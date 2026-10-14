@@ -1,0 +1,225 @@
+# Writes review/annotations.tsv. Every j_* value, tempting_wrong_fix and why_hard is the reviewer's
+# JUDGEMENT from reading the advisory and the fix diff; entry_point and services are GUESSES.
+import sys
+COLS = ["primary_id", "verdict", "role", "j_multi_site", "j_sites_touched", "j_sibling_sites",
+        "j_cause_other_layer", "j_defence_ineffective", "j_overbroad_breaks_legit", "entry_point",
+        "services", "flaw", "tempting_wrong_fix", "why_hard", "note"]
+R = []
+def keep(pid, role, s1, sites, sib, s2, s3, s7, entry, svc, flaw, wrong, why, note=""):
+    R.append([pid, "keep", role, s1, sites, sib, s2, s3, s7, entry, svc, flaw, wrong, why, note])
+def skip(pid, note):
+    R.append([pid, "skip", "", "", "", "", "", "", "", "", "", "", "", "", note])
+def drop(pid, note):
+    R.append([pid, "drop", "", "", "", "", "", "", "", "", "", "", "", "", note])
+
+# ---------------------------------------------------------------- the 16
+keep("GHSA-h3x4-894j-xpx5", "main", 0, "2 classes: AuthenticatorBase.invoke and FormAuthenticator (new result type threaded through doAuthenticate)", "unknown",
+     1, 0, 1,
+     "HTTP: FORM login, after which Tomcat restores the saved original request whose method differs from the login POST",
+     "none",
+     "Security constraints are looked up for the request before FORM authentication; when the saved request is restored with a different HTTP method the stale constraints are used, so a method-specific constraint is bypassed.",
+     "Patch FormAuthenticator.restoreRequest (where the method changes) to refuse or downgrade restored requests whose method differs, or re-check only roles there; that either breaks the documented restore-POST-after-login behaviour that existing FORM tests cover, or leaves the user-data (transport) constraint and cache headers computed for the wrong method.",
+     "S2: the wrong state (constraints for the pre-login method) is produced in AuthenticatorBase.invoke, but the symptom appears after FormAuthenticator swaps the request; the real fix changes the authenticator contract so the caller refreshes constraints. S7: the obvious repair removes saved-request restore. Java, authorisation class, fix restructures control flow (+133/-59).",
+     "Three fix commits referenced (one per Tomcat branch); metrics are for one of them. Not checked which branch the linked commit is on.")
+keep("GHSA-mhm7-754m-9p8w", "main", 1, "2 methods in ExternalTypeHandler (handlePropertyValue, complete), 4 hunks", "yes: sibling advisories GHSA-5hh8 and GHSA-rcqc fixed the same missing view check on other deserialisation paths",
+     1, 1, 1,
+     "Library API: ObjectMapper.readerWithView(View).readValue(json) for a class with a creator parameter carrying @JsonView and @JsonTypeInfo(include=EXTERNAL_PROPERTY)",
+     "none",
+     "The active @JsonView filter is applied to ordinary bean properties but not to creator properties handled through the external-type-id path, so a view-restricted constructor parameter is populated from attacker JSON.",
+     "Add creatorProp.visibleInView(activeView) in the BeanDeserializer branch the advisory names; values are buffered by ExternalTypeHandler and assigned later in complete(), so the restricted property is still populated. The over-broad variant (skip every external-type-id property when a view is active) breaks view-visible properties.",
+     "S1: the same view check must hold on every path that can set a property (regular, creator, unwrapped, external type id; two earlier advisories were the same gap elsewhere). S2: the advisory points at BeanDeserializer, the fix lands in ExternalTypeHandler where values are buffered and completed. S3: the view filter existed and was simply not consulted on this path.",
+     "Two fix commits referenced (2.x and 3.x branches).")
+keep("GHSA-qxvw-fvwx-5cp7", "main", 1, "4 files: the gate in StandardClient plus the per-plugin flag on the factory interface, ClearPassword and PAM factories", "yes: every authentication plugin that sends the password unhashed needs the flag; PAM (dialog) was the one missed",
+     0, 1, 1,
+     "Library API: JDBC connection to a server (hostile or man-in-the-middle) that answers with an Authentication Switch Request for the dialog plugin over plain TCP",
+     "MariaDB server with PAM, or a scripted fake MySQL-protocol server (GUESS)",
+     "The driver refuses to send a cleartext password over plain TCP for mysql_clear_password, but the sibling PAM (dialog) plugin has no such gate, so a server can make the client send the password in clear.",
+     "Refuse the dialog plugin whenever TLS is off: this breaks PAM authentication over a local unix socket, which is legitimate and which the real fix explicitly exempts. Or hard-code a check inside the PAM plugin only, leaving the gate keyed to one plugin name again.",
+     "S3: a working 'requires TLS' gate existed and covered only one of the plugins that transmit the password. S1: the property has to be declared per plugin and enforced at the one switch point. S7: the simple rule (no TLS, no PAM) rejects unix-socket connections. Java, authentication class; small fix (+15/-6) that is easy to get half right.",
+     "Two fix commits referenced. Reproducing needs a server that requests the dialog plugin; not verified how hard that is to script.")
+keep("GHSA-2jwh-9rmr-j4xf", "main", 1, "3 files: NettyRequestFactory (first request), Redirect30xInterceptor (redirect hop), CallerCookies (redirect and auth-retry reconciliation)", "yes: redirect and 401/407 retry hops rebuild the request separately",
+     1, 1, 1,
+     "Library API: request built with setHeader/addHeader(\"Cookie\", ...) on a client whose CookieStore already holds a cookie for the origin; needs a local HTTP server",
+     "none (a local test HTTP server)",
+     "With the default cookie store, a Cookie header the caller set directly is replaced by the store's cookies, so in a multi-user application one user's request can go out with another user's session cookie.",
+     "In NettyRequestFactory, skip writing store cookies when the caller already set a Cookie header. That drops the jar's cookies (breaks normal cookie-store behaviour that tests cover) and leaves the redirect and auth-retry hops, which rebuild the header from the cookie list.",
+     "S3: CVE-2024-53990 was already fixed, but that fix works on the cookie list and a directly set header never reaches it. S1: first request, redirect hop and auth retry each need the same merge rule. S2: the header is lost where the request is serialised, not where cookies are chosen. S7: must merge, keep caller precedence and fold to one header rather than suppress either source.",
+     "")
+keep("GHSA-p8qx-h547-fjw9", "main", 1, "2 files: negotiation.rs (client-to-server and server-to-client MAC selection) and cipher/mod.rs (length check)", "yes: both directions of MAC selection",
+     1, 1, 0,
+     "Network: SSH key exchange in which both peers offer MAC 'none' together with a CTR/CBC cipher, then one crafted packet",
+     "none",
+     "Algorithm negotiation checks that a MAC-requiring block cipher has a MAC only in the fallback branch, so 'none' can be negotiated with AES-CTR/CBC; a short packet then panics the reader (and the session has no integrity protection).",
+     "Add a bounds check in cipher::read where the slice index panics. The crash goes away, but an unauthenticated CTR/CBC session can still be negotiated.",
+     "S2: the report and the panic point at cipher::read; the cause is in negotiation.rs. S3: the needs_mac() check existed but ran only when no common MAC was found. A fix judged only on 'no panic' passes while leaving the negotiation flaw. Rust.",
+     "No tests changed in the fix commit apart from an inline unit test; CWE listed is CWE-129 (index validation), which hides the integrity aspect. Hidden tests would need an SSH peer that offers mac=none.")
+keep("GHSA-9gm5-9rfh-m6vx", "main", 1, "4 call sites in 3 files: gRPC Query, QUIC stream (DoQ), and the two DoH decoders in doh.go (POST body and GET base64), plus a new shared helper", "yes: UDP/TCP/DoT already enforce the rule in a different code path",
+     0, 1, 0,
+     "Network: RFC 2136 UPDATE message sent over DNS-over-HTTPS, DoH3, DoQ or DNS-over-gRPC to a CoreDNS that forwards upstream",
+     "an upstream DNS server that accepts dynamic updates, or a stub upstream (GUESS)",
+     "UDP, TCP and DoT listeners reject UPDATE opcodes before plugin dispatch, but the DoH, DoH3, DoQ and gRPC listeners unpack messages themselves and forward UPDATEs unchanged to the upstream.",
+     "Reject UPDATE in the one path the report demonstrates (for example the DoH POST decoder), or add an opcode check in the forward plugin only; the DoH GET decoder, DoQ and gRPC, and other proxying plugins stay open.",
+     "S1: one request policy has to hold at four separately written unpack sites (the fix routes all of them through one UnpackRequest helper). S3: the rejection existed for the classic transports, so the code looks protected. Small fix (+31/-7) spread over 4 files. Go.",
+     "Fix commit is a 'Merge commit from fork' (GitHub private-fork merge).")
+keep("GHSA-xwwr-4h3p-r22c", "main", 0, "5 files: serve/s3/server.go, s3.go, serve/proxy/proxy.go and the proxy test helper", "unknown",
+     1, 1, 1,
+     "CLI + HTTP: `rclone serve s3 --auth-proxy <prog>` without --auth-key, then S3 requests signed with an empty secret",
+     "none (the auth proxy is a local script)",
+     "With --auth-proxy, a middleware registers whatever access key id the client presents with the configured secret, which is empty unless --auth-key is set, so SigV4 verification succeeds for any request signed with an empty secret.",
+     "Refuse to start when --auth-proxy is used without --auth-key, or skip registering a key when the secret is empty. The first breaks the documented proxy-only mode; the second makes every proxy user fail signature verification. Neither gives per-user secrets.",
+     "S2: the signature check that 'fails' is in gofakes3; the bad state is created earlier by the middleware that fills the credential store from client input. S3: full SigV4 verification is present and runs, it is just fed an attacker-chosen key. S7: the real fix extends the proxy protocol so the proxy returns the secret per access key (+266/-63). Go, authentication class.",
+     "")
+keep("GHSA-fq2p-5p22-8g6j", "main", 1, "14 source files: ApplyPublicOnly added to six query-option types in models/, applied in org, repo, issue, star, watch and user API handlers, plus the repo assignment and API context", "yes: every API listing that can return private organisations, repositories, stars, watches, feeds or users",
+     1, 1, 0,
+     "HTTP API: GET /api/v1/user/orgs and /api/v1/users/{username}/orgs/{org}/permissions (and other listings) with a personal access token restricted to public-only",
+     "database (built-in SQLite should do; GUESS) and git",
+     "A personal access token limited to public-only can still read private organisation membership and permissions, because the public-only restriction is enforced by route middleware that is missing on some routes and checks the wrong object on others.",
+     "Add the existing checkTokenPublicOnly() middleware to the two routes named in the advisory. It evaluates the user in the path rather than the organisations returned, and the starred, watched, feed and search listings stay unfiltered.",
+     "S1: one restriction must hold in every query that can return private data (the fix touches 14 files). S3: a middleware for exactly this restriction exists and is attached to most routes, so the code looks protected. S2: the fix moves the decision from the route layer to the query options in the model layer. Go, authorisation class.",
+     "Two fix commits referenced; the linked one is dated 2026-05-18, before the June window (the advisory was published 2026-07-21). Large application; build time not measured.")
+keep("GHSA-6qvr-wjmv-v8mm", "main", 1, "17 source files: podcast sync, episode playable, radio station create/update (API and Subsonic), stream proxy, download service, shared Network/SafeHttp services", "yes: every server-side fetcher",
+     1, 1, 0,
+     "HTTP API as an authenticated non-admin user: add a podcast or radio station whose URL redirects to an internal address",
+     "database (SQLite or MySQL/PostgreSQL) and a local HTTP server that issues redirects (GUESS)",
+     "The fix for CVE-2026-47260 validated only the initial URL in most fetchers and the redirect target in one, so a 302 to an internal address (or DNS rebinding) still reaches internal services from several endpoints.",
+     "Add the per-redirect check to the one fetcher shown in the proof of concept. The other podcast and radio paths keep following redirects unchecked.",
+     "S1: the same 'is this destination allowed' decision is needed in about half a dozen fetch paths. S3 and S4: isSafeUrl() exists and the earlier fix shipped, but only the first hop was checked. S2: the durable fix is in the shared HTTP client layer (IP pinning, redirect callback), not at each caller. PHP; large restructuring (+263/-217).",
+     "Two fix commits referenced; the linked one moves helper classes, so part of the line count is file moves. SSRF is not one of the favoured classes.")
+keep("GHSA-8c6h-7g6x-m5x4", "main", 1, "4 endpoints in 3 controllers (Category, Faq x2, Question)", "yes: the advisory lists four endpoints left out when BackupController was fixed; not checked whether more exist",
+     0, 1, 0,
+     "HTTP REST API: write endpoints called with a valid shared API token by a user without the matching permission",
+     "database (MySQL/MariaDB, PostgreSQL or SQLite)",
+     "Four public-API write endpoints check only the shared API token and never the calling user's permission, so any token holder can create categories, FAQs and questions.",
+     "Add userHasPermission() to the single endpoint named in the report title, as the previous CVE fix did for BackupController; the other endpoints stay open.",
+     "S1 in its plainest form: one line per endpoint, and a fix is only complete if every write endpoint has it. S4: this advisory exists because CVE-2026-24421 was fixed at one site only. S3: hasValidToken() looks like an access check but is not per-user. Tiny fix (+7 lines) that is easy to leave partial. PHP, authorisation class.",
+     "No tests in the fix commit. Fix is added-only single lines, so the computed shape signals rate it low.")
+keep("GHSA-5qhf-9phg-95m2", "main", 0, "1 function (allowed_uri?) plus a new decoder, 3 hunks in one file", "yes: sibling advisory GHSA-8whx-365g-h9vv is another bypass of the same check (named whitespace references)",
+     0, 1, 1,
+     "Library API: Loofah::HTML5::Scrub.allowed_uri?(string) called directly by an application",
+     "none",
+     "allowed_uri? decodes HTML character references before testing the scheme, but only those ending in a semicolon; a browser also decodes semicolon-less numeric references, so java&#115cript: style URIs are reported safe.",
+     "Make the semicolon optional for the exact decimal form in the report, or strip '&#' sequences before the scheme test, or reject any URI containing '&#'. The first two miss hex and zero-padded forms or produce a different string than the browser sees; the last rejects legitimate encoded URLs.",
+     "S3: the decoding step is there and looks sufficient; it disagrees with browser parsing in a corner the report shows only one instance of. S7: blanket rejection breaks valid input. Ruby. Single file, so signals 1 and 2 do not apply.",
+     "Advisory says Loofah's default sanitize() path is not affected; only direct callers of allowed_uri?. Not in a favoured class (filter bypass leading to XSS).")
+keep("GHSA-889w-m37p-88m5", "main", 1, "5 files: core API (set_user_permission, remove_user, change_password and a session-invalidator hook), user database, web UI app setup, JSON blueprint, helpers", "yes: the documented /api/<func> route, its legacy camelCase alias and the web UI JSON routes all reach the same user changes",
+     1, 1, 0,
+     "HTTP: POST /api/set_user_permission (or legacy /api/setUserPermission) as admin, then continued use of the demoted user's cookie session",
+     "none (built-in SQLite)",
+     "Changing or revoking a user's permissions through the API updates the database but does not invalidate that user's existing session, which keeps its old role and permission bits for up to the session lifetime.",
+     "Call the existing session-invalidation helper in the one web route named in the report. The legacy alias and other API methods that change users (remove_user, password or role changes) still leave sessions alive.",
+     "S2: invalidation lived in the web UI JSON blueprint; the change that needs it happens in the core API layer, and the fix moves it there behind a hook. S1: several user-mutating API methods and two routes to each. S3: session invalidation already existed on one path, so the code looks covered. Python but in the session-handling class.",
+     "")
+keep("GHSA-3wxw-xv34-2frg", "main", 1, "5 files, about 13 hunks: tag creation, diff (two classes), blame options, ls-remote, and the shared option checker", "yes: every wrapper that forwards user values to a git subcommand",
+     0, 1, 0,
+     "Library API: TagReference.create(repo, path, reference=...) and the diff/blame wrappers with attacker-influenced arguments",
+     "none (git binary)",
+     "The unsafe-option guard for `git tag` inspects keyword arguments only, so a positional reference such as --file=<path> reaches git and the file's content is returned as the tag message; diff and blame have the same kind of gap.",
+     "Reject a reference that starts with --file or -F in TagReference.create. Option abbreviations, clustered short options and the equivalent gaps in diff, blame and ls-remote remain.",
+     "S3: the guard and its deny-list were added by the previous fix and are called, but with an empty positional list. S1: the same guard must be applied to positionals and kwargs in several wrappers, each with its own set of dangerous options. S4: stated incomplete fix; GitPython has several advisories of this family in the window.",
+     "Python and not a favoured class; kept for signals 1, 3 and 4.")
+keep("GHSA-6hx8-3wjj-gr8g", "main", 1, "3 call sites (Response Location handling, exc.py redirect __call__, Request.relative_url) plus a new urljoin in util.py", "yes",
+     1, 1, 0,
+     "Library API / WSGI: a redirect response whose Location value starts with a space or C0 control character followed by //host",
+     "none",
+     "WebOb checks a redirect target for a scheme or leading // before joining it to the request URL, but urllib's urljoin strips leading control characters and spaces afterwards, so ' //evil.example' passes the check and becomes an off-site redirect.",
+     "Strip the extra characters before the check in _make_location_absolute. The exc.py path and relative_url call urljoin directly and stay exposed, and the check still depends on mirroring whatever urlsplit strips in each Python version.",
+     "S2: the check and the parser disagree, and the lasting fix replaces the parser (own RFC 3986 urljoin) instead of adding another strip. S3 and S4: this is the third advisory for the same check. S1: three call sites.",
+     "Behaviour depends on the Python version (urlsplit stripping, 3.10+). Python and not a favoured class (open redirect); kept for signals 1-4.")
+keep("GHSA-7gfh-x38p-prh3", "main", 1, "3 files: guard moved out of set.ts into a shared module and applied at 4 reference sites in references.ts (root context lookup, property read, index access, method call); two `in` tests replaced by own-property tests", "yes: every way a template can walk from a value to its prototype chain",
+     0, 1, 1,
+     "Library API: rendering an attacker-controlled Velocity template (property read reaching the Function constructor)",
+     "none",
+     "The guard added for GHSA-j658-c2gf-x6pq blocks constructor / __proto__ / prototype only in #set assignment paths; property reads and method calls are unfiltered, so a template can reach the Function constructor and execute code.",
+     "Block the key 'constructor' in the one property-read path the proof of concept uses. Index access, method calls and the root context lookup stay open; and banning the key names outright also hides legitimate own properties called 'constructor', which the real fix keeps readable through an own-property test.",
+     "S3 and S4: a guard for exactly these keys exists and the advisory is a stated bypass of it. S1: the same rule has to be applied at every reference-resolution path (4 sites plus the #set paths). S7: a keyword ban breaks data objects that have such keys as own properties.",
+     "TypeScript, the models' strongest language, and a code-injection class; kept because signals 1, 3, 4 and 7 all apply. Small project (615 stars).")
+keep("GHSA-5j98-2g5x-46v6", "main", 1, "5 files: DNS error type, retry handle, resolver caching client, resolver, server forwarder (catalog.rs)", "yes: lookup(), lookup_ip() and the server's forwarded-response builder all consume the same validated response",
+     1, 1, 1,
+     "Library API: Resolver::lookup() / lookup_ip() with DNSSEC validation enabled, against an upstream that returns records with invalid signatures",
+     "none (a mock or scripted upstream DNS server; GUESS)",
+     "With DNSSEC validation enabled, the high-level lookup APIs return Ok with the records even when validation marks them bogus, so callers cannot tell forged answers from valid ones.",
+     "In Resolver::lookup(), scan the returned records and fail when any is not proven secure. That also fails unsigned (insecure) zones, which must keep resolving, and leaves lookup_ip(), the negative-answer path and the server's forwarder returning bogus data; the retry layer must also treat the new error as final.",
+     "S3: validation is implemented and runs, but its verdict is dropped before the API returns. S2: the decision belongs where the response becomes a lookup (caching client), and the new error has to be carried through the retry handle and the forwarder. S7: 'reject anything not Secure' breaks ordinary unsigned lookups. Rust, integrity class.",
+     "Advisory text is short. Workspace build time not measured.")
+
+# ---------------------------------------------------------------- 4 controls
+keep("GHSA-vj5c-m527-mpff", "control", 0, "1 hunk, 4 added lines", "no", 0, 0, 0,
+     "Library API: convertTokenData(tokens, {output: 'object'}) with a token key containing __proto__",
+     "none",
+     "convertTokenData builds nested objects from token keys without filtering __proto__, giving prototype pollution.",
+     "(control) none needed: the obvious guard at the reported spot is the actual fix.",
+     "Predicted easy: one sink, one compact added-only hunk at the place the report names, JavaScript, no earlier fix to get round.",
+     "Two commits referenced. The shipped fix is itself a keyword check ('__proto__'); constructor/prototype paths were not examined.")
+keep("GHSA-g84c-rxfj-3j2c", "control", 0, "1 hunk, 15 added lines", "no", 0, 0, 0,
+     "HTTP: request to a dev server using webpack-dev-middleware with a publicPath that does not end in a slash",
+     "none",
+     "getFilenameFromUrl slices the URL by publicPath length, so with a non-slash-terminated publicPath a crafted URL resolves outside the output directory.",
+     "(control) none needed: a containment check after the path is built, at the reported function, is the fix.",
+     "Predicted easy: single function, added-only containment check, JavaScript.",
+     "Fix commit is a 'Merge commit from fork'; two commits referenced.")
+keep("GHSA-7mx3-vvmw-hjmv", "control", 0, "1 hunk, +5/-1", "no", 0, 0, 0,
+     "Library API: mergeDeep() over objects with keys constructor / __proto__ / prototype (reached in practice through GraphQL field aliases during result merging)",
+     "none",
+     "mergeDeep copies keys named __proto__, constructor or prototype, giving prototype pollution.",
+     "(control) none needed: skip the three keys in the merge loop.",
+     "Predicted easy: one utility function, textbook guard, TypeScript.",
+     "Monorepo (only packages/utils is touched).")
+keep("GHSA-j36p-7w88-g82j", "control", 0, "1 hunk, +2/-2 (two adjacent path joins in one method)", "no", 0, 0, 0,
+     "HTTP / component API: a FileExplorer component payload whose path segments contain ../, reaching preprocess()",
+     "none",
+     "FileExplorer.preprocess joins client-supplied path segments onto root_dir with os.path.join and normpath, so files outside root_dir reach the application callback.",
+     "(control) none needed: the class already has a _safe_join helper; using it at the two joins in this method is the fix.",
+     "Predicted easy: one method, an existing helper to reuse, +2/-2, Python, the report names the method.",
+     "Fix commit dated 2026-05-31, one day before the window (advisory published inside it).")
+
+# ---------------------------------------------------------------- read, not chosen this round (stay candidates)
+skip("GHSA-8r5x-fm3f-whwj", "reserve: Handlebars AST validation bypass; signals 1-4 all apply (validator covers 3 node types, fix moves checks into the compiler); not used because the fix commit is dated 2026-03-26, well before the window, although the advisory was published 2026-10-08")
+skip("GHSA-c59q-g84q-2gj5", "reserve: pnpm virtual-store traversal; signals 1, 3, 4 (same helper needed at 5 path joins, incomplete earlier fix); TypeScript, path class, left out to keep JS/TS low")
+skip("GHSA-c36x-h252-g9x2", "reserve: OpenBao cross-namespace lease revoke/renew; stated incomplete fix, signals 1-3 (fix removes the namespace check in Renew and resolves the lease namespace during request routing); left out in favour of Gitea because of the Vault-sized build")
+skip("GHSA-p6ph-3jx2-3337", "reserve: OpenList search path check; strong on signals 2 and 3; left out only to keep Go at three")
+skip("GHSA-96h3-5x6v-m776", "reserve: Composer symlinked bin path, bypass of an earlier fix, 2 sites; CLI entry point")
+skip("GHSA-9pwp-9qqc-pr26", "reserve: Bouncy Castle name-constraint trailing dot; advisory text is two lines, hard to write a report from")
+skip("GHSA-p279-2cqp-84jg", "reserve: OpenDJ SASL PLAIN authzid; good signals, heavy Maven build and needs an LDAP client")
+skip("GHSA-m65r-rprj-r5rg", "reserve: russh channel callbacks without an open channel; strong signal 1; same repository as the chosen russh entry")
+skip("GHSA-c8jx-96c9-8xrp", "SurrealDB indexed COUNT permission leak: signal 2, very heavy Rust build")
+skip("GHSA-239g-2685-54x3", "uutils install TOCTOU: race is hard to test deterministically")
+skip("GHSA-prq8-7wvh-44qh", "reserve: ruby-oauth cross-origin redirect; none of signals 1-3 clearly applies")
+skip("GHSA-9998-894r-fwvr", "reserve: http4s Transfer-Encoding parsing; clear signal 3, sbt build likely slow")
+skip("GHSA-qcxp-gm7m-4j5v", "Quarkus path normalisation at 7 files; very large monorepo build")
+skip("GHSA-3g44-3m7x-cgg2", "Yamcs StreamSQL: fix is in a JavaCC grammar plus regenerated parser, metrics describe generated code")
+skip("GHSA-584p-f93j-wpgc", "Formie (Craft CMS plugin): needs a Craft CMS install to exercise")
+skip("GHSA-pxcx-fv34-x9p5", "nginx-ignition onboarding race: a process-local lock would pass a concurrency test, weak tempting-wrong-fix")
+skip("GHSA-5gj4-9gm7-2fx2", "Coraza JSON key collision: good signal 2, single file")
+skip("GHSA-5gpm-rgj3-9q76", "Skipper OPA truncated body: needs an OPA bundle set-up")
+skip("GHSA-rqrh-8wpv-x7hh", "note-mark slug traversal: unanchored pattern is signal 3, small app (775 stars)")
+skip("GHSA-x8gv-g2g3-65fj", "SiYuan DNS-rebinding SSRF: rebinding is awkward to reproduce in a container")
+skip("GHSA-45gv-9wjv-xh7p", "nginx-ui passkey enforcement: needs WebAuthn in tests")
+skip("GHSA-hxvh-4h3w-prp9", "Nuxt route-rule case folding: strong signals, heavy monorepo, TypeScript")
+skip("GHSA-4hmc-cfm3-w43c", "Langflow MCP resource authorisation: strong signals, 1.6 GB repository")
+skip("GHSA-38c3-wv3c-v3xj", "swagger-typescript-api: multi-sink escaping, TypeScript, commit bundles several advisories")
+skip("GHSA-gqvv-2mrq-wpjv", "Hono toSSG traversal: incomplete fix, single site, TypeScript")
+skip("GHSA-fph4-wmhf-6fwf", "fast-uri double decoding: incomplete fix, JavaScript")
+skip("GHSA-7gwp-5pfp-969j", "MLflow webhook SSRF via redirect/rebinding: signal 2 and 3, Python, 1.5 GB repository")
+skip("GHSA-x97p-jq2g-jp4f", "axios: read-side gadget that needs prototype pollution from elsewhere")
+skip("GHSA-26c4-7vv6-867j", "Keras: selected commit is a release bundle")
+skip("GHSA-w3f4-8pj2-599w", "Grav watermark traversal: the only fetched commit is a mixed 'various fixes' bundle")
+skip("GHSA-9x44-4gxf-8c25", "Pimcore field-name injection: heavy application, single validator")
+skip("GHSA-r6gq-whwq-mvg9", "NLTK corpus reader symlink escape: Python, path class")
+skip("GHSA-6wvf-77m9-58rm", "LiteLLM SSTI: commit bundles unrelated endpoint hardening")
+skip("GHSA-5578-w22f-pfx9", "datamodel-code-generator import injection: single sink class, though validated at 3 sites")
+skip("GHSA-27vj-qcqg-25rc", "fsspec: selected commit is a general 'small safety improvements' bundle")
+skip("GHSA-xj3h-wwxq-gfcj", "Cloudreve quota race: no tests, diff not read in full")
+skip("GHSA-r3hx-x5rh-p9vv", "django-haystack eval() in the Elasticsearch backend: a clean single-sink control, not used because it needs an Elasticsearch 1.x-era backend or a stub")
+skip("GHSA-848c-c2cx-j7qx", "NLTK collocations eval: reachable only through the module's own demo CLI arguments; fix dated 2025-11")
+# ---------------------------------------------------------------- dropped on reading
+drop("GHSA-rf44-j88r-hh8c", "Traefik header alias: the fix is a new opt-in entry point option whose default keeps the old behaviour; not a code fix an agent can be graded on")
+drop("GHSA-q8gq-377p-jq3r", "vLLM assert-based check: exploitable only under python -O, GPU/torch stack, fix is assert-to-raise replacement")
+
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write("# Reading notes for the shortlist. j_* columns, tempting_wrong_fix and why_hard are the reviewer's JUDGEMENT\n")
+    f.write("# after reading the advisory and the fix diff; entry_point and services are GUESSES. verdict: keep / skip / drop.\n")
+    f.write("\t".join(COLS) + "\n")
+    for r in R:
+        assert len(r) == len(COLS)
+        f.write("\t".join(str(x).replace("\t", " ").replace("\n", " ") for x in r) + "\n")
+print(len(R), "rows")
