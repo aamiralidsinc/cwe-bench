@@ -1,0 +1,213 @@
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/intercept/CallerCookies.java b/client/src/main/java/org/asynchttpclient/netty/handler/intercept/CallerCookies.java
+index f2eb55cf9..b38b1685a 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/intercept/CallerCookies.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/intercept/CallerCookies.java
+@@ -18,17 +18,20 @@ package org.asynchttpclient.netty.handler.intercept;
+ import io.netty.handler.codec.http.HttpResponse;
+ import io.netty.handler.codec.http.cookie.ClientCookieDecoder;
+ import io.netty.handler.codec.http.cookie.Cookie;
++import io.netty.handler.codec.http.cookie.ServerCookieDecoder;
+ import org.asynchttpclient.Request;
+ import org.asynchttpclient.RequestBuilder;
+ import org.asynchttpclient.cookie.CookieStore;
+ import org.asynchttpclient.uri.Uri;
+ 
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Set;
+ 
++import static io.netty.handler.codec.http.HttpHeaderNames.COOKIE;
+ import static io.netty.handler.codec.http.HttpHeaderNames.SET_COOKIE;
+ 
+ /**
+@@ -47,7 +50,7 @@ final class CallerCookies {
+      */
+     static List<Cookie> of(Request request, HttpResponse response, CookieStore cookieStore, Uri next,
+                            ClientCookieDecoder cookieDecoder) {
+-        List<Cookie> cookies = request.getCookies();
++        List<Cookie> cookies = withHeaderCookies(request);
+         if (cookies.isEmpty()) {
+             return cookies;
+         }
+@@ -94,11 +97,29 @@ final class CallerCookies {
+     static void refresh(RequestBuilder retry, Request request, HttpResponse response, CookieStore cookieStore,
+                         ClientCookieDecoder cookieDecoder) {
+         retry.setCookies(of(request, response, cookieStore, request.getUri(), cookieDecoder));
++        retry.setHeader(COOKIE, Collections.emptyList());
+         for (Cookie cookie : cookieStore.get(request.getUri())) {
+             retry.addCookieIfUnset(cookie);
+         }
+     }
+ 
++    /**
++     * The request's cookies plus the pairs of a Cookie header the caller set. A hop drops the raw header and
++     * sends these instead, reconciled against the response, or the header would outrank a cookie it rotated.
++     * Only the request the caller built sends the header as written.
++     */
++    private static List<Cookie> withHeaderCookies(Request request) {
++        List<String> headers = request.getHeaders().getAll(COOKIE);
++        if (headers.isEmpty()) {
++            return request.getCookies();
++        }
++        List<Cookie> cookies = new ArrayList<>(request.getCookies());
++        for (String header : headers) {
++            cookies.addAll(ServerCookieDecoder.LAX.decodeAll(header));
++        }
++        return cookies;
++    }
++
+     private static boolean holdsSameValue(List<Cookie> stored, Cookie cookie) {
+         for (Cookie candidate : stored) {
+             if (candidate.name().equals(cookie.name()) && candidate.value().equals(cookie.value())) {
+diff --git a/client/src/main/java/org/asynchttpclient/netty/handler/intercept/Redirect30xInterceptor.java b/client/src/main/java/org/asynchttpclient/netty/handler/intercept/Redirect30xInterceptor.java
+index 90d1e84b1..2e4369699 100644
+--- a/client/src/main/java/org/asynchttpclient/netty/handler/intercept/Redirect30xInterceptor.java
++++ b/client/src/main/java/org/asynchttpclient/netty/handler/intercept/Redirect30xInterceptor.java
+@@ -215,7 +215,7 @@ public class Redirect30xInterceptor {
+                 requestBuilder.setMethod(switchToGet ? GET : originalMethod)
+                         .setFollowRedirect(true)
+                         .setRealm(stripAuth ? null : request.getRealm())
+-                        .setHeaders(propagatedHeaders(request, realm, keepBody, stripAuth))
++                        .setHeaders(propagatedHeaders(request, realm, keepBody, stripAuth, cookieStore != null))
+                         .setRequestTimeout(request.getRequestTimeout())
+                         .setReadTimeout(request.getReadTimeout());
+ 
+@@ -457,7 +457,8 @@ public class Redirect30xInterceptor {
+         NONE
+     }
+ 
+-    private static HttpHeaders propagatedHeaders(Request request, Realm realm, boolean keepBody, boolean stripAuthorization) {
++    private static HttpHeaders propagatedHeaders(Request request, Realm realm, boolean keepBody, boolean stripAuthorization,
++                                                 boolean cookiesReconciled) {
+         HttpHeaders headers = request.getHeaders().copy().remove(HOST);
+ 
+         // Preserve an explicit length when the selected stream representation cannot rebuild it.
+@@ -480,6 +481,10 @@ public class Redirect30xInterceptor {
+             headers.remove(AUTHORIZATION)
+                     .remove(PROXY_AUTHORIZATION);
+         }
++        if (cookiesReconciled) {
++            // CallerCookies carries its pairs in the cookie list.
++            headers.remove(COOKIE);
++        }
+         return headers;
+     }
+ }
+diff --git a/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestFactory.java b/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestFactory.java
+index f9802af67..b5ea972ab 100755
+--- a/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestFactory.java
++++ b/client/src/main/java/org/asynchttpclient/netty/request/NettyRequestFactory.java
+@@ -26,6 +26,7 @@ import io.netty.handler.codec.http.HttpHeaders;
+ import io.netty.handler.codec.http.HttpMethod;
+ import io.netty.handler.codec.http.HttpRequest;
+ import io.netty.handler.codec.http.HttpVersion;
++import io.netty.handler.codec.http.cookie.Cookie;
+ import io.netty.handler.codec.http.cookie.ClientCookieEncoder;
+ import io.netty.util.AsciiString;
+ import org.asynchttpclient.AsyncHttpClientConfig;
+@@ -48,9 +49,13 @@ import org.asynchttpclient.uri.Uri;
+ import org.asynchttpclient.util.StringUtils;
+ 
+ import java.nio.charset.Charset;
++import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.function.Function;
+ 
+ import static io.netty.handler.codec.http.HttpHeaderNames.ACCEPT;
+@@ -158,6 +163,76 @@ public final class NettyRequestFactory {
+         }
+     }
+ 
++    /**
++     * Adds the request's cookies to any {@code Cookie} header the caller set, instead of replacing it. Where
++     * both name one cookie the caller's wins. The caller's text is kept verbatim: a decode and re-encode would
++     * drop values the strict decoder rejects. One field only, as RFC 6265 Section 5.4 requires.
++     */
++    private void mergeCookies(List<Cookie> cookies, HttpHeaders headers) {
++        List<String> callerHeaders = headers.getAll(COOKIE);
++        if (callerHeaders.isEmpty()) {
++            if (isNonEmpty(cookies)) {
++                headers.set(COOKIE, cookieEncoder.encode(cookies));
++            }
++            return;
++        }
++        if (callerHeaders.size() == 1 && !isNonEmpty(cookies)) {
++            // Nothing to merge: leave the caller's bytes alone, unless the field is blank.
++            if (callerHeaders.get(0).trim().isEmpty()) {
++                headers.remove(COOKIE);
++            }
++            return;
++        }
++
++        StringBuilder merged = new StringBuilder();
++        Set<String> callerNames = new HashSet<>(4);
++        for (String callerHeader : callerHeaders) {
++            // Appended as one run, trimming only the delimiters at the ends so the join cannot double them.
++            int start = 0;
++            int end = callerHeader.length();
++            while (start < end && (callerHeader.charAt(start) == ';' || callerHeader.charAt(start) <= ' ')) {
++                start++;
++            }
++            while (end > start && (callerHeader.charAt(end - 1) == ';' || callerHeader.charAt(end - 1) <= ' ')) {
++                end--;
++            }
++            if (start == end) {
++                continue;
++            }
++            if (merged.length() > 0) {
++                merged.append("; ");
++            }
++            merged.append(callerHeader, start, end);
++            for (String pair : callerHeader.split(";")) {
++                int eq = pair.indexOf('=');
++                // Case-sensitive, but trimmed: "a = 1" still names "a".
++                String name = (eq >= 0 ? pair.substring(0, eq) : pair).trim();
++                if (!name.isEmpty()) {
++                    callerNames.add(name);
++                }
++            }
++        }
++
++        List<Cookie> notSetByCaller = new ArrayList<>(cookies.size());
++        for (Cookie cookie : cookies) {
++            if (!callerNames.contains(cookie.name())) {
++                notSetByCaller.add(cookie);
++            }
++        }
++        if (!notSetByCaller.isEmpty()) {
++            if (merged.length() > 0) {
++                merged.append("; ");
++            }
++            merged.append(cookieEncoder.encode(notSetByCaller));
++        }
++
++        if (merged.length() == 0) {
++            headers.remove(COOKIE);
++        } else {
++            headers.set(COOKIE, merged.toString());
++        }
++    }
++
+     private final AsyncHttpClientConfig config;
+     private final ClientCookieEncoder cookieEncoder;
+ 
+@@ -277,9 +352,8 @@ public final class NettyRequestFactory {
+             // assign headers as configured on request
+             copyInternedHeaders(request.getHeaders(), headers);
+ 
+-            if (isNonEmpty(request.getCookies())) {
+-                headers.set(COOKIE, cookieEncoder.encode(request.getCookies()));
+-            }
++            // Unconditional: it also folds several caller-set Cookie fields into one.
++            mergeCookies(request.getCookies(), headers);
+ 
+             String userDefinedAcceptEncoding = headers.get(ACCEPT_ENCODING);
+             if (userDefinedAcceptEncoding != null) {
