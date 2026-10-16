@@ -100,3 +100,11 @@ its tests really ran (12+5 results, test-stdout complete), so it stands.
 The first mimo-r11 regrade attempt failed at image build (apt, disk-full window) and wrote no
 regrade dir; rerun 06:12 UTC -> 1.0.
 Not regradable (no final-code/changes.patch): deepseek-r1 n001/n002, mimo-r1 040706/050806/102205.
+
+## 2026-10-16 audit finding on DeepSeek r12 (not applied; decision for the user)
+r12 scored 1.0 (17/17). The post-run audit judged it untrusted (lenient test, medium confidence): the
+handshake guard keys on `_session_id`, which is set when the endpoint sends its own NEWKEYS, so a
+plaintext USERAUTH_REQUEST/EXT_INFO injected after the KEXDH reply and before the peer's NEWKEYS is
+still processed (the window the real attacks use). The tests inject only before KEXINIT. Adding a
+test now would turn an observed solve into a failure after the fact; the lead did not add it and
+left the decision to the user. The task is rejected either way (MiMo solved at 96 min).

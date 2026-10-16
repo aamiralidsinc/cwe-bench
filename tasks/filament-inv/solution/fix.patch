@@ -1,0 +1,426 @@
+diff --git a/packages/panels/src/Auth/MultiFactor/App/Actions/DisableAppAuthenticationAction.php b/packages/panels/src/Auth/MultiFactor/App/Actions/DisableAppAuthenticationAction.php
+index d04758bcf1..6ea4816be0 100644
+--- a/packages/panels/src/Auth/MultiFactor/App/Actions/DisableAppAuthenticationAction.php
++++ b/packages/panels/src/Auth/MultiFactor/App/Actions/DisableAppAuthenticationAction.php
+@@ -17,6 +17,8 @@ use Filament\Support\Enums\Width;
+ use Filament\Support\Icons\Heroicon;
+ use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\RateLimiter;
++use Illuminate\Validation\ValidationException;
++use Livewire\Component;
+ 
+ class DisableAppAuthenticationAction
+ {
+@@ -24,6 +26,27 @@ class DisableAppAuthenticationAction
+     {
+         $isRecoverable = $appAuthentication->isRecoverable();
+ 
++        $rateLimitAuthenticationAttempt = static function (string $passwordStatePath): void {
++            $rateLimitingKey = 'filament-disable-app-authentication:' . Filament::auth()->id();
++
++            if (RateLimiter::tooManyAttempts($rateLimitingKey, maxAttempts: 5)) {
++                throw ValidationException::withMessages([
++                    $passwordStatePath => __('filament-panels::auth/multi-factor/app/actions/disable.modal.form.code.messages.rate_limited'),
++                ]);
++            }
++
++            RateLimiter::hit($rateLimitingKey);
++        };
++
++        $passwordInput = TextInput::make('password')
++            ->label(__('filament-panels::auth/multi-factor/app/actions/disable.modal.form.password.label'))
++            ->validationAttribute(__('filament-panels::auth/multi-factor/app/actions/disable.modal.form.password.validation_attribute'))
++            ->currentPassword(guard: Filament::getAuthGuard())
++            ->password()
++            ->revealable(Filament::arePasswordsRevealable())
++            ->required()
++            ->dehydrated(false);
++
+         return Action::make('disableAppAuthentication')
+             ->label(__('filament-panels::auth/multi-factor/app/actions/disable.label'))
+             ->color('danger')
+@@ -34,6 +57,7 @@ class DisableAppAuthenticationAction
+             ->modalHeading(__('filament-panels::auth/multi-factor/app/actions/disable.modal.heading'))
+             ->modalDescription(__('filament-panels::auth/multi-factor/app/actions/disable.modal.description'))
+             ->schema([
++                $passwordInput,
+                 OneTimeCodeInput::make('code')
+                     ->label(__('filament-panels::auth/multi-factor/app/actions/disable.modal.form.code.label'))
+                     ->belowContent(fn (Get $get): Action => Action::make('useRecoveryCode')
+@@ -45,16 +69,6 @@ class DisableAppAuthenticationAction
+                     ->required(fn (Get $get): bool => (! $isRecoverable) || blank($get('recoveryCode')))
+                     ->rule(function () use ($appAuthentication): Closure {
+                         return function (string $attribute, mixed $value, Closure $fail) use ($appAuthentication): void {
+-                            $rateLimitingKey = 'filament-disable-app-authentication:' . Filament::auth()->id();
+-
+-                            if (RateLimiter::tooManyAttempts($rateLimitingKey, maxAttempts: 5)) {
+-                                $fail(__('filament-panels::auth/multi-factor/app/actions/disable.modal.form.code.messages.rate_limited'));
+-
+-                                return;
+-                            }
+-
+-                            RateLimiter::hit($rateLimitingKey);
+-
+                             if (is_string($value) && $appAuthentication->verifyCode($value)) {
+                                 return;
+                             }
+@@ -73,16 +87,6 @@ class DisableAppAuthenticationAction
+                                 return;
+                             }
+ 
+-                            $rateLimitingKey = 'filament-disable-app-authentication:' . Filament::auth()->id();
+-
+-                            if (RateLimiter::tooManyAttempts($rateLimitingKey, maxAttempts: 5)) {
+-                                $fail(__('filament-panels::auth/multi-factor/app/actions/disable.modal.form.recovery_code.messages.rate_limited'));
+-
+-                                return;
+-                            }
+-
+-                            RateLimiter::hit($rateLimitingKey);
+-
+                             if (is_string($value) && $appAuthentication->verifyRecoveryCode($value)) {
+                                 return;
+                             }
+@@ -93,6 +97,17 @@ class DisableAppAuthenticationAction
+                     ->visible(fn (Get $get): bool => $isRecoverable && $get('useRecoveryCode'))
+                     ->live(onBlur: true),
+             ])
++            ->beforeFormValidated(function (Component $livewire) use ($passwordInput, $rateLimitAuthenticationAttempt): void {
++                $passwordStatePath = $passwordInput->getStatePath();
++
++                $rateLimitAuthenticationAttempt($passwordStatePath);
++
++                $livewire->validateOnly(
++                    $passwordStatePath,
++                    [$passwordStatePath => $passwordInput->getValidationRules()],
++                    attributes: [$passwordStatePath => $passwordInput->getValidationAttribute()],
++                );
++            })
+             ->modalSubmitAction(fn (Action $action) => $action
+                 ->label(__('filament-panels::auth/multi-factor/app/actions/disable.modal.actions.submit.label')))
+             ->action(function () use ($appAuthentication, $isRecoverable): void {
+diff --git a/packages/panels/src/Auth/MultiFactor/App/AppAuthentication.php b/packages/panels/src/Auth/MultiFactor/App/AppAuthentication.php
+index 4327e859e7..9b0d7324a8 100644
+--- a/packages/panels/src/Auth/MultiFactor/App/AppAuthentication.php
++++ b/packages/panels/src/Auth/MultiFactor/App/AppAuthentication.php
+@@ -22,7 +22,9 @@ use Filament\Schemas\Components\Text;
+ use Filament\Schemas\Components\Utilities\Get;
+ use Filament\Schemas\Components\Utilities\Set;
+ use Illuminate\Contracts\Auth\Authenticatable;
++use Illuminate\Contracts\Cache\LockProvider;
+ use Illuminate\Support\Collection;
++use Illuminate\Support\Facades\Cache;
+ use Illuminate\Support\Facades\Hash;
+ use Illuminate\Support\Str;
+ use LogicException;
+@@ -175,21 +177,35 @@ class AppAuthentication implements MultiFactorAuthenticationProvider
+             return $this->google2FA->verifyKey($secret, $code, $this->getCodeWindow());
+         }
+ 
+-        $cacheKey = 'filament.app_authentication_codes.' . md5($secret . $code);
++        // The key deliberately excludes the code itself, so that it records the timestep of the
++        // last accepted code rather than a marker for one specific code. A successful verification
++        // must reject that code and every earlier one, not just a repeat of the same code.
++        $cacheKey = 'filament.app_authentication_codes.' . md5($secret);
+ 
+-        $timestamp = $this->google2FA->verifyKeyNewer($secret, $code, cache()->get($cacheKey), $this->getCodeWindow());
++        $verifyCode = function () use ($cacheKey, $code, $secret): bool {
++            $timestamp = $this->google2FA->verifyKeyNewer($secret, $code, Cache::get($cacheKey), $this->getCodeWindow());
++
++            if ($timestamp === false) {
++                return false;
++            }
+ 
+-        if ($timestamp !== false) {
+             if ($timestamp === true) {
+                 $timestamp = $this->google2FA->getTimestamp();
+             }
+ 
+-            cache()->put($cacheKey, $timestamp, ($this->getCodeWindow() + 1) * 60);
++            Cache::put($cacheKey, $timestamp, ($this->getCodeWindow() + 1) * 60);
+ 
+             return true;
++        };
++
++        // Locking closes the window where concurrent requests both read the timestep before either
++        // writes it. Not every cache store supports locks, and verification is on the login path,
++        // so fall back to verifying without one rather than failing to log in.
++        if (! (Cache::getStore() instanceof LockProvider)) {
++            return $verifyCode();
+         }
+ 
+-        return false;
++        return Cache::lock("{$cacheKey}.lock", 10)->block(10, $verifyCode);
+     }
+ 
+     public function verifyRecoveryCode(string $recoveryCode, ?HasAppAuthenticationRecovery $user = null): bool
+diff --git a/packages/panels/src/Auth/MultiFactor/Pages/SetUpRequiredMultiFactorAuthentication.php b/packages/panels/src/Auth/MultiFactor/Pages/SetUpRequiredMultiFactorAuthentication.php
+index 51bc040657..48aea4ceaa 100644
+--- a/packages/panels/src/Auth/MultiFactor/Pages/SetUpRequiredMultiFactorAuthentication.php
++++ b/packages/panels/src/Auth/MultiFactor/Pages/SetUpRequiredMultiFactorAuthentication.php
+@@ -10,11 +10,14 @@ use Filament\Schemas\Components\Actions;
+ use Filament\Schemas\Components\Component;
+ use Filament\Schemas\Components\Group;
+ use Filament\Schemas\Components\Section;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Illuminate\Contracts\Support\Htmlable;
+ 
+ class SetUpRequiredMultiFactorAuthentication extends SimplePage
+ {
++    use RestrictsFileUploadsToSchemaComponents;
++
+     public function mount(): void
+     {
+         if ((! Filament::hasMultiFactorAuthentication()) || $this->isEnabled()) {
+diff --git a/packages/panels/src/Auth/Pages/EmailVerification/EmailVerificationPrompt.php b/packages/panels/src/Auth/Pages/EmailVerification/EmailVerificationPrompt.php
+index 93a4fed5c7..a852e1542d 100644
+--- a/packages/panels/src/Auth/Pages/EmailVerification/EmailVerificationPrompt.php
++++ b/packages/panels/src/Auth/Pages/EmailVerification/EmailVerificationPrompt.php
+@@ -10,6 +10,7 @@ use Filament\Facades\Filament;
+ use Filament\Notifications\Notification;
+ use Filament\Pages\SimplePage;
+ use Filament\Schemas\Components\Text;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Illuminate\Contracts\Auth\MustVerifyEmail;
+ use Illuminate\Contracts\Support\Htmlable;
+@@ -22,6 +23,7 @@ use LogicException;
+  */
+ class EmailVerificationPrompt extends SimplePage
+ {
++    use RestrictsFileUploadsToSchemaComponents;
+     use WithRateLimiting;
+ 
+     public function mount(): void
+diff --git a/packages/panels/src/Auth/Pages/Login.php b/packages/panels/src/Auth/Pages/Login.php
+index e71eb9843a..8b438e5213 100644
+--- a/packages/panels/src/Auth/Pages/Login.php
++++ b/packages/panels/src/Auth/Pages/Login.php
+@@ -24,6 +24,7 @@ use Filament\Schemas\Components\Group;
+ use Filament\Schemas\Components\RenderHook;
+ use Filament\Schemas\Components\Section;
+ use Filament\Schemas\Components\Utilities\Get;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Filament\Support\Enums\Alignment;
+ use Filament\View\PanelsRenderHook;
+@@ -47,6 +48,7 @@ use SensitiveParameter;
+  */
+ class Login extends SimplePage
+ {
++    use RestrictsFileUploadsToSchemaComponents;
+     use WithRateLimiting;
+ 
+     /**
+@@ -93,6 +95,16 @@ class Login extends SimplePage
+             $this->throwFailureValidationException();
+         }
+ 
++        // This must run before the multi-factor challenge is presented, otherwise the
++        // challenge confirms that the password was valid for an account that can never
++        // sign in, revealing password validity to an unauthenticated attacker.
++        if (! $this->isUserAllowedToAccessPanel($user)) {
++            $this->userUndertakingMultiFactorAuthentication = null;
++
++            $this->fireFailedEvent($authGuard, $user, $credentials);
++            $this->throwFailureValidationException();
++        }
++
+         if (
+             filled($this->userUndertakingMultiFactorAuthentication) &&
+             (decrypt($this->userUndertakingMultiFactorAuthentication) === $user->getAuthIdentifier())
+@@ -124,13 +136,7 @@ class Login extends SimplePage
+             }
+         }
+ 
+-        if (! $authGuard->attemptWhen($credentials, function (Authenticatable $user): bool {
+-            if (! ($user instanceof FilamentUser)) {
+-                return true;
+-            }
+-
+-            return $user->canAccessPanel(Filament::getCurrentOrDefaultPanel());
+-        }, $data['remember'] ?? false)) {
++        if (! $authGuard->attemptWhen($credentials, fn (Authenticatable $user): bool => $this->isUserAllowedToAccessPanel($user), $data['remember'] ?? false)) {
+             $this->fireFailedEvent($authGuard, $user, $credentials);
+             $this->throwFailureValidationException();
+         }
+@@ -140,6 +146,15 @@ class Login extends SimplePage
+         return app(LoginResponse::class);
+     }
+ 
++    protected function isUserAllowedToAccessPanel(Authenticatable $user): bool
++    {
++        if (! ($user instanceof FilamentUser)) {
++            return true;
++        }
++
++        return $user->canAccessPanel(Filament::getCurrentOrDefaultPanel());
++    }
++
+     protected function isMultiFactorChallengeRateLimited(Authenticatable $user): bool
+     {
+         $rateLimitingKey = "filament-multi-factor-challenge:{$user->getAuthIdentifier()}";
+diff --git a/packages/panels/src/Auth/Pages/PasswordReset/RequestPasswordReset.php b/packages/panels/src/Auth/Pages/PasswordReset/RequestPasswordReset.php
+index 41192420dd..f52f242a3b 100644
+--- a/packages/panels/src/Auth/Pages/PasswordReset/RequestPasswordReset.php
++++ b/packages/panels/src/Auth/Pages/PasswordReset/RequestPasswordReset.php
+@@ -17,6 +17,7 @@ use Filament\Schemas\Components\Component;
+ use Filament\Schemas\Components\EmbeddedSchema;
+ use Filament\Schemas\Components\Form;
+ use Filament\Schemas\Components\RenderHook;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Filament\Support\Facades\FilamentIcon;
+ use Filament\Support\Icons\Heroicon;
+@@ -34,6 +35,7 @@ use LogicException;
+  */
+ class RequestPasswordReset extends SimplePage
+ {
++    use RestrictsFileUploadsToSchemaComponents;
+     use WithRateLimiting;
+ 
+     /**
+diff --git a/packages/panels/src/Auth/Pages/PasswordReset/ResetPassword.php b/packages/panels/src/Auth/Pages/PasswordReset/ResetPassword.php
+index a95f17f32e..b1f7d5ecea 100644
+--- a/packages/panels/src/Auth/Pages/PasswordReset/ResetPassword.php
++++ b/packages/panels/src/Auth/Pages/PasswordReset/ResetPassword.php
+@@ -17,6 +17,7 @@ use Filament\Schemas\Components\Component;
+ use Filament\Schemas\Components\EmbeddedSchema;
+ use Filament\Schemas\Components\Form;
+ use Filament\Schemas\Components\RenderHook;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Filament\View\PanelsRenderHook;
+ use Illuminate\Auth\Events\PasswordReset;
+@@ -36,6 +37,7 @@ use Livewire\Attributes\Locked;
+  */
+ class ResetPassword extends SimplePage
+ {
++    use RestrictsFileUploadsToSchemaComponents;
+     use WithRateLimiting;
+ 
+     #[Locked]
+diff --git a/packages/panels/src/Auth/Pages/Register.php b/packages/panels/src/Auth/Pages/Register.php
+index ed70078700..4c86a26617 100644
+--- a/packages/panels/src/Auth/Pages/Register.php
++++ b/packages/panels/src/Auth/Pages/Register.php
+@@ -19,6 +19,7 @@ use Filament\Schemas\Components\Component;
+ use Filament\Schemas\Components\EmbeddedSchema;
+ use Filament\Schemas\Components\Form;
+ use Filament\Schemas\Components\RenderHook;
++use Filament\Schemas\Concerns\RestrictsFileUploadsToSchemaComponents;
+ use Filament\Schemas\Schema;
+ use Filament\View\PanelsRenderHook;
+ use Illuminate\Auth\EloquentUserProvider;
+@@ -39,6 +40,7 @@ use LogicException;
+ class Register extends SimplePage
+ {
+     use CanUseDatabaseTransactions;
++    use RestrictsFileUploadsToSchemaComponents;
+     use WithRateLimiting;
+ 
+     /**
+diff --git a/packages/schemas/src/Concerns/RestrictsFileUploadsToSchemaComponents.php b/packages/schemas/src/Concerns/RestrictsFileUploadsToSchemaComponents.php
+new file mode 100644
+index 0000000000..1757d2b0a5
+--- /dev/null
++++ b/packages/schemas/src/Concerns/RestrictsFileUploadsToSchemaComponents.php
+@@ -0,0 +1,97 @@
++<?php
++
++namespace Filament\Schemas\Concerns;
++
++use Filament\Forms\Components\BaseFileUpload;
++use Filament\Forms\Components\Concerns\HasFileAttachments;
++use Filament\Forms\Components\Field;
++use Filament\Schemas\Components\Component;
++use Filament\Schemas\Schema;
++use Livewire\WithFileUploads;
++
++trait RestrictsFileUploadsToSchemaComponents
++{
++    use WithFileUploads {
++        WithFileUploads::_startUpload as private baseStartUpload;
++        WithFileUploads::_finishUpload as private baseFinishUpload;
++    }
++
++    /**
++     * @param  string  $name
++     * @param  array<mixed>  $fileInfo
++     * @param  bool  $isMultiple
++     */
++    public function _startUpload($name, $fileInfo, $isMultiple): void
++    {
++        abort_unless($this->isFileUploadForSchemaComponent($name), 403);
++
++        $this->baseStartUpload($name, $fileInfo, $isMultiple);
++    }
++
++    /**
++     * @param  string  $name
++     * @param  array<string>  $tmpPath
++     * @param  bool  $isMultiple
++     * @param  bool  $append
++     */
++    public function _finishUpload($name, $tmpPath, $isMultiple, $append = false): void
++    {
++        abort_unless($this->isFileUploadForSchemaComponent($name), 403);
++
++        $this->baseFinishUpload($name, $tmpPath, $isMultiple, $append);
++    }
++
++    protected function isFileUploadForSchemaComponent(string $name): bool
++    {
++        if (str_starts_with($name, 'componentFileAttachments.')) {
++            $name = substr($name, strlen('componentFileAttachments.'));
++        }
++
++        $component = $this->getSchemaComponentForFileUpload($name);
++
++        if ($component !== null) {
++            return true;
++        }
++
++        $lastDotPosition = strrpos($name, '.');
++
++        if ($lastDotPosition === false) {
++            return false;
++        }
++
++        return $this->getSchemaComponentForFileUpload(substr($name, 0, $lastDotPosition)) !== null;
++    }
++
++    protected function getSchemaComponentForFileUpload(string $statePath): ?Component
++    {
++        foreach ($this->getCachedSchemas() as $schema) {
++            if (! $schema instanceof Schema) {
++                continue;
++            }
++
++            foreach ($schema->getFlatComponents() as $component) {
++                if (! $component instanceof Field) {
++                    continue;
++                }
++
++                if ($component->getStatePath() !== $statePath) {
++                    continue;
++                }
++
++                if ($component instanceof BaseFileUpload) {
++                    return $component;
++                }
++
++                if (
++                    in_array(HasFileAttachments::class, class_uses_recursive($component), strict: true) &&
++                    method_exists($component, 'hasFileAttachments') &&
++                    $component->hasFileAttachments()
++                ) {
++                    return $component;
++                }
++            }
++        }
++
++        return null;
++    }
++}
