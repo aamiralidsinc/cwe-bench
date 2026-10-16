@@ -108,3 +108,75 @@ plaintext USERAUTH_REQUEST/EXT_INFO injected after the KEXDH reply and before th
 still processed (the window the real attacks use). The tests inject only before KEXINIT. Adding a
 test now would turn an observed solve into a failure after the fact; the lead did not add it and
 left the decision to the user. The task is rejected either way (MiMo solved at 96 min).
+
+## 2026-10-16 test repair 2: mid-exchange injection window (user-approved)
+Applied to both `asyncssh` and `asyncssh-inv`. The tests are byte-identical (`diff -r tasks/asyncssh/tests tasks/asyncssh-inv/tests`
+is empty), and so are the check patches (`diff -r build/asyncssh/checks build/asyncssh-inv/checks` is empty).
+
+**Item.** This comes from the post-run audit of asyncssh DeepSeek r12
+(`asyncssh-deepseek-r12-20261016-072037-n001/asyncssh__UcLi2Lk/postmortem-20261016T122746Z/verdict.json`;
+lenient test). The four injection tests sent their packet before KEXINIT only. A guard keyed on
+the endpoint's own `_session_id` therefore passed them. That id is set in `send_newkeys`, when the
+endpoint sends its own NEWKEYS, and `_kex`/`_kex_complete` change at the same point. Such a guard
+still processes a plaintext packet that arrives after the KEX reply and before the peer's NEWKEYS.
+**Decision: fix.** Both wordings support it. The original says "while the initial key exchange is
+still in progress ... never act on these packets before the secure channel is established; it should
+drop the connection". The -inv wording says "until the initial key exchange has completed ... must
+drop the connection promptly". No instruction change.
+
+**New tests** (`tests/security/test_message_injection.py`; security count 12 -> 16):
+`test_server_rejects_mid_kex_userauth`, `test_server_rejects_mid_kex_ext_info`,
+`test_client_rejects_mid_kex_ext_info` and `test_client_rejects_mid_kex_userauth_success`. They use
+the same raw-socket peer approach. The peer runs a real curve25519-sha256 / ssh-ed25519 /
+aes128-ctr / hmac-sha2-256 key exchange, using `cryptography` only and no product helpers. As the
+client it does not verify anything. As the server it computes the exchange hash and signs it, so
+the asyncssh client accepts the reply (`known_hosts=None`). The peer waits until the endpoint has
+sent NEWKEYS, then injects one plaintext packet in place of its own NEWKEYS. The only pass
+condition is that the endpoint closes the connection (EOF) within 3 s. A DISCONNECT cannot be
+parsed here because it is already encrypted, and any refusal ends in a close, so EOF covers every
+refusal the instruction allows. A peer-side handshake failure is reported as "no key exchange",
+which counts as a fail, so a broken peer cannot pass.
+
+**New patch check:** `handshake_session_id_gate.patch` (`security_fail`). It is
+`handshake_reported_types_only` with that patch's guard replaced by r12's guard:
+`not self._session_id and pkttype not in (transport/kex types)`. It fails exactly the 4 mid-kex
+tests and passes the 4 early ones.
+
+**Local pre-check** (CPython 3.11, vulnerable commit plus each patch): vulnerable 8/8 injection
+tests fail ('vulnerable', so the key exchange really completed). The reference passes 16/16 and
+the alt_correct_fix passes 16/16. All existing checks behave as declared. Three independent model
+fixes, all keyed on `_recv_encryption`, pass 16/16 (asyncssh mimo-r11, asyncssh-inv deepseek-r11,
+asyncssh-inv mimo-r11). That is evidence that a correct fix passes.
+
+**Gates** (run one at a time via `build/slot.py 3 -- python3 -I builder/gate.py`):
+- asyncssh: **PASSED** (11:08-11:19 local). nop 16 security fail / 5 functional; oracle 1.0 twice.
+  Patch checks: subset 0.8125, disable_feature 0.0, alt_correct 1.0, eq_zero 0.9375,
+  open_only 0.9375, scp_leading 0.875, handshake_reported_types 0.75, username_leading 0.9375,
+  handshake_session_id_gate 0.75 (the 4 mid-kex tests).
+- asyncssh-inv: **PASSED** (11:19-11:29 local) with identical numbers.
+- Warnings only: no `hardening`/`blind` pass patches (pre-strict task).
+
+**Regrade.** This covers every trial of both slugs that has `final-code/changes.patch` and a current
+reward of 1.0. No test was relaxed, so runs below 1.0 were not regraded.
+
+| trial | model | old | new | failing tests |
+|---|---|---|---|---|
+| asyncssh-deepseek-r12-20261016-072037-n001/asyncssh__UcLi2Lk | deepseek-flash | 1.0 | 0.75 | test_server_rejects_mid_kex_userauth, test_server_rejects_mid_kex_ext_info, test_client_rejects_mid_kex_ext_info, test_client_rejects_mid_kex_userauth_success |
+| asyncssh-mimo-r11-20261015-194029-n001/asyncssh__iEYziJe | mimo-v2.6-pro | 1.0 | 1.0 | - |
+| asyncssh-inv-deepseek-r11-20261016-072906-n001/asyncssh-inv__hUqyukY | deepseek-flash | 1.0 | 1.0 | - |
+| asyncssh-inv-mimo-r11-20261016-072906-n001/asyncssh-inv__PL2YpyL | mimo-v2.6-pro | 1.0 | 1.0 | - |
+
+The new regrade dirs are `regrade-20261016T151928Z`, `T151946Z`, `T152940Z` and `T152946Z`.
+Unchanged from before: asyncssh deepseek-r11 stays at 0.9167 (regrade 055525Z) and was not
+regraded. Not regradable (no final-code): asyncssh deepseek-r1 n001/n002 and mimo-r1
+040706/050806/102205.
+
+**The r12 drop is a real defect.** Its `connection.py` hunk at `_recv_packet` rejects non-kex
+packets only `while not self._session_id`. The vulnerable `send_newkeys` sets `_session_id` (and
+clears `_kex`) when the endpoint sends its own NEWKEYS. From then on, a plaintext
+USERAUTH_REQUEST or EXT_INFO from the peer, sent before the peer's NEWKEYS, takes the old dispatch
+path: the server handles the auth request, and the client handles EXT_INFO / USERAUTH_SUCCESS (the
+latter is answered with UNIMPLEMENTED). Nothing drops the connection, so the endpoint acts on
+unprotected packets during the initial key exchange, which is the window the real attacks use. This
+supersedes the "not applied" note above: the audit's lenient-test finding is now closed. The r12
+1.0 is no longer a clean solve; it scores 0.75.
