@@ -212,6 +212,12 @@ def _record_failures(cfg: Config, env_dir: Path, ids: list[str]) -> None:
                 knowledge.record_outcome(cfg, osv_id, STAGE, "rejected_safeguards_flagged", why)
                 log.warning("Retired: safeguards flagged the session", extra={"osv_id": osv_id})
                 continue
+            if (d / "generation_unsuitable.txt").is_file():
+                why = "unsuitable: " + (d / "generation_unsuitable.txt").read_text().strip()[:200]
+                state.mark(STAGE, osv_id, Status.REJECTED, why)
+                knowledge.record_outcome(cfg, osv_id, STAGE, "rejected_unsuitable", why)
+                log.warning("Retired: unsuitable candidate", extra={"osv_id": osv_id, "why": why})
+                continue
             refused = refusals(d)
             rejected = sorted(d.glob("generation_rejected_*.txt"), key=lambda p: p.stat().st_mtime)
             last = rejected[-1].read_text(errors="replace").splitlines()[0][:200] if rejected else "no valid output"

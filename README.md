@@ -10,6 +10,9 @@ it in every attempt (pass@3 = 0):
 A failure counts only if the task is sound (it passes the rubric and validation) and the deterministic trial analysis
 attributes the failure to the model, not to a task defect.
 
+> **Start here:** [docs/PIPELINE.md](docs/PIPELINE.md) (pipeline on one page) and
+> [docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md) (why the models fail).
+>
 > **Results:** see **[C_RESULTS.md](C_RESULTS.md)**, rebuilt automatically after every evaluation. It has every
 > evaluated task with its final verdict, which task type broke which model, and per-attempt failure details.
 
@@ -18,18 +21,20 @@ attributes the failure to the model, not to a task defect.
 ## Contents
 
 1. [Results so far](#results-so-far)
-2. [How the pipeline works](#how-the-pipeline-works)
-3. [How a task is graded](#how-a-task-is-graded-and-why-it-cannot-be-gamed)
-4. [The learning loop](#the-learning-loop-knowledge-base)
-5. [Repository structure](#repository-structure)
-6. [Requirements](#requirements)
-7. [Installation](#installation)
-8. [Running the pipeline](#running-the-pipeline)
-9. [Configuration](#configuration-env)
-10. [Outputs](#outputs-where-to-look)
-11. [Rules and policies](#rules-and-policies)
-12. [Troubleshooting](#troubleshooting)
-13. [What is not in git](#what-is-not-in-git)
+2. [Documentation (per stage)](#documentation-per-stage)
+3. [How the pipeline works](#how-the-pipeline-works)
+4. [Task generation rules](#task-generation-rules)
+5. [How a task is graded](#how-a-task-is-graded-and-why-it-cannot-be-gamed)
+6. [The learning loop](#the-learning-loop-knowledge-base)
+7. [Repository structure](#repository-structure)
+8. [Requirements](#requirements)
+9. [Installation](#installation)
+10. [Running the pipeline](#running-the-pipeline)
+11. [Configuration](#configuration-env)
+12. [Outputs](#outputs-where-to-look)
+13. [Rules and policies](#rules-and-policies)
+14. [Troubleshooting](#troubleshooting)
+15. [What is not in git](#what-is-not-in-git)
 
 ---
 
@@ -72,6 +77,26 @@ What we have learned about the two models (details in
 
 ---
 
+## Documentation (per stage)
+
+Detailed, code-referenced documentation for each stage is in [`docs/`](docs/README.md): what it reads and writes, the
+exact rules and thresholds, configuration, and a code map.
+
+| Doc | Covers |
+|---|---|
+| **[docs/PIPELINE.md](docs/PIPELINE.md)** | **The whole pipeline on one page: every stage, the rules that make a task good, the guarantees (2-minute read)** |
+| **[docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md)** | **Deep analysis of the tasks the models failed: attempt-by-attempt results, task dossiers, why the models failed, which vulnerability types to target, recommendations, client FAQ** |
+| [docs/README.md](docs/README.md) | Overview, end-to-end flow, data layout and paths |
+| [01 - Mining](docs/01-mining.md) | Advisory sources (OSV, GHSA, huntr), fix-commit resolution, dedupe, where data is stored |
+| [02 - Screening](docs/02-screening.md) | Rejection rules, date cutoff, repo limits, candidate scoring |
+| [03 - Task builder](docs/03-task-builder.md) | Candidate selection and learned ranking, build check, generation prompt, output validators, fallback and safety handling |
+| [04 - Validation](docs/04-validation.md) | Rubric, recall probe, isolation audit and image scan, oracle and pre-patch runs, existing tests, check patches |
+| [05 - Evaluation](docs/05-evaluation.md) | Harbor and the Claude Code agent, task image, network isolation, separate grader, scoring, verdict and attribution |
+| [06 - Packaging](docs/06-packaging.md) | Final Harbor task layout, `task.toml` metadata, output paths, running a packaged task |
+| [07 - Knowledge loop](docs/07-knowledge-loop.md) | Results report, failure map, failure analyses, technique scoreboard, what the generator reads |
+
+---
+
 ## How the pipeline works
 
 ```
@@ -106,6 +131,75 @@ Stage 4 accepts a task only if it passes all of these:
 
 Each stage can run on its own. A task moves forward only when the previous stage marked it done, and the state lives
 in `data/pipeline_state.sqlite3`.
+
+## Task generation rules
+
+Every generated task must satisfy these rules. Most are enforced by code: the generator's output validators, stage 4
+checks and the rubric. The rest are instructions in the generation prompt and the technique guide. Details:
+[docs/03-task-builder.md](docs/03-task-builder.md) and [docs/04-validation.md](docs/04-validation.md).
+
+**What a task is**
+
+1. **A real vulnerability in a real repo.** A mined advisory whose fix was committed after `PUBLISHED_AFTER`, with the
+   repo pinned at the vulnerable commit and the historical fix as the oracle. No synthetic snippets, no
+   dependency-bump or config-only fixes, no unreachable code.
+2. **Three artifacts from the generator:** the report (`instruction.md`), the hidden tests (`hidden_tests.py`) and
+   three check patches (shallow, removal, alternative).
+
+**The report (`instruction.md`)**
+
+3. Behaviour only: the impact and how the issue is triggered, as a user or researcher would file it, in 150-400
+   words.
+4. No localisation: no changed file names, no module, function or class names the fix touches, no line numbers, no
+   hint of where or how to fix it. A validator rejects names of changed files and edited identifiers.
+5. No fix prescription. The expected behaviour may state only the security property and the legitimate behaviour that
+   must keep working.
+6. Written in the generator's own words: no advisory phrases, no CVE or GHSA id, and no description of the hidden
+   variants.
+
+**The hidden tests (`hidden_tests.py`)**
+
+7. Naming and counts: at least 3 `test_security_*` tests (fail on the vulnerable code, pass after a fix) and at least
+   3 `test_functional_*` tests (pass on both). No `skip`, `skipif`, `xfail` or `importorskip`.
+8. They go through a real entry point (public API, HTTP route, CLI, exported function), never the internal helper the
+   fix edits.
+9. They are implementation-agnostic. They observe only what a caller can see, never import or assert anything the fix
+   adds, never assert exact error text, and accept any reasonable way of blocking the attack.
+10. They include variants beyond the report that share the same root cause, one test per variant: another entry
+    point, encoding, casing, nested input, round-trip or repeated call. A fix that closes only some variants still
+    fails.
+11. Functional tests sit close to the attack boundary, so a fix that over-blocks or removes the feature fails.
+12. Fairness:
+    - the reference fix passes every test;
+    - no test requires a number the report does not state;
+    - variants share the reported root cause;
+    - "must keep working" behaviour already works on the vulnerable code.
+13. They are deterministic and offline: no network, no timing races, no randomness. They use harmless sentinel
+    values.
+
+**Proof that the tests tell good fixes from bad ones** (run in stage 4)
+
+14. The reference fix scores 1.0 twice, and the vulnerable code fails every security test.
+15. The **shallow** patch (blocks only the reported trigger) still fails a security test. The **removal** patch
+    (disables the feature) fails a functional test. The **alternative** patch (a correct fix of a different design)
+    scores 1.0.
+16. The repo's existing tests of the affected code pass before and after the fix and are enforced in grading.
+
+**Design techniques that make the models fail** (curated in
+[`skills/task_design_techniques.md`](skills/task_design_techniques.md); live break rates in
+[`technique_scoreboard.md`](data/knowledge/technique_scoreboard.md))
+
+17. An unnamed sibling path to the same root cause, a parallel implementation of the same feature, a second public
+    API, input-shape variants at each sink, a "must keep working" clause that argues against the fix,
+    already-protected-looking code nearby, a fix across a layer boundary, and big multi-file fixes.
+18. The generator records which techniques each task applies. The scoreboard and the automatic failure analyses feed
+    back into the next round.
+
+**Safety**
+
+19. If the primary model (Opus 5.5) declines, generation of that candidate continues on the fallback model (Opus
+    4.8). If Anthropic's safeguards flag a session, the candidate is retired with no retry and no fallback, and its
+    repo is not tried again.
 
 ## How a task is graded (and why it cannot be gamed)
 
