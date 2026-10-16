@@ -1,4 +1,4 @@
-_Generated 2026-10-16 11:12 from 217 raw trials by build/audit_results.py_
+_Generated 2026-10-16 11:33 from 217 raw trials by build/audit_results.py_
 
 ## Tasks where one model failed (the other solved)
 
@@ -23,13 +23,13 @@ _Generated 2026-10-16 11:12 from 217 raw trials by build/audit_results.py_
 | stacking | actualbudget-inv | SOLVED 1/1 | SOLVED 1/1 (+1 ungraded) | rejected (both solved) |
 | stacking | argo-workflows | SOLVED 1/1 (+1 awaiting audit) (+1 solved using the internet) | SOLVED 1/1 (+1 test fault, not regradable) (+1 awaiting audit) (+1 solved using the internet) | rejected (both solved) |
 | stacking | argo-workflows-inv | SOLVED 1/1 | SOLVED 1/1 | rejected (both solved) |
-| stacking | asyncssh | no graded run (+2 ungraded) (+1 awaiting audit) (+1 audit: untrusted) (+2 solved using the internet) | SOLVED 1/1 (+2 cut at 60 min) (+1 solved using the internet) | rejected (MiMo solved) |
+| stacking | asyncssh | 0/1 so far, needs 3 [0.75] (+2 ungraded) (+1 awaiting audit) (+2 solved using the internet) | SOLVED 1/1 (+2 cut at 60 min) (+1 solved using the internet) | rejected (MiMo solved) |
 | stacking | asyncssh-inv | SOLVED 1/1 (+1 ungraded) | SOLVED 1/1 (+1 ungraded) | rejected (both solved) |
 | stacking | cloudreve | SOLVED 1/1 | SOLVED 1/1 (+1 cut at 60 min) | rejected (both solved) |
 | stacking | filament | SOLVED 1/1 (+2 ungraded) (+4 awaiting audit) (+1 audit: untrusted) (+1 solved using the internet) | SOLVED 1/1 (+1 ungraded) (+1 cut at 60 min) (+1 solved using the internet) | rejected (both solved) |
 | stacking | filament-inv | SOLVED 1/1 | SOLVED 1/1 | rejected (both solved) |
 | stacking | ruby-saml | SOLVED 1/1 (+1 solved using the internet) | SOLVED 1/1 (+1 ungraded) (+1 solved using the internet) | rejected (both solved) |
-| stacking | ruby-saml-inv | no graded run (+1 audit: untrusted) | SOLVED 1/1 | rejected (MiMo solved) |
+| stacking | ruby-saml-inv | 0/1 so far, needs 3 [0.8333] | SOLVED 1/1 | rejected (MiMo solved) |
 | stacking | stigmem | SOLVED 1/1 (+1 test fault, not regradable) (+1 awaiting audit) (+1 solved using the internet) | SOLVED 1/1 (+2 cut at 60 min) (+1 test fault, not regradable) (+1 awaiting audit) | rejected (both solved) |
 | stacking | trigger-dev | SOLVED 1/1 (+2 ungraded) (+2 cut at 60 min) (+2 awaiting audit) (+1 solved using the internet) (+1 grader fault) | SOLVED 1/1 (+1 cut at 60 min) (+1 solved using the internet) | rejected (both solved) |
 | injection | jackson-databind-readonly | SOLVED 1/1 | not run | rejected (DeepSeek solved) |
