@@ -38,6 +38,6 @@ the current setup fails, and not by moving them to another model, another sessio
 | File | Contents |
 |---|---|
 | `BLOCKED.md` | This notice |
-| `history-handoff-2026-10-16.md` | The handoff conversation's text (stopped replies are not in it) |
+| `history-handoff-2026-10-16.md` | The handoff conversation's text (stopped replies are not in it). **Local only, not in the repo** (it is a copy of a Claude Code transcript) |
 | `decision-record.md` | What was dropped or narrowed after the stops, and why |
 | `assessment-2026-10-16.md` | The assessment: misclassification, or reduced quality? |
