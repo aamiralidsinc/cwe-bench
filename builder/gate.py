@@ -135,6 +135,9 @@ def wait_for_disk():
 def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     """Run one Harbor trial and return {'reward', 'security', 'functional'}."""
     wait_for_disk()
+    # Kept trial containers leave networks behind and Docker's ~31 address pools run out
+    # ("all predefined address pools have been fully subnetted"); prune unused ones first.
+    subprocess.run(["docker", "network", "prune", "-f"], capture_output=True)
     for attempt in (1, 2):
         name = f"{task_dir.name}-{label}-{int(time.time())}"
         cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),

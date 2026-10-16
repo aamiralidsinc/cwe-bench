@@ -1,0 +1,304 @@
+diff -ruN a/src/main/java/com/fasterxml/jackson/databind/BeanDescription.java b/src/main/java/com/fasterxml/jackson/databind/BeanDescription.java
+--- a/src/main/java/com/fasterxml/jackson/databind/BeanDescription.java	2026-06-26 20:20:40
++++ b/src/main/java/com/fasterxml/jackson/databind/BeanDescription.java	2026-10-16 10:13:57
+@@ -101,6 +101,17 @@
+     public abstract Set<String> getIgnoredPropertyNames();
+ 
+     /**
++     * Accessor for names of properties that are declared read-only (see
++     * {@link com.fasterxml.jackson.annotation.JsonProperty.Access#READ_ONLY})
++     * and are thereby not to be deserialized at all.
++     *
++     * @since 2.18.9
++     */
++    public Set<String> getReadOnlyPropertyNames() {
++        return Collections.emptySet();
++    }
++
++    /**
+      * Method for locating all back-reference properties (setters, fields) bean has
+      *
+      * @since 2.9
+diff -ruN a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java	2026-06-26 20:20:40
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java	2026-10-16 10:13:52
+@@ -565,6 +565,19 @@
+                 }
+             }
+         }
++        // Read-only properties must never be passed via Creator either: if they
++        // were not added as ignorable above (due to "any setter"), need to make
++        // sure matching Creator properties are not populated from input
++        if (hasCreatorProps && (anySetter != null)) {
++            Set<String> readOnly = beanDesc.getReadOnlyPropertyNames();
++            if ((readOnly != null) && !readOnly.isEmpty()) {
++                for (SettableBeanProperty cp : creatorProps) {
++                    if ((cp != null) && readOnly.contains(cp.getName())) {
++                        cp.markAsIgnorable();
++                    }
++                }
++            }
++        }
+         final boolean useGettersAsSetters = ctxt.isEnabled(MapperFeature.USE_GETTERS_AS_SETTERS)
+                 && ctxt.isEnabled(MapperFeature.AUTO_DETECT_GETTERS);
+ 
+diff -ruN a/src/main/java/com/fasterxml/jackson/databind/introspect/BasicBeanDescription.java b/src/main/java/com/fasterxml/jackson/databind/introspect/BasicBeanDescription.java
+--- a/src/main/java/com/fasterxml/jackson/databind/introspect/BasicBeanDescription.java	2026-06-26 20:20:40
++++ b/src/main/java/com/fasterxml/jackson/databind/introspect/BasicBeanDescription.java	2026-10-16 10:13:44
+@@ -249,6 +249,16 @@
+     }
+ 
+     @Override
++    public Set<String> getReadOnlyPropertyNames() {
++        Set<String> ro = (_propCollector == null) ? null
++                : _propCollector.getReadOnlyPropertyNames();
++        if (ro == null) {
++            return Collections.emptySet();
++        }
++        return ro;
++    }
++
++    @Override
+     public Set<String> getIgnoredPropertyNames() {
+         Set<String> ign = (_propCollector == null) ? null
+                 : _propCollector.getIgnoredPropertyNames();
+diff -ruN a/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java b/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java
+--- a/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java	2026-06-26 20:20:40
++++ b/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java	2026-10-16 10:19:20
+@@ -145,6 +145,16 @@
+     protected HashSet<String> _ignoredPropertyNames;
+ 
+     /**
++     * Lazily collected set of (final) names of properties that were declared
++     * read-only and therefore removed altogether from the set of properties
++     * to deserialize; only updated when collecting information for
++     * deserialization purposes
++     *
++     * @since 2.18.9
++     */
++    protected HashSet<String> _readOnlyPropertyNames;
++
++    /**
+      * Lazily collected list of members that were annotated to
+      * indicate that they represent mutators for deserializer
+      * value injection.
+@@ -499,6 +509,14 @@
+             _renameWithWrappers(props);
+         }
+ 
++        // Read-only properties must not be modifiable via deserialization in any
++        // way: now that their final names are known, drop them (including getters
++        // that could otherwise be used as "setterless" mutators) and mark names
++        // as ignorable
++        if (!_forSerialization) {
++            _removeReadOnlyProperties(props);
++        }
++
+         // well, almost last: there's still ordering...
+         _sortProperties(props);
+         _properties = props;
+@@ -1348,6 +1366,68 @@
+             //    addition of ignorals wrt explicit name
+             prop.removeNonVisible(inferMutators, _forSerialization ? null : this);
+         }
++    }
++
++    /**
++     * Method called (for deserialization only) to remove properties declared
++     * read-only, after all renaming has been applied. Such properties only
++     * retain getters at this point; and since getters may be used as mutators
++     * (for merging, or for Collection/Map-valued "setterless" properties) they
++     * must be removed as well. Names of removed properties are added as
++     * ignorable so that matching input is quietly skipped.
++     *
++     * @since 2.18.9
++     */
++    protected void _removeReadOnlyProperties(Map<String, POJOPropertyBuilder> props)
++    {
++        Iterator<POJOPropertyBuilder> it = props.values().iterator();
++        while (it.hasNext()) {
++            POJOPropertyBuilder prop = it.next();
++            if (!prop.isReadOnlyForDeserialization()) {
++                continue;
++            }
++            // If merged with a separately declared writable property that shares
++            // the name (has its own setter, field or creator parameter), leave as is:
++            // those mutators take precedence over getters
++            if (prop.hasNonGetterMutator()) {
++                continue;
++            }
++            it.remove();
++            final String name = prop.getName();
++            _collectIgnorals(name);
++            // Keep track of external names of the read-only property: explicit name(s)
++            // if any (and the final name, if renamed); otherwise final (implicit) name
++            if (_readOnlyPropertyNames == null) {
++                _readOnlyPropertyNames = new HashSet<>();
++            }
++            Collection<PropertyName> explNames = prop.findExplicitNames();
++            if (explNames.isEmpty() || (name == null)
++                    || !name.equals(prop.getInternalName())) {
++                if (name != null) {
++                    _readOnlyPropertyNames.add(name);
++                }
++            }
++            for (PropertyName pn : explNames) {
++                _readOnlyPropertyNames.add(pn.getSimpleName());
++            }
++            // and aliases, if any, need to be quietly ignored as well (unless
++            // used as the name of another, writable property)
++            for (String alias : prop.getReadOnlyAliases()) {
++                if (!props.containsKey(alias)) {
++                    _collectIgnorals(alias);
++                }
++            }
++        }
++    }
++
++    /**
++     * Accessor for names of properties declared read-only, that are not
++     * to be deserialized at all (only collected for deserialization).
++     *
++     * @since 2.18.9
++     */
++    public Set<String> getReadOnlyPropertyNames() {
++        return _readOnlyPropertyNames;
+     }
+ 
+     /**
+diff -ruN a/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.java b/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.java
+--- a/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.java	2026-06-26 20:20:40
++++ b/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.java	2026-10-16 10:19:11
+@@ -69,6 +69,25 @@
+      */
+     protected transient AnnotationIntrospector.ReferenceProperty _referenceInfo;
+ 
++    /**
++     * Marker set (for deserialization only) when this property has been
++     * declared read-only ({@link JsonProperty.Access#READ_ONLY}): such a
++     * property must not be modified by deserialization in any way, including
++     * via "setterless" (getter-based) access used for merging or for
++     * Collection/Map-valued properties.
++     *
++     * @since 2.18.9
++     */
++    protected boolean _readOnly;
++
++    /**
++     * Aliases (see {@code JsonAlias}) declared on accessors of a read-only property,
++     * collected before mutators are removed; used to ignore matching input.
++     *
++     * @since 2.18.9
++     */
++    protected Set<String> _readOnlyAliases;
++
+     public POJOPropertyBuilder(MapperConfig<?> config, AnnotationIntrospector ai,
+             boolean forSerialization, PropertyName internalName) {
+         this(config, ai, forSerialization, internalName, internalName);
+@@ -96,6 +115,8 @@
+         _getters = src._getters;
+         _setters = src._setters;
+         _forSerialization = src._forSerialization;
++        _readOnly = src._readOnly;
++        _readOnlyAliases = src._readOnlyAliases;
+     }
+ 
+     /*
+@@ -892,6 +913,13 @@
+         _ctorParameters = merge(_ctorParameters, src._ctorParameters);
+         _getters= merge(_getters, src._getters);
+         _setters = merge(_setters, src._setters);
++        _readOnly |= src._readOnly;
++        if (src._readOnlyAliases != null) {
++            if (_readOnlyAliases == null) {
++                _readOnlyAliases = new LinkedHashSet<>();
++            }
++            _readOnlyAliases.addAll(src._readOnlyAliases);
++        }
+     }
+ 
+     private static <T> Linked<T> merge(Linked<T> chain1, Linked<T> chain2)
+@@ -955,11 +983,18 @@
+                     parent._collectIgnorals(pn.getSimpleName());
+                 }
+             }
++            if (!_forSerialization) {
++                _readOnlyAliases = _collectAliases();
++            }
+             // Remove setters, creators for sure, but fields too if deserializing
+             _setters = null;
+             _ctorParameters = null;
+             if (!_forSerialization) {
+                 _fields = null;
++                // Getters must not be usable as mutators either (merging, or
++                // "setterless" Collection/Map handling): remember the status so
++                // that they can be dropped once naming has been resolved
++                _readOnly = true;
+             }
+             break;
+         case READ_WRITE:
+@@ -986,6 +1021,55 @@
+     }
+ 
+     /**
++     * Accessor for checking whether this property was declared read-only
++     * (only tracked when collecting properties for deserialization).
++     *
++     * @since 2.18.9
++     */
++    public boolean isReadOnlyForDeserialization() {
++        return _readOnly && !_forSerialization;
++    }
++
++    /**
++     * Accessor for aliases declared for a read-only property (if any).
++     *
++     * @since 2.18.9
++     */
++    protected Set<String> getReadOnlyAliases() {
++        return (_readOnlyAliases == null) ? Collections.<String>emptySet() : _readOnlyAliases;
++    }
++
++    private Set<String> _collectAliases() {
++        Set<String> result = null;
++        for (Linked<?> l : Arrays.asList(_fields, _getters, _setters, _ctorParameters)) {
++            for (Linked<?> node = l; node != null; node = node.next) {
++                List<PropertyName> aliases = _annotationIntrospector.findPropertyAliases(
++                        (AnnotatedMember) node.value);
++                if (aliases != null) {
++                    for (PropertyName pn : aliases) {
++                        if (result == null) {
++                            result = new LinkedHashSet<>();
++                        }
++                        result.add(pn.getSimpleName());
++                    }
++                }
++            }
++        }
++        return result;
++    }
++
++    /**
++     * Accessor for checking whether this property has any accessor that
++     * could be used to mutate it, other than a getter (setter, field
++     * or constructor parameter).
++     *
++     * @since 2.18.9
++     */
++    protected boolean hasNonGetterMutator() {
++        return (_setters != null) || (_fields != null) || (_ctorParameters != null);
++    }
++
++    /**
+      * Mutator that will simply drop any constructor parameters property may have.
+      *
+      * @since 2.5
+@@ -1290,6 +1374,8 @@
+             if (prop == null) {
+                 prop = new POJOPropertyBuilder(_config, _annotationIntrospector, _forSerialization,
+                         _internalName, name);
++                prop._readOnly = _readOnly;
++                prop._readOnlyAliases = _readOnlyAliases;
+                 props.put(name, prop);
+             }
+             // ultra-clumsy, part 2 -- lambdas would be nice here

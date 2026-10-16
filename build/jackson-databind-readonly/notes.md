@@ -140,3 +140,4 @@ ConstructorProperties, plus all of deser/merge, deser/filter and deser/creators.
 - oracle: PASSED.
 - patches: PASSED (all 10 checks matched their expectation).
 - End: 14:05Z.
+- 14:21Z (lead): trials started in parallel with the full strict gate; results count only if that gate run prints PASSED.
