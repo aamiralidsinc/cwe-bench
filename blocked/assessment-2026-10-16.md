@@ -35,6 +35,6 @@ way around the safety check, only spread out over time. If a stop seems mistaken
 feedback button on the stopped message, which reports it to Anthropic. See `BLOCKED.md`.
 
 ## What was offered and recorded instead
-- The raw history: `history-handoff-2026-10-16.md` (source:
+- The raw history: `history-handoff-2026-10-16.md`, kept local only, not pushed (source:
   `~/.claude/projects/-Users-dev-terminal-bench/56a308da-f54d-46af-a1cc-33027d74fd72.jsonl`).
 - A short decision record, with no mechanism detail: `decision-record.md`.
