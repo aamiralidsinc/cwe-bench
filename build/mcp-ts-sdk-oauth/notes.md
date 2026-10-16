@@ -95,3 +95,6 @@ A second blind attempt was deliberately not run (re-running until one passes wou
 check). Decision for the user: (a) drop the base-producer tests and keep the two new traps
 (the task then leans on traps 1-2 only), (b) state that applications reload saved credentials with
 the SDK's own schemas (likely makes it easy for DeepSeek), or (c) shelve.
+
+## 2026-10-16 SHELVED (user decision)
+Not to be trialled. Hadi original task remains a DeepSeek-only result.
