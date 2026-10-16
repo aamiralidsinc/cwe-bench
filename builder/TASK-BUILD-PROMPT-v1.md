@@ -136,12 +136,14 @@ fix cannot find is unfair: remove it.
 **Pattern B rules:**
 - Confirm each route with a behavioural test on the pinned copy before relying on it. The
   screener's claim is only a lead.
-- Write one row per route to `{{PROJECT_ROOT}}/build/audit/uncovered-routes.tsv`, creating the file
-  with this header if it is missing. Columns:
+- Append one row per route to `{{PROJECT_ROOT}}/build/audit/uncovered-routes.tsv`, using its existing
+  header. Columns:
   - `task`, `repo`, `advisory`;
-  - `route` (one line: the protection, the route, file:line);
+  - `trap_ref` (the manifest trap id only; no mechanism text, since the manifest holds the detail);
+  - `real_upstream`;
   - `present_in_latest` (`yes`, `no` or `unknown`, from a read-only look at current upstream code if
     you can reach it);
+  - `public_upstream_report`, `in_current_scope`, `built`, `note`;
   - `disclosure_status` (`pending client decision`).
 
 ## Environment (`tasks/{{SLUG}}/environment/Dockerfile`)
