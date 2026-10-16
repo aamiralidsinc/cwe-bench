@@ -153,6 +153,13 @@ def one_run(model, task_dir, idx):
             rec["cause"] = f"session-ended-early-no-result at {wall}s (cut/dropped/gave-up; NOT a timeout)"
         else:
             rec["cause"] = f"hit-agent-timeout (~{wall}s) and verifier produced no reward"
+    # A session cut by an API/network error (terminal_reason "api_error") is not a result even if the
+    # verifier graded the unfinished code (2026-10-16 13:51 UTC DNS outage cut 5 runs at once).
+    if rec["reward"] is not None and rec["reward"] != 1.0 and agent_log.is_file() and \
+            '"terminal_reason":"api_error"' in agent_log.read_text(errors="replace")[-20000:]:
+        rec["graded_reward_ignored"] = rec["reward"]
+        rec["reward"] = None
+        rec["cause"] = "api-error-cut (session cut by an API/network error; not a result, retried)"
     rec.update(extract_detail(trial))
     rec["trial_dir"] = str(trial)
     rec.update(keep_or_release(trial, task_dir.name, model, name, rec.get("reward")))

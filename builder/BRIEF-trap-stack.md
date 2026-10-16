@@ -51,6 +51,15 @@ verbs, other protocols, other role/direction, anything the instruction names. Do
 9. Record in `build/SLUG/notes.md`: start/end UTC, each trap (`manifest.traps`: shape, file:line,
    covering tests, why it is realistic), what you verified, and what you could not.
 
+## Lesson from marshmallow-readonly-sib (2026-10-16)
+DeepSeek solved it in 10 minutes and found every trap within 2 minutes of starting: the whole
+nesting logic is a few hundred lines in two files, so the ignored route sat right next to the code
+the report leads to. The same class-A shape beat DeepSeek 6/6 on jackson-databind, where the ignored
+route (`SettableAnyProperty`) is far from the view-handling code in a very large codebase, and its
+absence reads as design. Require **distance**: the ignored route must live in a different file or
+package from where the report's example lands, in a codebase large enough that reading everything
+is not the natural first move. Small libraries are poor hosts for class A.
+
 ## Report back (under 400 words)
 Gate stage results; the traps with one line each; the new instruction's word count; every
 unverified guess; any fairness concern you see yourself.

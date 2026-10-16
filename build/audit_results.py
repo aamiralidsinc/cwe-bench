@@ -97,7 +97,11 @@ def read_trial(trial):
     else:
         note = ""
     env = agent.get("env") or {}
-    return {"task": task, "model": agent.get("model_name", ""), "start_utc": (res.get("started_at") or "")[:16],
+    # A session ended by an API/network error (Claude Code terminal_reason "api_error", e.g. the local
+    # DNS outage of 2026-10-16 13:51 UTC) was cut off, not finished: its grade measures unfinished code.
+    log = trial / "agent" / "claude-code.txt"
+    api_cut = bool(ex) and log.is_file() and '"terminal_reason":"api_error"' in log.read_text(errors="replace")[-20000:]
+    return {"task": task, "api_cut": api_cut, "model": agent.get("model_name", ""), "start_utc": (res.get("started_at") or "")[:16],
             "limit_sec": int(env.get("CWE_AGENT_LIMIT_SEC", PRE_LIMIT_SEC)),
             "timed_out": ex.get("exception_type") == "AgentTimeoutError",
             "reward": reward, "security": frac("security"), "functional": frac("functional"),
@@ -222,7 +226,8 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     defects = task_defects()
     leaked_task = [r for r in runs if r["task"] in defects
                    and (not defects[r["task"]][0] or (r.get("start_utc") or "") < defects[r["task"]][0])]
-    stopped = [r for r in runs if excluded.get((r["job"], r["trial"])) == "provider-stop"]
+    stopped = [r for r in runs if excluded.get((r["job"], r["trial"])) == "provider-stop"
+               or (r.get("api_cut") and r["reward"] != 1.0)]
     runs = [r for r in runs if r not in fault and r not in stopped and r not in leaked_task]
     # Runs that used leaked hidden tests prove nothing about the model: excluded.
     leaked = [r for r in runs if (r["job"], r["trial"]) in tainted]

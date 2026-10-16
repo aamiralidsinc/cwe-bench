@@ -209,8 +209,9 @@ instructions turn a task into a checklist. Write instead:
   ("directly", "only via"); never name or paraphrase an injected sibling's mechanism;
 - the standard constraints block (fix the attack and close variants; keep legitimate use; do not
   modify or add tests; do not look up the upstream fix; do not special-case the example).
-Experiment in progress: `tasks/*-inv` are round-1 tasks with only the instruction rewritten this
-way (results in `research/instruction-experiment.md`).
+Experiment (2026-10-16, `research/instruction-experiment.md`): rewriting 7 round-1 instructions
+this way did not make any of them fail (every finished run still solved). Keep this style as
+hygiene (no fix hints, closer to CWE-bench); difficulty must come from 3j.
 
 ### 3j. Trap stacking for injected tasks (round 2)
 Difficulty comes from what the task contains, not from the advisory. Plan traps from the ranked
