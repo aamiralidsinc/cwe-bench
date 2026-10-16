@@ -181,3 +181,12 @@ Written by the lead from the repair agent's work (its own note was cut off).
     The new test is fair there through that sentence plus standard expert knowledge of
     XML-signature wrapping (CVE-2024-45409), but a reviewer could argue the report scoped the
     problem to duplicate IDs. Medium risk on the original; disclose it with any verdict.
+
+## 2026-10-16 (later, lead): stray-digest test WITHDRAWN from the original ruby-saml
+Both re-audits of the original-wording regrades (DeepSeek QpqHKHG, MiMo SyFoddE) judged the new test
+a test fault (medium confidence): the original instruction scopes the attack to duplicate IDs; the
+earlier repair had declined this test for that reason; the task's own alt fix and 3 of 4 independent
+fixes failed it. Lead decision: remove the test and dupid_only_fix check from ruby-saml (kept in
+ruby-saml-inv, whose wording states the property). The two regrades and their audits are renamed
+setaside-*. Gate re-run: PASSED. The original-wording solves stand; disclose that those fixes leave
+the unique-ID stray-digest wrapping gap open.
