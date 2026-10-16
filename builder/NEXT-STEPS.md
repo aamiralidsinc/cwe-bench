@@ -3,6 +3,7 @@
 Read this first in a new conversation. Commit only to `aamiralidsinc/cwe-bench`.
 
 ## Read these, in order
+0. `blocked/BLOCKED.md`: approaches that must not be pursued, and why (2026-10-16).
 1. `plan.md`: the goal and the overall plan.
 2. `RESULTS.md`: results; the "Round 2 (2026-10-16)" section is the latest.
 3. `build/audit/ledger.md`: per-task verdicts. Regenerate with `python3 build/audit_results.py`;
