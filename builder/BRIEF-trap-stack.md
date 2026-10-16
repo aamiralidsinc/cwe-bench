@@ -70,6 +70,28 @@ ignored route must be one a reasonable engineer could argue the protection never
 unsupported combination, a neighbouring feature, a legacy path), while the stated invariant still
 covers it unambiguously. Distance helps; the reason to dismiss is the main lever.
 
+## DeepSeek shape 2: data producer off the check's path (Hadi, 2026-10-15)
+Source: Hadi's DEEPSEEK_WEAKNESS_2026-10-15.md (in Hadi/mcp-ts-sdk-oauth-issuer-confusion_deepseek.zip;
+credit him in notes). DeepSeek failed this 8/8 (3/3 on the real MCP TypeScript SDK, GHSA-6qxp-vccf-f47h),
+always missing the same tests and never breaking functionality.
+- **Shape:** the fix needs (1) the CHECK the report points at and (2) the DATA PRODUCER the check
+  depends on (schema, serializer, parser, loader, constructor), in another file or package. The
+  check does **not** call the producer: the data reaches the check on a separate path (saved and
+  reloaded, deserialized from storage, rebuilt from config). If the check calls the producer
+  directly, DeepSeek follows the call and fixes it (Hadi's Semaphore control), so verify this.
+- **Why it works:** DeepSeek follows calls INTO the check and never asks where the check's data
+  comes from. It keeps a fail-open branch ("field missing, allow") for compatibility, and it stops
+  when the repo's own tests pass (none of them exercise save and reload).
+- **Controls:** check-only broken → solved. One report sentence naming the second path → solved
+  3/3. Removing misleading comments → still failed. So the report must describe impact through
+  the check's path only and state the property abstractly ("including credentials saved
+  earlier"), never name the producer or the reload path.
+- **Avoid:** fixes where the check cannot compile without the producer change (that forces the
+  find), and hidden tests that need a field or function name the model would have to guess.
+- **MiMo solved Hadi's task** (it probes), so this shape alone is DeepSeek-only. Pair it with at
+  least two MiMo traps of different kinds (coupled visible value; unsupported-combination route;
+  merged/defaults route) as in jackson-databind-sib2.
+
 ## Report back (under 400 words)
 Gate stage results; the traps with one line each; the new instruction's word count; every
 unverified guess; any fairness concern you see yourself.
