@@ -22,6 +22,9 @@ public class ViewFeatureTest {
             "{'label':'hello','kind':'admin','asset':{'name':'foo','secret':'shh'}}");
     private static final String PUB_JSON = Model.q(
             "{'label':'hi','kind':'pub','asset':{'name':'bar'}}");
+    // Value before its sibling discriminator: equally valid JSON (member order is free).
+    private static final String ADMIN_JSON_VALUE_FIRST = Model.q(
+            "{'label':'hello','asset':{'name':'foo','secret':'shh'},'kind':'admin'}");
 
     // With AdminView the admin-only property IS bound (creator path).
     @Test
@@ -66,6 +69,19 @@ public class ViewFeatureTest {
                 .forType(BuilderContainer.class).readValue(ADMIN_JSON);
         assertNotNull(r.asset);
         assertInstanceOf(AdminAsset.class, r.asset);
+    }
+
+    // Value before discriminator: admin view still binds it (default-ctor and builder).
+    @Test
+    void adminSeesGatedPropertyValueFirst() throws Exception {
+        DefaultCtorContainer d = MAPPER.readerWithView(AdminView.class)
+                .forType(DefaultCtorContainer.class).readValue(ADMIN_JSON_VALUE_FIRST);
+        AdminAsset a = assertInstanceOf(AdminAsset.class, d.asset);
+        assertEquals("shh", a.secret);
+        BuilderContainer b = MAPPER.readerWithView(AdminView.class)
+                .forType(BuilderContainer.class).readValue(ADMIN_JSON_VALUE_FIRST);
+        AdminAsset ba = assertInstanceOf(AdminAsset.class, b.asset);
+        assertEquals("shh", ba.secret);
     }
 
     // A view never rewrites the type id: with the property visible but a field

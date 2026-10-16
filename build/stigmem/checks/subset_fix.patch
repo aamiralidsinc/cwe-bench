@@ -1,0 +1,643 @@
+diff --git a/node/migrations/038_peer_approval_flow.sql b/node/migrations/038_peer_approval_flow.sql
+new file mode 100644
+index 0000000..df05391
+--- /dev/null
++++ b/node/migrations/038_peer_approval_flow.sql
+@@ -0,0 +1,79 @@
++-- Add pending peer approval state and audit events for explicit peer activation.
++
++PRAGMA legacy_alter_table = ON;
++
++ALTER TABLE replication_cursors RENAME TO replication_cursors_old;
++ALTER TABLE peers RENAME TO peers_old;
++ALTER TABLE federation_audit RENAME TO federation_audit_old;
++
++CREATE TABLE peers (
++    id                TEXT PRIMARY KEY,
++    node_id           TEXT NOT NULL UNIQUE,
++    node_url          TEXT NOT NULL,
++    federation_pubkey TEXT NOT NULL,
++    allowed_scopes    TEXT NOT NULL,
++    status            TEXT NOT NULL CHECK(status IN (
++                        'pending_verification','pending_approval','active',
++                        'rejected','revoked','pending_tl_proof'
++                      )),
++    established_at    TEXT,
++    declaration_sig   TEXT NOT NULL,
++    signed_at         TEXT NOT NULL,
++    created_at        TEXT
++);
++
++CREATE TABLE replication_cursors (
++    peer_id    TEXT NOT NULL REFERENCES peers(id),
++    direction  TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
++    cursor     TEXT,
++    updated_at TEXT NOT NULL,
++    PRIMARY KEY (peer_id, direction)
++);
++
++CREATE TABLE federation_audit (
++    id         TEXT PRIMARY KEY,
++    peer_id    TEXT NOT NULL,
++    event_type TEXT NOT NULL CHECK(event_type IN (
++                    'rejected_fact','rejected_token','scope_violation','replay_attempt',
++                    'tl_proof_missing','tl_proof_verified','manifest_stored',
++                    'manifest_refresh_failed','san_mismatch',
++                    'peer_approved','peer_approval_failed'
++               )),
++    detail     TEXT,
++    ts         TEXT NOT NULL
++);
++
++INSERT INTO peers (
++    id,
++    node_id,
++    node_url,
++    federation_pubkey,
++    allowed_scopes,
++    status,
++    established_at,
++    declaration_sig,
++    signed_at,
++    created_at
++)
++SELECT
++    id,
++    node_id,
++    node_url,
++    federation_pubkey,
++    allowed_scopes,
++    status,
++    established_at,
++    declaration_sig,
++    signed_at,
++    created_at
++FROM peers_old;
++INSERT INTO replication_cursors SELECT * FROM replication_cursors_old;
++INSERT INTO federation_audit SELECT * FROM federation_audit_old;
++
++DROP TABLE replication_cursors_old;
++DROP TABLE peers_old;
++DROP TABLE federation_audit_old;
++
++CREATE INDEX IF NOT EXISTS idx_audit_peer_ts ON federation_audit(peer_id, ts);
++
++PRAGMA legacy_alter_table = OFF;
+diff --git a/node/src/stigmem_node/auth.py b/node/src/stigmem_node/auth.py
+index dade9ec..ec5ac0f 100644
+--- a/node/src/stigmem_node/auth.py
++++ b/node/src/stigmem_node/auth.py
+@@ -71,6 +71,22 @@ def _is_legacy_sha256_hash(stored_hash: str) -> bool:
+     return bool(_LEGACY_SHA256_HEX.fullmatch(stored_hash))
+ 
+ 
++def _legacy_sha256_allowed() -> bool:
++    deadline = settings.legacy_sha256_accept_until
++    if deadline is None:
++        return True
++    if deadline.tzinfo is None:
++        deadline = deadline.replace(tzinfo=UTC)
++    return datetime.now(UTC) <= deadline.astimezone(UTC)
++
++
++def _raise_legacy_sha256_disabled() -> None:
++    raise HTTPException(
++        status_code=status.HTTP_401_UNAUTHORIZED,
++        detail="Legacy API key hashes are no longer accepted; rotate the key.",
++    )
++
++
+ def _verify_key_hash(raw_key: str, stored_hash: str) -> bool:
+     """Verify *raw_key* against either current Argon2id or legacy SHA-256."""
+     if stored_hash.startswith("$argon2id$"):
+@@ -83,6 +99,8 @@ def _verify_key_hash(raw_key: str, stored_hash: str) -> bool:
+         except InvalidHash:
+             return False
+     if _is_legacy_sha256_hash(stored_hash):
++        if not _legacy_sha256_allowed():
++            _raise_legacy_sha256_disabled()
+         return hmac.compare_digest(stored_hash, _legacy_sha256(raw_key))
+     return False
+ 
+@@ -171,6 +189,8 @@ def _find_key_row(
+             (_legacy_sha256(raw_key),),
+         ).fetchone()
+         if legacy_row is not None and (include_expired or not _row_expired(legacy_row, now)):
++            if not _legacy_sha256_allowed():
++                _raise_legacy_sha256_disabled()
+             if rehash_legacy:
+                 _rehash_legacy_key(conn, legacy_row, raw_key)
+                 legacy_row = conn.execute(
+@@ -239,6 +259,9 @@ class Identity:
+     def can_federate(self) -> bool:
+         return self._has_capability("federate")
+ 
++    def can_admin_federation(self) -> bool:
++        return self._has_capability("admin:federation")
++
+     def can_audit(self) -> bool:
+         """True when the principal holds the audit.read capability (spec §22.3)."""
+         return self._has_capability("audit.read")
+diff --git a/node/src/stigmem_node/main.py b/node/src/stigmem_node/main.py
+index 7172b30..61644a0 100644
+--- a/node/src/stigmem_node/main.py
++++ b/node/src/stigmem_node/main.py
+@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
+ from contextlib import asynccontextmanager, suppress
+ from pathlib import Path
+ from typing import Annotated, Any, cast
++from urllib.parse import urlparse
+ 
+ import uvicorn
+ from fastapi import Depends, FastAPI, Request, Response
+@@ -62,25 +63,77 @@ def _enforce_federation_transport_security() -> None:
+             "STIGMEM_FEDERATION_INSECURE=1 only for local/dev/test federation."
+         )
+ 
++    if not _node_url_is_loopback(settings.node_url):
++        raise RuntimeError(
++            "STIGMEM_FEDERATION_INSECURE=1 is only permitted when node_url is "
++            f"bound to 127.0.0.1 or localhost. Got node_url={settings.node_url!r}. "
++            "Configure mTLS for any non-loopback deployment."
++        )
++
+     logger.warning(
+         "SECURITY WARNING: federation is running without mTLS because "
+-        "STIGMEM_FEDERATION_INSECURE=1 is set. Use this only for local/dev/test."
++        "STIGMEM_FEDERATION_INSECURE=1 is set. This is only allowed because "
++        "node_url is a loopback address. Use this only for local/dev/test."
++    )
++
++
++def _enforce_auth_required_in_production() -> None:
++    """Refuse to run unauthenticated outside loopback."""
++    if settings.auth_required:
++        return
++    if not _node_url_is_loopback(settings.node_url):
++        raise RuntimeError(
++            "STIGMEM_AUTH_REQUIRED=false is only permitted when node_url is "
++            f"bound to 127.0.0.1 or localhost. Got node_url={settings.node_url!r}. "
++            "Anonymous identity has read/write/federate permissions; never expose "
++            "this configuration to a network."
++        )
++    logger.warning(
++        "SECURITY WARNING: STIGMEM_AUTH_REQUIRED=false. Anonymous identity has "
++        "full read/write/federate permissions. This is only allowed because "
++        "node_url is a loopback address."
+     )
+ 
+ 
+-def _warn_if_rate_limit_kill_switch_enabled() -> None:
+-    """Warn when both legacy rate-limit knobs disable quota enforcement."""
++def _enforce_rate_limit_kill_switch_ack() -> None:
++    """Refuse boot when quota is fully disabled without an explicit acknowledgement."""
+     if settings.rate_limit_write_per_hour != 0 or settings.rate_limit_read_per_hour != 0:
+         return
++    if not settings.rate_limit_disabled_ack:
++        raise RuntimeError(
++            "STIGMEM_RATE_LIMIT_WRITE_PER_HOUR=0 and "
++            "STIGMEM_RATE_LIMIT_READ_PER_HOUR=0 fully disable quota enforcement. "
++            "To proceed, set STIGMEM_RATE_LIMIT_DISABLED_ACK=1 to acknowledge "
++            "that this node accepts unbounded read and write traffic."
++        )
+ 
+     logger.warning(
+-        "SECURITY WARNING: quota enforcement is disabled because "
+-        "STIGMEM_RATE_LIMIT_WRITE_PER_HOUR=0 and "
+-        "STIGMEM_RATE_LIMIT_READ_PER_HOUR=0 are both set. Use this only for "
+-        "local/dev/test."
++        "SECURITY WARNING: quota enforcement is fully disabled "
++        "(write=0, read=0) with explicit operator acknowledgment via "
++        "STIGMEM_RATE_LIMIT_DISABLED_ACK=1."
+     )
+ 
+ 
++def _warn_if_cors_dev_localhost_enabled() -> None:
++    """Log the expanded development CORS posture at startup."""
++    if settings.cors_dev_localhost:
++        logger.warning(
++            "SECURITY WARNING: STIGMEM_CORS_DEV_LOCALHOST=1 enables browser "
++            "access from localhost and loopback origins. Use this only for "
++            "local development."
++        )
++
++
++def _node_url_is_loopback(node_url: str) -> bool:
++    """Return True iff node_url's host is a loopback address."""
++    try:
++        parsed = urlparse(node_url)
++        host = (parsed.hostname or "").lower()
++    except ValueError:
++        return False
++    return host in {"localhost", "127.0.0.1", "::1"}
++
++
+ def create_app() -> FastAPI:
+     @asynccontextmanager
+     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+@@ -89,7 +142,9 @@ def create_app() -> FastAPI:
+         if settings.trust_mode == "strict" and not settings.node_private_key:
+             raise RuntimeError("STIGMEM_NODE_PRIVATE_KEY must be set when trust_mode=strict")
+         _enforce_federation_transport_security()
+-        _warn_if_rate_limit_kill_switch_enabled()
++        _enforce_auth_required_in_production()
++        _enforce_rate_limit_kill_switch_ack()
++        _warn_if_cors_dev_localhost_enabled()
+ 
+         discovered_plugins = register_discovered_plugins(freeze=False)
+         _include_plugin_routers(app, discovered_plugins)
+@@ -191,7 +246,7 @@ def create_app() -> FastAPI:
+             call_next: Callable[[Request], Awaitable[Response]],
+         ) -> Response:
+             """Reject plaintext federation requests when mTLS is configured (§22.1)."""
+-            if request.method == "OPTIONS":
++            if request.method == "OPTIONS" and not request.url.path.startswith("/v1/federation"):
+                 return await call_next(request)
+             if request.url.path.startswith("/v1/federation") and request.url.scheme != "https":
+                 return JSONResponse(
+diff --git a/node/src/stigmem_node/models/federation.py b/node/src/stigmem_node/models/federation.py
+index 31fbff2..cbbe634 100644
+--- a/node/src/stigmem_node/models/federation.py
++++ b/node/src/stigmem_node/models/federation.py
+@@ -40,6 +40,17 @@ class PeerRegisterResponse(BaseModel):
+     verified_at: str | None
+ 
+ 
++class PeerApprovalRequest(BaseModel):
++    pubkey_fingerprint: str = Field(..., min_length=1)
++
++
++class PeerApprovalResponse(BaseModel):
++    peer_id: str
++    node_id: str
++    status: str
++    approved_at: str
++
++
+ class FederationFactsResponse(BaseModel):
+     facts: list[FactRecord]
+     cursor: str | None
+@@ -60,4 +71,3 @@ class ConflictResolveRequest(BaseModel):
+     winning_fact_id: str | None = None
+     resolution_note: str = ""
+     new_value: FactValue | None = None
+-
+diff --git a/node/src/stigmem_node/plugins/signing.py b/node/src/stigmem_node/plugins/signing.py
+index 0baa57e..82ca2f6 100644
+--- a/node/src/stigmem_node/plugins/signing.py
++++ b/node/src/stigmem_node/plugins/signing.py
+@@ -9,6 +9,8 @@ from typing import Any
+ from .discovery import DiscoveredPlugin
+ from .errors import PluginSignatureError
+ 
++_UNSIGNED_PLUGIN_ACK = "i-understand-plugins-are-unsigned"
++
+ 
+ def _parse_identity_set(raw: str) -> frozenset[str]:
+     return frozenset(identity.strip() for identity in raw.split(",") if identity.strip())
+@@ -51,6 +53,14 @@ PluginSignatureVerifier = Callable[[DiscoveredPlugin], PluginSigningInfo]
+ 
+ def allow_unsigned_development_override(plugin: DiscoveredPlugin) -> PluginSigningInfo:
+     """Return explicit development override metadata for an unsigned plugin."""
++    from stigmem_node.settings import settings
++
++    if settings.plugin_unsigned_ack != _UNSIGNED_PLUGIN_ACK:
++        raise RuntimeError(
++            "STIGMEM_PLUGIN_SIGNING_REQUIRED=false requires "
++            "STIGMEM_PLUGIN_UNSIGNED_ACK='i-understand-plugins-are-unsigned' "
++            "to confirm the operator accepts unsigned-plugin code execution risk."
++        )
+ 
+     return PluginSigningInfo(
+         signing_identity=plugin.signing_identity,
+diff --git a/node/src/stigmem_node/routes/_federation_impl.py b/node/src/stigmem_node/routes/_federation_impl.py
+index 003d3ce..1a17fd8 100644
+--- a/node/src/stigmem_node/routes/_federation_impl.py
++++ b/node/src/stigmem_node/routes/_federation_impl.py
+@@ -13,6 +13,7 @@ bodies rather than binding them at import time.
+ from __future__ import annotations
+ 
+ import contextlib
++import hashlib
+ import json
+ import logging
+ import uuid
+@@ -31,6 +32,7 @@ from ..identity.manifest import ManifestError, manifest_from_dict, verify_manife
+ from ..identity.transparency_log import LogEntry, TransparencyLogUnavailable, make_transparency_log
+ from ..identity.trust_store import get_peer_manifest, store_peer_manifest
+ from ..models.federation import (
++    PeerApprovalResponse,
+     PeerRegisterRequest,
+     PeerRegisterResponse,
+ )
+@@ -44,6 +46,11 @@ from ..plugins import Deny, TenantContext, get_registry
+ logger = logging.getLogger("stigmem.federation")
+ 
+ 
++def peer_pubkey_fingerprint(pubkey: str) -> str:
++    """Return the operator-verifiable fingerprint for a pinned peer public key."""
++    return f"sha256:{hashlib.sha256(pubkey.encode()).hexdigest()}"
++
++
+ def _make_federation_client() -> httpx.AsyncClient:
+     from . import federation as _fed_mod
+ 
+@@ -129,8 +136,7 @@ async def register_peer_impl(
+             "signed_at": req.signed_at,
+         }
+         if verify_declaration_sig(signed_fields, req.declaration_sig, fetched_pubkey):
+-            final_status = "active"
+-            verified_at = datetime.now(UTC).isoformat()
++            final_status = "pending_approval"
+ 
+     with db() as conn:
+         conn.execute(
+@@ -138,13 +144,73 @@ async def register_peer_impl(
+             (final_status, verified_at, peer_id),
+         )
+ 
+-    # §19.2.3 — TL inclusion proof check runs after response to avoid blocking registration
+-    if final_status == "active":
+-        background_tasks.add_task(_check_tl_inclusion_for_peer, req.node_id, req.node_url, peer_id)
+-
+     return PeerRegisterResponse(peer_id=peer_id, status=final_status, verified_at=verified_at)
+ 
+ 
++def approve_peer_impl(
++    peer_id: str,
++    pubkey_fingerprint: str,
++    background_tasks: BackgroundTasks,
++    identity: Identity,
++) -> PeerApprovalResponse:
++    """Approve a verified peer after operator out-of-band key confirmation."""
++    if not identity.can_admin_federation():
++        raise HTTPException(status_code=403, detail="admin:federation required")
++
++    now = datetime.now(UTC).isoformat()
++    fingerprint_mismatch_peer: dict[str, Any] | None = None
++    with db() as conn:
++        peer = conn.execute("SELECT * FROM peers WHERE id = ?", (peer_id,)).fetchone()
++        if peer is None:
++            raise HTTPException(status_code=404, detail="peer not found")
++        if peer["status"] != "pending_approval":
++            raise HTTPException(
++                status_code=409,
++                detail=f"peer is not pending approval (status={peer['status']})",
++            )
++
++        expected = peer_pubkey_fingerprint(peer["federation_pubkey"])
++        if pubkey_fingerprint != expected:
++            fingerprint_mismatch_peer = dict(peer)
++        else:
++            fingerprint_mismatch_peer = None
++
++            conn.execute(
++                "UPDATE peers SET status = 'active', established_at = ? WHERE id = ?",
++                (now, peer["id"]),
++            )
++
++    if fingerprint_mismatch_peer is not None:
++        from . import federation as _fed_mod
++
++        _fed_mod.write_audit_log(
++            fingerprint_mismatch_peer["id"],
++            "peer_approval_failed",
++            {"node_id": fingerprint_mismatch_peer["node_id"], "reason": "fingerprint_mismatch"},
++        )
++        raise HTTPException(status_code=400, detail="fingerprint mismatch")
++
++    from . import federation as _fed_mod
++
++    _fed_mod.write_audit_log(
++        peer_id,
++        "peer_approved",
++        {"node_id": peer["node_id"], "approved_by": identity.entity_uri},
++    )
++    background_tasks.add_task(
++        _check_tl_inclusion_for_peer,
++        peer["node_id"],
++        peer["node_url"],
++        peer_id,
++    )
++    return PeerApprovalResponse(
++        peer_id=peer_id,
++        node_id=peer["node_id"],
++        status="active",
++        approved_at=now,
++    )
++
++
+ async def _check_tl_inclusion_for_peer(node_id: str, node_url: str, peer_id: str) -> None:
+     """Check TL inclusion proof for a newly registered peer (§19.2.3).
+ 
+@@ -340,16 +406,14 @@ def _ingest_revocation(payload: dict[str, Any], fed_settings: Any) -> dict[str,
+     except Exception as exc:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+ 
+-    if fed_settings.trust_mode != "off":
+-        # F-2 fix: verify revocation signature before applying.
+-        _verify_signed_artifact_or_400(
+-            record=rev,
+-            key_id=rev.key_id or "",
+-            artifact_label="revocation",
+-            missing_manifest_detail="no manifest for revocation signer",
+-            signer_uri=rev.signed_by,
+-            verifier=verify_revocation_signature,
+-        )
++    _verify_signed_artifact_or_400(
++        record=rev,
++        key_id=rev.key_id or "",
++        artifact_label="revocation",
++        missing_manifest_detail="no manifest for revocation signer",
++        signer_uri=rev.signed_by,
++        verifier=verify_revocation_signature,
++    )
+ 
+     apply_inbound_revocation(rev)
+     return {"status": "ok", "type": "revocation"}
+@@ -365,17 +429,15 @@ def _ingest_tombstone(payload: dict[str, Any], fed_settings: Any) -> dict[str, A
+     except Exception as exc:
+         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+ 
+-    if fed_settings.trust_mode != "off":
+-        # §23.4.2.1 — fail-closed signature verification.
+-        _verify_signed_artifact_or_400(
+-            record=record,
+-            key_id=record.key_id or "",
+-            artifact_label="tombstone",
+-            missing_manifest_detail="no manifest for signer",
+-            signer_uri=record.signed_by,
+-            verifier=verify_tombstone_signature,
+-            on_failure=_emit_tombstone_verification_failed,
+-        )
++    _verify_signed_artifact_or_400(
++        record=record,
++        key_id=record.key_id or "",
++        artifact_label="tombstone",
++        missing_manifest_detail="no manifest for signer",
++        signer_uri=record.signed_by,
++        verifier=verify_tombstone_signature,
++        on_failure=_emit_tombstone_verification_failed,
++    )
+ 
+     written = apply_inbound_tombstone(record)
+     return {"status": "ok", "written": written}
+diff --git a/node/src/stigmem_node/routes/federation/__init__.py b/node/src/stigmem_node/routes/federation/__init__.py
+index 2fef171..5eca15b 100644
+--- a/node/src/stigmem_node/routes/federation/__init__.py
++++ b/node/src/stigmem_node/routes/federation/__init__.py
+@@ -20,7 +20,7 @@ from .common import (  # noqa: F401
+     logger,
+     router,
+ )
+-from .peers import list_peers, register_peer  # noqa: F401
++from .peers import approve_peer, list_peers, register_peer  # noqa: F401
+ from .replication import (  # noqa: F401
+     _push_fact_with_cap_token,
+     _push_fact_with_peer_token,
+@@ -41,6 +41,7 @@ __all__ = [
+     "_try_peer_token_auth",
+     "_verify_push_cap_token",
+     "get_audit_log",
++    "approve_peer",
+     "ingest_fact",
+     "list_conflicts",
+     "list_peers",
+diff --git a/node/src/stigmem_node/routes/federation/common.py b/node/src/stigmem_node/routes/federation/common.py
+index e24397f..29431e8 100644
+--- a/node/src/stigmem_node/routes/federation/common.py
++++ b/node/src/stigmem_node/routes/federation/common.py
+@@ -85,15 +85,23 @@ def _require_peer_token(
+ 
+     with db() as conn:
+         peer_row = conn.execute(
+-            "SELECT * FROM peers WHERE node_id = ? AND status = 'active'",
++            "SELECT * FROM peers WHERE node_id = ?",
+             (iss,),
+         ).fetchone()
+ 
+     if peer_row is None:
+         _public_module().write_audit_log(
+-            iss, "rejected_token", {"reason": "peer_not_found_or_inactive", "iss": iss}
++            iss, "rejected_token", {"reason": "peer_not_found", "iss": iss}
+         )
+-        raise HTTPException(status_code=401, detail="peer not registered or not active")
++        raise HTTPException(status_code=401, detail="peer not registered")
++
++    if peer_row["status"] != "active":
++        _public_module().write_audit_log(
++            peer_row["id"],
++            "rejected_token",
++            {"reason": "peer_not_approved", "iss": iss, "status": peer_row["status"]},
++        )
++        raise HTTPException(status_code=401, detail="peer_not_approved")
+ 
+     peer = dict(peer_row)
+ 
+@@ -161,11 +169,11 @@ def _try_peer_token_auth(
+     iss = unverified.get("iss", "")
+     with db() as conn:
+         peer_row = conn.execute(
+-            "SELECT * FROM peers WHERE node_id = ? AND status = 'active'",
++            "SELECT * FROM peers WHERE node_id = ?",
+             (iss,),
+         ).fetchone()
+ 
+-    if peer_row is None:
++    if peer_row is None or peer_row["status"] != "active":
+         return None
+ 
+     peer = dict(peer_row)
+diff --git a/node/src/stigmem_node/routes/federation/peers.py b/node/src/stigmem_node/routes/federation/peers.py
+index 1ee0fcc..82ef275 100644
+--- a/node/src/stigmem_node/routes/federation/peers.py
++++ b/node/src/stigmem_node/routes/federation/peers.py
+@@ -9,8 +9,13 @@ from fastapi import BackgroundTasks, Depends, HTTPException, status
+ 
+ from ...auth import Identity, resolve_identity
+ from ...db import db
+-from ...models.federation import PeerRegisterRequest, PeerRegisterResponse
+-from .._federation_impl import register_peer_impl
++from ...models.federation import (
++    PeerApprovalRequest,
++    PeerApprovalResponse,
++    PeerRegisterRequest,
++    PeerRegisterResponse,
++)
++from .._federation_impl import approve_peer_impl, register_peer_impl
+ from .common import router
+ 
+ 
+@@ -33,6 +38,20 @@ async def register_peer(
+     return await register_peer_impl(req, background_tasks, identity)
+ 
+ 
++@router.post(
++    "/v1/federation/peers/{peer_id}/approve",
++    response_model=PeerApprovalResponse,
++)
++def approve_peer(
++    peer_id: str,
++    req: PeerApprovalRequest,
++    background_tasks: BackgroundTasks,
++    identity: Annotated[Identity, Depends(resolve_identity)],
++) -> PeerApprovalResponse:
++    """Approve a pending peer after out-of-band public-key confirmation."""
++    return approve_peer_impl(peer_id, req.pubkey_fingerprint, background_tasks, identity)
++
++
+ # ---------------------------------------------------------------------------
+ # GET /v1/federation/peers — list peers (§5.7)
+ # ---------------------------------------------------------------------------
+diff --git a/node/src/stigmem_node/settings.py b/node/src/stigmem_node/settings.py
+index 98df10e..1276eda 100644
+--- a/node/src/stigmem_node/settings.py
++++ b/node/src/stigmem_node/settings.py
+@@ -1,3 +1,4 @@
++from datetime import datetime
+ from typing import Annotated
+ 
+ from pydantic import field_validator, model_validator
+@@ -31,6 +32,7 @@ class Settings(BaseSettings):
+     # Static API-key lifecycle controls. 0 disables max-age enforcement.
+     api_key_max_age_days: int = 90
+     api_key_expiring_soon_days: int = 30
++    legacy_sha256_accept_until: datetime | None = None
+ 
+     @field_validator("cors_allowed_origins", mode="before")
+     @classmethod
+@@ -58,6 +60,8 @@ class Settings(BaseSettings):
+     # Nonce window: how long (seconds) a nonce is kept to detect replays
+     # (spec §6.6, default 5 min).
+     federation_nonce_window_s: int = 300
++    # Clock-skew leeway for peer-token exp/iat/nbf claim checks.
++    peer_token_leeway_s: int = 30
+     # Maximum accepted remote HLC skew for federated fact ingest. Future skew is
+     # strict by default because it can advance local logical time; past skew is a
+     # wider archival bound and may be set to 0 for one-off historical backfills.
+@@ -89,6 +93,8 @@ class Settings(BaseSettings):
+     oidc_audience: str = ""
+     # lifetime of issued API keys in hours (default 8 h working-day session)
+     oidc_token_ttl_hours: int = 8
++    # Accepted OIDC id_token signing algorithms. Operators can narrow this list.
++    oidc_id_token_algorithms: list[str] = ["RS256", "ES256", "PS256", "EdDSA"]
+     # comma-separated list of allowed email domains; empty = allow any
+     oidc_allowed_domains: str = ""
+ 
+@@ -105,6 +111,7 @@ class Settings(BaseSettings):
+     # 0 = disabled.
+     rate_limit_write_per_hour: int = 1000
+     rate_limit_read_per_hour: int = 5000
++    rate_limit_disabled_ack: bool = False
+ 
+     # Storage backend (Phase 8 / 11).
+     # "sqlite"   (default) — local SQLite file at db_path.
+@@ -184,6 +191,8 @@ class Settings(BaseSettings):
+     # before registration. Set false only for local development; unsigned plugin
+     # loading remains warning- and audit-visible.
+     plugin_signing_required: bool = True
++    # Required literal acknowledgement before unsigned-plugin loading is allowed.
++    plugin_unsigned_ack: str = ""
+     # Comma-separated Sigstore signing identities accepted for production plugin
+     # registration when plugin_signing_required=true.
+     plugin_trusted_publishers: str = ""

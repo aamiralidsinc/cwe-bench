@@ -31,8 +31,10 @@ RUN go build -o /usr/local/bin/rclone . \
 
 # The out-of-tree test harness: a standalone Go module that drives the real
 # `rclone serve s3` process over HTTP as an S3 client would (no rclone internals
-# are called). Pre-download its deps and pre-compile the test binaries so a
-# verifier run builds nothing from the network.
+# are called). Only its module files and STUBS go into the image: the stubs
+# import what the real files import, so this layer pre-downloads and pre-compiles
+# every dependency. The hidden tests are copied in from /tests by tests/test.sh at
+# grading time (the agent shares this container and could read tests baked in here).
 COPY harness /opt/harness
 RUN cd /opt/harness \
     && go mod download \

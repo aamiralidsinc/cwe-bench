@@ -12,7 +12,7 @@ WORKDIR /app
 # Fetch the repository at the vulnerable commit, then drop its git history so
 # the later (fixed) history is not present in the image.
 ARG REPO_URL=https://github.com/pylons/webob
-ARG COMMIT=54c1133c79e48940776a272f4500530e1cc3232a
+ARG COMMIT=b240857958df492ef71bb00fb4b5365ecd92480a
 RUN git init -q . \
     && git fetch -q --depth 1 "${REPO_URL}.git" "${COMMIT}" \
     && git checkout -q FETCH_HEAD \

@@ -1,0 +1,69 @@
+diff --git a/russh/src/cipher/mod.rs b/russh/src/cipher/mod.rs
+index 7250d60..508c265 100644
+--- a/russh/src/cipher/mod.rs
++++ b/russh/src/cipher/mod.rs
+@@ -314,6 +314,14 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
+                 return Err(Error::PacketSize(len));
+             }
+ 
++            // A valid packet_length can never be shorter than the block we
++            // already read to probe it; a smaller value would shrink the
++            // buffer below `l` below and panic on the `buffer.buffer[l..]`
++            // slice. Reject it as a protocol error instead.
++            if len + PACKET_LENGTH_LEN < cipher.packet_length_to_read_for_block_length() {
++                return Err(Error::PacketSize(len));
++            }
++
+             buffer.len = len + cipher.tag_len();
+             trace!("reading, clear len = {:?}", buffer.len);
+         }
+diff --git a/russh/src/negotiation.rs b/russh/src/negotiation.rs
+index 89a279b..590745e 100644
+--- a/russh/src/negotiation.rs
++++ b/russh/src/negotiation.rs
+@@ -390,28 +390,23 @@ pub(crate) trait Select {
+ 
+         let need_mac = CIPHERS.get(&cipher).map(|x| x.needs_mac()).unwrap_or(false);
+ 
+-        let client_mac =
+-            match Self::select(&pref.mac, &NameList::decode(&mut r)?, AlgorithmKind::Mac) {
+-                Ok((_, m)) => m,
+-                Err(e) => {
+-                    if need_mac {
+-                        return Err(e);
+-                    } else {
+-                        mac::NONE
+-                    }
+-                }
+-            };
+-        let server_mac =
+-            match Self::select(&pref.mac, &NameList::decode(&mut r)?, AlgorithmKind::Mac) {
+-                Ok((_, m)) => m,
+-                Err(e) => {
+-                    if need_mac {
+-                        return Err(e);
+-                    } else {
+-                        mac::NONE
+-                    }
+-                }
+-            };
++        // Select a MAC, refusing `none` whenever the negotiated cipher needs an
++        // integrity MAC — regardless of whether `none` was a common choice or
++        // only the no-common-MAC fallback. Pairing e.g. aes*-ctr/cbc with
++        // mac=none yields a tag_len() of 0 and a panic on the read path.
++        let select_mac = |list: &[String]| match Self::select(&pref.mac, list, AlgorithmKind::Mac) {
++            Ok((_, m)) if need_mac && m == mac::NONE => Err(Error::NoCommonAlgo {
++                kind: AlgorithmKind::Mac,
++                ours: pref.mac.iter().map(|x| x.as_ref().to_owned()).collect(),
++                theirs: list.to_vec(),
++            }),
++            Ok((_, m)) => Ok(m),
++            Err(_) if !need_mac => Ok(mac::NONE),
++            Err(e) => Err(e),
++        };
++
++        let client_mac = select_mac(&NameList::decode(&mut r)?)?;
++        let server_mac = select_mac(&NameList::decode(&mut r)?)?;
+ 
+         // Compression
+ 

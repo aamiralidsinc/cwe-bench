@@ -5,6 +5,9 @@ use hickory_resolver::Resolver;
 use hickory_resolver::config::{ResolverConfig, ServerGroup};
 use test_support::{MockNetworkHandler, MockProvider, MockRecord};
 
+mod common;
+use common::{INSECURE_IP, SECURE_IP, World};
+
 fn plain_resolver(records: Vec<MockRecord>, resolver_ip: std::net::IpAddr) -> Resolver<MockProvider> {
     let provider = MockProvider::new(MockNetworkHandler::new(records));
     let server_group = ServerGroup { ips: &[resolver_ip], server_name: "ns.testing", path: "/dns-query" };
@@ -72,4 +75,75 @@ async fn unsigned_nodata_is_negative() {
     let r = plain_resolver(recs, ip);
     let result = r.lookup(qn, RecordType::A).await;
     assert!(result.is_err(), "nodata must be a negative answer, got {result:?}");
+}
+
+// --- validating resolver: answers that ARE legitimately resolvable -----------
+// A correctly signed answer (Secure) and an answer from a delegation that the
+// signed parent proves is unsigned (Insecure) must still resolve when
+// validation is enabled.
+
+fn v4s(addrs: impl Iterator<Item = std::net::IpAddr>) -> Vec<std::net::IpAddr> {
+    addrs.filter(|a| a.is_ipv4()).collect()
+}
+
+#[tokio::test]
+async fn validating_secure_lookup_a_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup(Name::parse("www.signed.testing.", None).unwrap(), RecordType::A)
+        .await
+        .expect("a correctly signed answer must resolve under validation");
+    let got: Vec<_> = lk.answers().iter().filter_map(|r| r.data.ip_addr()).collect();
+    assert_eq!(got, vec![std::net::IpAddr::V4(SECURE_IP)]);
+}
+
+#[tokio::test]
+async fn validating_secure_lookup_ip_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup_ip(Name::parse("www.signed.testing.", None).unwrap())
+        .await
+        .expect("a correctly signed answer must resolve via lookup_ip under validation");
+    assert_eq!(v4s(lk.iter()), vec![std::net::IpAddr::V4(SECURE_IP)]);
+}
+
+#[tokio::test]
+async fn validating_secure_txt_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup(Name::parse("txt.signed.testing.", None).unwrap(), RecordType::TXT)
+        .await
+        .expect("a correctly signed TXT answer must resolve under validation");
+    assert!(lk.answers().iter().any(|r| r.record_type() == RecordType::TXT));
+}
+
+#[tokio::test]
+async fn validating_secure_cname_chain_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup_ip(Name::parse("alias.signed.testing.", None).unwrap())
+        .await
+        .expect("a correctly signed CNAME to a signed name must resolve under validation");
+    assert_eq!(v4s(lk.iter()), vec![std::net::IpAddr::V4(SECURE_IP)]);
+}
+
+#[tokio::test]
+async fn validating_insecure_lookup_a_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup(Name::parse("www.unsigned.testing.", None).unwrap(), RecordType::A)
+        .await
+        .expect("an answer from a provably unsigned zone must resolve under validation");
+    let got: Vec<_> = lk.answers().iter().filter_map(|r| r.data.ip_addr()).collect();
+    assert_eq!(got, vec![std::net::IpAddr::V4(INSECURE_IP)]);
+}
+
+#[tokio::test]
+async fn validating_insecure_lookup_ip_succeeds() {
+    let r = World::new().resolver();
+    let lk = r
+        .lookup_ip(Name::parse("www.unsigned.testing.", None).unwrap())
+        .await
+        .expect("an answer from a provably unsigned zone must resolve via lookup_ip under validation");
+    assert_eq!(v4s(lk.iter()), vec![std::net::IpAddr::V4(INSECURE_IP)]);
 }

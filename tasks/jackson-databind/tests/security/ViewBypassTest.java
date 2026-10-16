@@ -20,6 +20,11 @@ public class ViewBypassTest {
     private static final String JSON = Model.q(
             "{'label':'hello','kind':'admin','asset':{'name':'foo','secret':'LEAKED'}}");
 
+    // Same document with the value BEFORE its sibling discriminator: the value is
+    // buffered first and bound only once the discriminator arrives.
+    private static final String JSON_VALUE_FIRST = Model.q(
+            "{'label':'hello','asset':{'name':'foo','secret':'LEAKED'},'kind':'admin'}");
+
     // Creator (property-based @JsonCreator) path.
     @Test
     void creatorPropertyHidden() throws Exception {
@@ -45,6 +50,24 @@ public class ViewBypassTest {
                 .forType(BuilderContainer.class).readValue(JSON);
         assertEquals("hello", r.label);
         assertNull(r.asset, "admin-only 'asset' leaked under PublicView (builder path)");
+    }
+
+    // Default-constructor bean, value before discriminator (buffered binding).
+    @Test
+    void defaultCtorPropertyHiddenValueFirst() throws Exception {
+        DefaultCtorContainer r = MAPPER.readerWithView(PublicView.class)
+                .forType(DefaultCtorContainer.class).readValue(JSON_VALUE_FIRST);
+        assertEquals("hello", r.label);
+        assertNull(r.asset, "admin-only 'asset' leaked under PublicView (default-ctor path, value first)");
+    }
+
+    // Builder bean, value before discriminator (buffered binding).
+    @Test
+    void builderPropertyHiddenValueFirst() throws Exception {
+        BuilderContainer r = MAPPER.readerWithView(PublicView.class)
+                .forType(BuilderContainer.class).readValue(JSON_VALUE_FIRST);
+        assertEquals("hello", r.label);
+        assertNull(r.asset, "admin-only 'asset' leaked under PublicView (builder path, value first)");
     }
 
     // Creator path where the external type id is itself a (visible) creator

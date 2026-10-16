@@ -77,6 +77,36 @@ public class SecurityTests {
         }
     }
 
+    /**
+     * The caller names SID with a value that is not strict RFC 6265 cookie syntax (real servers issue
+     * such values), next to an ordinary pair. Whatever the client does with the unusual value, it must
+     * never send the store's SID (another user's session) in its place, because the caller named SID.
+     * Delivering the caller's header and refusing the request are both acceptable here; substituting
+     * the stored session is not. When a request does go out, the caller's ordinary pair must be in it.
+     */
+    @Test
+    void storedSessionNotSubstitutedForANamedCallerCookieWithAnUnusualValue() throws Exception {
+        for (String sid : new String[] {"user\"B", "user B"}) {
+            String header = "SID=" + sid + "; x=1";
+            try (StubServer srv = new StubServer();
+                 AsyncHttpClient c = asyncHttpClient(config())) {
+                c.prepareGet(srv.base() + "/seed").execute().get(T, TimeUnit.SECONDS); // store: SID=storeval
+                try {
+                    c.prepareGet(srv.base() + "/first").setHeader("Cookie", header)
+                            .execute().get(T, TimeUnit.SECONDS);
+                } catch (Exception refused) {
+                    // A client may refuse a header it considers malformed; the leak check below still applies.
+                }
+                for (String got : srv.cookies("/first")) {
+                    assertFalse(got.contains("storeval"),
+                            "caller set [" + header + "] but the stored session was sent: " + got);
+                    assertTrue(got.contains("x=1"),
+                            "caller set [" + header + "] but its ordinary pair was not delivered: " + got);
+                }
+            }
+        }
+    }
+
     @Test
     void multipleCallerCookieHeadersAreNotReplacedByTheStore() throws Exception {
         try (StubServer srv = new StubServer();

@@ -20,6 +20,12 @@ for env_file in "${CWE_MODELS_ENV:-}" "$HOME/.tb-graders/cwe/models.env" "$here/
   if [ -n "$env_file" ] && [ -f "$env_file" ]; then set -a; . "$env_file"; set +a; break; fi
 done
 
+# Per-run hold: build/<task>/hold_<model> stops any NEW run of that task/model from
+# starting (checked on every run, so it also stops a trial.py loop that is already
+# going, e.g. after the same runs were started in parallel by hand).
+hold="$here/../build/$(basename "$task")/hold_$model"
+if [ -f "$hold" ]; then echo "held: $hold exists; not starting a run" >&2; exit 3; fi
+
 extra=()
 case "$model" in
   deepseek)
@@ -29,6 +35,11 @@ case "$model" in
     model_id='deepseek-flash[1m]'   # served by DeepSeek-V4.1-Flash, 1M context
     effort=${EFFORT-max}
     extra+=(--ae CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432)
+    # DeepSeek-max counts reasoning toward the token budget and will think
+    # to exhaustion and return empty on hard tasks without a large cap (Task13).
+    extra+=(--ae CLAUDE_CODE_MAX_OUTPUT_TOKENS=131072)
+    extra+=(--ae CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1)
+    extra+=(--ak max_thinking_tokens=96000)
     ;;
   mimo)
     base_url=https://api.xiaomimimo.com/anthropic
@@ -40,12 +51,40 @@ case "$model" in
 esac
 [ -n "$effort" ] && extra+=(--ak "reasoning_effort=$effort")
 
+# DeepSeek-max / MiMo calls can run long; the default per-request API timeout
+# (~300s) cuts them off mid-reasoning (empty result). Task13: set >= 900s.
+extra+=(--ae API_TIMEOUT_MS=1200000)
+
+# Harbor does not record the task's agent time limit in a trial; pass it as an env
+# var so each trial's config.json carries the limit it ran under (read by
+# build/audit_results.py). Runs before 2026-10-15 have no such var: they ran at 3600 s.
+limit=$(awk '/^\[/{s=$0} s=="[agent]" && /^timeout_sec/{print int($3)}' "$task/task.toml")
+# Optional longer limit for a re-run after a timeout (user, 2026-10-16: a run that fails by hitting
+# the 2 h limit is re-run with 3 h). CWE_AGENT_TIMEOUT_MULT=1.5 -> Harbor's agent timeout x1.5,
+# and the recorded limit (CWE_AGENT_LIMIT_SEC, read by build/audit_results.py) matches it.
+mult_args=()
+if [ -n "${CWE_AGENT_TIMEOUT_MULT:-}" ]; then
+  limit=$(python3 -c "print(int($limit * $CWE_AGENT_TIMEOUT_MULT))")
+  mult_args=(--agent-timeout-multiplier "$CWE_AGENT_TIMEOUT_MULT")
+fi
+[ -n "$limit" ] && extra+=(--ae "CWE_AGENT_LIMIT_SEC=$limit")
+
+# Keep the container (stopped) after the run instead of deleting it, so the agent's
+# final code can be saved and, if grading broke, re-graded. build/trial.py saves the
+# code, then removes containers of clean solves and lists the rest for review.
+extra+=(--ek keep_containers=true)
+
+# No web tools (2026-10-16). CWE-bench agents reach only the model API. Claude Code's WebSearch
+# runs on the provider's side, inside the allowed API call, so the network allowlist cannot stop
+# it: it returned live results in the "offline" filament r11 run. Remove the tools themselves.
+extra+=(--ak "disallowed_tools=WebSearch,WebFetch")
+
 # Passed through the process environment, not --ae, so the key stays out of
 # the command line and the job's saved config.
 export ANTHROPIC_BASE_URL=$base_url ANTHROPIC_API_KEY=$key
 unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_MODEL
 
-exec harbor run -p "$task" -a claude-code -m "$model_id" -k "$attempts" \
+exec harbor run -p "$task" -a claude-code -m "$model_id" -k "$attempts" ${mult_args[@]+"${mult_args[@]}"} \
   -o "${JOBS_DIR:-$HOME/.tb-graders/cwe/jobs}" \
   --job-name "$(basename "$task")-$model-$(date +%m%d-%H%M%S)" \
   ${extra[@]+"${extra[@]}"} "$@"

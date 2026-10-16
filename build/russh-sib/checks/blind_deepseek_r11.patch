@@ -1,0 +1,676 @@
+--- a/russh/src/negotiation.rs
++++ b/russh/src/negotiation.rs
+@@ -300,6 +300,14 @@
+             &_remote_kexes_no_ext,
+             AlgorithmKind::Kex,
+         )?;
++
++        // The `none` key exchange performs no key agreement and signs (or
++        // verifies) no host key, so a session negotiated on it has no shared
++        // secret and no authenticated peer. Reject it on both sides rather
++        // than set up an unprotected session.
++        if kex_algorithm == kex::NONE {
++            return Err(Error::InsecureAlgorithm);
++        }
+ 
+         // Strict kex detection
+ 
+@@ -386,9 +394,17 @@
+             Self::select(&pref.cipher, &cipher_list, AlgorithmKind::Cipher)?;
+         String::decode(&mut r)?; // cipher server-to-client.
+ 
++        // The `none` (`clear`) cipher sends traffic in the clear and ignores
++        // the MAC, leaving the session with neither confidentiality nor
++        // integrity. Reject it whichever side proposed it.
++        let cipher_impl = CIPHERS.get(&cipher).ok_or(Error::UnknownAlgo)?;
++        if cipher_impl.is_null() {
++            return Err(Error::InsecureAlgorithm);
++        }
++
+         // MAC
+ 
+-        let need_mac = CIPHERS.get(&cipher).map(|x| x.needs_mac()).unwrap_or(false);
++        let need_mac = cipher_impl.needs_mac();
+ 
+         let client_mac =
+             match Self::select(&pref.mac, &NameList::decode(&mut r)?, AlgorithmKind::Mac) {
+@@ -412,6 +428,13 @@
+                     }
+                 }
+             };
++
++        // A cipher that is not authenticated by itself (anything but an AEAD
++        // cipher) needs a genuine MAC: the `none` MAC verifies every packet
++        // and so drops integrity altogether.
++        if need_mac && (client_mac == mac::NONE || server_mac == mac::NONE) {
++            return Err(Error::InsecureAlgorithm);
++        }
+ 
+         // Compression
+ 
+@@ -646,45 +669,66 @@
+     use super::*;
+     use crate::helpers::NameList;
+ 
+-    /// Build a minimal KEXINIT payload with custom kex and host-key
+-    /// name-lists and a `first_kex_packet_follows` flag. All other lists come
+-    /// from the default preferences so negotiation succeeds.
+-    fn build_kexinit_keys(kex_names: &[&str], key_names: &[&str], follows: bool) -> Vec<u8> {
+-        let pref = Preferred::DEFAULT;
++    /// Build a minimal KEXINIT payload with custom algorithm name-lists and a
++    /// `first_kex_packet_follows` flag. The compression lists come from the
++    /// default preferences.
++    fn build_kexinit_lists(
++        kex_names: &[&str],
++        key_names: &[&str],
++        cipher_names: &[&str],
++        mac_names: &[&str],
++        follows: bool,
++    ) -> Vec<u8> {
+         let mut buf = vec![msg::KEXINIT];
+         buf.extend_from_slice(&[0u8; 16]); // cookie
+-        let names = |v: Vec<String>| NameList(v);
+-        names(kex_names.iter().map(|s| s.to_string()).collect())
+-            .encode(&mut buf)
+-            .unwrap();
+-        names(key_names.iter().map(|s| s.to_string()).collect())
+-            .encode(&mut buf)
+-            .unwrap();
++        let enc = |buf: &mut Vec<u8>, list: &[&str]| {
++            NameList(list.iter().map(|s| s.to_string()).collect())
++                .encode(buf)
++                .unwrap();
++        };
++        enc(&mut buf, kex_names);
++        enc(&mut buf, key_names);
+         for _ in 0..2 {
+-            names(pref.cipher.iter().map(|x| x.as_ref().to_string()).collect())
+-                .encode(&mut buf)
+-                .unwrap();
++            enc(&mut buf, cipher_names);
+         }
+         for _ in 0..2 {
+-            names(pref.mac.iter().map(|x| x.as_ref().to_string()).collect())
+-                .encode(&mut buf)
+-                .unwrap();
+-        }
++            enc(&mut buf, mac_names);
++        }
++        let compression = Preferred::DEFAULT
++            .compression
++            .iter()
++            .map(|x| x.as_ref().to_string())
++            .collect::<Vec<_>>();
++        let compression = compression.iter().map(String::as_str).collect::<Vec<_>>();
+         for _ in 0..2 {
+-            names(
+-                pref.compression
+-                    .iter()
+-                    .map(|x| x.as_ref().to_string())
+-                    .collect(),
+-            )
+-            .encode(&mut buf)
+-            .unwrap();
++            enc(&mut buf, &compression);
+         }
+         Vec::<String>::new().encode(&mut buf).unwrap(); // lang c2s
+         Vec::<String>::new().encode(&mut buf).unwrap(); // lang s2c
+         (follows as u8).encode(&mut buf).unwrap();
+         0u32.encode(&mut buf).unwrap();
+         buf
++    }
++
++    /// Build a minimal KEXINIT payload with custom kex and host-key
++    /// name-lists; the cipher and MAC lists come from the default
++    /// preferences so negotiation succeeds.
++    fn build_kexinit_keys(kex_names: &[&str], key_names: &[&str], follows: bool) -> Vec<u8> {
++        let strings = |names: &[cipher::Name]| {
++            names
++                .iter()
++                .map(|x| x.as_ref().to_string())
++                .collect::<Vec<_>>()
++        };
++        let ciphers = strings(&Preferred::DEFAULT.cipher);
++        let ciphers = ciphers.iter().map(String::as_str).collect::<Vec<_>>();
++        let macs = Preferred::DEFAULT
++            .mac
++            .iter()
++            .map(|x| x.as_ref().to_string())
++            .collect::<Vec<_>>();
++        let macs = macs.iter().map(String::as_str).collect::<Vec<_>>();
++        build_kexinit_lists(kex_names, key_names, &ciphers, &macs, follows)
+     }
+ 
+     fn build_kexinit(kex_names: &[&str], follows: bool) -> Vec<u8> {
+@@ -951,4 +995,144 @@
+             vec!["rsa-sha2-512-cert-v01@openssh.com".to_string()]
+         );
+     }
+-}
++
++    fn default_key_list() -> Vec<String> {
++        Preferred::DEFAULT.key.iter().map(ToString::to_string).collect()
++    }
++
++    /// The `none` key exchange performs no key agreement and proves no host
++    /// key, so negotiation must refuse it however it is offered.
++    #[test]
++    fn none_kex_is_rejected_on_both_sides() {
++        let buf = build_kexinit(&["none"], false);
++        let pref = Preferred {
++            kex: Cow::Owned(vec![kex::NONE]),
++            ..Preferred::DEFAULT
++        };
++        assert!(matches!(
++            Server::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++            Err(Error::InsecureAlgorithm)
++        ));
++        assert!(matches!(
++            Client::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++            Err(Error::InsecureAlgorithm)
++        ));
++    }
++
++    /// The `none`/`clear` cipher leaves traffic in the clear and ignores the
++    /// MAC, so it must be refused even when a genuine MAC is offered.
++    #[test]
++    fn null_cipher_is_rejected_on_both_sides() {
++        let keys = default_key_list();
++        let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
++        for (cipher_name, cipher_pref, mac_name, mac_pref) in [
++            ("none", cipher::NONE, "none", mac::NONE),
++            ("clear", cipher::CLEAR, "none", mac::NONE),
++            ("clear", cipher::CLEAR, "hmac-sha2-256", mac::HMAC_SHA256),
++        ] {
++            let buf = build_kexinit_lists(
++                &["curve25519-sha256"],
++                &keys,
++                &[cipher_name],
++                &[mac_name],
++                false,
++            );
++            let pref = Preferred {
++                kex: Cow::Owned(vec![kex::CURVE25519]),
++                cipher: Cow::Owned(vec![cipher_pref]),
++                mac: Cow::Owned(vec![mac_pref]),
++                ..Preferred::DEFAULT
++            };
++            assert!(matches!(
++                Server::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++                Err(Error::InsecureAlgorithm)
++            ));
++            assert!(matches!(
++                Client::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++                Err(Error::InsecureAlgorithm)
++            ));
++        }
++    }
++
++    /// A cipher that relies on a MAC (CTR/CBC/3DES) must never be paired with
++    /// the `none` MAC, which authenticates nothing.
++    #[test]
++    fn mac_requiring_cipher_with_null_mac_is_rejected() {
++        let keys = default_key_list();
++        let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
++        let buf = build_kexinit_lists(
++            &["curve25519-sha256"],
++            &keys,
++            &["aes256-ctr", "aes256-cbc"],
++            &["none"],
++            false,
++        );
++        let pref = Preferred {
++            kex: Cow::Owned(vec![kex::CURVE25519]),
++            cipher: Cow::Owned(vec![cipher::AES_256_CTR, cipher::AES_256_CBC]),
++            mac: Cow::Owned(vec![mac::NONE]),
++            ..Preferred::DEFAULT
++        };
++        assert!(matches!(
++            Server::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++            Err(Error::InsecureAlgorithm)
++        ));
++        assert!(matches!(
++            Client::read_kex(&buf, &pref, None, None, &KexCause::Initial),
++            Err(Error::InsecureAlgorithm)
++        ));
++    }
++
++    /// AEAD ciphers provide their own integrity, so the `none` MAC is a valid
++    /// pairing for them and negotiation must accept it.
++    #[test]
++    fn aead_cipher_with_null_mac_is_accepted() {
++        let keys = default_key_list();
++        let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
++        let buf = build_kexinit_lists(
++            &["curve25519-sha256"],
++            &keys,
++            &["chacha20-poly1305@openssh.com"],
++            &["none"],
++            false,
++        );
++        let pref = Preferred {
++            kex: Cow::Owned(vec![kex::CURVE25519]),
++            cipher: Cow::Owned(vec![cipher::CHACHA20_POLY1305]),
++            mac: Cow::Owned(vec![mac::NONE]),
++            ..Preferred::DEFAULT
++        };
++        for names in [
++            Server::read_kex(&buf, &pref, None, None, &KexCause::Initial).unwrap(),
++            Client::read_kex(&buf, &pref, None, None, &KexCause::Initial).unwrap(),
++        ] {
++            assert_eq!(names.cipher, cipher::CHACHA20_POLY1305);
++            assert_eq!(names.client_mac, mac::NONE);
++            assert_eq!(names.server_mac, mac::NONE);
++        }
++    }
++
++    /// A non-AEAD cipher with a genuine MAC remains a valid combination.
++    #[test]
++    fn mac_requiring_cipher_with_genuine_mac_is_accepted() {
++        let keys = default_key_list();
++        let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
++        let buf = build_kexinit_lists(
++            &["curve25519-sha256"],
++            &keys,
++            &["aes256-ctr"],
++            &["hmac-sha2-256"],
++            false,
++        );
++        let pref = Preferred {
++            kex: Cow::Owned(vec![kex::CURVE25519]),
++            cipher: Cow::Owned(vec![cipher::AES_256_CTR]),
++            mac: Cow::Owned(vec![mac::HMAC_SHA256]),
++            ..Preferred::DEFAULT
++        };
++        let names = Server::read_kex(&buf, &pref, None, None, &KexCause::Initial).unwrap();
++        assert_eq!(names.cipher, cipher::AES_256_CTR);
++        assert_eq!(names.client_mac, mac::HMAC_SHA256);
++        assert_eq!(names.server_mac, mac::HMAC_SHA256);
++    }
++}
+--- a/russh/src/cipher/clear.rs
++++ b/russh/src/cipher/clear.rs
+@@ -26,6 +26,10 @@
+ impl super::Cipher for Clear {
+     fn key_len(&self) -> usize {
+         0
++    }
++
++    fn is_null(&self) -> bool {
++        true
+     }
+ 
+     fn make_opening_key(
+--- a/russh/src/cipher/mod.rs
++++ b/russh/src/cipher/mod.rs
+@@ -53,6 +53,13 @@
+ 
+ pub(crate) trait Cipher {
+     fn needs_mac(&self) -> bool {
++        false
++    }
++    /// Whether this is the `none` (`clear`) cipher, which neither encrypts
++    /// nor authenticates the traffic. Sessions negotiated on it have no
++    /// confidentiality and no integrity (the MAC, if any, is ignored), so
++    /// negotiation refuses to select it.
++    fn is_null(&self) -> bool {
+         false
+     }
+     fn key_len(&self) -> usize;
+--- a/russh/src/server/encrypted.rs
++++ b/russh/src/server/encrypted.rs
+@@ -179,8 +179,7 @@
+     use crate::tests::raw_no_crypto::{
+         MSG_SERVICE_REQUEST, MSG_USERAUTH_FAILURE, MSG_USERAUTH_REQUEST, RawSession,
+         assert_rejected, capture_panics, channel_request_payload, encode_string, pty_req_payload,
+-        raw_auth_request_signal, raw_channel_request_signal, raw_service_request_signal,
+-        read_packet, timeout,
++        raw_auth_request_signal, raw_channel_request_signal, raw_service_request_signal, timeout,
+     };
+ 
+     #[tokio::test]
+@@ -202,14 +201,14 @@
+         // Each rejected attempt gets a USERAUTH_FAILURE, up to the configured cap.
+         for _ in 0..max {
+             session.send_packet(&password_request()).await.unwrap();
+-            let reply = read_packet(&mut session.stream).await.unwrap();
++            let reply = session.recv_packet().await.unwrap();
+             assert_eq!(reply.first(), Some(&MSG_USERAUTH_FAILURE));
+         }
+ 
+         // The next attempt exceeds the cap: the server must refuse it with a
+         // DISCONNECT instead of answering with yet another failure.
+         session.send_packet(&password_request()).await.unwrap();
+-        let reply = read_packet(&mut session.stream).await.unwrap();
++        let reply = session.recv_packet().await.unwrap();
+         assert_eq!(
+             reply.first(),
+             Some(&crate::msg::DISCONNECT),
+@@ -407,7 +406,7 @@
+         encode_string(&mut payload, b"new-password");
+         stream.send_packet(&payload).await.unwrap();
+ 
+-        let failure = read_packet(&mut stream.stream).await.unwrap();
++        let failure = stream.recv_packet().await.unwrap();
+         assert_eq!(failure.first(), Some(&MSG_USERAUTH_FAILURE));
+         assert!(
+             !stream.events.lock().unwrap().contains(&"auth_password"),
+--- a/russh/src/lib_inner.rs
++++ b/russh/src/lib_inner.rs
+@@ -100,6 +100,12 @@
+         ours: Vec<String>,
+         theirs: Vec<String>,
+     },
++
++    /// Negotiation settled on a combination of algorithms that does not
++    /// protect the session (the `none` key exchange, the `none`/`clear`
++    /// cipher, or a cipher that requires a MAC without a genuine one).
++    #[error("Insecure algorithm negotiated")]
++    InsecureAlgorithm,
+ 
+     /// Invalid SSH version string.
+     #[error("invalid SSH version string")]
+--- a/russh/src/tests.rs
++++ b/russh/src/tests.rs
+@@ -758,6 +758,9 @@
+     }
+ }
+ 
++/// Raw-packet test client helpers. The module name is historical: sessions
++/// are established with a real curve25519 + ChaCha20-Poly1305 key exchange
++/// (negotiation refuses anything without cryptographic protection).
+ pub(crate) mod raw_no_crypto {
+     use std::borrow::Cow;
+     use std::io;
+@@ -765,15 +768,23 @@
+     use std::time::Duration;
+ 
+     use byteorder::{BigEndian, ByteOrder};
++    use curve25519_dalek::montgomery::MontgomeryPoint;
++    use sha2::{Digest, Sha256};
+     use ssh_key::{Algorithm, PrivateKey};
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
+     use super::*;
++    use crate::cipher::{self, OpeningKey};
++    use crate::kex::{self, SharedSecret};
++    use crate::mac;
++    use crate::sshbuffer::{PacketWriter, SSHBuffer};
+ 
+     pub(crate) const MSG_SERVICE_REQUEST: u8 = 5;
+     pub(crate) const MSG_SERVICE_ACCEPT: u8 = 6;
+     pub(crate) const MSG_KEXINIT: u8 = 20;
+     pub(crate) const MSG_NEWKEYS: u8 = 21;
++    pub(crate) const MSG_KEX_ECDH_INIT: u8 = 30;
++    pub(crate) const MSG_KEX_ECDH_REPLY: u8 = 31;
+     pub(crate) const MSG_USERAUTH_REQUEST: u8 = 50;
+     pub(crate) const MSG_USERAUTH_FAILURE: u8 = 51;
+     pub(crate) const MSG_USERAUTH_SUCCESS: u8 = 52;
+@@ -829,17 +840,22 @@
+         pub(crate) events: Arc<Mutex<Vec<&'static str>>>,
+         pub(crate) stream: tokio::net::TcpStream,
+         pub(crate) server_task: tokio::task::JoinHandle<Result<(), Error>>,
++        server_id: Vec<u8>,
++        server_kex_init: Vec<u8>,
++        read_buffer: SSHBuffer,
++        opener: Box<dyn OpeningKey + Send>,
++        writer: PacketWriter,
+     }
+ 
+     impl RawSession {
+         pub(crate) async fn connect() -> Self {
+-            let mut stream = Self::connect_without_kex().await;
+-            raw_client_no_crypto_kex(&mut stream.stream).await.unwrap();
+-            stream
++            let mut session = Self::connect_without_kex().await;
++            session.client_kex().await.unwrap();
++            session
+         }
+ 
+         pub(crate) async fn connect_without_kex() -> Self {
+-            Self::connect_without_kex_with_config(no_crypto_server_config()).await
++            Self::connect_without_kex_with_config(raw_test_server_config()).await
+         }
+ 
+         pub(crate) async fn connect_without_kex_with_config(
+@@ -865,13 +881,86 @@
+ 
+             let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+             stream.write_all(b"SSH-2.0-russh-test\r\n").await.unwrap();
+-            read_ssh_id(&mut stream).await.unwrap();
+-            let _server_kex = read_packet(&mut stream).await.unwrap();
++            let server_id = read_ssh_id(&mut stream).await.unwrap();
++            let mut read_buffer = SSHBuffer::new();
++            let mut opener: Box<dyn OpeningKey + Send> = Box::new(cipher::clear::Key {});
++            let n = cipher::read(&mut stream, &mut read_buffer, &mut *opener)
++                .await
++                .unwrap();
++            let server_kex_init = read_buffer.buffer[5..n].to_vec();
+             Self {
+                 events,
+                 stream,
+                 server_task,
+-            }
++                server_id,
++                server_kex_init,
++                read_buffer,
++                opener,
++                writer: PacketWriter::clear(),
++            }
++        }
++
++        /// Establish an ordinary encrypted session (curve25519 key exchange,
++        /// ChaCha20-Poly1305), so that the tests can then drive the server
++        /// with raw packets on top of it.
++        async fn client_kex(&mut self) -> io::Result<()> {
++            let client_kex_init = secure_kexinit_payload();
++            self.send_packet(&client_kex_init).await?;
++
++            let client_secret = rand::random::<[u8; 32]>();
++            let client_pubkey = MontgomeryPoint::mul_base_clamped(client_secret);
++
++            let mut init = vec![MSG_KEX_ECDH_INIT];
++            encode_string(&mut init, &client_pubkey.0);
++            self.send_packet(&init).await?;
++
++            let reply = self.recv_packet().await?;
++            assert_eq!(reply.first(), Some(&MSG_KEX_ECDH_REPLY));
++            let mut pos = 1;
++            let host_key = decode_string(&reply, &mut pos);
++            let server_pubkey = decode_string(&reply, &mut pos);
++            let _signature = decode_string(&reply, &mut pos);
++
++            let mut point = [0u8; 32];
++            point.copy_from_slice(&server_pubkey);
++            let shared = MontgomeryPoint(point).mul_clamped(client_secret);
++
++            // Exchange hash: H = hash(string V_C || string V_S || string I_C
++            // || string I_S || string K_S || string Q_C || string Q_S
++            // || mpint K). Identification strings are hashed without their
++            // line terminators.
++            let mut buf = Vec::new();
++            encode_string(&mut buf, b"SSH-2.0-russh-test");
++            encode_string(&mut buf, self.server_id.trim_ascii_end());
++            encode_string(&mut buf, &client_kex_init);
++            encode_string(&mut buf, &self.server_kex_init);
++            encode_string(&mut buf, &host_key);
++            encode_string(&mut buf, &client_pubkey.0);
++            encode_string(&mut buf, &server_pubkey);
++            kex::encode_mpint(&shared.0, &mut buf).unwrap();
++            let exchange_hash = Sha256::digest(&buf).to_vec();
++
++            let shared_secret = SharedSecret::from_mpint(&shared.0).unwrap();
++            let keys = kex::compute_keys::<Sha256>(
++                Some(&shared_secret),
++                &exchange_hash,
++                &exchange_hash,
++                cipher::CHACHA20_POLY1305,
++                mac::NONE,
++                mac::NONE,
++                false,
++            )
++            .unwrap();
++
++            // The NEWKEYS packets themselves still travel under the clear
++            // keys; the negotiated keys take over for every packet after
++            // them (sequence numbers keep counting).
++            let newkeys = self.recv_packet().await?;
++            assert_eq!(newkeys.first(), Some(&MSG_NEWKEYS));
++            self.send_packet(&[MSG_NEWKEYS]).await?;
++            self.opener = keys.remote_to_local;
++            self.writer.set_cipher(keys.local_to_remote);
++            Ok(())
+         }
+ 
+         pub(crate) async fn service_request(&mut self) -> io::Result<()> {
+@@ -880,7 +969,7 @@
+             encode_string(&mut service, b"ssh-userauth");
+             self.send_packet(&service).await?;
+ 
+-            let accept = read_packet(&mut self.stream).await?;
++            let accept = self.recv_packet().await?;
+             assert_eq!(accept.first(), Some(&MSG_SERVICE_ACCEPT));
+             Ok(())
+         }
+@@ -895,7 +984,7 @@
+             encode_string(&mut auth, b"none");
+             self.send_packet(&auth).await?;
+ 
+-            let success = read_packet(&mut self.stream).await?;
++            let success = self.recv_packet().await?;
+             assert_eq!(success.first(), Some(&MSG_USERAUTH_SUCCESS));
+             Ok(())
+         }
+@@ -909,14 +998,24 @@
+             push_u32(&mut open, 32 * 1024);
+             self.send_packet(&open).await?;
+ 
+-            let confirmation = read_packet(&mut self.stream).await?;
++            let confirmation = self.recv_packet().await?;
+             assert_eq!(confirmation.first(), Some(&MSG_CHANNEL_OPEN_CONFIRMATION));
+             Ok(BigEndian::read_u32(&confirmation[5..9]))
+         }
+ 
+         pub(crate) async fn send_packet(&mut self, payload: &[u8]) -> io::Result<()> {
+-            self.stream.write_all(&ssh_packet(payload)).await?;
+-            self.stream.flush().await
++            self.writer.packet_raw(payload).map_err(io::Error::other)?;
++            self.writer.flush_into(&mut self.stream).await
++        }
++
++        /// Read one packet, decrypting it once keys have been installed.
++        pub(crate) async fn recv_packet(&mut self) -> io::Result<Vec<u8>> {
++            let n = cipher::read(&mut self.stream, &mut self.read_buffer, &mut *self.opener)
++                .await
++                .map_err(io::Error::other)?;
++            // `buffer.buffer` holds the 4-byte length, the padding length and
++            // the payload; `n` is the end of the payload.
++            Ok(self.read_buffer.buffer[5..n].to_vec())
+         }
+ 
+         pub(crate) async fn result(mut self) -> ServerSignal {
+@@ -998,37 +1097,60 @@
+         ));
+     }
+ 
+-    fn no_crypto_server_config() -> Arc<server::Config> {
++    fn raw_test_server_config() -> Arc<server::Config> {
+         let mut config = server::Config::default();
+         config.inactivity_timeout = None;
+         config.auth_rejection_time = Duration::from_millis(1);
+         config.auth_rejection_time_initial = Some(Duration::from_millis(1));
+-        config.preferred = no_crypto_preferred();
++        config.preferred = raw_test_preferred();
+         config
+             .keys
+             .push(PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap());
+         Arc::new(config)
+     }
+ 
+-    fn no_crypto_preferred() -> Preferred {
++    /// The algorithms [`RawSession::client_kex`] drives on the client side.
++    fn raw_test_preferred() -> Preferred {
+         Preferred {
+             host_key_certificates: Cow::Borrowed(&[]),
+-            kex: Cow::Owned(vec![kex::NONE]),
++            kex: Cow::Owned(vec![kex::CURVE25519]),
+             key: Cow::Owned(vec![Algorithm::Ed25519]),
+-            cipher: Cow::Owned(vec![cipher::NONE]),
++            cipher: Cow::Owned(vec![cipher::CHACHA20_POLY1305]),
+             mac: Cow::Owned(vec![mac::NONE]),
+             compression: Cow::Owned(vec![compression::NONE]),
+         }
+     }
+ 
+-    async fn raw_client_no_crypto_kex(stream: &mut tokio::net::TcpStream) -> io::Result<()> {
+-        stream
+-            .write_all(&ssh_packet(&kexinit_payload("none")))
+-            .await?;
+-        let newkeys = read_packet(stream).await?;
+-        assert_eq!(newkeys.first(), Some(&MSG_NEWKEYS));
+-        stream.write_all(&ssh_packet(&[MSG_NEWKEYS])).await?;
+-        stream.flush().await
++    /// The client KEXINIT matching [`raw_test_preferred`].
++    fn secure_kexinit_payload() -> Vec<u8> {
++        let mut payload = Vec::new();
++        payload.push(MSG_KEXINIT);
++        payload.extend_from_slice(&[0; 16]);
++        encode_name_list(&mut payload, &["curve25519-sha256"]);
++        encode_name_list(&mut payload, &["ssh-ed25519"]);
++        for _ in 0..2 {
++            encode_name_list(&mut payload, &["chacha20-poly1305@openssh.com"]);
++        }
++        for _ in 0..2 {
++            encode_name_list(&mut payload, &["none"]);
++        }
++        for _ in 0..2 {
++            encode_name_list(&mut payload, &["none"]);
++        }
++        encode_name_list(&mut payload, &[]);
++        encode_name_list(&mut payload, &[]);
++        payload.push(0);
++        push_u32(&mut payload, 0);
++        payload
++    }
++
++    /// Read a length-prefixed string at `pos`, advancing `pos`.
++    fn decode_string(buf: &[u8], pos: &mut usize) -> Vec<u8> {
++        let len = BigEndian::read_u32(&buf[*pos..*pos + 4]) as usize;
++        *pos += 4;
++        let value = buf[*pos..*pos + len].to_vec();
++        *pos += len;
++        value
+     }
+ 
+     pub(crate) fn pty_req_payload(server_channel: u32, terminal_modes: &[u8]) -> Vec<u8> {
+@@ -1079,30 +1201,6 @@
+         payload
+     }
+ 
+-    fn ssh_packet(payload: &[u8]) -> Vec<u8> {
+-        let mut padding_len = 8 - ((5 + payload.len()) % 8);
+-        if padding_len < 4 {
+-            padding_len += 8;
+-        }
+-        let packet_len = 1 + payload.len() + padding_len;
+-        let mut packet = Vec::with_capacity(4 + packet_len);
+-        push_u32(&mut packet, packet_len as u32);
+-        packet.push(padding_len as u8);
+-        packet.extend_from_slice(payload);
+-        packet.resize(packet.len() + padding_len, 0);
+-        packet
+-    }
+-
+-    pub(crate) async fn read_packet(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+-        let mut len_buf = [0; 4];
+-        stream.read_exact(&mut len_buf).await?;
+-        let packet_len = BigEndian::read_u32(&len_buf) as usize;
+-        let mut packet = vec![0; packet_len];
+-        stream.read_exact(&mut packet).await?;
+-        let padding_len = packet[0] as usize;
+-        Ok(packet[1..packet.len() - padding_len].to_vec())
+-    }
+-
+     async fn read_ssh_id(stream: &mut tokio::net::TcpStream) -> io::Result<Vec<u8>> {
+         let mut id = Vec::new();
+         loop {

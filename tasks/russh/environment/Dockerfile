@@ -16,8 +16,8 @@ RUN git init -q . \
  && rm -rf /app/.git
 
 # Hidden test harness: a standalone crate that drives russh's public
-# client/server transport API (path dependency on /app/russh). The agent can
-# only edit /app, never /opt/harness.
+# client/server transport API (path dependency on /app/russh). Only its manifest
+# and empty stubs are in the image.
 ENV CARGO_TERM_COLOR=never
 WORKDIR /opt/harness
 
@@ -28,11 +28,11 @@ COPY harness/Cargo.toml ./Cargo.toml
 RUN mkdir -p src tests && : > src/lib.rs && : > tests/security.rs && : > tests/functional.rs \
  && cargo build --tests 2>&1 | tail -5
 
-# 2) Real harness sources, and pre-build the test binaries so the gate does not
-#    recompile them on every run. touch so the real sources are newer than the
-#    stub-built artifacts (otherwise cargo skips rebuilding them).
-COPY harness ./
-RUN touch src/lib.rs tests/*.rs && cargo build --tests 2>&1 | tail -20
+# 2) nextest config only. The real harness sources (src/lib.rs, tests/*.rs) are
+#    hidden: tests/test.sh copies them in from /tests/harness at grading time,
+#    over the empty stubs above. The agent shares this container, so sources
+#    baked in here could be read and run.
+COPY harness/.config ./.config
 
 # Offline JUnit-emitting test runner (cargo-nextest), installed after the
 # compile layers so it never invalidates them. Arch-aware; vendored into the

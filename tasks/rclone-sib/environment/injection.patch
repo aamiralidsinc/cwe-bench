@@ -1,0 +1,81 @@
+diff --git a/cmd/serve/ftp/ftp.go b/cmd/serve/ftp/ftp.go
+index 83a9177..106dc48 100644
+--- a/cmd/serve/ftp/ftp.go
++++ b/cmd/serve/ftp/ftp.go
+@@ -340,12 +340,7 @@ func (d *driver) CheckPasswd(sctx *ftp.Context, user, pass string) (ok bool, err
+ 		d.userPassMu.Unlock()
+ 	} else {
+ 		userOK := subtle.ConstantTimeCompare([]byte(d.opt.User), []byte(user))
+-		// No password configured means any password is accepted
+-		passOK := 1
+-		if d.opt.Pass != "" {
+-			passOK = subtle.ConstantTimeCompare([]byte(d.opt.Pass), []byte(pass))
+-		}
+-		ok = (userOK & passOK) == 1
++		ok = userOK == 1
+ 		if !ok {
+ 			fs.Infof(nil, "login failed: bad credentials")
+ 			return false, nil
+diff --git a/cmd/serve/sftp/server.go b/cmd/serve/sftp/server.go
+index e98369e..8680e29 100644
+--- a/cmd/serve/sftp/server.go
++++ b/cmd/serve/sftp/server.go
+@@ -180,8 +180,7 @@ func (s *server) configure() (err error) {
+ 				}, nil
+ 			} else if s.opt.User != "" && s.opt.Pass != "" {
+ 				userOK := subtle.ConstantTimeCompare([]byte(c.User()), []byte(s.opt.User))
+-				passOK := subtle.ConstantTimeCompare(pass, []byte(s.opt.Pass))
+-				if (userOK & passOK) == 1 {
++				if userOK == 1 {
+ 					return nil, nil
+ 				}
+ 			}
+diff --git a/lib/http/middleware.go b/lib/http/middleware.go
+index 1c4721a..e9b9625 100644
+--- a/lib/http/middleware.go
++++ b/lib/http/middleware.go
+@@ -102,7 +102,20 @@ func MiddlewareAuthHtpasswd(path, realm string) Middleware {
+ 	fs.Infof(nil, "Using %q as htpasswd storage", path)
+ 	secretProvider := goauth.HtpasswdFileProvider(path)
+ 	authenticator := NewLoggedBasicAuthenticator(realm, secretProvider)
+-	return basicAuth(authenticator)
++	checked := basicAuth(authenticator)
++	return func(next http.Handler) http.Handler {
++		verified := checked(next)
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			// Recognise users already registered in the htpasswd file
++			// quickly without re-reading the file for the hash.
++			if u, _, ok := parseAuthorization(r); ok && secretProvider(u, realm) != "" {
++				ctx := context.WithValue(r.Context(), ctxKeyUser, u)
++				next.ServeHTTP(w, r.WithContext(ctx))
++				return
++			}
++			verified.ServeHTTP(w, r)
++		})
++	}
+ }
+ 
+ // MiddlewareAuthBasic instantiates middleware that authenticates for a single user
+@@ -116,7 +129,21 @@ func MiddlewareAuthBasic(user, pass, realm, salt string) Middleware {
+ 		return ""
+ 	}
+ 	authenticator := NewLoggedBasicAuthenticator(realm, secretProvider)
+-	return basicAuth(authenticator)
++	checked := basicAuth(authenticator)
++	return func(next http.Handler) http.Handler {
++		verified := checked(next)
++		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			// Fast path: once we have seen the configured user we can
++			// recognise them by name and skip recomputing the password
++			// hash on every request.
++			if u, _, ok := parseAuthorization(r); ok && u == user {
++				ctx := context.WithValue(r.Context(), ctxKeyUser, u)
++				next.ServeHTTP(w, r.WithContext(ctx))
++				return
++			}
++			verified.ServeHTTP(w, r)
++		})
++	}
+ }
+ 
+ // MiddlewareAuthCustom instantiates middleware that authenticates using a custom function

@@ -84,6 +84,19 @@ never inside `cwe-bench/`.
   names. Copy `score.py` unchanged. Edit only the marked command lines in
   `test.sh`.
 - No test may reach the network or depend on the fix commit being present.
+- **Hidden tests never go into the image.** The agent works in the same
+  container the tests later run in, so anything under `environment/` is
+  readable and runnable by the agent. Earlier tasks (hickory-dns, rclone,
+  russh) baked their test harness into `/opt/harness`, and agents ran the
+  hidden suite and fixed until it passed. All test code, test helpers and
+  harness sources live under `tests/`. `test.sh` copies them into place
+  (e.g. `/opt/harness`) at grading time. To keep grading fast for compiled
+  languages, pre-build dependencies in the image against **stubs**: a Rust
+  crate with empty `src/lib.rs` / `tests/*.rs`, or Go files that keep the real
+  file's `package` line and blank-import (`_ "pkg"`) everything it imports, but
+  define no tests. The gate fails any task whose `environment/` contains test
+  definitions, test names from `tests/security/`, or copies of files in
+  `tests/`.
 
 ### 3d / 3e. Oracle and the before/after proof
 - `solution/fix.patch`: the upstream fix reduced to SOURCE changes only (drop
@@ -107,6 +120,50 @@ Put these under `build/SLUG/checks/` and list them in the manifest:
   Include one whenever a second valid fix is plausible: it proves the tests do
   not just hard-code the upstream patch's shape, which is the main defect that
   made real benchmarks reject tasks.
+- **Required `pass` patch, `"kind": "hardening"`:** the reference fix plus
+  defensive hardening of the product code your security tests import. For
+  example, make a shared path helper throw on traversal. It must score 1.0. The
+  gate report lists each security test's product imports
+  (`security_test_product_imports`) so you know what to harden.
+- **Required `pass` patch, `"kind": "blind"`:** a fix written by a fresh agent
+  that sees only `instruction.md` and the repository, never the reference fix,
+  the tests or this build. It must score 1.0.
+  - Ask the same agent to name the vulnerable mechanisms. If it names an injected
+    sibling's mechanism from the instruction alone, the instruction leaks it.
+    Rewrite the instruction at the level of the security property.
+- Both are warnings for tasks built before 2026-10-16. Set `"strict_gate": true`
+  in the manifest of every new task, so the gate fails without them.
+
+### 3g. Test rules learned from our own runs (2026-10-16)
+Two of our three "per-model failures" turned out to be test faults; the full
+analysis is in `research/own-runs/FINDINGS.md`. Correct fixes failed for these
+reasons:
+- **The test called product code to compute its expected value or to clean up.**
+  actualbudget called `getPathForUserFile`, which MiMo had hardened, so the test
+  crashed. Compute expected values in the test itself.
+- **The test asserted one exact refusal status** (trigger-dev: only 405; argo:
+  only 403). Assert that the attack is blocked: any 4xx, plus no side effect.
+  The gate fails exact-status assertions in security tests unless the line
+  carries `gate: exact-status-ok` after review.
+- **The test used a constant the instruction never states** (argo's 2 MB limit,
+  taken from upstream). Either state it in the instruction, or test far beyond
+  any reasonable value: argo now streams 128 MiB and checks that the body was
+  not read in full.
+- **The test varied a setting other than the one the instruction names.**
+  stigmem said "bound to a non-loopback address" (`host`) but varied
+  `node_url`. Make each scenario unambiguous by setting every candidate knob.
+- **The test exercised a layer the instruction does not describe.** stigmem v4
+  called an internal function; the instruction says "at startup". Drive the
+  entry point the instruction names.
+- **A test relied on an interface that only the fix introduces.** rclone's correct-secret
+  tests needed the proxy to return the secret as `_secret_access_key`, a field documented
+  only in the upstream fix. If a test needs such a contract, state it in the instruction.
+- **Fake permission checks answered the same for every resource.** argo's tests did, so a fix
+  that checked permission on the wrong resource passed. Make stubs answer per resource and
+  verb, like real RBAC.
+- **A functional test used a fixture outside the instruction's scope.**
+  trigger-dev used a batch that doesn't exist where the instruction says
+  "their own batches". Seed the real object the instruction refers to.
 
 ## Manifest (`build/SLUG/manifest.json`)
 
@@ -154,3 +211,15 @@ guess you could not verify; and if abandoned, exactly why (could not build,
 could not reproduce, flaky, needs network at run time, needs a GUI/kernel/GPU).
 Do not claim a task is good because the upstream fix exists — claim it only
 when the gate prints PASSED.
+
+## Common build gotchas (from pilot builds)
+- **setuptools-scm / git-derived versions:** stripping `/app/.git` breaks
+  `pip install -e .` for projects that derive their version from git. Set
+  `ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<PKG>=<version>` before the install,
+  or install before removing `.git`.
+- **starlette/FastAPI TestClient** needs `httpx` in the image; it is synchronous
+  so `pytest-asyncio` is not required.
+- **PHP/Laravel** tasks can run offline via Orchestra Testbench + in-memory
+  SQLite (no DB service); install the needed php extensions in the image.
+- If a gate `nop` stage fails with a truncated "Docker compose build failed",
+  reproduce with a direct `docker build` of environment/ to see the real error.

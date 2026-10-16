@@ -242,6 +242,196 @@ def shape_metrics(source_files):
     }
 
 
+# ---- where the fix lands (S2a) and which role each changed site plays (S2b) ----------------
+# A definition line in any of the common languages -> the name it defines.  Order matters: the
+# keyword forms first, then method shapes without a keyword (Java/C#/TS class members).
+_DEF_FORMS = [
+    re.compile(r"\b(?:def|function\*?|func|fn|sub|fun|proc)\s+(?:\([^)]*\)\s*)?"
+               r"(?:self\.)?([A-Za-z_$][\w$]*[!?]?)"),
+    re.compile(r"\b(?:class|struct|interface|trait|enum|module|object|record|protocol|union)\s+"
+               r"([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*(?:pub(?:\([\w:]+\))?\s+)?(?:unsafe\s+)?impl(?:\s*<[^>]*>)?\s+"
+               r"(?:[\w:]+(?:<[^>]*>)?\s+for\s+)?([A-Za-z_][\w]*)"),
+    re.compile(r"^(?:export\s+)?(?:default\s+)?type\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^(?:export\s+)?(?:const|let|var|val)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=(?!=)"),
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"
+               r"(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)"),
+    re.compile(r"^\s*(?:(?:public|private|protected|internal|static|final|abstract|synchronized|"
+               r"override|async|export|default|virtual|inline|open|suspend|native|readonly|"
+               r"get|set)\s+)+(?:[\w<>\[\],.?:|]+\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\("),
+    re.compile(r"^\s*(?:[A-Za-z_][\w<>\[\],.?]*\s+)+([A-Za-z_][\w]*)\s*\([^;]*\)\s*"
+               r"(?:throws\s+[\w., ]+)?\{\s*$"),
+    re.compile(r"^\s*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^={;]+)?\{\s*$"),
+]
+_NOT_A_NAME = set("""
+if for while switch catch return else new function typeof await throw do try with elif sizeof
+match case when unless until loop super this self foreach using lock fixed yield static
+""".split())
+
+
+def def_name(line):
+    """Name defined on a source line (function, method, class, type, top-level const), or ''."""
+    s = line.rstrip()
+    if not s.strip() or _COMMENT.match(s):
+        return ""
+    for rx in _DEF_FORMS:
+        m = rx.search(s)
+        if m and m.group(1).lower() not in _NOT_A_NAME:
+            return m.group(1)
+    return ""
+
+
+_WORDS = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def name_words(name):
+    """'OAuthTokensSchema' -> ['o', 'auth', 'tokens', 'schema']; 'from_str' -> ['from', 'str']."""
+    return [w.lower() for w in _WORDS.findall(name or "")]
+
+
+# Roles (S2b, Hadi 2026-10-15). A producer creates, loads or converts the data a check relies on;
+# a check decides allowed or not. Matched on the defining name first (its leading verb, then its
+# head noun, then any word), and only when the name says nothing, on the file name, then on the
+# directories nearest the file.
+PRODUCER_VERBS = {"serialize", "deserialize", "parse", "load", "decode", "unmarshal", "new",
+                  "from", "migrate", "construct"}
+PRODUCER_NOUNS = {"schema", "schemas", "serializer", "serializers", "deserializer",
+                  "deserializers", "parser", "parsers", "loader", "loaders", "decoder",
+                  "decoders", "unmarshaller", "unmarshaler", "codec", "codecs", "model", "models",
+                  "types", "constructor", "migration", "migrations", "store", "stores",
+                  "serialization", "deserialization", "parsing", "loading", "decoding",
+                  "unmarshal"}
+CHECK_VERBS = {"check", "validate", "verify", "authorize", "authorise", "authenticate", "auth",
+               "guard", "permit"}
+CHECK_NOUNS = {"auth", "authz", "authn", "authorization", "authorisation", "authentication",
+               "authenticator", "authorizer", "permission", "permissions", "policy", "policies",
+               "guard", "guards", "middleware", "middlewares", "validator", "validators",
+               "validation", "verifier", "verification", "checker", "check", "checks", "access",
+               "acl", "acls", "token", "tokens"}
+_CTOR_NAMES = {"__init__", "constructor", "initialize", "__new__", "__construct"}
+
+
+def _is_ctor(name):
+    """A bare constructor: __init__, constructor, __construct, new, New, newServer, NewConfig."""
+    return name in _CTOR_NAMES or name.lower() == "new" or bool(re.match(r"^[Nn]ew[A-Z]\w*$", name))
+
+
+def role_of_words(words):
+    """-> 'producer', 'check' or '' for the words of one name."""
+    if not words:
+        return ""
+    first, head = words[0], words[-1]
+    prod = first in PRODUCER_VERBS or head in PRODUCER_NOUNS
+    chk = first in CHECK_VERBS or head in CHECK_NOUNS
+    if prod and not chk:
+        return "producer"
+    if chk and not prod:
+        return "check"
+    if prod and chk:              # 'validateSchema' is a check, 'parseToken' a producer
+        if first in PRODUCER_VERBS:
+            return "producer"
+        if first in CHECK_VERBS:
+            return "check"
+        return ""
+    p = any(w in PRODUCER_VERBS or w in PRODUCER_NOUNS for w in words)
+    c = any(w in CHECK_VERBS or w in CHECK_NOUNS for w in words)
+    if p != c:
+        return "producer" if p else "check"
+    return ""
+
+
+def site_role(path, name):
+    """-> (role, basis): basis is 'name', 'file' or 'dir'."""
+    if name:
+        if name in _CTOR_NAMES:
+            return "producer", "name"
+        r = role_of_words(name_words(name))
+        if r:
+            return r, "name"
+    parts = path.split("/")
+    stem = parts[-1].split(".")[0]
+    r = role_of_words(name_words(stem))
+    if r:
+        return r, "file"
+    for d in reversed(parts[:-1][-3:]):          # the three directories nearest the file
+        r = role_of_words(name_words(d))
+        if r:
+            return r, "dir"
+    return "", ""
+
+
+def location_metrics(source_files):
+    """Where the fix lands, for S2a and S2b.  Stored in the commit's `shape` JSON.
+
+    changed_files  non-test source files with a hunk that changes real code
+    hunk_funcs     {file: names from the hunk headers (git's enclosing-function text) of those hunks}
+    units          [file, name, role, basis] for every distinct enclosing definition of a changed
+                   line (name '' = file level); role 'producer' / 'check' / '' (see site_role)
+    s2b            data producer off the check's path, diff part: a check-role unit AND a
+                   producer-role unit in a DIFFERENT file.  'check_calls_producer' is left null
+                   for the `siblings` stage, which needs the vulnerable tree.
+    """
+    changed, heads, units, calls = [], {}, {}, {}
+    for path, st in source_files.items():
+        for h in st.get("hunk_list") or []:
+            if not _substantive(h["added"]) and not _substantive(h["removed"]):
+                continue
+            if path not in changed:
+                changed.append(path)
+            hname = def_name(h.get("context", ""))
+            if hname and hname not in heads.setdefault(path, []):
+                heads[path].append(hname)
+            heads.setdefault(path, [])
+            enclosing = hname
+            for tag, text in h.get("seq") or []:
+                d = def_name(text)
+                if d:
+                    enclosing = d
+                if tag == " " or not _substantive([text]):
+                    continue
+                units.setdefault((path, enclosing), None)
+                if tag == "+":
+                    calls.setdefault(path, set()).update(m.group(1) for m in _CALL.finditer(text))
+    unit_rows = []
+    for (path, name) in units:
+        role, basis = site_role(path, name)
+        unit_rows.append([path, name, role, basis])
+    checks = [u for u in unit_rows if u[2] == "check"]
+    prods = [u for u in unit_rows if u[2] == "producer"]
+    pairs = [(c, p) for c in checks for p in prods if c[0] != p[0]]
+    diff_dir = any(c[0].rsplit("/", 1)[0] != p[0].rsplit("/", 1)[0] for c, p in pairs)
+    # strict: both roles come from the definition's own name, the producer is not a bare
+    # constructor (constructors of check classes change whenever a check gains a dependency),
+    # and neither file's added lines call a definition the fix changed in the other file (a new
+    # validator defined in one file and called from the parser's file is one change, not a check
+    # plus a separate producer; a check whose file now calls the producer is on its call path)
+    defs = {}
+    for u in unit_rows:
+        if u[1]:
+            defs.setdefault(u[0], set()).add(u[1])
+
+    def linked(c, p):
+        return bool(defs.get(c[0], set()) & calls.get(p[0], set()) or
+                    defs.get(p[0], set()) & calls.get(c[0], set()))
+    strict = any(c[3] == "name" and p[3] == "name" and not _is_ctor(p[1]) and not linked(c, p)
+                 for c, p in pairs)
+    s2b = {"fires": 1 if pairs else 0, "diff_dir": 1 if diff_dir else 0,
+           "strict": 1 if strict else 0,
+           "linked_in_diff": 1 if (pairs and all(linked(c, p) for c, p in pairs)) else 0,
+           "check_files": sorted(set(c[0] for c, _p in pairs))[:8],
+           "producer_files": sorted(set(p[0] for _c, p in pairs))[:8],
+           "check_names": sorted(set(c[1] for c, _p in pairs if c[1]))[:8],
+           "producer_names": sorted(set(p[1] for _c, p in pairs if p[1]))[:8],
+           "check_calls_producer": None}
+    return {
+        "changed_files": changed[:40],
+        "hunk_funcs": dict((p, v[:12]) for p, v in list(heads.items())[:40]),
+        "units": unit_rows[:80],
+        "n_units": len(unit_rows),
+        "s2b": s2b,
+    }
+
+
 def parse_patch(text):
     """Return a dict of metrics for one .patch text (may hold several commits)."""
     files = {}          # path -> dict(added, removed, hunks, binary)
@@ -278,7 +468,7 @@ def parse_patch(text):
             hm = _HUNK.match(line)
             cur["hunk_list"].append({"start": int(hm.group(1)) if hm else 0,
                                      "context": (hm.group(2).strip() if hm else "")[:120],
-                                     "added": [], "removed": []})
+                                     "added": [], "removed": [], "seq": []})
             continue
         if not in_hunk:
             if line.startswith("Binary files") or line.startswith("GIT binary patch"):
@@ -288,6 +478,7 @@ def parse_patch(text):
             if line[1:].strip():
                 cur["added"] += 1
                 cur["hunk_list"][-1]["added"].append(line[1:])
+                cur["hunk_list"][-1]["seq"].append(("+", line[1:]))
         elif line.startswith("-"):
             if line == "-- ":            # format-patch signature separator ends the commit
                 in_hunk = False
@@ -296,7 +487,11 @@ def parse_patch(text):
             if line[1:].strip():
                 cur["removed"] += 1
                 cur["hunk_list"][-1]["removed"].append(line[1:])
-        elif line.startswith(" ") or line == "" or line.startswith("\\"):
+                cur["hunk_list"][-1]["seq"].append(("-", line[1:]))
+        elif line.startswith(" "):
+            if line[1:].strip():     # context: only used to find the enclosing definition
+                cur["hunk_list"][-1]["seq"].append((" ", line[1:]))
+        elif line == "" or line.startswith("\\"):
             pass
         else:
             in_hunk = False
@@ -340,7 +535,7 @@ def parse_patch(text):
         "other_files": len(files) - src_files - test_files,
         "language": language,
         "breakdown": breakdown,
-        "shape": shape_metrics(source_files),
+        "shape": dict(shape_metrics(source_files), **location_metrics(source_files)),
         "src_paths": src_paths[:40],
         "test_paths": test_paths[:20],
     }
