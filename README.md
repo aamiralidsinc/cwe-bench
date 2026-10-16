@@ -21,7 +21,7 @@ attributes the failure to the model, not to a task defect.
 ## Contents
 
 1. [Results so far](#results-so-far)
-2. [Documentation (per stage)](#documentation-per-stage)
+2. [Documentation](#documentation)
 3. [How the pipeline works](#how-the-pipeline-works)
 4. [Task generation rules](#task-generation-rules)
 5. [How a task is graded](#how-a-task-is-graded-and-why-it-cannot-be-gamed)
@@ -77,23 +77,12 @@ What we have learned about the two models (details in
 
 ---
 
-## Documentation (per stage)
+## Documentation
 
-Detailed, code-referenced documentation for each stage is in [`docs/`](docs/README.md): what it reads and writes, the
-exact rules and thresholds, configuration, and a code map.
-
-| Doc | Covers |
+| Doc | What it is |
 |---|---|
-| **[docs/PIPELINE.md](docs/PIPELINE.md)** | **The whole pipeline on one page: every stage, the rules that make a task good, the guarantees (2-minute read)** |
-| **[docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md)** | **Deep analysis of the tasks the models failed: attempt-by-attempt results, task dossiers, why the models failed, which vulnerability types to target, recommendations, client FAQ** |
-| [docs/README.md](docs/README.md) | Overview, end-to-end flow, data layout and paths |
-| [01 - Mining](docs/01-mining.md) | Advisory sources (OSV, GHSA, huntr), fix-commit resolution, dedupe, where data is stored |
-| [02 - Screening](docs/02-screening.md) | Rejection rules, date cutoff, repo limits, candidate scoring |
-| [03 - Task builder](docs/03-task-builder.md) | Candidate selection and learned ranking, build check, generation prompt, output validators, fallback and safety handling |
-| [04 - Validation](docs/04-validation.md) | Rubric, recall probe, isolation audit and image scan, oracle and pre-patch runs, existing tests, check patches |
-| [05 - Evaluation](docs/05-evaluation.md) | Harbor and the Claude Code agent, task image, network isolation, separate grader, scoring, verdict and attribution |
-| [06 - Packaging](docs/06-packaging.md) | Final Harbor task layout, `task.toml` metadata, output paths, running a packaged task |
-| [07 - Knowledge loop](docs/07-knowledge-loop.md) | Results report, failure map, failure analyses, technique scoreboard, what the generator reads |
+| [docs/PIPELINE.md](docs/PIPELINE.md) | Every stage on one page: sources and storage, rules, generation logic, validation checks, evaluation (image, Claude Code agent, what is blocked, grading, verdict), packaging and paths |
+| [docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md) | Analysis of the tasks the models failed: attempt-by-attempt results, task details, why the models failed, what to target next |
 
 ---
 
@@ -136,7 +125,7 @@ in `data/pipeline_state.sqlite3`.
 
 Every generated task must satisfy these rules. Most are enforced by code: the generator's output validators, stage 4
 checks and the rubric. The rest are instructions in the generation prompt and the technique guide. Details:
-[docs/03-task-builder.md](docs/03-task-builder.md) and [docs/04-validation.md](docs/04-validation.md).
+[docs/PIPELINE.md](docs/PIPELINE.md).
 
 **What a task is**
 
