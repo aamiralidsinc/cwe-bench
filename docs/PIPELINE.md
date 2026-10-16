@@ -1,33 +1,115 @@
-# Pipeline at a glance
+# Pipeline: stage by stage
 
-**Goal:** Harbor security-fix tasks that **both** DeepSeek V4.1 Flash (effort max) and MiMo-V2.6-Pro fail in all 3
-attempts. The failure must be the model's fault, not the task's. Details per stage are in [01-07](README.md).
+**Goal:** Harbor security-fix tasks that both DeepSeek V4.1 Flash (effort max) and MiMo-V2.6-Pro fail in all 3
+attempts, where the failure is the model's fault and not the task's.
+Run with `python run_pipeline.py` (see the [README](../README.md)). The state of each task is kept in
+`data/pipeline_state.sqlite3`, so finished work is never repeated.
 
-| Stage | What it does | Key rules |
-|---|---|---|
-| **1 Mining** | Collects PyPI/npm advisories from OSV, GHSA and huntr, and resolves each fix commit | Fix commit must be after `PUBLISHED_AFTER` (2026-08-01), so the fix is not in the models' training data. A series of fixes is merged; for a backport the default-branch copy is used. Known advisories are never re-mined. |
-| **2 Screening** | Keeps candidates that can become a good task, and scores them | Rejects dependency-bump, config, docs, CI and template-only fixes; fixes with no source change; repos with no tests; repos over 400 MB; fixes that are too small or too big. Score = breadth: up to 8 files, up to 4 directories, line band. |
-| **3 Task builder** | Picks the best candidates, checks out the vulnerable commit, then **Opus 5.5** writes the task | **Ranking** = score + what results taught: families that never broke a model rank lower, and repos already solved, unbuildable or safety-flagged are skipped. **Docker build check** first. Opus writes the report, hidden tests and 3 check patches. **Validators:** no file or function names in the report, ≥3 security + ≥3 functional tests, no skips, check patches well formed. If Opus 5.5 declines, Opus 4.8 takes over. A safety flag retires the candidate. |
-| **4 Validation** | Proves the task is sound before any model sees it | **Rubric** (10 blocking criteria: accurate, solvable from the report, real entry point, implementation-agnostic, realistic, not config). **Recall probe**: reject if both models name the fix file from the report alone. **Leak scan** of the whole image. **Reference fix scores 1.0** twice; **vulnerable code fails** the security tests. **Existing repo tests** pass before and after. **Shallow fix must fail**, **feature-removal fix must fail**, **alternative correct fix must pass**. A failure sends the task back for a rewrite (max 2) with feedback. |
-| **5 Evaluation** | Runs both models, 3 attempts each | Harbor + **Claude Code agent** in the task image; 2 h per attempt; 5 tasks in parallel. Agent network is **allowlisted to the model API only**. **Grading in a separate fresh container**: only the agent's source patch crosses over. **Deterministic verdict**: solved = 1.0; partial fix or broken feature = failure; timeout = not counted. Early stop once a model solves. |
-| **6 Packaging** | Writes the accepted task | Final reference-fix run, then the Harbor layout (`instruction.md`, `task.toml` with CWE/language/repo/source/entry point, `environment/`, `solution/`, `tests/`) in `data/05_accepted_harbor/<id>/`. |
-| **Knowledge loop** | Every verdict teaches the next round | Automatic: `C_RESULTS.md`, model failure map, **failure analyses from trajectories**, **technique scoreboard**, learned ranking. The generator reads them every round. |
+## Stage 1 - Mining
 
-## Rules that make a task good
+- **Sources:** OSV (bulk export), the GitHub Advisory Database (GHSA) and huntr. PyPI and npm only.
+- **Fix commit:** taken from the advisory's commit links. A series of fix commits is merged; for a backport the
+  default-branch copy is used. The commit before the fix is the vulnerable state.
+- **Cutoff:** the advisory and the fix commit must be after `PUBLISHED_AFTER` (2026-08-01), so the fix is not in the
+  models' training data.
+- **Dedupe:** an advisory or commit already seen is never mined again.
+- **Stored in:** `data/01_mined/osv_candidates.json`.
 
-1. **Report**: behaviour only (impact and trigger), 150-400 words, no file, function or line hints, no fix
-   prescription.
-2. **Tests through a real entry point**, implementation-agnostic, offline and deterministic.
-3. **Variants beyond the report** (other entry points, encodings, shapes, round-trips), **one test per variant**, so
-   a partial fix still fails.
-4. **Functional tests near the boundary**, so over-blocking fails.
-5. **Fair**: the reference fix passes everything, no undisclosed numbers, variants share the root cause.
-6. **Techniques that break the models** (measured): unnamed sibling path, parallel implementation, a "must keep
-   working" clause that argues against the fix, second public API or input-shape variants, and big multi-file fixes.
+## Stage 2 - Screening
 
-## What can never happen
+- **Rejected:**
+  - dependency-bump, config, CI, docs and generated-only fixes;
+  - template-dominated fixes;
+  - no source change in Python or JS/TS;
+  - fixes outside 4-400 source lines or over 300 files;
+  - no root build manifest or no tests in the repo;
+  - repos over 400 MB;
+  - more than 3 candidates from one repo.
+- **Score (fix breadth):** `8 × files (max 8) + 6 × (directories - 1, max 4)` + a line-band bonus, −25 for tiny
+  fixes, +3 if the repo has 5+ tests. A small prior is added from how often the CWE broke both models before.
+- **Stored in:** `data/02_screened/screened.json` (passed) and `rejected.json`.
 
-- The agent sees the hidden tests, the fix or the advisory, or reaches the internet.
-- An LLM decides whether a model passed.
-- A timeout is counted as a model failure.
-- A task with a flaky or unfair test is accepted: the reference fix must score 1.0 and an alternative fix must pass.
+## Stage 3 - Task builder
+
+- **Picking candidates:**
+  - screening score + a **learned adjustment** from results so far: vulnerability families that never broke a model
+    rank lower, and so do packages already solved;
+  - repos that cannot be built here or were safety-flagged are skipped;
+  - one candidate per repo per batch.
+- **Environment:** the repo is checked out at the vulnerable commit as a single snapshot commit, with no fix history.
+  It is stored in `data/03_environments/<id>/repo/`, with the fix saved as `oracle_solution.patch`.
+- **Build check:**
+  - a Docker install of the project; the Python version comes from `requires-python` (3.11-3.13), and uv workspaces
+    install from `uv.lock`;
+  - network errors are retried;
+  - a candidate whose build times out twice is retired.
+- **Generation:** Claude Opus 5.5 gets the fix, the vulnerable source, its callers, a repo map, test examples and the
+  knowledge base. It writes:
+  - `instruction.md`: a behavioural bug report, 150-400 words, no file, function or line hints, no fix;
+  - `hidden_tests.py`: ≥3 `test_security_*` (fail on the vulnerable code) and ≥3 `test_functional_*` (pass on both),
+    through a real entry point, implementation-agnostic, offline, with variants beyond the report;
+  - three check patches (shallow, removal, alternative) and metadata (entry point, techniques used).
+- **Output checks:** no changed file or function names in the report, no copied advisory text, the minimum test
+  counts, no skips (`skip`, `xfail`, `importorskip`), check patches that apply, output not truncated.
+- **Fallbacks and safety:** if Opus 5.5 declines, Opus 4.8 continues. A safeguards (AUP) flag retires the candidate
+  with no retry. A patch that is too large retires the candidate.
+
+## Stage 4 - Validation
+
+A task must pass all of these before any model sees it:
+
+1. **Rubric:** 10 criteria, all blocking: accurate report, report doesn't prescribe the fix, solvable from the
+   report, real entry point, variants share the root cause, implementation-agnostic, functional tests meaningful,
+   deterministic and offline, realistic, not a config or dependency change.
+2. **Recall probe:** both models get the report only; rejected if both name the file to fix.
+3. **Leak checks:** the task files are audited, and the whole built image is scanned for copies of the fix's code
+   (for example a released, already-fixed copy of the package in `node_modules`).
+4. **Reference fix** scores 1.0 twice; the **vulnerable code** fails every security test.
+5. **Existing repo tests** of the affected code pass before and after the fix. They are required, and enforced in
+   grading.
+6. **Check patches:** the *shallow* fix still fails a security test, the *removal* fix fails a functional test, and
+   the *alternative* fix scores 1.0.
+
+On failure the task goes back to stage 3 with the reviewer's or pytest's feedback (at most 2 rewrites). Docker or
+infrastructure errors give "no verdict" and are retried. Records are kept in `data/03_environments/<id>/validation/`.
+
+## Stage 5 - Evaluation (model runner)
+
+- **Harness:** Harbor CLI 0.24 runs each task with the **Claude Code agent** (version pinned and baked into the task
+  image). DeepSeek is reached through its Anthropic-compatible API with reasoning effort `max`, and MiMo through its
+  own API.
+- **Task image:** a `node:22` or `python:3.x-slim` base, the project installed (and built for TypeScript), the repo at
+  the vulnerable commit, and Claude Code.
+- **Blocked:**
+  - **Network:** the agent container sits on an internal network; an egress proxy allows only the model API hosts.
+    No GitHub, npm, PyPI or web search.
+  - **Answer key:** no hidden tests, fix, fix history or advisory in the container.
+  - **Credentials:** our Anthropic and GitHub keys are stripped from what Harbor passes into the container.
+- **Grading in a separate container:** after the agent stops, only its source patch is collected (test configs and
+  manifests excluded) and applied in a **fresh container** from the same image, where the hidden tests and the
+  existing tests run. Nothing else the agent changed can reach the grader.
+- **Score:** the mean of the security, functional and existing-test pass rates. Solved = 1.0; anything less is a
+  failure (a partial fix or a broken feature).
+- **Runs:** 3 attempts per model, 2 hours each, up to 5 tasks in parallel. Attempt 1 runs alone, then attempts 2-3
+  together. Once either model solves, the remaining attempts are cancelled and the task is rejected.
+- **Verdict (deterministic, no LLM judge):** **accepted** only if every attempt of both models is a counted failure
+  (graded, below 1.0, no harness error, the agent really worked, no tampering). A **timeout is not a failure**.
+- **Stored in:** `data/04_eval_runs/<id>/<model>/…`: each attempt's trajectory, patch and per-test results, plus
+  `attribution.json`.
+
+## Stage 6 - Packaging
+
+- The reference fix runs one last time on the final task (it must score 1.0).
+- **Harbor layout** written to `data/05_accepted_harbor/<id>/`: `instruction.md`, `task.toml` (CWE, language, repo,
+  source, entry point, timeouts, network policy), `environment/` (Dockerfile + repo), `solution/` (reference fix),
+  `tests/` (hidden tests, existing-test list, grader scripts).
+- Run it with `harbor run -p data/05_accepted_harbor/<id> -a oracle`.
+
+## Knowledge loop (after every verdict)
+
+- **Rebuilt automatically:** `C_RESULTS.md` (all results and per-attempt failure details) and
+  `data/knowledge/model_failure_map.md`.
+- **Failure analyses:** `failure_analyses/<id>.md`, why each model failed, written from its trajectories.
+- **Technique scoreboard:** `technique_scoreboard.md`, how often each design technique broke a model compared with
+  the baseline.
+- The **generator reads all of these** in the next round, and **candidate ranking** uses the same results.
