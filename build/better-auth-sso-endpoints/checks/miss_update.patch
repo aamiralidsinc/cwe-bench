@@ -1,0 +1,265 @@
+diff --git a/packages/sso/src/oidc/discovery.ts b/packages/sso/src/oidc/discovery.ts
+index 4cc520193..db33ecbf7 100644
+--- a/packages/sso/src/oidc/discovery.ts
++++ b/packages/sso/src/oidc/discovery.ts
+@@ -8,6 +8,7 @@
+  * @see https://openid.net/specs/openid-connect-discovery-1_0.html
+  */
+ 
++import { isPublicRoutableHost } from "@better-auth/core/utils/host";
+ import { betterFetch } from "@better-fetch/fetch";
+ import type { OIDCConfig } from "../types";
+ import type {
+@@ -123,6 +124,77 @@ export function validateDiscoveryUrl(
+ 	}
+ }
+ 
++/**
++ * Validate that a user-supplied OIDC endpoint URL is safe to fetch.
++ *
++ * Layered checks (in order):
++ *   1. URL parsing + http(s) scheme            → discovery_invalid_url
++ *   2. Public-routable host (RFC 6890)         → allowed
++ *   3. Operator-allowlisted via trustedOrigins → allowed (opt-in for internal IdPs)
++ *   4. Otherwise                               → discovery_private_host
++ *
++ * Step 2 rejects loopback, RFC 1918, link-local, ULA, shared-address,
++ * cloud-metadata FQDNs (e.g. `169.254.169.254`, `metadata.google.internal`),
++ * multicast, and reserved ranges. See `isPublicRoutableHost` in
++ * `@better-auth/core/utils/host`.
++ *
++ * Step 3 is the documented escape hatch for customers whose IdP runs on a
++ * private network or behind a corporate VPN: they add the IdP origin to their
++ * `trustedOrigins` configuration.
++ *
++ * @param name - The endpoint field name, used in error messages
++ * @param endpoint - The URL to validate
++ * @param isTrustedOrigin - Predicate matching the configured `trustedOrigins`
++ * @throws DiscoveryError(discovery_invalid_url)  — malformed URL or non-http(s) scheme
++ * @throws DiscoveryError(discovery_private_host) — host is not publicly routable and not allowlisted
++ */
++function validateSkipDiscoveryEndpoint(
++	name: string,
++	endpoint: string,
++	isTrustedOrigin: (url: string) => boolean,
++): void {
++	const parsed = parseURL(name, endpoint);
++	if (isPublicRoutableHost(parsed.hostname)) return;
++	if (isTrustedOrigin(parsed.toString())) return;
++	throw new DiscoveryError(
++		"discovery_private_host",
++		`The ${name} URL (${parsed.toString()}) is not publicly routable: ${parsed.hostname}. If this is an internal IdP, add its origin to trustedOrigins.`,
++		{ endpoint: name, url: endpoint, hostname: parsed.hostname },
++	);
++}
++
++/**
++ * Validate every present OIDC endpoint URL in a registration or update body.
++ *
++ * Each provided URL is checked with {@link validateSkipDiscoveryEndpoint}.
++ * Omitted (undefined / null / empty) fields are skipped.
++ *
++ * @param config - OIDC endpoint URLs from the request body
++ * @param isTrustedOrigin - Predicate matching the configured `trustedOrigins`
++ * @throws DiscoveryError on the first invalid endpoint
++ */
++export function validateSkipDiscoveryEndpoints(
++	config: {
++		authorizationEndpoint?: string | null;
++		tokenEndpoint?: string | null;
++		userInfoEndpoint?: string | null;
++		jwksEndpoint?: string | null;
++		discoveryEndpoint?: string | null;
++	},
++	isTrustedOrigin: (url: string) => boolean,
++): void {
++	const fields: Array<[string, string | null | undefined]> = [
++		["authorizationEndpoint", config.authorizationEndpoint],
++		["tokenEndpoint", config.tokenEndpoint],
++		["userInfoEndpoint", config.userInfoEndpoint],
++		["jwksEndpoint", config.jwksEndpoint],
++		["discoveryEndpoint", config.discoveryEndpoint],
++	];
++	for (const [name, url] of fields) {
++		if (url) validateSkipDiscoveryEndpoint(name, url, isTrustedOrigin);
++	}
++}
++
+ /**
+  * Fetch the OIDC discovery document from the IdP.
+  *
+diff --git a/packages/sso/src/oidc/errors.ts b/packages/sso/src/oidc/errors.ts
+index 8f4cddc84..d3ffdaa8a 100644
+--- a/packages/sso/src/oidc/errors.ts
++++ b/packages/sso/src/oidc/errors.ts
+@@ -12,14 +12,16 @@ import type { DiscoveryError } from "./types";
+  * Maps a DiscoveryError to an appropriate APIError for HTTP responses.
+  *
+  * Error code mapping:
+- * - discovery_invalid_url       → 400 BAD_REQUEST
+- * - discovery_not_found         → 400 BAD_REQUEST
+- * - discovery_invalid_json      → 400 BAD_REQUEST
+- * - discovery_incomplete        → 400 BAD_REQUEST
+- * - issuer_mismatch             → 400 BAD_REQUEST
++ * - discovery_invalid_url        → 400 BAD_REQUEST
++ * - discovery_not_found          → 400 BAD_REQUEST
++ * - discovery_untrusted_origin   → 400 BAD_REQUEST
++ * - discovery_private_host       → 400 BAD_REQUEST
++ * - discovery_invalid_json       → 400 BAD_REQUEST
++ * - discovery_incomplete         → 400 BAD_REQUEST
++ * - issuer_mismatch              → 400 BAD_REQUEST
+  * - unsupported_token_auth_method → 400 BAD_REQUEST
+- * - discovery_timeout           → 502 BAD_GATEWAY
+- * - discovery_unexpected_error  → 502 BAD_GATEWAY
++ * - discovery_timeout            → 502 BAD_GATEWAY
++ * - discovery_unexpected_error   → 502 BAD_GATEWAY
+  *
+  * @param error - The DiscoveryError to map
+  * @returns An APIError with appropriate status and message
+@@ -46,7 +48,7 @@ export function mapDiscoveryErrorToAPIError(error: DiscoveryError): APIError {
+ 
+ 		case "discovery_invalid_url":
+ 			return new APIError("BAD_REQUEST", {
+-				message: `Invalid OIDC discovery URL: ${error.message}`,
++				message: `Invalid OIDC endpoint URL: ${error.message}`,
+ 				code: error.code,
+ 			});
+ 
+@@ -56,6 +58,12 @@ export function mapDiscoveryErrorToAPIError(error: DiscoveryError): APIError {
+ 				code: error.code,
+ 			});
+ 
++		case "discovery_private_host":
++			return new APIError("BAD_REQUEST", {
++				message: error.message,
++				code: error.code,
++			});
++
+ 		case "discovery_invalid_json":
+ 			return new APIError("BAD_REQUEST", {
+ 				message: `OIDC discovery returned invalid data: ${error.message}`,
+diff --git a/packages/sso/src/oidc/index.ts b/packages/sso/src/oidc/index.ts
+index 38f96c8f4..1f8705e55 100644
+--- a/packages/sso/src/oidc/index.ts
++++ b/packages/sso/src/oidc/index.ts
+@@ -17,6 +17,7 @@ export {
+ 	selectTokenEndpointAuthMethod,
+ 	validateDiscoveryDocument,
+ 	validateDiscoveryUrl,
++	validateSkipDiscoveryEndpoints,
+ } from "./discovery";
+ 
+ export { mapDiscoveryErrorToAPIError } from "./errors";
+diff --git a/packages/sso/src/oidc/types.ts b/packages/sso/src/oidc/types.ts
+index 8f60ffd71..4fb8110aa 100644
+--- a/packages/sso/src/oidc/types.ts
++++ b/packages/sso/src/oidc/types.ts
+@@ -101,10 +101,12 @@ export type DiscoveryErrorCode =
+ 	| "discovery_not_found"
+ 	/** Discovery endpoint returned invalid JSON */
+ 	| "discovery_invalid_json"
+-	/** Discovery URL is invalid or malformed */
++	/** OIDC endpoint URL (discovery or per-endpoint: authorization, token, userinfo, jwks) is invalid, malformed, or uses a non-`http(s)` scheme */
+ 	| "discovery_invalid_url"
+-	/** Discovery URL is not trusted by the trusted origins configuration */
++	/** OIDC endpoint URL is not trusted by the trusted origins configuration */
+ 	| "discovery_untrusted_origin"
++	/** OIDC endpoint URL (discovery or per-endpoint) points to a host that is not publicly routable (loopback, RFC 1918, link-local, cloud metadata FQDN, etc.) */
++	| "discovery_private_host"
+ 	/** Discovery document issuer doesn't match configured issuer */
+ 	| "issuer_mismatch"
+ 	/** Discovery document is missing required fields */
+diff --git a/packages/sso/src/routes/schemas.ts b/packages/sso/src/routes/schemas.ts
+index cc836d75c..803a7a745 100644
+--- a/packages/sso/src/routes/schemas.ts
++++ b/packages/sso/src/routes/schemas.ts
+@@ -26,14 +26,14 @@ const samlMappingSchema = z
+ const oidcConfigSchema = z.object({
+ 	clientId: z.string().optional(),
+ 	clientSecret: z.string().optional(),
+-	authorizationEndpoint: z.string().url().optional(),
+-	tokenEndpoint: z.string().url().optional(),
+-	userInfoEndpoint: z.string().url().optional(),
++	authorizationEndpoint: z.url().optional(),
++	tokenEndpoint: z.url().optional(),
++	userInfoEndpoint: z.url().optional(),
+ 	tokenEndpointAuthentication: z
+ 		.enum(["client_secret_post", "client_secret_basic"])
+ 		.optional(),
+-	jwksEndpoint: z.string().url().optional(),
+-	discoveryEndpoint: z.string().url().optional(),
++	jwksEndpoint: z.url().optional(),
++	discoveryEndpoint: z.url().optional(),
+ 	scopes: z.array(z.string()).optional(),
+ 	pkce: z.boolean().optional(),
+ 	overrideUserInfo: z.boolean().optional(),
+diff --git a/packages/sso/src/routes/sso.ts b/packages/sso/src/routes/sso.ts
+index f2057c6f9..0cf6ccddd 100644
+--- a/packages/sso/src/routes/sso.ts
++++ b/packages/sso/src/routes/sso.ts
+@@ -28,6 +28,7 @@ import {
+ 	discoverOIDCConfig,
+ 	ensureRuntimeDiscovery,
+ 	mapDiscoveryErrorToAPIError,
++	validateSkipDiscoveryEndpoints,
+ } from "../oidc";
+ import { validateConfigAlgorithms } from "../saml";
+ import { SAML_ERROR_CODES } from "../saml/error-codes";
+@@ -194,19 +195,19 @@ const ssoProviderBodySchema = z.object({
+ 				description: "The client secret",
+ 			}),
+ 			authorizationEndpoint: z
+-				.string({})
++				.url()
+ 				.meta({
+ 					description: "The authorization endpoint",
+ 				})
+ 				.optional(),
+ 			tokenEndpoint: z
+-				.string({})
++				.url()
+ 				.meta({
+ 					description: "The token endpoint",
+ 				})
+ 				.optional(),
+ 			userInfoEndpoint: z
+-				.string({})
++				.url()
+ 				.meta({
+ 					description: "The user info endpoint",
+ 				})
+@@ -215,12 +216,12 @@ const ssoProviderBodySchema = z.object({
+ 				.enum(["client_secret_post", "client_secret_basic"])
+ 				.optional(),
+ 			jwksEndpoint: z
+-				.string({})
++				.url()
+ 				.meta({
+ 					description: "The JWKS endpoint",
+ 				})
+ 				.optional(),
+-			discoveryEndpoint: z.string().optional(),
++			discoveryEndpoint: z.url().optional(),
+ 			skipDiscovery: z
+ 				.boolean()
+ 				.meta({
+@@ -669,6 +670,19 @@ export const registerSSOProvider = <O extends SSOOptions>(options: O) => {
+ 				});
+ 			}
+ 
++			if (body.oidcConfig) {
++				try {
++					validateSkipDiscoveryEndpoints(body.oidcConfig, (url) =>
++						ctx.context.isTrustedOrigin(url),
++					);
++				} catch (error) {
++					if (error instanceof DiscoveryError) {
++						throw mapDiscoveryErrorToAPIError(error);
++					}
++					throw error;
++				}
++			}
++
+ 			let hydratedOIDCConfig: HydratedOIDCConfig | null = null;
+ 			if (body.oidcConfig && !body.oidcConfig.skipDiscovery) {
+ 				try {

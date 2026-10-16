@@ -1,0 +1,233 @@
+diff -ruN a/packages/sso/src/oidc/discovery.ts b/packages/sso/src/oidc/discovery.ts
+--- a/packages/sso/src/oidc/discovery.ts	2026-05-12 09:12:03
++++ b/packages/sso/src/oidc/discovery.ts	2026-10-16 13:02:58
+@@ -8,6 +8,7 @@
+  * @see https://openid.net/specs/openid-connect-discovery-1_0.html
+  */
+ 
++import { isPublicRoutableHost } from "@better-auth/core/utils/host";
+ import { betterFetch } from "@better-fetch/fetch";
+ import type { OIDCConfig } from "../types";
+ import type {
+@@ -522,4 +523,87 @@
+ 		userInfoEndpoint: hydrated.userInfoEndpoint,
+ 		jwksEndpoint: hydrated.jwksEndpoint,
+ 	};
++}
++
++/**
++ * Provider configuration fields that hold addresses the server may contact
++ * (or send users to) on behalf of an OIDC provider.
++ */
++export const PROVIDER_ENDPOINT_FIELDS = [
++	"discoveryEndpoint",
++	"authorizationEndpoint",
++	"tokenEndpoint",
++	"userInfoEndpoint",
++	"jwksEndpoint",
++] as const;
++
++export type ProviderEndpointField = (typeof PROVIDER_ENDPOINT_FIELDS)[number];
++
++/**
++ * Returns true when the server is allowed to use `url` for a provider:
++ * it must be an absolute http(s) URL whose origin is trusted by the
++ * deployment's trusted origins configuration, or whose host is publicly
++ * routable. Loopback, private-network, link-local, cloud-metadata and other
++ * special-purpose hosts (in any spelling the URL parser accepts) are refused
++ * unless their origin is explicitly trusted.
++ */
++export function isPermittedProviderUrl(
++	url: string,
++	isTrustedOrigin: (url: string) => boolean,
++): boolean {
++	if (typeof url !== "string" || url.length === 0) {
++		return false;
++	}
++	let parsed: URL;
++	try {
++		parsed = new URL(url);
++	} catch {
++		return false;
++	}
++	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
++		return false;
++	}
++	if (isTrustedOrigin(url)) {
++		return true;
++	}
++	return isPublicRoutableHost(parsed.hostname);
++}
++
++/**
++ * Validates every endpoint address present in a provider configuration.
++ *
++ * @param config - Provider configuration (only endpoint fields are read)
++ * @param isTrustedOrigin - Origin verification tester function
++ * @param fields - Which endpoint fields to check (defaults to all)
++ * @throws DiscoveryError if an endpoint is malformed or not permitted
++ */
++export function validateProviderEndpoints(
++	config: Partial<Record<ProviderEndpointField, unknown>> | null | undefined,
++	isTrustedOrigin: (url: string) => boolean,
++	fields: readonly ProviderEndpointField[] = PROVIDER_ENDPOINT_FIELDS,
++): void {
++	if (!config) {
++		return;
++	}
++	for (const field of fields) {
++		const value = config[field];
++		if (value === undefined || value === null || value === "") {
++			continue;
++		}
++		if (typeof value !== "string") {
++			throw new DiscoveryError(
++				"discovery_invalid_url",
++				`The url "${field}" must be a valid http or https url`,
++				{ endpoint: field },
++			);
++		}
++		const url = parseURL(field, value);
++		if (!isPermittedProviderUrl(value, isTrustedOrigin)) {
++			throw new DiscoveryError(
++				"discovery_untrusted_origin",
++				`The ${field} "${url.toString()}" is not a publicly routable address and is not trusted by your trusted origins configuration.`,
++				{ endpoint: field, url: url.toString() },
++			);
++		}
++	}
+ }
+diff -ruN a/packages/sso/src/oidc/index.ts b/packages/sso/src/oidc/index.ts
+--- a/packages/sso/src/oidc/index.ts	2026-05-12 09:12:03
++++ b/packages/sso/src/oidc/index.ts	2026-10-16 13:02:58
+@@ -11,12 +11,16 @@
+ 	discoverOIDCConfig,
+ 	ensureRuntimeDiscovery,
+ 	fetchDiscoveryDocument,
++	isPermittedProviderUrl,
+ 	needsRuntimeDiscovery,
+ 	normalizeDiscoveryUrls,
+ 	normalizeUrl,
++	PROVIDER_ENDPOINT_FIELDS,
++	type ProviderEndpointField,
+ 	selectTokenEndpointAuthMethod,
+ 	validateDiscoveryDocument,
+ 	validateDiscoveryUrl,
++	validateProviderEndpoints,
+ } from "./discovery";
+ 
+ export { mapDiscoveryErrorToAPIError } from "./errors";
+diff -ruN a/packages/sso/src/routes/providers.ts b/packages/sso/src/routes/providers.ts
+--- a/packages/sso/src/routes/providers.ts	2026-05-12 09:12:03
++++ b/packages/sso/src/routes/providers.ts	2026-10-16 13:03:22
+@@ -6,6 +6,11 @@
+ } from "better-auth/api";
+ import * as z from "zod";
+ import { DEFAULT_MAX_SAML_METADATA_SIZE } from "../constants";
++import {
++	DiscoveryError,
++	mapDiscoveryErrorToAPIError,
++	validateProviderEndpoints,
++} from "../oidc";
+ import { validateConfigAlgorithms } from "../saml";
+ import type { Member, OIDCConfig, SAMLConfig, SSOOptions } from "../types";
+ import { maskClientId, parseCertificate, safeJsonParse } from "../utils";
+@@ -484,6 +489,20 @@
+ 			}
+ 
+ 			if (body.oidcConfig) {
++				// Endpoints supplied here are hosts the server will contact on the
++				// provider's behalf: only publicly routable hosts or trusted
++				// origins are permitted.
++				try {
++					validateProviderEndpoints(body.oidcConfig, (url: string) =>
++						ctx.context.isTrustedOrigin(url),
++					);
++				} catch (error) {
++					if (error instanceof DiscoveryError) {
++						throw mapDiscoveryErrorToAPIError(error);
++					}
++					throw error;
++				}
++
+ 				const currentOidcConfig = parseAndValidateConfig<OIDCConfig>(
+ 					existingProvider.oidcConfig,
+ 					"OIDC",
+diff -ruN a/packages/sso/src/routes/sso.ts b/packages/sso/src/routes/sso.ts
+--- a/packages/sso/src/routes/sso.ts	2026-05-12 09:12:03
++++ b/packages/sso/src/routes/sso.ts	2026-10-16 13:03:14
+@@ -28,6 +28,7 @@
+ 	discoverOIDCConfig,
+ 	ensureRuntimeDiscovery,
+ 	mapDiscoveryErrorToAPIError,
++	validateProviderEndpoints,
+ } from "../oidc";
+ import { validateConfigAlgorithms } from "../saml";
+ import { SAML_ERROR_CODES } from "../saml/error-codes";
+@@ -669,6 +670,22 @@
+ 				});
+ 			}
+ 
++			if (body.oidcConfig) {
++				// Every endpoint the caller supplies is a host the server will
++				// contact (or send users to) on the provider's behalf. Only
++				// publicly routable hosts or trusted origins are permitted.
++				try {
++					validateProviderEndpoints(body.oidcConfig, (url: string) =>
++						ctx.context.isTrustedOrigin(url),
++					);
++				} catch (error) {
++					if (error instanceof DiscoveryError) {
++						throw mapDiscoveryErrorToAPIError(error);
++					}
++					throw error;
++				}
++			}
++
+ 			let hydratedOIDCConfig: HydratedOIDCConfig | null = null;
+ 			if (body.oidcConfig && !body.oidcConfig.skipDiscovery) {
+ 				try {
+@@ -1396,11 +1413,16 @@
+ 		);
+ 	}
+ 	let provider: SSOProvider<SSOOptions> | null = null;
++	// Providers declared by the operator in `defaultSSO` are server
++	// configuration; providers loaded from the database were supplied through
++	// the public API and their endpoints must be re-checked before use.
++	let isOperatorProvider = false;
+ 	if (options?.defaultSSO?.length) {
+ 		const matchingDefault = options.defaultSSO.find(
+ 			(defaultProvider) => defaultProvider.providerId === providerId,
+ 		);
+ 		if (matchingDefault) {
++			isOperatorProvider = true;
+ 			provider = {
+ 				...matchingDefault,
+ 				issuer: matchingDefault.oidcConfig?.issuer || "",
+@@ -1477,6 +1499,26 @@
+ 			}?error=discovery_failed&error_description=unexpected_discovery_error`,
+ 		);
+ 	}
++	if (!isOperatorProvider) {
++		try {
++			validateProviderEndpoints(
++				config,
++				(url) => ctx.context.isTrustedOrigin(url),
++				["tokenEndpoint", "userInfoEndpoint", "jwksEndpoint"],
++			);
++		} catch (error) {
++			const description =
++				error instanceof DiscoveryError
++					? error.code
++					: "untrusted_provider_endpoint";
++			throw ctx.redirect(
++				`${
++					errorURL || callbackURL
++				}?error=invalid_provider&error_description=${encodeURIComponent(description)}`,
++			);
++		}
++	}
++
+ 	if (!config.scopes) {
+ 		config = {
+ 			...config,
