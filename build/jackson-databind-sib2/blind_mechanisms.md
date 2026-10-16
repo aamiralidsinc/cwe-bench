@@ -1,0 +1,16 @@
+# Mechanisms changed (blind fix, jackson-databind-sib2)
+
+Legend: [REPORT] = the report's wording pointed me to it; [CODE] = found by reading the code.
+
+1. ExternalTypeHandler: values for an external-type-id property hidden by the active view were buffered and set via `handlePropertyValue` / `_handleTypePropertyValue` / `complete(bean)` with no view check. Now the value is skipped, the type id is never used to fill the hidden property, and `complete()` leaves it alone. Applies to the default-ctor, update and Builder paths. [REPORT: the `asset` / `kind` example]
+2. ExternalTypeHandler `complete(buffer, creator)`: hidden external-typed creator parameters and fields are no longer deserialized, assigned or `set(null)`. That includes the #3533 "type id only" path that built an instance from the type id alone. [REPORT: example plus "however the object is built"]
+3. ExternalTypeHandler `complete(buffer, creator)`: a type-id property that is itself a creator parameter (#999 linkage) is no longer given a value when it is hidden. A visible type-id parameter still gets one, even when its value property is hidden. [CODE]
+4. Shared type id (#291 multi-index list) and a hidden type-id property: the type id is still recorded, so visible siblings and dependents bind exactly as before. [REPORT: "next to a hidden value or depend on one"]
+5. BeanDeserializer.deserializeUsingPropertyBasedWithExternalTypeId: ordinary creator properties (not part of the external type id) were assigned with no view check. A view check is now added. [CODE; the report's "however the object is built" points in this direction]
+6. BeanAsArrayDeserializer.deserialize(p, ctxt, bean): the readerForUpdating path for `@JsonFormat(shape=ARRAY)` beans ignored views. A view check is now added. [CODE; the report's "applied to an existing one" points in this direction]
+7. ThrowableDeserializer.deserializeFromObject: properties of Throwable types, whether set directly or buffered as pending, ignored views. A view check is now added. [CODE; the report's "whatever the type looks like"]
+8. Object Id (`@JsonIdentityInfo` PropertyGenerator): ObjectIdValueProperty, PropertyValueBuffer.handleIdValue and BeanDeserializerBase._handleTypedObjectId wrote the id into a view-hidden id property. The Object Id is still bound, so references keep working, but the hidden property is no longer set. [CODE]
+9. POJOPropertyBuilder.findViews: for deserialization, `@JsonView` on a getter was ignored when the getter is the only accessor. This covers setterless Collection/Map properties and getter-only `@JsonMerge` properties. The getter's views are now used. [CODE; the report's "however the object is populated"]
+10. Any-setter with `@JsonView` (method, field or 2.18 creator parameter): it previously accepted values under any view. It now skips them silently. This is done through SettableAnyProperty.visibleInView plus BeanDeserializerBase._anySetterHiddenInView, checked at every any-setter call site: vanilla/view, property-based, unwrapped, external-type, Builder and Throwable. [CODE]
+
+Already fixed in the given repository, so I did not change them: creator and buffered regular properties in the property-based paths (#5969/#5971), and unwrapped properties (#6060).

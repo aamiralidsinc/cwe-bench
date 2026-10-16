@@ -1,0 +1,309 @@
+diff --git a/src/webob/exc.py b/src/webob/exc.py
+index 553a0b1..f6cc59a 100644
+--- a/src/webob/exc.py
++++ b/src/webob/exc.py
+@@ -175,7 +175,6 @@ from webob.compat import (
+     class_types,
+     text_,
+     text_type,
+-    urlparse,
+     )
+ from webob.request import Request
+ from webob.response import Response
+@@ -530,7 +529,14 @@ ${html_comment}''')
+             if req.environ.get('QUERY_STRING'):
+                 url += '?' + req.environ['QUERY_STRING']
+             self.location = url
+-        self.location = urlparse.urljoin(req.path_url, self.location)
++        if self.location:
++            # Normalize the location through the same code path used for
++            # the Location header so that a relative (or protocol-relative)
++            # location cannot turn into an open redirect. See
++            # CVE-2024-42353, GHSA-fh3h-vg37-cc95, and GHSA-6hx8-3wjj-gr8g.
++            self.location = self._make_location_absolute(environ, self.location)
++        else:
++            self.location = req.path_url
+         return super(_HTTPMove, self).__call__(
+             environ, start_response)
+ 
+diff --git a/src/webob/request.py b/src/webob/request.py
+index 343f282..7f3d77c 100644
+--- a/src/webob/request.py
++++ b/src/webob/request.py
+@@ -67,6 +67,8 @@ from webob.etag import (
+ 
+ from webob.headers import EnvironHeaders
+ 
++from webob.util import urljoin
++
+ from webob.multidict import (
+     NestedMultiDict,
+     MultiDict,
+@@ -511,7 +513,10 @@ class BaseRequest(object):
+                 url += '/'
+         else:
+             url = self.path_url
+-        return urlparse.urljoin(url, other_url)
++        # Use WebOb's own RFC 3986 urljoin() rather than
++        # urllib.parse.urljoin(), which removes ASCII tab/CR/LF and strips
++        # leading/trailing C0 control and space characters before parsing.
++        return urljoin(url, other_url)
+ 
+     def path_info_pop(self, pattern=None):
+         """
+diff --git a/src/webob/response.py b/src/webob/response.py
+index 91b801c..ff70a5f 100644
+--- a/src/webob/response.py
++++ b/src/webob/response.py
+@@ -14,7 +14,6 @@ from webob.compat import (
+     string_types,
+     text_type,
+     url_quote,
+-    urlparse,
+ )
+ from webob.cookies import Cookie, make_cookie
+ from webob.datetime_utils import (
+@@ -41,7 +40,12 @@ from webob.descriptors import (
+ )
+ from webob.headers import ResponseHeaders
+ from webob.request import BaseRequest
+-from webob.util import status_generic_reasons, status_reasons, warn_deprecation
++from webob.util import (
++    status_generic_reasons,
++    status_reasons,
++    urljoin,
++    warn_deprecation,
++)
+ 
+ try:
+     import simplejson as json
+@@ -1281,10 +1285,9 @@ class Response(object):
+ 
+     @staticmethod
+     def _make_location_absolute(environ, value):
+-        # urllib.parse.urlsplit() (called internally by urljoin) strips
+-        # ASCII tab, CR, and LF from the URL on Python 3.10+. Strip them
+-        # ourselves first so they cannot be used to bypass the SCHEME_RE
+-        # or protocol-relative ("//") checks below. See CVE-2024-42353,
++        # Strip ASCII tab, CR, and LF so they cannot be used to smuggle a
++        # protocol-relative URL past the checks below (user agents remove
++        # them when parsing a URL). See CVE-2024-42353,
+         # https://github.com/Pylons/webob/security/advisories/GHSA-mg3v-6m49-jhp3,
+         # and the follow-up advisory GHSA-fh3h-vg37-cc95.
+         value = value.replace("\t", "").replace("\r", "").replace("\n", "")
+@@ -1294,7 +1297,15 @@ class Response(object):
+ 
+         if value.startswith("//"):
+             value = "/%2f{}".format(value[2:])
+-        new_location = urlparse.urljoin(_request_uri(environ), value)
++
++        # urllib.parse.urljoin() removes ASCII tab/CR/LF anywhere in the
++        # URL and strips leading and trailing C0 control and space
++        # characters before parsing (Python 3.10+). That turns values such
++        # as " //evil.example" into protocol-relative URLs, bypassing the
++        # checks above. Use WebOb's own RFC 3986 urljoin(), which resolves
++        # the value exactly as given. See GHSA-6hx8-3wjj-gr8g.
++        new_location = urljoin(_request_uri(environ), value)
++
+         return new_location
+ 
+     def _abs_headerlist(self, environ):
+diff --git a/src/webob/util.py b/src/webob/util.py
+index b7db88c..6e0f0b3 100644
+--- a/src/webob/util.py
++++ b/src/webob/util.py
+@@ -1,3 +1,4 @@
++import re
+ import warnings
+ 
+ from webob.compat import (
+@@ -35,6 +36,189 @@ def html_escape(s):
+         s = s.encode('ascii', 'xmlcharrefreplace')
+     return text_(s)
+ 
++
++# RFC 3986 section 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
++_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+\-.]*$")
++
++
++def _split_uri_reference(uri):
++    """Split a URI reference into its five components.
++
++    Returns a ``(scheme, authority, path, query, fragment)`` tuple,
++    following the grammar from RFC 3986 (see appendix B). Components that
++    are not present in the reference are ``None``. The path is always
++    present, but may be the empty string.
++
++    Unlike ``urllib.parse.urlsplit()``, no characters are ever removed
++    from the reference: ASCII tab/CR/LF and leading or trailing C0
++    control and space characters are treated like any other character.
++    """
++    scheme = authority = query = fragment = None
++
++    rest, sep, token = uri.partition("#")
++
++    if sep:
++        fragment = token
++
++    rest, sep, token = rest.partition("?")
++
++    if sep:
++        query = token
++
++    token, sep, candidate = rest.partition(":")
++
++    if sep and _URI_SCHEME_RE.match(token):
++        scheme = token
++        rest = candidate
++
++    if rest.startswith("//"):
++        end = rest.find("/", 2)
++
++        if end == -1:
++            authority, rest = rest[2:], ""
++        else:
++            authority, rest = rest[2:end], rest[end:]
++
++    return scheme, authority, rest, query, fragment
++
++
++def _remove_dot_segments(path):
++    """Remove ``.`` and ``..`` segments from a path (RFC 3986 5.2.4)."""
++    output = []
++
++    while path:
++        if path.startswith("../"):
++            path = path[3:]
++        elif path.startswith("./"):
++            path = path[2:]
++        elif path.startswith("/./"):
++            path = "/" + path[3:]
++        elif path == "/.":
++            path = "/"
++        elif path.startswith("/../"):
++            path = "/" + path[4:]
++
++            if output:
++                output.pop()
++        elif path == "/..":
++            path = "/"
++
++            if output:
++                output.pop()
++        elif path in (".", ".."):
++            path = ""
++        else:
++            end = path.find("/", 1) if path.startswith("/") else path.find("/")
++
++            if end == -1:
++                output.append(path)
++                path = ""
++            else:
++                output.append(path[:end])
++                path = path[end:]
++
++    return "".join(output)
++
++
++def _merge_paths(base_authority, base_path, path):
++    """Merge a relative-path reference with the base path (RFC 3986 5.2.3)."""
++
++    if base_authority is not None and base_path == "":
++        return "/" + path
++
++    if "/" in base_path:
++        return base_path[: base_path.rfind("/") + 1] + path
++
++    return path
++
++
++def urljoin(base, url):
++    """Resolve a URI reference relative to a base URI (RFC 3986 section 5).
++
++    A replacement for ``urllib.parse.urljoin()``. The standard library
++    implementation follows the WHATWG URL living standard (on Python
++    3.10+) by removing ASCII tab, CR, and LF anywhere in the URL and
++    stripping leading and trailing C0 control and space characters
++    before parsing. Those transformations can silently turn an otherwise
++    harmless relative reference such as ``" //evil.example"`` into a
++    protocol-relative or absolute URL, which has repeatedly led to open
++    redirect issues when normalizing the ``Location`` header (see
++    CVE-2024-42353/GHSA-mg3v-6m49-jhp3, GHSA-fh3h-vg37-cc95, and
++    GHSA-6hx8-3wjj-gr8g).
++
++    This implementation resolves the reference exactly as given,
++    character for character, with no whitespace removal whatsoever.
++    """
++
++    # Mirror urllib.parse.urljoin()'s short-circuits for degenerate input
++    # (such as a reference of None or the empty string), which callers of
++    # Request.relative_url() may rely on.
++
++    if not base:
++        return url
++
++    if not url:
++        return base
++
++    b_scheme, b_authority, b_path, b_query, b_fragment = _split_uri_reference(base)
++    r_scheme, r_authority, r_path, r_query, r_fragment = _split_uri_reference(url)
++
++    # Like urllib.parse.urljoin(), use the non-strict variant of the
++    # resolution algorithm (RFC 3986 5.2.2): a reference whose scheme
++    # matches the base scheme is treated as a relative reference.
++
++    if (
++        r_scheme is not None
++        and b_scheme is not None
++        and r_scheme.lower() == b_scheme.lower()
++    ):
++        r_scheme = None
++
++    if r_scheme is not None:
++        scheme = r_scheme
++        authority = r_authority
++        path = _remove_dot_segments(r_path)
++        query = r_query
++    elif r_authority is not None:
++        scheme = b_scheme
++        authority = r_authority
++        path = _remove_dot_segments(r_path)
++        query = r_query
++    elif r_path == "":
++        scheme = b_scheme
++        authority = b_authority
++        path = b_path
++        query = r_query if r_query is not None else b_query
++    else:
++        scheme = b_scheme
++        authority = b_authority
++
++        if r_path.startswith("/"):
++            path = _remove_dot_segments(r_path)
++        else:
++            path = _remove_dot_segments(_merge_paths(b_authority, b_path, r_path))
++        query = r_query
++    fragment = r_fragment
++
++    # Recompose the components (RFC 3986 5.3)
++    result = []
++
++    if scheme is not None:
++        result.append(scheme + ":")
++
++    if authority is not None:
++        result.append("//" + authority)
++    result.append(path)
++
++    if query is not None:
++        result.append("?" + query)
++
++    if fragment is not None:
++        result.append("#" + fragment)
++
++    return "".join(result)
++
++
+ def header_docstring(header, rfc_section):
+     if header.isupper():
+         header = _trans_key(header)

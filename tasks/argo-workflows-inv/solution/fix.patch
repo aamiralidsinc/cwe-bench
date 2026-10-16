@@ -1,0 +1,372 @@
+diff --git a/server/auth/webhook/interceptor.go b/server/auth/webhook/interceptor.go
+index 57f9795..458db1a 100644
+--- a/server/auth/webhook/interceptor.go
++++ b/server/auth/webhook/interceptor.go
+@@ -75,8 +75,16 @@ func (i *WebhookInterceptor) addWebhookAuthorization(r *http.Request, kube kuber
+ 		return fmt.Errorf("failed to get webhook clients: %w", err)
+ 	}
+ 	// we need to read the request body to check the signature, but we still need it for the GRPC request,
+-	// so read it all now, and then reinstate when we are done
+-	buf, _ := io.ReadAll(r.Body)
++	// so read it all now, and then reinstate when we are done.
++	// Limit to 2MB to prevent denial-of-service via oversized webhook payloads.
++	const maxWebhookSize = 2 * 1024 * 1024 // 2MB
++	buf, err2 := io.ReadAll(io.LimitReader(r.Body, maxWebhookSize+1))
++	if err2 != nil {
++		return fmt.Errorf("failed to read webhook request body: %w", err2)
++	}
++	if len(buf) > maxWebhookSize {
++		return fmt.Errorf("webhook request body exceeds maximum size of 2MB")
++	}
+ 	defer func() { r.Body = io.NopCloser(bytes.NewBuffer(buf)) }()
+ 	serviceAccountInterface := kube.CoreV1().ServiceAccounts(namespace)
+ 	for serviceAccountName, data := range webhookClients.Data {
+diff --git a/server/clusterworkflowtemplate/cluster_workflow_template_server.go b/server/clusterworkflowtemplate/cluster_workflow_template_server.go
+index 0e1c19c..3cb263e 100644
+--- a/server/clusterworkflowtemplate/cluster_workflow_template_server.go
++++ b/server/clusterworkflowtemplate/cluster_workflow_template_server.go
+@@ -6,6 +6,7 @@ import (
+ 	"sort"
+ 
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	clusterwftmplpkg "github.com/argoproj/argo-workflows/v4/pkg/apiclient/clusterworkflowtemplate"
+@@ -52,6 +53,13 @@ func (cwts *ClusterWorkflowTemplateServer) CreateClusterWorkflowTemplate(ctx con
+ }
+ 
+ func (cwts *ClusterWorkflowTemplateServer) GetClusterWorkflowTemplate(ctx context.Context, req *clusterwftmplpkg.ClusterWorkflowTemplateGetRequest) (*v1alpha1.ClusterWorkflowTemplate, error) {
++	allowed, err := auth.CanI(ctx, "get", "clusterworkflowtemplates", "", req.Name)
++	if err != nil {
++		return nil, serverutils.ToStatusError(err, codes.Internal)
++	}
++	if !allowed {
++		return nil, status.Error(codes.PermissionDenied, "permission denied")
++	}
+ 	wfTmpl, err := cwts.getTemplateAndValidate(ctx, req.Name)
+ 	if err != nil {
+ 		return nil, serverutils.ToStatusError(err, codes.Internal)
+diff --git a/server/sync/sync_cm.go b/server/sync/sync_cm.go
+index a4f81b3..cf35ed2 100644
+--- a/server/sync/sync_cm.go
++++ b/server/sync/sync_cm.go
+@@ -6,12 +6,14 @@ import (
+ 	"strconv"
+ 
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	syncpkg "github.com/argoproj/argo-workflows/v4/pkg/apiclient/sync"
+ 	"github.com/argoproj/argo-workflows/v4/server/auth"
+ 	sutils "github.com/argoproj/argo-workflows/v4/server/utils"
++	authutil "github.com/argoproj/argo-workflows/v4/util/auth"
+ )
+ 
+ type configMapSyncProvider struct{}
+@@ -23,6 +25,10 @@ func (s *configMapSyncProvider) createSyncLimit(ctx context.Context, req *syncpk
+ 		return nil, sutils.ToStatusError(fmt.Errorf("limit must be greater than zero"), codes.InvalidArgument)
+ 	}
+ 
++	if err := checkConfigMapPermission(ctx, "create", req.Namespace); err != nil {
++		return nil, err
++	}
++
+ 	kubeClient := auth.GetKubeClient(ctx)
+ 
+ 	configmapGetter := kubeClient.CoreV1().ConfigMaps(req.Namespace)
+@@ -67,6 +73,10 @@ func (s *configMapSyncProvider) createSyncLimit(ctx context.Context, req *syncpk
+ }
+ 
+ func (s *configMapSyncProvider) getSyncLimit(ctx context.Context, req *syncpkg.GetSyncLimitRequest) (*syncpkg.SyncLimitResponse, error) {
++	if err := checkConfigMapPermission(ctx, "get", req.Namespace); err != nil {
++		return nil, err
++	}
++
+ 	kubeClient := auth.GetKubeClient(ctx)
+ 
+ 	configmapGetter := kubeClient.CoreV1().ConfigMaps(req.Namespace)
+@@ -100,10 +110,18 @@ func (s *configMapSyncProvider) updateSyncLimit(ctx context.Context, req *syncpk
+ 		return nil, sutils.ToStatusError(fmt.Errorf("limit must be greater than zero"), codes.InvalidArgument)
+ 	}
+ 
++	if err := checkConfigMapPermission(ctx, "update", req.Namespace); err != nil {
++		return nil, err
++	}
++
+ 	return s.handleUpdateSyncLimit(ctx, req, true)
+ }
+ 
+ func (s *configMapSyncProvider) deleteSyncLimit(ctx context.Context, req *syncpkg.DeleteSyncLimitRequest) (*syncpkg.DeleteSyncLimitResponse, error) {
++	if err := checkConfigMapPermission(ctx, "update", req.Namespace); err != nil {
++		return nil, err
++	}
++
+ 	kubeClient := auth.GetKubeClient(ctx)
+ 
+ 	configmapGetter := kubeClient.CoreV1().ConfigMaps(req.Namespace)
+@@ -123,6 +141,18 @@ func (s *configMapSyncProvider) deleteSyncLimit(ctx context.Context, req *syncpk
+ 	return &syncpkg.DeleteSyncLimitResponse{}, nil
+ }
+ 
++func checkConfigMapPermission(ctx context.Context, verb, namespace string) error {
++	kubeClient := auth.GetKubeClient(ctx)
++	allowed, err := authutil.CanI(ctx, kubeClient, []string{verb}, "", namespace, "configmaps")
++	if err != nil {
++		return sutils.ToStatusError(err, codes.Internal)
++	}
++	if !allowed {
++		return status.Error(codes.PermissionDenied, fmt.Sprintf("Permission denied, you are not allowed to %s configmaps in namespace %q.", verb, namespace))
++	}
++	return nil
++}
++
+ func (s *configMapSyncProvider) handleUpdateSyncLimit(ctx context.Context, req *syncpkg.UpdateSyncLimitRequest, shouldFieldExist bool) (*syncpkg.SyncLimitResponse, error) {
+ 	kubeClient := auth.GetKubeClient(ctx)
+ 
+diff --git a/server/sync/sync_db.go b/server/sync/sync_db.go
+index d1f5b07..858de8f 100644
+--- a/server/sync/sync_db.go
++++ b/server/sync/sync_db.go
+@@ -23,7 +23,6 @@ var _ SyncConfigProvider = &dbSyncProvider{}
+ 
+ func (s *dbSyncProvider) createSyncLimit(ctx context.Context, req *syncpkg.CreateSyncLimitRequest) (*syncpkg.SyncLimitResponse, error) {
+ 	// since there's no permission system for db sync limits, we use the k8s RBAC check to see if the request is reasonable
+-	// configmap version is relying on the k8s RBAC so we don't need to check permissions
+ 	allowed, err := auth.CanI(ctx, "create", workflow.WorkflowPlural, req.Namespace, "")
+ 	if err != nil {
+ 		return nil, sutils.ToStatusError(err, codes.Internal)
+diff --git a/server/workflowtemplate/workflow_template_server.go b/server/workflowtemplate/workflow_template_server.go
+index b555aec..f457846 100644
+--- a/server/workflowtemplate/workflow_template_server.go
++++ b/server/workflowtemplate/workflow_template_server.go
+@@ -8,6 +8,7 @@ import (
+ 	"strings"
+ 
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 
+ 	workflowtemplatepkg "github.com/argoproj/argo-workflows/v4/pkg/apiclient/workflowtemplate"
+@@ -58,6 +59,13 @@ func (wts *WorkflowTemplateServer) CreateWorkflowTemplate(ctx context.Context, r
+ }
+ 
+ func (wts *WorkflowTemplateServer) GetWorkflowTemplate(ctx context.Context, req *workflowtemplatepkg.WorkflowTemplateGetRequest) (*v1alpha1.WorkflowTemplate, error) {
++	allowed, err := auth.CanI(ctx, "get", "workflowtemplates", req.Namespace, req.Name)
++	if err != nil {
++		return nil, sutils.ToStatusError(err, codes.Internal)
++	}
++	if !allowed {
++		return nil, status.Error(codes.PermissionDenied, "permission denied")
++	}
+ 	wfTmpl, err := wts.getTemplateAndValidate(ctx, req.Namespace, req.Name)
+ 	if err != nil {
+ 		return nil, sutils.ToStatusError(err, codes.Internal)
+diff --git a/workflow/artifacts/logging/driver.go b/workflow/artifacts/logging/driver.go
+index fb648af..96cf8df 100644
+--- a/workflow/artifacts/logging/driver.go
++++ b/workflow/artifacts/logging/driver.go
+@@ -21,7 +21,7 @@ func New(d common.ArtifactDriver) common.ArtifactDriver {
+ 
+ func (d *driver) Load(ctx context.Context, inputArtifact *wfv1.Artifact, path string) error {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Loading artifact")
++	log.Info(ctx, "Loading artifact")
+ 	t := time.Now()
+ 	key, _ := inputArtifact.GetKey()
+ 	err := d.ArtifactDriver.Load(ctx, inputArtifact, path)
+@@ -35,7 +35,7 @@ func (d *driver) Load(ctx context.Context, inputArtifact *wfv1.Artifact, path st
+ 
+ func (d *driver) OpenStream(ctx context.Context, inputArtifact *wfv1.Artifact) (io.ReadCloser, error) {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Opening stream")
++	log.Info(ctx, "Opening stream")
+ 	t := time.Now()
+ 	key, _ := inputArtifact.GetKey()
+ 	rc, err := d.ArtifactDriver.OpenStream(ctx, inputArtifact)
+@@ -49,7 +49,7 @@ func (d *driver) OpenStream(ctx context.Context, inputArtifact *wfv1.Artifact) (
+ 
+ func (d *driver) Save(ctx context.Context, path string, outputArtifact *wfv1.Artifact) error {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Saving artifact")
++	log.Info(ctx, "Saving artifact")
+ 	t := time.Now()
+ 	key, _ := outputArtifact.GetKey()
+ 	err := d.ArtifactDriver.Save(ctx, path, outputArtifact)
+@@ -63,13 +63,21 @@ func (d *driver) Save(ctx context.Context, path string, outputArtifact *wfv1.Art
+ 
+ func (d *driver) Delete(ctx context.Context, s *wfv1.Artifact) error {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Deleting artifact")
+-	return d.ArtifactDriver.Delete(ctx, s)
++	log.Info(ctx, "Deleting artifact")
++	t := time.Now()
++	key, _ := s.GetKey()
++	err := d.ArtifactDriver.Delete(ctx, s)
++	log.WithField("artifactName", s.Name).
++		WithField("key", key).
++		WithField("duration", time.Since(t)).
++		WithError(err).
++		Info(ctx, "Delete artifact")
++	return err
+ }
+ 
+ func (d *driver) ListObjects(ctx context.Context, artifact *wfv1.Artifact) ([]string, error) {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Listing objects")
++	log.Info(ctx, "Listing objects")
+ 	t := time.Now()
+ 	key, _ := artifact.GetKey()
+ 	list, err := d.ArtifactDriver.ListObjects(ctx, artifact)
+@@ -83,7 +91,7 @@ func (d *driver) ListObjects(ctx context.Context, artifact *wfv1.Artifact) ([]st
+ 
+ func (d *driver) IsDirectory(ctx context.Context, artifact *wfv1.Artifact) (bool, error) {
+ 	log := logging.RequireLoggerFromContext(ctx)
+-	log.WithField("driver", d.ArtifactDriver).Info(ctx, "Checking if directory")
++	log.Info(ctx, "Checking if directory")
+ 	t := time.Now()
+ 	key, _ := artifact.GetKey()
+ 	isDir, err := d.ArtifactDriver.IsDirectory(ctx, artifact)
+diff --git a/workflow/controller/operator.go b/workflow/controller/operator.go
+index 4560cc1..6ddc0e0 100644
+--- a/workflow/controller/operator.go
++++ b/workflow/controller/operator.go
+@@ -4283,12 +4283,13 @@ func (woc *wfOperationCtx) retryStrategy(tmpl *wfv1.Template) *wfv1.RetryStrateg
+ func (woc *wfOperationCtx) setExecWorkflow(ctx context.Context) error {
+ 	if woc.wf.Spec.WorkflowTemplateRef != nil { // not-woc-misuse
+ 		// When workflow restrictions require template referencing (Strict/Secure mode),
+-		// reject workflows that include a podSpecPatch as it could override security
+-		// settings defined in the WorkflowTemplate.
+-		if woc.controller.Config.WorkflowRestrictions.MustUseReference() && woc.wf.Spec.HasPodSpecPatch() { // not-woc-misuse: intentionally checking the user-submitted spec
+-			err := fmt.Errorf("podSpecPatch is not permitted when using workflowTemplateRef with templateReferencing restriction")
+-			woc.markWorkflowError(ctx, err)
+-			return err
++		// reject workflows that set any non-allowed fields, as they could override
++		// security settings defined in the WorkflowTemplate.
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() { // not-woc-misuse: intentionally checking the user-submitted spec
++			if err := wfutil.ValidateUserOverrides(&woc.wf.Spec); err != nil { // not-woc-misuse
++				woc.markWorkflowError(ctx, err)
++				return err
++			}
+ 		}
+ 		err := woc.setStoredWfSpec(ctx)
+ 		if err != nil {
+@@ -4402,8 +4403,14 @@ func (woc *wfOperationCtx) setStoredWfSpec(ctx context.Context) error {
+ 	}
+ 	// Update the Entrypoint, ShutdownStrategy and Suspend
+ 	if woc.needsStoredWfSpecUpdate() {
++		// In reference mode, sanitize the user spec before merging so that
++		// only allow-listed fields participate in the strategic merge patch.
++		userSpec := &woc.wf.Spec // not-woc-misuse
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() {
++			userSpec = wfutil.SanitizeUserWorkflowSpec(&woc.wf.Spec) // not-woc-misuse
++		}
+ 		// Join workflow, workflow template, and workflow default metadata to workflow spec.
+-		mergedWf, err := wfutil.JoinWorkflowSpec(&woc.wf.Spec, workflowTemplateSpec, &wfDefault.Spec) // not-woc-misuse
++		mergedWf, err := wfutil.JoinWorkflowSpec(userSpec, workflowTemplateSpec, &wfDefault.Spec)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -4414,7 +4421,11 @@ func (woc *wfOperationCtx) setStoredWfSpec(ctx context.Context) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		mergedWf, err := wfutil.JoinWorkflowSpec(&woc.wf.Spec, wftHolder.GetWorkflowSpec(), &wfDefault.Spec) // not-woc-misuse
++		userSpec := &woc.wf.Spec // not-woc-misuse
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() {
++			userSpec = wfutil.SanitizeUserWorkflowSpec(&woc.wf.Spec) // not-woc-misuse
++		}
++		mergedWf, err := wfutil.JoinWorkflowSpec(userSpec, wftHolder.GetWorkflowSpec(), &wfDefault.Spec)
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/workflow/util/merge.go b/workflow/util/merge.go
+index 0f69d32..079f5e0 100644
+--- a/workflow/util/merge.go
++++ b/workflow/util/merge.go
+@@ -2,6 +2,9 @@ package util
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
++	"reflect"
++	"sort"
+ 
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+@@ -9,6 +12,73 @@ import (
+ 	wfv1 "github.com/argoproj/argo-workflows/v4/pkg/apis/workflow/v1alpha1"
+ )
+ 
++// allowedUserOverrideFields lists WorkflowSpec fields that users may set when
++// submitting a workflow via workflowTemplateRef under Strict/Secure mode.
++// Any field NOT in this set is blocked by default, ensuring new fields added
++// to WorkflowSpec are denied until explicitly reviewed.
++var allowedUserOverrideFields = map[string]bool{
++	"Arguments":             true,
++	"Entrypoint":            true,
++	"Shutdown":              true,
++	"Suspend":               true,
++	"ActiveDeadlineSeconds": true,
++	"Priority":              true,
++	"TTLStrategy":           true,
++	"PodGC":                 true,
++	"VolumeClaimGC":         true,
++	"ArchiveLogs":           true,
++	"WorkflowMetadata":      true,
++	"WorkflowTemplateRef":   true,
++	"Metrics":               true,
++	"ArtifactGC":            true,
++}
++
++// ValidateUserOverrides checks that a user-submitted WorkflowSpec only sets
++// fields from the allow-list. Returns an error listing all violations.
++func ValidateUserOverrides(userSpec *wfv1.WorkflowSpec) error {
++	if userSpec == nil {
++		return nil
++	}
++	v := reflect.ValueOf(userSpec).Elem()
++	t := v.Type()
++	zero := reflect.New(t).Elem()
++
++	var violations []string
++	for i := 0; i < t.NumField(); i++ {
++		fieldName := t.Field(i).Name
++		if allowedUserOverrideFields[fieldName] {
++			continue
++		}
++		if !reflect.DeepEqual(v.Field(i).Interface(), zero.Field(i).Interface()) {
++			violations = append(violations, fieldName)
++		}
++	}
++	if len(violations) > 0 {
++		sort.Strings(violations)
++		return fmt.Errorf("fields %v are not permitted when using workflowTemplateRef with templateReferencing restriction", violations)
++	}
++	return nil
++}
++
++// SanitizeUserWorkflowSpec returns a copy of userSpec with only allow-listed
++// fields preserved. This provides defense-in-depth after validation.
++func SanitizeUserWorkflowSpec(userSpec *wfv1.WorkflowSpec) *wfv1.WorkflowSpec {
++	if userSpec == nil {
++		return nil
++	}
++	sanitized := &wfv1.WorkflowSpec{}
++	src := reflect.ValueOf(userSpec).Elem()
++	dst := reflect.ValueOf(sanitized).Elem()
++	t := src.Type()
++
++	for i := 0; i < t.NumField(); i++ {
++		if allowedUserOverrideFields[t.Field(i).Name] {
++			dst.Field(i).Set(src.Field(i))
++		}
++	}
++	return sanitized
++}
++
+ // MergeTo will merge one workflow (the "patch" workflow) into another (the "target" workflow.
+ // If the target workflow defines a field, this take precedence over the patch.
+ func MergeTo(patch, target *wfv1.Workflow) error {

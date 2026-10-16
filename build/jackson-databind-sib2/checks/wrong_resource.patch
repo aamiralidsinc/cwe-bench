@@ -1,0 +1,296 @@
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java b/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
+index d606d86..46d914c 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
+@@ -17,6 +17,7 @@ import com.fasterxml.jackson.databind.jsontype.TypeDeserializer;
+ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+ import com.fasterxml.jackson.databind.node.ObjectNode;
+ import com.fasterxml.jackson.databind.util.ClassUtil;
++import com.fasterxml.jackson.databind.util.ViewMatcher;
+ 
+ /**
+  * Class that represents a "wildcard" set method which can be used
+@@ -177,6 +178,25 @@ public abstract class SettableAnyProperty
+ 
+     public BeanProperty getProperty() { return _property; }
+ 
++    /**
++     * Accessor for checking whether this "any" property is visible in the
++     * currently active deserialization view. An any-setter annotated with
++     * {@code @JsonView} must only collect values when its declared view (or a
++     * sub-view) is active; otherwise it would bypass view-based filtering by
++     * binding otherwise-unmapped properties regardless of the active view.
++     */
++    public boolean visibleInView(DeserializationContext ctxt, Class<?> activeView) {
++        if (activeView == null) {
++            return true;
++        }
++        Class<?>[] views = ctxt.getAnnotationIntrospector().findViews(_setter);
++        // No `@JsonView` declared: visible in every view (default inclusion).
++        if (views == null) {
++            return true;
++        }
++        return ViewMatcher.construct(views).isVisibleForView(activeView);
++    }
++
+     public boolean hasValueDeserializer() { return (_valueDeserializer != null); }
+ 
+     public JavaType getType() { return _type; }
+@@ -231,6 +251,12 @@ public abstract class SettableAnyProperty
+             Object instance, String propName)
+         throws IOException
+     {
++        // Honor `@JsonView` on the any-setter: when a view is active in which
++        // this property is not visible, discard the value instead of binding it.
++        if (!visibleInView(ctxt, ctxt.getActiveView())) {
++            p.skipChildren();
++            return;
++        }
+         try {
+             Object key = (_keyDeserializer == null) ? propName
+                     : _keyDeserializer.deserializeKey(propName, ctxt);
+@@ -452,6 +478,11 @@ public abstract class SettableAnyProperty
+                 Object instance, String propName)
+             throws IOException
+         {
++            // Honor `@JsonView` here too (see base implementation).
++            if (!visibleInView(ctxt, ctxt.getActiveView())) {
++                p.skipChildren();
++                return;
++            }
+             setProperty(instance, propName, (JsonNode) deserialize(p, ctxt));
+         }
+ 
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanAsArrayDeserializer.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanAsArrayDeserializer.java
+index 71c28d1..619eed1 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanAsArrayDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/BeanAsArrayDeserializer.java
+@@ -164,6 +164,8 @@ public class BeanAsArrayDeserializer
+         if (_injectables != null) {
+             injectValues(ctxt, bean);
+         }
++        // Must honor `@JsonView` when updating an existing instance, too
++        final Class<?> activeView = _needViewProcesing ? ctxt.getActiveView() : null;
+         final SettableBeanProperty[] props = _orderedProperties;
+         int i = 0;
+         final int propCount = props.length;
+@@ -175,13 +177,14 @@ public class BeanAsArrayDeserializer
+                 break;
+             }
+             SettableBeanProperty prop = props[i];
+-            if (prop != null) { // normal case
++            if ((prop != null) // normal case
++                    && ((activeView == null) || prop.visibleInView(activeView))) {
+                 try {
+                     prop.deserializeAndSet(p, ctxt, bean);
+                 } catch (Exception e) {
+                     wrapAndThrow(e, bean, prop.getName(), ctxt);
+                 }
+-            } else { // just skip?
++            } else { // just skip? (no property, or view-filtered)
+                 p.skipChildren();
+             }
+             ++i;
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ExternalTypeHandler.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ExternalTypeHandler.java
+index c6b2628..ee5dcb3 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ExternalTypeHandler.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ExternalTypeHandler.java
+@@ -201,9 +201,17 @@ public class ExternalTypeHandler
+     public Object complete(JsonParser p, DeserializationContext ctxt, Object bean)
+         throws IOException
+     {
++        final Class<?> activeView = ctxt.getActiveView();
+         for (int i = 0, len = _properties.length; i < len; ++i) {
+-            String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
++            // 26-Jun-2026, tatu: Must honor `@JsonView` for external-type-id
++            //   properties too (see JsonViewExternalTypeIdBypassTest); otherwise
++            //   value for property not visible in active view would still get bound,
++            //   bypassing view-based filtering.
++            if ((activeView != null) && !extProp.getProperty().visibleInView(activeView)) {
++                continue;
++            }
++            String typeId = _typeIds[i];
+             if (typeId == null) {
+                 TokenBuffer tokens = _tokens[i];
+                 // let's allow missing both type and property (may already have been set, too)
+@@ -264,53 +272,71 @@ public class ExternalTypeHandler
+         // first things first: deserialize all data buffered:
+         final int len = _properties.length;
+         Object[] values = new Object[len];
++        final Class<?> activeView = ctxt.getActiveView();
+         for (int i = 0; i < len; ++i) {
+-            String typeId = _typeIds[i];
+             final ExtTypedProperty extProp = _properties[i];
+-            if (typeId == null) {
+-                // let's allow missing both type and property (may already have been set, too)
+-                TokenBuffer tb = _tokens[i];
+-                if ((tb == null)
+-                        // 19-Feb-2021, tatu: Both missing value and explicit `null`
+-                        //    should be accepted...
+-                        || (tb.firstToken() == JsonToken.VALUE_NULL)
+-                    ) {
+-                    continue;
+-                }
+-                // but not just one
+-                // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
+-                if (!extProp.hasDefaultType()) {
+-                    ctxt.reportPropertyInputMismatch(_beanType, extProp.getProperty().getName(),
+-                            "Missing external type id property '%s'",
+-                            extProp.getTypePropertyName());
+-                } else {
+-                    typeId = extProp.getDefaultTypeId();
++            final SettableBeanProperty prop = extProp.getProperty();
++            String typeId = _typeIds[i];
++
++            // 26-Jun-2026, tatu: Must honor `@JsonView` for external-type-id
++            //   properties too (see JsonViewExternalTypeIdBypassTest): leave the
++            //   value of a property not visible in the active view unbound (null),
++            //   so it does not bypass view-based filtering. NOTE: the external type
++            //   id itself may be a separate, still-visible creator property, so that
++            //   is still assigned below ([databind#999]).
++            final boolean viewHidden = (activeView != null) && !prop.visibleInView(activeView);
++
++            if (!viewHidden) {
++                if (typeId == null) {
++                    // let's allow missing both type and property (may already have been set, too)
++                    TokenBuffer tb = _tokens[i];
++                    if ((tb == null)
++                            // 19-Feb-2021, tatu: Both missing value and explicit `null`
++                            //    should be accepted...
++                            || (tb.firstToken() == JsonToken.VALUE_NULL)
++                        ) {
++                        continue;
++                    }
++                    // but not just one
++                    // 26-Oct-2012, tatu: As per [databind#94], must allow use of 'defaultImpl'
++                    if (!extProp.hasDefaultType()) {
++                        ctxt.reportPropertyInputMismatch(_beanType, prop.getName(),
++                                "Missing external type id property '%s'",
++                                extProp.getTypePropertyName());
++                    } else {
++                        typeId = extProp.getDefaultTypeId();
++                    }
+                 }
+-            }
+ 
+-            if (_tokens[i] != null) {
+-                values[i] = _deserialize(p, ctxt, i, typeId);
+-            } else {
+-                if (ctxt.isEnabled(DeserializationFeature.FAIL_ON_MISSING_EXTERNAL_TYPE_ID_PROPERTY)) {
+-                    SettableBeanProperty prop = extProp.getProperty();
+-                    ctxt.reportPropertyInputMismatch(_beanType, prop.getName(),
+-                            "Missing property '%s' for external type id '%s'",
+-                            prop.getName(), _properties[i].getTypePropertyName());
++                if (_tokens[i] != null) {
++                    values[i] = _deserialize(p, ctxt, i, typeId);
++                } else {
++                    if (ctxt.isEnabled(DeserializationFeature.FAIL_ON_MISSING_EXTERNAL_TYPE_ID_PROPERTY)) {
++                        ctxt.reportPropertyInputMismatch(_beanType, prop.getName(),
++                                "Missing property '%s' for external type id '%s'",
++                                prop.getName(), extProp.getTypePropertyName());
++                    }
++                    // 03-Aug-2022, tatu: [databind#3533] to handle absent value matching
++                    //    present type id
++                    values[i] = _deserializeMissingToken(p, ctxt, i, typeId);
+                 }
+-                // 03-Aug-2022, tatu: [databind#3533] to handle absent value matching
+-                //    present type id
+-                values[i] = _deserializeMissingToken(p, ctxt, i, typeId);
+             }
+ 
+-            final SettableBeanProperty prop = extProp.getProperty();
+             // also: if it's creator prop, fill in
+             if (prop.getCreatorIndex() >= 0) {
+-                buffer.assignParameter(prop, values[i]);
++                // ...but skip binding the value itself if hidden by the active view
++                if (!viewHidden) {
++                    buffer.assignParameter(prop, values[i]);
++                }
+ 
+                 // [databind#999] And maybe there's creator property for type id too?
++                //   Assign it even when the value is view-hidden, provided we have a
++                //   type id and the type-id property is itself visible in the view.
+                 SettableBeanProperty typeProp = extProp.getTypeProperty();
+                 // for now, should only be needed for creator properties, too
+-                if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)) {
++                if ((typeProp != null) && (typeProp.getCreatorIndex() >= 0)
++                        && (typeId != null)
++                        && ((activeView == null) || typeProp.visibleInView(activeView))) {
+                     // 31-May-2018, tatu: [databind#1328] if id is NOT plain `String`, need to
+                     //    apply deserializer... fun fun.
+                     final Object v;
+@@ -329,7 +355,12 @@ public class ExternalTypeHandler
+         Object bean = creator.build(ctxt, buffer);
+         // third: assign non-creator properties
+         for (int i = 0; i < len; ++i) {
+-            SettableBeanProperty prop = _properties[i].getProperty();
++            final ExtTypedProperty extProp = _properties[i];
++            // 26-Jun-2026, tatu: also honor `@JsonView` here (see above)
++            final SettableBeanProperty prop = extProp.getProperty();
++            if ((activeView != null) && !prop.visibleInView(activeView)) {
++                continue;
++            }
+             if (prop.getCreatorIndex() < 0) {
+                 prop.set(bean, values[i]);
+             }
+@@ -379,6 +410,17 @@ public class ExternalTypeHandler
+     protected final void _deserializeAndSet(JsonParser p, DeserializationContext ctxt,
+             Object bean, int index, String typeId) throws IOException
+     {
++        // 26-Jun-2026, tatu: Must honor `@JsonView` here too (see
++        //   JsonViewExternalTypeIdBypassTest): for default-constructor beans the value
++        //   may be bound eagerly via this method (when the type id precedes the value),
++        //   so a property not visible in the active view must be skipped here as well.
++        //   The value is read from the buffered token (`_tokens[index]`), and the main
++        //   parser has already advanced past it, so we simply discard it (do not set).
++        final Class<?> activeView = ctxt.getActiveView();
++        if ((activeView != null) && !_properties[index].getProperty().visibleInView(activeView)) {
++            return;
++        }
++
+         // 11-Nov-2020, tatu: Should never get `null` passed this far,
+         if (typeId == null) {
+             ctxt.reportInputMismatch(_beanType, "Internal error in external Type Id handling: `null` type id passed");
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ObjectIdValueProperty.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ObjectIdValueProperty.java
+index 7c0ad31..5d53137 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/ObjectIdValueProperty.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/ObjectIdValueProperty.java
+@@ -102,6 +102,11 @@ public final class ObjectIdValueProperty
+         // also: may need to set a property value as well
+         SettableBeanProperty idProp = _objectIdReader.idProperty;
+         if (idProp != null) {
++            // Must honor `@JsonView`: do not set id property if not visible in active view
++            final Class<?> activeView = ctxt.getActiveView();
++            if ((activeView != null) && !visibleInView(activeView)) {
++                return instance;
++            }
+             return idProp.setAndReturn(instance, id);
+         }
+         return instance;
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+index 31d2b76..53677be 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+@@ -388,6 +388,10 @@ public class PropertyValueBuffer
+     }
+ 
+     public void bufferAnyProperty(SettableAnyProperty prop, String propName, Object value) {
++        // Honor `@JsonView` on the any-setter: discard if hidden in the active view
++        if (!prop.visibleInView(_context, _context.getActiveView())) {
++            return;
++        }
+         _buffered = new PropertyValue.Any(_buffered, value, prop, propName);
+     }
+ 
+@@ -397,6 +401,10 @@ public class PropertyValueBuffer
+ 
+     // @since 2.18
+     public void bufferAnyParameterProperty(SettableAnyProperty prop, String propName, Object value) {
++        // Honor `@JsonView` on the any-setter: discard if hidden in the active view
++        if (!prop.visibleInView(_context, _context.getActiveView())) {
++            return;
++        }
+         _anyParamBuffered = new PropertyValue.AnyParameter(_anyParamBuffered, value, prop, propName);
+     }
+ }
