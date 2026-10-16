@@ -1,0 +1,106 @@
+diff -ruN a/packages/client/src/client/auth.ts b/packages/client/src/client/auth.ts
+--- a/packages/client/src/client/auth.ts	2026-09-28 12:44:22
++++ b/packages/client/src/client/auth.ts	2026-10-16 08:43:27
+@@ -160,6 +160,32 @@
+ }
+ 
+ /**
++ * The authorization-server identity a request built from `authorizationServerUrl` /
++ * `metadata` is addressed to. Mirrors the identity {@linkcode auth} stamps stored
++ * credentials with: the (RFC 8414 §3.3-validated) `metadata.issuer` whose endpoints
++ * the request uses, or the authorization-server URL itself when no metadata is in hand.
++ */
++function requestIssuer(authorizationServerUrl: string | URL, metadata: AuthorizationServerMetadata | undefined): string {
++    return metadata?.issuer ?? String(authorizationServerUrl);
++}
++
++/**
++ * SEP-2352 enforcement for every SDK function that presents client credentials to an
++ * authorization server. A credential carrying an `issuer` stamp (set by {@linkcode auth}
++ * on everything it saves, or seeded via a provider's `expectedIssuer`) may only be
++ * presented to that authorization server; anything else throws
++ * {@linkcode AuthorizationServerMismatchError} before a request is built or sent.
++ * Unstamped (legacy / unpinned) credentials are not restricted.
++ */
++function assertCredentialIssuer(credential: { issuer?: unknown } | undefined | null, targetIssuer: string): void {
++    const stamp = credential?.issuer;
++    if (typeof stamp !== 'string') return;
++    if (!issuersMatch(stamp, targetIssuer)) {
++        throw new AuthorizationServerMismatchError(stamp, targetIssuer);
++    }
++}
++
++/**
+  * Type guard distinguishing `OAuthClientProvider` from a minimal `AuthProvider`.
+  * Transports use this at construction time to classify the `authProvider` option.
+  *
+@@ -1366,7 +1392,21 @@
+ 
+     // SEP-2352: a refresh_token stamped for a different authorization server reads back
+     // as `undefined`, so it is never POSTed to this AS's token endpoint.
+-    let tokens = discardIfIssuerMismatch(await provider.tokens(infoCtx), issuer);
++    const rawTokens = await provider.tokens(infoCtx);
++    let tokens: StoredOAuthTokens | undefined;
++    if (
++        rawTokens &&
++        rawTokens.issuer === undefined &&
++        typeof rawClientInfo?.issuer === 'string' &&
++        !issuersMatch(rawClientInfo.issuer, issuer)
++    ) {
++        // An unstamped token set stored alongside client credentials that are stamped for a
++        // different authorization server was obtained by that client, i.e. at that server.
++        // Never back-stamp it to (or refresh it at) this one.
++        tokens = undefined;
++    } else {
++        tokens = discardIfIssuerMismatch(rawTokens, issuer);
++    }
+     if (tokens && tokens.issuer === undefined) {
+         // SEP-2352 back-stamp: bind a legacy unstamped token set to the first-resolved AS
+         // so the stamp check is effective from the next call onward.
+@@ -2086,6 +2126,10 @@
+         resource?: string | URL;
+     }
+ ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
++    // SEP-2352: client information stamped for one authorization server is never presented
++    // at another one's authorization endpoint.
++    assertCredentialIssuer(clientInformation as StoredOAuthClientInformation, requestIssuer(authorizationServerUrl, metadata));
++
+     let authorizationUrl: URL;
+     if (metadata) {
+         authorizationUrl = new URL(metadata.authorization_endpoint);
+@@ -2191,6 +2235,12 @@
+         fetchFn?: FetchLike;
+     }
+ ): Promise<OAuthTokens> {
++    // SEP-2352: the single choke point for every token request (exchangeAuthorization,
++    // refreshAuthorization, fetchToken, auth()). Client credentials stamped for one
++    // authorization server are never presented — directly or via addClientAuthentication —
++    // to another, whichever server the caller names.
++    assertCredentialIssuer(clientInformation as StoredOAuthClientInformation | undefined, requestIssuer(authorizationServerUrl, metadata));
++
+     const tokenUrl = assertSecureTokenEndpoint(metadata?.token_endpoint ?? new URL('/token', authorizationServerUrl));
+ 
+     const headers = new Headers({
+@@ -2441,6 +2491,13 @@
+         });
+     }
+ 
++    // SEP-2352: resolve the provider's client credentials for the authorization server this
++    // request is addressed to, and refuse before any grant parameters are prepared (or any
++    // assertion minted) when they are stamped for a different one.
++    const targetIssuer = requestIssuer(authorizationServerUrl, metadata);
++    const clientInformation = await provider.clientInformation({ issuer: targetIssuer });
++    assertCredentialIssuer(clientInformation, targetIssuer);
++
+     // Prefer scope from options, fallback to provider.clientMetadata.scope
+     const effectiveScope = scope ?? provider.clientMetadata.scope;
+ 
+@@ -2461,8 +2518,6 @@
+         const codeVerifier = await provider.codeVerifier();
+         tokenRequestParams = prepareAuthorizationCodeRequest(authorizationCode, codeVerifier, provider.redirectUrl);
+     }
+-
+-    const clientInformation = await provider.clientInformation({ issuer: metadata?.issuer ?? String(authorizationServerUrl) });
+ 
+     return executeTokenRequest(authorizationServerUrl, {
+         metadata,

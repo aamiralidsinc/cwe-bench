@@ -1,0 +1,491 @@
+diff --git a/packages/client/src/client/auth.ts b/packages/client/src/client/auth.ts
+index a3fa18f0..634fbe6e 100644
+--- a/packages/client/src/client/auth.ts
++++ b/packages/client/src/client/auth.ts
+@@ -25,7 +25,8 @@ import {
+     OAuthTokensSchema,
+     OpenIdProviderDiscoveryMetadataSchema,
+     resourceUrlFromServerUrl,
+-    stampErrorBrands
++    stampErrorBrands,
++    withoutIssuer
+ } from '@modelcontextprotocol/core-internal';
+ import pkceChallenge from 'pkce-challenge';
+ 
+@@ -129,12 +130,14 @@ export interface OAuthClientInformationContext {
+  *   "binding on first use" claim would be false and would fire on every call.
+  */
+ export function discardIfIssuerMismatch<T extends { issuer?: string }>(
+-    stored: T | undefined,
++    stored: T | null | undefined,
+     issuer: string,
+     opts?: { canPersistStamp?: boolean }
+ ): T | undefined {
+-    if (stored === undefined) return undefined;
+-    if (stored.issuer === undefined) {
++    // Nothing stored (`null` from a `JSON.parse(storage.getItem(...))`-style getter included).
++    if (!stored) return undefined;
++    // A stamp that is not a string (raw storage) counts as no stamp.
++    if (typeof stored.issuer !== 'string') {
+         if (opts?.canPersistStamp !== false) {
+             console.warn(
+                 `[mcp-sdk] SEP-2352: stored OAuth credential has no 'issuer' stamp (pre-upgrade storage or ` +
+@@ -142,7 +145,7 @@ export function discardIfIssuerMismatch<T extends { issuer?: string }>(
+                     `ensure your provider round-trips the issuer field.`
+             );
+         }
+-        return stored;
++        return stored.issuer === undefined ? stored : { ...stored, issuer: undefined };
+     }
+     return issuersMatch(stored.issuer, issuer) ? stored : undefined;
+ }
+@@ -155,6 +158,13 @@ export function discardIfIssuerMismatch<T extends { issuer?: string }>(
+  * publishes a slash-free `metadata.issuer`, the two name the same authorization
+  * server.
+  */
++function assertBoundTo(clientInformation: OAuthClientInformationMixed, authorizationServer: string): void {
++    const stamp = (clientInformation as StoredOAuthClientInformation).issuer;
++    if (typeof stamp === 'string' && !issuersMatch(stamp, authorizationServer)) {
++        throw new AuthorizationServerMismatchError(stamp, authorizationServer);
++    }
++}
++
+ function issuersMatch(a: string, b: string): boolean {
+     return a === b || (a.endsWith('/') && a.slice(0, -1) === b) || (b.endsWith('/') && b.slice(0, -1) === a);
+ }
+@@ -1001,7 +1011,8 @@ export interface AuthOptions {
+     /**
+      * Opt-out for the RFC 8414 §3.3 issuer-echo check during authorization
+      * server discovery. Disabling it is **security-weakening** and intended only
+-     * for authorization servers known to publish a mismatched `issuer`.
++     * for authorization servers known to publish a mismatched `issuer`. The unchecked
++     * `issuer` is also what `expectedIssuer` and stored `issuer` stamps are compared with.
+      *
+      * @default false
+      */
+@@ -2191,6 +2202,7 @@ export async function executeTokenRequest(
+         fetchFn?: FetchLike;
+     }
+ ): Promise<OAuthTokens> {
++
+     const tokenUrl = assertSecureTokenEndpoint(metadata?.token_endpoint ?? new URL('/token', authorizationServerUrl));
+ 
+     const headers = new Headers({
+@@ -2254,7 +2266,7 @@ export async function executeTokenRequest(
+     const json: unknown = await response.json();
+ 
+     try {
+-        return OAuthTokensSchema.parse(json);
++        return { ...OAuthTokensSchema.parse(withoutIssuer(json)), issuer: metadata?.issuer ?? String(authorizationServerUrl) };
+     } catch (parseError) {
+         // Some OAuth servers (e.g., GitHub) return error responses with HTTP 200 status.
+         // Check for error field only if token parsing failed.
+@@ -2315,6 +2327,7 @@ export async function exchangeAuthorization(
+         issParameterSupported: isIssParameterSupported(metadata)
+     });
+ 
++    assertBoundTo(clientInformation, metadata?.issuer ?? String(authorizationServerUrl));
+     const tokenRequestParams = prepareAuthorizationCodeRequest(authorizationCode, codeVerifier, redirectUri);
+ 
+     return executeTokenRequest(authorizationServerUrl, {
+@@ -2361,6 +2374,7 @@ export async function refreshAuthorization(
+         fetchFn?: FetchLike;
+     }
+ ): Promise<OAuthTokens> {
++    assertBoundTo(clientInformation, metadata?.issuer ?? String(authorizationServerUrl));
+     const tokenRequestParams = new URLSearchParams({
+         grant_type: 'refresh_token',
+         refresh_token: refreshToken
+@@ -2441,6 +2455,18 @@ export async function fetchToken(
+         });
+     }
+ 
++    // SEP-2352: nothing is sent to an authorization server other than the one the client information is stamped for.
++    const issuer = metadata?.issuer ?? String(authorizationServerUrl);
++    const readClientInformation = async () => {
++        const rawClientInfo = await provider.clientInformation({ issuer });
++        const checked = discardIfIssuerMismatch(rawClientInfo, issuer, { canPersistStamp: false });
++        if (rawClientInfo && checked === undefined) {
++            throw new AuthorizationServerMismatchError(String(rawClientInfo.issuer), issuer);
++        }
++        return checked;
++    };
++    let clientInformation = await readClientInformation();
++
+     // Prefer scope from options, fallback to provider.clientMetadata.scope
+     const effectiveScope = scope ?? provider.clientMetadata.scope;
+ 
+@@ -2462,12 +2488,13 @@ export async function fetchToken(
+         tokenRequestParams = prepareAuthorizationCodeRequest(authorizationCode, codeVerifier, provider.redirectUrl);
+     }
+ 
+-    const clientInformation = await provider.clientInformation({ issuer: metadata?.issuer ?? String(authorizationServerUrl) });
++    // A provider may fill in its client information while the request is prepared.
++    clientInformation ??= await readClientInformation();
+ 
+     return executeTokenRequest(authorizationServerUrl, {
+         metadata,
+         tokenRequestParams,
+-        clientInformation: clientInformation ?? undefined,
++        clientInformation,
+         addClientAuthentication: provider.addClientAuthentication,
+         resource,
+         dpop: await provider.dpop?.(),
+@@ -2542,5 +2569,5 @@ export async function registerClient(
+         throw new RegistrationRejectedError({ status: response.status, body: await response.text(), submittedMetadata });
+     }
+ 
+-    return OAuthClientInformationFullSchema.parse(await response.json());
++    return OAuthClientInformationFullSchema.parse(withoutIssuer(await response.json()));
+ }
+diff --git a/packages/client/src/client/authErrors.ts b/packages/client/src/client/authErrors.ts
+index 98b2c57c..df61820c 100644
+--- a/packages/client/src/client/authErrors.ts
++++ b/packages/client/src/client/authErrors.ts
+@@ -177,14 +177,18 @@ export class InsecureTokenEndpointError extends OAuthClientFlowError {
+  * `requiredScope`, which appears in the error message).
+  */
+ /**
+- * Thrown by `auth()` on the authorization-code callback leg when the
+- * authorization server resolved by discovery differs from the one recorded in
+- * `discoveryState()` at redirect time. The `authorization_code` and PKCE
+- * `code_verifier` are bound to the AS that minted the code (RFC 7636); sending
+- * them to a different AS's token endpoint is a credential-exfiltration vector.
++ * Thrown by `auth()` and `fetchToken()` when the authorization server in use differs
++ * from the one a credential is bound to and the flow cannot simply start over:
+  *
+- * This is the only runtime check left in the SEP-2352 model — stored tokens and
+- * client credentials are protected structurally by the `issuer` stamp instead.
++ * - on the authorization-code callback leg, when it differs from the one recorded
++ *   in `discoveryState()` at redirect time — the `authorization_code` and PKCE
++ *   `code_verifier` are bound to the AS that minted the code (RFC 7636);
++ * - for client information whose `issuer` stamp names a different authorization
++ *   server on a provider that cannot re-register (no `saveClientInformation()`,
++ *   e.g. the bundled static-credential providers); `fetchToken()` throws for any provider.
++ *
++ * Stored tokens and re-registrable client information are protected structurally
++ * by the `issuer` stamp instead (they read back as absent).
+  */
+ export class AuthorizationServerMismatchError extends OAuthClientFlowError {
+     static {
+@@ -192,15 +196,14 @@ export class AuthorizationServerMismatchError extends OAuthClientFlowError {
+     }
+ 
+     constructor(
+-        /** The issuer recorded in `discoveryState()` when the authorization redirect was issued. */
++        /** The issuer the credential is bound to (recorded in `discoveryState()` at redirect time, or stamped on the client information). */
+         public readonly recordedIssuer: string,
+         /** The issuer resolved by discovery on this call. */
+         public readonly currentIssuer: string
+     ) {
+         super(
+-            `Authorization server changed between redirect and callback ` +
+-                `(redirected to ${JSON.stringify(recordedIssuer)}, callback resolved ${JSON.stringify(currentIssuer)}); ` +
+-                `refusing to send authorization_code/code_verifier to a different token endpoint`
++            `Authorization server mismatch: credentials are bound to ${JSON.stringify(recordedIssuer)} ` +
++                `but this call resolved ${JSON.stringify(currentIssuer)}; refusing to present them to a different authorization server`
+         );
+     }
+ }
+diff --git a/packages/client/src/client/authExtensions.examples.ts b/packages/client/src/client/authExtensions.examples.ts
+index 668cdd35..35bee44d 100644
+--- a/packages/client/src/client/authExtensions.examples.ts
++++ b/packages/client/src/client/authExtensions.examples.ts
+@@ -33,7 +33,8 @@ function ClientCredentialsProvider_basicUsage(serverUrl: URL) {
+     //#region ClientCredentialsProvider_basicUsage
+     const provider = new ClientCredentialsProvider({
+         clientId: 'my-client',
+-        clientSecret: 'my-secret'
++        clientSecret: 'my-secret',
++        expectedIssuer: 'https://auth.example.com'
+     });
+ 
+     const transport = new StreamableHTTPClientTransport(serverUrl, {
+@@ -51,7 +52,8 @@ function PrivateKeyJwtProvider_basicUsage(pemEncodedPrivateKey: string, serverUr
+     const provider = new PrivateKeyJwtProvider({
+         clientId: 'my-client',
+         privateKey: pemEncodedPrivateKey,
+-        algorithm: 'RS256'
++        algorithm: 'RS256',
++        expectedIssuer: 'https://auth.example.com'
+     });
+ 
+     const transport = new StreamableHTTPClientTransport(serverUrl, {
+diff --git a/packages/client/src/client/authExtensions.ts b/packages/client/src/client/authExtensions.ts
+index 073b42ee..e210786b 100644
+--- a/packages/client/src/client/authExtensions.ts
++++ b/packages/client/src/client/authExtensions.ts
+@@ -94,6 +94,23 @@ export function createPrivateKeyJwtAuth(options: {
+     };
+ }
+ 
++/**
++ * The `issuer` stamp for constructor-supplied client information. Omitting `expectedIssuer` is
++ * deprecated: nothing else says which authorization server such credentials belong to.
++ */
++function checkedExpectedIssuer(expectedIssuer: string | undefined): string | undefined {
++    if (expectedIssuer === undefined) {
++        console.warn(
++            '[mcp-sdk] Omitting `expectedIssuer` is deprecated. Without it, the MCP server decides which authorization ' +
++                "server receives this client's credentials; pass your authorization server's issuer URL as " +
++                '`expectedIssuer` so they are only sent there.'
++        );
++    } else if (typeof expectedIssuer !== 'string' || !expectedIssuer) {
++        throw new Error("expectedIssuer must be the authorization server's issuer URL");
++    }
++    return expectedIssuer;
++}
++
+ /**
+  * Options for creating a {@linkcode ClientCredentialsProvider}.
+  */
+@@ -121,9 +138,10 @@ export interface ClientCredentialsProviderOptions {
+     /**
+      * The authorization server's `issuer` identifier these credentials were registered with.
+      * Stamped onto the stored client information so `auth()`'s SEP-2352 issuer check
+-     * refuses to send the credential to any other authorization server. Hosts supplying
+-     * static client credentials SHOULD set this; omitting it preserves the legacy
+-     * (no-binding) behaviour for back-compat.
++     * refuses to send the credential to any other authorization server.
++     *
++     * Omitting it is deprecated: the credential then goes to whichever authorization server
++     * the MCP server advertises.
+      */
+     expectedIssuer?: string;
+ }
+@@ -138,7 +156,8 @@ export interface ClientCredentialsProviderOptions {
+  * ```ts source="./authExtensions.examples.ts#ClientCredentialsProvider_basicUsage"
+  * const provider = new ClientCredentialsProvider({
+  *     clientId: 'my-client',
+- *     clientSecret: 'my-secret'
++ *     clientSecret: 'my-secret',
++ *     expectedIssuer: 'https://auth.example.com'
+  * });
+  *
+  * const transport = new StreamableHTTPClientTransport(serverUrl, {
+@@ -151,11 +170,14 @@ export class ClientCredentialsProvider implements OAuthClientProvider {
+     private _clientInfo: StoredOAuthClientInformation;
+     private _clientMetadata: OAuthClientMetadata;
+ 
++    constructor(options: ClientCredentialsProviderOptions & { expectedIssuer: string });
++    /** @deprecated Pass `expectedIssuer` so the credentials are only sent to that authorization server. */
++    constructor(options: ClientCredentialsProviderOptions);
+     constructor(options: ClientCredentialsProviderOptions) {
+         this._clientInfo = {
+             client_id: options.clientId,
+             client_secret: options.clientSecret,
+-            issuer: options.expectedIssuer
++            issuer: checkedExpectedIssuer(options.expectedIssuer)
+         };
+         this._clientMetadata = {
+             client_name: options.clientName ?? 'client-credentials-client',
+@@ -274,7 +296,8 @@ export interface PrivateKeyJwtProviderOptions {
+  * const provider = new PrivateKeyJwtProvider({
+  *     clientId: 'my-client',
+  *     privateKey: pemEncodedPrivateKey,
+- *     algorithm: 'RS256'
++ *     algorithm: 'RS256',
++ *     expectedIssuer: 'https://auth.example.com'
+  * });
+  *
+  * const transport = new StreamableHTTPClientTransport(serverUrl, {
+@@ -288,10 +311,13 @@ export class PrivateKeyJwtProvider implements OAuthClientProvider {
+     private _clientMetadata: OAuthClientMetadata;
+     addClientAuthentication: AddClientAuthentication;
+ 
++    constructor(options: PrivateKeyJwtProviderOptions & { expectedIssuer: string });
++    /** @deprecated Pass `expectedIssuer` so the credentials are only sent to that authorization server. */
++    constructor(options: PrivateKeyJwtProviderOptions);
+     constructor(options: PrivateKeyJwtProviderOptions) {
+         this._clientInfo = {
+             client_id: options.clientId,
+-            issuer: options.expectedIssuer
++            issuer: checkedExpectedIssuer(options.expectedIssuer)
+         };
+         this._clientMetadata = {
+             client_name: options.clientName ?? 'private-key-jwt-client',
+@@ -400,10 +426,13 @@ export class StaticPrivateKeyJwtProvider implements OAuthClientProvider {
+     private _clientMetadata: OAuthClientMetadata;
+     addClientAuthentication: AddClientAuthentication;
+ 
++    constructor(options: StaticPrivateKeyJwtProviderOptions & { expectedIssuer: string });
++    /** @deprecated Pass `expectedIssuer` so the credentials are only sent to that authorization server. */
++    constructor(options: StaticPrivateKeyJwtProviderOptions);
+     constructor(options: StaticPrivateKeyJwtProviderOptions) {
+         this._clientInfo = {
+             client_id: options.clientId,
+-            issuer: options.expectedIssuer
++            issuer: checkedExpectedIssuer(options.expectedIssuer)
+         };
+         this._clientMetadata = {
+             client_name: options.clientName ?? 'static-private-key-jwt-client',
+@@ -591,7 +620,8 @@ export interface CrossAppAccessProviderOptions {
+  *         return result.jwtAuthGrant;
+  *     },
+  *     clientId: 'my-mcp-client',
+- *     clientSecret: 'my-mcp-secret'
++ *     clientSecret: 'my-mcp-secret',
++ *     expectedIssuer: 'https://auth.example.com'
+  * });
+  *
+  * const transport = new StreamableHTTPClientTransport(serverUrl, {
+@@ -609,11 +639,14 @@ export class CrossAppAccessProvider implements OAuthClientProvider {
+     private _resourceUrl?: string;
+     private _scope?: string;
+ 
++    constructor(options: CrossAppAccessProviderOptions & { expectedIssuer: string });
++    /** @deprecated Pass `expectedIssuer` so the credentials are only sent to that authorization server. */
++    constructor(options: CrossAppAccessProviderOptions);
+     constructor(options: CrossAppAccessProviderOptions) {
+         this._clientInfo = {
+             client_id: options.clientId,
+             client_secret: options.clientSecret,
+-            issuer: options.expectedIssuer
++            issuer: checkedExpectedIssuer(options.expectedIssuer)
+         };
+         this._clientMetadata = {
+             client_name: options.clientName ?? 'cross-app-access-client',
+diff --git a/packages/client/src/client/crossAppAccess.ts b/packages/client/src/client/crossAppAccess.ts
+index 49f010d6..a5491258 100644
+--- a/packages/client/src/client/crossAppAccess.ts
++++ b/packages/client/src/client/crossAppAccess.ts
+@@ -9,7 +9,12 @@
+  */
+ 
+ import type { FetchLike } from '@modelcontextprotocol/core-internal';
+-import { IdJagTokenExchangeResponseSchema, OAuthErrorResponseSchema, OAuthTokensSchema } from '@modelcontextprotocol/core-internal';
++import {
++    IdJagTokenExchangeResponseSchema,
++    OAuthErrorResponseSchema,
++    OAuthTokensSchema,
++    withoutIssuer
++} from '@modelcontextprotocol/core-internal';
+ 
+ import type { ClientAuthMethod } from './auth';
+ import { applyClientAuthentication, assertSecureTokenEndpoint, discoverAuthorizationServerMetadata } from './auth';
+@@ -298,7 +303,7 @@ export async function exchangeJwtAuthGrant(options: {
+     const responseBody = await response.json();
+ 
+     // Validate response using core schema
+-    const parseResult = OAuthTokensSchema.safeParse(responseBody);
++    const parseResult = OAuthTokensSchema.safeParse(withoutIssuer(responseBody));
+     if (!parseResult.success) {
+         throw new Error(`Invalid token response: ${parseResult.error.message}`);
+     }
+diff --git a/packages/core-internal/src/shared/authUtils.ts b/packages/core-internal/src/shared/authUtils.ts
+index 3083e425..a73575eb 100644
+--- a/packages/core-internal/src/shared/authUtils.ts
++++ b/packages/core-internal/src/shared/authUtils.ts
+@@ -14,6 +14,14 @@ export function resourceUrlFromServerUrl(url: URL | string): URL {
+     return resourceURL;
+ }
+ 
++/** Returns an authorization-server response body without `issuer`, which only the client sets, when it stores a value (SEP-2352). */
++export function withoutIssuer(body: unknown): unknown {
++    if (typeof body !== 'object' || body === null || Array.isArray(body)) return body;
++    const copy: Record<string, unknown> = { ...body };
++    delete copy.issuer;
++    return copy;
++}
++
+ /**
+  * Checks if a requested resource URL matches a configured resource URL.
+  * A requested resource matches if it has the same scheme, domain, port,
+diff --git a/packages/core/src/auth.ts b/packages/core/src/auth.ts
+index cf98edd7..d7f7f885 100644
+--- a/packages/core/src/auth.ts
++++ b/packages/core/src/auth.ts
+@@ -144,7 +144,13 @@ export const OAuthTokensSchema = z
+         token_type: z.string(),
+         expires_in: z.coerce.number().optional(),
+         scope: z.string().optional(),
+-        refresh_token: z.string().optional()
++        refresh_token: z.string().optional(),
++        /**
++         * Not part of the wire format: the authorization server this value was obtained from, added by
++         * the client's `auth()` before it is stored and compared when it is read back (SEP-2352).
++         */
++        // eslint-disable-next-line unicorn/prefer-top-level-await -- Zod .catch(), not a Promise chain
++        issuer: z.string().optional().catch(undefined)
+     })
+     .strip();
+ 
+@@ -223,7 +229,13 @@ export const OAuthClientInformationSchema = z
+         client_id: z.string(),
+         client_secret: z.string().optional(),
+         client_id_issued_at: z.number().optional(),
+-        client_secret_expires_at: z.number().optional()
++        client_secret_expires_at: z.number().optional(),
++        /**
++         * Not part of the wire format: the authorization server this value was obtained from, added by
++         * the client's `auth()` before it is stored and compared when it is read back (SEP-2352).
++         */
++        // eslint-disable-next-line unicorn/prefer-top-level-await -- Zod .catch(), not a Promise chain
++        issuer: z.string().optional().catch(undefined)
+     })
+     .strip();
+ 
+@@ -267,20 +279,18 @@ export type OAuthClientInformationMixed = OAuthClientInformation | OAuthClientIn
+  * {@linkcode OAuthTokens} as persisted by an `OAuthClientProvider`. Adds an
+  * SDK-stamped authorization-server `issuer` identifier so stored tokens are
+  * bound to the AS that issued them. The `issuer` field is **not** part of the
+- * RFC 6749 wire response and is intentionally absent from the wire-response
+- * schema; the client SDK writes it before calling `saveTokens`.
++ * RFC 6749 wire response; the client SDK writes it before calling `saveTokens`.
+  */
+-export type StoredOAuthTokens = OAuthTokens & { issuer?: string };
++export type StoredOAuthTokens = OAuthTokens & { issuer?: string | undefined };
+ 
+ /**
+  * {@linkcode OAuthClientInformationMixed} as persisted by an
+  * `OAuthClientProvider`. Adds an SDK-stamped authorization-server `issuer`
+  * identifier so stored client credentials are bound to the AS that issued them.
+- * The `issuer` field is **not** part of the RFC 7591 wire response and is
+- * intentionally absent from the wire-response schema; the client SDK writes it
+- * before calling `saveClientInformation`.
++ * The `issuer` field is **not** part of the RFC 7591 wire response; the client SDK
++ * writes it before calling `saveClientInformation`.
+  */
+-export type StoredOAuthClientInformation = OAuthClientInformationMixed & { issuer?: string };
++export type StoredOAuthClientInformation = OAuthClientInformationMixed & { issuer?: string | undefined };
+ 
+ export type OAuthClientRegistrationError = z.infer<typeof OAuthClientRegistrationErrorSchema>;
+ export type OAuthTokenRevocationRequest = z.infer<typeof OAuthTokenRevocationRequestSchema>;
+diff --git a/packages/server-legacy/src/auth/providers/proxyProvider.ts b/packages/server-legacy/src/auth/providers/proxyProvider.ts
+index 34758919..692dd291 100644
+--- a/packages/server-legacy/src/auth/providers/proxyProvider.ts
++++ b/packages/server-legacy/src/auth/providers/proxyProvider.ts
+@@ -1,5 +1,5 @@
+ import type { FetchLike, OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from '@modelcontextprotocol/core-internal';
+-import { OAuthClientInformationFullSchema, OAuthTokensSchema } from '@modelcontextprotocol/core-internal';
++import { OAuthClientInformationFullSchema, OAuthTokensSchema, withoutIssuer } from '@modelcontextprotocol/core-internal';
+ import type { Response } from 'express';
+ 
+ import type { OAuthRegisteredClientsStore } from '../clients';
+@@ -119,7 +119,7 @@ export class ProxyOAuthServerProvider implements OAuthServerProvider {
+                     }
+ 
+                     const data = await response.json();
+-                    return OAuthClientInformationFullSchema.parse(data);
++                    return OAuthClientInformationFullSchema.parse(withoutIssuer(data));
+                 }
+             })
+         };
+@@ -194,7 +194,7 @@ export class ProxyOAuthServerProvider implements OAuthServerProvider {
+         }
+ 
+         const data = await response.json();
+-        return OAuthTokensSchema.parse(data);
++        return OAuthTokensSchema.parse(withoutIssuer(data));
+     }
+ 
+     async exchangeRefreshToken(
+@@ -235,7 +235,7 @@ export class ProxyOAuthServerProvider implements OAuthServerProvider {
+         }
+ 
+         const data = await response.json();
+-        return OAuthTokensSchema.parse(data);
++        return OAuthTokensSchema.parse(withoutIssuer(data));
+     }
+ 
+     async verifyAccessToken(token: string): Promise<AuthInfo> {
