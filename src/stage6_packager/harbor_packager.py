@@ -160,6 +160,47 @@ RUN if [ -f bun.lock ] || [ -f bun.lockb ]; then \\
     elif [ -f pnpm-lock.yaml ]; then corepack enable && (pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile); \\
     elif [ -f yarn.lock ]; then corepack enable && (yarn install --frozen-lockfile || yarn install); \\
     else npm ci || npm install; fi"""
+# Answer-key hygiene: a project's own dev tooling often depends on the project itself (fast-uri <- ajv), so the install
+# pulls the RELEASED package - which already contains the fix - into node_modules. Replace every installed real copy
+# of any package defined in the repo with a link to its local source (the vulnerable code under test).
+NODE_SELF_LINK_JS = r"""
+const fs = require('fs'), path = require('path');
+const local = {};
+(function scan(d, depth) {
+  if (depth > 4) return;
+  let es; try { es = fs.readdirSync(d, {withFileTypes: true}); } catch (e) { return; }
+  for (const e of es) {
+    if (e.name === 'node_modules' || e.name === '.git' || e.isSymbolicLink()) continue;
+    const p = path.join(d, e.name);
+    if (e.isDirectory()) scan(p, depth + 1);
+    else if (e.name === 'package.json') {
+      try { const n = JSON.parse(fs.readFileSync(p, 'utf8')).name; if (n && !local[n]) local[n] = d; } catch (err) {}
+    }
+  }
+})('/app', 0);
+let linked = 0;
+(function walk(d, depth) {
+  if (depth > 14) return;
+  let es; try { es = fs.readdirSync(d, {withFileTypes: true}); } catch (e) { return; }
+  for (const e of es) {
+    if (e.isSymbolicLink() || !e.isDirectory()) continue;
+    const p = path.join(d, e.name);
+    const m = p.match(/node_modules\/((?:@[^/]+\/)?[^/@][^/]*)$/);
+    if (m && local[m[1]]) {
+      fs.rmSync(p, {recursive: true, force: true});
+      fs.symlinkSync(local[m[1]], p);
+      linked++;
+      continue;
+    }
+    walk(p, depth + 1);
+  }
+})('/app/node_modules', 0);
+if (linked) console.log('self-link: replaced ' + linked + ' installed copies of repo packages with links to the source');
+"""
+import base64 as _b64
+NODE_SELF_LINK = ("RUN echo " + _b64.b64encode(NODE_SELF_LINK_JS.encode()).decode()
+                  + " | base64 -d > /tmp/self-link.js && node /tmp/self-link.js; rm -f /tmp/self-link.js")
+
 NODE_BUILD = ("if [ -f bun.lock ] || [ -f bun.lockb ]; then bun run --if-present build 2>/dev/null || bun run build; "
               # a pnpm monorepo's root `build` script is the curated build (e.g. turbo with filters); a recursive
               # build would also try every test fixture and stop at the first one that cannot build
@@ -186,6 +227,7 @@ RUN pip3 install --no-cache-dir --break-system-packages pytest==8.4.1 pytest-jso
 WORKDIR /app
 COPY repo/ /app/
 {NODE_INSTALL} || true
+{NODE_SELF_LINK}
 # Compile TypeScript/bundled packages so dist/ exists for the agent and for the pre-patch run.
 RUN ({NODE_BUILD}) || true
 """

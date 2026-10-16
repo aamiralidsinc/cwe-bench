@@ -495,6 +495,9 @@ def project_test_examples(repo: Path, changed: list[str], budget: int = 12_000) 
     return "\n\n".join(out) or "(no existing tests found)"
 
 
+UNSUITABLE_MARKER = "generation_unsuitable.txt"   # candidate can never yield a task (e.g. oversized patch)
+
+
 def build_context(env_dir: Path, candidates: dict[str, dict]) -> Context:
     osv_id = env_dir.name
     patch_path = env_dir / PATCH_NAME
@@ -895,6 +898,8 @@ def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, st
         ctx = build_context(env_dir, candidates)
     except ValueError as e:
         log.warning("[%s] cannot build context: %s", osv_id, e)
+        if "too large" in str(e):      # a fixed property of the candidate: retire it, never retry
+            (env_dir / UNSUITABLE_MARKER).write_text(str(e) + "\n")
         return osv_id, "failed", str(e)
 
     if args.dry_run:
