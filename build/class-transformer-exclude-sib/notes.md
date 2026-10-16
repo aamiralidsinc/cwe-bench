@@ -73,9 +73,7 @@ gate static passes apart from the expected blind/FAIRNESS items; nop/oracle/patc
 locally (results above), never in Docker. Follow-up scout of a large host (DRF 3.16: read_only/write_only
 are centralised in Serializer._writable_fields/_readable_fields, OrderingFilter honours write_only;
 Django admin save-as-new is an ordinary add) found nothing real in the remaining time box.
-Lead found in that follow-up (not built, fails the distance rule): Django main
-(django/contrib/admin/options.py) changelist list_editable never consults get_readonly_fields(request, obj),
-so a field read-only per user or per object can be bulk-edited from the changelist. Unreported on Trac
-(summary search, 2026-10-16). The per-object *permission* half was fixed upstream ~2026-04 (#15759,
-commits 84db026 + 5b3cfce), in the same function, so there is no distance between example and sibling.
+The follow-up also noted one lead in another project, outside any published advisory. It was not
+built and is not pursued (see `blocked/BLOCKED.md`, item 1). It is listed for the client's disclosure
+decision in `build/audit/uncovered-routes.tsv`.
 Scout end 13:29 UTC.

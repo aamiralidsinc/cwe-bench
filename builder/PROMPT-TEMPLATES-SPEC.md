@@ -129,9 +129,11 @@ shared core plus a short per-task section.
    builder confirms it; the screener's claim is a lead.
 3. **Disclosure register.**
    - **Where:** `build/audit/uncovered-routes.tsv`, one row per route.
-   - **Fields:** task, repo, advisory, a one-line description of the mechanism, and whether the
-     route is still present in the latest release (`yes`, `no` or `unknown`, from a read-only look
-     at current upstream code).
+   - **Fields:** task, repo, advisory, the manifest trap id (`trap_ref`; no mechanism text, since
+     the manifest holds the detail), whether the route is real upstream code, whether it is still
+     present in the latest release (`yes`, `no` or `unknown`, from a read-only look at current
+     upstream code), any public upstream report, whether it is within the current scope, and its
+     build status.
    - **Disclosure status:** `pending client decision` until NEXT-STEPS item 4 is settled.
    - **Hold:** a task with a route still present upstream is not shared outside the project until
      the client has decided on disclosure.
