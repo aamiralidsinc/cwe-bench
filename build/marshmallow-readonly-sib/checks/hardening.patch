@@ -1,0 +1,90 @@
+diff -ruN pristine/src/marshmallow/fields.py variants/hardening/src/marshmallow/fields.py
+--- a/src/marshmallow/fields.py	2026-10-16 08:39:18
++++ b/src/marshmallow/fields.py	2026-10-16 08:59:43
+@@ -477,6 +477,26 @@
+     """Field that applies no formatting."""
+ 
+ 
++def _unbound_copy(field: Field) -> Field:
++    """Return a copy of a field, and of the fields it contains, that is not
++    bound to any schema, so that it can be bound to another one."""
++    new = copy.copy(field)
++    new.parent = None
++    new.root = None
++    if isinstance(new, Nested):
++        new._schema = None
++    if isinstance(new, List):
++        new.inner = _unbound_copy(new.inner)
++    if isinstance(new, Tuple):
++        new.tuple_fields = [_unbound_copy(f) for f in new.tuple_fields]
++    if isinstance(new, Mapping):
++        if new.key_field is not None:
++            new.key_field = _unbound_copy(new.key_field)
++        if new.value_field is not None:
++            new.value_field = _unbound_copy(new.value_field)
++    return new
++
++
+ class Nested(Field):
+     """Allows you to nest a :class:`Schema <marshmallow.Schema>`
+     inside a field.
+@@ -592,6 +612,25 @@
+                     self._schema.exclude = set_class(self.exclude) | set_class(original)
+                 if self.many is not None:
+                     self._schema.many = self.many
++                # Respect load_only and dump_only passed from parent with dot
++                # delimiters, as is done for nested schema classes.
++                load_only = self._nested_normalized_option("load_only")
++                dump_only = self._nested_normalized_option("dump_only")
++                if load_only or dump_only:
++                    # The copy shares its field objects with the original
++                    # instance, and those stay bound to it. Give the copy its
++                    # own unbound fields so that the restrictions apply within
++                    # this field only, and reach further nested schemas.
++                    self._schema.declared_fields = {
++                        name: _unbound_copy(field_obj)
++                        for name, field_obj in self._schema.declared_fields.items()
++                    }
++                    self._schema.load_only = set_class(load_only) | set_class(
++                        self._schema.load_only
++                    )
++                    self._schema.dump_only = set_class(dump_only) | set_class(
++                        self._schema.dump_only
++                    )
+                 self._schema._init_fields()
+             else:
+                 if isinstance(nested, type) and issubclass(nested, Schema):
+diff -ruN pristine/src/marshmallow/schema.py variants/hardening/src/marshmallow/schema.py
+--- a/src/marshmallow/schema.py	2026-10-16 08:39:18
++++ b/src/marshmallow/schema.py	2026-10-16 08:59:43
+@@ -428,8 +428,10 @@
+         self.exclude: set[typing.Any] | typing.MutableSet[typing.Any] = set(
+             self.opts.exclude
+         ) | set(exclude)
+-        self.load_only = set(load_only) or set(self.opts.load_only)
+-        self.dump_only = set(dump_only) or set(self.opts.dump_only)
++        # Fields named here are restricted in addition to those named in
++        # class Meta, never instead of them.
++        self.load_only = set(load_only) | set(self.opts.load_only)
++        self.dump_only = set(dump_only) | set(self.opts.dump_only)
+         self.partial = partial
+         self.unknown: types.UnknownOption = (
+             self.opts.unknown if unknown is None else unknown
+@@ -538,6 +540,8 @@
+             return [self._serialize(d, many=False) for d in obj]
+         ret = self.dict_class()
+         for attr_name, field_obj in self.dump_fields.items():
++            if field_obj.load_only or attr_name in self.load_only:
++                continue  # never emit a write-only field
+             value = field_obj.serialize(attr_name, obj, accessor=self.get_attribute)
+             if value is missing:
+                 continue
+@@ -645,6 +649,8 @@
+         else:
+             partial_is_collection = is_collection(partial)
+             for attr_name, field_obj in self.load_fields.items():
++                if field_obj.dump_only or attr_name in self.dump_only:
++                    continue  # never set a read-only field from input
+                 field_name = (
+                     field_obj.data_key if field_obj.data_key is not None else attr_name
+                 )
