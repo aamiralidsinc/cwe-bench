@@ -111,6 +111,45 @@ g.test('wrapping: duplicate signed identifier on an injected element is rejected
            'signature accepted for a response where the signed identifier appears on more than one element')
 end
 
+# ---- Signature wrapping, unique identifier: the signed identifier appears on
+# exactly one element, but the digest material the signature check trusts is taken
+# from a stray element placed outside the signed info. The genuinely signed
+# assertion is altered (its NameID is changed) and a digest matching the altered
+# assertion is planted ahead of the real one, so a check that resolves the digest
+# document-wide rather than within the signed info trusts the forged content. A
+# document whose trusted content is not exactly what the IdP signed must not be
+# reported as validly signed, even when only one element bears the signed
+# identifier. (2026-10-16 repair) ----
+
+DSIG_NS = 'http://www.w3.org/2000/09/xmldsig#'
+
+# Digest of the element carrying `id`, computed with a third-party XML library the
+# way any XML-signature verifier would (drop the enveloped signature, exclusive-
+# canonicalize, SHA-1). Uses no code from the library under test.
+def signed_element_digest(xml, id)
+  doc = Nokogiri::XML(xml)
+  el = doc.at_xpath('//*[@ID=$id]', nil, { 'id' => id })
+  sig = el.at_xpath('.//ds:Signature', 'ds' => DSIG_NS)
+  sig&.remove
+  canon = el.canonicalize(Nokogiri::XML::XML_C14N_EXCLUSIVE_1_0)
+  Base64.strict_encode64(OpenSSL::Digest::SHA1.new.digest(canon))
+end
+
+g.test('wrapping: a digest from an element outside the signed info does not make altered content verify') do
+  altered = base.sub('someone@example.org', 'attacker@evil.example')
+  forged_digest = signed_element_digest(altered, signed_id)
+  stray = %(<ds:Reference xmlns:ds="#{DSIG_NS}" URI="##{signed_id}">) +
+          %(<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>) +
+          %(<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>) +
+          %(<ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>) +
+          %(<ds:DigestValue>#{forged_digest}</ds:DigestValue></ds:Reference>)
+  # The stray reference precedes the genuinely signed element (and its signed info)
+  # in document order, so a document-wide lookup picks it up first.
+  payload = altered.sub('<samlp:Status>', '<samlp:Status>' + stray)
+  g.assert(!verifies?(payload, fingerprint),
+           'signature accepted for a document whose trusted digest came from an element outside the signed info')
+end
+
 # ---- Resource exhaustion: a tiny compressed message that inflates to a huge one
 # must be refused rather than processed: the entry point raises, and the expanded
 # document is never handed to an XML parser. ----
