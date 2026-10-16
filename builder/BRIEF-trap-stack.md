@@ -60,6 +60,16 @@ absence reads as design. Require **distance**: the ignored route must live in a 
 package from where the report's example lands, in a codebase large enough that reading everything
 is not the natural first move. Small libraries are poor hosts for class A.
 
+## Lesson from jackson-databind-readonly (2026-10-16)
+Same codebase as sib2, same "protection ignored on one route" shape, yet DeepSeek solved it in
+22 minutes: its very first repro already covered the catch-all route. The difference: READ_ONLY is
+documented with no exceptions, so nothing invited a "this route is out of scope" reading. In sib2
+upstream never supported views on any-setters, and DeepSeek said so ("upstream doesn't support it")
+and left it open in every run. The ingredient that beats DeepSeek is a **reason to dismiss**: the
+ignored route must be one a reasonable engineer could argue the protection never covered (an
+unsupported combination, a neighbouring feature, a legacy path), while the stated invariant still
+covers it unambiguously. Distance helps; the reason to dismiss is the main lever.
+
 ## Report back (under 400 words)
 Gate stage results; the traps with one line each; the new instruction's word count; every
 unverified guess; any fairness concern you see yourself.

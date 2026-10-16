@@ -1,6 +1,6 @@
 # CWE-Bench — Results Ledger (internal)
 
-_Audited verdicts as of 2026-10-16 05:28 from 186 raw trials by build/audit (ledger from `python3 build/audit_results.py`). Since 2026-10-16
+_Audited verdicts as of 2026-10-16 10:18 from 213 raw trials by build/audit (ledger from `python3 build/audit_results.py`). Since 2026-10-16
 **every counted run has passed an independent post-run audit**: a Claude Opus 5.5 (high effort)
 sub-agent judged from the instruction, tests, grading output, final code and transcript whether
 the reward can be trusted (`build/postmortem.py`, procedure in `build/TRIAL-PROCEDURE.md`).
@@ -69,6 +69,42 @@ the run do not count). Details per task: `build/<task>/notes.md`, section "2026-
 - Many other "SOLVED" verdicts came from runs that looked the fix up online. CWE-bench would not
   allow that, so those pairs are open again.
 
+## Round 2 (2026-10-16): first both-model breaker candidate
+
+**jackson-databind-sib2: pass@3 = 0 on BOTH models, every counted run audited as a genuine
+model failure (high confidence).**
+
+| Model | Counted runs (reward) | Set aside |
+|---|---|---|
+| DeepSeek V4.1 Flash | 0.0, 0.0, 0.5833 (all finished on their own, 17-35 min) | 1 run cut by a local DNS outage (13:51 UTC) |
+| MiMo-V2.6-Pro | 0.0, 0.5833, 0.0 (all finished on their own, 41-76 min) | 2 runs cut by the same outage |
+
+- **What the task is:** jackson-databind at a real commit; `@JsonView` restrictions must hold on
+  every deserialization route. It combines three real, unmodified upstream gaps: the any-setter
+  catch-all ignores views (the round-1 shape that beat DeepSeek 6/6), Object Id handling writes a
+  restricted id, and the array-shape update path has no view check. It also has coupled functional
+  tests: visible linked values must keep binding.
+- **Fairness evidence before any trial:**
+  - a blind Opus fix (report and code only) found every trap and scored 1.0;
+  - an independent fairness review said READY;
+  - the full strict gate PASSED (3 identical oracle runs, 12 patch checks).
+- **Why the models failed (from the audits):**
+  - Both models saw the any-setter leak in their own probes and left it open, treating it as a
+    feature upstream never supported.
+  - Both missed the constructor-path id write.
+  - Both broke the coupled visible binding.
+- **Outage handling:** the three runs cut by the outage scored 0.0 on unfinished code. They are NOT
+  counted (`build/audit/excluded_runs.tsv`). `trial.py` and `audit_results.py` now refuse to count
+  any API-cut run as a failure.
+- **Other round-2 tasks, all rejected because at least one model solved:**
+  - jackson-databind-readonly (DeepSeek solved);
+  - marshmallow-readonly-sib (both solved);
+  - the 7 `-inv` instruction-experiment tasks (all solved by both; see
+    `research/instruction-experiment.md`).
+- **On hold:** mcp-ts-sdk-oauth (Hadi's base plus two traps): its blind fix missed the base
+  producer, so the full gate did not pass. Hadi's own task stands as a DeepSeek-only result
+  (DeepSeek 0/3 under terminus-2, no time limit; MiMo solved).
+
 ## All trialed tasks (mined → stacking → injection)
 
 | Track | Task | Language | DeepSeek | MiMo | Verdict | Image build (cached / longest) | Image size |
@@ -82,7 +118,7 @@ the run do not count). Details per task: `build/<task>/notes.md`, section "2026-
 | mined | webob | Python | SOLVED 1/1 (+3 task leaked the answer) | SOLVED 1/1 (+3 task leaked the answer) | rejected (both solved) | 25 s / 3.0 min | not measured |
 | stacking | actualbudget | TypeScript | SOLVED 1/1 (+1 ungraded) (+1 solved using the internet) | SOLVED 1/1 (+3 test fault, not regradable) (+2 solved using the internet) | rejected (both solved) | 5 s / 1.3 min | not measured |
 | stacking | argo-workflows | Go | SOLVED 1/1 (+1 solved using the internet) | SOLVED 1/1 (+1 test fault, not regradable) (+1 solved using the internet) | rejected (both solved) | 4 s / 10.7 min | not measured |
-| stacking | asyncssh | Python | no graded run (+2 ungraded) (+1 awaiting audit) (+2 solved using the internet) | SOLVED 1/1 (+2 cut at 60 min) (+1 solved using the internet) | rejected (MiMo solved) | 6 s / 1.6 min | 811 MB |
+| stacking | asyncssh | Python | no graded run (+2 ungraded) (+1 awaiting audit) (+1 audit: untrusted) (+2 solved using the internet) | SOLVED 1/1 (+2 cut at 60 min) (+1 solved using the internet) | rejected (MiMo solved) | 6 s / 1.6 min | 811 MB |
 | stacking | cloudreve | Go | SOLVED 1/1 | SOLVED 1/1 (+1 cut at 60 min) | rejected (both solved) | 2 s / 4.6 min | not measured |
 | stacking | filament | PHP | SOLVED 1/1 (+2 ungraded) (+1 audit: untrusted) (+1 solved using the internet) | SOLVED 1/1 (+1 ungraded) (+1 cut at 60 min) (+1 solved using the internet) | rejected (both solved) | 8 s / 4.4 min | not measured |
 | stacking | ruby-saml | Ruby | SOLVED 1/1 (+1 solved using the internet) | SOLVED 1/1 (+1 ungraded) (+1 solved using the internet) | rejected (both solved) | 4 s / 1.9 min | not measured |
