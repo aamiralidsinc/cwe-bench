@@ -1,0 +1,551 @@
+diff --git a/cmd/serve/ftp/ftp.go b/cmd/serve/ftp/ftp.go
+index 106dc48..83a9177 100644
+--- a/cmd/serve/ftp/ftp.go
++++ b/cmd/serve/ftp/ftp.go
+@@ -340,7 +340,12 @@ func (d *driver) CheckPasswd(sctx *ftp.Context, user, pass string) (ok bool, err
+ 		d.userPassMu.Unlock()
+ 	} else {
+ 		userOK := subtle.ConstantTimeCompare([]byte(d.opt.User), []byte(user))
+-		ok = userOK == 1
++		// No password configured means any password is accepted
++		passOK := 1
++		if d.opt.Pass != "" {
++			passOK = subtle.ConstantTimeCompare([]byte(d.opt.Pass), []byte(pass))
++		}
++		ok = (userOK & passOK) == 1
+ 		if !ok {
+ 			fs.Infof(nil, "login failed: bad credentials")
+ 			return false, nil
+diff --git a/cmd/serve/proxy/proxy.go b/cmd/serve/proxy/proxy.go
+index 29532bf..5718588 100644
+--- a/cmd/serve/proxy/proxy.go
++++ b/cmd/serve/proxy/proxy.go
+@@ -15,6 +15,8 @@ import (
+ 	"net/netip"
+ 	"os/exec"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/rclone/rclone/fs"
+@@ -54,9 +56,10 @@ This config generated must have this extra parameter
+ 
+ - |_root| - root to use for the backend
+ 
+-And it may have this parameter
++And it may have these parameters
+ 
+ - |_obscure| - comma separated strings for parameters to obscure
++- |_secret_access_key| - the secret for S3 access key auth (see below)
+ 
+ If password authentication was used by the client, input to the proxy
+ process (on STDIN) would look similar to this:
+@@ -80,6 +83,32 @@ proxy process (on STDIN) would look similar to this:
+ }
+ |||
+ 
++If the client authenticated with an S3 access key (|rclone serve s3|),
++the client never sends its secret, only a signature made with it, so
++the input contains just the access key ID as the |user| with no |pass|
++or |public_key|:
++
++|||json
++{
++  "user": "AKIAIOSFODNN7EXAMPLE",
++  "client_ip": "192.168.1.1"
++}
++|||
++
++In this case the program must look up the secret access key for that
++access key ID and return it in the |_secret_access_key| field of the
++output. Rclone then uses that secret to verify the signature on the
++request, refusing the request if it does not match. This means the
++proxy program is the source of truth for both the credentials and the
++backend they map to. If the program does not return
++|_secret_access_key| or returns it empty the request is refused.
++
++The program's answer for an access key ID is cached (see below) but
++is checked with the program again after 5 minutes even if the access
++key ID is in constant use, so revoking an access key ID in the
++program takes effect within 5 minutes. A rotated secret takes effect
++on the first request signed with it.
++
+ The |client_ip| key holds the IP address the client connected from,
+ without a port number.  It can be used to restrict logins to certain
+ networks, or to log authentication attempts centrally.  It is omitted if
+@@ -145,19 +174,48 @@ func init() {
+ 
+ // Proxy represents a proxy to turn auth requests into a VFS
+ type Proxy struct {
+-	cmdLine  []string // broken down command line
+-	vfsCache *libcache.Cache
+-	ctx      context.Context // for global config
+-	Opt      Options
+-	vfsOpt   vfscommon.Options
++	cmdLine     []string // broken down command line
++	vfsCache    *libcache.Cache
++	ctx         context.Context // for global config
++	Opt         Options
++	vfsOpt      vfscommon.Options
++	accessKeyMu sync.Mutex // serialises replacing a cached access key entry
+ }
+ 
+ // cacheEntry is what is stored in the vfsCache
+ type cacheEntry struct {
+-	vfs    *vfs.VFS          // stored VFS
+-	pwHash [sha256.Size]byte // sha256 hash of the password/publicKey
++	vfs       *vfs.VFS          // stored VFS
++	pwHash    [sha256.Size]byte // sha256 hash of the password/publicKey
++	secret    string            // secret access key returned by the proxy for access key auth
++	refreshed *atomic.Int64     // unix nanoseconds when the proxy last confirmed this entry
+ }
+ 
++// accessKeyRefreshInterval is the minimum time between consulting the
++// proxy again for a cached access key ID whose secret failed to
++// verify a request, so a stream of bad signatures for a known access
++// key ID can't make the proxy run for every request.
++//
++// A variable so tests can adjust it.
++var accessKeyRefreshInterval = 10 * time.Second
++
++// accessKeyRevalidateInterval is how long a cached access key ID is
++// trusted before the proxy is asked about it again even though its
++// signatures are still verifying, so a revoked access key ID stops
++// working within this time rather than for as long as it stays in
++// use.
++//
++// A variable so tests can adjust it.
++var accessKeyRevalidateInterval = 5 * time.Minute
++
++// authKind is the kind of credential the client presented
++type authKind int
++
++const (
++	authPassword  authKind = iota // auth is a password
++	authPublicKey                 // auth is a public key
++	authAccessKey                 // user is an S3 access key ID and auth is empty
++)
++
+ // New creates a new proxy with the Options passed in
+ //
+ // Any VFS are created with the vfsOpt passed in.
+@@ -251,14 +309,15 @@ func generateCacheKey(user, auth, clientIP string) string {
+ }
+ 
+ // call runs the auth proxy and returns a cacheEntry and an error
+-func (p *Proxy) call(user, auth string, isPublicKey bool, clientIP string) (value any, err error) {
++func (p *Proxy) call(user, auth string, kind authKind, clientIP string) (value any, err error) {
+ 	// Contact the proxy
+ 	in := map[string]string{
+ 		"user": user,
+ 	}
+-	if isPublicKey {
++	switch kind {
++	case authPublicKey:
+ 		in["public_key"] = auth
+-	} else {
++	case authPassword:
+ 		in["pass"] = auth
+ 	}
+ 	if clientIP != "" {
+@@ -278,6 +337,19 @@ func (p *Proxy) call(user, auth string, isPublicKey bool, clientIP string) (valu
+ 	if !ok {
+ 		return nil, errors.New("proxy: _root not set in result")
+ 	}
++	var secret string
++	if kind == authAccessKey {
++		secret, ok = config.Get("_secret_access_key")
++		if !ok {
++			return nil, errors.New("proxy: _secret_access_key not set in result")
++		}
++		// An empty secret would let anyone sign for this access key ID
++		if secret == "" {
++			return nil, errors.New("proxy: _secret_access_key is empty in result")
++		}
++		// Keep the secret out of the backend config
++		delete(config, "_secret_access_key")
++	}
+ 
+ 	// Find the backend
+ 	fsInfo, err := fs.Find(fsName)
+@@ -290,6 +362,28 @@ func (p *Proxy) call(user, auth string, isPublicKey bool, clientIP string) (valu
+ 	// fresh backend rather than reusing the cached one.
+ 	cacheKey := generateCacheKey(user, auth, clientIP)
+ 
++	// For access key auth the secret isn't part of the cache key as
++	// it isn't known until the proxy has been run, so retire any
++	// cached entry whose secret the proxy has since changed.
++	//
++	// The stale entry is moved to a key including its old secret
++	// rather than deleted so that its VFS isn't shut down under
++	// requests still using it - it expires with the rest of the cache
++	// once it has been unused for long enough.
++	//
++	// The check, rename and the creation below are done under a lock
++	// so that two concurrent refreshes during a rotation can't have
++	// the second retire the backend the first has just created.
++	if kind == authAccessKey {
++		p.accessKeyMu.Lock()
++		defer p.accessKeyMu.Unlock()
++		if old, ok := p.vfsCache.GetMaybe(cacheKey); ok {
++			if entry, ok := old.(cacheEntry); ok && entry.secret != secret {
++				p.vfsCache.Rename(cacheKey, generateCacheKey(user, entry.secret, clientIP))
++			}
++		}
++	}
++
+ 	// base name of config on user name and auth hash.  This may appear in logs
+ 	name := "proxy-" + cacheKey
+ 	fsString := name + ":" + root
+@@ -315,14 +409,21 @@ func (p *Proxy) call(user, auth string, isPublicKey bool, clientIP string) (valu
+ 		// need to in memory. An attacker would find it easier to go
+ 		// after the unencrypted password in memory most likely.
+ 		entry := cacheEntry{
+-			vfs:    vfs.New(p.ctx, f, &p.vfsOpt),
+-			pwHash: sha256.Sum256([]byte(auth)),
++			vfs:       vfs.New(p.ctx, f, &p.vfsOpt),
++			pwHash:    sha256.Sum256([]byte(auth)),
++			secret:    secret,
++			refreshed: new(atomic.Int64),
+ 		}
+ 		return entry, true, nil
+ 	})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("proxy: failed to create backend: %w", err)
+ 	}
++	// The proxy has just confirmed this entry whether it was created
++	// or reused
++	if entry, ok := value.(cacheEntry); ok {
++		entry.refreshed.Store(time.Now().UnixNano())
++	}
+ 	return value, nil
+ }
+ 
+@@ -344,7 +445,11 @@ func (p *Proxy) Call(user, auth string, isPublicKey bool, remoteAddr string) (VF
+ 
+ 	// If not found then call the proxy for a fresh answer
+ 	if !ok {
+-		value, err = p.call(user, auth, isPublicKey, clientIP)
++		kind := authPassword
++		if isPublicKey {
++			kind = authPublicKey
++		}
++		value, err = p.call(user, auth, kind, clientIP)
+ 		if err != nil {
+ 			return nil, "", err
+ 		}
+@@ -372,6 +477,53 @@ func (p *Proxy) Call(user, auth string, isPublicKey bool, remoteAddr string) (VF
+ 	return entry.vfs, cacheKey, nil
+ }
+ 
++// CallAccessKey runs the auth proxy for an S3 access key ID returning
++// a *vfs.VFS and the secret access key the proxy supplied for it.
++//
++// The caller must verify the request's signature against the returned
++// secret - the proxy only maps the access key ID to a backend and
++// secret, it cannot authenticate the client itself.
++//
++// If refresh is true the proxy is consulted rather than using a cached
++// answer, unless it was consulted for this access key ID less than
++// accessKeyRefreshInterval ago. A refresh never shuts down a cached
++// backend, even if the proxy returns a different secret, so this is
++// safe to do when a signature fails to verify in case the secret has
++// been rotated.
++//
++// A cached answer older than accessKeyRevalidateInterval is always
++// checked with the proxy so a revoked access key ID is refused even
++// if it is in constant use.
++//
++// remoteAddr is the address of the client as returned by net.Addr.String().
++func (p *Proxy) CallAccessKey(accessKeyID, remoteAddr string, refresh bool) (VFS *vfs.VFS, secret string, err error) {
++	clientIP := ipFromAddr(remoteAddr)
++	cacheKey := generateCacheKey(accessKeyID, "", clientIP)
++	value, ok := p.vfsCache.GetMaybe(cacheKey)
++	if ok {
++		if entry, isEntry := value.(cacheEntry); isEntry {
++			age := time.Since(time.Unix(0, entry.refreshed.Load()))
++			switch {
++			case age >= accessKeyRevalidateInterval:
++				refresh = true
++			case age < accessKeyRefreshInterval:
++				refresh = false
++			}
++		}
++	}
++	if !ok || refresh {
++		value, err = p.call(accessKeyID, "", authAccessKey, clientIP)
++		if err != nil {
++			return nil, "", err
++		}
++	}
++	entry, ok := value.(cacheEntry)
++	if !ok {
++		return nil, "", fmt.Errorf("proxy: value is not cache entry: %#v", value)
++	}
++	return entry.vfs, entry.secret, nil
++}
++
+ // Get VFS from the cache using key - returns nil if not found
+ func (p *Proxy) Get(key string) *vfs.VFS {
+ 	value, ok := p.vfsCache.GetMaybe(key)
+diff --git a/cmd/serve/s3/s3.go b/cmd/serve/s3/s3.go
+index 94cb75c..5dd9df7 100644
+--- a/cmd/serve/s3/s3.go
++++ b/cmd/serve/s3/s3.go
+@@ -120,7 +120,7 @@ var Command = &cobra.Command{
+ 	},
+ 	Use:   "s3 remote:path",
+ 	Short: `Serve remote:path over s3.`,
+-	Long:  help() + strings.TrimSpace(httplib.AuthHelp(flagPrefix)+httplib.Help(flagPrefix)+vfs.Help()),
++	Long:  help() + strings.TrimSpace(httplib.AuthHelp(flagPrefix)+httplib.Help(flagPrefix)+vfs.Help()+proxy.Help),
+ 	RunE: func(command *cobra.Command, args []string) error {
+ 		var f fs.Fs
+ 		if proxy.Opt.AuthProxy == "" {
+diff --git a/cmd/serve/s3/server.go b/cmd/serve/s3/server.go
+index 7082384..8476c2d 100644
+--- a/cmd/serve/s3/server.go
++++ b/cmd/serve/s3/server.go
+@@ -3,14 +3,11 @@ package s3
+ 
+ import (
+ 	"context"
+-	"crypto/md5"
+-	"encoding/hex"
+ 	"errors"
+ 	"fmt"
+ 	"math/rand"
+ 	"net"
+ 	"net/http"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/go-chi/chi/v5"
+@@ -40,7 +37,6 @@ type Server struct {
+ 	backend      *s3Backend
+ 	handler      http.Handler
+ 	ctx          context.Context // for global config
+-	s3Secret     string
+ 	etagHashType hash.Type
+ }
+ 
+@@ -73,14 +69,20 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
+ 
+ 	if len(opt.AuthKey) == 0 && !w.provider.IsProxy() {
+ 		fs.Logf("serve s3", "No auth provided so allowing anonymous access")
+-	} else if len(opt.AuthKey) > 0 {
+-		w.s3Secret = getAuthSecret(opt.AuthKey)
+ 	}
+ 
+ 	authList, err := authlistResolver(opt.AuthKey)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("parsing auth list failed: %q", err)
+ 	}
++	if w.provider.IsProxy() {
++		// The proxy middleware authenticates every request itself so
++		// gofakes3's own auth must be left empty.
++		if len(authList) > 0 {
++			fs.Logf("serve s3", "--auth-key is ignored when --auth-proxy is set - the proxy must supply the secret for each access key ID")
++		}
++		authList = nil
++	}
+ 
+ 	w.backend = newBackend(w)
+ 	if w.opt.MultipartExpiry > 0 {
+@@ -101,9 +103,7 @@ func newServer(ctx context.Context, f fs.Fs, opt *Options, vfsOpt *vfscommon.Opt
+ 	w.handler = w.faker.Server()
+ 
+ 	if w.provider.IsProxy() {
+-		// proxy auth middleware
+ 		w.handler = proxyAuthMiddleware(w.handler, w)
+-		w.handler = authPairMiddleware(w.handler, w)
+ 	} else if len(opt.AuthKey) > 0 {
+ 		w.faker.AddAuthKeys(authList)
+ 	}
+@@ -139,13 +139,41 @@ func (w *Server) getVFS(ctx context.Context) (VFS *vfs.VFS, err error) {
+ 	return VFS, nil
+ }
+ 
+-// auth does proxy authorization
+-func (w *Server) auth(r *http.Request, accessKeyID string) (value any, err error) {
+-	VFS, _, err := w.provider.Proxy().Call(stringToMd5Hash(accessKeyID), accessKeyID, false, r.RemoteAddr)
++// auth authenticates the request via the auth proxy.
++//
++// The proxy maps the access key ID to a VFS and a secret access key
++// and the request's signature is verified against that secret. If it
++// fails against a cached secret the proxy is consulted again in case
++// the secret has been rotated.
++//
++// The secret is only ever used here and is never registered with
++// gofakes3, whose key store is shared by every instance in the
++// process.
++func (w *Server) auth(r *http.Request, accessKeyID string) (VFS *vfs.VFS, err error) {
++	p := w.provider.Proxy()
++	VFS, secret, err := p.CallAccessKey(accessKeyID, r.RemoteAddr, false)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return VFS, err
++	errCode := signature.V4SignVerifyWithSecret(r, secret)
++	if errCode == signature.ErrNone {
++		return VFS, nil
++	}
++	// Only a signature mismatch can be cured by a rotated secret, so
++	// only then is the proxy worth consulting again - other failures
++	// (expired request, bad date, missing headers) must not make
++	// every bad request run the proxy.
++	if signature.GetAPIError(errCode).Code == "SignatureDoesNotMatch" {
++		VFS, secret, err = p.CallAccessKey(accessKeyID, r.RemoteAddr, true)
++		if err != nil {
++			return nil, err
++		}
++		errCode = signature.V4SignVerifyWithSecret(r, secret)
++		if errCode == signature.ErrNone {
++			return VFS, nil
++		}
++	}
++	return nil, fmt.Errorf("signature verification failed: %s", signature.GetAPIError(errCode).Code)
+ }
+ 
+ // Bind register the handler to http.Router
+@@ -173,59 +201,49 @@ func (w *Server) Shutdown() error {
+ 	return err
+ }
+ 
+-func authPairMiddleware(next http.Handler, ws *Server) http.Handler {
+-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		accessKey, _ := parseAccessKeyID(r)
+-		// set the auth pair
+-		authPair := map[string]string{
+-			accessKey: ws.s3Secret,
+-		}
+-		ws.faker.AddAuthKeys(authPair)
+-		next.ServeHTTP(w, r)
+-	})
+-}
+-
++// proxyAuthMiddleware authenticates each request via the auth proxy,
++// storing the VFS it returns in the request context, and refuses
++// requests the proxy does not accept.
+ func proxyAuthMiddleware(next http.Handler, ws *Server) http.Handler {
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		accessKey, _ := parseAccessKeyID(r)
+-		value, err := ws.auth(r, accessKey)
++		accessKey, errCode := parseAccessKeyID(r)
++		if errCode != signature.ErrNone {
++			fs.Infof(r.URL.Path, "%s: Auth failed: no access key ID in request", r.RemoteAddr)
++			accessDenied(w)
++			return
++		}
++		VFS, err := ws.auth(r, accessKey)
+ 		if err != nil {
+ 			fs.Infof(r.URL.Path, "%s: Auth failed: %v", r.RemoteAddr, err)
++			accessDenied(w)
++			return
+ 		}
+-		if value != nil {
+-			r = r.WithContext(context.WithValue(r.Context(), ctxKeyID, value))
+-		}
+-
++		r = r.WithContext(context.WithValue(r.Context(), ctxKeyID, VFS))
+ 		next.ServeHTTP(w, r)
+ 	})
+ }
+ 
+-func parseAccessKeyID(r *http.Request) (accessKey string, error signature.ErrorCode) {
+-	v4Auth := r.Header.Get("Authorization")
+-	req, err := signature.ParseSignV4(v4Auth)
+-	if err != signature.ErrNone {
+-		return "", err
+-	}
+-
+-	return req.Credential.GetAccessKey(), signature.ErrNone
++// accessDenied writes an S3 AccessDenied error response
++func accessDenied(w http.ResponseWriter) {
++	w.Header().Set("Content-Type", "application/xml")
++	w.WriteHeader(http.StatusForbidden)
++	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`))
+ }
+ 
+-func stringToMd5Hash(s string) string {
+-	hasher := md5.New()
+-	hasher.Write([]byte(s))
+-	return hex.EncodeToString(hasher.Sum(nil))
+-}
+-
+-func getAuthSecret(authPair []string) string {
+-	if len(authPair) == 0 {
+-		return ""
++// parseAccessKeyID returns the access key ID from the request's
++// Authorization header or presigned URL query parameters
++func parseAccessKeyID(r *http.Request) (accessKey string, errCode signature.ErrorCode) {
++	v4Auth := r.Header.Get("Authorization")
++	if v4Auth == "" {
++		// Presigned URLs carry the credential in the query string
++		q := r.URL.Query()
++		if q.Get("X-Amz-Signature") != "" {
++			v4Auth = fmt.Sprintf("%s Credential=%s, SignedHeaders=%s, Signature=%s", q.Get("X-Amz-Algorithm"), q.Get("X-Amz-Credential"), q.Get("X-Amz-SignedHeaders"), q.Get("X-Amz-Signature"))
++		}
+ 	}
+-
+-	splited := strings.Split(authPair[0], ",")
+-	if len(splited) != 2 {
+-		return ""
++	req, errCode := signature.ParseSignV4(v4Auth)
++	if errCode != signature.ErrNone {
++		return "", errCode
+ 	}
+-
+-	secret := strings.TrimSpace(splited[1])
+-	return secret
++	return req.Credential.GetAccessKey(), signature.ErrNone
+ }
+diff --git a/lib/http/middleware.go b/lib/http/middleware.go
+index e9b9625..1c4721a 100644
+--- a/lib/http/middleware.go
++++ b/lib/http/middleware.go
+@@ -102,20 +102,7 @@ func MiddlewareAuthHtpasswd(path, realm string) Middleware {
+ 	fs.Infof(nil, "Using %q as htpasswd storage", path)
+ 	secretProvider := goauth.HtpasswdFileProvider(path)
+ 	authenticator := NewLoggedBasicAuthenticator(realm, secretProvider)
+-	checked := basicAuth(authenticator)
+-	return func(next http.Handler) http.Handler {
+-		verified := checked(next)
+-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			// Recognise users already registered in the htpasswd file
+-			// quickly without re-reading the file for the hash.
+-			if u, _, ok := parseAuthorization(r); ok && secretProvider(u, realm) != "" {
+-				ctx := context.WithValue(r.Context(), ctxKeyUser, u)
+-				next.ServeHTTP(w, r.WithContext(ctx))
+-				return
+-			}
+-			verified.ServeHTTP(w, r)
+-		})
+-	}
++	return basicAuth(authenticator)
+ }
+ 
+ // MiddlewareAuthBasic instantiates middleware that authenticates for a single user
+@@ -129,21 +116,7 @@ func MiddlewareAuthBasic(user, pass, realm, salt string) Middleware {
+ 		return ""
+ 	}
+ 	authenticator := NewLoggedBasicAuthenticator(realm, secretProvider)
+-	checked := basicAuth(authenticator)
+-	return func(next http.Handler) http.Handler {
+-		verified := checked(next)
+-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-			// Fast path: once we have seen the configured user we can
+-			// recognise them by name and skip recomputing the password
+-			// hash on every request.
+-			if u, _, ok := parseAuthorization(r); ok && u == user {
+-				ctx := context.WithValue(r.Context(), ctxKeyUser, u)
+-				next.ServeHTTP(w, r.WithContext(ctx))
+-				return
+-			}
+-			verified.ServeHTTP(w, r)
+-		})
+-	}
++	return basicAuth(authenticator)
+ }
+ 
+ // MiddlewareAuthCustom instantiates middleware that authenticates using a custom function

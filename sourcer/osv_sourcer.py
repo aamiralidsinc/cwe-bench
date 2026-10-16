@@ -24,6 +24,7 @@ only ever parsed as JSON / text.  Standard library only.
 """
 import argparse
 import calendar
+import csv
 import email.utils
 import gzip
 import json
@@ -488,7 +489,241 @@ def text_signals(text):
     svc = [name for name, rx in SERVICES if rx.search(text)]
     if svc:
         sig["services_guess"] = svc
+    named = named_locations(text)
+    if named:
+        sig["named"] = named
     return sig
+
+
+# --------------------------------------------------------------------------
+# S2a: the locations an advisory names (functions, files, endpoints, commands)
+# --------------------------------------------------------------------------
+_SRC_EXT = sorted((e.lstrip(".") for e, lang in patchmetrics.LANG_BY_EXT.items()
+                   if lang and lang != "Template"), key=len, reverse=True)
+_EXT_ALT = "|".join(re.escape(e) for e in _SRC_EXT)
+RE_FENCE = re.compile(r"```.*?(```|$)", re.S)
+RE_NOISE_SECTION = re.compile(       # sections whose names are PoC code, credits or links
+    r"^#{1,6}\s*(poc|proof[- ]of[- ]concept|steps to reproduce|reproduc\w*|exploit\w*|"
+    r"references?|credits?|attribution|acknowledg\w*|timeline|workarounds?|resources?|"
+    r"disclosure|reporter|thanks)\b.*?(?=^#{1,6}\s|\Z)", re.I | re.M | re.S)
+RE_BACKTICK = re.compile(r"`([^`\n]{2,120})`")
+RE_BLOB_URL = re.compile(r"github\.com/[\w.-]+/[\w.-]+/blob/[^/\s]+/([^\s#?)\]>\"']+)")
+RE_URL = re.compile(r"https?://\S+")
+RE_PATH = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.(?:%s))(?![\w/])" % _EXT_ALT)
+RE_CALL_PROSE = re.compile(r"(?<![\w.$#:])([A-Za-z_$][\w$]*(?:(?:\.|#|::|->)[A-Za-z_$][\w$]*)*)"
+                           r"\((?:\)|[^()\n]{0,40}\))")
+RE_ENDPOINT = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+`?(/[\w./{}:<>*-]*)")
+RE_IDENT = re.compile(r"^@?[A-Za-z_$][\w$]*(?:(?:\.|#|::|->)[A-Za-z_$][\w$]*)*(?:\(.*\))?$")
+RE_CAMEL = re.compile(r"^_*[a-z][a-z0-9]*[A-Z]\w*$|^_*[A-Z][a-z0-9]+[A-Z]\w*$")
+RE_CONSTANT = re.compile(r"^[A-Z0-9_]+$")
+CMD_STOP = {"pip", "pip3", "npm", "npx", "yarn", "pnpm", "go", "cargo", "gem", "bundle", "composer",
+            "mvn", "gradle", "docker", "curl", "wget", "git", "python", "python3", "node", "sudo",
+            "apt", "apt-get", "brew", "echo", "cat", "ls", "cd", "export", "set", "java", "ruby",
+            "php", "bash", "sh", "kubectl", "helm", "uv", "poetry", "deno", "bun", "nc", "ssh"}
+FS_ROOTS = {"etc", "tmp", "var", "usr", "home", "proc", "dev", "bin", "root", "opt", "sys",
+            "private", "users", "windows", "c:"}
+NAME_STOP = {"main", "run", "init", "get", "set", "call", "new", "md5", "sha1", "sha256", "len",
+             "str", "string", "open", "read", "write", "print", "eval", "exec", "join", "json",
+             "parse", "format", "require", "import", "include", "send", "fetch", "log", "test",
+             "url", "http", "https", "true", "false", "null", "none", "nil", "self", "this",
+             "toString", "hasOwnProperty", "constructor", "valueOf", "apply", "bind", "push",
+             "append", "replace", "split", "strip", "trim", "lower", "upper", "encode", "decode",
+             "startswith", "endswith", "startsWith", "endsWith", "includes", "contains", "equals",
+             "close", "flush", "map", "filter", "reduce", "keys", "values", "items", "resolve",
+             "then", "catch", "setTimeout", "assert", "alert", "fn", "func", "function"}
+TLDS = {"com", "org", "net", "io", "dev", "app", "example", "local", "localhost", "co", "uk"}
+
+
+FRAMEWORK_JS = {"node", "vue", "next", "nuxt", "three", "chart", "express", "react", "angular",
+                "d3", "socket", "moment", "ember", "backbone", "deno", "bun", "solid", "svelte",
+                "alpine", "htmx", "p5", "pdf", "highlight", "marked", "handlebars", "lodash",
+                "underscore", "jquery", "nest", "fastify", "koa", "hapi", "electron", "ckeditor",
+                "tiptap", "quill", "dompurify", "sanitize-html", "markdown-it", "showdown"}
+
+
+def _is_file_name(p):
+    """'src/webob/response.py' or 'negotiation.rs' yes; 'Node.js', 'e.g.c' no."""
+    if "/" in p:
+        return True
+    stem = p.rsplit(".", 1)[0].lower()
+    return stem not in FRAMEWORK_JS and not re.match(r"^(e\.g|i\.e|etc|vs|v?\d[\d.]*)$", stem)
+
+
+def _ident_key(raw):
+    """'Response._make_location_absolute()' -> ('_make_location_absolute', 'Response')."""
+    s = re.sub(r"\(.*$", "", raw.lstrip("@"))
+    parts = [p for p in re.split(r"\.|#|::|->", s) if p]
+    if not parts:
+        return "", ""
+    return parts[-1], (parts[-2] if len(parts) >= 2 else "")
+
+
+def _keep_ident(raw, called):
+    """Is this identifier a code location (function/method/class), not a value or word?"""
+    if raw.startswith("@"):                       # annotation / decorator / mention
+        return False
+    meth, owner = _ident_key(raw)
+    if not meth or meth in NAME_STOP or len(meth) < 3 or RE_CONSTANT.match(meth):
+        return False
+    if owner and (meth.lower() in TLDS or meth.lower() in _SRC_EXT):
+        return False                              # example.com, response.py
+    if called or owner:
+        return True
+    return bool(RE_CAMEL.match(meth))             # fetchToken, SshBlockCipher; not 'issuer'
+
+
+def named_locations(text):
+    """Locations an advisory names: {'func': [...], 'file': [...], 'endpoint': [...],
+    'command': [...]}.  Code blocks and PoC / credits / reference sections are ignored."""
+    files, funcs, endpoints, commands = [], [], [], []
+
+    def add(lst, v, cap=15):
+        if v and v not in lst and len(lst) < cap:
+            lst.append(v)
+
+    for m in RE_BLOB_URL.finditer(text):                 # links to source lines name a file
+        p = m.group(1)
+        if re.search(r"\.(%s)$" % _EXT_ALT, p):
+            add(files, p)
+    body = RE_NOISE_SECTION.sub("\n", RE_FENCE.sub("\n", text))
+    body = RE_URL.sub(" ", body)
+    for m in RE_ENDPOINT.finditer(body):
+        add(endpoints, m.group(1).rstrip(".,;:`"))
+    for m in RE_BACKTICK.finditer(body):
+        s = m.group(1).strip()
+        after = body[m.end():m.end() + 24].lower()
+        if not s:
+            continue
+        words = s.split()
+        if len(words) > 1:
+            if (2 <= len(words) <= 5 and words[0].lower() not in CMD_STOP and
+                    all(re.match(r"^[a-z0-9][\w.-]*$", w) for w in words) and
+                    not any(w.startswith("-") for w in words[:2])):
+                add(commands, s)
+            continue
+        if re.match(r"^--?[A-Za-z][\w-]+(=.*)?$", s):
+            continue                                       # a flag, not a location
+        if s.startswith("/") and not re.search(r"\.(%s)$" % _EXT_ALT, s):
+            segs = [x for x in s.split("/") if x]
+            if segs and segs[0].lower() not in FS_ROOTS and re.search(r"[A-Za-z]{3}", s) \
+                    and not s.startswith("//") and not re.search(r"\s|\.\.|%[0-9a-fA-F]{2}", s) \
+                    and not re.search(r"\.(com|org|net|io)\b", s):
+                add(endpoints, s.rstrip(".,;:"))
+            continue
+        if re.search(r"\.(%s)$" % _EXT_ALT, s) and re.match(r"^[\w./-]+$", s):
+            if _is_file_name(s):
+                add(files, s.lstrip("./"))
+            continue
+        if RE_IDENT.match(s):
+            called = "(" in s or bool(re.match(r"\s*(\(|function|method|handler|class|"
+                                               r"module|endpoint|route|middleware)\b", after))
+            if _keep_ident(s, called):
+                add(funcs, re.sub(r"\(.*$", "", s.lstrip("@")))
+    prose = RE_BACKTICK.sub(" ", body)
+    for m in RE_CALL_PROSE.finditer(prose):
+        if _keep_ident(m.group(1), True):
+            add(funcs, m.group(1))
+    for m in RE_PATH.finditer(prose):
+        if _is_file_name(m.group(1)):
+            add(files, m.group(1).lstrip("./"))
+    out = {}
+    for k, v in (("func", funcs), ("file", files), ("endpoint", endpoints), ("command", commands)):
+        if v:
+            out[k] = v
+    return out
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def s2a_signal(sig, shape, repo="", packages=""):
+    """S2a named-location disparity.  -> dict(state, named, touched, examples).
+
+    state: 'unknown'   the advisory names no location (or the fix's sites are not recorded)
+           'disparity' it names locations and the fix touches none of them
+           'partial'   the fix touches some named location and also changes code elsewhere
+           'on_named'  every changed site lies in a named function or named file
+    'Touched' is lenient (so 'disparity' is conservative): a named function or class equals a
+    hunk-header name, the enclosing definition of a changed line, or a changed file's basename;
+    a named file matches a changed file's path suffix or basename; an endpoint or command matches
+    when one of its segments names a changed definition, file or directory."""
+    named = sig.get("named") or {}
+    units = shape.get("units")
+    if units is None:
+        return {"state": "unknown", "why": "fix sites not recorded"}
+    own = set()
+    for p in (packages or "").split(" | "):
+        nm = p.split(":", 1)[-1]
+        own.update([_norm(nm), _norm(nm.split("/")[-1])])
+    if repo:
+        own.update([_norm(repo.split("/")[-1])])
+    funcs = []
+    for f in named.get("func", []):
+        meth, owner = _ident_key(f)
+        if _norm(meth) and _norm(meth) not in own:
+            funcs.append((f, _norm(meth), _norm(owner)))
+    files = [(f, f.lower().lstrip("/"), _norm(f.split("/")[-1].split(".")[0]))
+             for f in named.get("file", [])]
+    cmds = []
+    for c in named.get("command", []):
+        w = c.split()
+        if _norm(w[0]) in own or _norm(w[0]) == _norm((repo or "").split("/")[-1]):
+            cmds.append((c, [_norm(x) for x in w[1:] if len(_norm(x)) >= 2]))
+    eps = []
+    for e in named.get("endpoint", []):
+        segs = [_norm(s) for s in e.split("/") if s and not re.match(r"^[{:<*]|^\d+$|^v\d+$", s)]
+        segs = [s for s in segs if len(s) >= 3 and s not in ("api", "admin")]
+        if segs:
+            eps.append((e, segs))
+    n_named = len(funcs) + len(files) + len(cmds) + len(eps)
+    if not n_named:
+        return {"state": "unknown", "why": "advisory names no location"}
+    if not units:
+        return {"state": "unknown", "why": "no code-changing site", "named": n_named}
+    changed = list(shape.get("changed_files") or sorted(set(u[0] for u in units)))
+    stems = set(_norm(p.split("/")[-1].split(".")[0]) for p in changed)
+    dirs = set(_norm(d) for p in changed for d in p.split("/")[:-1])
+    names = set(_norm(u[1]) for u in units if u[1])
+    for v in (shape.get("hunk_funcs") or {}).values():
+        names.update(_norm(x) for x in v)
+    touched = []
+    for f, meth, owner in funcs:
+        if meth in names or meth in stems or (owner and (owner in names or owner in stems)):
+            touched.append(f)
+    for f, low, stem in files:
+        if any(p.lower().endswith(low) for p in changed) or ("/" not in low and stem in stems):
+            touched.append(f)
+    for c, ws in cmds:
+        if ws and all(w in dirs or w in stems or w in names for w in ws):
+            touched.append(c)
+    for e, segs in eps:
+        if any(s in names or s in stems or s in dirs for s in segs):
+            touched.append(e)
+    ex = [x[0] for x in funcs[:3]] + [x[0] for x in files[:2]] + [x[0] for x in eps[:2]] + \
+        [x[0] for x in cmds[:1]]
+    if not touched:
+        return {"state": "disparity", "named": n_named, "touched": [], "examples": ex[:5]}
+    # exact coverage of every changed site: its definition (or the hunk header) is a named
+    # function/class, or its file is a named file / a file named after a named class
+    cov_names = set(m for _f, m, _o in funcs) | set(o for _f, _m, o in funcs if o)
+    cov_files = set(low for _f, low, _s in files)
+    cov_stems = set(s for _f, low, s in files if "/" not in low) | set(
+        o for _f, _m, o in funcs if o)
+    heads = shape.get("hunk_funcs") or {}
+
+    def covered(u):
+        path, name = u[0], u[1]
+        if _norm(name) in cov_names:
+            return True
+        if any(_norm(h) in cov_names for h in heads.get(path, [])) and not name:
+            return True
+        if any(path.lower().endswith(f) for f in cov_files if "/" in f):
+            return True
+        return _norm(path.split("/")[-1].split(".")[0]) in cov_stems
+
+    state = "on_named" if all(covered(u) for u in units) else "partial"
+    return {"state": state, "named": n_named, "touched": touched[:6], "examples": ex[:5]}
 
 
 def reduce_record(rec, eco):
@@ -763,24 +998,22 @@ def prescore(row):
     Favoured weakness class, languages the target models are weakest in, and wording that
     points at signals 1-4 come first; newest first within a tie."""
     sig = json.loads(row["adv_signals"] or "{}")
+    p = weights()["prescore"]
     s = 0
-    if weakness_class(row["cwe_ids"]) != "other":
-        s += 3
+    if p["add_weakness_points"]:
+        s += weakness_points(row["cwe_ids"], row["summary"] or "", row["packages"] or "")[0]
     ecos = (row["ecosystems"] or "").split()
-    if any(e in ("Maven", "crates.io") for e in ecos):
-        s += 3
-    elif any(e in ("Go", "RubyGems", "Packagist") for e in ecos):
-        s += 2
+    s += max([p["ecosystem_points"].get(e, 0) for e in ecos] or [0])
     if sig.get("fix_bypass"):
-        s += 3
+        s += p["earlier_fix_incomplete"]
     if sig.get("defence_text"):
-        s += 1
+        s += p["defence_wording"]
     if sig.get("multi_site_text"):
-        s += 1
+        s += p["multi_site_wording"]
     if sig.get("cause_layer_text"):
-        s += 1
+        s += p["cause_layer_wording"]
     if (row["n_fix_commits"] or 0) > 4:
-        s -= 2
+        s += p["more_than_4_fix_commits"]
     return s
 
 
@@ -1001,11 +1234,128 @@ LANG_TIER = {"Java": "weakest", "Kotlin": "weakest", "Scala": "weakest", "Rust":
 
 
 def weakness_class(cwe_ids):
+    """Descriptive hand-made class (kept for reference; scoring uses weakness_points)."""
     nums = [int(c[4:]) for c in (cwe_ids or "").split()]
     for name, members in CLASS_CWES:
         if any(n in members for n in nums):
             return name
     return "other"
+
+
+# --------------------------------------------------------------------------
+# weights.json: every point value the screener uses lives there
+# --------------------------------------------------------------------------
+WEIGHTS_PATH = os.path.join(HERE, "weights.json")
+_WEIGHTS = None
+
+
+def weights():
+    """weights.json, loaded once, with the OWASP map and LLM regexes prepared."""
+    global _WEIGHTS
+    if _WEIGHTS is None:
+        with open(WEIGHTS_PATH) as f:
+            w = json.load(f)
+        if w.get("version") not in (2, 3):
+            raise SystemExit("%s: expected version 2 or 3" % WEIGHTS_PATH)
+        omap = w["owasp_map"]
+        with open(os.path.normpath(os.path.join(HERE, omap["file"]))) as f:
+            cats = json.load(f)["categories"]
+        w["_cat_of"] = {c: k for k, v in cats.items() for c in v["cwes"]}
+        w["_cat_of"].update({int(c): k for c, k in omap["extra"].items()})
+        w["_abstraction"], w["_ancestors"] = {}, {}
+        with open(os.path.normpath(os.path.join(HERE, omap["hierarchy_file"]))) as f:
+            for line in f.read().splitlines()[1:]:          # MITRE CWE Research view (CWE-1000)
+                cid, _name, abstraction, _status, _parent, _pillar, _depth, path = line.split("\t")
+                w["_abstraction"][int(cid)] = abstraction
+                w["_ancestors"][int(cid)] = [int(a) for a in reversed(path.split(">")[:-1])]
+        t25 = w["weakness"]["top25_label"]
+        with open(os.path.normpath(os.path.join(HERE, t25["file"]))) as f:
+            w["_top25"] = {int(l.split("\t")[1]): int(l.split("\t")[0])
+                           for l in f.read().splitlines()[1:] if l.strip()}
+        al = w["weakness"]["attack_label"]
+        w["_attack"] = {}                                   # CWE -> labelled attack classes
+        with open(os.path.normpath(os.path.join(HERE, al["file"]))) as f:
+            for r in csv.DictReader(f, delimiter="\t"):
+                hits = [c for col, wanted in al["classes"].items()
+                        for c in r[col].split(";") if c in wanted]
+                if hits:
+                    w["_attack"][int(r["cwe"])] = hits
+        lil, eco = w["weakness"]["llm_in_the_loop"], w["weakness"]["llm_ecosystem"]
+        w["_lil_summary"] = re.compile(lil["summary_regex"], re.I)
+        w["_eco_summary"] = re.compile(eco["summary_regex"], re.I)
+        w["_eco_package"] = re.compile(r"(?<![A-Za-z0-9])(?:%s)(?![A-Za-z0-9])"
+                                       % eco["package_regex"], re.I)
+        _WEIGHTS = w
+    return _WEIGHTS
+
+
+def owasp_category(cwe_num):
+    """-> (category or None, the CWE it came from). Direct OWASP 2025 mapping first, then the
+    nearest ancestor in MITRE's Research view that is mapped (weights: ancestor_fallback)."""
+    W = weights()
+    if cwe_num in W["_cat_of"]:
+        return W["_cat_of"][cwe_num], cwe_num
+    if W["owasp_map"].get("ancestor_fallback"):
+        for a in W["_ancestors"].get(cwe_num, []):
+            if a in W["_cat_of"]:
+                return W["_cat_of"][a], a
+    return None, None
+
+
+def weakness_points(cwe_ids, summary="", packages=""):
+    """-> (points, parts, category).  S5: OWASP 2025 category points + per-CWE adjustment for
+    the best-scoring CWE, plus the abstract-only and LLM-in-the-loop bonuses (weights.json)."""
+    W = weights()
+    w = W["weakness"]
+    nums = [int(c[4:]) for c in (cwe_ids or "").split() if c[4:].isdigit()]
+    adjs = sorted(((k, v) for k, v in w["cwe_adjustments"].items()
+                   if not k.startswith("_") and k != "disputed"), key=lambda kv: -kv[1]["points"])
+    parts = {}
+    # Category: the best CWE that maps (directly or via an ancestor); 'unmapped' only if none does.
+    mapped = []
+    for n in nums:
+        cat, via = owasp_category(n)
+        if cat:
+            mapped.append((w["category_points"][cat], n, cat, via))
+    if mapped:
+        pts, n, cat, via = max(mapped)
+        label = "OWASP %s (CWE-%d)" % (cat, n) if via == n else \
+            "OWASP %s (CWE-%d via ancestor CWE-%d)" % (cat, n, via)
+        parts[label] = pts
+    else:
+        cat = "unmapped"
+        parts["OWASP unmapped (no CWE maps, nor any ancestor)"] = w["category_points"]["unmapped"]
+    # Per-CWE adjustment: the highest over all CWEs (exact CWE only, never inherited).
+    best_adj = None
+    for n in nums:
+        if n in w["cwe_adjustments"]["disputed"]["cwes"]:
+            cand = (0, n, "disputed")
+        else:
+            cand = next(((spec["points"], n, name) for name, spec in adjs if n in spec["cwes"]), None)
+        if cand and (best_adj is None or cand[0] > best_adj[0]):
+            best_adj = cand
+    if best_adj and best_adj[0]:
+        parts["CWE-%d %s" % (best_adj[1], best_adj[2].replace("_", " "))] = best_adj[0]
+    elif best_adj:
+        parts["CWE-%d sources disagree" % best_adj[1]] = 0
+    # No specific weakness named: every CWE is a known-broad one, Pillar level, or not a weakness
+    # entry at all (a MITRE category such as 264).
+    ab = w["abstract_only"]
+    if nums and all(n in ab["cwes"] or W["_abstraction"].get(n) in ab["abstractions"]
+                    or n not in W["_abstraction"] for n in nums):
+        parts["only broad CWEs (no specific weakness named)"] = ab["points"]
+    in_top25 = sorted((W["_top25"][n], n) for n in nums if n in W["_top25"])
+    if in_top25:                                     # label (0 points unless weights change)
+        parts["CWE Top 25 2025: %s" % ", ".join("#%d CWE-%d" % rn for rn in in_top25)] = \
+            w["top25_label"]["points"]
+    attack = sorted({c for n in nums for c in W["_attack"].get(n, [])})
+    if attack:                                       # label (0 points unless weights change)
+        parts["Attack class: %s" % ", ".join(attack)] = w["attack_label"]["points"]
+    if W["_lil_summary"].search(summary or ""):
+        parts["LLM-in-the-loop (model output drives the action)"] = w["llm_in_the_loop"]["points"]
+    elif W["_eco_summary"].search(summary or "") or W["_eco_package"].search(packages or ""):
+        parts["LLM ecosystem (label)"] = w["llm_ecosystem"]["points"]
+    return sum(parts.values()), parts, cat
 
 
 def compute_signals(row, c, sig, siblings):
@@ -1019,7 +1369,9 @@ def compute_signals(row, c, sig, siblings):
     code_added = shape.get("code_added", c["src_added"] or 0)
     code_removed = shape.get("code_removed", c["src_removed"] or 0)
     cwes = [int(x[4:]) for x in (row["cwe_ids"] or "").split()]
-    klass = weakness_class(row["cwe_ids"])
+    wpoints, wparts, klass = weakness_points(row["cwe_ids"], row["summary"] or "",
+                                             row["packages"] or "")
+    favoured = 1 if wpoints >= weights()["weakness"]["favoured_threshold"] else 0
     compact = 1 if (fix_sites <= 1 or (site_files <= 1 and fix_sites <= 2 and span <= 30)) else 0
     multi = 1 if (same >= 2 or (fix_sites >= 4 and site_files >= 2)) else 0
     out = {
@@ -1035,18 +1387,25 @@ def compute_signals(row, c, sig, siblings):
         "c_modified_check_lines": removed_checks,
         "c_bypass_incomplete": 1 if sig.get("fix_bypass") else 0,
         "c_sibling_advisories": siblings,
-        "c_class": klass,
-        "c_favoured_class": 1 if klass != "other" else 0,
+        "c_class": klass,                        # OWASP Top 10:2025 category of the best CWE
+        "c_favoured_class": favoured,            # weakness points >= favoured_threshold
         "c_single_compact_hunk": compact,
         "c_far_apart": 1 if (site_files >= 2 or span > 80) else 0,
         "c_restructured": 1 if (code_removed >= 5 and
                                 code_removed >= 0.2 * max(1, code_added + code_removed)) else 0,
-        "c_single_sink": 1 if (any(n in SINK_CWES for n in cwes) and klass == "other"
+        "c_single_sink": 1 if (any(n in SINK_CWES for n in cwes) and not favoured
                                and site_files <= 1 and same < 2) else 0,
         "c_one_site_guard": 1 if (compact and code_removed <= 2) else 0,
         "c_compact_small_repo": (None if not row["repo_size_kb"] else
                                  (1 if (compact and row["repo_size_kb"] < 20000) else 0)),
         "lang_tier": LANG_TIER.get(c["language"] or "", "other"),
+        # transient (leading underscore): used by score_entry, never written to the index
+        "_changed_lines": (code_added or 0) + (code_removed or 0),
+        "_weakness": (wpoints, wparts),
+        # S2 computed parts (no index column: they live in score_detail; inputs are in
+        # adv_signals['named'] and the commit's shape JSON)
+        "_s2a": s2a_signal(sig, shape, row["repo"] or "", row["packages"] or ""),
+        "_s2b": shape.get("s2b"),
     }
     return out
 
@@ -1057,66 +1416,134 @@ def score_entry(row, cs, sig, judged=None):
     With `judged`, the reader's verdict on signals 1, 2, 3 and 7 replaces the computed proxy
     (a "no" scores 0 even when the proxy fired).  Total changed lines are not scored."""
     d = {}
+    W = weights()
 
     def yes(key):
         return judged is not None and str(judged.get(key, "")).strip() in ("1", "yes", "y")
 
     # 1. multi-site trust decision (strongest)
+    ms = W["multi_site"]
     if judged is not None:
         if yes("j_multi_site"):
-            d["S1 multi-site trust decision (JUDGEMENT)"] = 5
+            d["S1 multi-site trust decision (JUDGEMENT)"] = ms["judged"]
     elif cs["c_same_check_sites"] >= 3:
-        d["S1 same new check added at 3+ sites (%s)" % cs["c_same_check_name"]] = 5
+        d["S1 same new check added at 3+ sites (%s)" % cs["c_same_check_name"]] = \
+            ms["same_new_check_3plus_sites"]
     elif cs["c_same_check_sites"] == 2:
-        d["S1 same new check added at 2 sites (%s)" % cs["c_same_check_name"]] = 3
+        d["S1 same new check added at 2 sites (%s)" % cs["c_same_check_name"]] = \
+            ms["same_new_check_2_sites"]
     elif cs["c_multi_site"]:
-        d["S1 4+ code sites in 2+ files"] = 2
+        d["S1 4+ code sites in 2+ files"] = ms["four_plus_sites_in_two_plus_files"]
     if judged is None and sig.get("multi_site_text") and "S1" not in " ".join(d):
-        d["S1 advisory wording names sibling sites"] = 1
+        d["S1 advisory wording names sibling sites"] = ms["advisory_names_sibling_sites"]
     # 2. cause in a different layer from the symptom
+    co = W["cause_other_layer"]
     if judged is not None:
         if yes("j_cause_other_layer"):
-            d["S2 cause in another layer than the symptom (JUDGEMENT)"] = 4
+            d["S2 cause in another layer than the symptom (JUDGEMENT)"] = co["judged"]
     elif cs["c_cause_layer_hint"]:
-        d["S2 advisory wording suggests cause in another layer"] = 2
+        d["S2 advisory wording suggests cause in another layer"] = co["advisory_hint"]
+    # 2a/2b. computed S2 (added 2026-10-16; 0 points until validated, shown as labels)
+    sd = W.get("symptom_fix_disparity")
+    if sd:
+        sup = " (computed; JUDGEMENT supersedes)" if judged is not None else ""
+        pts = (lambda k: 0 if judged is not None else sd.get(k, 0))
+        a = cs.get("_s2a") or {"state": "unknown"}
+        st = a.get("state", "unknown")
+        if st == "disparity":
+            d["S2a fix touches none of the %d locations the advisory names (%s)%s" % (
+                a.get("named", 0), ", ".join(a.get("examples", [])[:3]), sup)] = pts("s2a_disparity")
+        elif st == "on_named":
+            d["S2a fix lands only on locations the advisory names (%s)%s" % (
+                ", ".join(a.get("touched", [])[:3]), sup)] = pts("s2a_on_named")
+        elif st == "partial":
+            d["S2a fix touches named locations (%s) and code elsewhere%s" % (
+                ", ".join(a.get("touched", [])[:3]), sup)] = pts("s2a_partial")
+        else:
+            d["S2a unknown: %s%s" % (a.get("why", "advisory names no location"), sup)] = \
+                pts("s2a_unknown")
+        b = cs.get("_s2b") or {}
+        if b.get("fires"):
+            calls = b.get("check_calls_producer")
+            d["S2b fix changes a check (%s) and a data producer (%s) in another %s; %s roles; "
+              "check->producer call: %s%s" % (
+                  ", ".join(b.get("check_files", [])[:2]), ", ".join(b.get("producer_files", [])[:2]),
+                  "directory" if b.get("diff_dir") else "file in the same directory",
+                  "strict (both by name)" if b.get("strict") else "loose",
+                  {None: "not searched", 1: "yes", 0: "no"}.get(calls, calls), sup)] = (
+                pts("s2b_check_and_producer_in_other_file")
+                + (pts("s2b_bonus_other_directory") if b.get("diff_dir") else 0)
+                + (pts("s2b_bonus_strict_roles") if b.get("strict") else 0)
+                + (pts("s2b_check_does_not_call_producer") if calls == 0 else 0))
     # 3. a defence was present and did not work
+    de = W["defence_ineffective"]
     if judged is not None:
         if yes("j_defence_ineffective"):
-            d["S3 existing defence was ineffective (JUDGEMENT)"] = 4
+            d["S3 existing defence was ineffective (JUDGEMENT)"] = de["judged"]
     elif cs["c_defence_present"]:
-        d["S3 advisory says a defence failed and the fix rewrote a condition"] = 3
+        d["S3 advisory says a defence failed and the fix rewrote a condition"] = \
+            de["advisory_and_condition_rewritten"]
     elif sig.get("defence_text"):
-        d["S3 advisory wording only: a defence failed"] = 1
+        d["S3 advisory wording only: a defence failed"] = de["advisory_wording_only"]
     # 4. bypass / incomplete earlier fix / repeated advisories
+    bs = W["bypass_and_siblings"]
     if cs["c_bypass_incomplete"]:
-        d["S4 advisory says an earlier fix was incomplete or bypassed"] = 3
+        d["S4 advisory says an earlier fix was incomplete or bypassed"] = bs["earlier_fix_incomplete"]
     if cs["c_sibling_advisories"] >= 3:
-        d["S4 3+ sibling advisories (same package, shared CWE, 120 days)"] = 2
+        d["S4 3+ sibling advisories (same package, shared CWE, 120 days)"] = \
+            bs["sibling_advisories_3plus"]
     elif cs["c_sibling_advisories"] >= 1:
-        d["S4 sibling advisory (same package, shared CWE, 120 days)"] = 1
-    # 5. weakness class
-    if cs["c_favoured_class"]:
-        d["S5 favoured class: %s" % cs["c_class"]] = 3
-    # 6. fix shape
-    if cs["c_far_apart"] and cs["c_fix_sites"] >= 3:
-        d["S6 3+ hunks far apart"] = 2
+        d["S4 sibling advisory (same package, shared CWE, 120 days)"] = bs["sibling_advisory_1plus"]
+    # 5. weakness: OWASP 2025 category + per-CWE evidence (+ abstract-only, LLM-in-the-loop)
+    wpoints, wparts = cs.get("_weakness") or weakness_points(
+        row["cwe_ids"], row["summary"] or "", row["packages"] or "")[:2]
+    for k, v in wparts.items():                 # zero-point parts kept: they show what was checked
+        d["S5 " + k] = v
+    # 6. fix shape: the strongest predictor of repair failure (PatchEval and others)
+    fs = W["fix_shape"]
+    if cs["c_site_files"] >= 2:
+        d["S6 fix touches 2+ files"] = fs["two_plus_files"]
+    if cs["c_fix_sites"] >= 3:
+        d["S6 fix has 3+ hunks"] = fs["three_plus_hunks"]
+        if cs["c_far_apart"]:
+            d["S6 3+ hunks far apart"] = fs["three_plus_hunks_far_apart"]
+    if (cs.get("_changed_lines") or 0) >= 50:
+        d["S6 50+ changed source lines"] = fs["fifty_plus_changed_source_lines"]
     if cs["c_restructured"]:
-        d["S6 code deleted or restructured, not only added"] = 1
+        d["S6 code deleted or restructured, not only added"] = fs["code_deleted_or_restructured"]
     if cs["c_single_compact_hunk"]:
-        d["S6 single compact hunk"] = -3
+        d["S6 single compact hunk"] = fs["single_compact_hunk"]
+    spread = sum(v for k, v in d.items() if v > 0 and k[:2] in ("S1", "S6"))
+    if spread > fs["cap_with_multi_site"]:
+        d["S1+S6 cap (spread-out fix counted once)"] = fs["cap_with_multi_site"] - spread
     # 7. over-broad repair would break legitimate use (reader only)
     if yes("j_overbroad_breaks_legit"):
-        d["S7 over-broad repair breaks covered legitimate use (JUDGEMENT)"] = 2
+        d["S7 over-broad repair breaks covered legitimate use (JUDGEMENT)"] = \
+            W["overbroad_repair"]["judged"]
+    # 8. undisclosed siblings / alternate paths (v3): judged, else computed by `siblings`
+    us = W.get("undisclosed_siblings")
+    if us:
+        if yes("j_undisclosed_siblings"):
+            d["S8 undisclosed sibling sites or alternate path (JUDGEMENT)"] = us["judged"]
+        elif (row["c_other_call_sites"] if "c_other_call_sites" in row.keys() else None) is not None:
+            n = row["c_other_call_sites"] or 0
+            if n >= 2:
+                d["S8 %d other call sites of the guard/sink not touched by the fix" % n] = \
+                    us["computed_other_call_sites_2plus"]
+            elif n == 1:
+                d["S8 1 other call site of the guard/sink not touched by the fix"] = \
+                    us["computed_other_call_sites_1"]
     # LOW signals
+    lo = W["low_signals"]
     if cs["c_single_sink"]:
-        d["LOW single obvious sink fixed at one spot"] = -3
+        d["LOW single obvious sink fixed at one spot"] = lo["single_obvious_sink_one_spot"]
     if cs["c_one_site_guard"]:
-        d["LOW one-site added-only guard"] = -2
+        d["LOW one-site added-only guard"] = lo["one_site_added_only_guard"]
     if cs["c_compact_small_repo"]:
-        d["LOW compact fix in a small repository"] = -1
+        d["LOW compact fix in a small repository"] = lo["compact_fix_small_repo"]
     size_kb = row["repo_size_kb"]
     if size_kb and size_kb > 1500000:
-        d["build risk: repository over 1.5 GB"] = -1
+        d["build risk: repository over 1.5 GB"] = lo["repo_over_1_5_gb"]
     return float(sum(d.values())), d
 
 
@@ -1315,7 +1742,7 @@ def stage_classify(args, idx):
             other_files=best["other_files"],
             language=best["language"] or ECO_LANG.get((row["ecosystems"] or "").split(" ")[0], ""),
             file_breakdown=best["file_breakdown"], notes="; ".join(notes) or None,
-            **dict(list(cs.items()) + list(jcols.items())))
+            **dict([kv for kv in cs.items() if not kv[0].startswith("_")] + list(jcols.items())))
         counts["candidate"] += 1
     idx.commit()
     return counts
@@ -1882,6 +2309,20 @@ def stage_stats(args, idx):
                      ).fetchone()
     out["pool_signal_counts"] = dict(zip(
         ["pool_size"] + sigcols + ["c_same_check_sites>=3", "c_sibling_advisories>=1"], row))
+    s2 = {"S2a disparity": 0, "S2a partial": 0, "S2a on_named": 0, "S2a unknown": 0,
+          "S2b fires": 0, "S2b strict": 0}
+    for (det,) in db.execute("SELECT score_detail FROM entries WHERE status IN "
+                             "('candidate', 'shortlisted')"):
+        d = json.loads(det or "{}")
+        d = d.get("computed", d)
+        for k in d:
+            if k.startswith("S2a "):
+                s2["S2a " + ("disparity" if "touches none" in k else "on_named" if "lands only"
+                             in k else "partial" if "code elsewhere" in k else "unknown")] += 1
+            elif k.startswith("S2b "):
+                s2["S2b fires"] += 1
+                s2["S2b strict"] += 1 if "strict (both by name)" in k else 0
+    out["pool_s2_computed"] = s2
     out["pool_by_class"] = dict(db.execute(
         "SELECT c_class, count(*) FROM entries WHERE status IN ('candidate', 'shortlisted') "
         "GROUP BY 1").fetchall())

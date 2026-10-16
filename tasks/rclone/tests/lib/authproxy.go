@@ -23,6 +23,9 @@ import (
 var mapping = map[string][2]string{
 	"AKIAALICE00000001": {"/data/alice", "alice-secret-0001"},
 	"AKIABOB0000000002": {"/data/bob", "bob-secret-0002"},
+	// carol is known to the proxy but has NO secret: a fix must refuse her requests
+	// (2026-10-16). Mapped onto alice's data so any acceptance visibly leaks.
+	"AKIACAROL00000003": {"/data/alice", ""},
 }
 
 func main() {
@@ -38,10 +41,9 @@ func main() {
 	if !ok {
 		log.Fatalf("authproxy: unknown access key ID %q", accessKeyID)
 	}
-	out := map[string]string{
-		"type":               "local",
-		"_root":              m[0],
-		"_secret_access_key": m[1],
+	out := map[string]string{"type": "local", "_root": m[0]}
+	if m[1] != "" {
+		out["_secret_access_key"] = m[1]
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(&out); err != nil {
 		log.Fatalf("authproxy: encode output: %v", err)

@@ -1,0 +1,86 @@
+diff --git a/asyncssh/config.py b/asyncssh/config.py
+index 5921f01..e688b7a 100644
+--- a/asyncssh/config.py
++++ b/asyncssh/config.py
+@@ -34,7 +34,7 @@ from typing import Set, Tuple, Union, cast
+ 
+ from .constants import DEFAULT_PORT
+ from .logging import logger
+-from .misc import DefTuple, FilePath, ip_address
++from .misc import DefTuple, FilePath, IllegalUserName, ip_address
+ from .pattern import HostPatternList, WildcardPatternList
+ 
+ 
+@@ -594,7 +594,20 @@ class SSHServerConfig(SSHConfig):
+             return None
+ 
+     def _set_tokens(self) -> None:
+-        """Set the tokens available for percent expansion"""
++        """Set the tokens available for percent expansion
++
++           Only allow "safe" username substitutions. Unsafe usernames are:
++
++               - a username of exactly ".."
++               - a username beginning with a "~"
++               - a username beginning with a Windows drive letter and a ":"
++               - a username containing forward or backward slashes
++               - a username containing an env substitution like "${...}"
++
++        """
++
++        if re.search(r'^\.\.$|^~|^[A-Za-z]:|[/\\]|\$\{.*?\}', self._user):
++            raise IllegalUserName('Unsafe username substitution')
+ 
+         self._tokens.update({'u': self._user})
+ 
+diff --git a/asyncssh/connection.py b/asyncssh/connection.py
+index 0faf4ea..3f37047 100644
+--- a/asyncssh/connection.py
++++ b/asyncssh/connection.py
+@@ -1544,6 +1544,11 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
+                 self._ignore_first_kex = False
+             else:
+                 handler = self._kex
++        elif not self._recv_encryption and (
++                (self.is_server() and pkttype == MSG_USERAUTH_REQUEST) or
++                (self.is_client() and pkttype == MSG_EXT_INFO)):
++            skip_reason = 'unexpected message before kex complete'
++            exc_reason = 'Unexpected message before key exchange was complete'
+         elif (self._auth and
+               MSG_USERAUTH_FIRST <= pkttype <= MSG_USERAUTH_LAST):
+             handler = self._auth
+@@ -2483,6 +2488,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
+         if b'dropbear' in self._client_version and self._compressor:
+             send_pktsize -= 1
+ 
++        if send_pktsize <= 0:
++            raise ProtocolError('Invalid maximum packet size')
++
+         try:
+             chantype = chantype_bytes.decode('ascii')
+         except UnicodeDecodeError:
+@@ -2520,6 +2528,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
+         if b'dropbear' in self._server_version and self._compressor:
+             send_pktsize -= 1
+ 
++        if send_pktsize <= 0:
++            raise ProtocolError('Invalid maximum packet size')
++
+         chan = self._channels.get(recv_chan)
+         if chan:
+             chan.process_open_confirmation(send_chan, send_window,
+diff --git a/asyncssh/scp.py b/asyncssh/scp.py
+index 85b5f22..4dfd304 100644
+--- a/asyncssh/scp.py
++++ b/asyncssh/scp.py
+@@ -112,6 +112,10 @@ def _parse_cd_args(args: bytes) -> Tuple[int, int, bytes]:
+ 
+     try:
+         permissions, size, name = args.split(None, 2)
++
++        if b'/' in name or b'\\' in name or name in (b'.', b'..'):
++            raise _scp_error(SFTPBadMessage, 'Invalid filename')
++
+         return int(permissions, 8), int(size), name
+     except ValueError:
+         raise _scp_error(SFTPBadMessage,

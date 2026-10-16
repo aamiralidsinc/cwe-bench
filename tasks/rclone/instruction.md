@@ -54,6 +54,11 @@ every access key ID the proxy maps, not just one particular request.
   A request signed with an empty secret, or with any secret other than the
   correct one, must be refused with an access-denied response. This must hold for
   all S3 operations and all access key IDs.
+- With `--auth-proxy`, the proxy program is the source of each identity's secret: it
+  returns the secret access key in the `_secret_access_key` field of its JSON result
+  (alongside `_root` and the backend settings). If the result has no
+  `_secret_access_key`, or it is empty, the identity has no usable secret and every
+  request for it must be refused.
 - Legitimate use must keep working. A client that signs with the correct secret
   for its access key ID must still be served, and the server must keep running
   and answering requests. The ordinary static-key mode (where a key/secret pair

@@ -1,0 +1,124 @@
+diff --git a/crates/net/src/error.rs b/crates/net/src/error.rs
+index a02a790..1237de2 100644
+--- a/crates/net/src/error.rs
++++ b/crates/net/src/error.rs
+@@ -391,6 +391,9 @@ pub enum DnsError {
+         /// DNSSEC proof of the record
+         proof: Proof,
+     },
++    /// DNSSEC validation failure
++    #[error("DNSSEC validation failed")]
++    DnssecBogus,
+ }
+ 
+ impl DnsError {
+@@ -504,6 +507,7 @@ impl DnsError {
+             Self::NoRecordsFound(_) => "dns_no_records",
+             #[cfg(feature = "__dnssec")]
+             Self::Nsec { .. } => "dns_nsec",
++            Self::DnssecBogus => "dns_dnssec_bogus",
+         }
+     }
+ }
+diff --git a/crates/net/src/xfer/retry_dns_handle.rs b/crates/net/src/xfer/retry_dns_handle.rs
+index b52aef7..826ff24 100644
+--- a/crates/net/src/xfer/retry_dns_handle.rs
++++ b/crates/net/src/xfer/retry_dns_handle.rs
+@@ -89,7 +89,8 @@ impl<H: DnsHandle> Stream for RetrySendStream<H> {
+                 (
+                     _,
+                     err @ NetError::NoConnections
+-                    | err @ NetError::Dns(DnsError::NoRecordsFound(_)),
++                    | err @ NetError::Dns(DnsError::NoRecordsFound(_))
++                    | err @ NetError::Dns(DnsError::DnssecBogus),
+                 ) => return Poll::Ready(Some(Err(err))),
+                 // Don't count `Busy` as an attempt
+                 (_, NetError::Busy) => {}
+diff --git a/crates/resolver/src/caching_client.rs b/crates/resolver/src/caching_client.rs
+index 7c82359..5e86e3e 100644
+--- a/crates/resolver/src/caching_client.rs
++++ b/crates/resolver/src/caching_client.rs
+@@ -15,6 +15,8 @@ use std::{
+ 
+ use once_cell::sync::Lazy;
+ 
++#[cfg(feature = "__dnssec")]
++use crate::proto::dnssec::{DnssecSummary, Proof};
+ use crate::{
+     cache::{MAX_TTL, ResponseCache, TtlConfig},
+     lookup::Lookup,
+@@ -200,6 +202,32 @@ where
+             response_message
+         };
+ 
++        // TODO: This doesn't yet take into account the CD flag. There is not yet a way to pass it
++        // from the ForwarderZoneHandler, through the Resolver public API, to here.
++        #[cfg(feature = "__dnssec")]
++        if is_dnssec {
++            let summary_opt = match &response_message {
++                Ok(response) => Some(DnssecSummary::from_records(response.answers.iter())),
++                Err(NetError::Dns(DnsError::Nsec {
++                    response, proof, ..
++                })) => Some(if *proof == Proof::Bogus {
++                    DnssecSummary::Bogus
++                } else {
++                    DnssecSummary::from_records(response.authorities.iter())
++                }),
++                _ => None,
++            };
++            if let Some(DnssecSummary::Bogus) = summary_opt {
++                #[cfg(feature = "metrics")]
++                client
++                    .cache_metrics
++                    .cache_miss_duration
++                    .record(request_start.elapsed());
++                // Treat untrustworthy data as if the name did not exist.
++                return Err(NoRecords::new(query, ResponseCode::NXDomain).into());
++            }
++        }
++
+         // TODO: take all records and cache them?
+         //  if it's DNSSEC they must be signed, otherwise?
+         let records = match response_message {
+diff --git a/crates/server/src/zone_handler/catalog.rs b/crates/server/src/zone_handler/catalog.rs
+index fe4cc5d..15513a2 100644
+--- a/crates/server/src/zone_handler/catalog.rs
++++ b/crates/server/src/zone_handler/catalog.rs
+@@ -15,6 +15,10 @@ use tracing::{debug, error, info, trace, warn};
+ #[cfg(feature = "metrics")]
+ use crate::metrics::CatalogMetrics;
+ #[cfg(feature = "__dnssec")]
++use crate::net::{DnsError, NetError};
++#[cfg(all(feature = "__dnssec", feature = "recursor"))]
++use crate::resolver::recursor;
++#[cfg(feature = "__dnssec")]
+ use crate::{
+     dnssec::NxProofKind,
+     proto::{
+@@ -39,11 +43,6 @@ use crate::{
+         MessageResponseBuilder, ZoneHandler, ZoneType,
+     },
+ };
+-#[cfg(all(feature = "__dnssec", feature = "recursor"))]
+-use crate::{
+-    net::{DnsError, NetError},
+-    resolver::recursor,
+-};
+ 
+ /// Set of zones and zone handlers available to this server.
+ #[derive(Default)]
+@@ -1170,6 +1169,14 @@ async fn build_forwarded_response(
+                 }
+             }
+         }
++        #[cfg(feature = "__dnssec")]
++        Err(LookupError::NetError(NetError::Dns(DnsError::DnssecBogus))) => {
++            response_meta.response_code = ResponseCode::ServFail;
++            ResponseParts {
++                nsec_proof: Some(Proof::Bogus),
++                ..ResponseParts::default()
++            }
++        }
+         Err(e) => {
+             response_meta.response_code = ResponseCode::ServFail;
+             debug!(error = ?e, "error resolving");

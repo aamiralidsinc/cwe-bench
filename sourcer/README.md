@@ -156,7 +156,7 @@ pool; `score_read` replaces the proxies for signals 1, 2, 3 and 7 with the reade
 | # | Signal | Computed column and points | With JUDGEMENT |
 |---|---|---|---|
 | 1 | Multi-site trust decision: the same check has to hold at several sites | `c_same_check_sites` >= 3: +5; = 2: +3; else `c_multi_site` (4+ code hunks in 2+ files): +2; else advisory wording about sibling sites: +1 | `j_multi_site`: +5 |
-| 2 | Cause in a different layer from the symptom | `c_cause_layer_hint` (advisory wording only): +2 | `j_cause_other_layer`: +4 |
+| 2 | Cause in a different layer from the symptom | `c_cause_layer_hint` (advisory wording only): `cause_other_layer.advisory_hint` (+1 in weights v3); plus the computed S2a and S2b labels, 0 points until validated (see below) | `j_cause_other_layer`: +4 (the computed S2a/S2b labels then score 0) |
 | 3 | A defence was present and did not work | `c_defence_present` (advisory says a defence failed AND the fix rewrote a condition): +3; wording only: +1 | `j_defence_ineffective`: +4 |
 | 4 | Bypass / incomplete earlier fix; repeated advisories | `c_bypass_incomplete`: +3; `c_sibling_advisories` >= 3: +2, 1-2: +1 | same |
 | 5 | Weakness class: authentication and session, authorisation, integrity, logic / insecure design | `c_favoured_class`: +3 (`c_class` names the class) | same |
@@ -197,6 +197,86 @@ From the advisory text (regular expressions in `osv_sourcer.py`, stored in `adv_
 From CWE ids: `c_class` (`auth_session`, `authz`, `integrity`, `logic_design`, `other`; the
 CWE sets are `CLASS_CWES` in `osv_sourcer.py`), `c_favoured_class`.
 
+### Computed S2: S2a and S2b (added 2026-10-16, 0 points, `validated: false`)
+
+These two have no index column. Each appears in `score_detail` as a label with its points,
+which are 0 in `weights.json` (`symptom_fix_disparity`). `stats` counts them under
+`pool_s2_computed`. Validation and proposed points: `../research/round1-analysis/D-computed-s2.md`.
+
+**Inputs.**
+- From the advisory: `adv_signals.named` = `{func, file, endpoint, command}`, written by
+  `resignal`/`parse` through `named_locations()`.
+  - It reads functions and methods (`fetchToken`, `foo.bar()`, `Class#m`, `A::b`, CamelCase
+    identifiers), files (paths, bare `x.rs` with a source extension, GitHub `blob/` links),
+    endpoints (`GET /x`, backticked `/api/...`) and backticked CLI commands.
+  - Code blocks are ignored, and so are PoC, reference, credit and workaround sections.
+- From the fix: the commit's `shape` JSON, written by `diffs`/`remetrics` through
+  `patchmetrics.location_metrics()`.
+  - `changed_files`: source files with a code-changing hunk.
+  - `hunk_funcs`: names from the hunk headers.
+  - `units`: `[file, name, role, basis]` for every enclosing definition of a changed line (the
+    nearest definition line in the hunk, else the hunk header).
+  - `s2b`: the S2b result.
+
+**S2a, named-location disparity.** Each candidate gets one state:
+
+| State | Meaning |
+|---|---|
+| `disparity` | the advisory names locations and the fix touches none of them |
+| `partial` | the fix touches some named locations and also changes code elsewhere |
+| `on_named` | every changed site is in a named function, class or file |
+| `unknown` | nothing is named |
+
+- "Touched" is lenient, which makes `disparity` conservative. A named function or class counts as
+  touched if it equals a hunk-header name, a changed line's enclosing definition, or a changed
+  file's basename. A named file counts on a path-suffix or basename match. An endpoint or command
+  counts when one of its segments names a changed definition, file or directory.
+- Names equal to the package or repository are dropped, as are commands that do not start with
+  the program's name.
+- Points: `s2a_disparity`, `s2a_partial`, `s2a_on_named`, `s2a_unknown`.
+
+**S2b, data producer off the check's path** (Hadi 2026-10-15). It fires when the fix changes a
+check-role unit and a producer-role unit in a different file.
+- **Producer roles**: schema, serializer, parser, loader, decoder, unmarshal, codec, model(s),
+  types, constructor/`new`/`from_*`, migration, store.
+- **Check roles**: auth, permission, policy, guard, middleware, validate/verify/check, access,
+  acl, token.
+- **How a role is chosen.** The role comes from the definition's name: its leading verb, then its
+  head noun, then any word, but only when the words point one way. Only if the name says nothing
+  is the file name used, then the nearest directories.
+
+Flags in `shape.s2b`:
+
+| Flag | Meaning |
+|---|---|
+| `diff_dir` | the two sites are in different directories |
+| `strict` | some pair has both roles taken from the name, the producer is not a bare constructor, and the two files are not linked in the diff (neither file's added lines call a definition the fix changed in the other) |
+| `linked_in_diff` | every pair is linked in the diff |
+| `check_calls_producer` | stays null: whether the check reaches the producer needs the vulnerable tree, and the `siblings` stage will fill it |
+
+Points: `s2b_check_and_producer_in_other_file`, `s2b_bonus_other_directory`,
+`s2b_bonus_strict_roles`, `s2b_check_does_not_call_producer`.
+
+**Pool on 2026-10-16 (1,462 candidates):**
+
+| Signal | Candidates |
+|---|---|
+| S2a `disparity` | 18.9% |
+| S2a `partial` | 30.7% |
+| S2a `on_named` | 30.4% |
+| S2a `unknown` | 20.0% |
+| S2b, any pair | 11.2% |
+| S2b strict | 5.5% |
+
+**Known weaknesses.**
+- Advisories usually name the root cause, so S2a measures how precise the advisory is more than
+  how far the symptom is from the fix. It caught 0 of 4 symptom-far-from-cause round-1 items.
+- For indented methods (Java, Python, PHP) git's hunk header names the class, so the enclosing
+  method is known only when its definition line is inside the hunk.
+- Role keywords are crude ("auth"/"token" inside identifiers; constructors of check classes).
+- S2b is meaningful per advisory only. On a patch that combines several flaws it pairs sites of
+  different flaws.
+
 Known weaknesses: `c_cause_layer_hint` is wording only (it fired on 24% of the first run's
 pool) and carries little information without a reading. `c_multi_site` is broad (55% of the
 pool); `c_same_check_sites >= 3` (22%) is the sharper form, but it misses a check that is
@@ -231,7 +311,7 @@ tempting wrong fix; a candidate for which no tempting wrong fix can be named is 
 | `fix_commit`, `fix_commit_date` | the commit the metrics describe (full SHA once known) and its date |
 | `parent_commit` | its first parent, the vulnerable state (NULL until `parents` has run) |
 | `cwe_ids`, `published`, `modified`, `severity`, `cvss`, `summary` | from the advisory |
-| `adv_signals` | JSON of text signals: `fix_bypass`, `bypass_word`, `multi_site_text`, `cause_layer_text`, `defence_text`, `semantic_kw`, `entry_guess`, `services_guess`, `platform_only`, `prs`, `commits_in_other_repos` |
+| `adv_signals` | JSON of text signals: `fix_bypass`, `bypass_word`, `multi_site_text`, `cause_layer_text`, `defence_text`, `semantic_kw`, `entry_guess`, `services_guess`, `platform_only`, `named` (S2a), `prs`, `commits_in_other_repos` |
 | `src_files`, `src_added`, `src_removed`, `src_hunks` | non-test source change of `fix_commit` |
 | `test_files`, `tests_in_fix`, `other_files`, `language`, `file_breakdown` | rest of the diff metrics |
 | `repo_stars`, `repo_size_kb`, `repo_flags` | from `repo-meta`, NULL when not looked up |

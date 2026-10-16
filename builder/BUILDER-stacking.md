@@ -30,6 +30,9 @@ this file covers only what differs for stacking.
   (C) every security test FAILS; after the full fix every one PASSES.
 - `tests/functional/` : legitimate-use tests for each affected feature, so a fix
   that disables a feature fails.
+- All test code stays under `tests/`, never in `environment/`: the agent shares the
+  container and can read and run anything baked into the image. See "Hidden tests
+  never go into the image" in BUILDER.md (pre-build against stubs); the gate enforces it.
 - `score.py` (unchanged) gives partial credit, but acceptance still requires the
   model to reach reward 1.0 — i.e. fix ALL of them. Partial fixes are recorded
   but count as a non-solve, which is exactly why stacking is hard.

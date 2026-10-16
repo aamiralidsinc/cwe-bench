@@ -83,8 +83,8 @@ def test_exception_leading_space_protocol_relative():
     _assert_on_host(_httpexception_location(" //" + ATTACKER_HOST + "/x"))
 
 
-def test_exception_bare_protocol_relative():
-    _assert_on_host(_httpexception_location("//" + ATTACKER_HOST + "/x"))
+# test_exception_bare_protocol_relative removed 2026-10-16: an explicit "//host/x" is outside the
+# instruction's requirement ("not an explicitly protocol-relative reference"); the test contradicted it.
 
 
 def test_exception_leading_tab_protocol_relative():

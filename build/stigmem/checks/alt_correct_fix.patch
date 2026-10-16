@@ -1,0 +1,145 @@
+diff --git a/node/src/stigmem_node/main.py b/node/src/stigmem_node/main.py
+index 7172b30..c21367a 100644
+--- a/node/src/stigmem_node/main.py
++++ b/node/src/stigmem_node/main.py
+@@ -3,7 +3,9 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import ipaddress
+ import logging
++import os
+ import signal
+ import ssl
+ from collections.abc import AsyncGenerator, Awaitable, Callable
+@@ -62,6 +64,10 @@ def _enforce_federation_transport_security() -> None:
+             "STIGMEM_FEDERATION_INSECURE=1 only for local/dev/test federation."
+         )
+ 
++    if not _alt_host_is_loopback(settings.node_url):
++        raise RuntimeError(
++            "Insecure (no-mTLS) federation is confined to loopback deployments."
++        )
+     logger.warning(
+         "SECURITY WARNING: federation is running without mTLS because "
+         "STIGMEM_FEDERATION_INSECURE=1 is set. Use this only for local/dev/test."
+@@ -73,6 +79,12 @@ def _warn_if_rate_limit_kill_switch_enabled() -> None:
+     if settings.rate_limit_write_per_hour != 0 or settings.rate_limit_read_per_hour != 0:
+         return
+ 
++    if not getattr(settings, "rate_limit_unbounded_ack", False):
++        raise RuntimeError(
++            "Quota enforcement is fully disabled; set the unbounded-traffic "
++            "acknowledgement to proceed."
++        )
++
+     logger.warning(
+         "SECURITY WARNING: quota enforcement is disabled because "
+         "STIGMEM_RATE_LIMIT_WRITE_PER_HOUR=0 and "
+@@ -81,6 +93,27 @@ def _warn_if_rate_limit_kill_switch_enabled() -> None:
+     )
+ 
+ 
++def _alt_host_is_loopback(node_url: str) -> bool:
++    from urllib.parse import urlparse
++
++    host = (urlparse(node_url).hostname or "").lower()
++    if host == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host).is_loopback
++    except ValueError:
++        return False
++
++
++def _enforce_auth_not_disabled_remotely() -> None:
++    if settings.auth_required:
++        return
++    if not _alt_host_is_loopback(settings.node_url):
++        raise RuntimeError(
++            "Unauthenticated operation is confined to loopback deployments."
++        )
++
++
+ def create_app() -> FastAPI:
+     @asynccontextmanager
+     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+@@ -89,11 +122,19 @@ def create_app() -> FastAPI:
+         if settings.trust_mode == "strict" and not settings.node_private_key:
+             raise RuntimeError("STIGMEM_NODE_PRIVATE_KEY must be set when trust_mode=strict")
+         _enforce_federation_transport_security()
++        _enforce_auth_not_disabled_remotely()
+         _warn_if_rate_limit_kill_switch_enabled()
+ 
+         discovered_plugins = register_discovered_plugins(freeze=False)
+         _include_plugin_routers(app, discovered_plugins)
+         apply_migrations()
++        if getattr(settings, "storage_backend", "sqlite") == "sqlite":
++            _db_file = settings.db_path
++            if _db_file and _db_file != ":memory:" and os.path.exists(_db_file):
++                for _suffix in ("", "-wal", "-shm"):
++                    _artifact = _db_file + _suffix
++                    if os.path.exists(_artifact):
++                        os.chmod(_artifact, 0o600)
+         get_registry().freeze()
+ 
+         if settings.otel_enabled:
+diff --git a/node/src/stigmem_node/plugins/signing.py b/node/src/stigmem_node/plugins/signing.py
+index 0baa57e..5e664ab 100644
+--- a/node/src/stigmem_node/plugins/signing.py
++++ b/node/src/stigmem_node/plugins/signing.py
+@@ -49,8 +49,18 @@ class PluginSigningInfo:
+ PluginSignatureVerifier = Callable[[DiscoveredPlugin], PluginSigningInfo]
+ 
+ 
++_ALT_UNSIGNED_ACK = "yes-load-unsigned-plugin-code"
++
++
+ def allow_unsigned_development_override(plugin: DiscoveredPlugin) -> PluginSigningInfo:
+     """Return explicit development override metadata for an unsigned plugin."""
++    from stigmem_node.settings import settings
++
++    if getattr(settings, "allow_unsigned_plugin_ack", "") != _ALT_UNSIGNED_ACK:
++        raise RuntimeError(
++            "Loading unsigned plugin code requires an explicit operator "
++            "acknowledgement."
++        )
+ 
+     return PluginSigningInfo(
+         signing_identity=plugin.signing_identity,
+diff --git a/node/src/stigmem_node/routes/_federation_impl.py b/node/src/stigmem_node/routes/_federation_impl.py
+index 003d3ce..3bf9466 100644
+--- a/node/src/stigmem_node/routes/_federation_impl.py
++++ b/node/src/stigmem_node/routes/_federation_impl.py
+@@ -129,8 +129,9 @@ async def register_peer_impl(
+             "signed_at": req.signed_at,
+         }
+         if verify_declaration_sig(signed_fields, req.declaration_sig, fetched_pubkey):
+-            final_status = "active"
+-            verified_at = datetime.now(UTC).isoformat()
++            # Verified declaration is accepted but held for explicit operator
++            # activation; it is NOT made active automatically.
++            final_status = "pending_verification"
+ 
+     with db() as conn:
+         conn.execute(
+diff --git a/node/src/stigmem_node/settings.py b/node/src/stigmem_node/settings.py
+index 98df10e..958d9dc 100644
+--- a/node/src/stigmem_node/settings.py
++++ b/node/src/stigmem_node/settings.py
+@@ -105,6 +105,7 @@ class Settings(BaseSettings):
+     # 0 = disabled.
+     rate_limit_write_per_hour: int = 1000
+     rate_limit_read_per_hour: int = 5000
++    rate_limit_unbounded_ack: bool = False
+ 
+     # Storage backend (Phase 8 / 11).
+     # "sqlite"   (default) — local SQLite file at db_path.
+@@ -184,6 +185,7 @@ class Settings(BaseSettings):
+     # before registration. Set false only for local development; unsigned plugin
+     # loading remains warning- and audit-visible.
+     plugin_signing_required: bool = True
++    allow_unsigned_plugin_ack: str = ""
+     # Comma-separated Sigstore signing identities accepted for production plugin
+     # registration when plugin_signing_required=true.
+     plugin_trusted_publishers: str = ""

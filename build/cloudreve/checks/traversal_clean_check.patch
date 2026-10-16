@@ -1,0 +1,219 @@
+diff --git a/inventory/user.go b/inventory/user.go
+index bb0391f..5fb16bc 100644
+--- a/inventory/user.go
++++ b/inventory/user.go
+@@ -402,6 +402,7 @@ func (c *userClient) SearchActive(ctx context.Context, limit int, keyword string
+ 		ctx,
+ 		c.client.User.Query().
+ 			Where(user.Or(user.EmailContainsFold(keyword), user.NickContainsFold(keyword))).
++			Where(user.StatusEQ(user.StatusActive)).
+ 			Limit(limit),
+ 	).All(ctx)
+ }
+diff --git a/middleware/wopi.go b/middleware/wopi.go
+index 8e498e1..d4efaba 100644
+--- a/middleware/wopi.go
++++ b/middleware/wopi.go
+@@ -1,6 +1,10 @@
+ package middleware
+ 
+ import (
++	"crypto/subtle"
++	"net/http"
++	"strings"
++
+ 	"github.com/cloudreve/Cloudreve/v4/application/dependency"
+ 	"github.com/cloudreve/Cloudreve/v4/inventory/types"
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager"
+@@ -8,8 +12,6 @@ import (
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/util"
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/wopi"
+ 	"github.com/gin-gonic/gin"
+-	"net/http"
+-	"strings"
+ )
+ 
+ // WopiWriteAccess validates if write access is obtained.
+@@ -33,15 +35,16 @@ func ViewerSessionValidation() gin.HandlerFunc {
+ 		store := dep.KV()
+ 		settings := dep.SettingProvider()
+ 
+-		accessToken := strings.Split(c.Query(wopi.AccessTokenQuery), ".")
+-		if len(accessToken) != 2 {
++		accessToken := c.Query(wopi.AccessTokenQuery)
++		sessionID, _, ok := strings.Cut(accessToken, ".")
++		if !ok || sessionID == "" {
+ 			c.Status(http.StatusForbidden)
+ 			c.Header(wopi.ServerErrorHeader, "malformed access token")
+ 			c.Abort()
+ 			return
+ 		}
+ 
+-		sessionRaw, exist := store.Get(manager.ViewerSessionCachePrefix + accessToken[0])
++		sessionRaw, exist := store.Get(manager.ViewerSessionCachePrefix + sessionID)
+ 		if !exist {
+ 			c.Status(http.StatusForbidden)
+ 			c.Header(wopi.ServerErrorHeader, "invalid access token")
+@@ -50,6 +53,13 @@ func ViewerSessionValidation() gin.HandlerFunc {
+ 		}
+ 
+ 		session := sessionRaw.(manager.ViewerSessionCache)
++		if subtle.ConstantTimeCompare([]byte(accessToken), []byte(session.Token)) != 1 {
++			c.Status(http.StatusForbidden)
++			c.Header(wopi.ServerErrorHeader, "invalid access token")
++			c.Abort()
++			return
++		}
++
+ 		if err := SetUserCtx(c, session.UserID); err != nil {
+ 			c.Status(http.StatusInternalServerError)
+ 			c.Header(wopi.ServerErrorHeader, "user not found")
+diff --git a/pkg/thumb/builtin.go b/pkg/thumb/builtin.go
+index 1017409..0f6be17 100644
+--- a/pkg/thumb/builtin.go
++++ b/pkg/thumb/builtin.go
+@@ -1,6 +1,7 @@
+ package thumb
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager/entitysource"
+@@ -19,6 +20,12 @@ import (
+ 
+ const thumbTempFolder = "thumb"
+ 
++// maxDecodePixels caps the decoded pixel count to prevent pixel-bomb DoS:
++// stdlib decoders allocate bytesPerPixel*W*H from the header before reading
++// pixel data, so a tiny file with huge dimensions can otherwise OOM-kill the
++// process. 64 MP covers any realistic camera output.
++const maxDecodePixels = 64 * 1000 * 1000
++
+ // BuiltinSupportedExts lists file extensions supported by the built-in
+ // thumbnail generator. Extensions are lowercased and do not include the dot.
+ var BuiltinSupportedExts = []string{"jpg", "jpeg", "png", "gif"}
+@@ -37,7 +44,18 @@ func NewThumbFromFile(file io.Reader, ext string) (*Thumb, error) {
+ 		return nil, fmt.Errorf("unknown image format: %w", ErrPassThrough)
+ 	}
+ 
+-	var err error
++	var hdr bytes.Buffer
++	cfg, _, err := image.DecodeConfig(io.TeeReader(file, &hdr))
++	if err != nil {
++		return nil, fmt.Errorf("failed to read image config: %w (%w)", err, ErrPassThrough)
++	}
++	if cfg.Width <= 0 || cfg.Height <= 0 ||
++		int64(cfg.Width)*int64(cfg.Height) > maxDecodePixels {
++		return nil, fmt.Errorf("image dimensions too large (%dx%d): %w",
++			cfg.Width, cfg.Height, ErrPassThrough)
++	}
++	file = io.MultiReader(&hdr, file)
++
+ 	var img image.Image
+ 	switch ext {
+ 	case "jpg", "jpeg":
+diff --git a/pkg/wopi/wopi.go b/pkg/wopi/wopi.go
+index 9664afb..4b9f1cd 100644
+--- a/pkg/wopi/wopi.go
++++ b/pkg/wopi/wopi.go
+@@ -4,11 +4,12 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"github.com/cloudreve/Cloudreve/v4/inventory/types"
+ 	"net/url"
+ 	"strings"
+ 	"time"
+ 
++	"github.com/cloudreve/Cloudreve/v4/inventory/types"
++
+ 	"github.com/cloudreve/Cloudreve/v4/application/dependency"
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/cluster/routes"
+ 	"github.com/cloudreve/Cloudreve/v4/pkg/filemanager/manager"
+@@ -44,6 +45,7 @@ const (
+ 	LockTokenHeader       = WopiHeaderPrefix + "Lock"
+ 	ItemVersionHeader     = WopiHeaderPrefix + "ItemVersion"
+ 	SuggestedTargetHeader = WopiHeaderPrefix + "SuggestedTarget"
++	InvalidFileNameHeader = WopiHeaderPrefix + "InvalidFileNameError"
+ 
+ 	MethodLock           = "LOCK"
+ 	MethodUnlock         = "UNLOCK"
+diff --git a/service/explorer/events.go b/service/explorer/events.go
+index 113d4e7..b5e54ce 100644
+--- a/service/explorer/events.go
++++ b/service/explorer/events.go
+@@ -34,7 +34,7 @@ func (s *ExplorerEventService) HandleExplorerEventsPush(c *gin.Context) error {
+ 	}
+ 
+ 	// Make sure target is a valid folder that the user can listen to
+-	parent, _, err := m.List(c, uri, &manager.ListArgs{
++	parent, listRes, err := m.List(c, uri, &manager.ListArgs{
+ 		Page:     0,
+ 		PageSize: 1,
+ 	})
+@@ -42,6 +42,14 @@ func (s *ExplorerEventService) HandleExplorerEventsPush(c *gin.Context) error {
+ 		return serializer.NewError(serializer.CodeParamErr, "Requested uri not available", err)
+ 	}
+ 
++	// Reject event subscriptions on single-file views (e.g. single-file shares).
++	// The listed parent is the underlying owner-side folder containing the file,
++	// while the subscriber is only authorized to observe the shared file itself.
++	// Subscribing to that folder topic would leak events about unshared siblings.
++	if listRes != nil && listRes.SingleFileView {
++		return serializer.NewError(serializer.CodeNoPermissionErr, "Event subscriptions are not supported on this view", nil)
++	}
++
+ 	requestInfo := requestinfo.RequestInfoFromContext(c)
+ 	if requestInfo.ClientID == "" {
+ 		return serializer.NewError(serializer.CodeParamErr, "Client ID is required", nil)
+diff --git a/service/explorer/viewer.go b/service/explorer/viewer.go
+index f8fd01b..566aecd 100644
+--- a/service/explorer/viewer.go
++++ b/service/explorer/viewer.go
+@@ -218,6 +218,14 @@ func (service *WopiService) PutContent(c *gin.Context, isPutRelative bool) error
+ 			return fmt.Errorf("failed to decode X-WOPI-SuggestedTarget header (UTF-7): %w", err)
+ 		}
+ 
++		// X-WOPI-SuggestedTarget is a filename, not a path. Reject any value
++		// that could traverse out of the source file's directory.
++		if !isValidWopiSuggestedTarget(fileName) {
++			c.Status(http.StatusBadRequest)
++			c.Header(wopi.InvalidFileNameHeader, "Invalid target file name")
++			return nil
++		}
++
+ 		fileUriParsed, err := fs.NewUriFromString(fileUri)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to parse file uri: %w", err)
+@@ -265,6 +273,17 @@ func (service *WopiService) PutContent(c *gin.Context, isPutRelative bool) error
+ 	return nil
+ }
+ 
++// isValidWopiSuggestedTarget enforces that X-WOPI-SuggestedTarget is a bare
++// filename (or extension prefixed with ".") and cannot traverse out of the
++// source file's directory once joined onto it.
++func isValidWopiSuggestedTarget(name string) bool {
++	// Wrong fix: lexically normalise and reject only names that climb out.
++	// path.Clean clamps ".." at a rooted path, so "/../x" looks safe here,
++	// while the raw (un-normalised) name is what gets joined later.
++	cleaned := filepath.Clean(name)
++	return name != "" && cleaned != ".." && !strings.HasPrefix(cleaned, "../")
++}
++
+ func (service *WopiService) GetFile(c *gin.Context) error {
+ 	uri, m, _, viewerSession, dep, err := prepareFs(c)
+ 	if err != nil {
+@@ -367,9 +386,9 @@ func (service *WopiService) FileInfo(c *gin.Context) (*WopiFileInfo, error) {
+ 
+ type (
+ 	CreateViewerSessionService struct {
+-		Uri             string               `json:"uri" form:"uri" binding:"required"`
+-		Version         string               `json:"version" form:"version"`
+-		ViewerID        string               `json:"viewer_id" form:"viewer_id" binding:"required"`
++		Uri             string             `json:"uri" form:"uri" binding:"required"`
++		Version         string             `json:"version" form:"version"`
++		ViewerID        string             `json:"viewer_id" form:"viewer_id" binding:"required"`
+ 		PreferredAction types.ViewerAction `json:"preferred_action" form:"preferred_action" binding:"required"`
+ 	}
+ 	CreateViewerSessionParamCtx struct{}

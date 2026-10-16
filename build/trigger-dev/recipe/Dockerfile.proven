@@ -1,0 +1,31 @@
+FROM node:22-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git patch bash python3 build-essential \
+        postgresql postgresql-contrib redis-server procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
+
+WORKDIR /app
+COPY src/ /app/
+
+# Install the whole workspace (filtered install chokes on internal workspace
+# deps in this repo). frozen lockfile = reproducible, uses the committed lock.
+ENV CI=1 HUSKY=0
+RUN pnpm install --frozen-lockfile 2>&1 | tail -30
+
+# Generate ALL Prisma clients + catalog before building (turbo build of the
+# internal packages needs the generated clients present).
+RUN pnpm --filter @trigger.dev/database run generate \
+ && pnpm --filter @internal/run-ops-database run generate \
+ && pnpm --filter @internal/llm-model-catalog run generate
+
+# The bundled server externalizes some transitive deps of the bundled
+# @trigger.dev/* packages that pnpm's isolated store then hides at runtime.
+# Have esbuild bundle them (correct version resolved per-import).
+RUN sed -i 's#serverDependenciesToBundle: \[#serverDependenciesToBundle: [ /^eventsource-parser.*/, /^eventsource.*/,#' apps/webapp/remix.config.js
+
+# Build the webapp and its workspace deps (turbo builds ^deps first).
+RUN pnpm run build --filter webapp
+

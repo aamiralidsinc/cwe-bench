@@ -1,0 +1,319 @@
+diff --git a/packages/sync-server/src/app-account.js b/packages/sync-server/src/app-account.js
+index 14eefc1d..c3bf5ec1 100644
+--- a/packages/sync-server/src/app-account.js
++++ b/packages/sync-server/src/app-account.js
+@@ -121,6 +121,18 @@ app.post('/change-password', (req, res) => {
+   const session = validateSession(req, res);
+   if (!session) return;
+ 
++  // Only a password-authenticated admin may change the server password.
++  const user = getUserInfo(session.user_id);
++  const isPrivileged = user?.role === 'ADMIN' && session.auth_method === 'password';
++  if (!isPrivileged) {
++    res.status(403).send({
++      status: 'error',
++      reason: 'forbidden',
++      details: 'permission-not-found',
++    });
++    return;
++  }
++
+   const { error } = changePassword(req.body.password);
+ 
+   if (error) {
+diff --git a/packages/sync-server/src/app-pluggyai/app-pluggyai.js b/packages/sync-server/src/app-pluggyai/app-pluggyai.js
+index aa863142..82c4ff77 100644
+--- a/packages/sync-server/src/app-pluggyai/app-pluggyai.js
++++ b/packages/sync-server/src/app-pluggyai/app-pluggyai.js
+@@ -2,14 +2,18 @@ import express from 'express';
+ 
+ import { handleError } from '../app-gocardless/util/handle-error';
+ import { SecretName, secretsService } from '../services/secrets-service';
+-import { requestLoggerMiddleware } from '../util/middlewares';
++import {
++  requestLoggerMiddleware,
++  validateSessionMiddleware,
++} from '../util/middlewares';
+ 
+ import { pluggyaiService } from './pluggyai-service';
+ 
+ const app = express();
+ export { app as handlers };
+-app.use(express.json());
+ app.use(requestLoggerMiddleware);
++app.use(express.json());
++app.use(validateSessionMiddleware);
+ 
+ app.post(
+   '/status',
+diff --git a/packages/sync-server/src/app-secrets.js b/packages/sync-server/src/app-secrets.js
+index 7c36ad7d..e6970ce8 100644
+--- a/packages/sync-server/src/app-secrets.js
++++ b/packages/sync-server/src/app-secrets.js
+@@ -1,6 +1,6 @@
+ import express from 'express';
+ 
+-import { getAccountDb, isAdmin } from './account-db';
++import { getAccountDb, getActiveLoginMethod, isAdmin } from './account-db';
+ import { secretsService } from './services/secrets-service';
+ import {
+   requestLoggerMiddleware,
+@@ -51,6 +51,15 @@ app.post('/', async (req, res) => {
+ });
+ 
+ app.get('/:name', async (req, res) => {
++  if (getActiveLoginMethod() === 'openid' && !isAdmin(res.locals.user_id)) {
++    res.status(403).send({
++      status: 'error',
++      reason: 'not-admin',
++      details: 'You have to be admin to read secrets',
++    });
++    return;
++  }
++
+   const name = req.params.name;
+   const keyExists = secretsService.exists(name);
+   if (keyExists) {
+diff --git a/packages/sync-server/src/app-simplefin/app-simplefin.js b/packages/sync-server/src/app-simplefin/app-simplefin.js
+index 0299e19f..a35e54f8 100644
+--- a/packages/sync-server/src/app-simplefin/app-simplefin.js
++++ b/packages/sync-server/src/app-simplefin/app-simplefin.js
+@@ -4,12 +4,16 @@ import express from 'express';
+ 
+ import { handleError } from '../app-gocardless/util/handle-error';
+ import { SecretName, secretsService } from '../services/secrets-service';
+-import { requestLoggerMiddleware } from '../util/middlewares';
++import {
++  requestLoggerMiddleware,
++  validateSessionMiddleware,
++} from '../util/middlewares';
+ 
+ const app = express();
+ export { app as handlers };
+-app.use(express.json());
+ app.use(requestLoggerMiddleware);
++app.use(express.json());
++app.use(validateSessionMiddleware);
+ 
+ app.post(
+   '/status',
+diff --git a/packages/sync-server/src/app-sync.ts b/packages/sync-server/src/app-sync.ts
+index 91c9bab4..d1e2845c 100644
+--- a/packages/sync-server/src/app-sync.ts
++++ b/packages/sync-server/src/app-sync.ts
+@@ -19,6 +19,7 @@ import {
+   validateUploadedFile,
+ } from './app-sync/validation';
+ import { config } from './load-config';
++import * as UserService from './services/user-service';
+ import * as simpleSync from './sync-simple';
+ import {
+   errorMiddleware,
+@@ -53,6 +54,24 @@ function boolToInt(deleted) {
+   return deleted ? 1 : 0;
+ }
+ 
++function isAllowedToAccess(file, userId) {
++  if (file.owner === userId || isAdmin(userId)) {
++    return true;
++  }
++  return UserService.countUserAccess(file.id, userId) > 0;
++}
++
++function denyAccess(res) {
++  res.status(403).send({ status: 'error', reason: 'forbidden' });
++}
++
++// Reject a file id whose resolved on-disk path would escape the user-files dir.
++function pathEscapesUserFiles(fileId) {
++  const base = resolve(config.get('userFiles'));
++  const target = getPathForUserFile(fileId);
++  return target !== base && !target.startsWith(base + '/');
++}
++
+ const verifyFileExists = (fileId, filesService, res, errorObject) => {
+   try {
+     return filesService.get(fileId);
+@@ -107,6 +126,11 @@ app.post('/sync', async (req, res): Promise<void> => {
+     return;
+   }
+ 
++  if (!isAllowedToAccess(currentFile, res.locals.user_id)) {
++    denyAccess(res);
++    return;
++  }
++
+   const errorMessage = validateSyncedFile(groupId, keyId, currentFile);
+   if (errorMessage) {
+     res.status(400);
+@@ -138,6 +162,11 @@ app.post('/user-get-key', (req, res) => {
+     return;
+   }
+ 
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
++    return;
++  }
++
+   res.send({
+     status: 'ok',
+     data: {
+@@ -152,8 +181,14 @@ app.post('/user-create-key', (req, res) => {
+   const { fileId, keyId, keySalt, testContent } = req.body || {};
+ 
+   const filesService = new FilesService(getAccountDb());
++  const file = verifyFileExists(fileId, filesService, res, 'file-not-found');
+ 
+-  if (!verifyFileExists(fileId, filesService, res, 'file not found')) {
++  if (!file) {
++    return;
++  }
++
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
+     return;
+   }
+ 
+@@ -184,6 +219,11 @@ app.post('/reset-user-file', async (req, res) => {
+     return;
+   }
+ 
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
++    return;
++  }
++
+   const groupId = file.groupId;
+ 
+   filesService.update(fileId, new FileUpdate({ groupId: null }));
+@@ -214,6 +254,10 @@ app.post('/upload-user-file', async (req, res) => {
+     res.status(400).send('fileId is required');
+     return;
+   }
++  if (pathEscapesUserFiles(fileId)) {
++    res.status(400).send('invalid fileId');
++    return;
++  }
+ 
+   let groupId = req.headers['x-actual-group-id'] || null;
+   const encryptMeta = req.headers['x-actual-encrypt-meta'] || null;
+@@ -237,6 +281,11 @@ app.post('/upload-user-file', async (req, res) => {
+     }
+   }
+ 
++  if (currentFile && !isAllowedToAccess(currentFile, res.locals.user_id)) {
++    denyAccess(res);
++    return;
++  }
++
+   const errorMessage = validateUploadedFile(groupId, keyId, currentFile);
+   if (errorMessage) {
+     res.status(400).send(errorMessage);
+@@ -301,9 +350,25 @@ app.get('/download-user-file', async (req, res) => {
+     res.status(400).send('Single file ID is required');
+     return;
+   }
++  if (pathEscapesUserFiles(fileId)) {
++    res.status(400).send('invalid fileId');
++    return;
++  }
+ 
+   const filesService = new FilesService(getAccountDb());
+-  if (!verifyFileExists(fileId, filesService, res, 'User or file not found')) {
++  const file = verifyFileExists(
++    fileId,
++    filesService,
++    res,
++    'User or file not found',
++  );
++
++  if (!file) {
++    return;
++  }
++
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
+     return;
+   }
+ 
+@@ -323,8 +388,14 @@ app.post('/update-user-filename', (req, res) => {
+   const { fileId, name } = req.body || {};
+ 
+   const filesService = new FilesService(getAccountDb());
++  const file = verifyFileExists(fileId, filesService, res, 'file-not-found');
++
++  if (!file) {
++    return;
++  }
+ 
+-  if (!verifyFileExists(fileId, filesService, res, 'file not found')) {
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
+     return;
+   }
+ 
+@@ -375,6 +446,11 @@ app.get('/get-user-file-info', (req, res) => {
+     return;
+   }
+ 
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
++    return;
++  }
++
+   res.send({
+     status: 'ok',
+     data: {
+@@ -409,18 +485,8 @@ app.post('/delete-user-file', (req, res) => {
+     return;
+   }
+ 
+-  // Check if user has permission to delete the file
+-  const { user_id: userId } = res.locals;
+-
+-  const isOwner = file.owner === userId;
+-  const isServerAdmin = isAdmin(userId);
+-
+-  if (!isOwner && !isServerAdmin) {
+-    res.status(403).send({
+-      status: 'error',
+-      reason: 'forbidden',
+-      details: 'file-delete-not-allowed',
+-    });
++  if (!isAllowedToAccess(file, res.locals.user_id)) {
++    denyAccess(res);
+     return;
+   }
+ 
+diff --git a/packages/sync-server/src/util/validate-user.ts b/packages/sync-server/src/util/validate-user.ts
+index 869db850..a71c8086 100644
+--- a/packages/sync-server/src/util/validate-user.ts
++++ b/packages/sync-server/src/util/validate-user.ts
+@@ -1,7 +1,7 @@
+ import { type Request, type Response } from 'express';
+ import ipaddr from 'ipaddr.js';
+ 
+-import { getSession } from '../account-db';
++import { getSession, getUserInfo } from '../account-db';
+ import { config } from '../load-config';
+ 
+ export const TOKEN_EXPIRATION_NEVER = -1;
+@@ -38,6 +38,18 @@ export function validateSession(req: Request, res: Response) {
+     return null;
+   }
+ 
++  // A disabled user's existing tokens must stop working.
++  const user = getUserInfo(session.user_id);
++  if (!user || user.enabled !== 1) {
++    res.status(401);
++    res.send({
++      status: 'error',
++      reason: 'unauthorized',
++      details: 'user-disabled',
++    });
++    return null;
++  }
++
+   return session;
+ }
+ 

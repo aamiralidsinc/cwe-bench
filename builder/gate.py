@@ -8,7 +8,11 @@ Layout it expects (paths relative to cwe-bench/):
     build/<slug>/   manifest.json  checks/*.patch
 
 Checks, in order (it stops at the first failing group):
-  static   required files, metadata, agent layer, no leaks in instruction.md
+  static   required files, metadata, agent layer, no leaks in instruction.md,
+           no hidden test content in environment/ (the image), no security test
+           asserting one exact refusal status, and (warning, or failure when
+           manifest["strict_gate"]) pass patches of kind 'hardening' and 'blind';
+           reports each security test's product imports
   nop      untouched vulnerable code: every security test FAILS, every
            functional test PASSES
   oracle   reference fix, run twice: reward 1.0 and identical results
@@ -114,6 +118,173 @@ def failing(group: dict) -> list:
     return sorted(k for k, v in group.items() if v != "pass")
 
 
+# Names of security tests, per language. A name found in environment/ means the hidden
+# tests (or a copy of them) would be inside the image the agent works in.
+TEST_NAME_PATTERNS = [
+    r"\bfn\s+(\w{6,})\s*\(",                          # Rust
+    r"\bfunc\s+(Test\w+)\s*\(",                       # Go
+    r"\bdef\s+(test_\w+)\s*\(",                       # Python, Ruby
+    r"@Test[^\n]*\n\s*(?:public\s+|private\s+)?void\s+(\w+)\s*\(",  # Java
+    r"\bfunction\s+(test\w+)\s*\(",                   # PHP
+    r"\b(?:it|test)\(\s*['\"`]([^'\"`\n]{12,})['\"`]",  # JS / TS / Pest
+    r"\bit\s+['\"]([^'\"\n]{12,})['\"]",              # Ruby rspec
+]
+RUNNER_FILES = {"test.sh", "score.py"}
+# Test definitions of any kind. environment/ may hold build-cache stubs, never tests:
+# this also catches tests that live ONLY in the image (russh did, with nothing in tests/).
+TEST_DEF_PATTERNS = [r"#\[(?:tokio::)?test\b", r"\bfunc\s+Test\w*\s*\(\s*\w+\s+\*testing\.T\)",
+                     r"(?m)^\s*def\s+test_\w+", r"@Test\b", r"(?m)^\s*(?:it|test|describe)\s*\(",
+                     r"\bfunction\s+test\w+\s*\(", r"(?m)^\s*it\s+['\"]"]
+
+
+def _text(path: Path):
+    try:
+        return path.read_text()
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+def hidden_test_leaks(task: Path) -> list:
+    """Hidden tests must reach the container only at grading time (from /tests).
+    Everything the image contains comes from environment/ (the build context), so it
+    is enough to check that folder for copies of, or pieces of, the hidden tests."""
+    env_files = [p for p in (task / "environment").rglob("*") if p.is_file()]
+    test_files = [p for p in (task / "tests").rglob("*") if p.is_file() and p.name not in RUNNER_FILES]
+    env_text = {p: _text(p) for p in env_files}
+    leaks = []
+    by_hash = {}
+    for t in test_files:
+        by_hash.setdefault(t.read_bytes(), []).append(t)
+    for e in env_files:
+        if e.name != "Dockerfile" and e.read_bytes() in by_hash:
+            leaks.append(f"{e.relative_to(task)} is a copy of {by_hash[e.read_bytes()][0].relative_to(task)}")
+    names, lines = set(), set()
+    for t in test_files:
+        src = _text(t)
+        if src is None:
+            continue
+        rel = str(t.relative_to(task / "tests"))
+        if rel.startswith(("security", "harness")):
+            for pat in TEST_NAME_PATTERNS:
+                names.update(re.findall(pat, src))
+        for line in src.splitlines():
+            s = line.strip()
+            if len(s) >= 30 and not re.match(r"(import |use |package |from |#include|require|//|#|\*|/\*)", s):
+                lines.add(s)
+    names = {n for n in names if n not in ("main", "setup", "teardown", "TestMain")}
+    for e, txt in env_text.items():
+        if not txt:
+            continue
+        if e.name != "Dockerfile":
+            defs = [p for p in TEST_DEF_PATTERNS if re.search(p, txt)]
+            if defs:
+                leaks.append(f"{e.relative_to(task)} defines tests (matched {defs[0]}); "
+                             "only build-cache stubs may be in environment/")
+        found = sorted(n for n in names if re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", txt))
+        if found:
+            leaks.append(f"{e.relative_to(task)} contains security test names: {', '.join(found[:5])}")
+        shared = sum(1 for s in lines if s in txt)
+        if shared >= 3:
+            leaks.append(f"{e.relative_to(task)} shares {shared} distinctive lines with tests/")
+    return sorted(set(leaks))
+
+
+# A security test must assert that the attack is BLOCKED, not how: an exact refusal status
+# (only 405, only 403, ...) fails correct fixes that refuse differently (trigger-dev 405,
+# argo 403; analysis 2026-10-16, research/own-runs/FINDINGS.md). A line may keep an exact
+# status after review by carrying the marker below.
+EXACT_STATUS_OK = "gate: exact-status-ok"
+EXACT_STATUS_PATTERNS = [
+    r"==\s*4\d\d\b",                                       # py/js/java: code == 405 (not Go, see below)
+    r"\b4\d\d\s*==",                                        # 405 == code
+    r"\.toBe\(\s*4\d\d\s*\)|\.toEqual\(\s*4\d\d\s*\)|\.toStrictEqual\(\s*4\d\d\s*\)",
+    r"assertEquals\(\s*4\d\d\s*,",
+    # Go: `if code != http.StatusForbidden { t.Fatal }` demands one status; `==` forbids one (fine)
+    r"!=\s*(?:http\.Status(?:BadRequest|Unauthorized|Forbidden|NotFound|MethodNotAllowed|"
+    r"RequestEntityTooLarge|Conflict|UnprocessableEntity|TooManyRequests)\b|4\d\d\b)",
+    r"\.status\(\)\.is(?:Forbidden|Unauthorized|NotFound|MethodNotAllowed)\(\)",
+    # Laravel / Livewire (filament demanded assertForbidden(); a correct fix threw instead)
+    r"->assert(?:Forbidden|Unauthorized|NotFound|MethodNotAllowed)\(\)|->assertStatus\(\s*4\d\d\s*\)",
+]
+TEST_EXTS = (".py", ".js", ".ts", ".mjs", ".go", ".java", ".kt", ".rb", ".php", ".rs")
+
+
+def security_test_files(task: Path) -> list:
+    """Security test sources: tests/security/** plus security tests placed under tests/harness/
+    (Go/Rust/Java tasks put them inside the product tree at grading time)."""
+    out = []
+    for p in (task / "tests").rglob("*"):
+        if not p.is_file() or p.suffix not in TEST_EXTS:
+            continue
+        rel = str(p.relative_to(task / "tests"))
+        if rel.startswith("security/") or (rel.startswith("harness/") and re.search(r"sec", p.name, re.I)):
+            out.append(p)
+    return sorted(out)
+
+
+def exact_status_asserts(task: Path) -> list:
+    found = []
+    for p in security_test_files(task):
+        src = _text(p) or ""
+        for n, line in enumerate(src.splitlines(), 1):
+            if EXACT_STATUS_OK in line or re.match(r"\s*(#|//|\*)", line):
+                continue
+            pats = EXACT_STATUS_PATTERNS[-2:-1] if p.suffix == ".go" else EXACT_STATUS_PATTERNS
+            if any(re.search(pat, line) for pat in pats):
+                found.append(f"{p.relative_to(task)}:{n}: {line.strip()[:100]}")
+    return found
+
+
+PRODUCT_IMPORT_PATTERNS = [
+    r"""from\s+['"](@ss/[^'"]+|/app/[^'"]+)['"]""",             # js/ts aliases into the product
+    r"""require\(\s*['"](@ss/[^'"]+|/app/[^'"]+)['"]\s*\)""",
+    r"^\s*from\s+([A-Za-z_][\w.]*)\s+import",                     # python
+    r"^\s*import\s+([A-Za-z_][\w.]*)",
+    r"^\s*import\s+(?:static\s+)?([a-z][\w.]*\.[A-Z]\w*)\s*;",    # java
+]
+PY_STDLIB_OR_TEST = {"__future__", "pytest", "os", "sys", "re", "json", "time", "uuid", "base64", "typing",
+                     "contextlib", "importlib", "sqlite3", "pathlib", "subprocess", "socket", "http",
+                     "urllib", "tempfile", "shutil", "hashlib", "hmac", "datetime", "random", "string",
+                     "conftest", "tr", "fastapi", "httpx", "requests", "cryptography", "unittest"}
+
+
+def product_imports(task: Path) -> dict:
+    """What product code each security test imports. Reported (not judged): a test that uses
+    product code to compute its expected value or to clean up breaks when a fix hardens that
+    code (actualbudget getPathForUserFile). The hardening patch check must cover these."""
+    out = {}
+    for p in security_test_files(task):
+        if p.suffix == ".go":
+            continue                     # Go security tests live inside the product package
+        src = _text(p) or ""
+        mods = set()
+        for pat in PRODUCT_IMPORT_PATTERNS:
+            for m in re.finditer(pat, src, flags=re.M):
+                mod = m.group(1)
+                if p.suffix == ".py" and mod.split(".")[0] in PY_STDLIB_OR_TEST:
+                    continue
+                if p.suffix == ".java" and mod.startswith(("java.", "javax.", "org.junit")):
+                    continue
+                mods.add(mod)
+        if mods:
+            out[str(p.relative_to(task))] = sorted(mods)
+    return out
+
+
+def variant_patch_warnings(manifest: dict) -> list:
+    """Every task needs two extra independent 'pass' patches besides the alternative fix:
+      kind=hardening  the reference fix plus defensive hardening of the product code the tests
+                      import (a correct, stricter fix must still score 1.0)
+      kind=blind      a fix written by a fresh agent that saw ONLY instruction.md and the repo
+                      (the existing alternative fixes were written knowing the reference). The
+                      same agent is asked to name the injected mechanisms; if it can, the
+                      instruction leaks them (jackson-sib7) and must be rewritten.
+    Warnings for tasks built before 2026-10-16; failures when manifest["strict_gate"] is true."""
+    kinds = {c.get("kind") for c in manifest.get("patch_checks", []) if c.get("expect") == "pass"}
+    return [f"manifest.patch_checks has no expect=pass patch with kind='{k}'"
+            for k in ("hardening", "blind") if k not in kinds]
+
+
 def check_static(task: Path, build: Path, manifest: dict) -> dict:
     problems = []
     for rel in REQUIRED:
@@ -135,6 +306,10 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
         problems.append("Dockerfile lacks the agent layer (harness/claude-code.Dockerfile.snippet)")
     if ".git" not in docker:
         problems.append("Dockerfile does not remove the repository's .git history")
+    # The agent and the verifier share one container: hidden tests baked into the image
+    # can be read and run by the agent (it happened: hickory-dns, rclone*, russh*).
+    for leak in hidden_test_leaks(task):
+        problems.append("hidden tests leak into the image: " + leak)
 
     # Leaks: the report must not name the advisory, the fix, or where the fix goes.
     instr = (task / "instruction.md").read_text()
@@ -165,9 +340,17 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
     for need in ("security_fail", "functional_fail"):
         if need not in kinds:
             problems.append(f"manifest.patch_checks has no '{need}' patch")
+    exact = exact_status_asserts(task)
+    if exact:
+        problems.append("security tests assert one exact refusal status (assert the attack is blocked, "
+                        f"e.g. any 4xx; or mark a reviewed line '{EXACT_STATUS_OK}'): " + " | ".join(exact))
+    warnings = variant_patch_warnings(manifest)
+    if manifest.get("strict_gate") and warnings:
+        problems.extend(warnings)
     if problems:
         raise GateFailure("; ".join(problems))
-    return {"ok": True, "patch_checks": sorted(declared)}
+    return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings,
+            "security_test_product_imports": product_imports(task)}
 
 
 def check_nop(task: Path) -> dict:

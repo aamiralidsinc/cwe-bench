@@ -86,3 +86,57 @@ shallow_wrong_layer -> security 0/5, functional 5/5;
 disable_feature -> functional 2/5;
 alt_keystore_fix -> 10/10 (reward 1.0).
 The gate re-runs all of this inside Docker via Harbor.
+
+## 2026-10-16 test repair
+
+Brief: `build/audit/REPAIR-BRIEF-2026-10-16.md`. Earlier today (before this pass) the tests
+already gained `TestS3ProxyAliceCorrectSecretServed`, `TestS3ProxyBobCorrectSecretServed`
+(GET only), `TestS3ProxyNoSecretRefused` (carol: known to the proxy, no secret; signed with
+"", the key ID and md5(key ID)), the `reject_all_proxy.patch` check, and the instruction
+sentence naming `_secret_access_key`.
+
+Flagged items and decisions:
+- deepseek-r11 (lenient: proxy returning no secret; key-ID / md5 fallback) - **already fixed**
+  by `TestS3ProxyNoSecretRefused` and the `_secret_access_key` instruction sentence. Optional
+  "static --auth-key secret must not authenticate a proxy identity": **skip** - the instruction
+  defines proxy mode as started without a static key pair, so `--auth-key` + `--auth-proxy`
+  together is outside what it promises.
+- deepseek-r4, deepseek-seq1, mimo-r1 (no positive proxy-mode test; deny-all fix scored 1.0) -
+  **already fixed** (correct-secret GET tests + `reject_all_proxy.patch`, security_fail).
+- deepseek-r21 (secret rotation / revocation while cached) - **skip**: the instruction states
+  no caching or revocation behaviour; it comes from the upstream design only.
+- mimo-r21 / our notes (correct-secret tests check GET only) - **fixed**: added
+  `TestS3ProxyAliceCorrectSecretPutServed` (PUT as alice with her real secret: any 2xx, the
+  object is on disk at /data/alice/alicebucket/alice-upload.txt with the sent content, and
+  reads back over S3) and `TestS3ProxyAliceCorrectSecretDeleteServed` (DELETE of an object
+  seeded in TestMain before the server starts: any 2xx, and the file is gone from disk).
+  Fair: the instruction says a client signing with the correct secret must be served and that
+  the property holds for all S3 operations (it names GET, PUT and DELETE). No product helpers;
+  side effects are checked on the backend directory by the test itself.
+
+New patch check: `checks/reads_only_proxy.patch` (security_fail) - the reference fix plus a
+refusal of every non-GET/HEAD request in auth-proxy mode after the signature verified. Fails
+exactly the two new tests (reward 0.8). No instruction change in this pass.
+
+Gate (`build/slot.py 3 -- python3 -I builder/gate.py rclone`): **PASSED**
+(log `gate-20261016-putdelete.log`). nop security 10/10 failing; oracle 1.0 twice;
+alt_keystore_fix (pass) 1.0; shallow_wrong_layer, disable_feature, reject_all_proxy,
+reads_only_proxy all fail as expected. Warnings only: no hardening / blind pass patches
+(task predates 2026-10-16).
+
+Regrade (all runs with saved final code were at 1.0; deepseek-seq1 `rclone__a4P8Fc2` and
+mimo-r1 `rclone__q4t49md` have no `final-code/changes.patch` and cannot be regraded):
+
+| trial | old | new | failing tests |
+|---|---|---|---|
+| rclone-deepseek-r11 / rclone__rEMTRVZ | 1.0 | 0.9 | security::TestS3ProxyNoSecretRefused |
+| rclone-deepseek-r21 / rclone__agcsccS | 1.0 | 1.0 | - |
+| rclone-deepseek-r4 / rclone__3SXNjrF | 1.0 | 1.0 | - |
+| rclone-mimo-r11 / rclone__L5CYjmw | 1.0 | 1.0 | - |
+| rclone-mimo-r21 / rclone__ByW3teV | 1.0 | 1.0 | - |
+
+deepseek-r11 drop is a real defect: its `verificationSecrets` falls back to the access key ID
+and md5(access key ID) as the secret when the proxy returns none (and to any other non-protocol
+config value), so carol signed with her own key ID was served alice's file (HTTP 200,
+"ALICE CONFIDENTIAL FILE"). The drop comes from the earlier no-secret test, not the new
+PUT/DELETE tests; no run refused correct-secret writes.

@@ -22,14 +22,74 @@ rescue StandardError
   false
 end
 
-# True when the given oversized/compressed message is refused by the size guard.
-def size_rejected?
+# Test-only spy on the XML parsers the library can use (REXML and Nokogiri). While armed,
+# it records every parse of a source at least `min_bytes` long, so a test can tell
+# "refused before parsing" apart from "parsed, then refused". (2026-10-16 repair)
+module ParseSpy
+  @armed = false
+  @min = 0
+  @hits = []
+  class << self
+    attr_reader :hits
+
+    def watch(min_bytes)
+      @hits = []
+      @min = min_bytes
+      @armed = true
+      yield
+    ensure
+      @armed = false
+    end
+
+    def seen(src, via)
+      return unless @armed
+      size = begin
+        if src.respond_to?(:bytesize) then src.bytesize
+        elsif src.respond_to?(:size) then src.size.to_i
+        else 0
+        end
+      rescue StandardError
+        0
+      end
+      @hits << via if size >= @min
+    end
+  end
+end
+
+module RexmlParseSpy
+  def stream=(source)
+    ParseSpy.seen(source, 'REXML')
+    super
+  end
+end
+REXML::Parsers::BaseParser.prepend(RexmlParseSpy)
+
+module NokogiriParseSpy
+  def parse(*args, **kw, &blk)
+    ParseSpy.seen(args.first, 'Nokogiri')
+    super
+  end
+end
+Nokogiri::XML::Document.singleton_class.prepend(NokogiriParseSpy)
+
+# True when the entry point refuses the message by raising (any error: the instruction
+# requires rejection, not a particular error class or wording). Running out of memory
+# or being interrupted is not a rejection.
+def rejected?
   yield
   false
-rescue OneLogin::RubySaml::ValidationError => e
-  e.message =~ /exceed/i ? true : false
-rescue StandardError
+rescue NoMemoryError, SignalException, SystemExit
   false
+rescue Exception # rubocop:disable Lint/RescueException
+  true
+end
+
+# Runs the entry point with the parse spy armed. Returns [rejected, parsers that
+# parsed a source of at least `min_bytes`].
+def refused_unparsed(min_bytes, &blk)
+  rej = nil
+  ParseSpy.watch(min_bytes) { rej = rejected?(&blk) }
+  [rej, ParseSpy.hits.uniq]
 end
 
 # ---- Signature wrapping: a stolen IdP-signed assertion is replayed alongside an
@@ -52,33 +112,61 @@ g.test('wrapping: duplicate signed identifier on an injected element is rejected
 end
 
 # ---- Resource exhaustion: a tiny compressed message that inflates to a huge one
-# must be refused before it is expanded/processed. ----
+# must be refused rather than processed: the entry point raises, and the expanded
+# document is never handed to an XML parser. ----
 
-def bomb_blob(inflated_bytes = 600_000)
-  xml = '<a>' + ('A' * inflated_bytes) + '</a>'
-  Base64.strict_encode64(Zlib::Deflate.deflate(xml, 9)[2..-5])
+BOMB_INFLATED = 600_000
+
+def bomb_xml(inflated_bytes = BOMB_INFLATED)
+  '<a>' + ('A' * inflated_bytes) + '</a>'
+end
+
+def bomb_blob(inflated_bytes = BOMB_INFLATED)
+  Base64.strict_encode64(Zlib::Deflate.deflate(bomb_xml(inflated_bytes), 9)[2..-5])
 end
 
 g.test('resource: decompression bomb via a redirect-binding message is rejected') do
   blob = bomb_blob
-  g.assert(size_rejected? { OneLogin::RubySaml::SloLogoutrequest.new(blob) },
-           'a small compressed message that expands past the configured limit was processed')
+  rej, parsed = refused_unparsed(BOMB_INFLATED) { OneLogin::RubySaml::SloLogoutrequest.new(blob) }
+  g.assert(rej, 'a small compressed message that expands past the configured limit was processed')
+  g.assert(parsed.empty?, "the expanded message was parsed (#{parsed.join(', ')}) before being rejected")
 end
 
 g.test('resource: decompression bomb via a response message is rejected') do
   blob = bomb_blob
   settings = OneLogin::RubySaml::Settings.new
-  g.assert(size_rejected? { OneLogin::RubySaml::Response.new(blob, settings: settings) },
-           'a small compressed response that expands past the configured limit was processed')
+  rej, parsed = refused_unparsed(BOMB_INFLATED) { OneLogin::RubySaml::Response.new(blob, settings: settings) }
+  g.assert(rej, 'a small compressed response that expands past the configured limit was processed')
+  g.assert(parsed.empty?, "the expanded response was parsed (#{parsed.join(', ')}) before being rejected")
 end
 
-# ---- Resource exhaustion: an oversized message must be refused regardless of
-# whether it is base64-encoded, before expensive scanning/parsing. ----
+# ---- Resource exhaustion: a greatly oversized message must be refused up front,
+# whatever its encoding: the entry point raises, never parses it, and spends far
+# less than one scanning pass over the input. The input is well-formed XML and not
+# base64, so the unfixed library parses it without error. The time bound is relative
+# to a whitespace-stripping pass over the same input measured here, so it does not
+# depend on machine speed; a size check up front costs microseconds. ----
 
 g.test('resource: oversized message is rejected before expensive processing') do
-  oversized = '<x>' + ('m \t<>' * 60_000) + '</x>' # > default limit, not base64
-  g.assert(size_rejected? { OneLogin::RubySaml::SloLogoutrequest.new(oversized) },
-           'an oversized message was accepted/processed instead of being rejected by the size guard')
+  require 'benchmark'
+  oversized = '<x>' + ("m m\t\n " * 1_400_000) + '</x>' # ~8.4 MB, not base64
+  scan_cost = Array.new(3) { Benchmark.realtime { oversized.gsub(/\s/, '') } }.min
+  results = Array.new(2) do
+    rej = parsed = nil
+    t = Benchmark.realtime do
+      rej, parsed = refused_unparsed(oversized.bytesize) { OneLogin::RubySaml::SloLogoutrequest.new(oversized) }
+    end
+    [rej, parsed, t]
+  end
+  g.assert(results.all? { |r| r[0] },
+           'an oversized message was accepted/processed instead of being rejected')
+  parsed = results.flat_map { |r| r[1] }.uniq
+  g.assert(parsed.empty?, "the oversized message was parsed (#{parsed.join(', ')}) before being rejected")
+  best = results.map { |r| r[2] }.min
+  g.assert(best < 0.2 * scan_cost,
+           format('rejecting the oversized message took %.3f s, not far below one scanning pass ' \
+                  'over it (%.3f s): it was scanned/processed before the size limit was applied',
+                  best, scan_cost))
 end
 
 g.write('/logs/verifier/security/results.xml')

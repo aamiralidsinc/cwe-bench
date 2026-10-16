@@ -3,7 +3,9 @@
 These assert that genuine, safe uses of the redirect and URL-resolution
 features keep working: an application may still redirect to an explicitly
 absolute off-site URL (e.g. an identity provider or a CDN), to an absolute
-same-host path, or to a reference resolved relative to the current request.
+same-host path, or to a reference resolved relative to the current request
+(which must resolve exactly as it does today, including an explicitly
+protocol-relative reference).
 
 A fix that kills the open redirect by disabling or over-restricting the
 feature (for example by forcing every redirect onto the request's own host)
@@ -103,6 +105,17 @@ def test_relative_url_to_application_root():
     parts = urlsplit(loc)
     assert parts.hostname == "localhost"
     assert parts.path == "/sub"
+
+
+def test_relative_url_explicit_protocol_relative_unchanged():
+    # Added 2026-10-16. An explicitly protocol-relative reference (no leading
+    # character) is outside the same-site guarantee, and resolution relative to
+    # the request must work "exactly as it does today": standard resolution,
+    # where the reference names its own host.
+    loc = _request().relative_url("//other.example.com/x")
+    parts = urlsplit(loc)
+    assert parts.hostname == "other.example.com"
+    assert parts.path == "/x"
 
 
 if __name__ == "__main__":

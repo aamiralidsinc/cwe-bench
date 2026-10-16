@@ -38,11 +38,14 @@ RUN set -eux; \
 
 # The DNSSEC verification harness: a standalone crate that drives the resolver's
 # public API against a scripted, in-process upstream (no real DNS, no sockets).
+# Only its manifest and EMPTY test stubs go into the image; the hidden tests are
+# copied in from /tests by tests/test.sh at grading time (the agent shares this
+# container, so tests baked in here could be read and run).
 COPY harness /opt/harness
 
 # Pre-build the entire dependency closure AND the hickory crates at the
-# vulnerable commit, so a verifier run only recompiles whatever /app source the
-# solver actually changed. The test binaries are compiled but not run here.
+# vulnerable commit, so a verifier run only recompiles the hidden tests and
+# whatever /app source the solver actually changed.
 RUN cd /opt/harness && cargo nextest run --profile ci --no-run
 
 # python3 runs the verifier's scorer (tests/score.py). Added after the prewarm

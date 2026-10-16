@@ -41,7 +41,9 @@ types.
 - When validation is enabled and an answer cannot be cryptographically
   validated, the resolution call must **fail** (return an error) rather than
   hand the untrustworthy records to the caller. This must hold across the
-  resolver's resolution entry points, not just one of them.
+  resolver's resolution entry points, not just one of them. The error must be
+  recognisable as a validation failure, not reported as an ordinary negative
+  answer (the name or record does not exist) or as a network failure or timeout.
 - Ordinary resolution must keep working. Non-validating resolvers, and lookups
   that are legitimately resolvable, must continue to return their answers as
   before. A fix that turns normal, acceptable lookups into errors is not

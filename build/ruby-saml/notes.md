@@ -39,11 +39,53 @@ lean (~200 MB) and the build does not thrash memory.
 - `checks/alt_correct_fix.patch` → pass (different formulation, 1.0).
 
 ## Offline
-No network at run time. Fixtures (signed responses + IdP cert) live under
+The verifier needs no network: fixtures (signed responses + IdP cert) live under
 `tests/fixtures`, copied from the repo, and all exploit payloads are generated
-in-process. Tests never read from `/app`.
+in-process. Tests never read from `/app`. (Corrected 2026-10-16: this section used to
+say "No network at run time", which was true of the tests but not of every agent run.
+The 2026-10-15 seq1 trials gave the agent open internet; the deepseek seq1 agent
+fetched upstream releases and the fix commit with curl. The r11 trials ran offline
+(`bundle install` failed). task.toml now sets `network_mode = "allowlist"` with only
+the model API hosts.)
 
 ## Caveat
 `source` in task.toml is `mined` (not `mined+stacking`) because the current
 `gate.py` static check only accepts `mined|mined+injected|injected`; the stacking
 nature is recorded in `manifest.build_kind` and in task.toml `tags`.
+
+## 2026-10-16 test repair
+Brief: `build/audit/REPAIR-BRIEF-2026-10-16.md`. Only `tests/security/group.rb` changed;
+instruction.md, solution/ and functional tests are unchanged.
+
+### Items
+| item | source | decision |
+|---|---|---|
+| Size rejection required `ValidationError` with a message matching `/exceed/i`, which the instruction never states | deepseek-seq1 + mimo-r11 audits, our notes | **fixed (relaxed).** A rejection is now any raised error (NoMemoryError, signals and exit excluded). The oversized payload is now well-formed, non-base64 XML, so the unfixed library raises nothing for it and "any error" still bites. The old payload contained `<>`, so unfixed code raised a REXML parse error, which is why the class/wording pin had been needed. |
+| "Oversized messages must be refused up front, before that expensive work" was not enforced: a fix that runs the size check after the base64 scan passed | mimo-seq1 audit (lenient-test), our notes | **fixed.** The oversized test now (a) arms a test-only spy on the XML parsers (REXML `BaseParser#stream=`, `Nokogiri::XML::Document.parse`) and fails if the payload is parsed; (b) sends ~8.4 MB, far beyond any reasonable limit, and requires the rejection to take < 0.2x one whitespace-stripping `gsub` pass over the same input, timed in the test itself (best of 2 calls vs best of 3 passes, so it does not depend on machine speed). Measured: reference 0.0005 s vs pass ~1.0 s; scan-then-reject ~2.0 s. |
+| Bombs rejected only after the expanded document was parsed would have passed | follows from "rejected rather than ... processed" | **fixed.** Both bomb tests arm the parse spy (threshold = the 600 kB inflated size) and fail if the expanded document reaches a parser. |
+| Bomb tests cannot tell streaming abort from expand-then-reject; instruction says "rather than fully expanded" | deepseek-seq1 audit | **skip.** The reference fix expands fully and then rejects, so a streaming-only test would fail the oracle. Parsing is now enforced, and the instruction wording is left unchanged. |
+| Stray `ds:DigestValue` before the real one in a unique-ID document (XPath scoping, part of the upstream fix) | deepseek-r11 REC | **skip.** The instruction reports only the duplicate-identifier form. Testing this needs a new vulnerability description in the instruction. That changes the task's scope rather than repairing a test, and would make earlier runs incomparable. Option for a future task version. |
+| notes.md "No network at run time" wrong | deepseek-seq1 audit | **fixed** in the Offline section above: the tests need no network, but seq1 agents had open internet. |
+| final-code/changes.patch missing from postmortem bundles | both seq1 audits | out of scope (harness); seq1 trials have no saved final code. |
+
+### New patch checks (manifest `patch_checks`)
+- `scan_then_reject.patch` (security_fail): the reference fix, except that the base64 scan runs before the size guard. Old tests: 1.0. New: oversized test fails on time (reward 0.8).
+- `parse_then_reject.patch` (security_fail): the reference signature fix, with size limits checked in the Response/SloLogoutrequest constructors after parsing. Old tests: both bomb tests passed. New: both bomb tests and the oversized test fail via the parse spy (reward 0.4).
+- `other_error_fix.patch` (pass): the reference fix with both size rejections raising `ArgumentError, "SAML message too large ..."`. Old tests: 3 security fails. New: 1.0 (proves the relaxation).
+
+### Gate
+`python3 build/slot.py 3 -- python3 -I builder/gate.py ruby-saml`: **PASSED** (nop 5/5 security fail;
+oracle x2; subset 0.8, disable 0.0, alt 1.0, scan_then_reject 0.8, parse_then_reject 0.4,
+other_error 1.0). Warnings: no `hardening`/`blind` pass patches exist for this task.
+
+### Regrade (saved final code, fresh container)
+| trial | old | new | failing tests |
+|---|---|---|---|
+| ruby-saml-deepseek-r11-20261015-202444-n001/ruby-saml__QpqHKHG | 1.0 | 1.0 (regrade-20261016T052620Z) | none |
+| ruby-saml-mimo-r11-20261015-204334-n001/ruby-saml__SyFoddE | 1.0 | 1.0 (regrade-20261016T052634Z) | none |
+| ruby-saml-deepseek-seq1-1791990964/ruby-saml__jZ9jGb7 | 1.0 | not regradable (no final-code/) | - |
+| ruby-saml-mimo-seq1-1792005093/ruby-saml__WGgGoMj | 1.0 | not regradable (no final-code/) | - |
+| ruby-saml-mimo-seq1-1792007992/ruby-saml__NCDHeXX | none (exception) | not regradable (no final-code/) | - |
+
+Both seq1 fixes, as described in their audits (streaming inflate raising ValidationError; size guard
+moved above the base64 scan), would pass the repaired tests, but this was not run.
