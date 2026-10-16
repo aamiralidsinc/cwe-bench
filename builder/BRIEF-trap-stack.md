@@ -92,6 +92,16 @@ always missing the same tests and never breaking functionality.
   least two MiMo traps of different kinds (coupled visible value; unsupported-combination route;
   merged/defaults route) as in jackson-databind-sib2.
 
+## Lesson from better-auth-sso-endpoints (2026-10-16)
+Hadi's shape on a real, published SSRF (GHSA-5rr4-8452-hf4v): DeepSeek solved it in 20 minutes,
+finding all three traps. It did not trace save -> reload; it read the SSO route files whole, and a
+grep landed on the registration branch. The "producer" here was the registration handler, which
+is the attacker's own entry point, and the report must mention registering a provider to describe
+the attack. Hadi's producer was hidden machinery (a zod schema stripping a field on reload) that
+no report sentence needs to touch. Require that the producer is **infrastructure the attacker never
+calls directly** (schema, serializer, cache, persistence mapper, config loader), not a request
+handler. Request handlers get read wholesale.
+
 ## Report back (under 400 words)
 Gate stage results; the traps with one line each; the new instruction's word count; every
 unverified guess; any fairness concern you see yourself.
