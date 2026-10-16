@@ -165,6 +165,70 @@ reasons:
   trigger-dev used a batch that doesn't exist where the instruction says
   "their own batches". Seed the real object the instruction refers to.
 
+### 3h. Defaults since 2026-10-16 (round-1 lessons; the gate enforces them)
+About half of round-1 agent time was voided by settings fixed only after trials had run. These are
+now defaults; do not change them per task.
+- **Offline.** Keep `[agent] network_mode = "allowlist"` with only the two model APIs (template).
+  `harness/run_trial.sh` also removes WebSearch/WebFetch. The gate fails a task without the allowlist.
+- **Agent killed before grading.** Keep the kill block at the top of the template `test.sh`. The
+  gate fails a `test.sh` without it.
+- **Strict gate by default.** New manifests must not set `"strict_gate": false` (only the 19 round-1
+  tasks do). Strict requires: the `hardening` and `blind` pass patches (3f), the wrong-fix catalogue
+  below, `build/SLUG/FAIRNESS.md`, and 3 identical oracle runs.
+- **Wrong-fix catalogue.** `manifest.wrong_fix_catalogue` names, for each class in
+  `gate.py: WRONG_FIX_CLASSES`, the `checks/` patch (expect `security_fail` or `functional_fail`)
+  that proves the tests catch it, or `"n/a: <why this class cannot occur here>"`. The classes:
+  `refuse_all`, `crash_as_refusal`, `wrong_resource`, `one_role_or_direction`, `reads_only`,
+  `check_after_adjustment`, `unlisted_route`, `malformed_identity`, `missing_authority`,
+  `adjacent_api`. Round-1 audits found each of these only after trials (`research/round1-analysis/`).
+- **Pre-trial fairness review (`build/SLUG/FAIRNESS.md`).** A reviewer who did not write the tests
+  maps every test (file::name) to the sentence of `instruction.md` (or the standard expert
+  knowledge) that makes it fair, rates the risk, and lists every contract the tests need. Fix every
+  high risk before trials, and re-run the gate after any test change.
+- **No leaked upstream tests.** The vulnerable commit must not be one that adds the advisory's
+  regression tests (webob). Check `git log` between the vulnerable and fix commits.
+- **Keep every metadata spoiler out of what the agent sees.** Only `environment/` reaches the
+  image; `task.toml` and `build/` do not.
+
+### 3i. instruction.md style: system and invariant (2026-10-16)
+Round-1 instructions were 409–687 words and named parameters, folders, root causes, the fix
+approach, every tested variant, and (stacked tasks) one section per flaw, which reveals the count.
+Models fix exactly what a report points at (`research/round1-analysis/B-failure-modes.md`), so such
+instructions turn a task into a checklist. Write instead:
+- what the system is (product level), one observed impact with ONE concrete trigger example at
+  the level a user sees (HTTP request, CLI call, public API use);
+- the security properties as invariants: who may do what to which data, or what attacker input
+  must never achieve. Word each so it covers the tested variants ("no value of X may ...");
+- for several flaws: one coherent list of properties in natural order, not one section per flaw,
+  never a count; let one bullet cover several flaws where natural;
+- the contracts the tests need and an engineer could not infer: refusal form ("a client error with
+  no side effect"), interfaces or field names the tests use, preservation clauses ("works exactly
+  as today"), legitimate magnitudes next to any attack magnitude;
+- NO file, package, function, class, field or parameter names unless a user would see them; no
+  root cause; no fix approach; no list of spellings, verbs, routes or roles; no restricting adverbs
+  ("directly", "only via"); never name or paraphrase an injected sibling's mechanism;
+- the standard constraints block (fix the attack and close variants; keep legitimate use; do not
+  modify or add tests; do not look up the upstream fix; do not special-case the example).
+Experiment in progress: `tasks/*-inv` are round-1 tasks with only the instruction rewritten this
+way (results in `research/instruction-experiment.md`).
+
+### 3j. Trap stacking for injected tasks (round 2)
+Difficulty comes from what the task contains, not from the advisory. Plan traps from the ranked
+recipes in `research/round1-analysis/B-failure-modes.md` §3a and record each one in
+`manifest.traps` (`shape`, file:line, the test that covers it, and why a real codebase would
+have it):
+- at least one shape that beat DeepSeek consistently (feature-absent sibling;
+  data producer off the check's path);
+- at least two shapes from DIFFERENT dismissal reasons that beat MiMo in round 1 (coupled visible
+  binding, merged/defaults route, neighbour-precedent authorisation, post-adjustment value,
+  parser differential with privileged fallback, missing-authority fallback, shared helper with
+  divergent contracts);
+- never more routes of one concept (they fall together), and never encoding/verb/protocol/role
+  variants (both models always catch them);
+- every trap must be realistic code a maintainer could have written, reachable through the real
+  entry point, covered by a stated invariant, and found by the blind fix (3f). A trap the blind
+  fix cannot find is unfair: remove it.
+
 ## Manifest (`build/SLUG/manifest.json`)
 
 ```json
@@ -195,6 +259,7 @@ observed impact and how it is triggered, through the real entry point. State
 the security property that must hold and that the feature must keep working.
 NO fix, NO file or function names, NO line numbers, NO CVE/GHSA id, NO count of
 how many places need changing. The gate rejects the task if any of those leak.
+Follow the style in 3i (system and invariant).
 
 ## Run the gate
 ```

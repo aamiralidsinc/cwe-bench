@@ -12,10 +12,16 @@ Checks, in order (it stops at the first failing group):
            no hidden test content in environment/ (the image), no security test
            asserting one exact refusal status, and (warning, or failure when
            manifest["strict_gate"]) pass patches of kind 'hardening' and 'blind';
-           reports each security test's product imports
+           reports each security test's product imports.
+           Since 2026-10-16 every task must be offline ([agent] allowlist of the
+           model APIs only) and its test.sh must kill the agent before grading.
+           strict_gate is ON unless the manifest sets "strict_gate": false (only
+           the 19 round-1 tasks do). Strict adds: hardening + blind pass patches,
+           a wrong-fix catalogue entry for every class in WRONG_FIX_CLASSES,
+           build/<slug>/FAIRNESS.md (pre-trial fairness review), and 3 oracle runs.
   nop      untouched vulnerable code: every security test FAILS, every
            functional test PASSES
-  oracle   reference fix, run twice: reward 1.0 and identical results
+  oracle   reference fix, run twice (3x under strict_gate): reward 1.0 and identical results
   patches  every patch listed in manifest["patch_checks"] behaves as declared:
              security_fail    at least one security test fails, functional all pass
              functional_fail  at least one functional test fails
@@ -78,6 +84,24 @@ REQUIRED = [
 ]
 META_KEYS = ["cwe_id", "language", "repo", "source", "entry_point"]
 MIN_SECURITY, MIN_FUNCTIONAL = 4, 5
+MODEL_HOSTS = {"api.deepseek.com", "api.xiaomimimo.com"}
+AGENT_KILL_MARK = "@anthropic-ai/claude-code"   # the kill block from templates/test.sh
+MIN_DOCKER_FREE_GB = 15   # the Colima disk (79 GB) filled twice on 2026-10-16 and broke 6+ gate runs
+# Wrong fixes the round-1 audits found passing (or correct fixes failing) only AFTER trials
+# (research/round1-analysis/B-failure-modes.md, C-pipeline-lessons.md). A strict task names, for each
+# class, the checks/ patch that proves the tests catch it, or "n/a: <why the class cannot apply>".
+WRONG_FIX_CLASSES = {
+    "refuse_all": "deny/refuse everything on the protected path (needs a positive control test)",
+    "crash_as_refusal": "crash, panic or HTTP 500 instead of a clean refusal",
+    "wrong_resource": "authorises a neighbouring/proxy resource instead of the object touched",
+    "one_role_or_direction": "fixes only one role, peer or direction",
+    "reads_only": "guards reads but not writes (or one verb only)",
+    "check_after_adjustment": "guard placed after a normalising/adjusting step on the attacker value",
+    "unlisted_route": "blocks the reported route/fields, not a merged/default/other route to the same sink",
+    "malformed_identity": "parser mismatch: a malformed spelling makes the guard see nothing",
+    "missing_authority": "fail-open when the authority returns no secret/role",
+    "adjacent_api": "a shared-helper fix that changes a sibling API's stated behaviour",
+}
 # Infrastructure errors worth one retry (Docker name lookups are flaky here).
 RETRYABLE = ("NetworkConnectionError", "Could not resolve", "ENOTFOUND", "TLS handshake")
 
@@ -86,8 +110,31 @@ class GateFailure(Exception):
     pass
 
 
+def docker_free_gb():
+    """Free GB on the Colima VM's Docker disk, or None if it cannot be read."""
+    try:
+        out = subprocess.run(["colima", "ssh", "--", "df", "-BG", "/var/lib/docker"],
+                             capture_output=True, text=True, timeout=60).stdout.split()
+        return int(out[-3].rstrip("G"))
+    except Exception:
+        return None
+
+
+def wait_for_disk():
+    """Wait (up to 30 min) until the Docker disk has MIN_DOCKER_FREE_GB free; a full disk
+    otherwise surfaces as a confusing build or test failure."""
+    for _ in range(30):
+        free = docker_free_gb()
+        if free is None or free >= MIN_DOCKER_FREE_GB:
+            return
+        print(f"[gate] Docker disk has {free} GB free (< {MIN_DOCKER_FREE_GB}); waiting", flush=True)
+        time.sleep(60)
+    raise GateFailure(f"Docker disk below {MIN_DOCKER_FREE_GB} GB free for 30 min (infrastructure, not the task)")
+
+
 def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     """Run one Harbor trial and return {'reward', 'security', 'functional'}."""
+    wait_for_disk()
     for attempt in (1, 2):
         name = f"{task_dir.name}-{label}-{int(time.time())}"
         cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
@@ -285,6 +332,29 @@ def variant_patch_warnings(manifest: dict) -> list:
             for k in ("hardening", "blind") if k not in kinds]
 
 
+def strict(manifest: dict) -> bool:
+    """strict_gate is the default; only the 19 round-1 tasks opt out (their gates predate it)."""
+    return manifest.get("strict_gate", True) is not False
+
+
+def catalogue_problems(build: Path, manifest: dict) -> list:
+    cat = manifest.get("wrong_fix_catalogue", {})
+    declared = {c.get("patch"): c.get("expect") for c in manifest.get("patch_checks", [])}
+    out = []
+    for cls in WRONG_FIX_CLASSES:
+        v = str(cat.get(cls, "")).strip()
+        if not v:
+            out.append(f"wrong_fix_catalogue.{cls} missing (a checks/ patch or 'n/a: <reason>')")
+        elif v.lower().startswith("n/a"):
+            if len(v) < 12:
+                out.append(f"wrong_fix_catalogue.{cls}: 'n/a' needs a reason")
+        elif v not in declared:
+            out.append(f"wrong_fix_catalogue.{cls}: patch {v} is not listed in patch_checks")
+        elif declared[v] == "pass":
+            out.append(f"wrong_fix_catalogue.{cls}: {v} is a wrong fix, so it must expect a failure")
+    return out
+
+
 def check_static(task: Path, build: Path, manifest: dict) -> dict:
     problems = []
     for rel in REQUIRED:
@@ -344,9 +414,18 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
     if exact:
         problems.append("security tests assert one exact refusal status (assert the attack is blocked, "
                         f"e.g. any 4xx; or mark a reviewed line '{EXACT_STATUS_OK}'): " + " | ".join(exact))
+    agent = toml.get("agent", {})
+    if agent.get("network_mode") != "allowlist" or set(agent.get("allowed_hosts", [])) != MODEL_HOSTS:
+        problems.append("task.toml [agent] must be offline: network_mode = \"allowlist\" with allowed_hosts "
+                        "= only the model APIs (see templates/task.toml)")
+    if AGENT_KILL_MARK not in (task / "tests/test.sh").read_text():
+        problems.append("tests/test.sh lacks the kill-the-agent-before-grading block from templates/test.sh")
     warnings = variant_patch_warnings(manifest)
-    if manifest.get("strict_gate") and warnings:
+    if strict(manifest):
         problems.extend(warnings)
+        problems.extend(catalogue_problems(build, manifest))
+        if not (build / "FAIRNESS.md").is_file():
+            problems.append("build/<slug>/FAIRNESS.md missing: the pre-trial fairness review (BUILDER.md 3h)")
     if problems:
         raise GateFailure("; ".join(problems))
     return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings,
@@ -371,14 +450,14 @@ def check_nop(task: Path) -> dict:
     return {"ok": True, "security": len(sec), "functional": len(fun), "trial": r["trial_dir"]}
 
 
-def check_oracle(task: Path) -> dict:
-    runs = [run_harbor(task, "oracle", f"oracle{i}") for i in (1, 2)]
+def check_oracle(task: Path, n: int = 2) -> dict:
+    runs = [run_harbor(task, "oracle", f"oracle{i}") for i in range(1, n + 1)]
     for i, r in enumerate(runs, 1):
         bad = failing(r["security"]) + failing(r["functional"])
         if r["reward"] != 1.0 or bad:
             raise GateFailure(f"oracle run {i}: reward {r['reward']}, failing {bad}")
-    if runs[0]["security"] != runs[1]["security"] or runs[0]["functional"] != runs[1]["functional"]:
-        raise GateFailure("oracle: the two runs disagree (flaky tests)")
+    if any(r["security"] != runs[0]["security"] or r["functional"] != runs[0]["functional"] for r in runs[1:]):
+        raise GateFailure("oracle: the runs disagree (flaky tests)")
     return {"ok": True, "trials": [r["trial_dir"] for r in runs]}
 
 
@@ -438,7 +517,7 @@ def main() -> int:
             elif stage == "nop":
                 report["stages"][stage] = check_nop(task)
             elif stage == "oracle":
-                report["stages"][stage] = check_oracle(task)
+                report["stages"][stage] = check_oracle(task, 3 if strict(manifest) else 2)
             else:
                 report["stages"][stage] = check_patches(task, build, manifest)
         report["passed"] = not args.only
@@ -448,7 +527,9 @@ def main() -> int:
         print(f"[gate] FAIL: {e}", file=sys.stderr)
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if build.is_dir():
-        (build / "gate_report.json").write_text(json.dumps(report, indent=1))
+        # A partial run (--only) must never overwrite the full report that a trial relies on.
+        out = "gate_report.partial.json" if args.only else "gate_report.json"
+        (build / out).write_text(json.dumps(report, indent=1))
     ok = "failure" not in report
     print(f"[gate] {args.slug}: {'PASSED' if ok else 'FAILED'}"
           f"{' (' + args.only + ' only)' if args.only and ok else ''}")
