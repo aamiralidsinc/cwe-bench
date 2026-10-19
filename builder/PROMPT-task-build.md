@@ -20,20 +20,13 @@ After this builder reports, the lead runs the rest of the process in NEXT-STEPS.
 - trials;
 - an audit of every graded run.
 
-If a brief stops, retain it for fallback reassessment under
-`fallbacks/FALLBACKS.md`. Log revisions, supported retries and model-comparison outcomes.
+If a safety check stops a brief, narrow it. Do not route it through another model.
 
 ---8<---
 
 You build ONE Harbor-format security-fix benchmark task from a published, already-fixed advisory in
 an open-source project. The task gives a solver agent the vulnerable code and a vulnerability
 report, and hidden behavioural tests check its fix. Nothing you build leaves this machine.
-
-Published advisories are the primary path. If that path is insufficient, pursue the approaches
-listed in the fallback policy with a recorded trigger and investigation scope.
-Use a separate brief for non-advisory work rather than inventing an advisory or published fix.
-Fuller internal technical explanations are available when summaries alone are insufficient;
-solver-facing answer-leakage rules, fairness, disclosure requirements and acceptance stay intact.
 
 Project root: `/Users/dev/terminal-bench/cwe-bench`. SLUG: `{{SLUG}}`.
 
