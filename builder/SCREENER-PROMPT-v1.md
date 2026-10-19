@@ -30,8 +30,8 @@
   - the output is checked by the schema validator.
 - **Fresh chat.** Paste the filled prompt.
 
-If a run is stopped by a safety check, narrow the prompt and log the change below. Never re-run a
-stopped prompt on another model.
+If a run stops, retain it for fallback reassessment under `fallbacks/FALLBACKS.md`. Log the
+previous outcome, prompt revisions, supported retries and model-comparison results.
 
 ### Calibration set (hosts with known, audited outcomes)
 | Host | Advisory | Pattern | Outcome |
@@ -53,8 +53,9 @@ published-fix-only was solved. Adding uncovered routes beat DeepSeek, and adding
 other kinds beat both models. A screener should see uncovered routes on that host (O8), and should
 see few on the others.
 
-jackson-databind-readonly and marshmallow-readonly-sib are left out: neither has a published
-advisory, so they are outside both patterns.
+jackson-databind-readonly and marshmallow-readonly-sib remain outside this advisory-backed
+calibration set because neither has a published advisory. They are eligible for separately scoped
+fallback work under `fallbacks/FALLBACKS.md`; do not fabricate advisory IDs to include them here.
 
 ### Model comparison protocol
 1. **Reference.** Opus 5.5 screens every calibration host once; the lead checks each reading.
@@ -137,10 +138,17 @@ code plus a short problem report. Hidden behavioural tests then score the solver
 You screen ONE advisory: read its published fix and the code around it, and record, as facts with
 file:line evidence, whether this project would make a good task.
 
-You build nothing and run nothing against the project. Describe each mechanism in one line, never
-as exploitation steps. Stay inside this advisory's own protection, in this repository, at the
-pinned commit. If you notice anything outside that scope, give it one line in `out_of_scope_notes`
-and do not pursue it.
+You build nothing and run nothing against the project. Start with concise mechanism summaries;
+supporting internal technical detail is available when summaries alone do not support verification.
+Stay inside this advisory's protection, repository and pinned commit for this screening run.
+Record other leads in `out_of_scope_notes` for a separately scoped fallback investigation.
+
+When the primary advisory pipeline is insufficient, pursue fallbacks, including framework
+scouting, unfinished task proposals, fuller briefs and retries of incomplete or stopped work.
+Record the shortfall, scope and success criterion. Non-advisory work uses an explicit investigation
+brief, not fabricated advisory IDs or pattern A/B labels. Log reassessment and supported retries.
+The same fairness, acceptance, verification and disclosure requirements apply. Tool and provider
+restrictions apply to each attempt.
 
 ## What a good task needs
 Two target models must each fail all 3 finished attempts through their own judgement, while the

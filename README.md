@@ -10,6 +10,9 @@ accepted only when it is failed on 3/3 runs by both target models
 See **[ALGORITHM.md](ALGORITHM.md)** for the full design, the three task-shape
 branches, the scoring model, and the learning loop.
 
+**Fallback policy:** pursue the approaches in [fallbacks/FALLBACKS.md](fallbacks/FALLBACKS.md)
+when the primary pipeline is insufficient. Fallback tasks must meet the task acceptance bar.
+
 ## Pipeline
 
 ```
@@ -31,6 +34,7 @@ python3 build/run.py status   <slug>
 | Path | What |
 |---|---|
 | `ALGORITHM.md` | design: pipeline, branches, scoring, learning loop |
+| `fallbacks/` | fallback policy, available approaches and activation process |
 | `sourcer/` | OSV sourcer, candidate index, `weights.json` scoring config, screeners |
 | `sourcer/stacking_screener.py` | Branch C: rank small repos with co-present real vulns |
 | `builder/BUILDER.md`, `BUILDER-stacking.md` | briefs a builder agent follows |
