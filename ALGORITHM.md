@@ -6,12 +6,6 @@ Xiaomi MiMo-V2.6-Pro, with the failure attributable to model capability, not a
 task defect. This document records the pipeline, the three task-shape strategies
 (branches), the scoring model, and the learning loop.
 
-**Fallback policy.** The pipeline below is the primary path. When it cannot meet the
-project's task count, quality or delivery needs, pursue the approaches in
-[fallbacks/FALLBACKS.md](fallbacks/FALLBACKS.md). Fallback candidates still pass the same gate,
-fairness checks, trials and audits; non-advisory investigations use explicit briefs rather than
-fabricated advisory records in the OSV sourcer.
-
 ## Pipeline (shared by all branches)
 
 ```

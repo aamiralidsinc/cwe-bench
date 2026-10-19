@@ -74,7 +74,6 @@ locally (results above), never in Docker. Follow-up scout of a large host (DRF 3
 are centralised in Serializer._writable_fields/_readable_fields, OrderingFilter honours write_only;
 Django admin save-as-new is an ordinary add) found nothing real in the remaining time box.
 The follow-up also noted one lead in another project, outside any published advisory. It was not
-built. Pursue it as a fallback when the primary pipeline is insufficient (see
-`fallbacks/FALLBACKS.md`, item 1). Its verification and the client's disclosure decision are
-recorded separately in `build/audit/uncovered-routes.tsv`.
+built and is not pursued (see `blocked/BLOCKED.md`, item 1). It is listed for the client's disclosure
+decision in `build/audit/uncovered-routes.tsv`.
 Scout end 13:29 UTC.

@@ -3,8 +3,7 @@
 Read this first in a new conversation. Commit only to `aamiralidsinc/cwe-bench`.
 
 ## Read these, in order
-0. `fallbacks/FALLBACKS.md`: pursue the listed approaches as fallbacks when the primary pipeline
-   is insufficient.
+0. `blocked/BLOCKED.md`: approaches that must not be pursued, and why (2026-10-16).
 1. `plan.md`: the goal and the overall plan.
 2. `RESULTS.md`: results; the "Round 2 (2026-10-16)" section is the latest.
 3. `build/audit/ledger.md`: per-task verdicts. Regenerate with `python3 build/audit_results.py`;
@@ -41,9 +40,8 @@ Read this first in a new conversation. Commit only to `aamiralidsinc/cwe-bench`.
 1. Reader pass over the top 30 of `sourcer/rerank-v4-draft/host-shortlist-40.tsv`.
 2. Build the confirmed hosts in the process above, following `BRIEF-trap-stack.md`.
 3. Write one shared screener prompt and one shared task-build template, with per-task inputs.
-   Use published, already-fixed advisories as the primary path. If this path is insufficient,
-   pursue the relevant fallback from `fallbacks/FALLBACKS.md`, recording its scope and trigger.
-   Retain stopped briefs for reassessment and supported retries; log changes and outcomes.
+   Keep both on published, already-fixed advisories and on building the benchmark task. If a
+   brief is stopped by a safety check, do not route it through another model; narrow it instead.
 4. Raise with the client:
    - `jackson-databind-sib2` (the breaker candidate);
    - Hadi's DeepSeek-only result;

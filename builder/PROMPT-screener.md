@@ -11,8 +11,8 @@ and no models.
 | `{{ROW}}` | the full TSV row, with its header line |
 | `{{FIX_COMMITS}}` | fix commit(s) and vulnerable parent, from `sourcer/index/candidates.sqlite` (`fix_commit`, `parent_commit`) |
 
-If a brief stops, retain it for fallback reassessment under
-`fallbacks/FALLBACKS.md`. Log revisions, supported retries and model-comparison outcomes.
+If a safety check stops a brief, narrow the brief (drop the exploit wording, keep the
+code-reading questions). Do not route it through another model.
 
 ---8<---
 
@@ -21,12 +21,6 @@ question is whether its repository is a good HOST for a security-fix benchmark t
 give a solver agent the vulnerable code and a vulnerability report; hidden behavioural tests then
 check its fix. You only read code and judge. You build nothing, run no Docker and no
 trials, and do not contact the maintainers or anyone else.
-
-Published advisories are the primary path. If that path is insufficient, pursue the approaches
-listed in the fallback policy. Record leads outside this advisory for a separate
-investigation brief with a repository, pinned commit and protection to study; do not invent
-advisory IDs. Fuller internal technical explanations are available when concise summaries do not
-support verification. Keep the same fairness, acceptance and disclosure requirements.
 
 Project root: `/Users/dev/terminal-bench/cwe-bench`. Scratch: `~/.tb-graders/cwe/work/screen/{{ENTRY_ID}}/`.
 
