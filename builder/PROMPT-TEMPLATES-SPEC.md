@@ -5,6 +5,10 @@ Status: specification, 2026-10-16. The prompt files written from it are
 (`builder/PROMPT-screener.md`, `builder/PROMPT-task-build.md`) are kept for reference only. They do
 not meet this spec (see "Why the first drafts miss" at the end of part 1).
 
+This spec describes the primary advisory-backed templates. If that path is insufficient, pursue
+the fallbacks in `fallbacks/FALLBACKS.md` with an explicit investigation or task brief. Non-advisory
+investigations must not be forced into the advisory screener's schema or labelled pattern A/B.
+
 **Two patterns, both in scope (user decision, 2026-10-16).** Both go through the screener and the
 builder:
 - **Pattern A, published scope.** All difficulty comes from the published fix's own sites:
@@ -18,7 +22,8 @@ builder:
   jackson-databind-sib2 (both models 0/3).
 
 Siblings we inject into our own copy can be added to either pattern. Pattern B comes with three
-guardrails (§1.5): a scope limit, a disclosure register, and summary-level write-ups.
+guardrails (§1.5): a defined scope, a disclosure register, and concise write-ups with supporting
+technical detail when needed.
 
 Sections: 1. Purpose · 2. Sources · 3. Contents.
 
@@ -27,26 +32,16 @@ Sections: 1. Purpose · 2. Sources · 3. Contents.
 ## 1. Purpose
 
 ### 1.1 Why two shared, written-once prompts
-The user's request (handoff conversation "CWE-bench plan.md handoff analysis", 2026-10-16 17:41 UTC)
-calls for two prompts, each written once:
+The pipeline uses two prompts, each written once:
 - a **shared screener prompt** "with goals and objectives". It is tried on the available models
   (Fable 5.1, Opus 4.8, DeepSeek V4.1 Flash, MiMo-V2.6-Pro and others), and then run on every new
   batch with the current weights and instructions;
 - a **refined task-build template** shared across all tasks, plus a short per-task section.
 
-They solve three problems from 2026-10-16:
-1. **Repeated stops by the safety classifier.**
-   - Each hand-written brief was a new chance of being stopped. 10 responses were stopped that day:
-     porting Hadi's weakness report onto new injected bugs, the jackson type-validator builder, the
-     framework scout, the re-screen launch, the handoff file and several planning replies.
-   - Briefs that stayed on **published, already-fixed advisories** and on **building the benchmark
-     task** went through: round 1, the instruction rewrites, better-auth.
-   - What was stopped: open-ended asks to find **new weaknesses across live, widely used
-     frameworks** with no advisory as the anchor (the framework scout), and exploit-level detail.
-     Pattern B differs in scope: it stays inside one published advisory's own protection, in one
-     repo, at one pinned commit. It may still draw stops, so §1.5 limits it and the narrowing rule
-     applies.
-   - A template fixed once on the framing that works removes this brief-by-brief variance.
+They serve three purposes:
+1. **Consistent task scope.** The primary templates work from published, already-fixed advisories.
+   Pattern B stays inside one advisory's protection, in one repository, at one pinned commit.
+   Fallback investigations use explicit briefs with their own scope and success criterion.
 2. **Scale.** 100–200 tasks cannot come from a hand-written brief per task. The user's words: "we
    gotta deliver results ... I can't go back to cave man things".
 3. **Model portability.** The pipeline will eventually run on DeepSeek or MiMo. The prompts must
@@ -54,9 +49,8 @@ They solve three problems from 2026-10-16:
    - as a Harbor job with Claude Code as the harness;
    - as a prompt pasted into a new chat (the user's "prompt.md" idea).
 
-What the templates are **not**: a way past the classifier. Running the same acceptable prompt on
-several models to compare quality is fine. Moving a stopped prompt to another model or session is
-not. If a template run is stopped, narrow the template.
+Retain unfinished work for fallback reassessment, revise its scope or detail when needed, and log
+supported retries and model comparisons. Tool and provider restrictions apply to each attempt.
 
 ### 1.2 File 1: the screener prompt
 **Job:** judge each published, already-fixed advisory in our index as a **host** for a task, and
@@ -75,8 +69,9 @@ candidates and we know which to build.
 - **Model choice by measurement.** The same prompt runs on each available model, on hosts whose
   outcome we already know. Routine screening then uses the cheapest model whose judgements match the
   reference.
-- **Out of scope:**
-  - looking beyond the advisory's own protection, or beyond its repo;
+- **Outside a primary-path screener run:**
+  - looking beyond the advisory's own protection, or beyond its repo: retain these leads for a
+    separately scoped fallback investigation;
   - building tasks;
   - running exploits;
   - running target models.
@@ -100,10 +95,12 @@ shared core plus a short per-task section.
   - the fairness verdict;
   - rounds of repair needed;
   - wall time.
-- **Material is limited to:**
+- **Primary-path material:**
   - the published advisory and its published fix (pattern A);
   - routes at the pinned commit where that same protection is missing (pattern B, within §1.5);
   - siblings we add to our own copy of the code.
+  Fallback briefs may use the other sources in `fallbacks/FALLBACKS.md`, with a pinned repository,
+  explicit evidence and a reference fix, without inventing a published advisory or fix.
 
 ### 1.4 Why the first drafts miss
 - **Not portable.** They tell the agent to read files on this machine (`builder/*.md`, `research/*`),
@@ -124,7 +121,8 @@ shared core plus a short per-task section.
    - Only the protection the published advisory is about, in that advisory's repository, at the
      pinned vulnerable commit.
    - Only routes into the same protected sink that the published fix left untouched.
-   - No searching for other weakness types, other projects or other frameworks.
+   - Leads about other weakness types, projects or frameworks belong in a separate fallback
+     investigation under `fallbacks/FALLBACKS.md`, not in this advisory's pattern B record.
 2. **Evidence.** A route counts only when a behavioural test on our pinned copy shows it. The
    builder confirms it; the screener's claim is a lead.
 3. **Disclosure register.**
@@ -137,15 +135,16 @@ shared core plus a short per-task section.
    - **Disclosure status:** `pending client decision` until NEXT-STEPS item 4 is settled.
    - **Hold:** a task with a route still present upstream is not shared outside the project until
      the client has decided on disclosure.
-4. **Write-ups at summary level.** Notes, manifests and reports describe a route in one line: the
-   protection, the route and the file:line. Never step-by-step exploitation. The tests are the
-   detail.
+4. **Write-up detail.** Start with a concise route summary: protection, route and file:line.
+   When that is insufficient, include supporting technical explanations and local reproduction
+   detail in internal notes or briefs as a fallback. Keep solver instructions subject to the
+   existing fairness and answer-leakage rules; the evidence must still be verified by tests.
 
 ---
 
 ## 2. Sources
 
-Everything is inside `cwe-bench/`, except the handoff conversation itself. The prompts **embed a
+The sources are inside `cwe-bench/`. The prompts **embed a
 digest** of these sources, so they run without the repo. They do not tell the agent to read them.
 The sources are what the person writing the templates reads, and what each digest is regenerated
 from when a source changes.
@@ -155,7 +154,7 @@ from when a source changes.
 |---|---|
 | `plan.md` §1, §3 | The goal (100–200 tasks; both models pass@3 = 0; the failure is the model's), the acceptance rule, and what round 1 taught |
 | `builder/NEXT-STEPS.md` | Process order, working rules (timeouts and API cuts are never failures; no tests after a solve without approval), and next step 3, which defines these two files |
-| Handoff conversation, 2026-10-16 (messages 297, 308, 312, 350–355) | The request itself, the safe framing (published, already-fixed advisories; building the benchmark), what was stopped, "screen hosts not advisories", and the "compare models, never reroute" rule |
+| `fallbacks/FALLBACKS.md` | Fallback eligibility, activation process and treatment of incomplete work |
 | `RESULTS.md` "Round 2" and `build/audit/ledger.md` (regenerated with `build/audit_results.py`, the only source of truth for verdicts) | Known outcomes per host and model: the labels for calibrating and comparing models |
 | `build/audit/trials.tsv`; per task `build/<task>/notes.md`, `FAIRNESS.md` and each run's `postmortem-*/verdict.json` | Per-attempt scores, and *why* each run failed or solved, so the digest's lessons cite audited evidence |
 | `research/round1-analysis/B-failure-modes.md` §2.2–2.3, §3a, §4 | Why models fail (they judge wrongly about sites the report does not name), what they always catch, the 8 shapes |
@@ -190,11 +189,12 @@ from when a source changes.
 
 ### 2.4 Used with care, or not at all
 - **The trap brief's "real, unmodified gaps" line.** Use it for pattern B only, together with the
-  §1.5 guardrails. It is not an open licence to hunt.
+  §1.5 guardrails in the primary pipeline. Broader investigations use a separately scoped fallback
+  brief under `fallbacks/FALLBACKS.md`.
 - **`sourcer/shortlist-20.*` and v2 weights.** History only. Their method did not predict
   difficulty.
-- **`sourcer/host_screener.py`.** Untracked, written by a stopped agent with a cut-off brief; not
-  reviewed. Do not use it.
+- **`sourcer/host_screener.py`.** Available for review and validation as a fallback. Check its
+  review status before use.
 - **`research/partial-progress-60min.md`.** For the client conversation, not for either template:
   timeouts never count as failures.
 - **Round-1 instructions.** They are examples of what not to write (409–687 words, names, counts).
@@ -221,12 +221,13 @@ from when a source changes.
 - **The same framing paragraph opens both prompts.** It says:
   - this is benchmark construction from one published, already-fixed advisory;
   - the work is local;
-  - mechanisms are described in one line, with no exploit write-ups;
+  - mechanisms start with concise summaries, with fuller internal detail available as a fallback;
   - the agent stays inside the advisory's own protection, in its own repo and pinned commit (§1.5).
-    Anything outside that scope that it happens to notice gets one line in its report and is not
-    built on.
-- **Stops are handled by narrowing.** If a run is stopped, the operator narrows the prompt. It is
-  never re-run on another model to get past the stop.
+    Anything outside that scope gets recorded as a lead for a separately scoped fallback brief.
+  - the listed fallback approaches are eligible when the primary path is
+    insufficient, with the same acceptance and fairness requirements.
+- **Stops are retained for reassessment.** Log the stop, any prompt revision, and the scope and
+  outcome of supported retries or comparisons under the fallback policy.
 
 ### 3.1 Screener prompt file (`builder/SCREENER-PROMPT-v1.md`, kept in `builder/` with the other briefs)
 
@@ -444,7 +445,7 @@ from when a source changes.
     - unverified guesses;
     - fairness concerns;
     - for pattern B, each route's register row;
-    - anything noticed outside the §1.5 scope (one line, nothing built on it).
+    - anything noticed outside the §1.5 scope (a concise lead for a separately scoped fallback).
 
 **Per-task section of the prompt (the only part that changes per task)**
 - `{{SLUG}}`, `{{PATTERN}}` (`A`, `B` or `A+B`), `{{TRACK}}` (`mined`, `stacking` or `injected`).
@@ -464,4 +465,5 @@ from when a source changes.
   logged.
 - The builder template has produced one pattern-A task and one pattern-B task, each passing the full strict gate (blind fix and
   fairness review included) with no hand edits to the shared core.
-- Neither template was stopped in those runs. Any stop is logged with the narrowing it led to.
+- Neither template was stopped in those runs. Any later stop is logged with its outcome and any
+  revision or fallback reassessment it led to.

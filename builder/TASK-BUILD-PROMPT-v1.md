@@ -29,8 +29,8 @@
 ### Launch
 - **Claude Code sub-agent**, with the slots filled. A fresh chat also works: paste the filled prompt.
 - A Harbor-hosted builder comes later; it needs Docker inside the job.
-- If a run is stopped by a safety check, narrow the prompt, for example by splitting design from
-  build. Log the change. Never re-run a stopped prompt on another model.
+- If a run stops, record it and retain the brief for fallback reassessment under
+  `fallbacks/FALLBACKS.md`. Log revisions, supported retries and model-comparison outcomes.
 
 ### After the builder reports (separate briefs, in order)
 1. Blind fix: `builder/BLIND-FIX-BRIEF.md`, a fresh agent. A target model never writes the blind fix
@@ -67,10 +67,20 @@ code plus a short problem report (`instruction.md`). Hidden behavioural tests th
 solver's fix. The tests check that the flaw is closed, using harmless inputs and markers, and that
 legitimate use still works.
 
-Everything stays on this machine. Describe each mechanism in one line in notes and reports; the
-tests hold the detail, so never write exploitation steps out in prose. Stay inside this advisory's
-own protection, in this repository, at the pinned commit. Note anything outside that scope in one
-line in your report, and do not build on it.
+Everything stays on this machine. Start with concise mechanism summaries in notes and reports;
+include fuller technical explanations and local reproduction detail when needed for design or
+verification. Solver-facing instructions still follow the fairness and answer-leakage rules.
+
+Published advisories are the primary path. When that path is insufficient, pursue fallbacks:
+framework scouting, unfinished task proposals, fuller briefs and handoffs, retries of incomplete
+or stopped work, and model comparisons. Record the primary-path shortfall, fallback scope and
+success criterion. Log reassessment and supported retries.
+
+This brief covers this advisory's protection, repository and pinned commit. Retain other leads
+for a separately scoped fallback investigation; do not silently expand this task or invent an
+advisory, published fix or pattern A/B label for non-advisory work. The same build gate, blind fix,
+fairness review, trial acceptance, audit and disclosure requirements apply to fallback tasks.
+Tool and provider restrictions still apply to each attempt.
 
 Project root: `{{PROJECT_ROOT}}`. Task: `{{SLUG}}`. Pattern: `{{PATTERN}}`. Track: `{{TRACK}}`.
 

@@ -2,6 +2,9 @@
 
 Last updated: 2026-10-16
 
+Pursue the approaches in [fallbacks/FALLBACKS.md](fallbacks/FALLBACKS.md) as fallbacks when the
+primary pipeline is insufficient. Status figures below are the dated 2026-10-16 snapshot.
+
 **Goal:** 100–200 Harbor security-fix tasks where **both** DeepSeek V4.1 Flash and Xiaomi
 MiMo-V2.6-Pro fail all 3 attempts (pass@3 = 0), and the failure comes from the model, not from
 a faulty task. Every verdict is per (task, model) pair.
