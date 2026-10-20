@@ -32,6 +32,17 @@ Request statuses:
    - finishes with `python scripts/handoff.py done <request file>` (it refuses if the response file is missing/empty).
 4. Report "done" with the file names.
 
+## Continuous mode (overnight)
+
+The autopilot keeps about 10 candidates in generation and writes new requests every ~30 minutes (new candidates, the
+tests step after a design is accepted, or a retry with the rejection reason). To keep up without a human:
+
+1. Answer everything pending (steps above), in parallel.
+2. Then wait about 10 minutes (`sleep 600` in the terminal) and run `python scripts/handoff.py pending` again.
+3. If anything is pending, go back to step 1. If nothing is pending, wait again and re-check.
+4. Keep doing this until you are told to stop. Never answer a request whose status is `in_progress` (another agent has
+   it) unless STATE.md shows it as stale.
+
 ## Rules
 
 - Write ONLY inside `data/handoff/responses/` (plus the claim/done commands). Never edit pipeline code, `STATE.*`,
