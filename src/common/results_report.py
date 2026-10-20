@@ -25,7 +25,7 @@ from src.common.config import Config
 from src.common.harbor import read_trial
 
 MODELS = (("deepseek", "DeepSeek"), ("mimo", "MiMo"))
-LANG = {"PyPI": "Python", "npm": "JavaScript/TypeScript"}
+LANG = {"PyPI": "Python", "npm": "JavaScript/TypeScript", "Go": "Go", "Packagist": "PHP"}
 
 CWE_FAMILIES: list[tuple[str, set[str]]] = [
     ("auth / session / credentials", {"287", "290", "306", "307", "345", "346", "347", "384", "522", "613", "620", "640",
@@ -49,7 +49,7 @@ def cwe_family(cwes: list[str]) -> str:
 
 def _meta(cfg: Config) -> dict[str, dict]:
     out: dict[str, dict] = {}
-    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json"):
+    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json", "02_screened/injected.json"):
         p = cfg.data_dir / rel
         if p.is_file():
             try:
@@ -213,8 +213,24 @@ def final_verdict(state_rec, per: dict[str, dict]) -> str:
     return f"REJECTED: {state_rec.detail[:80]}"
 
 
+def withdrawn_tasks(cfg: Config) -> dict[str, str]:
+    """osv_id -> reason for tasks the user acknowledged as defective (data/knowledge/withdrawn_tasks.json). Their runs
+    stay in C_RESULTS.md (marked WITHDRAWN) but never teach the generator. A state reset cannot un-withdraw them."""
+    p = cfg.data_dir / "knowledge" / "withdrawn_tasks.json"
+    try:
+        return {k: str(v) for k, v in json.loads(p.read_text()).items() if not k.startswith("_")}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def learning_rows(cfg: Config, rows: list[dict]) -> list[dict]:
+    """The rows the generator's knowledge files may learn from."""
+    return [r for r in rows if not r.get("withdrawn")]
+
+
 def collect(cfg: Config) -> list[dict]:
     from src.common.state_manager import StateManager
+    withdrawn = withdrawn_tasks(cfg)
     meta = _meta(cfg)
     with StateManager(cfg.state_db) as state:
         recs = {k: state.get("stage5_evaluator", k) for k in state.keys("stage5_evaluator")}
@@ -240,7 +256,9 @@ def collect(cfg: Config) -> list[dict]:
                      "type": task_type(cfg, tdir.name, m), "per": per, "state": recs.get(tdir.name),
                      "build": f"{statistics.median(setups):.0f} s / {max(setups) / 60:.1f} min" if setups else "not measured"})
     for r in rows:
-        r["verdict"] = final_verdict(r["state"], r["per"])
+        r["withdrawn"] = withdrawn.get(r["task"], "")
+        r["verdict"] = (f"WITHDRAWN: {r['withdrawn'][:80]}" if r["withdrawn"]
+                        else final_verdict(r["state"], r["per"]))
     return rows
 
 
@@ -465,6 +483,110 @@ def render_technique_scoreboard(cfg: Config, rows: list[dict]) -> str:
     return "\n".join(out) + "\n"
 
 
+PASS_RULES = {
+    "coverage gap": "list every place the reference fix hardens and reach EACH one from its own security test - a "
+                    "repair that skips one place must fail",
+    "small fix": "a one-place fix is solved whatever the report says; skip it unless the code has a real second place "
+                 "the fix must also reach (fix width alone does not help: 10-21-file fixes were solved on attempt 1)",
+    "report points at the code": "never name the file, function, option or parameter the fix changes, and never state "
+                                 "how far the bug reaches ('every provider', 'on every route')",
+    "no hidden path": "put part of the root cause in a REAL place the report never leads to - a second implementation, "
+                      "a producer feeding the check, a defaults/merge route - and reach it with its own test "
+                      "(techniques 1, 2, 3, 7, 12-15)",
+    "few security tests": "write one security test per fix place, each through its own entry point (spelling and "
+                          "encoding variants of one input do not count: models always catch them)",
+}
+
+
+def _report_leaks(cfg: Config, osv_id: str, ref: list[str]) -> list[str]:
+    """Code names from the reference fix (changed file stems, functions in hunk headers) that the report spells out."""
+    import re
+    env = cfg.stage_dir(3) / osv_id
+    try:
+        report = (env / "instruction.md").read_text(errors="replace")
+        patch = (env / "oracle_solution.patch").read_text(errors="replace")
+    except OSError:
+        return []
+    names = {Path(f).stem for f in ref if len(Path(f).stem) > 5 and Path(f).stem not in ("index", "__init__", "utils")}
+    names |= {m for m in re.findall(r"^@@[^@]*@@.*?\b(?:def|function|func|class)\s+([A-Za-z_]\w{5,})", patch, re.M)}
+    return sorted(n for n in names if re.search(rf"(?<![\w/]){re.escape(n)}(?!\w)", report))
+
+
+def pass_reasons(x: dict) -> list[str]:
+    """Deterministic reasons a solved task was too easy, each mapped to a PASS_RULES fix."""
+    out = []
+    if x["files"] and x["known"] and x["touched"] < x["files"]:      # older trials did not record the agent's files
+        out.append("coverage gap")
+    if x["files"] and x["files"] <= 3:
+        out.append("small fix")
+    if x["leaks"]:
+        out.append("report points at the code")
+    if not set(x["techs"]) & {1, 2, 3, 7}:
+        out.append("no hidden path")
+    if x["sec"] and x["sec"] <= 5:
+        out.append("few security tests")
+    return out
+
+
+def render_solved_profile(cfg: Config, rows: list[dict]) -> str:
+    """Deterministic profile of the tasks a model SOLVED: the shapes that do not work, so every cycle's generator learns
+    from solved tasks as well as from failures. Rebuilt after every evaluation."""
+    import statistics as st
+    names = technique_names(cfg)
+    solved = []
+    for r in rows:
+        for tag, name in MODELS:
+            if r["per"][tag]["verdict"] != "solved":
+                continue
+            atts = attempt_rows(cfg.stage_dir(5) / r["task"] / tag, None)
+            win = next((i for i, a in enumerate(atts, 1) if a["ended"] == "SOLVED"), None)
+            if win is None:
+                continue
+            a = atts[win - 1]
+            ref_list = _ref_files(cfg, r["task"])
+            ref = set(ref_list)
+            touched = len(ref & set(a["files"]))
+            x = {"pkg": r["package"], "family": r["type"]["family"], "shape": r["type"]["shape"],
+                 "files": len(ref), "sec": a["sec"][1], "solver": name, "attempt": win, "mins": a["mins"],
+                 "touched": touched, "known": bool(a["files"]), "techs": task_techniques(cfg, r["task"]),
+                 "leaks": _report_leaks(cfg, r["task"], ref_list)}
+            x["why"] = pass_reasons(x)
+            solved.append(x)
+            break
+    if not solved:
+        return "## Solved-task profile\n(no solved tasks yet)\n"
+    first = [x for x in solved if x["attempt"] == 1]
+    fams: dict[str, int] = {}
+    for x in solved:
+        for f in x["family"].split(" + "):
+            fams[f] = fams.get(f, 0) + 1
+    out = ["## Solved-task profile (deterministic, rebuilt after every evaluation)",
+           f"{len(solved)} evaluated tasks were solved by at least one model; {len(first)} on the FIRST attempt. "
+           f"Median solve time {st.median(x['mins'] for x in solved):.0f} min. These are the shapes to avoid or to "
+           "combine with the techniques that broke a model (see the technique scoreboard).",
+           f"- Median reference-fix size of solved tasks: {st.median(x['files'] for x in solved):.0f} source files; "
+           f"median number of security tests: {st.median(x['sec'] for x in solved):.0f}.",
+           "- Solved by vulnerability family: " + ", ".join(f"{k} x{v}" for k, v in sorted(fams.items(), key=lambda kv: -kv[1])),
+           f"- In {sum(1 for x in solved if x['files'] and x['touched'] >= x['files'])} of {len(solved)} solves the agent "
+           "changed every source file of the reference fix: the report led it to all affected places."]
+    counts: dict[str, int] = {}
+    for x in solved:
+        for w in x["why"]:
+            counts[w] = counts.get(w, 0) + 1
+    out += ["", "### Why solved tasks were too easy (measured; fix the most common first)"]
+    for w, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+        out.append(f"- **{w}** in {c} of {len(solved)} solved tasks -> {PASS_RULES[w]}.")
+    out += ["", "| Task | Family | Fix | Security tests | Techniques used | Solved by | Attempt | Minutes | Why it passed |",
+            "|---|---|---|---|---|---|---|---|---|"]
+    for x in sorted(solved, key=lambda x: x["mins"]):
+        why = "; ".join(f"{w} ({x['touched']}/{x['files']} fix files changed)" if w == "coverage gap" else
+                        f"{w}: {', '.join(x['leaks'][:3])}" if w == "report points at the code" else w for w in x["why"])
+        out.append(f"| {x['pkg']} | {x['family']} | {x['shape']} | {x['sec']} | "
+                   f"{', '.join(str(t) for t in x['techs']) or '-'} | {x['solver']} | {x['attempt']} | {x['mins']} | "
+                   f"{why or '-'} |")
+    return "\n".join(out) + "\n"
+
+
 def render_failure_map(rows: list[dict]) -> str:
     """Per-model guidance for the task generator: task types each model failed, timed out on, or solved."""
     out = ["## Model failure map (deterministic, rebuilt after every evaluation)",
@@ -491,9 +613,11 @@ def main() -> None:
     cfg = Config.load()
     rows = collect(cfg)
     (cfg.root / "C_RESULTS.md").write_text(render_results(rows) + render_failure_details(cfg, rows))
-    (cfg.data_dir / "knowledge" / "model_failure_map.md").write_text(render_failure_map(rows))
-    (cfg.data_dir / "knowledge" / "technique_scoreboard.md").write_text(render_technique_scoreboard(cfg, rows))
-    print(render_failure_map(rows))
+    learn = learning_rows(cfg, rows)      # the generator's knowledge never learns from withdrawn (defective) tasks
+    (cfg.data_dir / "knowledge" / "model_failure_map.md").write_text(render_failure_map(learn))
+    (cfg.data_dir / "knowledge" / "technique_scoreboard.md").write_text(render_technique_scoreboard(cfg, learn))
+    (cfg.data_dir / "knowledge" / "solved_profile.md").write_text(render_solved_profile(cfg, learn))
+    print(render_failure_map(learn))
 
 
 if __name__ == "__main__":

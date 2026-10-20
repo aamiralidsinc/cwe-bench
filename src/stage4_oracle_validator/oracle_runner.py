@@ -19,6 +19,10 @@ For every stage-3 task (instruction.md + hidden_tests.py present):
                 alternative (correct fix, different design)     -> reward 1.0
                 Each outcome also proves the patch really changed the code (it differs from the pre-patch run).
                 A wrong outcome sends the task back to stage 3 with the exact failing tests as feedback.
+  6. COVERAGE   Leave-one-file-out: the reference fix is run WITHOUT its change to one source file (the largest
+                COVERAGE_MAX_FILES files). If every test still passes, an agent that never touches that file solves
+                the task (the most common reason solved tasks were too easy) -> sent back with the file names while
+                rewrite budget remains; on the last round only a warning.
   Isolation:    static audit of the task dir (only repo/ is copied, single snapshot commit, no fix lines or upstream
                 regression tests in the tree or report, offline) + a scan of the BUILT image's whole filesystem for the
                 fix's added lines (e.g. an already-fixed copy of the package inside node_modules / site-packages).
@@ -35,8 +39,10 @@ from __future__ import annotations
 import argparse
 import os
 import json
+import re
 import logging
 import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -46,10 +52,10 @@ from typing import Optional
 
 from src.common.config import Config
 from src.common.harbor import HarborUnavailable, Trial, preflight, read_trials, run_harbor
-from src.common.llm import CliBackend, QuotaExhausted
+from src.common.llm import CliBackend, QuotaExhausted, SafeguardsFlagged
 from src.common.logging_setup import configure_logging
 from src.common.state_manager import StateManager, Status
-from src.stage4_oracle_validator import recall_probe, rubric_check
+from src.stage4_oracle_validator import plan_probe, recall_probe, rubric_check
 from src.common import knowledge
 from src.stage6_packager.harbor_packager import (TASK_DIRNAME, VERIFY_BUDGET_SEC, PackagingError, _link_or_copy, audit_task,
                                                  build_task, ensure_egress_image, load_meta,
@@ -86,16 +92,21 @@ def pytest_feedback(trials: list[Trial], limit: int = 3500) -> str:
         if not p.is_file():
             continue
         lines = p.read_text(errors="replace").splitlines()
-        errs, seen = [], set()
+        errs, seen, last_src = [], set(), ""
         for l in lines:
-            if l.startswith("E ") and l not in seen:
+            if l.startswith(">"):
+                last_src = l          # the source line that raised: shows HOW the test called the code
+            elif l.startswith("E ") and l not in seen:
                 seen.add(l)
+                if last_src and last_src not in seen:
+                    seen.add(last_src)
+                    errs.append(last_src)
                 errs.append(l)
         summary = []
         if "short test summary info" in "\n".join(lines):
             idx = max(i for i, l in enumerate(lines) if "short test summary info" in l)
             summary = lines[idx: idx + 30]
-        text = "\n".join(summary + ["", "Distinct error lines:"] + errs[:25])
+        text = "\n".join(summary + ["", "Distinct errors (with the test line that raised each):"] + errs[:40])
         return text[:limit]
     return ""
 
@@ -208,6 +219,127 @@ def run_fix_checks(env_dir: Path, task: Path, cfg: Config, vdir: Path, stamp: st
     return check_fix_patches(results, expected)
 
 
+# 4 left most places of a wide fix unproven (9router: agent changed 1 of 12 fix files and scored 1.0). Each check is one
+# oracle run (~2-3 min); 8 keeps a wide task's validation under ~25 min.
+COVERAGE_MAX_FILES = int(os.environ.get("COVERAGE_MAX_FILES", "8"))
+NON_SOURCE = re.compile(r"(^|/)(tests?|__tests__|spec|fixtures?|docs?|examples?|testdata)/|[._-](test|spec)\.|"
+                        r"\.(md|rst|txt|json|ya?ml|toml|lock|snap)$|(^|/)CHANGELOG|\.d\.ts$", re.I)
+
+
+def split_patch(patch: str) -> list[tuple[str, str, int]]:
+    """[(file, chunk, changed lines)] per `diff --git` section."""
+    out = []
+    for ch in re.split(r"(?m)^(?=diff --git )", patch):
+        m = re.match(r"diff --git a/(\S+) b/(\S+)", ch)
+        if m:
+            out.append((m.group(2), ch, len(re.findall(r"(?m)^[+-](?![+-]{2} )", ch))))
+    return out
+
+
+def run_coverage_checks(env_dir: Path, task: Path, cfg: Config, vdir: Path, stamp: str, timeout: int,
+                        can_rewrite: bool = True) -> list[str]:
+    """Source files of the reference fix whose change no test needs (fix minus that file still scores 1.0)."""
+    chunks = split_patch((env_dir / "oracle_solution.patch").read_text(errors="replace"))
+    trap_paths: set = set()
+    try:   # only the files the generator declared as part of the security fix (commits bundle unrelated changes)
+        tmeta = json.loads((env_dir / "task_metadata.json").read_text())
+        places = set(tmeta.get("fix_places") or [])
+        trap_paths = set((tmeta.get("trap") or {}).get("paths") or [])
+    except (OSError, ValueError):
+        places = set()
+    if places:
+        src = [c for c in chunks if c[0] in places and not NON_SOURCE.search(c[0])]
+    elif can_rewrite:
+        # tasks generated before fix_places existed: the largest source files (a rewrite then declares fix_places,
+        # so a bundled unrelated file costs one rewrite at most). react-router was solved changing 2 of 7.
+        src = [c for c in chunks if not NON_SOURCE.search(c[0]) and c[2] >= 6]
+    else:
+        log.info("Coverage check skipped (no fix_places, no rewrite left)", extra={"osv_id": env_dir.name})
+        return []
+    if len(src) < 2:
+        return []
+    uncovered = []
+    # declared trap paths first: the trap is only real if the tests provably fail when that file is left unfixed
+    for f, _, _ in sorted(src, key=lambda c: (c[0] not in trap_paths, -c[2]))[:COVERAGE_MAX_FILES]:
+        name = "lofo-" + re.sub(r"[^a-z0-9]+", "-", Path(f).stem.lower())[:24]
+        copy = vdir / "check_tasks" / name
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.copytree(task, copy, symlinks=True, copy_function=_link_or_copy)
+        (copy / "solution" / "oracle_solution.patch").unlink()
+        (copy / "solution" / "oracle_solution.patch").write_text("".join(ch for g, ch, _ in chunks if g != f))
+        trs = read_trials(run_harbor(cfg.harbor_bin, copy, "oracle", vdir, f"{name}-{stamp}", attempts=1, concurrent=1,
+                                     timeout=timeout, log_path=vdir / f"{name}-{stamp}.log"))
+        r = trs[0].reward if trs else None
+        log.info("Coverage check", extra={"osv_id": env_dir.name, "left_out": f, "reward": r})
+        if r is not None and r >= 1.0:
+            uncovered.append(f)
+    return uncovered
+
+
+DESIGN_TOK = re.compile(r"[A-Za-z_][A-Za-z0-9_]{4,}")
+# probing for members a fix might add: a literal member name (checked against the vulnerable repo) or a dynamic one
+PROBE_LITERAL_RE = re.compile(r"""\b(?:getattr|hasattr)\([^,()]+,\s*['"](\w+)['"]|(?:FieldByName|MethodByName)\(\s*"(\w+)"|"""
+                              r"""Reflect\.has\([^,()]+,\s*['"](\w+)['"]""")
+PROBE_DYNAMIC_RE = re.compile(r"(?:FieldByName|MethodByName)\(\s*[A-Za-z_]\w*\s*\)")
+
+
+def design_bound_names(env_dir: Path) -> tuple[list[str], list[str]]:
+    """(code-like names the hidden tests use that exist only in the reference fix's added SOURCE code - not in the
+    vulnerable repo, not in the report; probing constructs). Either makes a test pass only on the reference design
+    (infracost GHSA-6x6c: `TrustedHosts`, `TG_TF_DEFAULT_REGISTRY_HOST`)."""
+    from src.common.classify import is_test_path
+    tests = (env_dir / "hidden_tests.py").read_text(errors="replace")
+    report = (env_dir / "instruction.md").read_text(errors="replace").lower()
+    added = []
+    for ch in re.split(r"(?m)^(?=diff --git )", (env_dir / "oracle_solution.patch").read_text(errors="replace")):
+        m = re.match(r"diff --git a/\S+ b/(\S+)", ch)
+        if m and not is_test_path(m.group(1)):
+            added += [l[1:] for l in ch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    defined = {a or b for a, b in re.findall(
+        r"(?:def|func|class|const|var|let|function)\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*:?=", tests)}
+    code_like = lambda n: bool(re.search(r"[a-z][A-Z]|_|^[A-Z][A-Z0-9]+$", n))
+    cand = (set(DESIGN_TOK.findall(tests)) & set(DESIGN_TOK.findall("\n".join(added)))) - defined
+
+    def in_repo(name: str) -> bool:
+        return subprocess.run(["git", "grep", "-q", "-w", "-F", name, "HEAD"], cwd=env_dir / "repo",
+                              capture_output=True).returncode == 0
+    names = sorted(n for n in cand if code_like(n) and n.lower() not in report and not in_repo(n))
+    # Python-stdlib members the test HARNESS itself touches (subprocess results, paths): not probes for fix-added
+    # members, and absent from non-Python repos by nature (false positive: Ghost GHSA-9m84, 2026-10-20).
+    harness_attrs = {"returncode", "stdout", "stderr", "args", "pid", "name", "parent", "stem", "suffix"}
+    probes = sorted(({"".join(g) for g in PROBE_LITERAL_RE.findall(tests) if not in_repo("".join(g))}
+                     | set(PROBE_DYNAMIC_RE.findall(tests))) - harness_attrs)
+    return names, probes
+
+
+def trap_violations(env_dir: Path) -> list[str]:
+    """Re-verify the generator's declared trap (task_metadata.json "trap") against the artifacts on disk - stage 3
+    already validated it, but a rewrite can drift. Tasks generated before the trap gate have no "trap" field and are
+    skipped (backward compatible with cycle <= 11)."""
+    try:
+        tmeta = json.loads((env_dir / "task_metadata.json").read_text())
+    except (OSError, ValueError):
+        return []
+    trap = tmeta.get("trap") or {}
+    paths = trap.get("paths") or []
+    if not paths:
+        return []
+    out = []
+    places = set(tmeta.get("fix_places") or [])
+    report = (env_dir / "instruction.md").read_text(errors="replace").lower()
+    missing = [p for p in paths if not (env_dir / "repo" / p).is_file()]
+    if missing:
+        out.append(f"trap paths not in the pre-patch repo: {missing}")
+    outside = [p for p in paths if p not in places]
+    if outside:
+        out.append(f"trap paths not in fix_places (coverage check cannot prove them): {outside}")
+    named = [p for p in paths
+             if re.search(r"(?<![a-z0-9_])" + re.escape(Path(p).stem.lower()) + r"(?![a-z0-9_])", report)]
+    if named:
+        out.append(f"the report names the trap file(s): {named}")
+    return out
+
+
 def derive_existing_expected(oracle_trials: list[Trial], prepatch: Trial) -> list[str]:
     """Existing tests that pass in EVERY oracle trial and on the pre-patch code (true pass->pass).
     Names that do not survive existing_expected.txt's one-stripped-name-per-line format (a parametrised title ending
@@ -221,6 +353,20 @@ def derive_existing_expected(oracle_trials: list[Trial], prepatch: Trial) -> lis
 def validate_task(env_dir: Path, cfg: Config, meta: dict, args: argparse.Namespace,
                   backend: Optional[CliBackend]) -> Verdict:
     osv_id = env_dir.name
+    names, probes = design_bound_names(env_dir)
+    if names or probes:      # deterministic and cheap: before the rubric and any Docker work
+        what = (f"names that exist only in the reference fix: {names}" if names else "") + \
+               ("; " if names and probes else "") + (f"probing for guessed fields/attributes: {probes}" if probes else "")
+        return Verdict(False, f"tests bound to the reference design ({what})"[:600], feedback=(
+            f"TEST DESIGN - the hidden tests use {what}. A test may only use interfaces that exist in the vulnerable "
+            "code and behaviour the report asks for, so that ANY correct fix passes it (rule 7). Remove these names "
+            "and probes; if the behaviour they check matters, state it in the report and observe it through an "
+            "existing entry point."))
+    trap_bad = trap_violations(env_dir)   # deterministic, trap-gated tasks only (metadata.trap present)
+    if trap_bad:
+        return Verdict(False, f"trap evidence failed: {'; '.join(trap_bad)}"[:600], feedback=(
+            "TRAP EVIDENCE - metadata.trap must name real pre-patch source files, each also in metadata.fix_places, "
+            f"and the report must not name them: {'; '.join(trap_bad)}. Fix the metadata or rewrite the report."))
     prior = env_dir / "rubric_check.json"
     task_files = [env_dir / n for n in ("instruction.md", "hidden_tests.py")]
     reuse = (prior.is_file() and json.loads(prior.read_text()).get("passed")
@@ -305,6 +451,24 @@ def validate_task(env_dir: Path, cfg: Config, meta: dict, args: argparse.Namespa
         if not fc.ok:
             return fc
         fix_note = fc.detail
+    rounds = len(list((env_dir / "attempts").glob("round_*"))) if (env_dir / "attempts").is_dir() else 0
+    uncovered = run_coverage_checks(env_dir, task, cfg, vdir, stamp, max(args.timeout, per_run),
+                                    can_rewrite=rounds < args.max_regen)
+    if uncovered:
+        files = ", ".join(uncovered)
+        if rounds < args.max_regen:
+            return Verdict(False, f"coverage: reference fix minus {files} still scores 1.0",
+                           feedback=(f"COVERAGE - the pipeline ran the reference fix WITHOUT its changes to: {files}. "
+                                     "Every hidden test still passed (reward 1.0), so an agent that never touches "
+                                     "these files solves the task - the most common reason earlier tasks were "
+                                     "solved. For each file: find the attack path that only its change blocks and "
+                                     "add a test_security_* reaching it from a real public entry point (and, if that "
+                                     "path is legitimate for other inputs, a functional test that keeps it working). "
+                                     "Do not test the file directly or by internal names."))
+        log.warning("Coverage gap kept (no rewrite budget left)", extra={"osv_id": osv_id, "files": files})
+        fix_note += f"; coverage gap: {files}"
+    elif not args.skip_fix_checks:
+        fix_note += "; every large fix file needed"
     note = f"existing pass->pass tests: {len(expected)} (from {len(existing_files)} candidate files); {fix_note}"
     if not expected:
         log.warning("Task has no existing-test coverage; relies on generated functional tests only", extra={"osv_id": osv_id})
@@ -325,6 +489,17 @@ def process(env_dir: Path, cfg: Config, meta: dict, state: StateManager, args: a
     except HarborUnavailable as e:
         state.mark(STAGE, osv_id, Status.FAILED, str(e))
         return "failed"
+    except SafeguardsFlagged as e:
+        # The rubric reviewer (Claude) was safeguards-flagged. Terminal: a FAILED status would retry it next run and send
+        # the same flagged material to Claude again. The marker also makes the picker skip this repo's other candidates.
+        try:
+            (env_dir / "safeguards_flagged.txt").write_text(f"stage 4 rubric: {e}")
+        except OSError:
+            pass
+        log.error("Anthropic safeguards flagged the rubric review - never retried on Claude; task retired",
+                  extra={"osv_id": osv_id, "error": str(e)[:200]})
+        state.mark(STAGE, osv_id, Status.REJECTED, "safeguards flagged during the rubric review (never retried on Claude)")
+        return "failed"
     except Exception as e:
         log.exception("validator crashed", extra={"osv_id": osv_id})
         state.mark(STAGE, osv_id, Status.FAILED, f"unexpected: {e!r}")
@@ -336,6 +511,19 @@ def process(env_dir: Path, cfg: Config, meta: dict, state: StateManager, args: a
     knowledge.record_outcome(cfg, osv_id, STAGE, "validated" if v.ok else (v.status.value if v.status else "failed_oracle"),
                              v.detail, existing_expected=(v.data or {}).get("existing_expected"))
     if v.ok:
+        # Pre-trial plan probe (2026-10-20): skip tasks the target models already see through (see plan_probe.py)
+        if plan_probe.mode() != "off":
+            try:
+                pp = plan_probe.decide(env_dir, (meta.get(osv_id) or {}).get("ecosystem", ""), cfg.eval_endpoints())
+            except Exception as e:      # fail open: the probe must never block a validated task by crashing
+                pp = {"verdict": "trial", "why": f"probe crashed: {e!r}"[:200]}
+            log.info("Plan probe", extra={"osv_id": osv_id, "verdict": pp["verdict"], "why": pp.get("why", "")})
+            if pp["verdict"] == "skip" and plan_probe.mode() == "gate":
+                why = f"predicted easy by the plan probe: {pp.get('why', '')}"
+                state.mark(STAGE, osv_id, Status.REJECTED, why)
+                knowledge.record_outcome(cfg, osv_id, STAGE, "rejected_predicted_easy", why)
+                log.warning("Skipped before the trial (predicted easy)", extra={"osv_id": osv_id, "why": why})
+                return "rejected"
         state.mark(STAGE, osv_id, Status.DONE, v.detail)
         log.info("Validated", extra={"osv_id": osv_id, "detail": v.detail})
         return "ok"
@@ -429,7 +617,12 @@ def main(argv: Optional[list[str]] = None, cfg: Optional[Config] = None) -> int:
         except HarborUnavailable as e:
             log.error("Stage 4 cannot run: %s", e)
             return 1
-        backend = None if args.skip_rubric else CliBackend(cfg.claude_bin, 900.0)
+        # DeepSeek's CoT for a full rubric can exceed 15 min; the output cap is in rubric_check.py.
+        # rubric-only effort (2026-10-20): .env's CLAUDE_CODE_EFFORT_LEVEL=max kept two rubric reviews running 30 min
+        # (the same failure generation had); the reply is a short JSON verdict
+        backend = None if args.skip_rubric else CliBackend(
+            cfg.claude_bin, float(os.environ.get("RUBRIC_TIMEOUT_SEC", "900")),
+            effort=os.environ.get("RUBRIC_CLAUDE_EFFORT", "high"))
         abort: list[bool] = []
         counts = {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 0}
         try:

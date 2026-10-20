@@ -42,9 +42,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from src.common.llm import CliBackend, QuotaExhausted, SafeguardsFlagged, normalize_model  # noqa: F401  (re-exported)
+from src.common.llm import CliBackend, HandoffBackend, HandoffPending, OutputLimitExceeded, QuotaExhausted, SafeguardsFlagged, normalize_model  # noqa: F401,E501
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ PATCH_NAME = "oracle_solution.patch"
 REPO_DIRNAME = "repo"
 META_NAME = "generation_meta.json"
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "claude-fable-5-1"
 MAX_FILE_CHARS = 40_000        # per source file shown to the model
 MAX_CONTEXT_CHARS = 160_000    # all source files together
 MAX_PATCH_CHARS = 80_000
@@ -73,164 +73,376 @@ TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs)(/|$)|(^|/)(test_[
                           re.IGNORECASE)
 
 
+# # --------------------------------------------------------------------------- #
+# # Prompts
+# # --------------------------------------------------------------------------- #
+# SYSTEM_PROMPT = """\
+# You are a senior application-security engineer on the maintainer/QA side of a defensive benchmark that measures \
+# whether AI coding agents can correctly REPAIR real vulnerabilities that are already publicly disclosed (CVE/GHSA) \
+# and already fixed upstream. You are given the historical fix (the "reference patch") and the vulnerable source. \
+# You write (1) the bug report a maintainer would receive, (2) a hidden pytest regression suite that checks a \
+# repair actually closes the hole without breaking the feature, and (3) three candidate code fixes (an incomplete \
+# one, an over-restrictive one and a correct one) that are run against the suite to prove it tells good repairs \
+# from bad ones.
+
+# Purpose and use: the benchmark grades AI agents that are asked to FIX the code; the agents never see the tests. A \
+# repair task is useful only if an incomplete or over-broad repair is caught, which is why the suite checks every \
+# path to the bug and the feature's legitimate uses. Nothing here is run against anyone else's systems: the tests \
+# run offline, inside a throwaway container, against a pinned old version of the project, and the bug is already \
+# patched in current releases. This is ordinary security-regression-test work: the tests only assert that hostile \
+# input is REJECTED (or handled safely), use harmless sentinel values and small inputs, and contain no attack tooling.\
+# """
+
+# USER_PROMPT_TEMPLATE = """\
+# # Vulnerability metadata
+# - OSV ID: {osv_id}
+# - CVE: {cve_id}
+# - CWE: {cwes}
+# - Ecosystem / package: {ecosystem} / {package}
+# - Repository: {repo_url}
+# - Official summary: {summary}
+
+# # Oracle patch (the historical human fix; the agent never sees this)
+# ```diff
+# {patch}
+# ```
+
+# # Pre-patch source of the files the patch modifies (vulnerable state)
+# {sources}
+
+# # How the rest of the repository reaches that code (callers / entry points - read these to wire the tests correctly)
+# {callers}
+
+# # Repository map (source and test files; the agent under evaluation gets this whole repository)
+# {repo_map}
+
+# # Package manifests (entry points, exports, scripts, test runner)
+# {manifests}
+
+# # Other context
+# - Existing test files touched by the patch: {test_files}
+# - Repo top-level entries: {top_level}
+
+# # How this project's own tests set things up (copy the fixture/app-construction pattern)
+# {test_examples}
+
+# # Your job
+# Produce the artifacts below.
+
+# ## Artifact 1: instruction.md - the bug report
+# Write a realistic vulnerability report as a user/security researcher/customer would file it.
+# - Describe the business impact and the observable, behaviour-level way the issue is triggered \
+# (what is sent or done, what happens, what should happen instead). It must be accurate and give enough \
+# information that a skilled engineer could reproduce the *symptom* and recognise the vulnerability class.
+# - Crucial: DO NOT mention any file names, paths, module names from the patch, function/class names that \
+# the patch changes, line numbers, or hints about where or how to fix it. We are testing Localization: the \
+# agent must find the faulty code itself. Public, user-facing API names and documented features may be \
+# referenced only if the report is unintelligible without them.
+# - Where it is genuinely true of this bug, frame it as the deeper flaw it is (inter-procedural data flow, \
+# business-logic or state-tracking error, race condition, incomplete validation across code paths). Do not \
+# invent a different vulnerability than the one the patch fixes, and do not exaggerate.
+# - A validator rejects the report if it names a changed file's base name (e.g. `uneval` for uneval.js), or a \
+# function/method/class the patch defines or edits (e.g. `Address4`). Describe them by role instead ("the serializer that \
+# emits JavaScript source", "the IPv4 address type").
+# - Write it in your OWN words: never reuse phrases from the advisory summary/description above, and do not name the CVE/GHSA id.
+# - Do not describe the variants that your hidden tests cover.
+# - Do NOT prescribe the fix. Any 'expected behaviour' part may only state the security property that must hold and the legitimate behaviour that must keep working, in user-visible terms. It must not describe validation rules, token formats, where or in what order checks happen, what is logged versus returned, or which internal code paths need changing. Likewise do not hint which inputs are legitimate beyond what the report needs to be accurate.
+# - Every behaviour your functional tests require must be derivable from the report or from ordinary expectations of the feature; if a functional test needs an unusual-but-legal input, the report must make clear that input is legitimate.
+# - 150-400 words, Markdown, with a title.
+
+# ## Artifact 2: hidden_tests.py - pytest suite
+# Constraints (the suite is run with the working directory at the repo root, repo root on sys.path, \
+# after the agent edits the code; `REPO_ROOT` env var also points there):
+# - Pure pytest, deterministic, offline (no network, no sleeping beyond ~1s, no external services), \
+# self-contained: create temp files via `tmp_path`. Import only things that exist in the PRE-patch source above \
+# or the standard library / the project's declared dependencies. If the vulnerable language is not Python \
+# (e.g. npm package), drive the code via `subprocess` calling `node` with inline scripts and assert on the output. \
+# For a Go module, see rule 5.
+# - Black-box: test behaviour through public/entry-point APIs only. NEVER import, call, or assert on \
+# anything that the oracle patch ADDS (new helpers, new exceptions, new parameters), and never assert exact \
+# error message text. Accept any reasonable rejection (exception of any type, sanitised output, error \
+# status) when asserting that something is blocked - define a small helper like `assert_blocked(callable)`.
+# - The oracle patch MUST pass every test, and the pre-patch code MUST fail every `test_security_*` test. \
+# Only test hardening that the oracle patch itself provides; do not demand extra protections it does not give.
+# - Use harmless sentinel values (e.g. a marker file inside tmp_path, a sentinel string) - nothing that would be harmful outside the test.
+
+# Naming convention (enforced by a validator):
+# A) `test_security_*` (at least {min_sec}, ideally 4-8): fail on vulnerable code, pass after a correct fix. \
+# Cover the exact scenario in the report AND *variants beyond the report* that share the same root cause so \
+# that an incomplete remediation (patching only the one reported path/encoding/entry point/casing/ordering) \
+# still fails. Think: alternative entry points that reach the same sink, encodings and normalisation \
+# tricks, case/Unicode/whitespace variants, nested or chained inputs, repeated or interleaved calls \
+# (state/race-style), boundary values.
+# B) `test_functional_*` (at least {min_func}, ideally 4-8): pass on both vulnerable and fixed code. \
+# These are legitimate use-cases that a careless or over-broad fix would break (over-correction): valid \
+# inputs close to the rejection boundary, normal feature usage, documented options, edge cases that look \
+# suspicious but are legitimate. A fix that simply disables the feature or rejects everything must fail \
+# these tests.
+# - Add a one-line docstring on each test saying what it protects (without giving away the fix location).
+
+# # Hard rules learned from real rejections (most early drafts broke rule 1)
+# 1. IMPLEMENTATION-AGNOSTIC. A test may only observe what an attacker or user can observe at the entry point (HTTP \
+# status/body, return value, raised error, file written or not). It must pass for ANY reasonable correct fix, not just the \
+# reference patch's design. Real rejected examples:
+#    - asserting the fix lives in one permission layer, when an equally valid in-method check would fail the test
+#    - reading the server-side session store to prove sessions were deleted, when a valid fix rejects stale sessions \
+# without deleting them -> instead send the request with the old session and assert it is refused
+#    - driving a hand-built mini app instead of the project's real app/routes -> use the project's own app factory/entry point
+# 2. SOLVABLE FROM THE REPORT. Every input a security test uses must be an instance of the class the report describes. \
+# Never require blocking an input the report does not imply (rejected example: blocking a config key that the underlying \
+# tool ignores and the report never mentions).
+# 3. THE HARNESS MUST RUN. Build the app/client ONCE per module (module-scoped fixture) when the project registers global \
+# state (Flask blueprints, singletons, module-level registries) and reset state between tests instead of re-creating the \
+# app (rejected example: re-creating a Flask app per test -> "blueprint already registered" on every test after the first). \
+# Mirror how the project's own tests set things up (examples below, if any).
+# 4. COMPILED JS/TS PROJECTS. Test the SOURCE, not a prebuilt bundle: run the project's own test runner (vitest/jest/mocha via node_modules/.bin) on a temporary test file that imports from src/, or load the source through the project's TS tooling. Never import dist/ or build output (rejected example: tests that required dist/index.js, which does not exist until a build and would not contain the agent's edits).
+# 5. GO MODULES. Each test writes a temporary Go test file (name it `zz_hidden_<test name>_test.go`) into the package \
+# directory it exercises (same `package` clause as that directory's existing files, or `package <name>_test` for a black-box \
+# test), runs `go test -count=1 -run '^TestHidden$' ./<package dir>` via `subprocess` from the repo root, removes the file in \
+# a `finally` block, and asserts on the exit code / the lines the Go test prints. Use only exported identifiers that exist in \
+# the PRE-patch source; never add or change go.mod/go.sum (the grader is offline and ignores them).
+# 6. PHP (COMPOSER) PROJECTS. Each test writes a temporary PHP script (name it `zz_hidden_<test name>.php`) in the repo \
+# root that starts with `require __DIR__ . '/vendor/autoload.php';`, drives the project's public API (or its HTTP kernel / \
+# router with a built request, the way the project's own tests do), prints ONE JSON line with what a caller observes, and \
+# exits 0; the Python test runs it with `php` via `subprocess` from the repo root, removes it in a `finally` block and \
+# asserts on the JSON. Catch only the project's own exception types inside the script (report them in the JSON); let \
+# anything else fail. Use only classes/functions that exist in the PRE-patch source; never add or change \
+# composer.json/composer.lock (the grader is offline and ignores them). No database or network: use the project's \
+# in-memory / array / SQLite drivers if it has them.
+# 7. TESTS FOLLOW FROM THE REPORT, NOT FROM THE REFERENCE FIX. Every assertion - security AND "must keep working" - must \
+# be required by a sentence in your report (add the sentence if needed) and must pass on ANY correct fix, not only on the \
+# reference design. Never use a name that exists only in the reference fix's added code (a new field, function, env var, \
+# config key or error text), and never probe for guessed names (reflection, FieldByName, getattr/hasattr). Drive the code \
+# only through interfaces that exist in the vulnerable code. Rejected example: a "must keep working" test required a \
+# registry token to reach the host in TERRAFORM_CLOUD_HOST, through an env var only the reference fix reads and a guessed \
+# `TrustedHosts` field; the report never asked for it, so correct fixes of another design failed.
+# 8. INCOMPLETE UPSTREAM FIX. If the reference fix leaves another path with the SAME vulnerable code unfixed (e.g. one \
+# of several providers / renderers / parsers), a careful agent fixes it too and the project's own tests that pin the old \
+# behaviour of that path then fail - an unfair task (rejected example: OAuth state check fixed for every provider but X; \
+# agents fixed X and broke X's repo tests). Then answer ONLY with `<unsuitable>reason</unsuitable>`.
+# Before answering, check each test against these rules.
+
+# # Entry point
+# Security regression tests must reproduce the vulnerable behaviour through a REAL entry point of the project - the way \
+# an untrusted caller or a normal user reaches the code (public API call, HTTP route, CLI command, exported function) - never by calling the \
+# internal helper the patch modifies. State that entry point in the metadata block (internal use only, it is never \
+# shown to the agent).
+
+# ## Artifact 3: check patches - three fixes the pipeline RUNS against your tests (never shown to the agent)
+# Each is a list of exact search/replace edits on the PRE-patch source files above. "search" must appear EXACTLY ONCE in \
+# that file, copied verbatim (indentation included); "replace" is the new text. Edit only non-test source files and keep \
+# the code valid. The pipeline executes your hidden tests against each one; a wrong outcome sends the task back to you:
+# - "shallow": the band-aid a hurried engineer writes from the report alone - it blocks ONLY the exact reported trigger \
+# (one entry point / one encoding / one call path) and leaves the sibling variants open. It must make at least one \
+# security test pass, and at least one security test must still FAIL on it. (This proves a partial fix is caught.)
+# - "removal": closes the hole by disabling or over-restricting the feature (reject the whole input class, remove the \
+# code path, return early). At least one functional test must FAIL on it. (This proves over-blocking is caught.)
+# - "alternative": a CORRECT, complete fix whose design differs from the reference patch (another layer or mechanism). \
+# EVERY test must pass on it. (This proves the tests accept any correct fix, not just the reference design.)
+
+# # Output format (strict)
+# Return ONLY these four blocks, nothing else:
+
+# <instruction_md>
+# ...markdown...
+# </instruction_md>
+# <hidden_tests_py>
+# ...python source, no code fences...
+# </hidden_tests_py>
+# <task_metadata_json>
+# {{"entry_point": "<one line: how untrusted input reaches the code, e.g. 'HTTP GET /download?file= handled by the app'>",
+#   "techniques": [<numbers of the task-design techniques (from the curated technique list) this task applies, e.g. 1, 4, 7;
+#                   REQUIRED: at least one hidden-path technique - 1, 2, 3 or 7 - AND at least one over-correction
+#                   trap - 5 boundary-hugging functional tests, 9 a must-keep-working clause, or 11 a compatibility
+#                   contract pinned by an existing repo test>],
+#   "trap": {{"paths": [<repo-relative SOURCE files among fix_places that a hurried agent misses: the unnamed sibling,
+#                       parallel implementation or deeper layer. Each must exist in the pre-patch repo, be listed in
+#                       fix_places, and be NAMED NOWHERE in your report (not the file, not its functions) - at least
+#                       one security test must reach it only through an entry point the report does not localise>],
+#             "contract": "<one line: the legitimate behaviour near the attack boundary that your functional tests pin,
+#                          which an over-broad fix would break>"}},
+#   "fix_places": [<repo-relative paths of the reference fix's SOURCE files whose change closes part of the vulnerability
+#                   (not unrelated features, refactors or typing bundled in the same commit); the pipeline runs the fix
+#                   without each of them and at least one of your tests must then fail>]}}
+# If the candidate cannot support a real trap (no sibling path, no parallel place, no layer below the entry point),
+# answer ONLY with `<unsuitable>no hidden-path trap: <reason></unsuitable>` - measured: tasks whose tests reach every
+# variant through the reported entry point are solved on the first attempt and waste the batch slot.
+# </task_metadata_json>
+# <check_patches_json>
+# {{"shallow": [{{"file": "<repo-relative path>", "search": "<exact existing text>", "replace": "<new text>"}}],
+#   "removal": [...], "alternative": [...]}}
+# </check_patches_json>
+# """
+
 # --------------------------------------------------------------------------- #
 # Prompts
 # --------------------------------------------------------------------------- #
 SYSTEM_PROMPT = """\
-You are a senior application-security engineer on the maintainer/QA side of a defensive benchmark that measures \
-whether AI coding agents can correctly REPAIR real vulnerabilities that are already publicly disclosed (CVE/GHSA) \
-and already fixed upstream. You are given the historical fix (the "reference patch") and the vulnerable source. \
-You write (1) the bug report a maintainer would receive, (2) a hidden pytest regression suite that checks a \
-repair actually closes the hole without breaking the feature, and (3) three candidate code fixes (an incomplete \
-one, an over-restrictive one and a correct one) that are run against the suite to prove it tells good repairs \
-from bad ones.
+You are a Principal Software Quality Assurance (QA) and Defensive Benchmark Architect on the maintainer side \
+of an evaluation platform. We evaluate whether autonomous AI coding agents can correctly REPAIR real-world \
+vulnerabilities (CVE/GHSA) that have already been fixed upstream in open-source projects.
 
-Purpose and use: the benchmark grades AI agents that are asked to FIX the code; the agents never see the tests. A \
-repair task is useful only if an incomplete or over-broad repair is caught, which is why the suite checks every \
-path to the bug and the feature's legitimate uses. Nothing here is run against anyone else's systems: the tests \
-run offline, inside a throwaway container, against a pinned old version of the project, and the bug is already \
-patched in current releases. This is ordinary security-regression-test work: the tests only assert that hostile \
-input is REJECTED (or handled safely), use harmless sentinel values and small inputs, and contain no attack tooling.\
+You are provided with:
+1. The historical human fix (the "reference patch")
+2. The vulnerable codebase at the pre-patch commit
+3. Repository maps, manifests, and test fixtures
+
+Your responsibility is to author:
+(1) `instruction.md`: A realistic, fair defect report filed by an enterprise user or security auditor.
+(2) `hidden_tests.py`: A black-box pytest regression suite checking security enforcement and functional preservation.
+(3) Three validation check-patches (shallow, removal, alternative) to prove the test suite accurately distinguishes \
+good repairs from bad ones.
+
+Operational Principles:
+- Purely Defensive: All tests offline, inside an isolated container, using harmless sentinels. Tests only assert \
+that invalid/unauthorized input is safely rejected and legitimate operations execute cleanly.
+- Strict Fairness: A task is an exam of model intelligence, NOT a guessing game. Every legitimate use the functional \
+suite tests must be an ordinary use of a FEATURE the report names as "must keep working" (name features, not test values).
+- Zero Leakage: The agent must discover the faulty code and every place it lives. Never disclose file names, function \
+names, the hidden place(s), or the scope of the bug ("every provider", "on every route").\
 """
 
 USER_PROMPT_TEMPLATE = """\
-# Vulnerability metadata
+# Defect & Vulnerability Metadata
 - OSV ID: {osv_id}
 - CVE: {cve_id}
 - CWE: {cwes}
-- Ecosystem / package: {ecosystem} / {package}
+- Ecosystem / Package: {ecosystem} / {package}
 - Repository: {repo_url}
-- Official summary: {summary}
+- Official Summary: {summary}
 
-# Oracle patch (the historical human fix; the agent never sees this)
+# Reference Patch (Historical human fix; hidden from evaluated agents)
 ```diff
 {patch}
-```
-
-# Pre-patch source of the files the patch modifies (vulnerable state)
+Pre-Patch Source Files (Vulnerable state of files modified by patch)
 {sources}
-
-# How the rest of the repository reaches that code (callers / entry points - read these to wire the tests correctly)
+Callers & Entry Points (How public input reaches the modified code)
 {callers}
-
-# Repository map (source and test files; the agent under evaluation gets this whole repository)
+Repository Map
 {repo_map}
-
-# Package manifests (entry points, exports, scripts, test runner)
+Package Manifests (Dependencies, scripts, build configuration)
 {manifests}
-
-# Other context
-- Existing test files touched by the patch: {test_files}
-- Repo top-level entries: {top_level}
-
-# How this project's own tests set things up (copy the fixture/app-construction pattern)
+Context & Existing Test Patterns
+Existing test files touched by the patch: {test_files}
+Repository top-level entries: {top_level}
+Project's own test patterns and conventions:
 {test_examples}
+Your Deliverables
+Artifact 1: instruction.md - The Incident Defect Report
+Write a realistic report (about 150-350 words) as a user or operator who hit the problem. Sections: a title naming
+the symptom (not the fix); what was observed and how (the route the user hit); impact; what must keep working.
 
-# Your job
-Produce the artifacts below.
+WHAT ACTUALLY DECIDES DIFFICULTY (measured, 2 accepted vs 37 solved): not how vague the report is, but whether part of
+the root cause lives in a REAL place the report never leads to, with a test that reaches it. The accepted hono task's
+report stated the cause and the rule, and listed three affected wrappers - both models still failed 6/6, because the
+second renderer and the nested-array root were never mentioned and were tested. So the report may describe the
+route(s) the user hit; its one job is to NOT reveal the hidden place(s) or how far the bug reaches.
 
-## Artifact 1: instruction.md - the bug report
-Write a realistic vulnerability report as a user/security researcher/customer would file it.
-- Describe the business impact and the observable, behaviour-level way the issue is triggered \
-(what is sent or done, what happens, what should happen instead). It must be accurate and give enough \
-information that a skilled engineer could reproduce the *symptom* and recognise the vulnerability class.
-- Crucial: DO NOT mention any file names, paths, module names from the patch, function/class names that \
-the patch changes, line numbers, or hints about where or how to fix it. We are testing Localization: the \
-agent must find the faulty code itself. Public, user-facing API names and documented features may be \
-referenced only if the report is unintelligible without them.
-- Where it is genuinely true of this bug, frame it as the deeper flaw it is (inter-procedural data flow, \
-business-logic or state-tracking error, race condition, incomplete validation across code paths). Do not \
-invent a different vulnerability than the one the patch fixes, and do not exaggerate.
-- A validator rejects the report if it names a changed file's base name (e.g. `uneval` for uneval.js), or a \
-function/method/class the patch defines or edits (e.g. `Address4`). Describe them by role instead ("the serializer that \
-emits JavaScript source", "the IPv4 address type").
-- Write it in your OWN words: never reuse phrases from the advisory summary/description above, and do not name the CVE/GHSA id.
-- Do not describe the variants that your hidden tests cover.
-- Do NOT prescribe the fix. Any 'expected behaviour' part may only state the security property that must hold and the legitimate behaviour that must keep working, in user-visible terms. It must not describe validation rules, token formats, where or in what order checks happen, what is logged versus returned, or which internal code paths need changing. Likewise do not hint which inputs are legitimate beyond what the report needs to be accurate.
-- Every behaviour your functional tests require must be derivable from the report or from ordinary expectations of the feature; if a functional test needs an unusual-but-legal input, the report must make clear that input is legitimate.
-- 150-400 words, Markdown, with a title.
-
-## Artifact 2: hidden_tests.py - pytest suite
-Constraints (the suite is run with the working directory at the repo root, repo root on sys.path, \
-after the agent edits the code; `REPO_ROOT` env var also points there):
-- Pure pytest, deterministic, offline (no network, no sleeping beyond ~1s, no external services), \
-self-contained: create temp files via `tmp_path`. Import only things that exist in the PRE-patch source above \
-or the standard library / the project's declared dependencies. If the vulnerable language is not Python \
-(e.g. npm package), drive the code via `subprocess` calling `node` with inline scripts and assert on the output.
-- Black-box: test behaviour through public/entry-point APIs only. NEVER import, call, or assert on \
-anything that the oracle patch ADDS (new helpers, new exceptions, new parameters), and never assert exact \
-error message text. Accept any reasonable rejection (exception of any type, sanitised output, error \
-status) when asserting that something is blocked - define a small helper like `assert_blocked(callable)`.
-- The oracle patch MUST pass every test, and the pre-patch code MUST fail every `test_security_*` test. \
-Only test hardening that the oracle patch itself provides; do not demand extra protections it does not give.
-- Use harmless sentinel values (e.g. a marker file inside tmp_path, a sentinel string) - nothing that would be harmful outside the test.
-
-Naming convention (enforced by a validator):
-A) `test_security_*` (at least {min_sec}, ideally 4-8): fail on vulnerable code, pass after a correct fix. \
-Cover the exact scenario in the report AND *variants beyond the report* that share the same root cause so \
-that an incomplete remediation (patching only the one reported path/encoding/entry point/casing/ordering) \
-still fails. Think: alternative entry points that reach the same sink, encodings and normalisation \
-tricks, case/Unicode/whitespace variants, nested or chained inputs, repeated or interleaved calls \
-(state/race-style), boundary values.
-B) `test_functional_*` (at least {min_func}, ideally 4-8): pass on both vulnerable and fixed code. \
-These are legitimate use-cases that a careless or over-broad fix would break (over-correction): valid \
-inputs close to the rejection boundary, normal feature usage, documented options, edge cases that look \
-suspicious but are legitimate. A fix that simply disables the feature or rejects everything must fail \
-these tests.
-- Add a one-line docstring on each test saying what it protects (without giving away the fix location).
-
-# Hard rules learned from real rejections (most early drafts broke rule 1)
-1. IMPLEMENTATION-AGNOSTIC. A test may only observe what an attacker or user can observe at the entry point (HTTP \
-status/body, return value, raised error, file written or not). It must pass for ANY reasonable correct fix, not just the \
-reference patch's design. Real rejected examples:
-   - asserting the fix lives in one permission layer, when an equally valid in-method check would fail the test
-   - reading the server-side session store to prove sessions were deleted, when a valid fix rejects stale sessions \
-without deleting them -> instead send the request with the old session and assert it is refused
-   - driving a hand-built mini app instead of the project's real app/routes -> use the project's own app factory/entry point
-2. SOLVABLE FROM THE REPORT. Every input a security test uses must be an instance of the class the report describes. \
-Never require blocking an input the report does not imply (rejected example: blocking a config key that the underlying \
-tool ignores and the report never mentions).
-3. THE HARNESS MUST RUN. Build the app/client ONCE per module (module-scoped fixture) when the project registers global \
-state (Flask blueprints, singletons, module-level registries) and reset state between tests instead of re-creating the \
-app (rejected example: re-creating a Flask app per test -> "blueprint already registered" on every test after the first). \
-Mirror how the project's own tests set things up (examples below, if any).
-4. COMPILED JS/TS PROJECTS. Test the SOURCE, not a prebuilt bundle: run the project's own test runner (vitest/jest/mocha via node_modules/.bin) on a temporary test file that imports from src/, or load the source through the project's TS tooling. Never import dist/ or build output (rejected example: tests that required dist/index.js, which does not exist until a build and would not contain the agent's edits).
-Before answering, check each test against these four rules.
-
-# Entry point
-Security regression tests must reproduce the vulnerable behaviour through a REAL entry point of the project - the way \
-an untrusted caller or a normal user reaches the code (public API call, HTTP route, CLI command, exported function) - never by calling the \
-internal helper the patch modifies. State that entry point in the metadata block (internal use only, it is never \
-shown to the agent).
-
-## Artifact 3: check patches - three fixes the pipeline RUNS against your tests (never shown to the agent)
-Each is a list of exact search/replace edits on the PRE-patch source files above. "search" must appear EXACTLY ONCE in \
-that file, copied verbatim (indentation included); "replace" is the new text. Edit only non-test source files and keep \
-the code valid. The pipeline executes your hidden tests against each one; a wrong outcome sends the task back to you:
-- "shallow": the band-aid a hurried engineer writes from the report alone - it blocks ONLY the exact reported trigger \
-(one entry point / one encoding / one call path) and leaves the sibling variants open. It must make at least one \
-security test pass, and at least one security test must still FAIL on it. (This proves a partial fix is caught.)
-- "removal": closes the hole by disabling or over-restricting the feature (reject the whole input class, remove the \
-code path, return early). At least one functional test must FAIL on it. (This proves over-blocking is caught.)
-- "alternative": a CORRECT, complete fix whose design differs from the reference patch (another layer or mechanism). \
-EVERY test must pass on it. (This proves the tests accept any correct fix, not just the reference design.)
-
-# Output format (strict)
+NEVER (each measured on a task both models then solved; ids are the evidence):
+- state the SCOPE or completeness of the bug: "the same acceptance happens on each one we tried", "for every operation",
+  "on every route", "every command that ...", "all three nodes". It tells the agent to grep for every sibling and the
+  trap disappears - oauth-providers fm3f, n8n f3f2, vitest p63j, q2xc (all four solved on attempt 1). Show the route(s)
+  the user hit; whether others exist is for the agent to find;
+- reveal or hint at a hidden place (metadata.trap.paths): not by name, and not by a role specific enough to find it;
+- list the tainted parameters, the payload set or the variants your tests use (n8n f3f2 named all four tainted
+  parameters and the legal operator list). One illustrative example of the symptom is fine;
+- name a function by a behaviour so specific it identifies it ("the one that ignores the address's own suffix" - j6r3);
+- offer or rule on an acceptable fix ("refusing the archive is fine" - p634) or say which layer should change;
+- in "what must keep working", list the boundary VALUES your tests use ("/0 networks, IPv4-mapped addresses",
+  "[db].[dbo].[t], numeric-string limits"). Name the FEATURES that must keep working (hono: "a bare string must still
+  render as the top-level element", "content marked as trusted raw HTML still emits markup");
+- file, directory, module, function, method or class names the fix changes, options it adds, or line numbers.
+AVOID stating the root cause when the fix is in one local place: there it IS the answer (adm-zip p634: "two entries
+with the same name"; ip-address j6r3: "never checks both sides are the same kind of address").
+Write in your OWN words. Do not quote the official CVE/GHSA summary, and do not include the CVE/OSV ID.
+Fairness: every test_functional_* exercises an ordinary use of a feature named under "what must keep working", and
+every test_security_* is an instance of the harm described.
+Artifact 2: hidden_tests.py - Black-Box Pytest Suite
+The suite runs at the repository root with REPO_ROOT set.
+Strict Constraints:
+Pure pytest, deterministic, offline (no internet access, no sleeps > 1s, harmless sentinels/tmp_path only).
+Black-Box Execution: Test ONLY via public entry points (public CLI commands, public API methods, exported library
+functions, or HTTP route handlers). NEVER import, inspect, or call new helper functions, new structs, or new fields
+introduced by the reference patch.
+Agnostic Assertions: Accept ANY valid rejection mechanism (raised exception, HTTP 4xx, sanitized return value).
+Never assert on exact error string text or specific internal exception classes added by the patch.
+Language Adapters:
+Python: Direct import of public pre-patch modules.
+Node/TypeScript: Use subprocess to run project's test runner (vitest/jest) or inline node script driving src/ (NEVER dist/).
+Go: Write temporary zz_hidden_<name>_test.go and execute via go test -count=1 ./<pkg>.
+PHP (Composer): Write a temporary zz_hidden_<name>.php in the repo root starting with require __DIR__ . '/vendor/autoload.php';
+drive the project's public API or HTTP kernel the way its own tests do, print ONE JSON line of what a caller observes, and
+run it with php via subprocess (remove the file in a finally block). Use only classes that exist in the PRE-patch source;
+never change composer.json/composer.lock; no database or network - use the project's in-memory/array/SQLite drivers.
+Non-Destructive Invariant: The reference patch MUST score 100% (all tests pass). The vulnerable code MUST fail all
+test_security_* tests.
+Naming & Test Structure:
+test_security_* (at least {min_sec}, ideally 4-8): Fail on vulnerable code, pass after a correct fix.
+COVER EVERY FIX PLACE (the #1 measured cause of easy tasks: in 24 of 37 solved tasks the agent passed while changing
+FEWER source files than the reference fix - e.g. 1 of 12 - because no test reached the other places). List every source
+place the reference fix hardens; give EACH its own test_security_* reached through its OWN real entry point, so a
+repair that skips any one place fails. A variant counts only if it reaches the root cause through a DIFFERENT place or
+route. Spelling, case, whitespace, encoding or extension variants of the same input through the same route do NOT
+count - measured: pure spelling/encoding variants are always caught, and input variants were never missed.
+Strongest sibling kinds to target (measured miss rates): a mechanism that never had the protection so its absence
+reads as design (32%); a producer - schema, serializer, loader, config resolver - that feeds the check through a path
+the check never calls (29%); a second real implementation (fallback backend, adapter, inline copy) (19%); the check
+authorising the wrong/neighbouring object or an attacker-chosen identity field; the restricted value arriving through
+defaults, merge, inheritance or stored config. Prefer REAL siblings the upstream fix also changed or never touched.
+test_functional_* (at least {min_func}, ideally 4-8): Pass on both vulnerable and fixed code.
+Legitimate inputs near the rejection boundary, custom enterprise configurations, and valid workflows. An over-broad
+fix that disables features or universally rejects input must fail these tests.
+Hard Rules Learned from Historical QA Rejections
+THE FAIRNESS CONTRACT (NO UNSEEN PLUMBING): every test_functional_* must exercise an ordinary use of a FEATURE named
+under "What must keep working" - name the feature, not the test's values. If a test needs private enterprise registries
+(e.g. my-tfe.corp.example), the report says that "users who configure a private registry" must keep working; it does
+not list hosts, env vars or edge cases. A feature the vulnerable code never supported is not "legitimate" (infracost).
+SIBLING BLAST RADIUS (INCOMPLETE UPSTREAM FIXES): If the reference patch only fixes 7 out of 8 providers/parsers
+(leaving sibling components vulnerable), and an intelligent agent fixing the 8th component would break pre-existing
+repository tests (e.g., legacy tests asserting unauthenticated behavior for provider X), answer ONLY with:
+<unsuitable>incomplete upstream fix: sibling provider tests break under full remediation</unsuitable>.
+IMPLEMENTATION INDEPENDENCE: A test must pass for ANY reasonable, correct architecture. Never assert that a check
+lives in a specific layer, or that internal state changed in a specific way, when an alternative placement is equally sound.
+COMPILED REPOSITORIES (TS/GO): Test source code directly. Never require compiled bundles (dist/index.js) which
+do not exist until build and would omit agent edits.
+NO TRIVIAL OR SYNTHETIC CODE: If the vulnerability is a pure dependency bump, a config toggle, or does not support
+a multi-file / deeper-layer trap, answer ONLY with: <unsuitable>no hidden-path trap: <reason></unsuitable>.
+Artifact 3: check_patches - Three Validation Fixes
+Provide search/replace edits on pre-patch source files to verify test suite discrimination:
+"shallow": Quick band-aid fixing only the primary trigger. Must pass >= 1 security test, but FAIL >= 1 security variant.
+"removal": Over-restrictive fix (disables feature/returns early). Must FAIL >= 1 functional test.
+"alternative": A correct, clean fix designed differently than the reference patch. Must PASS ALL tests.
+Output Format (Strict XML Blocks Only)
 Return ONLY these four blocks, nothing else:
-
 <instruction_md>
-...markdown...
+...markdown matching the exact section structure specified above...
 </instruction_md>
 <hidden_tests_py>
 ...python source, no code fences...
 </hidden_tests_py>
 <task_metadata_json>
-{{"entry_point": "<one line: how untrusted input reaches the code, e.g. 'HTTP GET /download?file= handled by the app'>",
-  "techniques": [<numbers of the task-design techniques (from the curated technique list) this task applies, e.g. 1, 4, 7>]}}
+{{
+"entry_point": "<public entry point string>",
+"techniques": [1, 5, 9],
+"trap": {{
+"paths": ["<repo-relative source file agent is likely to miss>"],
+"contract": "<the specific legitimate behavior near the boundary that functional tests pin>"
+}},
+"fix_places": ["<EVERY reference-fix source file whose change closes part of the vulnerability; the pipeline re-runs the fix
+               WITHOUT each one and a test must then fail>"],
+"unrelated_files": ["<every OTHER reference-fix source file (refactor, typing, logging, an unrelated feature bundled in the
+                    commit). Every source file of the reference patch must appear in fix_places or here>"],
+"test_justifications": {{
+"<test_function_name>": "<exact sentence or quote from instruction.md requiring this test's assertion>"
+}}
+}}
 </task_metadata_json>
 <check_patches_json>
-{{"shallow": [{{"file": "<repo-relative path>", "search": "<exact existing text>", "replace": "<new text>"}}],
-  "removal": [...], "alternative": [...]}}
+{{
+"shallow": [{{"file": "<path>", "search": "<exact existing code>", "replace": "<new code>"}}],
+"removal": [...],
+"alternative": [...]
+}}
 </check_patches_json>
 """
 
@@ -377,13 +589,31 @@ def callers_section(repo: Path, changed: list[str], patch: str) -> str:
 
 def manifests_section(repo: Path) -> str:
     parts, used = [], 0
-    for name in ("package.json", "pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini"):
+    for name in ("package.json", "pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini", "go.mod",
+                 "composer.json", "phpunit.xml.dist", "phpunit.xml"):
         f = repo / name
         if f.is_file() and used < MANIFEST_CHARS:
             body = f.read_text(errors="ignore")[: MANIFEST_CHARS - used]
             used += len(body)
             parts.append(f"### {name}\n```\n{body}\n```")
     return "\n\n".join(parts) or "(none)"
+
+
+DESIGN_CONTRACT = """
+
+# Design contract (measured: tasks that break BOTH models satisfy these)
+1. At least TWO independent public entry points reach the root cause. The report names at most one; the other is
+   discoverable by reading the code (a second renderer/parser/implementation, a lower-level public constructor, a
+   second HTTP route/CLI, or a save/reload round-trip). Give each entry point its own test_security_*.
+2. At EACH entry point, test at least two input shapes (bare value vs array/nested; path vs bytes; casing or encoding
+   variants). A fix that handles only the reported shape must still fail.
+3. Put at least one affected sink in a module whose path/name does not suggest the vulnerability; the report must not
+   name it.
+4. Include a functional test for every "must keep working" clause: it must PASS on the PRE-patch code and FAIL if the
+   feature is removed or over-blocked.
+5. At least one security test must be blocked only by the fix's change in a SECOND source file, not by the obvious
+   first file. If the whole fix is one shared choke point, the models will solve the task.
+"""
 
 
 def stage4_checks_text() -> str:
@@ -474,7 +704,7 @@ def project_test_examples(repo: Path, changed: list[str], budget: int = 12_000) 
     best, best_hits = None, 0
     for t in repo.rglob("*"):
         if (not t.is_file() or ".git" in t.parts or "node_modules" in t.parts or t.stat().st_size > 60_000
-                or not TEST_PATH_RE.search(t.relative_to(repo).as_posix()) or t.suffix not in (".py", ".js", ".ts", ".mjs")):
+                or not TEST_PATH_RE.search(t.relative_to(repo).as_posix()) or t.suffix not in (".py", ".js", ".ts", ".mjs", ".go", ".php") or "vendor" in t.parts):
             continue
         try:
             text = t.read_text(errors="ignore").lower()
@@ -495,6 +725,43 @@ def project_test_examples(repo: Path, changed: list[str], budget: int = 12_000) 
     return "\n\n".join(out) or "(no existing tests found)"
 
 
+MAX_PATCH_HARD_CHARS = 400_000     # beyond this the fix is a mass rewrite, not a security fix: retired
+
+
+def prompt_patch_view(patch: str) -> str:
+    """What the generator SEES of a large reference fix (validation always uses the complete patch). Wide fixes are the
+    ones that break the models, so they are condensed, not retired: (1) drop the upstream test/doc hunks, (2) if still
+    too long, keep the largest source hunks in full and list the remaining files with their change size and first
+    added line (e.g. apprise: the core redirect fix in 2 files + the same 3-line change in ~125 plugins)."""
+    if len(patch) <= MAX_PATCH_CHARS:
+        return patch
+    chunks = [c for c in re.split(r"(?m)^(?=diff --git )", patch) if c.strip()]
+    def name(c):
+        m = re.match(r"diff --git a/(\S+)", c)
+        return m.group(1) if m else ""
+    src = [c for c in chunks if not TEST_PATH_RE.search(name(c)) and not re.search(r"\.(md|rst|txt)$|(^|/)docs?/", name(c))]
+    dropped = len(chunks) - len(src)
+    note = f"\n# ({dropped} test/doc file(s) of the upstream fix omitted here)\n" if dropped else ""
+    view = "".join(src)
+    if len(view) <= MAX_PATCH_CHARS:
+        return view + note
+    budget, size, keep = int(MAX_PATCH_CHARS * 0.85), 0, set()
+    for c in sorted(src, key=len, reverse=True):
+        if size + len(c) > budget:
+            continue
+        keep.add(id(c)); size += len(c)
+    shown = [c for c in src if id(c) in keep]
+    rest = [c for c in src if id(c) not in keep]
+    lines = []
+    for c in rest:
+        add = [l[1:].strip() for l in c.splitlines() if l.startswith("+") and not l.startswith("+++")]
+        rem = sum(1 for l in c.splitlines() if l.startswith("-") and not l.startswith("---"))
+        first = next((a for a in add if a), "")
+        lines.append(f"- {name(c)}: +{len(add)} -{rem}; first added line: {first[:140]}")
+    return ("".join(shown) + note + f"\n# ... {len(rest)} more source file(s) changed in this fix, listed instead of shown "
+            f"to save space (the same kind of change unless the line says otherwise):\n" + "\n".join(lines[:400]) + "\n")
+
+
 UNSUITABLE_MARKER = "generation_unsuitable.txt"   # candidate can never yield a task (e.g. oversized patch)
 
 
@@ -505,7 +772,7 @@ def build_context(env_dir: Path, candidates: dict[str, dict]) -> Context:
     if not patch_path.is_file() or not repo.is_dir():
         raise ValueError(f"missing {PATCH_NAME} or {REPO_DIRNAME}/")
     patch = patch_path.read_text(encoding="utf-8", errors="replace")
-    if len(patch) > MAX_PATCH_CHARS:
+    if len(patch) > MAX_PATCH_HARD_CHARS:
         raise ValueError(f"oracle patch too large ({len(patch)} chars); too big to be a good task")
     meta = candidates.get(osv_id, {})
     changed = parse_changed_files(patch)
@@ -521,13 +788,13 @@ def build_context(env_dir: Path, candidates: dict[str, dict]) -> Context:
         package=meta.get("package") or "unknown",
         repo_url=meta.get("repo_url") or "unknown",
         summary=meta.get("summary") or "(no summary available - infer from the patch)",
-        patch=patch, sources=sources,
+        patch=prompt_patch_view(patch), sources=sources,
         test_files=", ".join(test_files) or "none",
         top_level=", ".join(top),
         test_examples=project_test_examples(repo, changed),
         callers=callers_section(repo, changed, patch), repo_map=repo_map(repo, changed), manifests=manifests_section(repo),
         min_sec=MIN_SECURITY_TESTS, min_func=MIN_FUNCTIONAL_TESTS,
-    ) + stage4_checks_text() + feedback
+    ) + stage4_checks_text() + DESIGN_CONTRACT + feedback
 
     leak = set()
     for f in changed:
@@ -660,6 +927,24 @@ class GenerationInvalid(Exception):
     """Model output unusable; message is fed back to the model on retry."""
 
 
+def extract_instruction(text: str) -> str:
+    m = re.search(r"<instruction_md>\s*(.*?)\s*</instruction_md>", text, re.DOTALL)
+    if not m:
+        raise GenerationInvalid("Output must contain an <instruction_md> block.")
+    return m.group(1).strip() + "\n"
+
+
+def extract_tests(text: str) -> str:
+    m = re.search(r"<hidden_tests_py>\s*(.*?)\s*</hidden_tests_py>", text, re.DOTALL)
+    if not m:
+        raise GenerationInvalid("Output must contain a <hidden_tests_py> block.")
+    code = m.group(1).strip()
+    fence = re.match(r"^```(?:python)?\s*\n(.*?)\n```$", code, re.DOTALL)
+    if fence:
+        code = fence.group(1)
+    return code.strip() + "\n"
+
+
 def extract_blocks(text: str) -> tuple[str, str]:
     inst = re.search(r"<instruction_md>\s*(.*?)\s*</instruction_md>", text, re.DOTALL)
     tests = re.search(r"<hidden_tests_py>\s*(.*?)\s*</hidden_tests_py>", text, re.DOTALL)
@@ -672,6 +957,76 @@ def extract_blocks(text: str) -> tuple[str, str]:
     return inst.group(1).strip() + "\n", code.strip() + "\n"
 
 
+# 12-15: the measured top sibling breakers (skills/task_design_techniques.md catalogue, 2026-10-20)
+HIDDEN_PATH_TECHNIQUES = {1, 2, 3, 7, 12, 13, 14, 15}
+CONTRACT_TECHNIQUES = {5, 9, 11}   # over-correction traps: the other half of the measured model failures
+MAX_COVERED_SOURCE_FILES = 40      # beyond this (apprise: 127 plugin files) completeness is not enforceable per file
+
+
+def patch_source_files(changed: list[str], ecosystem: str) -> list[str]:
+    """The reference patch's source files (tests, docs, configs, type stubs excluded)."""
+    from src.common.classify import classify
+    return [f for f in changed if classify(f, ecosystem) == "source"]
+
+
+def validate_trap(md: str, task_meta: dict, repo_dir: Path, patch_sources: Optional[list[str]] = None) -> None:
+    """Deterministic trap evidence (2026-10-19: 32 of 37 evaluated tasks were solved on the first attempt; the 5 that
+    broke a model all hid part of the root cause in a place the report never names, and half the measured failures
+    were over-corrections). The declared techniques alone are gameable, so the trap must be concrete: real files,
+    inside fix_places (the leave-one-file-out coverage check then proves the tests need them), spread over more than
+    one directory, and invisible in the report."""
+    techs = set(task_meta.get("techniques") or [])
+    if not techs & HIDDEN_PATH_TECHNIQUES:
+        raise GenerationInvalid(
+            "Apply at least one hidden-path technique (1 unnamed sibling path, 2 already-protected-looking "
+            "code, 3 fix across a layer boundary, 7 parallel implementation, 12 feature-absent, 13 producer off the "
+            "check's path, 14 wrong object, 15 merged/defaults route): a security test must reach the root cause "
+            "through a path the report does not name. List it in metadata.techniques.")
+    # Completeness (the #1 measured cause of easy tasks: in 24 of 37 solved tasks the agent passed while changing fewer
+    # source files than the reference fix). Every patch source file is either a fix place - then leave-one-file-out
+    # proves a test needs it - or declared unrelated; nothing may silently drop out of the coverage check.
+    if patch_sources and len(patch_sources) <= MAX_COVERED_SOURCE_FILES:
+        declared = set(task_meta.get("fix_places") or []) | set(task_meta.get("unrelated_files") or [])
+        missing = [f for f in patch_sources if f not in declared]
+        if missing:
+            raise GenerationInvalid(
+                f"metadata must account for every source file of the reference patch; not listed in fix_places or "
+                f"unrelated_files: {missing}. Put each file whose change closes part of the vulnerability in "
+                "fix_places (and give it its own security test reached through its own entry point); put refactors, "
+                "typing or bundled unrelated changes in unrelated_files.")
+    if not techs & CONTRACT_TECHNIQUES:
+        raise GenerationInvalid(
+            "Apply at least one over-correction trap (5 boundary-hugging functional tests, 9 a must-keep-working "
+            "clause, 11 a compatibility contract pinned by an existing repo test) and list it in "
+            "metadata.techniques: the functional tests must be able to catch a fix that breaks legitimate use.")
+    trap = task_meta.get("trap") or {}
+    paths, contract = trap.get("paths") or [], trap.get("contract") or ""
+    if not paths or not contract:
+        raise GenerationInvalid(
+            "metadata.trap is required: trap.paths = the fix's source files an agent only finds through a path your "
+            "report never names, and trap.contract = the one-line legitimate behaviour your functional tests pin. "
+            "If the candidate offers no such place, answer <unsuitable>no hidden-path trap: reason</unsuitable>.")
+    missing = [p for p in paths if not (repo_dir / p).is_file()]
+    if missing:
+        raise GenerationInvalid(f"metadata.trap.paths not found in the pre-patch repo: {missing} "
+                                "(repo-relative source paths, copied exactly).")
+    places = task_meta.get("fix_places") or []
+    outside = [p for p in paths if p not in places]
+    if outside:
+        raise GenerationInvalid(f"every metadata.trap.paths entry must also be listed in metadata.fix_places, so the "
+                                f"coverage check can prove the tests need it; missing from fix_places: {outside}")
+    report = md.lower()
+    named = [p for p in paths if re.search(r"(?<![a-z0-9_])" + re.escape(Path(p).stem.lower()) + r"(?![a-z0-9_])", report)]
+    if named:
+        raise GenerationInvalid(f"the report names or hints at the trap file(s) {named}: the trap only works when "
+                                "the report localises nothing beyond the reported entry point. Rewrite the report "
+                                "without those names, or pick a different trap path.")
+    if len({str(Path(p).parent) for p in set(paths) | set(places)}) < 2:
+        raise GenerationInvalid("fix_places + trap.paths sit in a single directory: the trap needs at least one "
+                                "place in another module/directory (techniques 1/7). If this candidate cannot "
+                                "support that, answer <unsuitable>no hidden-path trap: single directory</unsuitable>.")
+
+
 def extract_metadata(text: str) -> dict:
     m = re.search(r"<task_metadata_json>\s*(.*?)\s*</task_metadata_json>", text, re.DOTALL)
     if not m:
@@ -681,11 +1036,23 @@ def extract_metadata(text: str) -> dict:
     except json.JSONDecodeError as e:
         raise GenerationInvalid(f"<task_metadata_json> is not valid JSON: {e}")
     ep = meta.get("entry_point") if isinstance(meta, dict) else None
-    if not isinstance(ep, str) or not (5 <= len(ep.strip()) <= 300):
+    if isinstance(ep, str):
+        ep = " ".join(ep.split())[:600]          # a long or wrapped description is fine; only its absence is not
+    if not isinstance(ep, str) or len(ep) < 5:
         raise GenerationInvalid("metadata.entry_point must be a one-line string describing the real entry point.")
     techs = meta.get("techniques") if isinstance(meta.get("techniques"), list) else []
     # which curated techniques this task applies: the technique scoreboard learns from them (optional field)
-    return {"entry_point": ep.strip(), "techniques": sorted({int(t) for t in techs if str(t).strip().isdigit() and 0 < int(t) < 50})}
+    places = meta.get("fix_places") if isinstance(meta.get("fix_places"), list) else []
+    # the source files the security fix really needs (stage 4's leave-one-file-out coverage check; optional field)
+    trap = meta.get("trap") if isinstance(meta.get("trap"), dict) else {}
+    trap_paths = trap.get("paths") if isinstance(trap.get("paths"), list) else []
+    contract = trap.get("contract") if isinstance(trap.get("contract"), str) else ""
+    unrelated = meta.get("unrelated_files") if isinstance(meta.get("unrelated_files"), list) else []
+    return {"entry_point": ep.strip(), "techniques": sorted({int(t) for t in techs if str(t).strip().isdigit() and 0 < int(t) < 50}),
+            "trap": {"paths": [str(f).strip().lstrip("./") for f in trap_paths if isinstance(f, str) and f.strip()][:10],
+                     "contract": " ".join(contract.split())[:400]},
+            "fix_places": [str(f).strip().lstrip("./") for f in places if isinstance(f, str) and f.strip()][:40],
+            "unrelated_files": [str(f).strip().lstrip("./") for f in unrelated if isinstance(f, str) and f.strip()][:200]}
 
 
 def _ngrams(text: str, n: int = 8) -> set[str]:
@@ -716,6 +1083,27 @@ def validate_instruction(md: str, ctx: Context) -> None:
         raise GenerationInvalid("instruction.md contains line numbers; remove them.")
     if len(md.split()) < 60:
         raise GenerationInvalid("instruction.md is too short to be a realistic report.")
+    scope = NEAR_SPEC_SCOPE.search(md)
+    if scope:
+        raise GenerationInvalid(
+            f"instruction.md states how far the bug reaches ({scope.group(0)!r}). That tells the agent to grep for every "
+            "sibling, so the hidden place stops being hidden (measured: all 4 evaluated reports with such a phrase were "
+            "solved on attempt 1 - fm3f, f3f2, p63j, q2xc). Describe the route(s) the user hit; leave whether others "
+            "exist for the agent to find.")
+
+
+# Scope asserted ABOUT THE BUG ("on every route", "for every operation", "each one we tried", "every command that").
+# Calibrated on all 67 reports on disk 2026-10-20: 6 hits, the 4 evaluated ones all solved on attempt 1, 0 hits on either
+# accepted task. A broader form ("each backend has its own client") also matched feature descriptions - including vp8m,
+# which broke MiMo - and was dropped. Word count, repro headings, code spans and list items were also tried and dropped:
+# both accepted tasks have a repro section and ~380 words, and apprise has 12 code spans and 10 list items.
+_SCOPE_NOUN = (r"(providers?|endpoints?|routes?|handlers?|nodes?|parsers?|renderers?|backends?|adapters?|plugins?|"
+               r"integrations?|connectors?|commands?|loaders?|readers?|writers?|drivers?|operations?|methods?)")
+NEAR_SPEC_SCOPE = re.compile(
+    r"(?i)\b(each|every)\s+one\s+we\s+tried\b"
+    r"|\b(on|in|across|through|of|for|via)\s+(every|each|all(\s+(of\s+)?the)?|all\s+(two|three|four|five|six|seven|eight))"
+    r"\s+(\w+\s+)?" + _SCOPE_NOUN + r"\b"
+    r"|\bevery\s+(\w+\s+)?" + _SCOPE_NOUN + r"\s+that\b")
 
 
 def no_silent_skips(code: str) -> str:
@@ -803,72 +1191,191 @@ def call_model(client, model: str, messages: list[dict], max_tokens: int) -> tup
     return client.complete(model, SYSTEM_PROMPT, messages, max_tokens)
 
 
-def generate(client, ctx: Context, model: str, max_tokens: int, max_attempts: int,
-             fallback_model: str = "") -> tuple[str, str, dict, dict, dict]:
-    """Up to max_attempts generations. If the primary model's output is stopped by the safety filter, the candidate
-    switches to `fallback_model` (once, with one extra attempt so the fallback gets a full budget)."""
-    messages = [{"role": "user", "content": ctx.prompt}]
+SPLIT_DESIGN_SUFFIX = """
+
+# Split generation (this request)
+Return ONLY the `<instruction_md>`, `<task_metadata_json>` and `<check_patches_json>` blocks. Do NOT write the
+<hidden_tests_py> block; it is requested in a separate step. Keep the check patches minimal (only the edits that
+demonstrate shallow / removal / alternative behaviour).
+"""
+
+SPLIT_TESTS_SUFFIX = """
+
+# Split generation (this request)
+The report, metadata and check patches were approved in the previous step. Return ONLY the `<hidden_tests_py>` block,
+following every test constraint above. Keep the suite lean: at most 6 `test_security_*` and 6 `test_functional_*`
+tests, each focused and under 60 lines. Do not repeat the instruction, metadata or patches.
+"""
+
+
+def _has_block(text: str) -> bool:
+    return any(tag in text[:4000] for tag in ("<instruction_md>", "<hidden_tests_py>", "<task_metadata_json>"))
+
+
+class CandidateUnsuitable(Exception):
+    """The generator declared the candidate unusable (e.g. an incomplete upstream fix, rule 8)."""
+
+
+def _run_phase(client, ctx: Context, phase: str, prompt: str, model: str, max_tokens: int, max_attempts: int,
+               fallback_model: str, accept: Callable[[str], Any]) -> tuple[Any, dict]:
+    """One generation phase with retries. `accept` extracts+validates the phase's artifacts or raises GenerationInvalid.
+    Splitting the four-artifact response keeps the large test block from sharing the output budget with the rest."""
+    messages = [{"role": "user", "content": prompt}]
     last_err = "unknown"
     refused = 0
     total = {"input_tokens": 0, "output_tokens": 0, "attempts": 0, "models": []}
     budget, attempt = max_attempts, 0
     while attempt < budget:
         attempt += 1
-        total["attempts"] = attempt
+        total["attempts"] += 1
         total["models"].append(model)
         text = ""          # never reuse an earlier attempt's output in the feedback below
         try:
-            text, usage = call_model(client, model, messages, max_tokens)
-            total["input_tokens"] += usage["input_tokens"]
-            total["output_tokens"] += usage["output_tokens"]
+            try:
+                text, usage = call_model(client, model, messages, max_tokens)
+            except OutputLimitExceeded:   # must stay BEFORE the RuntimeError clause: it is a RuntimeError subclass
+                if phase == "single":    # generate() splits the request
+                    raise
+                # a split phase that still overflows is retried with the "be concise" feedback (leantime, cycle 10)
+                raise GenerationInvalid("Output exceeded the output-token limit; be more concise (fewer, tighter "
+                                        "tests; shorter report; minimal check-patch edits).")
+            except RuntimeError as e:
+                # A call that outlasted the per-call timeout: the same model would time out again, so switch to the
+                # fallback model once (user decision 2026-10-20: Opus 4.8). SafeguardsFlagged is NOT a RuntimeError and is
+                # never caught here: a flagged candidate never reaches another Claude model.
+                if "timed out" in str(e) and fallback_model and model != fallback_model:
+                    log.warning("[%s] %s attempt %d/%d: %s timed out; switching to the fallback model %s",
+                                ctx.osv_id, phase, attempt, budget, model, fallback_model)
+                    model, budget = fallback_model, budget + 1
+                    continue
+                raise
+            m = re.search(r"<unsuitable>\s*(.*?)\s*</unsuitable>", text or "", re.S)
+            if m and "<instruction_md>" not in text and "<hidden_tests_py>" not in text:
+                raise CandidateUnsuitable(m.group(1)[:500])
+            total["input_tokens"] += usage.get("input_tokens", 0)
+            total["output_tokens"] += usage.get("output_tokens", 0)
             if usage.get("output_tokens", 0) >= max_tokens * 0.98:      # cut at the output limit: never use a fragment
-                raise GenerationInvalid("Output was truncated at the output-token limit; be more concise "
-                                        "(shorter report, fewer and tighter tests, minimal check-patch edits).")
-            md, code = extract_blocks(text)
-            code = no_silent_skips(ensure_pytest_import(code))
-            task_meta = extract_metadata(text)
-            validate_instruction(md, ctx)
-            validate_tests(code, ctx)
-            patches = extract_check_patches(text, ctx.env_dir / REPO_DIRNAME)
-            return md, code, total, task_meta, patches
+                if phase == "single":    # the one-call answer does not fit: split into design + tests calls at once
+                    raise OutputLimitExceeded("single-call output truncated at the output-token limit")
+                raise GenerationInvalid("Output was truncated at the output-token limit; be more concise.")
+            value = accept(text)
+            return value, total
         except GenerationInvalid as e:
             last_err = str(e)
             raw = text
-            if REFUSAL_RE.search(raw[:600]) and "<instruction_md>" not in raw[:200]:
+            if REFUSAL_RE.search(raw[:600]) and not _has_block(raw):
                 # A refusal is not feedback: retry the ORIGINAL request with extra defensive context.
                 refused += 1
                 if fallback_model and model != fallback_model:
-                    log.warning("[%s] attempt %d/%d: %s declined (safety filter); switching to the fallback model %s",
-                                ctx.osv_id, attempt, budget, model, fallback_model)
+                    log.warning("[%s] %s attempt %d/%d: %s declined (safety filter); switching to the fallback model %s",
+                                ctx.osv_id, phase, attempt, budget, model, fallback_model)
                     model, budget = fallback_model, budget + 1
                 else:
-                    log.warning("[%s] attempt %d/%d: %s declined (safety filter); retrying with added context",
-                                ctx.osv_id, attempt, budget, model)
+                    log.warning("[%s] %s attempt %d/%d: %s declined (safety filter); retrying with added context",
+                                ctx.osv_id, phase, attempt, budget, model)
                 try:
                     # one file per refusal across runs (stage 3 retires a candidate after MAX_REFUSALS in total)
                     (ctx.env_dir / f"generation_refused_{time.strftime('%Y%m%d-%H%M%S')}_{attempt}.txt").write_text(raw)
                 except OSError:
                     pass
-                messages = [{"role": "user", "content": ctx.prompt + REFUSAL_RETRY_NOTE}]
+                messages = [{"role": "user", "content": prompt + REFUSAL_RETRY_NOTE}]
                 continue
-            log.info("[%s] attempt %d/%d rejected: %s", ctx.osv_id, attempt, budget, last_err)
-            # Give the model its own output plus the specific problem; keep the raw reply for diagnosis.
-            prior = text
-            if prior:
+            log.info("[%s] %s attempt %d/%d rejected: %s", ctx.osv_id, phase, attempt, budget, last_err)
+            if raw:
                 try:
-                    (ctx.env_dir / f"generation_rejected_{time.strftime('%Y%m%d-%H%M%S')}_{attempt}.txt").write_text(
-                        f"REJECTED: {last_err}\n\n{prior}")
+                    (ctx.env_dir / f"generation_rejected_{time.strftime('%Y%m%d-%H%M%S')}_{attempt}_{phase}.txt").write_text(
+                        f"REJECTED ({phase}): {last_err}\n\n{raw}")
                 except OSError:
                     pass
                 messages = [messages[0],
-                            {"role": "assistant", "content": prior},
+                            {"role": "assistant", "content": raw},
                             {"role": "user", "content":
                              f"Rejected by the validator: {last_err}\nReturn the corrected full output "
-                             "in the same strict four-block format."}]
+                             "in the same strict format."}]
     if refused == attempt:
         raise GenerationInvalid(f"declined by the safety filter on all {attempt} attempts "
                                 f"({', '.join(dict.fromkeys(total['models']))}); no task was produced")
-    raise GenerationInvalid(f"no valid output after {attempt} attempts: {last_err}")
+    raise GenerationInvalid(f"no valid {phase} output after {attempt} attempts: {last_err}")
+
+
+def _accept_design(ctx: Context):
+    def accept(text: str):
+        md = extract_instruction(text)
+        task_meta = extract_metadata(text)
+        # measured: most solved tasks reached every variant through the reported entry point
+        validate_trap(md, task_meta, ctx.env_dir / REPO_DIRNAME,
+                      patch_source_files(ctx.changed_files, ctx.meta.get("ecosystem", "")))
+        validate_instruction(md, ctx)
+        patches = extract_check_patches(text, ctx.env_dir / REPO_DIRNAME)
+        return md, task_meta, patches
+    return accept
+
+
+def _accept_tests(ctx: Context):
+    def accept(text: str):
+        code = extract_tests(text)
+        code = no_silent_skips(ensure_pytest_import(code))
+        validate_tests(code, ctx)
+        return code
+    return accept
+
+
+def _combine_usage(*parts: dict) -> dict:
+    out = {"input_tokens": 0, "output_tokens": 0, "attempts": 0, "models": []}
+    for p in parts:
+        out["input_tokens"] += p.get("input_tokens", 0)
+        out["output_tokens"] += p.get("output_tokens", 0)
+        out["attempts"] += p.get("attempts", 0)
+        out["models"] += p.get("models", [])
+    return out
+
+
+def generate(client, ctx: Context, model: str, max_tokens: int, max_attempts: int,
+             fallback_model: str = "", force_split: bool = False) -> tuple[str, str, dict, dict, dict]:
+    """Generate in two calls (design+patches, then hidden tests) when the model is reached through an
+    Anthropic-compatible third-party API (DeepSeek/MiMo), where the four-block response routinely exceeds the 64k output
+    limit. On the Claude subscription the single call is cheaper; override with GEN_SPLIT_ARTIFACTS=1/0.
+    A safety refusal switches to `fallback_model` (once, with one extra attempt)."""
+    mode = os.environ.get("GEN_SPLIT_ARTIFACTS", "auto").strip().lower()
+    external = any(h in (os.environ.get("ANTHROPIC_BASE_URL") or "").lower()
+                   for h in ("deepseek.com", "xiaomimimo.com"))
+    split = force_split or mode in ("1", "true", "yes", "on") or (mode in ("auto", "") and external)
+    if not split:
+        try:
+            return _generate_single(client, ctx, model, max_tokens, max_attempts, fallback_model)
+        except OutputLimitExceeded as e:
+            log.info("[%s] single call exceeded the output limit; splitting into design + tests calls: %s",
+                     ctx.osv_id, str(e)[:120])
+
+    design_prompt = ctx.prompt + SPLIT_DESIGN_SUFFIX
+    (md, task_meta, patches), u1 = _run_phase(
+        client, ctx, "design", design_prompt, model, max_tokens, max_attempts, fallback_model, _accept_design(ctx))
+    tests_prompt = (ctx.prompt + "\n\n# Approved design (previous step)\n<instruction_md>\n" + md
+                    + "\n</instruction_md>\n<task_metadata_json>\n"
+                    + json.dumps(task_meta, indent=2) + "\n</task_metadata_json>" + SPLIT_TESTS_SUFFIX)
+    code, u2 = _run_phase(
+        client, ctx, "tests", tests_prompt, model, max_tokens, max_attempts, fallback_model, _accept_tests(ctx))
+    return md, code, _combine_usage(u1, u2), task_meta, patches
+
+
+def _generate_single(client, ctx: Context, model: str, max_tokens: int, max_attempts: int,
+                     fallback_model: str = "") -> tuple[str, str, dict, dict, dict]:
+    """Legacy single-call mode (all four blocks in one response)."""
+    def accept(text: str):
+        md, code = extract_blocks(text)
+        code = no_silent_skips(ensure_pytest_import(code))
+        task_meta = extract_metadata(text)
+        validate_trap(md, task_meta, ctx.env_dir / REPO_DIRNAME,
+                      patch_source_files(ctx.changed_files, ctx.meta.get("ecosystem", "")))
+        validate_instruction(md, ctx)
+        validate_tests(code, ctx)
+        patches = extract_check_patches(text, ctx.env_dir / REPO_DIRNAME)
+        return md, code, task_meta, patches
+
+    value, usage = _run_phase(client, ctx, "single", ctx.prompt, model, max_tokens, max_attempts,
+                              fallback_model, accept)
+    md, code, task_meta, patches = value
+    return md, code, usage, task_meta, patches
 
 
 # --------------------------------------------------------------------------- #
@@ -887,9 +1394,52 @@ def already_done(env_dir: Path) -> bool:
 
 ABORT = threading.Event()  # set when the quota is exhausted so remaining folders are not attempted
 
+# User decision (2026-10-20, replaces the 2026-10-19 DeepSeek fallback): a candidate Anthropic's safeguards flag - and any
+# candidate of a flagged repo or an offensive-security tool repo - is RETIRED. It is never sent to Claude again and no
+# longer generated by DeepSeek: 0 of 17 DeepSeek-generated tasks were accepted (10 failed validation, all 5 evaluated were
+# solved), and DeepSeek is one of the two models under test, so a task it can design is one it can solve.
+# The DeepSeek fallback was removed entirely (user, 2026-10-20). After FLAG_LIMIT flags in one run, the rest of the run is
+# DEFERRED (back to pending, no strike) and a cluster warning is logged for the user.
+DEFERRED_MARKER = "generation_deferred.txt"   # skipped this run through no fault of the candidate: no strike
+FLAGS_LOCK = threading.Lock()
+FLAGS = {"n": 0}
+FLAG_LIMIT = int(os.environ.get("GEN_FLAG_LIMIT", "3"))
+OFFENSIVE_REPO_RE = re.compile(
+    r"github\.com/(projectdiscovery|rapid7|sqlmapproject|zaproxy|bishopfox|bc-security|cobbr|gentilkiwi|fortra|"
+    r"lgandx|beefproject|bettercap|epi052|ffuf|owasp-amass)/"
+    r"|github\.com/[^/]+/[^/]*(exploit|pentest|red-?team|hacktool|metasploit|nuclei|sqlmap|c2-?framework)", re.I)
+
+
+def flagged_repos(env_root: Path, candidates: dict) -> set[str]:
+    out = set()
+    for f in env_root.glob("*/safeguards_flagged.txt"):
+        rec = candidates.get(f.parent.name) or {}
+        if rec.get("repo_url"):
+            out.add(rec["repo_url"].lower().rstrip("/"))
+    return out
+
+
+def deepseek_client(args):
+    """Claude Code CLI against DeepSeek's Anthropic-compatible API, for this client only."""
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return None
+    model = os.environ.get("DEEPSEEK_GEN_MODEL", "deepseek-flash[1m]")
+    small = model.replace("[1m]", "")
+    return CliBackend(args.claude_bin, args.timeout, env_overrides={
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic", "ANTHROPIC_AUTH_TOKEN": key,
+        "ANTHROPIC_MODEL": model, "ANTHROPIC_DEFAULT_OPUS_MODEL": model, "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": small, "CLAUDE_CODE_SUBAGENT_MODEL": small,
+        # thinking counts against the 64k output limit. Effort "max" made every call 20+ min (cycle 11: nothing
+        # finished inside the 45-min cap), so generation never completes; "high" calls take 3-8 min.
+        "CLAUDE_CODE_EFFORT_LEVEL": os.environ.get("DEEPSEEK_GEN_EFFORT", "high"),
+        "MAX_THINKING_TOKENS": os.environ.get("DEEPSEEK_GEN_THINKING", "20000")}), model
+
 
 def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, str]:
     osv_id = env_dir.name
+    if hasattr(client, "set_label"):       # HandoffBackend: names this candidate's request/response files
+        client.set_label(osv_id)
     if ABORT.is_set():
         return osv_id, "failed", "aborted: quota exhausted earlier in this run"
     if already_done(env_dir):
@@ -906,20 +1456,58 @@ def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, st
         print(f"===== SYSTEM =====\n{SYSTEM_PROMPT}\n\n===== USER ({len(ctx.prompt)} chars) =====\n{ctx.prompt}")
         return osv_id, "skipped", "dry-run"
 
+    repo = (ctx.meta.get("repo_url") or "").lower().rstrip("/")
+    if (env_dir / "safeguards_flagged.txt").is_file():
+        route = "Anthropic safeguards flagged this candidate earlier"
+    elif repo and repo in flagged_repos(env_dir.parent, candidates):
+        route = "Anthropic safeguards flagged another candidate of this repository"
+    elif OFFENSIVE_REPO_RE.search(ctx.meta.get("repo_url", "") or ""):
+        route = "offensive-security tool repository"
+    elif FLAGS["n"] >= FLAG_LIMIT:
+        route = f"{FLAGS['n']} safeguards flags earlier in this run"
+    else:
+        route = ""
+    if route:
+        if "safeguards flags earlier in this run" in route:          # a cluster this run: not the candidate's fault
+            (env_dir / DEFERRED_MARKER).write_text(route + "\n")
+            log.error("[%s] deferred: %s - safeguards flags are clustering; the user decides how to continue",
+                      osv_id, route)
+            return osv_id, "failed", f"deferred: {route}"
+        (env_dir / UNSUITABLE_MARKER).write_text(f"retired: {route} (flagged candidates are not generated)\n")
+        log.warning("[%s] retired without generation: %s", osv_id, route)
+        return osv_id, "failed", f"unsuitable: retired: {route}"
     try:
-        md, code, usage, task_meta, patches = generate(client, ctx, args.model, args.max_tokens, args.max_attempts,
-                                                       args.fallback_model)
+        try:
+            md, code, usage, task_meta, patches = generate(client, ctx, args.model, args.max_tokens,
+                                                           args.max_attempts, args.fallback_model,
+                                                           force_split=args.backend in ("cursor", "handoff")
+                                                           and os.environ.get("GEN_SPLIT_ARTIFACTS", "auto").lower() != "0")
+        except HandoffPending as e:
+            # waiting for a Cursor agent to answer the request: not the candidate's fault, no strike (see _record_failures)
+            (env_dir / DEFERRED_MARKER).write_text(f"waiting for handoff response: {e}\n")
+            log.info("[%s] handoff request pending: %s", osv_id, e)
+            return osv_id, "failed", f"deferred: handoff pending {e}"
+        except SafeguardsFlagged as e:
+            # never retried on any Claude model (fallback included) and not sent to another engine: retired
+            with FLAGS_LOCK:
+                FLAGS["n"] += 1
+            try:
+                (env_dir / "safeguards_flagged.txt").write_text(str(e))
+            except OSError:
+                pass
+            log.error("[%s] Anthropic safeguards flagged the session (AUP, flag %d this run) - never retried on "
+                      "Claude; candidate retired: %s", osv_id, FLAGS["n"], str(e)[:200])
+            (env_dir / UNSUITABLE_MARKER).write_text("retired: Anthropic safeguards flag\n")
+            return osv_id, "failed", "unsuitable: retired: Anthropic safeguards flag"
+    except CandidateUnsuitable as e:   # rule 8: retired by stage 3 (generation_unsuitable.txt -> REJECTED)
+        log.warning("[%s] generator declared the candidate unsuitable: %s", osv_id, e)
+        (env_dir / UNSUITABLE_MARKER).write_text(f"generator: {e}\n")
+        return osv_id, "failed", f"unsuitable: {e}"
     except GenerationInvalid as e:
         log.warning("[%s] FAILED validation: %s", osv_id, e)
         return osv_id, "failed", str(e)
-    except SafeguardsFlagged as e:
-        ABORT.set()      # an account-level flag: generate nothing more in this run; a human decides how to proceed
-        log.error("[%s] Anthropic safeguards flagged the session (AUP) - candidate retired, no retry/fallback: %s",
-                  osv_id, str(e)[:200])
-        try:
-            (env_dir / "safeguards_flagged.txt").write_text(str(e))
-        except OSError:
-            pass
+    except SafeguardsFlagged as e:   # cannot come from the DeepSeek route; kept so a flag never crashes the run
+        log.error("[%s] safeguards flag: %s", osv_id, str(e)[:200])
         return osv_id, "failed", f"safeguards flagged (AUP): {str(e)[:200]}"
     except QuotaExhausted as e:
         ABORT.set()
@@ -935,7 +1523,14 @@ def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, st
         (env_dir / CHECK_DIR).mkdir(exist_ok=True)
         for kind, diff in patches.items():
             write_atomic(env_dir / CHECK_DIR / f"{kind}.patch", diff)
-        write_atomic(env_dir / META_NAME, json.dumps({"model": usage["models"][-1], "backend": args.backend, **usage},
+        # handoff: the answer came from whatever model the Cursor operator selected (HANDOFF_MODEL), not args.model -
+        # recording args.model would tag Grok-written tasks as Claude and corrupt the generator comparison
+        model_used = (os.environ.get("HANDOFF_MODEL", "cursor-handoff (model not recorded)")
+                      if args.backend == "handoff" else usage["models"][-1])
+        write_atomic(env_dir / META_NAME, json.dumps({**usage, "model": model_used, "backend": args.backend,
+                                                      "generator": ("handoff" if args.backend == "handoff"
+                                                                    else "cursor" if args.backend == "cursor"
+                                                                    else "deepseek" if usage.get("generator_route") else "claude")},
                                                      indent=2))
         write_atomic(env_dir / INSTRUCTION_NAME, md)  # last: its presence marks completion
     except OSError as e:
@@ -964,8 +1559,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--environments", type=Path, default=Path("environments"))
     p.add_argument("--candidates", type=Path, help="Stage 1 JSON, supplies summary/CVE/CWE")
     p.add_argument("--env-file", type=Path, help=".env path (default: search upward from cwd)")
-    p.add_argument("--backend", choices=("cli", "api"), default=os.environ.get("TASK_GEN_BACKEND", "cli"),
-                   help="cli = headless `claude -p` with the logged-in subscription (default); api = ANTHROPIC_API_KEY")
+    p.add_argument("--backend", choices=("cli", "api", "cursor", "handoff"), default=os.environ.get("TASK_GEN_BACKEND", "cli"),
+                   help="cli = headless `claude -p` with the logged-in subscription (default); api = ANTHROPIC_API_KEY; "
+                        "cursor = headless Cursor Agent CLI (`agent -p`) signed in with the Cursor account "
+                        "(model: CURSOR_GEN_MODEL)")
+    p.add_argument("--cursor-bin", default=os.environ.get("CURSOR_AGENT_BIN", "agent"))
     p.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     p.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL))
     p.add_argument("--fallback-model", default=os.environ.get("GEN_FALLBACK_MODEL", "claude-opus-4-8"),
@@ -973,7 +1571,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "('' = no fallback)")
     p.add_argument("--max-tokens", type=int, default=64000)
     p.add_argument("--max-attempts", type=int, default=3, help="regeneration attempts when validation rejects output")
-    p.add_argument("--timeout", type=float, default=3600.0, help="per-call timeout seconds (long: a 64k-token generation can take > 15 min)")
+    # below the 45-min step cap (was 3600: the cap killed slow calls first, so nothing was logged and they were retired)
+    p.add_argument("--timeout", type=float, default=float(os.environ.get("GEN_CALL_TIMEOUT_SEC", "900")),
+                   help="per-call timeout seconds; a slow call now fails loudly instead of silently using the window")
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--only", nargs="+", help="only these OSV IDs")
     p.add_argument("--dry-run", action="store_true", help="print the prompt, make no API call")
@@ -983,6 +1583,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    if args.backend == "cursor":
+        # Cursor models: their own model id (CURSOR_GEN_MODEL), and a fallback only if it is a Cursor model too
+        # (the Claude fallback cannot be reached through this backend).
+        args.model = os.environ.get("CURSOR_GEN_MODEL", "grok-4.7-high-fast")
+        args.fallback_model = os.environ.get("CURSOR_GEN_FALLBACK_MODEL", "")
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1009,7 +1614,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     client = None
     if not args.dry_run:
         if args.backend == "cli":
-            client = CliBackend(args.claude_bin, args.timeout)
+            # Generation-only effort (2026-10-20): .env's CLAUDE_CODE_EFFORT_LEVEL=max made every Claude generation call
+            # outlast the 45-min step cap (cycles 13-20: zero Claude-generated tasks finished). The same cause was fixed
+            # for DeepSeek earlier ("max: 20+ min per call; high: 3-8 min").
+            client = CliBackend(args.claude_bin, args.timeout, effort=os.environ.get("GEN_CLAUDE_EFFORT", "high"))
+        elif args.backend == "handoff":
+            client = HandoffBackend()
+            args.fallback_model = ""          # a fallback would only queue a second request for the same answer
+        elif args.backend == "cursor":
+            from src.common.llm import CursorCliBackend
+            client = CursorCliBackend(args.cursor_bin, args.timeout)
         else:
             load_api_key(args.env_file)
             client = ApiBackend(args.timeout)

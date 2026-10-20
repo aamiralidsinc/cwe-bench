@@ -1,8 +1,11 @@
 """Stage 5 - Evaluator: the pass@3 = 0 gate on DeepSeek V4.1 Flash and Xiaomi MiMo-V2.6-Pro.
 
-STAGED, to waste no compute: phase A runs attempt 1 of BOTH models concurrently. The moment any attempt scores 1.0, pass@3 = 0
-is impossible: every still-running attempt of the task is cancelled and the task is rejected. Only survivors run phase B (the
-remaining EVAL_ATTEMPTS-1 attempts of both models, with the same early cancel). Several tasks run in parallel, bounded by a
+STAGED, to waste no compute: phase A runs attempt 1 of BOTH models concurrently. The moment a model scores 1.0, pass@3 = 0
+is impossible and THAT MODEL's remaining attempts are cancelled - but the OTHER model keeps running all its attempts
+(2026-10-19: a task one model solves and the other fails is the best pattern data the knowledge loop gets; the old
+cross-model cancel threw it away as CancelledError). Phase B (the remaining EVAL_ATTEMPTS-1 attempts) runs for every
+model that neither solved nor errored in phase A. The task's verdict is unchanged: any clean solve by any model still
+rejects it. Several tasks run in parallel, bounded by a
 container budget (--max-containers / $MAX_CONTAINERS). Everything lands under
 data/04_eval_runs/<OSV-ID>/<model-tag>/<job>/<trial>/ (agent trajectory, logs, verifier output).
 
@@ -31,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import sys
 import threading
@@ -146,7 +150,7 @@ def evaluate_task(env_dir: Path, cfg: Config, endpoints: list[ModelEndpoint], ba
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
     def run_phase(ep: ModelEndpoint, suffix: str, k: int, cancel: threading.Event) -> tuple[str, list[Trial], str]:
-        conc = max(1, min(k, budget.total // len(endpoints)))
+        conc = max(1, min(k, budget.total // max(1, len(endpoints))))
         waves = -(-k // conc)                       # attempts run in ceil(k / concurrent) waves
         job = run_harbor(
             cfg.harbor_bin, task, ep.agent, out / ep.tag, f"{ep.tag}-{stamp}-{suffix}",
@@ -156,26 +160,35 @@ def evaluate_task(env_dir: Path, cfg: Config, endpoints: list[ModelEndpoint], ba
             log_path=out / ep.tag / f"harbor_stdout_{suffix}.log", cancel=cancel)
         return ep.tag, read_trials(job), job.name
 
-    def phase(suffix: str, k: int) -> dict[str, tuple[list[Trial], str]]:
-        slots = len(endpoints) * max(1, min(k, budget.total // len(endpoints)))
+    def phase(suffix: str, k: int, eps: Optional[list[ModelEndpoint]] = None) -> dict[str, tuple[list[Trial], str]]:
+        eps = eps if eps is not None else endpoints
+        slots = len(eps) * max(1, min(k, budget.total // max(1, len(endpoints))))
         budget.acquire(slots)                       # wait until this phase's containers fit in the budget
-        cancel, done = threading.Event(), threading.Event()
+        cancels = {ep.tag: threading.Event() for ep in eps}
+        done = threading.Event()
 
         def watch() -> None:
-            """Any attempt of any model reaching 1.0 settles the task (rejected): stop everything else at once."""
-            jobs_ = [out / ep.tag / f"{ep.tag}-{stamp}-{suffix}" for ep in endpoints]
+            """A model reaching 1.0 settles ITS OWN remaining attempts (pass@3 > 0 is decided for it) - the other
+            model keeps running, so the knowledge loop still learns whether the task defeats it."""
+            jobs_ = {ep.tag: out / ep.tag / f"{ep.tag}-{stamp}-{suffix}" for ep in eps}
             while not done.wait(15):
-                solved = [t for j in jobs_ for t in read_trials(j) if t.reward is not None and t.reward >= 1.0]
-                if solved:
-                    log.info("Solved - cancelling the remaining attempts", extra={"osv_id": osv_id, "trial": solved[0].path.name})
-                    cancel.set()
+                for tag, j in jobs_.items():
+                    if cancels[tag].is_set():
+                        continue
+                    solved = [t for t in read_trials(j) if t.reward is not None and t.reward >= 1.0]
+                    if solved:
+                        log.info("Solved - cancelling this model's remaining attempts (other models keep running)",
+                                 extra={"osv_id": osv_id, "model": tag, "trial": solved[0].path.name})
+                        cancels[tag].set()
+                if all(c.is_set() for c in cancels.values()):
                     return
 
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         try:
-            with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:      # both target models at once
-                return {tag: (trials, job) for tag, trials, job in pool.map(lambda ep: run_phase(ep, suffix, k, cancel), endpoints)}
+            with ThreadPoolExecutor(max_workers=len(eps)) as pool:      # the target models at once
+                return {tag: (trials, job)
+                        for tag, trials, job in pool.map(lambda ep: run_phase(ep, suffix, k, cancels[ep.tag]), eps)}
         finally:
             done.set()
             budget.release(slots)
@@ -188,10 +201,10 @@ def evaluate_task(env_dir: Path, cfg: Config, endpoints: list[ModelEndpoint], ba
             trials[tag] += trs
             jobs[tag].append(job)
 
-    def stats_for(expected: int) -> dict[str, dict]:
+    def stats_for(expected) -> dict[str, dict]:
         out_ = {}
         for ep in endpoints:
-            st = summarize_attempts(trials[ep.tag], expected)
+            st = summarize_attempts(trials[ep.tag], expected[ep.tag] if isinstance(expected, dict) else expected)
             st.update({"model": ep.model, "jobs": jobs[ep.tag]})
             out_[ep.tag] = st
         return out_
@@ -199,10 +212,16 @@ def evaluate_task(env_dir: Path, cfg: Config, endpoints: list[ModelEndpoint], ba
     absorb(phase("a", 1))                                   # phase A: attempt 1 of each model
     per_model = stats_for(1)
     status, detail = decide(per_model)
-    if status is Status.DONE and cfg.eval_attempts > 1:     # nobody solved it and no errors -> remaining attempts
-        absorb(phase("b", cfg.eval_attempts - 1))
-        per_model = stats_for(cfg.eval_attempts)
-        status, detail = decide(per_model)
+    if status in (Status.DONE, Status.REJECTED_TOO_EASY) and cfg.eval_attempts > 1:
+        # Remaining attempts for every model that neither solved nor errored - ALSO when another model already solved
+        # the task: the task stays rejected, but the full per-model record ("only_<model>" pattern) feeds the
+        # knowledge loop with what defeats the model that failed (user decision 2026-10-19).
+        rest = [ep for ep in endpoints if per_model[ep.tag]["passes"] == 0 and per_model[ep.tag]["errors"] == 0]
+        if rest:
+            absorb(phase("b", cfg.eval_attempts - 1, rest))
+            kept = {ep.tag for ep in rest}
+            per_model = stats_for({ep.tag: (cfg.eval_attempts if ep.tag in kept else 1) for ep in endpoints})
+            status, detail = decide(per_model)
     if status is Status.REJECTED_TOO_EASY:
         # A solve that came from editing the grading inputs is reward hacking, not a solve: a human looks at it.
         hacked = {f"{tag}/{t.path.name}": sig for tag, trs in trials.items() for t in trs if attempt_outcome(t) == "pass"

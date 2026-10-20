@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import zipfile
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -44,9 +45,9 @@ log = logging.getLogger(__name__)
 STAGE = "stage1_mining"
 OSV_EXPORT_URL = "https://osv-vulnerabilities.storage.googleapis.com/{eco}/all.zip"
 GITHUB_API = "https://api.github.com"
-SUPPORTED_ECOSYSTEMS = ("PyPI", "npm")
+SUPPORTED_ECOSYSTEMS = ("PyPI", "npm", "Go", "Packagist")
 SOURCES = ("osv", "ghsa", "huntr")
-GHSA_ECOSYSTEM = {"PyPI": "pip", "npm": "npm"}
+GHSA_ECOSYSTEM = {"PyPI": "pip", "npm": "npm", "Go": "go", "Packagist": "composer"}
 HUNTR_RE = re.compile(r"^https?://(?:www\.)?huntr\.(?:com|dev)/bounties/[0-9a-f-]{8,}", re.IGNORECASE)
 OUTPUT_NAME = "osv_candidates.json"
 MAX_RESOLVE_ATTEMPTS = 2
@@ -100,6 +101,62 @@ class MinedVuln:
     report_url: Optional[str] = None                      # huntr bounty page, when there is one
     description: str = ""                                  # advisory text (first 2000 chars) - used to stop the report copying it
     fix_commits: list[str] = field(default_factory=list)   # >1 = a consecutive fix series; the oracle is pre_patch..fixed
+    # fix-bypass pair: {"original_id": <advisory or commit the bypass completes>, "original_fix": <full sha>}. Then
+    # pre_patch = parent(original fix), fixed = the bypass fix, and the reference fix is the combined change.
+    fix_pair: dict = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+# Fix-bypass pairs (2026-10-20 mining strategy). An advisory that fixes a bypass of an earlier fix documents a place
+# the original human fixers missed - a real hidden sibling. The task is built before the ORIGINAL fix: the report shows
+# the original symptom, and the bypass place is the part a careful repair must also find.
+# --------------------------------------------------------------------------- #
+BYPASS_RE = re.compile(
+    r"incomplete fix|insufficient fix|bypass(es|ed|ing)? (of |for )?(the )?(previous|prior|earlier|original|initial)|"
+    r"(previous|prior|earlier|original|initial) (fix|patch)|(fix|patch) for (CVE|GHSA)-|(still|remains) (vulnerable|"
+    r"exploitable)|regression of (CVE|GHSA)-", re.I)
+REF_ID_RE = re.compile(r"\b(GHSA(?:-[0-9a-z]{4}){3}|CVE-\d{4}-\d{4,}|PYSEC-\d{4}-\d+|GO-\d{4}-\d+)\b", re.I)
+SHA_REF_RE = re.compile(r"incomplete fix (?:of|for) (?:commit )?`?([0-9a-f]{7,40})\b", re.I)
+
+
+def find_fix_pairs(osv_by_eco: dict[str, list]) -> list[tuple[str, dict, "FixRef", list[str], dict]]:
+    """(eco, bypass record, bypass fix, sources, pair) for every bypass advisory whose referenced original advisory
+    (or commit) has a fix commit in the SAME repository. Records with a multi-commit fix series are skipped on either
+    side (the one-sha original/bypass split would be wrong)."""
+    idx: dict[str, tuple[str, dict, FixRef]] = {}
+    for eco, items in osv_by_eco.items():
+        for rec, fix, _ in items:
+            if rec.get("_fix_series"):
+                continue
+            for k in [rec["id"], *(rec.get("aliases") or [])]:
+                idx.setdefault(k.upper(), (eco, rec, fix))
+    pairs = []
+    for eco, items in osv_by_eco.items():
+        for rec, fix, srcs in items:
+            if rec.get("_fix_series"):
+                continue
+            text = f"{rec.get('summary') or ''}\n{rec.get('details') or ''}"
+            if not BYPASS_RE.search(text):
+                continue
+            own = {k.upper() for k in [rec["id"], *(rec.get("aliases") or [])]}
+            same_repo = lambda f: (f.owner.lower(), f.repo.lower()) == (fix.owner.lower(), fix.repo.lower())
+            pair = None
+            for ref in dict.fromkeys(m.upper() for m in REF_ID_RE.findall(text)):
+                if ref in own or ref not in idx:
+                    continue
+                _, orig, ofix = idx[ref]
+                if orig["id"].upper() in own or not same_repo(ofix) or ofix.sha == fix.sha:
+                    continue
+                pair = {"original_id": orig["id"], "original_fix": ofix.sha}
+                break
+            if not pair:
+                m = SHA_REF_RE.search(text)
+                if m and not fix.sha.startswith(m.group(1).lower()):
+                    pair = {"original_id": f"commit {m.group(1)}", "original_fix": m.group(1).lower()}
+            if pair:
+                pairs.append((eco, rec, fix, srcs, pair))
+    log.info("Fix-bypass pairs found", extra={"pairs": len(pairs)})
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +406,25 @@ class GitHubResolver:
                 return f, parents[f.sha], [f.sha]
         return None
 
+    def resolve_pair(self, owner: str, repo: str, orig_sha: str, bypass_sha: str) -> tuple[Optional[tuple[str, str]], str]:
+        """Fix-bypass pair -> ((full original sha, pre-patch = parent(original)), "") or (None, reason). The bypass fix
+        must DESCEND from the original fix; a bypass on a separate backport line would make the combined diff
+        meaningless. Pairs far apart in time pull in unrelated commits; stage 2's diff-size limits reject those."""
+        c = self._get_json(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{orig_sha}")      # also resolves short shas
+        if not c or not c.get("sha"):
+            return None, "original fix commit not found"
+        full = c["sha"].lower()
+        parents = c.get("parents") or []
+        if len(parents) != 1:
+            return None, "original fix is not a single-parent commit"
+        dates = [d for d in (((c.get("commit") or {}).get(x) or {}).get("date") for x in ("author", "committer")) if d]
+        if dates:
+            self.commit_dates[FixRef(owner, repo, full).key()] = min(dates)[:10]
+        cmp = self._get_json(f"{GITHUB_API}/repos/{owner}/{repo}/compare/{full}...{bypass_sha}")
+        if not cmp or cmp.get("status") != "ahead":
+            return None, f"bypass fix does not descend from the original fix (compare: {(cmp or {}).get('status')})"
+        return (full, parents[0]["sha"]), ""
+
     @staticmethod
     def _is_rate_limited(r: requests.Response) -> bool:
         return (r.headers.get("X-RateLimit-Remaining") == "0"
@@ -384,7 +460,7 @@ def ghsa_to_osv(adv: dict) -> Optional[dict]:
     affected = []
     for v in adv.get("vulnerabilities") or []:
         pkg = v.get("package") or {}
-        eco = {"pip": "PyPI", "npm": "npm"}.get(pkg.get("ecosystem"))
+        eco = {"pip": "PyPI", "npm": "npm", "go": "Go", "composer": "Packagist"}.get(pkg.get("ecosystem"))
         if eco and pkg.get("name"):
             affected.append({"package": {"ecosystem": eco, "name": pkg["name"]}})
     if not affected:
@@ -490,7 +566,7 @@ def mine(ecosystems: list[str], limit: int, cache_dir: Path, github_token: Optio
          sources: tuple[str, ...] = SOURCES, ghsa_pages: int = 3, ghsa_severity: Optional[str] = None,
          ghsa_cwes: Optional[list[str]] = None, batch_size: int = 10,
          on_batch: Optional[Callable[[list[MinedVuln]], None]] = None,
-         published_after: str = "") -> list[MinedVuln]:
+         published_after: str = "", fix_pairs: bool = True) -> list[MinedVuln]:
     osv_session = make_session()
     gh_session = make_session(github_token)
     resolver = GitHubResolver(gh_session, github_rps)
@@ -522,6 +598,61 @@ def mine(ecosystems: list[str], limit: int, cache_dir: Path, github_token: Optio
     results: list[MinedVuln] = []
     seen_this_run: set[str] = set()
     skipped_known = 0
+
+    # Fix-bypass pairs first: the strongest new source (2026-10-20). Keyed "pair:<repo>@<orig>..<bypass>" in the state so
+    # the bypass advisory's own single-fix record (usually already mined) does not hide its pair.
+    pair_stats: Counter = Counter()
+    for eco, rec, fix, srcs, pair in (find_fix_pairs(osv_by_eco) if fix_pairs and osv_by_eco else []):
+        if len(results) >= limit:
+            break
+        if published_after and (rec.get("published") or "")[:10] < published_after:
+            pair_stats["bypass advisory before cutoff"] += 1
+            continue
+        key = f"pair:{fix.owner.lower()}/{fix.repo.lower()}@{pair['original_fix'][:12]}..{fix.sha}"
+        if key in seen_this_run:
+            continue
+        seen_this_run.add(key)
+        if state and not state.should_process(STAGE, key, MAX_RESOLVE_ATTEMPTS):
+            pair_stats["known"] += 1
+            continue
+        if state and any(state.get(s, rec["id"]) for s in ("stage3_task_builder", "stage4_oracle_validator",
+                                                           "stage5_evaluator")):
+            state.mark(STAGE, key, Status.REJECTED, "bypass advisory already used by the pipeline", {"osv_id": rec["id"]})
+            pair_stats["already used"] += 1
+            continue
+        resolved, why = resolver.resolve_pair(fix.owner, fix.repo, pair["original_fix"], fix.sha)
+        if not resolved:
+            state and state.mark(STAGE, key, Status.REJECTED, f"pair: {why}", {"osv_id": rec["id"]})
+            pair_stats["unresolvable"] += 1
+            continue
+        orig_full, parent = resolved
+        resolver.parent_of(fix)                                   # the bypass commit's date (the cutoff applies to it)
+        fixed_on = resolver.commit_dates.get(fix.key(), "")
+        if published_after and fixed_on and fixed_on < published_after:
+            state and state.mark(STAGE, key, Status.REJECTED, f"bypass fix committed {fixed_on}, before {published_after}",
+                                 {"osv_id": rec["id"]})
+            pair_stats["bypass fix before cutoff"] += 1
+            continue
+        if state:   # the bypass advisory was screened as a single fix: re-screen it as the combined pair
+            state.reset("stage2_screening", rec["id"])
+        pair_stats["mined"] += 1
+        results.append(MinedVuln(
+            osv_id=rec["id"], cve_id=extract_cve(rec), ecosystem=eco,
+            package=first_package(rec, eco), repo_url=fix.repo_url,
+            pre_patch_commit=parent, fixed_commit=fix.sha, summary=build_summary(rec),
+            published=rec.get("published"), aliases=rec.get("aliases", []),
+            cwe_ids=extract_cwes(rec),
+            severity=rec.get("database_specific", {}).get("severity"),
+            fix_commit_url=f"{fix.repo_url}/commit/{fix.sha}",
+            source_refs=sorted(set(srcs)), sources=sorted(tags.get(fix.key(), set()) | {"fix_pair"}),
+            report_url=huntr_url(rec), description=(rec.get("details") or "")[:2000],
+            fix_commits=[orig_full, fix.sha], fix_pair={"original_id": pair["original_id"], "original_fix": orig_full},
+        ))
+        if len(results) % batch_size == 0 and on_batch:
+            on_batch(results[len(results) - batch_size:])
+    if pair_stats:
+        log.info("Fix-bypass pairs processed", extra=dict(pair_stats))
+
     for eco, rec, fix, srcs in interleave([items for _, items in feeds]):
         if len(results) >= limit:
             break
@@ -658,7 +789,9 @@ def main(argv: Optional[list[str]] = None, cfg: Optional[Config] = None) -> int:
             # Only after the output is safely on disk do we record the commits as done.
             if state:
                 for v in batch:
-                    key = f"{v.repo_url.removeprefix('https://github.com/').lower()}@{v.fixed_commit}"
+                    repo = v.repo_url.removeprefix('https://github.com/').lower()
+                    key = (f"pair:{repo}@{v.fix_pair['original_fix'][:12]}..{v.fixed_commit}" if v.fix_pair
+                           else f"{repo}@{v.fixed_commit}")
                     state.mark(STAGE, key, Status.DONE, payload={"osv_id": v.osv_id})
 
         vulns = mine(args.ecosystems, args.limit, args.cache_dir, cfg.github_token,

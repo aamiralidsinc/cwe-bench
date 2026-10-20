@@ -68,6 +68,38 @@ def preflight(harbor_bin: str, need_docker: bool = True) -> None:
             raise HarborUnavailable("docker daemon is not running / reachable") from e
 
 
+DISK_PRUNE_BELOW_GB, DISK_STOP_BELOW_GB, BUILD_CACHE_MAX = 15, 8, "60gb"
+_last_cache_prune = 0.0
+
+
+def disk_guard() -> None:
+    """Never let Docker run the host disk full (that corrupts its image store: I/O errors on every call). Cap the build
+    cache every 10 minutes; below 15 GB free prune now; below 8 GB after pruning stop with HarborUnavailable."""
+    global _last_cache_prune
+    free_gb = lambda: shutil.disk_usage("/").free / 1e9
+    if time.time() - _last_cache_prune > 600 or free_gb() < DISK_PRUNE_BELOW_GB:
+        _last_cache_prune = time.time()
+        subprocess.run(["docker", "builder", "prune", "-f", "--max-used-space", BUILD_CACHE_MAX],
+                       capture_output=True, timeout=900)
+        if free_gb() < DISK_PRUNE_BELOW_GB:
+            subprocess.run(["docker", "image", "prune", "-f"], capture_output=True, timeout=600)
+            subprocess.run(["docker", "builder", "prune", "-f"], capture_output=True, timeout=900)
+    if free_gb() < DISK_STOP_BELOW_GB:
+        raise HarborUnavailable(f"host disk nearly full ({free_gb():.1f} GB free): free space before continuing")
+    # hard cap on Docker Desktop's own disk file (it never shrinks on its own): prune, then stop above the cap
+    import os
+    cap = float(os.environ.get("DOCKER_DISK_MAX_GB", "150"))
+    raw = Path.home() / "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw"
+    used_gb = lambda: raw.stat().st_blocks * 512 / 1e9 if raw.exists() else 0.0
+    if cap and used_gb() > cap:
+        subprocess.run(["docker", "image", "prune", "-f"], capture_output=True, timeout=600)
+        subprocess.run(["docker", "builder", "prune", "-a", "-f", "--max-used-space", BUILD_CACHE_MAX],
+                       capture_output=True, timeout=900)
+        if used_gb() > cap:
+            raise HarborUnavailable(f"Docker disk at {used_gb():.0f} GB, over DOCKER_DISK_MAX_GB={cap:.0f}: "
+                                    "remove unused images before continuing")
+
+
 def run_harbor(harbor_bin: str, task_dir: Path, agent: str, jobs_dir: Path, job_name: str,
                attempts: int = 1, concurrent: int = 1, model: Optional[str] = None,
                agent_kwargs: Optional[Mapping[str, str]] = None, extra_env: Optional[Mapping[str, str]] = None,
@@ -95,6 +127,7 @@ def run_harbor(harbor_bin: str, task_dir: Path, agent: str, jobs_dir: Path, job_
     # read them. Only what this run passes explicitly in `extra_env` (its own endpoint's key) reaches Harbor.
     env = {k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV and not k.endswith(("_API_KEY", "_AUTH_TOKEN"))}
     env.update(extra_env or {})
+    disk_guard()
     log.info("harbor run", extra={"task": task_dir.name, "agent": agent, "job": job_name, "k": attempts})
     cancelled = False
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
@@ -170,6 +203,13 @@ def remove_job_containers(job_dir: Path) -> None:
         nets = owned("network")
         if nets:      # Docker has a small fixed number of address pools: never leave networks behind
             subprocess.run(["docker", "network", "rm", *nets], capture_output=True, timeout=60)
+        # per-trial image tags (<trial>__env-main, <trial>__verifier__trial-main): layers stay in the build cache, so a
+        # rebuild is fast, but the tags would otherwise pin gigabytes per task
+        rows = subprocess.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], capture_output=True, text=True,
+                              timeout=60).stdout.splitlines()
+        imgs = [r for r in rows if r.split(":")[0].startswith(prefixes)]
+        if imgs:
+            subprocess.run(["docker", "rmi", *imgs], capture_output=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         pass
 

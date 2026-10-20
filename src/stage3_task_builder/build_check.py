@@ -17,7 +17,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from src.stage6_packager.harbor_packager import DOCKERFILE_OVERRIDE, PY_BASE, UV_WORKSPACE_INSTALL, _link_or_copy, python_base_image
+from src.stage6_packager.harbor_packager import (DOCKERFILE_OVERRIDE, NODE_BASE, PY_BASE, UV_WORKSPACE_INSTALL, _link_or_copy,
+                                                 node_base_image, python_base_image)
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,19 @@ COPY repo/ /app/
 RUN ({UV_WORKSPACE_INSTALL}) || pip install --no-cache-dir -e . || (test -f requirements.txt && pip install --no-cache-dir -r requirements.txt)
 """
 from src.stage6_packager.harbor_packager import NODE_INSTALL  # same package-manager logic as the task image
+
+GO_STRICT = """\
+FROM golang:1.24-bookworm
+ENV GOTOOLCHAIN=auto
+WORKDIR /app
+COPY repo/ /app/
+RUN go mod download && go build ./...
+"""
+
+from src.stage6_packager.harbor_packager import PHP_DOCKERFILE, php_base_image, PHP_BASE  # noqa: E402
+
+# strict: the composer install must succeed (the task image tolerates a failure; the build check does not)
+PHP_STRICT = PHP_DOCKERFILE.rstrip("\n").removesuffix(" || true") + "\n"
 
 NODE_STRICT = f"""\
 FROM node:22-bookworm
@@ -50,20 +64,41 @@ def docker_available() -> bool:
         return False
 
 
+def dockerfile_for(env_dir: Path, ecosystem: str) -> str:
+    """The exact Dockerfile the build check uses for this environment."""
+    repo = env_dir / "repo"
+    override = env_dir / DOCKERFILE_OVERRIDE
+    dockerfile = override.read_text() if override.is_file() else {"PyPI": PY_STRICT, "Go": GO_STRICT, "Packagist": PHP_STRICT}.get(ecosystem, NODE_STRICT)
+    if ecosystem == "PyPI" and not override.is_file():
+        dockerfile = dockerfile.replace(f"FROM {PY_BASE}\n", f"FROM {python_base_image(repo)}\n", 1)
+    if ecosystem == "npm" and not override.is_file():
+        dockerfile = dockerfile.replace(f"FROM {NODE_BASE}\n", f"FROM {node_base_image(repo)}\n", 1)
+    if ecosystem == "Packagist" and not override.is_file():
+        dockerfile = dockerfile.replace(f"FROM {PHP_BASE}\n", f"FROM {php_base_image(repo)}\n", 1)
+    return dockerfile
+
+
+def dockerfile_fingerprint(env_dir: Path, ecosystem: str) -> str:
+    import hashlib
+    return hashlib.sha1(dockerfile_for(env_dir, ecosystem).encode()).hexdigest()[:12]
+
+
 def check_buildable(env_dir: Path, ecosystem: str, timeout: int = 1800) -> tuple[bool, str]:
     osv_id = env_dir.name
     repo = env_dir / "repo"
     if not repo.is_dir():
         return False, "repo/ missing"
-    override = env_dir / DOCKERFILE_OVERRIDE
-    dockerfile = override.read_text() if override.is_file() else (PY_STRICT if ecosystem == "PyPI" else NODE_STRICT)
-    if ecosystem == "PyPI" and not override.is_file():
-        dockerfile = dockerfile.replace(f"FROM {PY_BASE}\n", f"FROM {python_base_image(repo)}\n", 1)
+    dockerfile = dockerfile_for(env_dir, ecosystem)
     tag = f"cwe-buildcheck-{osv_id.lower()}"
     for attempt in range(3):          # registry/network hiccups are retried, never turned into a rejection
         with tempfile.TemporaryDirectory(prefix="buildcheck_") as ctx_s:
             ctx = Path(ctx_s)
-            shutil.copytree(repo, ctx / "repo", symlinks=True, copy_function=_link_or_copy)
+            try:
+                shutil.copytree(repo, ctx / "repo", symlinks=True, copy_function=_link_or_copy)
+            except (shutil.Error, OSError) as e:   # e.g. a file vanished mid-copy: retry, never crash the stage
+                if attempt == 2:
+                    return False, TRANSIENT + f"could not copy the repo for the build check: {str(e)[:200]}"
+                continue
             (ctx / "Dockerfile").write_text(dockerfile)
             try:
                 proc = subprocess.run(["docker", "build", "--progress=plain", "-t", tag, str(ctx)], capture_output=True,
@@ -87,7 +122,8 @@ TRANSIENT_RE = re.compile(r"trouble with your network|malformed response from re
                           r"ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|Temporary failure in name resolution|"
                           r"Read timed out|Connection (reset|refused|timed out)|TLS handshake timeout|"
                           r"failed to (fetch|resolve|do request)|i/o timeout|503 Service|502 Bad Gateway|429 Too Many|"
-                          r"context canceled|Canceled: context|Cannot connect to the Docker daemon|EOF while",
+                          r"context canceled|Canceled: context|Cannot connect to the Docker daemon|EOF while|"
+                          r"input/output error|no space left on device|error committing|metadata.*\.db",
                           re.IGNORECASE)
 
 
@@ -97,13 +133,20 @@ def run_checks(env_dir_root: Path, ids: list[str], meta: dict[str, dict]) -> dic
     for osv_id in ids:
         env = env_dir_root / osv_id
         cache = env / "build_check.json"
+        eco = meta.get(osv_id, {}).get("ecosystem", "PyPI")
+        fp = dockerfile_fingerprint(env, eco) if (env / "repo").is_dir() else ""
         if cache.is_file():
             c = json.loads(cache.read_text())
-            out[osv_id] = (c["ok"], c["detail"])
-            continue
-        ok, detail = check_buildable(env, meta.get(osv_id, {}).get("ecosystem", "PyPI"))
+            # a result is only reused for the Dockerfile it was built with: after a template fix (PHP, 2026-10-20)
+            # a cached failure would otherwise reject the candidate forever. Old entries without a fingerprint are
+            # trusted when they passed and re-checked when they failed.
+            if c.get("dockerfile") == fp or (c["ok"] and "dockerfile" not in c):
+                out[osv_id] = (c["ok"], c["detail"])
+                continue
+            log.info("Build check re-run: the Dockerfile changed since the cached result", extra={"osv_id": osv_id})
+        ok, detail = check_buildable(env, eco)
         if not detail.startswith(TRANSIENT):
-            cache.write_text(json.dumps({"ok": ok, "detail": detail}))
+            cache.write_text(json.dumps({"ok": ok, "detail": detail, "dockerfile": fp}))
         log.info("Build check", extra={"osv_id": osv_id, "ok": ok, "detail": detail[:200]})
         out[osv_id] = (ok, detail)
     return out

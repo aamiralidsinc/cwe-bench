@@ -141,10 +141,31 @@ def condense(trial: Path, keywords: set[str]) -> str:
     return "\n".join(out)
 
 
-def attempt_evidence(trial: Path, ref_files: list[str]) -> tuple[str, set[str]]:
+def _existing_failures(trial: Path, enforced: set[str]) -> str:
+    """Enforced repo tests (pass->pass set) the attempt broke, with the assertion line of each."""
+    p = trial / "verifier" / "ctrf_existing.json"
+    try:
+        tests = json.loads(p.read_text()).get("results", {}).get("tests", [])
+    except (OSError, ValueError):
+        return ""
+    out = []
+    for x in tests:
+        if x.get("name") in enforced and x.get("status") != "passed":
+            err = [l.strip() for l in (x.get("trace") or "").splitlines() if l.strip().startswith(("E ", ">"))][:4]
+            out.append(f"{x['name']}: " + " | ".join(err)[:400])
+    return "\n".join(out[:10])
+
+
+def attempt_evidence(trial: Path, ref_files: list[str], enforced: set[str] = frozenset()) -> tuple[str, set[str]]:
     t = read_trial(trial)
     hidden = t.ctrf or {}
     missed = {n.split("::")[-1] for n, s in hidden.items() if s != "passed"}
+    broken = _existing_failures(trial, enforced)
+    edited_tests = []
+    ch = trial / "verifier" / "agent_changes.txt"
+    if ch.is_file():   # repo test files the agent edited (the grader restores them, so edits cannot hide a break)
+        edited_tests = [l.split("\t")[-1] for l in ch.read_text().splitlines()
+                        if re.search(r"(^|/)(tests?|__tests__)/|[._-](test|spec)\.", l.split("\t")[-1])]
     changed = []
     pf = trial / "verifier" / "agent_patch_files.txt"
     if pf.is_file():
@@ -157,11 +178,17 @@ def attempt_evidence(trial: Path, ref_files: list[str]) -> tuple[str, set[str]]:
     dp = trial / "verifier" / "agent.diff"
     if dp.is_file():
         d = dp.read_text(errors="replace")
-        diff = "\n".join(ch[:1500] for ch in re.split(r"(?m)^(?=diff --git )", d)
-                         if ch.strip() and not re.search(r"(test|spec)", ch.splitlines()[0], re.I))[:6000]
+        chunks = [c for c in re.split(r"(?m)^(?=diff --git )", d) if c.strip()]
+        src_d = [c[:1500] for c in chunks if not re.search(r"(test|spec)", c.splitlines()[0], re.I)]
+        test_d = [c[:800] for c in chunks if re.search(r"(test|spec)", c.splitlines()[0], re.I)
+                  and any(f in c.splitlines()[0] for f in edited_tests)]
+        diff = ("\n".join(src_d)[:6000] + ("\n--- edits to existing repo tests\n" + "\n".join(test_d)[:1500]
+                                            if test_d else ""))
     ev = (f"reward {t.reward}; hidden tests failing: {sorted(missed) or 'none'}; "
           f"agent time {round((t.agent_secs or 0) / 60)} min; ended: "
           f"{'timed out' if t.timed_out else 'stopped on its own'}\n"
+          f"enforced repo tests this attempt BROKE: {broken or 'none'}\n"
+          f"repo test files the agent edited (restored before grading): {edited_tests or 'none'}\n"
           f"source files changed: {changed}\nreference-fix files NOT changed: {untouched}\n"
           f"--- patch (source files, truncated)\n{diff}\n--- trajectory (condensed)\n{condense(trial, keywords)}")
     return ev, missed
@@ -181,6 +208,8 @@ def analyse(cfg: Config, osv_id: str, backend=None, force: bool = False) -> Opti
     env_dir = cfg.stage_dir(3) / osv_id
     ref = _ref_files(env_dir)
     hidden_src = (env_dir / "hidden_tests.py").read_text(errors="replace") if (env_dir / "hidden_tests.py").is_file() else ""
+    exp = env_dir / "harbor_task" / "tests" / "existing_expected.txt"
+    enforced = {l.strip() for l in exp.read_text().splitlines() if l.strip()} if exp.is_file() else set()
     blocks, all_missed, sections = [], set(), ""
     for tag, name in MODELS:
         trials = [t for _, t in latest_trials(cfg.stage_dir(5) / osv_id / tag)]
@@ -190,23 +219,27 @@ def analyse(cfg: Config, osv_id: str, backend=None, force: bool = False) -> Opti
         if not fails:
             continue
         for i, t in enumerate(fails, 1):
-            ev, missed = attempt_evidence(t, ref)
+            ev, missed = attempt_evidence(t, ref, enforced)
             all_missed |= missed
             blocks.append(f"## {name} - failed attempt {i}\n{ev}")
         if wins:
-            ev, _ = attempt_evidence(wins[0], ref)
+            ev, _ = attempt_evidence(wins[0], ref, enforced)
             blocks.append(f"## {name} - SOLVING attempt (for contrast)\n{ev}")
         sections += MODEL_SECTION.format(
             name=name, solved_note=("- <what its solving attempt did differently>" if wins else ""))
     if not blocks:
         return None
-    prompt = PROMPT.format(
+    fields = dict(
         osv_id=osv_id, package=row["package"], verdict=row["verdict"].replace("**", ""),
         instruction=(env_dir / "instruction.md").read_text(errors="replace")[:6000] if (env_dir / "instruction.md").is_file() else "",
-        ref_files=", ".join(ref) or "-",
+        ref_files=", ".join(ref[:60]) + (f" ... (+{len(ref) - 60} more)" if len(ref) > 60 else "") or "-",
         test_names=", ".join(sorted(re.findall(r"^def (test_\w+)", hidden_src, re.M))),
-        missed_code=_test_blocks(hidden_src, all_missed) or "-",
-        attempts="\n\n".join(blocks), model_sections=sections)[:MAX_PROMPT_CHARS]
+        missed_code=_test_blocks(hidden_src, all_missed) or "-", model_sections=sections)
+    # shorten the attempts, never the end of the prompt: the required output format is written there
+    room = MAX_PROMPT_CHARS - len(PROMPT.format(attempts="", **fields))
+    per = max(2000, room // max(1, len(blocks)))
+    attempts = "\n\n".join(b if len(b) <= per else b[:per] + "\n[... attempt evidence truncated ...]" for b in blocks)
+    prompt = PROMPT.format(attempts=attempts, **fields)
     if backend is None:
         from src.common.llm import CliBackend
         backend = CliBackend(cfg.claude_bin, 1800.0)
@@ -223,6 +256,8 @@ def analyse(cfg: Config, osv_id: str, backend=None, force: bool = False) -> Opti
             continue
         if "#### Summary" in text and "#### Task-design lessons" in text:
             break
+        log.warning("Failure analysis reply not in the required format", extra={"osv_id": osv_id, "model": model,
+                                                                                 "reply_start": text[:300]})
         text = ""
     if not text:
         return None
