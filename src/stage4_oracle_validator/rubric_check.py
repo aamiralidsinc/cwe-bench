@@ -109,7 +109,9 @@ def check_task(env_dir: Path, backend: CliBackend, model: str, timeout_note: str
         criteria="\n".join(f"- {n} ({'critical' if c else 'advisory'}): {d}" for n, (c, d) in CRITERIA.items()),
     )
     system = "You are a meticulous benchmark-quality reviewer. Output JSON only."
-    text, _ = backend.complete(model, system, [{"role": "user", "content": prompt}], 8000)
+    # DeepSeek Flash often needs >32k for long CoT before the JSON verdict (observed 2026-10-18).
+    max_out = int(os.environ.get("RUBRIC_MAX_OUTPUT_TOKENS", "64000"))
+    text, _ = backend.complete(model, system, [{"role": "user", "content": prompt}], max_out)
     try:
         reply = extract_json_object(text)
     except ValueError:
@@ -118,7 +120,7 @@ def check_task(env_dir: Path, backend: CliBackend, model: str, timeout_note: str
         if not fallback or fallback == model:
             raise
         log.warning("Rubric reviewer gave no verdict; retrying with the fallback model", extra={"model": fallback})
-        text, _ = backend.complete(fallback, system, [{"role": "user", "content": prompt}], 8000)
+        text, _ = backend.complete(fallback, system, [{"role": "user", "content": prompt}], max_out)
         reply = extract_json_object(text)
     result = evaluate_reply(reply)
     (env_dir / "rubric_check.json").write_text(json.dumps(

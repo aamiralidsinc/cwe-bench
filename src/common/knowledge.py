@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 LESSONS_NAME = "lessons_learned.md"
 TECHNIQUES_NAME = "task_design_techniques.md"
 MAX_LESSONS_CHARS = 8000
-MAX_TECHNIQUES_CHARS = 9000
+MAX_TECHNIQUES_CHARS = 20000     # 11000 silently cut the fairness + answer-key rules once the guide grew past it
 LESSONS_SECTIONS = ("## Breaks BOTH models (replicate)", "## Breaks only DeepSeek (MiMo solves)",
                     "## Breaks only MiMo (DeepSeek solves)", "## Solved by both (avoid)",
                     "## Task-quality pitfalls (rubric / oracle failures)", "## Selection hints")
@@ -48,7 +48,7 @@ def lessons_path(cfg: Config) -> Path:
 def task_features(cfg: Config, osv_id: str) -> dict[str, Any]:
     """Static facts about a task from the mined/screened records."""
     rec: dict[str, Any] = {}
-    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json"):
+    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json", "02_screened/injected.json"):
         p = cfg.data_dir / rel
         if p.is_file():
             try:
@@ -190,18 +190,19 @@ def prior_bonus(priors: dict[str, Any], rec: dict) -> int:
 def learned_ranking(cfg: Config) -> dict[str, Any]:
     """What the evaluations so far say about candidate SELECTION: per vulnerability family and per package/repo,
     how many evaluated tasks there were and in how many some model failed (a counted failure)."""
-    from src.common.results_report import MODELS, collect
+    from src.common.results_report import MODELS, collect, learning_rows
     fam: dict[str, list[int]] = {}
     pkg: dict[str, list[int]] = {}
+    size: dict[str, list[int]] = {}
     meta = {}
-    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json"):
+    for rel in ("01_mined/osv_candidates.json", "02_screened/screened.json", "02_screened/injected.json"):
         p = cfg.data_dir / rel
         if p.is_file():
             try:
                 meta.update({v["osv_id"]: v for v in json.loads(p.read_text()).get("vulnerabilities", [])})
             except (OSError, json.JSONDecodeError, KeyError):
                 pass
-    for r in collect(cfg):
+    for r in learning_rows(cfg, collect(cfg)):
         broke = int(any(r["per"][t]["verdict"] in ("failed", "failed+timed_out") for t, _ in MODELS))
         graded = any(r["per"][t]["graded"] for t, _ in MODELS)
         if not graded:
@@ -211,11 +212,20 @@ def learned_ranking(cfg: Config) -> dict[str, Any]:
         m = meta.get(r["task"], {})
         for key in {(m.get("package") or "").lower(), (m.get("repo_url") or "").lower().rstrip("/")} - {""}:
             n = pkg.setdefault(key, [0, 0]); n[0] += 1; n[1] += broke
-    return {"family": fam, "package": pkg}
+        n = size.setdefault(size_band(m), [0, 0]); n[0] += 1; n[1] += broke
+    return {"family": fam, "package": pkg, "size": size}
+
+
+def size_band(rec: dict) -> str:
+    """Fix breadth band by source files changed (the strongest predictor so far: no fix of <= 5 files broke a model)."""
+    n = len(((rec.get("screening") or {}).get("diff") or {}).get("source_files") or [])
+    return "1-3 files" if n <= 3 else "4-5 files" if n <= 5 else "6-7 files" if n <= 7 else "8+ files"
 
 
 def selection_adjustment(learned: dict[str, Any], rec: dict) -> tuple[int, str]:
     """Score adjustment in [-30, +30] for a screened candidate, with the reason (logged with the pick)."""
+    if rec.get("source") == "injected" or rec.get("injection"):
+        return 30, "injected parallel-path task (the shape that broke both models)"
     from src.common.results_report import cwe_family
     why, adj = [], 0.0
     fams = [f for f in cwe_family(rec.get("cwe_ids") or []).split(" + ") if f]
@@ -226,8 +236,14 @@ def selection_adjustment(learned: dict[str, Any], rec: dict) -> tuple[int, str]:
             v = 25 * broke / n - (15 if broke == 0 and n >= 4 else 0)
             fadj.append(v)
             why.append(f"{f}: {broke}/{n} broke a model")
+    sn, sbroke = learned.get("size", {}).get(size_band(rec), [0, 0])
+    size_dead = sn >= 4 and sbroke == 0
+    if sn >= 3:
+        adj += 30 * sbroke / sn - (20 if size_dead else 0)
+        why.append(f"fix size {size_band(rec)}: {sbroke}/{sn} broke a model")
     if fadj:
-        adj += sum(fadj) / len(fadj)
+        fam_adj = sum(fadj) / len(fadj)
+        adj += min(fam_adj, 0) if size_dead else fam_adj    # a family bonus never lifts a fix size that never broke a model
     seen = [learned["package"].get(k) for k in {(rec.get("package") or "").lower(),
                                                  (rec.get("repo_url") or "").lower().rstrip("/")} - {""}]
     seen = [s for s in seen if s]
@@ -249,7 +265,15 @@ def failure_analysis_lessons(cfg: Config) -> str:
     if not d.is_dir():
         return ""
     parts = []
+    from src.common.state_manager import StateManager
+    from src.common.results_report import withdrawn_tasks
+    with StateManager(cfg.state_db) as st:     # failures blamed on the task teach nothing about the models
+        withdrawn = {k for k in (st.keys("stage5_evaluator")) if (r := st.get("stage5_evaluator", k))
+                     and r.status.value in ("needs_review", "rejected_task_defect")}
+    withdrawn |= set(withdrawn_tasks(cfg))     # persistent: a state reset (e.g. a repair trial) must not un-withdraw
     for f in sorted(d.glob("*.md")):
+        if f.stem in withdrawn:
+            continue
         text = f.read_text(encoding="utf-8")
         title = next((l.lstrip("# ").strip() for l in text.splitlines() if l.startswith("#### Summary")), "")
         summary = ""
@@ -269,8 +293,11 @@ def lessons_for_prompt(cfg: Config) -> str:
     out = ""
     tech = cfg.root / "skills" / TECHNIQUES_NAME
     if tech.is_file() and tech.read_text(encoding="utf-8").strip():
-        out += ("\n\n# Task-design techniques (curated - follow them)\n"
-                + tech.read_text(encoding="utf-8").strip()[:MAX_TECHNIQUES_CHARS] + "\n")
+        guide = tech.read_text(encoding="utf-8").strip()
+        if len(guide) > MAX_TECHNIQUES_CHARS:     # the fairness and hygiene rules sit at the end: a cut drops them
+            log.warning("Technique guide truncated in the generation prompt (%d > %d chars): its last sections are "
+                        "not reaching the generator", len(guide), MAX_TECHNIQUES_CHARS)
+        out += ("\n\n# Task-design techniques (curated - follow them)\n" + guide[:MAX_TECHNIQUES_CHARS] + "\n")
     fmap = knowledge_dir(cfg) / "model_failure_map.md"
     if fmap.is_file() and fmap.read_text(encoding="utf-8").strip():
         out += ("\n\n# Which task types each evaluated agent could not repair completely (measured results)\n"
@@ -279,6 +306,10 @@ def lessons_for_prompt(cfg: Config) -> str:
     if board.is_file() and board.read_text(encoding="utf-8").strip():
         out += ("\n\n# Which techniques have broken the evaluated agents so far (measured)\n"
                 + board.read_text(encoding="utf-8").strip()[:4000] + "\n")
+    solved = knowledge_dir(cfg) / "solved_profile.md"
+    if solved.is_file() and solved.read_text(encoding="utf-8").strip():
+        out += ("\n\n# Task shapes the evaluated agents SOLVED (avoid repeating them; measured)\n"
+                + solved.read_text(encoding="utf-8").strip()[:5000] + "\n")
     lessons = failure_analysis_lessons(cfg)
     if lessons:
         out += ("\n\n# Why the evaluated agents failed real tasks (curated from their trajectories - design for these)\n"
@@ -332,6 +363,13 @@ Rewrite the lessons file. Rules:
 - For each model, keep a separate list of techniques that broke it, then say which techniques to COMBINE in a single task.
 - Add SELECTION hints (CWE / ecosystem / fix shapes to prefer or skip) for the screening step.
 - Keep earlier lessons that are still supported; drop ones contradicted by new data; merge duplicates.
+- Do not infer report style from `recall_probe`. It measures only whether a model can NAME the fix file from the report;
+  a report can hide every file name and still hand over the diagnosis. Never write "hiding the fix location doesn't help".
+- Spelling, case, encoding and input-shape variants of one input through one route are not a difficulty technique
+  (measured: always caught). Difficulty comes from a REAL place the report never leads to, reached by its own test, and
+  from a legitimate behaviour an over-broad fix breaks. Never recommend "more input shapes" as the way to break a model.
+- Fix width (files / lines) does not separate hard from easy tasks (10-21-file fixes were solved on attempt 1); never
+  recommend "prefer bigger fixes" as a difficulty lever. Tiny fixes (<= 3 files and <= 35 lines) are still unusable.
 - Max ~4500 characters, Markdown, these sections only: "## Breaks BOTH models (replicate)", "## Breaks only DeepSeek (MiMo solves)",
   "## Breaks only MiMo (DeepSeek solves)", "## Solved by both (avoid)", "## Task-quality pitfalls (rubric / oracle failures)",
   "## Selection hints". No preamble.
@@ -345,16 +383,22 @@ Rewrite the lessons file. Rules:
 
 
 def update_lessons(cfg: Config, backend: CliBackend, model: str, max_rows: int = 150) -> bool:
-    rows = load_outcomes(cfg, max_rows)
+    from src.common.results_report import withdrawn_tasks
+    gone = set(withdrawn_tasks(cfg))
+    rows = [r for r in load_outcomes(cfg, max_rows) if r.get("osv_id") not in gone]
     if not rows:
         return False
     keep = ("osv_id", "stage", "status", "detail", "cwe_ids", "ecosystem", "repo", "source_files", "source_lines",
             "source_dirs", "models", "pattern", "model_verdicts", "technique", "failure_classes", "why_easy", "recall_probe",
             "sources", "task_type", "model_results")
     compact = "\n".join(json.dumps({k: r[k] for k in keep if r.get(k) not in (None, [], {})}, ensure_ascii=False)
-                        for r in rows)[:60_000]
+                        for r in rows)
+    if len(compact) > 60_000:          # keep the NEWEST rows (the tail), dropping the cut-off first row, not the newest third
+        compact = compact[-60_000:]
+        compact = compact[compact.find("\n") + 1:]
     path = lessons_path(cfg)
-    current = path.read_text(encoding="utf-8") if path.is_file() else "(none yet)"
+    current_raw = path.read_text(encoding="utf-8") if path.is_file() else "(none yet)"
+    current = current_raw
     if lessons_problems(current.strip()):          # never feed a damaged file back in as the "current" lessons
         current = "(the previous file was damaged; rebuild every section from the outcome rows)"
     text, usage = backend.complete(model, "You write concise, evidence-backed engineering guidance. Output Markdown only.",
@@ -372,8 +416,8 @@ def update_lessons(cfg: Config, backend: CliBackend, model: str, max_rows: int =
         return False
     hist = knowledge_dir(cfg) / "lessons_history"
     hist.mkdir(exist_ok=True)
-    if path.is_file():
-        (hist / f"lessons_{time.strftime('%Y%m%d-%H%M%S')}.md").write_text(current, encoding="utf-8")
+    if path.is_file():                 # back up what was really on disk, not the damaged-file placeholder
+        (hist / f"lessons_{time.strftime('%Y%m%d-%H%M%S')}.md").write_text(current_raw, encoding="utf-8")
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text + "\n", encoding="utf-8")
     tmp.replace(path)

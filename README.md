@@ -10,8 +10,8 @@ it in every attempt (pass@3 = 0):
 A failure counts only if the task is sound (it passes the rubric and validation) and the deterministic trial analysis
 attributes the failure to the model, not to a task defect.
 
-> **Start here:** [docs/PIPELINE.md](docs/PIPELINE.md) (pipeline on one page) and
-> [docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md) (why the models fail).
+> **Start here:** [docs/PIPELINE.md](docs/PIPELINE.md) (pipeline on one page); why the models fail is tracked live in
+> [C_RESULTS.md](C_RESULTS.md) and `data/knowledge/` (failure map, technique scoreboard, per-task failure analyses).
 >
 > **Results:** see **[C_RESULTS.md](C_RESULTS.md)**, rebuilt automatically after every evaluation. It has every
 > evaluated task with its final verdict, which task type broke which model, and per-attempt failure details.
@@ -82,7 +82,6 @@ What we have learned about the two models (details in
 | Doc | What it is |
 |---|---|
 | [docs/PIPELINE.md](docs/PIPELINE.md) | Every stage on one page: sources and storage, rules, generation logic, validation checks, evaluation (image, Claude Code agent, what is blocked, grading, verdict), packaging and paths |
-| [docs/MODEL_FAILURE_REPORT.md](docs/MODEL_FAILURE_REPORT.md) | Analysis of the tasks the models failed: attempt-by-attempt results, task details, why the models failed, what to target next |
 
 ---
 

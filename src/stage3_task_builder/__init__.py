@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import logging
 from pathlib import Path
 from typing import Optional
@@ -24,8 +26,24 @@ log = logging.getLogger(__name__)
 
 def _input_file(cfg: Config, allow_unscreened: bool) -> Path:
     screened = cfg.data_dir / "02_screened" / "screened.json"
+    injected = cfg.data_dir / "02_screened" / "injected.json"
     if screened.exists():
-        return screened
+        # injected candidates are only picked while the injector is enabled (retired 2026-10-20: mined CVEs only)
+        if not injected.is_file() or os.environ.get("INJECTOR_ENABLED") != "1":
+            return screened
+        # Injected "parallel path" candidates (docs/INJECTED_TASKS.md) live in their own registry; merge them for
+        # selection without mutating the mined screened.json.
+        try:
+            base = json.loads(screened.read_text()).get("vulnerabilities", [])
+            inj = json.loads(injected.read_text()).get("vulnerabilities", [])
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("Could not merge injected candidates: %s", e)
+            return screened
+        merged = {r["osv_id"]: r for r in base + inj if isinstance(r, dict) and r.get("osv_id")}
+        out = cfg.cache_dir / "screened_plus_injected.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({"count": len(merged), "vulnerabilities": list(merged.values())}, indent=2))
+        return out
     mined = cfg.data_dir / "01_mined" / "osv_candidates.json"
     if allow_unscreened and mined.exists():
         log.warning("Using UNSCREENED candidates", extra={"path": str(mined)})
@@ -34,7 +52,14 @@ def _input_file(cfg: Config, allow_unscreened: bool) -> Path:
         f"{screened} not found. Run stage 2, or pass --allow-unscreened to build from stage 1 output.")
 
 
-def _limit_to_top_n(cfg: Config, src: Path, env_dir: Path, max_tasks: Optional[int], only: Optional[list[str]]) -> Path:
+OFFENSIVE_REPO_RE = re.compile(
+    r"github\.com/(projectdiscovery|rapid7|sqlmapproject|zaproxy|bishopfox|bc-security|cobbr|gentilkiwi|fortra|"
+    r"lgandx|beefproject|bettercap|epi052|ffuf|owasp-amass)/"
+    r"|github\.com/[^/]+/[^/]*(exploit|pentest|red-?team|hacktool|metasploit|nuclei|sqlmap|c2-?framework)", re.I)
+
+
+def _limit_to_top_n(cfg: Config, src: Path, env_dir: Path, max_tasks: Optional[int], only: Optional[list[str]],
+                    exclude: Optional[set] = None) -> Path:
     """Pilot mode: write a subset file with the best-scored candidates that have no finished task yet."""
     if not max_tasks and not only:
         return src
@@ -46,6 +71,7 @@ def _limit_to_top_n(cfg: Config, src: Path, env_dir: Path, max_tasks: Optional[i
                                         and (env_dir / r["osv_id"] / "hidden_tests.py").is_file())]
         # never retry candidates the safety filter keeps declining (they burn Opus time and keep failing)
         recs = [r for r in recs if refusals(env_dir / r["osv_id"]) < MAX_REFUSALS]
+        recs = [r for r in recs if r["osv_id"] not in (exclude or set())]      # already queued in this cycle
         with StateManager(cfg.state_db) as state:   # nor anything already decided in a later stage
             recs = [r for r in recs if not any(
                 (rec := state.get(st, r["osv_id"])) and rec.status.value in ("rejected", "rejected_too_easy", "failed_oracle", "accepted")
@@ -61,22 +87,50 @@ def _limit_to_top_n(cfg: Config, src: Path, env_dir: Path, max_tasks: Optional[i
         with StateManager(cfg.state_db) as state:
             for k in state.keys(STAGE, Status.REJECTED):
                 det = (state.get(STAGE, k).detail or "").lower()
-                why = ("safeguards flagged" if "safeguards" in det else
-                       "unbuildable" if ("docker build" in det or "build timed out" in det or "unbuildable" in det) else "")
+                why = ("unbuildable" if ("docker build" in det or "build timed out" in det or "unbuildable" in det) else "")
                 if why and k in by_id:
                     bad_repos[by_id[k]["repo_url"].lower()] = f"{why} ({k})"
-        skipped = [r["osv_id"] for r in recs if r["repo_url"].lower() in bad_repos]
+        # Flagged candidates are retired (2026-10-20), so a repo with a safeguards-flagged candidate and offensive-security
+        # tool repos are not picked at all: picking them only wastes a slot and an env build.
+        from src.stage3_task_builder.task_generator import OFFENSIVE_REPO_RE, flagged_repos
+        for repo in flagged_repos(env_dir, by_id):
+            bad_repos.setdefault(repo, "safeguards-flagged repo")
+        for r in recs:
+            if OFFENSIVE_REPO_RE.search(r.get("repo_url") or ""):
+                bad_repos.setdefault(r["repo_url"].lower(), "offensive-security tool repo")
+        skipped = [r["osv_id"] for r in recs if r["repo_url"].lower().rstrip("/") in bad_repos
+                   or r["repo_url"].lower() in bad_repos]
         if skipped:
             log.info("Skipping candidates from unusable repos", extra={"n": len(skipped), "ids": skipped[:20]})
-        recs = [r for r in recs if r["repo_url"].lower() not in bad_repos]
-        recs.sort(key=lambda r: -(current_score(r) + adj[r["osv_id"]][0]))
+        recs = [r for r in recs if r["repo_url"].lower() not in bad_repos
+                and r["repo_url"].lower().rstrip("/") not in bad_repos]
+        # Injected parallel-path tasks are the measured breaker shape: pilot them ahead of mined candidates.
+        recs.sort(key=lambda r: -(current_score(r) + adj[r["osv_id"]][0]
+                                  + (1000 if (r.get("source") == "injected" or r.get("injection")) else 0)))
         picked, repos = [], set()
-        for r in recs:                      # diversity: at most one task per repository per pilot batch
-            repo = r["repo_url"].lower()
-            if repo in repos:
-                continue
-            repos.add(repo)
-            picked.append(r)
+        # diversity: at most one task per repository, and the languages balanced (PICK_ECOSYSTEMS, default all):
+        # each ecosystem gets at most ceil(N / #ecosystems) slots; leftover slots go to the next-best candidates.
+        allowed = [e.strip() for e in os.environ.get("PICK_ECOSYSTEMS", "").split(",") if e.strip()]
+        if allowed:
+            recs = [r for r in recs if r.get("ecosystem") in allowed]
+        ecos = sorted({r.get("ecosystem") for r in recs})
+        cap = -(-max_tasks // max(1, len(ecos)))
+        # measured: no fix of <= 5 source files ever broke a model (0/17); >= 6 files broke one in 3/17. So the first
+        # passes take only wide fixes; smaller ones only fill slots nothing wider can.
+        min_src = int(os.environ.get("MIN_PICK_SOURCE_FILES", "6"))
+        width = lambda r: ((r.get("screening") or {}).get("diff") or {}).get("counts", {}).get("source", 0)
+        per: dict = {}
+        for strict, wide in ((True, True), (False, True), (False, False)):
+            for r in recs:
+                repo = r["repo_url"].lower()
+                inj = r.get("source") == "injected" or r.get("injection")   # built deliberately: width is not its difficulty mechanism
+                if repo in repos or (strict and per.get(r.get("ecosystem"), 0) >= cap) or (wide and width(r) < min_src and not inj):
+                    continue
+                repos.add(repo)
+                per[r.get("ecosystem")] = per.get(r.get("ecosystem"), 0) + 1
+                picked.append(r)
+                if len(picked) >= max_tasks:
+                    break
             if len(picked) >= max_tasks:
                 break
         recs = picked
@@ -169,7 +223,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if only is not None and not only:
         log.warning("No buildable environments to generate tasks for")
         return 0
-    gen_argv = (["--only", *only] if only is not None else []) + ["--environments", str(env_dir), "--candidates", str(src), "--workers", str(min(args.workers, 3)),
+    gen_argv = (["--only", *only] if only is not None else []) + ["--environments", str(env_dir), "--candidates", str(src), "--workers", str(min(args.workers, 6)),
                 "--backend", cfg.task_gen_backend, "--claude-bin", cfg.claude_bin]
     if args.model or cfg.anthropic_model:
         gen_argv += ["--model", args.model or cfg.anthropic_model]
@@ -192,7 +246,7 @@ def current_score(rec: dict) -> int:
     from src.stage2_screening.screener import score
     scr = rec.get("screening") or {}
     if scr.get("diff") and "source_files" in scr["diff"]:
-        return score(scr["diff"], scr.get("repo") or {}) + int(scr.get("prior", 0) or 0)
+        return score(scr["diff"], scr.get("repo") or {}, rec) + int(scr.get("prior", 0) or 0)
     return int(scr.get("score", 0) or 0)
 
 
@@ -206,12 +260,14 @@ def _record_failures(cfg: Config, env_dir: Path, ids: list[str]) -> None:
             d = env_dir / osv_id
             if (d / "instruction.md").is_file():
                 continue
-            if (d / "safeguards_flagged.txt").is_file():
-                why = "Anthropic safeguards flagged the generation session (AUP); retired, not retried or rerouted"
-                state.mark(STAGE, osv_id, Status.REJECTED, why)
-                knowledge.record_outcome(cfg, osv_id, STAGE, "rejected_safeguards_flagged", why)
-                log.warning("Retired: safeguards flagged the session", extra={"osv_id": osv_id})
+            # deferred (a safeguards-flag cluster stopped this run): not the candidate's fault, so no strike
+            deferred = d / "generation_deferred.txt"
+            if deferred.is_file():
+                deferred.unlink()
+                log.info("Deferred, no strike", extra={"osv_id": osv_id})
                 continue
+            # a safeguards-flagged candidate is retired (task_generator writes generation_unsuitable.txt), never sent to
+            # any Claude model again
             if (d / "generation_unsuitable.txt").is_file():
                 why = "unsuitable: " + (d / "generation_unsuitable.txt").read_text().strip()[:200]
                 state.mark(STAGE, osv_id, Status.REJECTED, why)

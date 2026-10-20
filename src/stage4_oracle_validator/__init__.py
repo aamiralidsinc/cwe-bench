@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from src.common.config import Config
 
@@ -9,7 +10,8 @@ from src.common.config import Config
 def run(cfg: Config, args: argparse.Namespace) -> int:
     from src.stage4_oracle_validator.oracle_runner import main
 
-    argv = ["--workers", str(min(args.workers, 3))]       # heavy Docker builds: at most 3 tasks validated at once
+    # heavy Docker builds: cap from STAGE4_MAX_WORKERS (default 6 = one cycle; 3 builds used < 2 GB of the Docker VM)
+    argv = ["--workers", str(min(args.workers, int(os.environ.get("STAGE4_MAX_WORKERS", "6"))))]
     if args.skip_rubric:
         argv.append("--skip-rubric")
     if args.skip_probe:

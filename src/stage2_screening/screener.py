@@ -43,15 +43,20 @@ STAGE = "stage2_screening"
 GITHUB_API = "https://api.github.com"
 MAX_FILES_IN_COMMIT_API = 300   # GitHub truncates the files list at 300
 MAX_ATTEMPTS = 3
-MAX_TOTAL_CHANGED_LINES = 2500   # ~80k chars of diff, the generator's patch limit
+# the generator condenses large patches (prompt_patch_view), and the widest fixes are the ones that break the models
+MAX_TOTAL_CHANGED_LINES = int(__import__("os").environ.get("SCREEN_MAX_DIFF_LINES", "6000"))
 
 ROOT_MANIFESTS = {
     "PyPI": {"pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"},
     "npm": {"package.json"},
+    "Go": {"go.mod"},
+    "Packagist": {"composer.json"},
 }
 TEST_FILE_RE = {
     "PyPI": re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.py|conftest\.py)$"),
     "npm": re.compile(r"(\.(test|spec)\.[cm]?[jt]sx?$)|(^|/)__tests__/|(^|/)(test|tests)/[^/]+\.[cm]?[jt]sx?$"),
+    "Go": re.compile(r"_test\.go$"),
+    "Packagist": re.compile(r"(^|/)tests?/.+\.php$|[^/]+Tests?\.php$", re.I),
 }
 
 
@@ -117,6 +122,11 @@ class GitHubClient:
 TEMPLATE_RE = re.compile(r"\.(ejs|hbs|handlebars|mustache|jinja2?|j2|njk|tmpl|tpl|liquid|eta)$", re.IGNORECASE)
 
 
+IMPORT_LINE_RE = re.compile(
+    r"""^(import\b|from\s+[\w.]+\s+import\b|export\s+\*?\s*\{?.*\}?\s*from\s|const\s+\w+\s*=\s*require\(|"""
+    r"""use\s+[\w\\]+(\s+as\s+\w+)?;|(\w+\s+)?"[\w.\-]+(/[\w.\-]+)+"$|[()]$)""")
+
+
 def summarize_files(files: list[dict], ecosystem: str) -> dict[str, Any]:
     cats: dict[str, list[str]] = defaultdict(list)
     src_lines = 0
@@ -171,6 +181,16 @@ def evaluate_diff(files: list[dict], ecosystem: str, min_lines: int, max_lines: 
         if tmpl > s["source_lines"]:
             reasons.append(f"fix lives mostly in code-generation templates ({tmpl} template lines > "
                            f"{s['source_lines']} source lines)")
+        # A dependency swap (fork / bumped library + import-path rewrites) has no project logic to repair; the real fix
+        # lives in an external module the agent cannot see (nuclei GHSA-vxg7: forked goja, rubric-rejected).
+        if s["counts"].get("manifest"):
+            changed = [l for f in files if classify(f["filename"], ecosystem) == "source"
+                       for l in (f.get("patch") or "").splitlines()
+                       if l[:1] in "+-" and not l.startswith(("+++", "---")) and l[1:].strip()]
+            imports = [l for l in changed if IMPORT_LINE_RE.match(l[1:].strip())]
+            if changed and len(imports) >= 0.8 * len(changed):
+                reasons.append(f"dependency swap: {len(imports)}/{len(changed)} changed source lines are imports "
+                               "(the fix is in an external module)")
         if s["source_lines"] < min_lines:
             reasons.append(f"trivial fix ({s['source_lines']} source lines < {min_lines})")
         if s["source_lines"] > max_lines:
@@ -195,7 +215,44 @@ def evaluate_tree(tree: dict, ecosystem: str) -> Decision:
     return Decision(not reasons, reasons, info)
 
 
-def score(diff: dict[str, Any], tree: dict[str, Any]) -> int:
+# --------------------------------------------------------------------------- #
+# Lessons from 41 evaluated tasks (2026-10-20): candidate shapes that never produced a usable task. Applied to every
+# newly screened candidate and, with --prune, to the existing lake (screened.json). Evidence in skills/lessons_learned.md
+# and data/knowledge/solved_profile.md.
+# --------------------------------------------------------------------------- #
+SMALL_FIX_FILES, SMALL_FIX_LINES = 4, 60   # <=4 src files AND <=60 src lines: 0 usable of 14; no <=5-file fix broke both
+DOS_ONLY_CWES = {"400", "407", "409", "674", "770", "1284", "1333"}   # resource-exhaustion only: 0 usable (family: 0 of 7)
+DEAD_MONOREPO_RE = re.compile(   # never built or never validated here (payload: 5 failures)
+    r"github\.com/(payloadcms/payload|pydantic/pydantic-ai|vllm-project/vllm|flowiseai/flowise|[^/]+/reactpress|"
+    r"mermaid-js/mermaid|vitest-dev/vitest)/?$", re.I)
+# A producer (schema / serializer / loader / parser / config resolver) changed together with the check it feeds: the
+# measured second-strongest sibling kind (29% missed). Matched on the changed source files' names.
+PRODUCER_FILE_RE = re.compile(r"(schema|serializ|marshal|loader|(^|[/_.-])load|pars(e|er)|decod|codec|config|resolv|"
+                              r"normaliz|transform|convert|import|deserializ)", re.I)
+
+
+def lesson_rejects(rec: dict, diff: Optional[dict] = None) -> list[str]:
+    """Static dead-end rules (no pipeline state needed). A fix-bypass PAIR (original fix + its bypass fix, mined by
+    stage 1) is exempt from the small-fix rule: its combined change is the task, and the bypass place is one human
+    fixers already missed."""
+    from src.stage3_task_builder.task_generator import OFFENSIVE_REPO_RE
+    out = []
+    cwes = {c.upper().removeprefix("CWE-") for c in rec.get("cwe_ids") or []}
+    if cwes and cwes <= DOS_ONLY_CWES:
+        out.append(f"resource-exhaustion-only CWE ({', '.join(sorted(cwes))}): 0 usable tasks measured")
+    if DEAD_MONOREPO_RE.search(rec.get("repo_url") or ""):
+        out.append("monorepo that never built or validated here")
+    if OFFENSIVE_REPO_RE.search(rec.get("repo_url") or ""):
+        out.append("offensive-security tool repository (generation is safeguards-flagged; flagged candidates are retired)")
+    if diff and not rec.get("fix_pair"):
+        files, lines = (diff.get("counts") or {}).get("source", len(diff.get("source_files") or [])), diff.get("source_lines", 0)
+        if files <= SMALL_FIX_FILES and lines <= SMALL_FIX_LINES:
+            out.append(f"small one-place fix ({files} src files / {lines} src lines; <= {SMALL_FIX_FILES} files and "
+                       f"<= {SMALL_FIX_LINES} lines gave 0 usable tasks of 14)")
+    return out
+
+
+def score(diff: dict[str, Any], tree: dict[str, Any], rec: Optional[dict] = None) -> int:
     """Higher = better candidate for a hard, fair task. Calibrated on the measured results (skills/lessons_learned.md):
     every fix of <= 5 source files was solved by DeepSeek, the only task both models failed spans 8 files / 174 lines /
     4 dirs, and none of the 8 fixes of <= 3 files and <= 35 lines gave a usable task. So: reward breadth (files, dirs =
@@ -207,6 +264,31 @@ def score(diff: dict[str, Any], tree: dict[str, Any]) -> int:
     sc += 10 if 100 <= lines <= 400 else (5 if 40 <= lines < 100 else 0)
     sc -= 25 if files <= 3 and lines <= 35 else 0
     sc += 3 if tree.get("test_files_in_repo", 0) >= 5 else 0
+    # Parallel-implementation shape (measured 2026-10-19 over 37 evaluated tasks): raw width did NOT separate the 5
+    # model-breaking tasks from the 31 solved ones (10-21-file fixes were solved on the first attempt), but every
+    # breaker hid part of the root cause in a sibling place. The strongest static proxy: the fix changes a file of
+    # the SAME NAME in two different directories (two providers/renderers/strategies re-implementing one control).
+    by_name: dict[str, set] = {}
+    generic = {"index", "init", "__init__", "main", "mod", "utils", "util", "helpers", "types", "config", "constants"}
+    for p in diff["source_files"]:
+        parts = p.rsplit("/", 1)
+        stem = parts[-1].rsplit(".", 1)[0]
+        if stem.lower() in generic:   # index.js / __init__.py etc. recur in every directory and prove nothing
+            continue
+        by_name.setdefault(parts[-1], set()).add(parts[0] if len(parts) == 2 else "")
+    sc += 14 if any(len(ds) >= 2 for ds in by_name.values()) else 0
+    # the upstream fix also changed tests: pinned behaviour next to the fix = compatibility-contract material (tech 11)
+    sc += 4 if diff.get("test_files") else 0
+    # Structural pre-screen (2026-10-20 mining strategy): shapes that put part of the root cause in a REAL place.
+    srcs = diff.get("source_files") or []
+    producers = [p for p in srcs if PRODUCER_FILE_RE.search(PurePosixPath(p).name)]
+    if producers and len({str(PurePosixPath(p).parent) for p in srcs}) >= 2 and len(srcs) > len(producers):
+        sc += 10          # a producer changed together with the check it feeds, in different places
+    if rec:
+        if len(rec.get("fix_commits") or []) > 1:
+            sc += 8       # a multi-commit fix series: multi-place fixes often land as several commits
+        if rec.get("fix_pair"):
+            sc += 40      # fix-bypass pair: the bypass place is one the original human fixers demonstrably missed
     return sc
 
 
@@ -217,11 +299,19 @@ def screen_one(rec: dict, gh: GitHubClient, min_lines: int, max_lines: int, publ
                prior: Callable[[dict], int] = lambda r: 0, max_repo_mb: int = 0) -> Decision:
     owner_repo = rec["repo_url"].removeprefix("https://github.com/")
     eco = rec["ecosystem"]
+    early = lesson_rejects(rec)          # the rules that need no diff: decided before any GitHub call
+    if early:
+        return Decision(False, early)
     if len(rec.get("fix_commits") or []) > 1:
         # A consecutive fix series: judge the combined change (pre-patch..last fix) and the EARLIEST commit's date.
         commit = gh.get_json(f"/repos/{owner_repo}/compare/{rec['pre_patch_commit']}...{rec['fixed_commit']}",
                              f"compare_{rec['pre_patch_commit'][:12]}_{rec['fixed_commit'][:12]}")
-        dates = [d for cm in commit.get("commits", []) for x in ("author", "committer")
+        cms = commit.get("commits", [])
+        if rec.get("fix_pair"):
+            # A fix-bypass pair: the hidden place is the BYPASS fix, so the recency cutoff applies to it. The original
+            # fix may be older; it is the reported route the agent is shown anyway.
+            cms = [cm for cm in cms if (cm.get("sha") or "").lower() == rec["fixed_commit"].lower()] or cms[-1:]
+        dates = [d for cm in cms for x in ("author", "committer")
                  for d in [((cm.get("commit") or {}).get(x) or {}).get("date")] if d]
     else:
         commit = gh.get_json(f"/repos/{owner_repo}/commits/{rec['fixed_commit']}", f"commit_{rec['fixed_commit']}")
@@ -233,6 +323,9 @@ def screen_one(rec: dict, gh: GitHubClient, min_lines: int, max_lines: int, publ
     d = evaluate_diff(commit.get("files", []), eco, min_lines, max_lines)
     if not d.accepted:
         return d
+    dead = lesson_rejects(rec, d.info)
+    if dead:
+        return Decision(False, dead, {"diff": d.info})
     repo_info = gh.get_json(f"/repos/{owner_repo}", f"repo_{owner_repo.replace('/', '__')}")
     size_mb = int(repo_info.get("size", 0)) / 1024          # GitHub reports KB (repo incl. history)
     if max_repo_mb and size_mb > max_repo_mb:
@@ -243,8 +336,8 @@ def screen_one(rec: dict, gh: GitHubClient, min_lines: int, max_lines: int, publ
     if not t.accepted:
         return Decision(False, t.reasons, {"diff": d.info, "repo": t.info})
     bonus = prior(rec)
-    return Decision(True, [], {"diff": d.info, "repo": t.info, "score": score(d.info, t.info) + bonus, "prior": bonus,
-                              "fix_commit_date": commit_date})
+    return Decision(True, [], {"diff": d.info, "repo": t.info, "score": score(d.info, t.info, rec) + bonus,
+                               "prior": bonus, "fix_commit_date": commit_date})
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -345,14 +438,63 @@ def screen(cfg: Config, args: argparse.Namespace, state: Optional[StateManager])
     return 0 if kept else 1
 
 
+def history_rejects(cfg: Config, state: StateManager, by_id: dict[str, dict]) -> dict[str, str]:
+    """repo_url -> reason, for repos the pipeline's own history ruled out (needs state; not a screening-time rule)."""
+    from src.stage3_task_builder.task_generator import flagged_repos
+    out = {repo: "repo has a safeguards-flagged candidate (flagged candidates are retired)"
+           for repo in flagged_repos(cfg.stage_dir(3), by_id)}
+    for k in state.keys("stage3_task_builder", Status.REJECTED):
+        det = (state.get("stage3_task_builder", k).detail or "").lower()
+        if k in by_id and ("docker build" in det or "build timed out" in det or "unbuildable" in det):
+            out.setdefault(by_id[k]["repo_url"].lower().rstrip("/"), f"repo proven unbuildable here ({k})")
+    return out
+
+
+def prune_lake(cfg: Config, args: argparse.Namespace, state: StateManager, dry_run: bool = False) -> dict[str, list[str]]:
+    """Re-apply the lessons to the existing lake: move dead-end candidates from screened.json to rejected.json (with the
+    reason) and re-score the rest. Candidates the pipeline already used (stage 3+) are never touched."""
+    lake = load_json(args.output, {}).get("vulnerabilities", [])
+    by_id = {r["osv_id"]: r for r in lake}
+    used = set().union(*(state.keys(s) for s in ("stage3_task_builder", "stage4_oracle_validator", "stage5_evaluator")))
+    repos = history_rejects(cfg, state, by_id)
+    removed: dict[str, list[str]] = {}
+    kept = []
+    for r in lake:
+        diff = (r.get("screening") or {}).get("diff") or {}
+        why = [] if r["osv_id"] in used else lesson_rejects(r, diff)
+        repo_why = repos.get(r["repo_url"].lower().rstrip("/"))
+        if repo_why and r["osv_id"] not in used:
+            why.append(repo_why)
+        if why:
+            removed[r["osv_id"]] = why
+            continue
+        scr = r.get("screening") or {}
+        if diff.get("source_files") is not None:
+            scr["score"] = score(diff, scr.get("repo") or {}, r) + int(scr.get("prior", 0) or 0)
+        kept.append(r)
+    if dry_run:
+        return removed
+    rejected_all = load_json(args.rejected, {})
+    for oid, why in removed.items():
+        rejected_all[oid] = ["pruned 2026-10-20: " + w for w in why]
+        state.mark(STAGE, oid, Status.REJECTED, "pruned: " + "; ".join(why)[:300])
+    write_json(args.output, {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                             "count": len(kept), "vulnerabilities": kept})
+    write_json(args.rejected, rejected_all)
+    reasons = Counter(w.split(" (")[0] for ws in removed.values() for w in ws)
+    log.info("Lake pruned", extra={"before": len(lake), "removed": len(removed), "kept": len(kept),
+                                   "used_untouched": len(used & set(by_id)), "reasons": dict(reasons)})
+    return removed
+
+
 def parse_args(argv: Optional[list[str]], cfg: Config) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stage 2: screen mined candidates")
     p.add_argument("--input", type=Path, default=cfg.data_dir / "01_mined" / "osv_candidates.json")
     p.add_argument("--output", type=Path, default=cfg.data_dir / "02_screened" / "screened.json")
     p.add_argument("--rejected", type=Path, default=cfg.data_dir / "02_screened" / "rejected.json")
     p.add_argument("--min-lines", type=int, default=4)
-    p.add_argument("--max-lines", type=int, default=400)
-    p.add_argument("--max-per-repo", type=int, default=3)
+    p.add_argument("--max-lines", type=int, default=int(__import__("os").environ.get("SCREEN_MAX_SOURCE_LINES", "1200")))
+    p.add_argument("--max-per-repo", type=int, default=int(__import__("os").environ.get("SCREEN_MAX_PER_REPO", "5")))
     p.add_argument("--max-repo-mb", type=int, default=int(__import__("os").environ.get("MAX_REPO_MB", "150")),
                    help="reject repositories larger than this (GitHub size incl. history); 0 = no limit (default 150)")
     p.add_argument("--published-after", metavar="YYYY-MM-DD",
@@ -360,6 +502,9 @@ def parse_args(argv: Optional[list[str]], cfg: Config) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--github-rps", type=float, default=None)
     p.add_argument("--ignore-state", action="store_true")
+    p.add_argument("--prune", action="store_true",
+                   help="re-apply the dead-end lessons to the existing lake (screened.json -> rejected.json); no GitHub calls")
+    p.add_argument("--dry-run", action="store_true", help="with --prune: report what would be removed, change nothing")
     args = p.parse_args(argv)
     if args.github_rps is None:
         args.github_rps = 3.0 if cfg.github_token else 0.5
@@ -374,6 +519,16 @@ def main(argv: Optional[list[str]] = None, cfg: Optional[Config] = None) -> int:
     if not cfg.github_token:
         log.warning("No GITHUB_TOKEN: 60 GitHub calls/hour; screening will stall on large inputs")
     state = None if args.ignore_state else StateManager(cfg.state_db)
+    if args.prune:
+        if state is None:
+            log.error("--prune needs the pipeline state (to leave used candidates untouched)")
+            return 2
+        try:
+            removed = prune_lake(cfg, args, state, dry_run=args.dry_run)
+            print(f"{'would remove' if args.dry_run else 'removed'} {len(removed)} candidates")
+            return 0
+        finally:
+            state.close()
     try:
         return screen(cfg, args, state)
     except KeyboardInterrupt:

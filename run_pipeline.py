@@ -59,7 +59,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     s1 = p.add_argument_group("stage 1")
     s1.add_argument("--limit", type=int, default=50, help="new vulnerabilities to mine (default 50, scale to 400)")
-    s1.add_argument("--ecosystems", nargs="+", choices=["PyPI", "npm"])
+    s1.add_argument("--ecosystems", nargs="+", choices=["PyPI", "npm", "Go", "Packagist"])
     s1.add_argument("--sources", nargs="+", choices=["osv", "ghsa", "huntr"],
                     help="stage 1 feeds (default: osv ghsa huntr, interleaved)")
     s1.add_argument("--ignore-state", action="store_true")
@@ -98,6 +98,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     s6.add_argument("--skip-final-oracle", action="store_true", help="package without re-running the oracle on the final copy")
 
     args = p.parse_args(argv)
+    if args.only:      # accept "A B" / "A,B" in one argument too (zsh does not word-split an unquoted $IDS)
+        import re as _re
+        args.only = [x for v in args.only for x in _re.split(r"[\s,]+", v) if x]
     if args.batch:
         args.from_stage, args.to_stage = args.from_stage or 1, args.to_stage or 6
         args.max_tasks = args.max_tasks or args.batch

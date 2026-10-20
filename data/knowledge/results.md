@@ -470,3 +470,471 @@ counts: {"rejected_too_easy": 2}
 | GHSA-q2xc-rrxj-58x9 | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
 | GHSA-w3v8-gmh9-3wv7 | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
 
+## 2026-10-16T15:06:45Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-f65p-4m7j-42xc | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+
+## 2026-10-16T15:22:36Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-f65p-4m7j-42xc | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 883 (from 15 candidate files); fix checks: shallow leaves 6/8 security tests open, removal b |
+
+## 2026-10-16T15:41:45Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 2, "failed_oracle": 4, "rejected": 1, "regenerate": 2, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-376h-93r7-7g6f | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| GHSA-c4c3-pg64-4m4v | REJECTED | oracle fails once the existing-test set is enforced: oracle does not pass its own tests (reward [0.99], failing: ['packages/mermaid/src/config.spec.ts::packages |
+| GHSA-c7q8-3ch8-vqpv | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 254 (from 15 candidate files); fix checks: shallow leaves 6/10 security tests open, removal  |
+| GHSA-f65p-4m7j-42xc | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 883 (from 15 candidate files); fix checks: shallow leaves 6/8 security tests open, removal b |
+| GHSA-gqvv-2mrq-wpjv | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 59 (from 4 candidate files); fix checks: shallow leaves 1/4 security tests open, removal bre |
+| GHSA-hwr6-493r-vm6h | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_custom_compiler_object_schema', '::test_functional_custom_compiler_object_sc |
+| GHSA-pfvf-fwfp-25mp | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| GHSA-x78j-v8h9-3j2q | REJECTED | rubric: Prompt security tests catch only `Exception`, so a parse-time rejection through argparse (`SystemExit`) fails the test even though the docstring claims  |
+| PYSEC-2026-3869 | REJECTED | rubric: test_functional_self_referential_but_noncyclic_units_converts uses the mixed rule `S -> S 'a'`, which chomsky_normal_form rejects with ValueError ('Cann |
+
+## 2026-10-16T16:28:17Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-pfvf-fwfp-25mp | REJECTED | oracle run had no verdict: EnvironmentStartTimeoutError: Environment start timed out after 1200.0 seconds |
+
+## 2026-10-16T16:32:48Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-hwr6-493r-vm6h | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 6; repos whose test runner we cannot run yet end here too) |
+| PYSEC-2026-3869 | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 42 (from 5 candidate files); fix checks: shallow leaves 3/5 security tests open, removal bre |
+
+## 2026-10-16T16:38:14Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 4}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-c7q8-3ch8-vqpv | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+| GHSA-gqvv-2mrq-wpjv | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+| GHSA-f65p-4m7j-42xc | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+| PYSEC-2026-3869 | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-16T18:56:45Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-pfvf-fwfp-25mp | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| GHSA-x937-hj6v-793p | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 399 (from 8 candidate files); fix checks: shallow leaves 3/7 security tests open, removal br |
+
+## 2026-10-16T20:34:02Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-337j-9hxr-rhxg | REJECTED | oracle run had no verdict: RuntimeError: Docker compose command failed for environment ghsa-337j-9hxr-rhxg. Command: docker compose --project-name harbor_task__ |
+
+## 2026-10-16T23:50:36Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 2, "failed_oracle": 1, "rejected": 0, "regenerate": 6, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-3753-m2x2-q623 | REJECTED | rubric: The oracle blocks external links by default ('externalLinkPolicy' defaults to blocked, and its own test asserts the https URL is absent from the blocked |
+| GHSA-5vf6-jrqr-78fj | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_public_ip', '::test_functional_public_ip', '::test_functional_public_ip_othe |
+| GHSA-856c-92hv-3vxx | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 229 (from 15 candidate files); fix checks: shallow leaves 6/8 security tests open, removal b |
+| GHSA-92cr-jxw4-5wjg | REJECTED | rubric: Tests require the undisclosed JWT claim name `tokenType` and the oracle's exact string values ('access', 'refresh', 'collabora_online', 'only_office', . |
+| GHSA-p63j-vcc4-9vmv | REJECTED | rubric: The security tests call the patched handler functions directly with fabricated contexts instead of going through the browser RPC command entry point.; T |
+| GHSA-rf44-j88r-hh8c | REJECTED | isolation audit: 1 added fix block(s) already present in the vulnerable tree, e.g. 'wantStatus:         http.StatusBadRequest,\nwantReachedBackend: false,\n},\n |
+| GHSA-wmw4-mw6x-6vfm | REJECTED | rubric: The tests call the patched service `findAll` methods directly instead of going through the HTTP route or controller, so a valid fix at the controller or |
+| GHSA-x3hf-7cj6-3r4m | REJECTED | rubric: Tests require rejecting `extra: {"foo": "bar"}`, a benign option that neither loads code nor overrides the connection target. The report gives no basis  |
+| PYSEC-2026-3819 | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 211 (from 15 candidate files); fix checks: shallow leaves 4/6 security tests open, removal b |
+
+## 2026-10-17T00:29:40Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 2, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-32gc-64m7-hj7v | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| GHSA-337j-9hxr-rhxg | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 10; repos whose test runner we cannot run yet end here too) |
+| PYSEC-2026-3569 | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_graphql_permitted', '::test_functional_graphql_permitted', '::test_functiona |
+
+## 2026-10-17T03:01:20Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"done": 0, "failed": 1, "accepted": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-856c-92hv-3vxx | accepted | deepseek: [0.99, 0.99, 0.99] ; mimo: [0.99, 0.99, 0.99] | every attempt is a counted model failure on every model {'over_correction': 6} |
+| PYSEC-2026-3819 | failed | deepseek: [] ; mimo: [] | incomplete attempts (errors per model): {'deepseek': 1, 'mimo': 1} |
+
+## 2026-10-17T05:07:28Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 4, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-3753-m2x2-q623 | REJECTED | oracle does not pass its own tests (reward [0.5, 0.5], failing: ['::test_functional_bold_formatting_rendered', '::test_functional_bold_formatting_rendered', ':: |
+| GHSA-92cr-jxw4-5wjg | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_valid_collabora_editor_accepted', '::test_functional_valid_collabora_editor_ |
+| GHSA-p63j-vcc4-9vmv | REJECTED | oracle does not pass its own tests (reward [0.5, 0.5], failing: ['::test_functional_screenshot_saves_to_nested_permitted_path', '::test_functional_screenshot_sa |
+| GHSA-x3hf-7cj6-3r4m | REJECTED | rubric: Security tests check the node's stored config (result.config[...]) rather than what actually reaches the DataSource, so a correct fix that sanitizes at  |
+| PYSEC-2026-3569 | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_graphql_permitted', '::test_functional_graphql_permitted', '::test_functiona |
+
+## 2026-10-17T06:10:12Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 2, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-3753-m2x2-q623 | REJECTED | rubric: The harness waits only one microtask (`await Promise.resolve()`) and falls back to the last posted message, so results depend on timing and can attribut |
+| GHSA-92cr-jxw4-5wjg | REJECTED | oracle does not pass its own tests (reward [0.75, 0.75], failing: ['::test_functional_valid_collabora_editor_accepted', '::test_functional_valid_collabora_edito |
+| GHSA-x3hf-7cj6-3r4m | REJECTED | rubric: Security tests check whether the key exists (hasOwnProperty) instead of what value reaches the connection layer, so a valid fix that sets entities/subsc |
+| PYSEC-2026-3569 | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_graphql_mutation_permitted', '::test_functional_graphql_mutation_permitted', |
+
+## 2026-10-17T06:47:53Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-92cr-jxw4-5wjg | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 171 (from 15 candidate files); fix checks: shallow leaves 3/6 security tests open, removal b |
+
+## 2026-10-17T07:03:47Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-92cr-jxw4-5wjg | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-17T08:13:11Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 2, "failed_oracle": 3, "rejected": 1, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-32gc-64m7-hj7v | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 133 (from 15 candidate files); fix checks: shallow leaves 5/6 security tests open, removal b |
+| GHSA-337j-9hxr-rhxg | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 485 (from 10 candidate files); fix checks: shallow leaves 3/5 security tests open, removal b |
+| GHSA-376h-93r7-7g6f | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| GHSA-5vf6-jrqr-78fj | REJECTED | rubric: The runtime test reaches the bug via a test-only Addon subclass calling fetchRetry directly, not a real provider or AddonService's dispatch path.; The r |
+| GHSA-p63j-vcc4-9vmv | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 3; repos whose test runner we cannot run yet end here too) |
+| GHSA-rf44-j88r-hh8c | REJECTED | isolation audit: 1 added fix block(s) already present in the vulnerable tree, e.g. 'wantStatus:         http.StatusBadRequest,\nwantReachedBackend: false,\n},\n |
+
+## 2026-10-18T15:30:26Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-32gc-64m7-hj7v | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-18T16:22:05Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| PYSEC-2026-3819 | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-18T19:34:45Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-wmw4-mw6x-6vfm | REJECTED | rubric: The tests call the patched service `findAll` methods directly instead of going through the HTTP route or controller, so a valid fix at the controller or |
+
+## 2026-10-18T20:08:53Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-wmw4-mw6x-6vfm | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_article_title_filter', '::test_functional_article_title_filter', '::test_fun |
+
+## 2026-10-18T22:45:26Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-6x6c-w9w9-hv4h | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 168 (from 11 candidate files); fix checks: shallow leaves 3/4 security tests open, removal b |
+| GHSA-g53w-w6mj-hrpp | REJECTED | oracle does not pass its own tests (reward [0.9167, 0.9167], failing: ['::test_functional_custom_client_headers_still_forwarded', '::test_functional_custom_clie |
+
+## 2026-10-18T23:57:40Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"done": 0, "needs_review": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-6x6c-w9w9-hv4h | needs_review | deepseek: [0.9167, 0.9167, 0.8333] ; mimo: [0.9167, 0.9167, 0.9167] | deepseek: 1/3 attempts are counted model failures; deepseek/harbor_task__h6xwkEn: step 114: command touches grading files ('command": "ls /; ls /opt 2>/dev/null |
+
+## 2026-10-19T00:24:53Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-g53w-w6mj-hrpp | REJECTED | rubric: `_SESSION_SEC` calls `JWTManager.Validate` directly instead of using the declared `RouteMCPRequest` entry point.; `_SESSION_SEC` hardcodes the oracle-ad |
+
+## 2026-10-19T02:25:52Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-g53w-w6mj-hrpp | REJECTED | oracle does not pass its own tests (reward [0.75, 0.75], failing: ['::test_functional_client_headers_forwarded_on_backend_init', '::test_functional_client_heade |
+| GHSA-mwwr-p57h-56pf | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 273 (from 7 candidate files); fix checks: shallow leaves 7/8 security tests open, removal br |
+
+## 2026-10-19T02:47:39Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-mwwr-p57h-56pf | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-19T09:44:44Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 1, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-376h-93r7-7g6f | REJECTED | fix checks: FEATURE-REMOVAL fix passes every functional test: over-blocking is not caught |
+| GHSA-p63j-vcc4-9vmv | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 1 (from 3 candidate files); fix checks: shallow leaves 3/4 security tests open, removal brea |
+| GHSA-rf44-j88r-hh8c | REJECTED | coverage: reference fix minus pkg/config/static/static_config.go still scores 1.0 |
+
+## 2026-10-19T09:58:07Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-p63j-vcc4-9vmv | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-19T12:49:51Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 2, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-fm3f-ch8h-qw8q | REJECTED | fix checks: ALTERNATIVE correct fix scores 0 |
+| GHSA-vxg7-f2jj-jmqm | REJECTED | rubric: The oracle fix is a dependency swap to forked goja/goja_nodejs modules with only import-path rewrites; no project logic changes, and the fix lives in an |
+
+## 2026-10-19T13:10:47Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-fm3f-ch8h-qw8q | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 43 (from 1 candidate files); fix checks: shallow leaves 5/6 security tests open, removal bre |
+
+## 2026-10-19T14:12:52Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"done": 0, "accepted": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-fm3f-ch8h-qw8q | accepted | deepseek: [0.9845, 0.9845, 0.9845] ; mimo: [0.9845, 0.99, 0.9845] | every attempt is a counted model failure on every model {'over_correction': 6} |
+
+## 2026-10-19T15:37:24Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 4, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-54mm-6729-r5wp | REJECTED | rubric: Hidden test requires RequiresPermission(global: true) gates on six company-wide project, user and plugin listing methods that the report never mentions; |
+| GHSA-8gr3-5j6f-25gp | REJECTED | rubric: Four of six security tests (both API-mapper tests, the schema test and the navigate test) call code the patch edits directly (mapToDto, inAppControlZodS |
+| GHSA-8rgj-vrfr-6hqr | REJECTED | rubric: The security assertions can never pass. The harness replaces DashboardAPIError and RestAPIError with plain Error subclasses that Effect cannot run as er |
+| GHSA-mw8m-398g-h89w | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_api_tag_lookup_by_identifier_still_works', '::test_functional_api_tag_lookup |
+
+## 2026-10-19T16:28:57Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 2, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-8gr3-5j6f-25gp | REJECTED | rubric: The hidden harness stubs `@novu/application-generic` and mocks the inbox utils barrel with only the exports the oracle needs. A reasonable fix that expo |
+| GHSA-8rgj-vrfr-6hqr | REJECTED | isolation audit: 1 added fix block(s) already present in the vulnerable tree, e.g. "import {\ntype AvailablePermissionRanks,\navailablePermissionRanks,\n} from  |
+| GHSA-mw8m-398g-h89w | REJECTED | oracle does not pass its own tests (reward [0.8333, 0.8333], failing: ['::test_functional_api_tag_lookup_still_works', '::test_functional_api_tag_lookup_still_w |
+
+## 2026-10-19T17:52:46Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-8gr3-5j6f-25gp | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_control_schema_accepts_web_and_local_destinations', '::test_functional_contr |
+| GHSA-mw8m-398g-h89w | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 41 (from 15 candidate files); fix checks: shallow leaves 3/6 security tests open, removal br |
+
+## 2026-10-19T18:18:04Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-mw8m-398g-h89w | rejected_too_easy | deepseek: [1.0] ; mimo: [] | solved by deepseek |
+
+## 2026-10-19T19:21:21Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-8rgj-vrfr-6hqr | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_admin_can_invite_editor', '::test_functional_admin_can_invite_editor', '::te |
+
+## 2026-10-19T20:41:06Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-6x6c-w9w9-hv4h | REJECTED | rubric: Registry security/functional tests instantiate `TerraformRegistryGetter` directly, which the oracle diff indicates was unwired dead code before the fix  |
+| GHSA-fm3f-ch8h-qw8q | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 41 (from 1 candidate files); fix checks: shallow leaves 5/6 security tests open, removal bre |
+
+## 2026-10-19T20:46:42Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 2, "rejected": 0, "regenerate": 4, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-54mm-6729-r5wp | REJECTED | rubric: Self-contradictory hidden tests: scenario 2 of _TICKETS_EDIT_BODY has identical setup (caller only in project 1, parent ticket 5 in project 9) but the s |
+| GHSA-6h7w-v2xr-mqvw | REJECTED | isolation audit: Dockerfile copies something other than repo/: ['COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer'] |
+| GHSA-8rgj-vrfr-6hqr | REJECTED | oracle does not pass its own tests (reward [0.0, 0.0], failing: ['::test_functional_admin_can_invite_editor', '::test_functional_admin_can_invite_editor', '::te |
+| GHSA-f3f2-mcxc-pwjx | REJECTED | oracle does not pass its own tests (reward [0.9167, 0.9167], failing: ['::test_functional_mysql_select_keeps_supported_operators', '::test_functional_mysql_sele |
+| GHSA-v2f8-6655-7grj | REJECTED | tests bound to the reference design (names that exist only in the reference fix: ['VIBE_TRADING_ALLOWED_FILE_ROOTS', 'VIBE_TRADING_ALLOWED_RUN_ROOTS', 'VIBE_TRA |
+| GHSA-w3rp-4cm2-4wgc | REJECTED | tests bound to the reference design (names that exist only in the reference fix: ['SECURITY']) |
+
+## 2026-10-19T21:46:19Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-fm3f-ch8h-qw8q | rejected_too_easy | deepseek: [1.0] ; mimo: [1.0] | solved by deepseek, mimo |
+
+## 2026-10-19T22:37:14Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 2, "failed_oracle": 0, "rejected": 1, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-54mm-6729-r5wp | REJECTED | rubric: test_security_company_wide_listings_require_entitlement and the app-only probe are static docblock/source-grep heuristics (zz_blocked) rather than behav |
+| GHSA-f3f2-mcxc-pwjx | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 286 (from 15 candidate files); fix checks: shallow leaves 4/6 security tests open, removal b |
+| GHSA-v2f8-6655-7grj | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 133 (from 10 candidate files); fix checks: shallow leaves 5/6 security tests open, removal b |
+| GHSA-w3rp-4cm2-4wgc | REJECTED | rubric: Hidden Go source does not compile: `[]sdk.Msg{authz.NewMsgExec(signerAddr, inner)}` and `[]sdk.Msg{inner}` use the value returned by authz.NewMsgExec, b |
+
+## 2026-10-19T23:38:37Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"rejected_too_easy": 2}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| GHSA-f3f2-mcxc-pwjx | rejected_too_easy | deepseek: [1.0] ; mimo: [1.0] | solved by deepseek, mimo |
+| GHSA-v2f8-6655-7grj | rejected_too_easy | deepseek: [1.0] ; mimo: [1.0] | solved by deepseek, mimo |
+
+## 2026-10-20T00:02:12Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 1, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-w3rp-4cm2-4wgc | REJECTED | rubric: Security assertions are inverted: `_expect_refused` requires `returncode != 0` and `--- FAIL: <case>`, yet each Go security case fails only when the att |
+
+## 2026-10-20T00:55:01Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-6h7w-v2xr-mqvw | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 0; repos whose test runner we cannot run yet end here too) |
+| GHSA-hfvx-25r5-qc3w | REJECTED | tests bound to the reference design (probing for guessed fields/attributes: ['returncode']) |
+
+## 2026-10-20T01:33:27Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-hfvx-25r5-qc3w | REJECTED | fix checks: SHALLOW fix: no security test passes, so it does not even block the reported trigger |
+
+## 2026-10-20T02:18:37Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 1, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-hfvx-25r5-qc3w | REJECTED | rubric: F6 (`test_functional_save_reload_export`) expects the object id 'panel & frame' to survive canvas.toObject() -> loadFromJSON() -> toSVG(); FabricObject. |
+
+## 2026-10-20T03:59:40Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-9m84-wc28-w895 | REJECTED | rubric: Security tests never go through the declared HTTP entry points; they instantiate the internal session service with a hand-rolled DI container and call t |
+
+## 2026-10-20T04:06:16Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-9m84-wc28-w895 | REJECTED | tests bound to the reference design (probing for guessed fields/attributes: ['returncode']) |
+
+## 2026-10-20T04:29:35Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-9m84-wc28-w895 | REJECTED | tests bound to the reference design (probing for guessed fields/attributes: ['returncode']) |
+
+## 2026-10-20T05:27:34Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 1, "failed": 1}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-9m84-wc28-w895 | REJECTED | tests bound to the reference design (probing for guessed fields/attributes: ['returncode']) |
+| GHSA-c78m-c52x-jgwp | REJECTED | rubric: PHP probe harness instantiates ZzHiddenArrayBackend and TransientMemoryBackend with zero constructor arguments; AbstractBackend::__construct($context, a |
+| GHSA-m382-6jw4-fmp6 | REJECTED | isolation audit: 3 added fix block(s) already present in the vulnerable tree, e.g. '"@internal/cfg-typescript": "workspace:*",\n"@internal/cfg-vitest": "workspa |
+
+## 2026-10-20T05:47:56Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-c78m-c52x-jgwp | REJECTED | oracle does not pass its own tests (reward [0.3333, 0.3333], failing: ['::test_functional_cache_miss_tags_lifetime_and_removal', '::test_functional_cache_miss_t |
+
+## 2026-10-20T06:05:30Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-c78m-c52x-jgwp | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+
+## 2026-10-20T07:24:39Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-2q76-m6w6-qgc6 | REJECTED | oracle does not pass its own tests (reward [0.8333, 0.8333], failing: ['::test_functional_api_key_auth_on_other_collections_still_works', '::test_functional_api |
+

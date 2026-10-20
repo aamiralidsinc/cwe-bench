@@ -94,7 +94,7 @@ class Config:
             data_dir=(data_dir or Path(env("CWE_DATA_DIR") or PROJECT_ROOT / "data")).resolve(),
             github_token=env("GITHUB_TOKEN") or None,
             anthropic_api_key=env("ANTHROPIC_API_KEY") or None,
-            anthropic_model=env("ANTHROPIC_MODEL", "claude-opus-5-5"),
+            anthropic_model=env("ANTHROPIC_MODEL", "claude-fable-5-1"),
             claude_bin=env("CLAUDE_BIN", "claude"),
             task_gen_backend=env("TASK_GEN_BACKEND", "cli"),
             harbor_bin=env("HARBOR_BIN") or _default_harbor(),
