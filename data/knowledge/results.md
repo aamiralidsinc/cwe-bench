@@ -938,3 +938,12 @@ counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 0, "failed": 
 |---|---|---|
 | GHSA-2q76-m6w6-qgc6 | REJECTED | oracle does not pass its own tests (reward [0.8333, 0.8333], failing: ['::test_functional_api_key_auth_on_other_collections_still_works', '::test_functional_api |
 
+## 2026-10-20T22:27:51Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 1, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-jmg2-rcxh-w8q3 | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 7; repos whose test runner we cannot run yet end here too) |
+| PYSEC-2026-3837 | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 62 (from 15 candidate files); fix checks: shallow leaves 5/6 security tests open, removal br |
+
