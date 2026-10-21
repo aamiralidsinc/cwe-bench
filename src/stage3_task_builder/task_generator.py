@@ -432,6 +432,12 @@ Return ONLY these four blocks, nothing else:
                WITHOUT each one and a test must then fail>"],
 "unrelated_files": ["<every OTHER reference-fix source file (refactor, typing, logging, an unrelated feature bundled in the
                     commit). Every source file of the reference patch must appear in fix_places or here>"],
+"self_attack": {{
+"naive_fix": "<the repair YOU would make from the report alone, first 20 minutes>",
+"naive_fix_files": ["<repo-relative files that repair touches = the shallow check patch's files>"],
+"over_broad_fix": "<the sledgehammer fix you would reach for when unsure = the removal check patch>",
+"why_naive_fails": "<which test_security_* fails it, through which hidden place and mechanism>"
+}},
 "test_justifications": {{
 "<test_function_name>": "<exact sentence or quote from instruction.md requiring this test's assertion>"
 }}
@@ -615,6 +621,51 @@ DESIGN_CONTRACT = """
    first file. If the whole fix is one shared choke point, the models will solve the task.
 """
 
+# Self-break protocol (2026-10-21): the generator is DeepSeek, which is also a target model. Before this protocol, 0 of 15
+# DeepSeek-designed tasks were accepted and every one that reached a trial was solved. The design must predict the
+# generator's own first repair and prove - through the executed shallow/removal check patches - that it fails.
+SELF_BREAK = """
+
+# Self-break protocol (you are ALSO one of the agents this task will be tested on)
+The target agents are DeepSeek V4.1 Flash and MiMo-V2.6-Pro, given ONLY your report, the repository and 2 hours, offline.
+You are the same DeepSeek model: a task you can design without thinking hard is one you will solve (measured: 0 of 15
+DeepSeek-designed tasks accepted before this protocol; every one that reached a trial was solved). Before writing:
+1. SOLVE IT YOURSELF FIRST. Read only your draft report and write down the repair you would make in your first 20
+   minutes: which files you would open (grep for the symptom's words), which guard you would add, where. That is
+   `naive_fix`. Measured habit of both agents: fix the reported route, re-run the reported example, see it blocked, STOP
+   ("it thought it was done") - on the tasks DeepSeek failed it closed 5 of 6 variants in all 3 runs.
+2. MAKE THAT FIX FAIL. At least one trap place lies OUTSIDE naive_fix_files and is reached by a test through its own entry
+   point, using a top mechanism: M4 feature-absent, M6 producer off the check's path, M2 second real implementation,
+   M10 wrong object, M5 merged/defaults route. Stack two DIFFERENT mechanisms where the code allows (the only task that
+   broke both models stacked M4 + M10/M11 + M5 + a coupled visible value).
+3. MAKE THE OVER-BROAD FIX FAIL. Write down the sledgehammer you would reach for when unsure (reject the whole input
+   class, disable the feature, escape everything). That is `over_broad_fix`; a functional test of a feature named under
+   "what must keep working" must fail on it (MiMo's measured failure: hole closed, legitimate use broken).
+4. PROVE IT WITH THE CHECK PATCHES. The `shallow` check patch MUST BE your naive_fix (edits only in naive_fix_files) and
+   the `removal` check patch MUST BE your over_broad_fix. Stage 4 executes both against your tests: if your own likely
+   repair passes, the task is rejected before any trial.
+5. STAY FAIR. Everything a test asserts must follow from a sentence of the report - you will quote that sentence for
+   every test. Difficulty comes from WHERE the root cause lives, never from requirements the report does not state.
+Record it in task_metadata_json: "self_attack": {"naive_fix": "<2-3 sentences>", "naive_fix_files": ["<repo paths>"],
+"over_broad_fix": "<1-2 sentences>", "why_naive_fails": "<which test fails it, through which place and mechanism>"}.
+"""
+
+
+def approved_plan_section(env_dir: Path) -> str:
+    """The design the pre-build plan gate approved (src/stage3_task_builder/plan_gate.py): generation builds THIS design."""
+    try:
+        gate = json.loads((env_dir / "plan_gate.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    plan = gate.get("plan") if gate.get("verdict") == "proceed" else None
+    if not isinstance(plan, dict):
+        return ""
+    notes = (gate.get("review") or {}).get("required_changes") or []
+    extra = ("\nThe reviewer requires these changes:\n" + "\n".join(f"- {n}" for n in notes)) if notes else ""
+    return ("\n\n# Approved design plan (passed the pre-build review and the self-solve probe)\n"
+            "Build THIS design. You may refine details, but do not drop a hidden place or a mechanism, and do not "
+            "describe a hidden place in the report.\n```json\n" + json.dumps(plan, indent=2)[:8000] + "\n```" + extra + "\n")
+
 
 def stage4_checks_text() -> str:
     """The exact checks stage 4 applies, so the first draft is written to pass them (instead of learning by rejection)."""
@@ -794,7 +845,7 @@ def build_context(env_dir: Path, candidates: dict[str, dict]) -> Context:
         test_examples=project_test_examples(repo, changed),
         callers=callers_section(repo, changed, patch), repo_map=repo_map(repo, changed), manifests=manifests_section(repo),
         min_sec=MIN_SECURITY_TESTS, min_func=MIN_FUNCTIONAL_TESTS,
-    ) + stage4_checks_text() + DESIGN_CONTRACT + feedback
+    ) + stage4_checks_text() + DESIGN_CONTRACT + SELF_BREAK + approved_plan_section(env_dir) + feedback
 
     leak = set()
     for f in changed:
@@ -1048,11 +1099,79 @@ def extract_metadata(text: str) -> dict:
     trap_paths = trap.get("paths") if isinstance(trap.get("paths"), list) else []
     contract = trap.get("contract") if isinstance(trap.get("contract"), str) else ""
     unrelated = meta.get("unrelated_files") if isinstance(meta.get("unrelated_files"), list) else []
+    sa = meta.get("self_attack") if isinstance(meta.get("self_attack"), dict) else {}
+    just = meta.get("test_justifications") if isinstance(meta.get("test_justifications"), dict) else {}
+    paths = lambda xs: [str(f).strip().lstrip("./") for f in xs if isinstance(f, str) and f.strip()]
     return {"entry_point": ep.strip(), "techniques": sorted({int(t) for t in techs if str(t).strip().isdigit() and 0 < int(t) < 50}),
-            "trap": {"paths": [str(f).strip().lstrip("./") for f in trap_paths if isinstance(f, str) and f.strip()][:10],
-                     "contract": " ".join(contract.split())[:400]},
-            "fix_places": [str(f).strip().lstrip("./") for f in places if isinstance(f, str) and f.strip()][:40],
-            "unrelated_files": [str(f).strip().lstrip("./") for f in unrelated if isinstance(f, str) and f.strip()][:200]}
+            "trap": {"paths": paths(trap_paths)[:10], "contract": " ".join(contract.split())[:400]},
+            "fix_places": paths(places)[:40],
+            "unrelated_files": paths(unrelated)[:200],
+            "self_attack": {"naive_fix": " ".join(str(sa.get("naive_fix") or "").split())[:800],
+                            "naive_fix_files": paths(sa.get("naive_fix_files") or [])[:20],
+                            "over_broad_fix": " ".join(str(sa.get("over_broad_fix") or "").split())[:600],
+                            "why_naive_fails": " ".join(str(sa.get("why_naive_fails") or "").split())[:800]},
+            "test_justifications": {str(k): str(v) for k, v in just.items() if isinstance(v, str)}}
+
+
+SELF_ATTACK_REQUIRED = os.environ.get("GEN_SELF_ATTACK", "1") != "0"
+
+
+def validate_self_attack(task_meta: dict, patches: dict[str, str]) -> None:
+    """Self-break protocol: the design names its own likely repair, keeps a trap place outside it, and the executed check
+    patches ARE that repair (shallow) and the over-broad one (removal)."""
+    if not SELF_ATTACK_REQUIRED:
+        return
+    sa = task_meta.get("self_attack") or {}
+    naive = set(sa.get("naive_fix_files") or [])
+    if len(sa.get("naive_fix") or "") < 20 or not naive or len(sa.get("over_broad_fix") or "") < 10:
+        raise GenerationInvalid('metadata.self_attack is required: {"naive_fix", "naive_fix_files", "over_broad_fix", '
+                                '"why_naive_fails"} - the repair YOU would make from the report alone (see the '
+                                'self-break protocol).')
+    trap = task_meta.get("trap", {}).get("paths") or []
+    if trap and set(trap) <= naive:
+        raise GenerationInvalid(f"every trap path {trap} is inside your own naive_fix_files: the repair you predicted "
+                                "already covers the hidden place, so the task is solvable. Move the trap to a place "
+                                "the naive fix does not touch (M4/M6/M2/M10/M5), or declare <unsuitable>.")
+    shallow = set(parse_changed_files(patches.get("shallow", "")))
+    if shallow and not shallow <= naive:
+        raise GenerationInvalid(f"the shallow check patch edits {sorted(shallow - naive)}, outside naive_fix_files "
+                                f"{sorted(naive)}: the shallow patch must BE your naive fix.")
+
+
+def _norm_quote(s: str) -> str:
+    s = s.lower().translate(str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "—": "-",
+                                           "–": "-"}))
+    return " ".join(re.sub(r"[*_`#>]", " ", s).split())
+
+
+def validate_justifications(code: str, md: str, justifs: dict[str, str]) -> None:
+    """Fairness, enforced deterministically: every test quotes the instruction sentence that demands what it asserts
+    (GitPython/pimcore/stigmem/LibreNMS 2026-10-20: tests demanded behaviour the report never stated)."""
+    names = [n.name for n in ast.walk(ast.parse(code)) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and n.name.startswith(("test_security_", "test_functional_"))]
+    report = _norm_quote(md)
+    bad = []
+    for n in names:
+        q = _norm_quote(justifs.get(n) or "").strip("\"' .")
+        if len(q.split()) < 5:
+            bad.append(f"{n}: no justification quote (>= 5 words copied from instruction.md)")
+        elif q not in report:
+            bad.append(f"{n}: quote not found verbatim in instruction.md: {q[:120]!r}")
+    if bad:
+        raise GenerationInvalid("Every test needs the exact instruction.md sentence that requires its assertion. The "
+                                "report is fixed - change the TEST (or drop it) when no sentence justifies it:\n- "
+                                + "\n- ".join(bad[:10]))
+
+
+def validate_design_bound(env_dir: Path, code: str, md: str) -> None:
+    """Stage 4's first deterministic check, run at generation time so call 2 cannot ship a suite that only the
+    reference design passes."""
+    from src.stage4_oracle_validator.oracle_runner import design_bound_names
+    names, probes = design_bound_names(env_dir, tests=code, report=md)
+    if names or probes:
+        raise GenerationInvalid(f"the tests use names that exist only in the reference fix {names[:8]} or probe for "
+                                f"members a fix might add {probes[:8]}: any correct repair must pass, so drive behaviour "
+                                "only through pre-patch public API and observable results.")
 
 
 def _ngrams(text: str, n: int = 8) -> set[str]:
@@ -1203,8 +1322,12 @@ SPLIT_TESTS_SUFFIX = """
 
 # Split generation (this request)
 The report, metadata and check patches were approved in the previous step. Return ONLY the `<hidden_tests_py>` block,
-following every test constraint above. Keep the suite lean: at most 6 `test_security_*` and 6 `test_functional_*`
-tests, each focused and under 60 lines. Do not repeat the instruction, metadata or patches.
+following every test constraint above, then a `<test_justifications_json>` block: {"<test name>": "<the exact sentence
+copied from instruction.md that requires this test's assertion>"} for EVERY test_security_* and test_functional_*.
+The report is fixed: a test no sentence justifies is unfair - change or drop the test. Keep the suite lean: at most 6
+`test_security_*` and 6 `test_functional_*` tests, each focused and under 60 lines. The tests must make your own
+naive_fix (the shallow check patch) fail at least one test_security_* and your over_broad_fix (the removal check patch)
+fail at least one test_functional_*. Do not repeat the instruction, metadata or patches.
 """
 
 
@@ -1307,16 +1430,31 @@ def _accept_design(ctx: Context):
                       patch_source_files(ctx.changed_files, ctx.meta.get("ecosystem", "")))
         validate_instruction(md, ctx)
         patches = extract_check_patches(text, ctx.env_dir / REPO_DIRNAME)
+        validate_self_attack(task_meta, patches)
         return md, task_meta, patches
     return accept
 
 
-def _accept_tests(ctx: Context):
+def extract_justifications(text: str) -> dict[str, str]:
+    m = re.search(r"<test_justifications_json>\s*(.*?)\s*</test_justifications_json>", text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        got = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        raise GenerationInvalid(f"<test_justifications_json> is not valid JSON: {e}")
+    return {str(k): str(v) for k, v in got.items() if isinstance(v, str)} if isinstance(got, dict) else {}
+
+
+def _accept_tests(ctx: Context, md: str, design_justifs: dict[str, str]):
     def accept(text: str):
         code = extract_tests(text)
         code = no_silent_skips(ensure_pytest_import(code))
         validate_tests(code, ctx)
-        return code
+        justifs = {**design_justifs, **extract_justifications(text)}
+        validate_justifications(code, md, justifs)
+        validate_design_bound(ctx.env_dir, code, md)
+        return code, justifs
     return accept
 
 
@@ -1353,8 +1491,10 @@ def generate(client, ctx: Context, model: str, max_tokens: int, max_attempts: in
     tests_prompt = (ctx.prompt + "\n\n# Approved design (previous step)\n<instruction_md>\n" + md
                     + "\n</instruction_md>\n<task_metadata_json>\n"
                     + json.dumps(task_meta, indent=2) + "\n</task_metadata_json>" + SPLIT_TESTS_SUFFIX)
-    code, u2 = _run_phase(
-        client, ctx, "tests", tests_prompt, model, max_tokens, max_attempts, fallback_model, _accept_tests(ctx))
+    (code, justifs), u2 = _run_phase(
+        client, ctx, "tests", tests_prompt, model, max_tokens, max_attempts, fallback_model,
+        _accept_tests(ctx, md, task_meta.get("test_justifications") or {}))
+    task_meta["test_justifications"] = justifs
     return md, code, _combine_usage(u1, u2), task_meta, patches
 
 
@@ -1370,6 +1510,9 @@ def _generate_single(client, ctx: Context, model: str, max_tokens: int, max_atte
         validate_instruction(md, ctx)
         validate_tests(code, ctx)
         patches = extract_check_patches(text, ctx.env_dir / REPO_DIRNAME)
+        validate_self_attack(task_meta, patches)
+        validate_justifications(code, md, task_meta.get("test_justifications") or {})
+        validate_design_bound(ctx.env_dir, code, md)
         return md, code, task_meta, patches
 
     value, usage = _run_phase(client, ctx, "single", ctx.prompt, model, max_tokens, max_attempts,
@@ -1394,12 +1537,12 @@ def already_done(env_dir: Path) -> bool:
 
 ABORT = threading.Event()  # set when the quota is exhausted so remaining folders are not attempted
 
-# User decision (2026-10-20, replaces the 2026-10-19 DeepSeek fallback): a candidate Anthropic's safeguards flag - and any
-# candidate of a flagged repo or an offensive-security tool repo - is RETIRED. It is never sent to Claude again and no
-# longer generated by DeepSeek: 0 of 17 DeepSeek-generated tasks were accepted (10 failed validation, all 5 evaluated were
-# solved), and DeepSeek is one of the two models under test, so a task it can design is one it can solve.
-# The DeepSeek fallback was removed entirely (user, 2026-10-20). After FLAG_LIMIT flags in one run, the rest of the run is
-# DEFERRED (back to pending, no strike) and a cluster warning is logged for the user.
+# User decision (2026-10-20): a candidate Anthropic's safeguards flag - and any candidate of a flagged repo or an
+# offensive-security tool repo - is RETIRED and never sent to Claude again. After FLAG_LIMIT flags in one run, the rest of
+# the run is DEFERRED (back to pending, no strike) and a cluster warning is logged for the user.
+# User decision (2026-10-21): DeepSeek is the PRIMARY generator again (`--backend deepseek`), despite 0 of 15 accepted under
+# the old prompt - now behind the pre-build plan gate (plan_gate.py: heuristic, Claude review, self-solve probe), the
+# self-break protocol (SELF_BREAK) and the contamination canary. Retired candidates stay retired on every backend.
 DEFERRED_MARKER = "generation_deferred.txt"   # skipped this run through no fault of the candidate: no strike
 FLAGS_LOCK = threading.Lock()
 FLAGS = {"n": 0}
@@ -1439,7 +1582,8 @@ def deepseek_client(args):
 def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, str]:
     osv_id = env_dir.name
     if hasattr(client, "set_label"):       # HandoffBackend: names this candidate's request/response files
-        client.set_label(osv_id)
+        rounds = len(list((env_dir / "attempts").glob("round_*"))) if (env_dir / "attempts").is_dir() else 0
+        client.set_label(f"{osv_id}__r{rounds}" if rounds else osv_id)   # a regeneration must not replay old answers
     if ABORT.is_set():
         return osv_id, "failed", "aborted: quota exhausted earlier in this run"
     if already_done(env_dir):
@@ -1480,7 +1624,7 @@ def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, st
         try:
             md, code, usage, task_meta, patches = generate(client, ctx, args.model, args.max_tokens,
                                                            args.max_attempts, args.fallback_model,
-                                                           force_split=args.backend in ("cursor", "handoff")
+                                                           force_split=args.backend in ("cursor", "handoff", "deepseek")
                                                            and os.environ.get("GEN_SPLIT_ARTIFACTS", "auto").lower() != "0")
         except HandoffPending as e:
             # waiting for a Cursor agent to answer the request: not the candidate's fault, no strike (see _record_failures)
@@ -1530,7 +1674,9 @@ def process(env_dir: Path, candidates: dict, client, args) -> tuple[str, str, st
         write_atomic(env_dir / META_NAME, json.dumps({**usage, "model": model_used, "backend": args.backend,
                                                       "generator": ("handoff" if args.backend == "handoff"
                                                                     else "cursor" if args.backend == "cursor"
-                                                                    else "deepseek" if usage.get("generator_route") else "claude")},
+                                                                    else "deepseek" if (args.backend == "deepseek"
+                                                                                        or usage.get("generator_route"))
+                                                                    else "claude")},
                                                      indent=2))
         write_atomic(env_dir / INSTRUCTION_NAME, md)  # last: its presence marks completion
     except OSError as e:
@@ -1559,10 +1705,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--environments", type=Path, default=Path("environments"))
     p.add_argument("--candidates", type=Path, help="Stage 1 JSON, supplies summary/CVE/CWE")
     p.add_argument("--env-file", type=Path, help=".env path (default: search upward from cwd)")
-    p.add_argument("--backend", choices=("cli", "api", "cursor", "handoff"), default=os.environ.get("TASK_GEN_BACKEND", "cli"),
+    p.add_argument("--backend", choices=("cli", "api", "cursor", "handoff", "deepseek"),
+                   default=os.environ.get("TASK_GEN_BACKEND", "cli"),
                    help="cli = headless `claude -p` with the logged-in subscription (default); api = ANTHROPIC_API_KEY; "
                         "cursor = headless Cursor Agent CLI (`agent -p`) signed in with the Cursor account "
-                        "(model: CURSOR_GEN_MODEL)")
+                        "(model: CURSOR_GEN_MODEL); deepseek = Claude Code CLI against DeepSeek's Anthropic-compatible "
+                        "API (DEEPSEEK_API_KEY, model DEEPSEEK_GEN_MODEL), no Claude fallback")
     p.add_argument("--cursor-bin", default=os.environ.get("CURSOR_AGENT_BIN", "agent"))
     p.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     p.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL))
@@ -1618,6 +1766,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             # outlast the 45-min step cap (cycles 13-20: zero Claude-generated tasks finished). The same cause was fixed
             # for DeepSeek earlier ("max: 20+ min per call; high: 3-8 min").
             client = CliBackend(args.claude_bin, args.timeout, effort=os.environ.get("GEN_CLAUDE_EFFORT", "high"))
+        elif args.backend == "deepseek":
+            # user decision 2026-10-21: DeepSeek is the generator (Grok handoff retired). No Claude fallback, so every
+            # task it produces is DeepSeek-authored and the contamination canary (knowledge.generator_canary) stays clean.
+            client, args.model = deepseek_client(args) or (None, args.model)
+            if client is None:
+                log.error("TASK_GEN_BACKEND=deepseek needs DEEPSEEK_API_KEY")
+                return 2
+            args.fallback_model = ""
         elif args.backend == "handoff":
             client = HandoffBackend()
             args.fallback_model = ""          # a fallback would only queue a second request for the same answer

@@ -62,9 +62,9 @@ def short(text: str, n: int = 170) -> str:
 
 
 def find_cycle_dir() -> Path:
-    dirs = sorted((ROOT / "data" / "logs").glob("*cycle*_*tasks"), key=lambda p: p.stat().st_mtime, reverse=True)
+    dirs = sorted((ROOT / "data" / "logs" / "runs").glob("*cycle*_*tasks"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not dirs:
-        sys.exit("no cycle log folder under data/logs/")
+        sys.exit("no cycle log folder under data/logs/runs/")
     return dirs[0]
 
 

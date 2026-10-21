@@ -1,1 +1,0 @@
-<unsuitable>no hidden-path trap: the reported temp-file read is one handler the reference commit still passes through to getFile when the name is not a temp id, the public UI on this version already rejects that read when no login is set, and the commit's other edits do not add a second enforcement place.</unsuitable>

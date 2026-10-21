@@ -1,1 +1,0 @@
-<unsuitable>no hidden-path trap: the three nil-items panic guards are all local checks in openapi3filter/req_resp_decoder.go, so every public entry point shares one choke point and there is no second source file a partial repair can miss.</unsuitable>

@@ -1,1 +1,0 @@
-<unsuitable>no hidden-path trap: reserving the code during checkout closes both an exhausted redemption cap and a repeat per-customer use, and pricing already rejects a per-customer use once that use is recorded, so a correct repair does not need a second source file.</unsuitable>

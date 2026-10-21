@@ -947,3 +947,46 @@ counts: {"ok": 0, "failed_oracle": 1, "rejected": 1, "regenerate": 0, "failed": 
 | GHSA-jmg2-rcxh-w8q3 | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 7; repos whose test runner we cannot run yet end here too) |
 | PYSEC-2026-3837 | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 62 (from 15 candidate files); fix checks: shallow leaves 5/6 security tests open, removal br |
 
+## 2026-10-21T00:00:26Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 1, "failed_oracle": 0, "rejected": 0, "regenerate": 0, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| PYSEC-2026-3837 | ok | oracle 1.0, pre-patch fails as required; existing pass->pass tests: 62 (from 15 candidate files); fix checks: shallow leaves 5/6 security tests open, removal br |
+
+## 2026-10-21T01:14:16Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 1, "rejected": 0, "regenerate": 2, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-36fc-7wjg-mfvj | REJECTED | rubric: Two of the four security tests (store-root, store-nested) target Asset\WebDAV\Service::getDeleteLog(), a file-backed WebDAV delete-history sink the inst |
+| GHSA-59w7-v8rr-pr4p | REJECTED | out of spec: no usable existing tests of the affected code (candidate files: 15; repos whose test runner we cannot run yet end here too) |
+| PYSEC-2026-4200 | REJECTED | oracle does not pass its own tests (reward [0.9167, 0.9167], failing: ['::test_functional_reprinted_address_adds_no_extra_switch', '::test_functional_reprinted_ |
+
+## 2026-10-21T01:22:12Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 2, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-5p3m-vhh6-9236 | REJECTED | rubric: test_security_delivery_dns_rebind can only observe the URL passed to the mocked httpx.Client.post, so it demands the oracle's specific URL-rewrite-to-pi |
+| GHSA-rqx4-3f6q-3x2v | REJECTED | rubric: no_hints: not answered by reviewer; accurate_report: not answered by reviewer; solvable_from_report: not answered by reviewer; real_entry_point: not ans |
+
+## 2026-10-21T01:26:37Z - Stage 5 - DeepSeek / MiMo evaluation
+
+counts: {"done": 0, "needs_review": 1}
+
+| task | status | rewards per model | detail |
+|---|---|---|---|
+| PYSEC-2026-3837 | needs_review | deepseek: [0.8889, 0.8889, 0.8889] ; mimo: [0.8889, 0.8889, 0.8889] | deepseek: 2/3 attempts are counted model failures; deepseek/harbor_task__edp62ja: step 84: command touches grading files ('ls -la /logs/artifacts /logs/verifier |
+
+## 2026-10-21T01:51:37Z - Stage 4 - rubric + oracle validation
+
+counts: {"ok": 0, "failed_oracle": 0, "rejected": 0, "regenerate": 1, "failed": 0}
+
+| task | verdict | detail |
+|---|---|---|
+| GHSA-7w8c-qgxg-m7jx | REJECTED | rubric: Report describes only the syslog program-name sink, but hidden tests require escaping fixes in ~8 unrelated pages/functions (alert details, BGP peer row |
+

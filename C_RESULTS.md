@@ -1,12 +1,12 @@
 # CWE-Bench — Results Ledger (internal)
 
-_Generated 2026-10-20 07:30 from the latest evaluation run of each model on each task (106 attempts, 75 graded) in `data/04_eval_runs/` and the pipeline state. Regenerate with `python -m src.common.results_report` (stage 5 does it after every run)._
+_Generated 2026-10-20 21:26 from the latest evaluation run of each model on each task (112 attempts, 81 graded) in `data/04_eval_runs/` and the pipeline state. Regenerate with `python -m src.common.results_report` (stage 5 does it after every run)._
 
 **Breaker** = pass@3 = 0 on **both** DeepSeek V4.1 Flash (max) and MiMo-V2.6-Pro. A run is solved at reward 1.0. A partial fix (some attack variants still open) and a fix that breaks legitimate behaviour are failures. A run that hit the 2-hour agent limit is **timed out and not counted as a failure**. Runs that were never graded (stopped early, crashed, lost to a connection drop) are left out. Each model is judged on its latest evaluation run; the agent harness (terminus-2 or Claude Code) is shown next to each result.
 
 ## Executive summary
 
-**2 accepted out of 41 trialed tasks.** In 8 task(s) at least one model did not solve it (see the second table for which task type broke which model).
+**2 accepted out of 42 trialed tasks.** In 9 task(s) at least one model did not solve it (see the second table for which task type broke which model).
 
 ## All trialed tasks
 
@@ -52,7 +52,8 @@ _Generated 2026-10-20 07:30 from the latest evaluation run of each model on each
 | 38 | nltk (GHSA-w3v8-gmh9-3wv7) | Python | 1333 | resource exhaustion (DoS); wide multi-layer fix (7 files / 4 dirs / 289 lines) | SOLVED 1/1 — Claude Code | stopped early (not graded) — Claude Code | REJECTED: DeepSeek solved | — | 21 s / 0.3 min |
 | 39 | fast-jwt (GHSA-x937-hj6v-793p) | JavaScript | 613 | auth / session / credentials; local fix (1 files / 1 dir / 33 lines) | failed 0/1 (0.95, stopped on its own) — Claude Code | SOLVED 1/1 — Claude Code | REJECTED: MiMo solved | DeepSeek: partial fix: closed 6 of 7 attack variants in its run and stopped on its own (it thought it was done); left open every time: exp_at_epoch_boundary | 11 s / 0.2 min |
 | 40 | crewai-tools (PYSEC-2026-3819) | Python |  | other; wide multi-layer fix (8 files / 4 dirs / 121 lines) | SOLVED 1/1 — Claude Code | stopped early (not graded) — Claude Code | REJECTED: DeepSeek solved | — | 1990 s / 33.2 min |
-| 41 | nltk (PYSEC-2026-3869) | Python |  | other; wide multi-layer fix (6 files / 2 dirs / 163 lines) | SOLVED 1/1 — Claude Code | stopped early (not graded) — Claude Code | REJECTED: DeepSeek solved | — | 10 s / 0.2 min |
+| 41 | gitpython (PYSEC-2026-3837) | Python |  | other; wide multi-layer fix (14 files / 6 dirs / 571 lines) | failed 0/3 (0.89 each, stopped on its own) — Claude Code | failed 0/3 (0.89 each, stopped on its own) — Claude Code | NEEDS REVIEW: deepseek: 2/3 attempts are counted model failures; deepseek/harbor_task__edp62ja | DeepSeek: partial fix: closed 4 of 6 attack variants in all 3 runs and stopped on its own (it thought it was done); left open every time: commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents — MiMo: partial fix: closed 4 of 6 attack variants in all 3 runs and stopped on its own (it thought it was done); left open every time: commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | 26 s / 0.5 min |
+| 42 | nltk (PYSEC-2026-3869) | Python |  | other; wide multi-layer fix (6 files / 2 dirs / 163 lines) | SOLVED 1/1 — Claude Code | stopped early (not graded) — Claude Code | REJECTED: DeepSeek solved | — | 10 s / 0.2 min |
 
 ## What breaks which model
 
@@ -72,6 +73,8 @@ Every task where a model did not solve it. A task that breaks only one model is 
 | nltk (GHSA-p4rw-rvv2-7xwr) | path / file handling; wide multi-layer fix (10 files / 3 dirs / 236 lines) | Loading a corpus through the public corpus-reader APIs over a directory that contains a … | DeepSeek | FAILED | partial fix: closed 4 of 5 attack variants in all 3 runs and stopped on its own (it thought it was done); left open every time: toolbox_symlink_escape | MiMo solved it (solved in 90 steps, 61 min) |
 | undici (GHSA-vp8m-p9jh-q5pm) | auth / session / credentials; wide multi-layer fix (10 files / 5 dirs / 120 lines) | Public undici API: dispatcher.request({origin?, path, method}) on … | MiMo | FAILED | closed the hole but broke legitimate behaviour (storage_with_custom_lookup_same_host) in its run and stopped on its own (it thought it was done) | DeepSeek solved it (solved in 164 steps, 49 min) |
 | fast-jwt (GHSA-x937-hj6v-793p) | auth / session / credentials; local fix (1 files / 1 dir / 33 lines) | Public API: createVerifier({ key, cache: true, ... }) from the package index, then … | DeepSeek | FAILED | partial fix: closed 6 of 7 attack variants in its run and stopped on its own (it thought it was done); left open every time: exp_at_epoch_boundary | MiMo solved it (solved in 30 steps, 34 min) |
+| gitpython (PYSEC-2026-3837) | other; wide multi-layer fix (14 files / 6 dirs / 571 lines) | annotated tag creation; full and incremental blame of a committed file; diff of a commit … | DeepSeek | FAILED | partial fix: closed 4 of 6 attack variants in all 3 runs and stopped on its own (it thought it was done); left open every time: commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | MiMo also did not solve it (failed 0/3 (0.89 each, stopped on its own)) |
+| gitpython (PYSEC-2026-3837) | other; wide multi-layer fix (14 files / 6 dirs / 571 lines) | annotated tag creation; full and incremental blame of a committed file; diff of a commit … | MiMo | FAILED | partial fix: closed 4 of 6 attack variants in all 3 runs and stopped on its own (it thought it was done); left open every time: commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | DeepSeek also did not solve it (failed 0/3 (0.89 each, stopped on its own)) |
 
 ## Failure details
 
@@ -288,6 +291,21 @@ Verdict: NEEDS REVIEW — all six attempts scored 0.9167 except one DeepSeek att
 - **Require a positive *and* negative assertion on the same code path, with an adversarial intermediate host.** The `reg_advertised_host` test (registry redirects to a different download host) and `reg_source_host` test (module source names an arbitrary host) must be paired with the `confighost` test so that a blanket deny (DeepSeek attempt 3's `return nil, nil` for non-public hosts) fails as loudly as a leak. A generator should score "denied everywhere" as zero, not as a partial pass.
 - **Make self-written tests insufficient by construction.** In all six attempts the agent's own tests passed while a hidden test failed, because the agent authored tests only for cases it had already decided were interesting. Design tasks so the grading fixture is an end-to-end CLI invocation with the token/host supplied through the same external configuration surface a user would use (env vars / config file), which cannot be faked by a unit test of a helper function.
 - **Punish narrowing a signature or changing a return contract as a side effect of "hardening".** DeepSeek attempt 3 returned `nil, nil` from `ForHost` for non-public hosts, and several attempts added early `return vars, nil` bail-outs in the remote-variables loader. Hidden tests should include a "legitimate non-public configuration still produces its result" case to force the agent to preserve the contract while blocking the leak.
+
+### gitpython (PYSEC-2026-3837) - NEEDS REVIEW: deepseek: 2/3 attempts are counted model failures; deepseek/harbor_task__edp62ja
+
+- **Task type:** other; wide multi-layer fix (14 files / 6 dirs / 571 lines); CWE ; Python
+- **Entry point:** annotated tag creation; full and incremental blame of a committed file; diff of a commit and diff of the index
+- **Reference fix (source files):** `.basedpyright/baseline.json`, `.github/workflows/pythonpackage.yml`, `VERSION`, `doc/source/changes.rst`, `doc/source/reference.rst`, `git/cmd.py`, `git/config.py`, `git/diff.py`, `git/index/base.py`, `git/index/fun.py`, `git/objects/commit.py`, `git/objects/submodule/base.py`, `git/objects/submodule/root.py`, `git/refs/head.py`, `git/refs/log.py`, `git/refs/symbolic.py`, `git/refs/tag.py`, `git/repo/base.py`, `git/util.py`, `pyproject.toml`, `tox.ini`
+
+| Model | # | Score | Security | Functional | Existing | Left open | Broke | Source files changed | Time | Turns | Ended |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| DeepSeek | 1 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/cmd.py`, `git/objects/commit.py`, `git/refs/tag.py`, `git/repo/base.py` | 18 min | 158 | failed - stopped on its own |
+| DeepSeek | 2 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/cmd.py`, `git/diff.py`, `git/index/base.py`, `git/refs/tag.py`, `git/repo/base.py` | 17 min | 155 | failed - stopped on its own |
+| DeepSeek | 3 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/cmd.py`, `git/refs/tag.py`, `git/repo/base.py` | 9 min | 70 | failed - stopped on its own |
+| MiMo | 1 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/diff.py`, `git/refs/tag.py`, `git/repo/base.py` | 35 min | 96 | failed - stopped on its own |
+| MiMo | 2 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/refs/tag.py`, `git/repo/base.py` | 28 min | 55 | failed - stopped on its own |
+| MiMo | 3 | 0.89 | 4/6 | 6/6 | 62/62 | commit_diff_option_returns_file_contents, index_diff_option_returns_file_contents | - | `git/cmd.py`, `git/objects/commit.py`, `git/refs/tag.py`, `git/repo/base.py` | 37 min | 83 | failed - stopped on its own |
 
 ### nltk (GHSA-p4rw-rvv2-7xwr) - REJECTED: MiMo solved
 

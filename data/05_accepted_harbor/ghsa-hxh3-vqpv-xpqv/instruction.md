@@ -1,5 +1,7 @@
 # Untrusted text is emitted as live HTML by the JSX server renderer
 
+Fix the problem described below in the project in `/workspace`.
+
 ## Summary
 We render HTML on the server using this framework's built-in JSX. Normally any string we interpolate as element content is automatically HTML-escaped, so visitor-supplied text appears as inert characters and never as markup. We found several common rendering situations where that automatic escaping silently does not happen and the raw string is written straight into the response. Any attacker-controlled value displayed through one of those paths becomes stored or reflected cross-site scripting.
 
@@ -11,3 +13,19 @@ Render a page where an untrusted string is interpolated as child content. In the
 
 ## Expected behaviour
 Any plain string that ends up in the rendered output must be HTML-escaped in every rendering mode, so it can never introduce tags or attributes. Legitimate behaviour must keep working: ordinary text must still appear (as visible text), a bare string must still be renderable as the top-level element, and content that a developer has explicitly marked as trusted raw HTML must still be emitted as markup.
+
+## What you have
+
+- `/workspace`: the project's source at the affected revision, with its dependencies installed in `node_modules` and the package built (`bun run build`).
+- Node.js 22, its package managers and git are installed. There is no network access.
+
+## Requirements
+
+- Fix the vulnerability described above in the project's source code under `/workspace`.
+- Only changes under `/workspace` are kept. Changes to dependency manifests and lockfiles, to test-runner configuration (such as `conftest.py`, `pytest.ini`, `vitest.config.*`, `jest.config.*`) and to the project's existing test files are not kept, and no dependencies can be added or upgraded.
+- The project must still build offline with `bun run build`.
+- Do not look for existing fixes elsewhere.
+
+## Time
+
+You have 2 hours. Run `bash /app/timer.sh` to see how much time remains. Keep the project working after every change.

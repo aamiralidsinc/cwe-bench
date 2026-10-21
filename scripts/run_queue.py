@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 STOP = ROOT / "data" / "STOP_CYCLES"
-LOGS = ROOT / "data" / "logs"
+LOGS = ROOT / "data" / "logs" / "runs"
 
 
 def now() -> str:
@@ -225,7 +225,7 @@ def main() -> int:
     lines += [f"| {r[0]} | {r[1]} | {r[2]} | {r[3].replace('|', '/')} |" for r in rows]
     (run_dir / "QUEUE_SUMMARY.md").write_text("\n".join(lines) + "\n")
     try:
-        with (LOGS / "README.md").open("a") as fh:
+        with (LOGS.parent / "README.md").open("a") as fh:
             fh.write(f"| {run_dir.name} | Queue runner: {a.cycles} sequential cycles x {a.size} tasks | {status} |\n")
     except OSError:
         pass

@@ -100,7 +100,7 @@ What we have learned about the two models (details in
 |---|---|---|
 | 1 Mining | `src/stage1_mining` | Pulls PyPI/npm advisories from OSV and GHSA. Resolves the fix commit (or fix series). Never re-mines a known advisory. |
 | 2 Screening | `src/stage2_screening` | Keeps fixes committed after `PUBLISHED_AFTER`, in a supported language, with real source changes and a test suite, in repos under `MAX_REPO_MB`. Rejects dependency-bump, config-only, docs-only and template-only fixes. Scores candidates by fix breadth (files, directories, lines). |
-| 3 Task builder | `src/stage3_task_builder` | Ranks candidates by screening score plus a **learned adjustment** from past results. Checks out the vulnerable commit and runs a Docker build check. **Claude Opus 5.5** (Opus 4.8 fallback on refusals) then writes `instruction.md` (a behavioural report with no fix, file or function hints), hidden security and functional tests, metadata (entry point, techniques used) and three check patches. |
+| 3 Task builder | `src/stage3_task_builder` | Ranks candidates by screening score plus a **learned adjustment** from past results. Checks out the vulnerable commit, runs the **pre-build plan gate** (No-AI heuristic, DeepSeek plan draft, self-solve probe by both targets, Claude review), then a Docker build check. **DeepSeek** (self-break protocol: it predicts and defeats its own first repair) then writes `instruction.md` (a behavioural report with no fix, file or function hints), hidden security and functional tests, metadata (entry point, techniques used) and three check patches. |
 | 4 Validator | `src/stage4_oracle_validator` | See the checks below. |
 | 5 Model runner | `src/stage5_evaluator` | Runs DeepSeek and MiMo through Harbor's **Claude Code** agent: 3 attempts each, a 2-hour limit, up to 5 tasks in parallel. Stops early once a model solves. Gives a deterministic verdict and attribution. |
 | 6 Packager | `src/stage6_packager` | Re-runs the reference fix one last time, then writes the final Harbor task to `data/05_accepted_harbor/<id>/`. |
@@ -185,9 +185,10 @@ checks and the rubric. The rest are instructions in the generation prompt and th
 
 **Safety**
 
-19. If the primary model (Opus 5.5) declines, generation of that candidate continues on the fallback model (Opus
-    4.8). If Anthropic's safeguards flag a session, the candidate is retired with no retry and no fallback, and its
-    repo is not tried again.
+19. Generation runs on DeepSeek with no Claude fallback. Claude is used only to review (plan gate, rubric); if
+    Anthropic's safeguards flag a session, the candidate is retired with no retry and no fallback, and its repo is not
+    tried again. Because DeepSeek is also a target, `data/knowledge/generator_canary.md` watches for it solving its
+    own designs disproportionately.
 
 ## How a task is graded (and why it cannot be gamed)
 
@@ -352,7 +353,9 @@ See [`.env.example`](.env.example) for all keys. The important ones:
 |---|---|
 | `PUBLISHED_AFTER` | Only fixes committed after this date (avoids the models' training data). Currently `2026-08-01`. |
 | `MAX_REPO_MB` | Skip repos larger than this (400). |
-| `ANTHROPIC_MODEL`, `GEN_FALLBACK_MODEL` | Task generator (Opus 5.5) and the model used when it declines (Opus 4.8). |
+| `TASK_GEN_BACKEND`, `DEEPSEEK_GEN_MODEL` | Task generator: `deepseek` (default, model `deepseek-flash[1m]`); `cli`/`api` = Claude. |
+| `PLAN_GATE` | Pre-build plan gate: `gate` (default), `advisory`, `off`. |
+| `ANTHROPIC_MODEL`, `GEN_FALLBACK_MODEL` | Claude reviewer for the plan gate and rubric, and its fallback on a malformed reply. |
 | `EVAL_AGENT`, `CLAUDE_CODE_VERSION` | Agent harness for the evaluated models (`claude-code`, baked into each task image). |
 | `DEEPSEEK_*`, `MIMO_*` | Evaluated models: keys, model ids, DeepSeek reasoning effort `max`. |
 | `EVAL_ATTEMPTS`, `AGENT_TIMEOUT_SEC` | 3 attempts per model, 2 hours each. |
@@ -421,7 +424,7 @@ Excluded by [`.gitignore`](.gitignore):
 - `.venv/`, caches and `.DS_Store`;
 - `.backup/` (state backups);
 - `share/` (Slack bundles) and `others/` (other repos);
-- `data/03_environments/`, `data/04_eval_runs/` and `data/logs/` (large, regenerable);
+- `data/03_environments/`, `data/04_eval_runs/`, `data/logs/` and `data/archive/` (large, regenerable);
 - the state database;
 - the repo snapshots inside accepted tasks.
 

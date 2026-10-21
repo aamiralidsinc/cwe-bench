@@ -1,5 +1,7 @@
 # Secret request headers are replayed to other hosts after a 3xx reply, and operators cannot turn redirect following off
 
+Fix the problem described below in the project in `/workspace`.
+
 ## Summary
 
 Apprise lets an operator add their own request headers to a target, for example `json://alerts.internal.example/hook?+X-Api-Key=s3cr3t`. Self-hosted receivers, API gateways and reverse proxies often authenticate callers with exactly this kind of header. Some services also use their own key header for the same purpose.
@@ -30,3 +32,18 @@ Remote configuration sources and remote files that Apprise retrieves to attach t
 - With `redirect=no`, Apprise must never contact the host named in a redirect, whatever kind of target is involved. A redirect reply counts as a failed delivery or a failed retrieval. Its body must never be used as content.
 - With no option, or with `redirect=yes`, behaviour stays as it is today. Redirects are still followed and succeed, for example when an endpoint has moved to a new path on the same server.
 - Custom headers must still reach the configured host itself.
+
+## What you have
+
+- `/workspace`: the project's source at the affected revision, installed in editable mode into the system Python with its dependencies.
+- Python 3.11 and git are installed. There is no network access.
+
+## Requirements
+
+- Fix the vulnerability described above in the project's source code under `/workspace`.
+- Only changes under `/workspace` are kept. Changes to dependency manifests and lockfiles, to test-runner configuration (such as `conftest.py`, `pytest.ini`, `vitest.config.*`, `jest.config.*`) and to the project's existing test files are not kept, and no dependencies can be added or upgraded.
+- Do not look for existing fixes elsewhere.
+
+## Time
+
+You have 2 hours. Run `bash /app/timer.sh` to see how much time remains. Keep the project working after every change.
