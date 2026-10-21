@@ -1,8 +1,8 @@
 # Results ledger (generated)
 
-*Rebuilt 2026-10-19 19:38 from all 106 raw trials (75 graded, 31 ungraded). Regenerate with `python -m src.common.ledger`.*
+*Rebuilt 2026-10-20 21:26 from all 112 raw trials (81 graded, 31 ungraded). Regenerate with `python -m src.common.ledger`.*
 
-**2 breakers out of 41 trialed tasks.** In 32 tasks one model failed and the other solved.
+**2 breakers out of 42 trialed tasks.** In 32 tasks one model failed and the other solved.
 
 | Track | Task | Repo | Language | CWE | DeepSeek | MiMo | Verdict | Image build (cached / longest) |
 |---|---|---|---|---|---|---|---|---|
@@ -46,4 +46,5 @@
 | mined | GHSA-w3v8-gmh9-3wv7 | nltk/nltk | Python | CWE-1333 | SOLVED 1/1 | no graded run (1 ungraded) | rejected (DeepSeek solved) | 21 s / 0.3 min |
 | mined | GHSA-x937-hj6v-793p | nearform/fast-jwt | JavaScript/TypeScript | CWE-613 | failed 0/1 | SOLVED 1/1 | rejected (MiMo solved) | 11 s / 0.2 min |
 | mined | PYSEC-2026-3819 | crewAIInc/crewAI | Python |  | SOLVED 1/1 | no graded run (1 ungraded) | rejected (DeepSeek solved) | 1990 s / 33.2 min |
+| mined | PYSEC-2026-3837 | gitpython-developers/GitPython | Python |  | failed 0/3 | failed 0/3 | needs review: deepseek: 2/3 attempts are counted model failures; deepseek/harbor_task__edp62ja: step 84: | 26 s / 0.5 min |
 | mined | PYSEC-2026-3869 | nltk/nltk | Python |  | SOLVED 1/1 | no graded run (1 ungraded) | rejected (DeepSeek solved) | 10 s / 0.2 min |

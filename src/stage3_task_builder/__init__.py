@@ -24,6 +24,28 @@ MAX_REFUSALS = 3            # safety-filter refusals (all runs together) before 
 log = logging.getLogger(__name__)
 
 
+def _revision_pool(cfg: Config, base: Path, only: Optional[list[str]]) -> Path:
+    """Revisions (data/02_screened/revisions.json) are repaired re-versions of a task that already ran, e.g.
+    PYSEC-2026-3837-v2. They are merged into the candidate pool ONLY when asked for by id, so a fresh cycle never
+    re-picks one by score - a cycle must run new candidates (user, 2026-10-21)."""
+    revisions = cfg.data_dir / "02_screened" / "revisions.json"
+    if not only or not revisions.is_file():
+        return base
+    try:
+        revs = [r for r in json.loads(revisions.read_text()).get("vulnerabilities", []) if r.get("osv_id") in set(only)]
+        if not revs:
+            return base
+        merged = {r["osv_id"]: r for r in json.loads(base.read_text()).get("vulnerabilities", []) + revs}
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        log.warning("Could not merge revisions: %s", e)
+        return base
+    out = cfg.cache_dir / "screened_plus_revisions.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"count": len(merged), "vulnerabilities": list(merged.values())}, indent=2))
+    log.info("Revision candidates requested by id", extra={"ids": [r["osv_id"] for r in revs]})
+    return out
+
+
 def _input_file(cfg: Config, allow_unscreened: bool) -> Path:
     screened = cfg.data_dir / "02_screened" / "screened.json"
     injected = cfg.data_dir / "02_screened" / "injected.json"
@@ -212,6 +234,7 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
         log.error("%s", e)
         return 2
     env_dir = cfg.stage_dir(3)
+    src = _revision_pool(cfg, src, args.only)
     src = _limit_to_top_n(cfg, src, env_dir, args.max_tasks, args.only)
 
     build_argv = [str(src), "--environments", str(env_dir), "--workers", str(args.workers)]
@@ -219,10 +242,25 @@ def run(cfg: Config, args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
 
+    # Order by cost, cheapest first: the Docker build check spends only local CPU, the plan gate spends model budget
+    # (DeepSeek plan + two self-solve probes + a Claude review, ~25 min/candidate) and full generation spends the most.
+    # So build first: 10 of 29 stage-3 rejections were build failures (mostly Go and pnpm repos), and paying for a plan
+    # review of a repo that cannot build here is pure waste. _buildable_ids marks failures REJECTED, which plan_gate skips.
     only = _buildable_ids(cfg, src, env_dir, args)
     if only is not None and not only:
         log.warning("No buildable environments to generate tasks for")
         return 0
+
+    # Pre-build plan gate (2026-10-21): heuristic, DeepSeek plan draft, self-solve probe, Claude review - before the
+    # expensive full generation. Rejections are marked REJECTED here, so generation skips them.
+    from src.stage3_task_builder import plan_gate
+    if plan_gate.mode() != "off" and not args.dry_run:
+        gated = plan_gate.run(cfg, src, env_dir, only, workers=args.workers)
+        if plan_gate.mode() == "gate" and gated:
+            only = [i for i in only if (gated.get(i) or {}).get("verdict", "proceed") == "proceed"]
+            if not only:
+                log.warning("Plan gate rejected every candidate in this batch")
+                return 0
     gen_argv = (["--only", *only] if only is not None else []) + ["--environments", str(env_dir), "--candidates", str(src), "--workers", str(min(args.workers, 6)),
                 "--backend", cfg.task_gen_backend, "--claude-bin", cfg.claude_bin]
     if args.model or cfg.anthropic_model:

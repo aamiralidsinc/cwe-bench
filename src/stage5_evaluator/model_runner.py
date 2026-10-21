@@ -406,6 +406,11 @@ def refresh_knowledge(cfg: Config, osv_id: str) -> None:
         results_report.main()
     except Exception as e:
         log.warning("Results report rebuild failed", extra={"error": repr(e)[:200]})
+    try:
+        from src.common import knowledge
+        knowledge.generator_canary(cfg)
+    except Exception as e:
+        log.warning("Generator canary rebuild failed", extra={"error": repr(e)[:200]})
 
 
 def main(argv: Optional[list[str]] = None, cfg: Optional[Config] = None) -> int:

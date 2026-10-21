@@ -70,7 +70,7 @@ class Config:
     anthropic_api_key: Optional[str]
     anthropic_model: str
     claude_bin: str
-    task_gen_backend: str      # "cli" (Claude Code subscription session) or "api"
+    task_gen_backend: str      # "deepseek" (DeepSeek API, default since 2026-10-21) | "cli" | "api" | "cursor" | "handoff"
     harbor_bin: str
     eval_agent: str            # Harbor agent used for target models
     eval_attempts: int

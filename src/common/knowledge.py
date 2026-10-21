@@ -45,6 +45,77 @@ def lessons_path(cfg: Config) -> Path:
     return cfg.root / "skills" / LESSONS_NAME
 
 
+CANARY_MIN_TASKS = 5
+CANARY_GAP = 0.20
+
+
+def generator_canary(cfg: Config) -> dict[str, Any]:
+    """Contamination canary (user decision 2026-10-21): DeepSeek both GENERATES tasks and is a TARGET. If it designs
+    tasks it can solve, it shows as DeepSeek solving its own tasks more often than MiMo does - beyond the usual gap on
+    tasks from other generators. Writes data/knowledge/generator_canary.md; returns the numbers and the alert flag.
+    Measurement only: never changes a verdict."""
+    groups: dict[str, dict[str, int]] = {}
+    for summ in sorted((cfg.data_dir / "04_eval_runs").glob("*/summary.json")):
+        osv_id = summ.parent.name
+        env = cfg.stage_dir(3) / osv_id
+        try:
+            models = json.loads(summ.read_text()).get("models") or {}
+            gm = json.loads((env / "generation_meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        # tasks generated before the "generator" field existed: infer it from the model id
+        model_id = str(gm.get("model") or "").lower()
+        gen = gm.get("generator") or ("deepseek" if "deepseek" in model_id else "grok" if "grok" in model_id
+                                      else "claude" if model_id else "unknown")
+        try:
+            protocol = bool((json.loads((env / "task_metadata.json").read_text()).get("self_attack") or {})
+                            .get("naive_fix"))
+        except (OSError, ValueError):
+            protocol = False
+        key = f"{gen} (self-break protocol)" if gen == "deepseek" and protocol else gen
+        ds, mm = models.get("deepseek") or {}, models.get("mimo") or {}
+        measured = lambda m: (m.get("passes", 0) + m.get("fails", 0)) > 0
+        g = groups.setdefault(key, {"ds_n": 0, "ds_solved": 0, "n": 0, "pair_ds": 0, "pair_mimo": 0})
+        # (a) DeepSeek alone: its attempt 1 always runs, so early stop cannot hide a DeepSeek solve
+        if measured(ds):
+            g["ds_n"] += 1
+            g["ds_solved"] += int(ds.get("passes", 0) > 0)
+        # (b) paired: both models counted. Early stop cancels MiMo once DeepSeek solves, which biases this toward
+        # tasks DeepSeek did NOT solve - so the alarm uses (a); (b) is context.
+        if measured(ds) and measured(mm):
+            g["n"] += 1
+            g["pair_ds"] += int(ds.get("passes", 0) > 0)
+            g["pair_mimo"] += int(mm.get("passes", 0) > 0)
+    rate = lambda a, b: a / b if b else 0.0
+    others = [g for k, g in groups.items() if not k.startswith("deepseek")]
+    base = rate(sum(g["ds_solved"] for g in others), sum(g["ds_n"] for g in others))
+    own = groups.get("deepseek (self-break protocol)") or {"ds_n": 0, "ds_solved": 0, "n": 0, "pair_ds": 0, "pair_mimo": 0}
+    own_rate = rate(own["ds_solved"], own["ds_n"])
+    alert = own["ds_n"] >= CANARY_MIN_TASKS and own_rate - base >= CANARY_GAP
+    lines = ["## Generator contamination canary (rebuilt after every evaluation)",
+             "DeepSeek generates tasks AND is a target. Alarm: DeepSeek's solve rate on its OWN designs (self-break protocol) "
+             f"exceeds its solve rate on other generators' tasks by >= {CANARY_GAP:.0%} (needs >= {CANARY_MIN_TASKS} "
+             "tasks). Uses DeepSeek alone because early stop cancels MiMo once DeepSeek solves; the paired columns are "
+             "context only.", "",
+             "| Generator | Tasks (DeepSeek measured) | DeepSeek solved | Paired tasks | Paired: DeepSeek / MiMo solved |",
+             "|---|---|---|---|---|"]
+    for k, g in sorted(groups.items()):
+        lines.append(f"| {k} | {g['ds_n']} | {rate(g['ds_solved'], g['ds_n']):.0%} | {g['n']} | "
+                     f"{rate(g['pair_ds'], g['n']):.0%} / {rate(g['pair_mimo'], g['n']):.0%} |")
+    lines += ["", f"Baseline (DeepSeek on other generators' tasks): {base:.0%}. Own protocol tasks: {own['ds_n']}, "
+                  f"DeepSeek solved {own_rate:.0%}.",
+              ("**ALERT: DeepSeek solves its own designs disproportionately - contamination suspected; review the "
+               "generator choice with the user.**" if alert else
+               "Status: no alert" + ("." if own["ds_n"] >= CANARY_MIN_TASKS else
+                                     f" (too few protocol tasks yet: {own['ds_n']} of {CANARY_MIN_TASKS}).")),
+              "", "Pre-protocol reference: DeepSeek-designed tasks before 2026-10-21 (old prompt) - 0 of 15 accepted."]
+    (knowledge_dir(cfg) / "generator_canary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if alert:
+        log.warning("Generator canary ALERT", extra={"own_rate": round(own_rate, 3), "base_rate": round(base, 3),
+                                                     "tasks": own["ds_n"]})
+    return {"groups": groups, "base_rate": base, "own_rate": own_rate, "alert": alert}
+
+
 def task_features(cfg: Config, osv_id: str) -> dict[str, Any]:
     """Static facts about a task from the mined/screened records."""
     rec: dict[str, Any] = {}

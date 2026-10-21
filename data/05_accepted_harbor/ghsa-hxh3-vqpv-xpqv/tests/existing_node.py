@@ -1,3 +1,4 @@
+import os
 """Run the repo's own JS/TS test files (/tests/existing_files.txt) with the project's runner -> ctrf_existing.json.
 One runner call per file (so every result maps to its file); names are "<file>::<suite / test title>"."""
 import json
@@ -6,7 +7,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-APP, OUT = Path("/app"), Path("/logs/verifier/ctrf_existing.json")
+APP, OUT = Path("/app"), Path(os.environ.get("CTRF_OUT", "/logs/verifier/ctrf_existing.json"))
 RUNNERS = ("vitest", "jest", "mocha")
 
 
@@ -97,7 +98,7 @@ def run_file(rel):
 
 
 tests = {}
-for rel in [l.strip() for l in open("/tests/existing_files.txt") if l.strip()]:
+for rel in [l.strip() for l in open(os.environ.get("EXISTING_LIST", "/tests/existing_files.txt")) if l.strip()]:
     tests.update(run_file(rel))
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(json.dumps({"results": {"tests": [{"name": n, "status": s} for n, s in tests.items()]}}))

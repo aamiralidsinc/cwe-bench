@@ -156,7 +156,7 @@ def cycle(cfg: Config, n: int, number: int, ids: Optional[list[str]] = None) -> 
     if not todo:
         print("data lake empty and nothing pending - done")
         return False
-    run_dir = ROOT / "data" / "logs" / f"{datetime.now():%Y-%m-%d_%H%M}_cycle{number:02d}_{len(todo)}tasks"
+    run_dir = ROOT / "data" / "logs" / "runs" / f"{datetime.now():%Y-%m-%d_%H%M}_cycle{number:02d}_{len(todo)}tasks"
     run_dir.mkdir(parents=True, exist_ok=True)
     (ROOT / "data" / ".cache" / "current_run_dir.txt").write_text(str(run_dir.relative_to(ROOT)))
     (run_dir / "00_selection.txt").write_text("\n".join(todo) + "\n")
@@ -223,7 +223,7 @@ def main() -> int:
     cfg = Config.load(None)
     STOP.unlink(missing_ok=True)
     done = 0
-    logs = ROOT / "data" / "logs"
+    logs = ROOT / "data" / "logs" / "runs"
     number = 1 + max([int(m.group(1)) for d in logs.glob("*_cycle*_*") if (m := re.search(r"_cycle(\d+)_", d.name))] or [0])
     stop_requested = False
     while not stopped() and (a.cycles == 0 or done < a.cycles):

@@ -283,13 +283,15 @@ PROBE_LITERAL_RE = re.compile(r"""\b(?:getattr|hasattr)\([^,()]+,\s*['"](\w+)['"
 PROBE_DYNAMIC_RE = re.compile(r"(?:FieldByName|MethodByName)\(\s*[A-Za-z_]\w*\s*\)")
 
 
-def design_bound_names(env_dir: Path) -> tuple[list[str], list[str]]:
+def design_bound_names(env_dir: Path, tests: Optional[str] = None, report: Optional[str] = None
+                       ) -> tuple[list[str], list[str]]:
     """(code-like names the hidden tests use that exist only in the reference fix's added SOURCE code - not in the
     vulnerable repo, not in the report; probing constructs). Either makes a test pass only on the reference design
-    (infracost GHSA-6x6c: `TrustedHosts`, `TG_TF_DEFAULT_REGISTRY_HOST`)."""
+    (infracost GHSA-6x6c: `TrustedHosts`, `TG_TF_DEFAULT_REGISTRY_HOST`). `tests`/`report` default to the files on disk;
+    stage 3 passes its draft to run the same check at generation time."""
     from src.common.classify import is_test_path
-    tests = (env_dir / "hidden_tests.py").read_text(errors="replace")
-    report = (env_dir / "instruction.md").read_text(errors="replace").lower()
+    tests = tests if tests is not None else (env_dir / "hidden_tests.py").read_text(errors="replace")
+    report = (report if report is not None else (env_dir / "instruction.md").read_text(errors="replace")).lower()
     added = []
     for ch in re.split(r"(?m)^(?=diff --git )", (env_dir / "oracle_solution.patch").read_text(errors="replace")):
         m = re.match(r"diff --git a/\S+ b/(\S+)", ch)

@@ -4,7 +4,7 @@ DeepSeek and MiMo each get the task's report plus the repository's source-file L
 they would change to fix the problem completely. If the fix spans >= 2 places and BOTH models already name at least half
 of them, nothing is hidden and the task is predicted easy.
 
-Backtest on the 32 measurable evaluated tasks (data/logs/2026-10-20_1359_plan-probe-backtest): this rule would have
+Backtest on the 32 measurable evaluated tasks (data/logs/runs/2026-10-20_1359_plan-probe-backtest): this rule would have
 skipped 18 of 27 solved tasks (66%) and kept all 5 measurable breakers (AUC 0.70). The ">= 2 places" condition was added
 after seeing fast-jwt x937 (one-file fix, trap inside the file - a file list cannot reveal it): treat it as fitted on
 little data. Safety valves:

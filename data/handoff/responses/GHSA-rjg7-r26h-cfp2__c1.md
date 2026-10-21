@@ -1,1 +1,0 @@
-<unsuitable>no hidden-path trap: the IPv6-transition rejection is one shared host check every caller already uses, so a single correction closes every entry point and the commit's other edits do not leave an independent path.</unsuitable>

@@ -220,6 +220,7 @@ def evaluate_tree(tree: dict, ecosystem: str) -> Decision:
 # newly screened candidate and, with --prune, to the existing lake (screened.json). Evidence in skills/lessons_learned.md
 # and data/knowledge/solved_profile.md.
 # --------------------------------------------------------------------------- #
+REQUIRE_CWE = __import__("os").environ.get("REQUIRE_CWE", "1") != "0"   # CWE-bench: a candidate must carry a CWE
 SMALL_FIX_FILES, SMALL_FIX_LINES = 4, 60   # <=4 src files AND <=60 src lines: 0 usable of 14; no <=5-file fix broke both
 DOS_ONLY_CWES = {"400", "407", "409", "674", "770", "1284", "1333"}   # resource-exhaustion only: 0 usable (family: 0 of 7)
 DEAD_MONOREPO_RE = re.compile(   # never built or never validated here (payload: 5 failures)
@@ -230,6 +231,77 @@ DEAD_MONOREPO_RE = re.compile(   # never built or never validated here (payload:
 PRODUCER_FILE_RE = re.compile(r"(schema|serializ|marshal|loader|(^|[/_.-])load|pars(e|er)|decod|codec|config|resolv|"
                               r"normaliz|transform|convert|import|deserializ)", re.I)
 
+# --------------------------------------------------------------------------- #
+# CWE weakness-class scope + No-AI difficulty weight (the "CWE-bench category").
+# Source: others/cwe-bench/sourcer/weights.json `weakness_class` map (research-grounded prior: all models are weakest on
+# auth/session, access-control, integrity and insecure-design; strongest on single-sink injection, open redirect and
+# path traversal). We do NOT hard-reject the easy classes - we down-weight them so they rank last and get less priority
+# next cycle (user rule 2026-10-21). DoS-only CWEs are still rejected in lesson_rejects (0 usable measured).
+# --------------------------------------------------------------------------- #
+CWE_CLASS = {   # CWE number (no "CWE-") -> weakness class
+    "863": "access_control", "862": "access_control", "285": "access_control", "639": "access_control",
+    "732": "access_control", "1259": "access_control", "441": "access_control", "552": "access_control",
+    "284": "access_control", "266": "access_control", "267": "access_control", "268": "access_control",
+    "269": "access_control", "276": "access_control", "749": "access_control", "1220": "access_control",
+    "287": "auth_session", "306": "auth_session", "384": "auth_session", "613": "auth_session",
+    "620": "auth_session", "640": "auth_session", "798": "auth_session", "319": "auth_session",
+    "290": "auth_session", "291": "auth_session", "293": "auth_session", "302": "auth_session",
+    "303": "auth_session", "304": "auth_session", "305": "auth_session", "307": "auth_session",
+    "288": "auth_session", "294": "auth_session", "521": "auth_session", "522": "auth_session",
+    "523": "auth_session", "549": "auth_session", "592": "auth_session", "1390": "auth_session",
+    "345": "integrity", "347": "integrity", "353": "integrity", "354": "integrity", "494": "integrity",
+    "565": "integrity", "829": "integrity", "924": "integrity", "346": "integrity", "350": "integrity",
+    "349": "integrity", "357": "integrity", "471": "integrity", "913": "integrity",
+    "840": "insecure_design", "693": "insecure_design", "807": "insecure_design", "664": "insecure_design",
+    "670": "insecure_design", "691": "insecure_design", "1188": "insecure_design", "453": "insecure_design",
+    "295": "crypto", "326": "crypto", "327": "crypto", "330": "crypto", "916": "crypto", "331": "crypto",
+    "335": "crypto", "338": "crypto", "340": "crypto", "323": "crypto", "760": "crypto",
+    "918": "ssrf", "1385": "ssrf",
+    "502": "deserialization", "915": "deserialization", "470": "deserialization",
+    # parser differentials / interpretation conflicts: request smuggling and friends are strong, hidden-path material
+    "444": "logic", "436": "logic", "115": "logic", "138": "logic", "150": "logic", "179": "logic",
+    "180": "logic", "182": "logic", "41": "logic", "172": "logic", "173": "logic", "176": "logic",
+    "362": "logic", "367": "logic", "841": "logic", "662": "logic", "833": "logic", "248": "logic",
+    "208": "logic", "385": "logic",
+    "200": "info_exposure", "201": "info_exposure", "209": "info_exposure", "215": "info_exposure",
+    "359": "info_exposure", "497": "info_exposure", "532": "info_exposure", "538": "info_exposure",
+    "540": "info_exposure", "548": "info_exposure", "668": "info_exposure", "212": "info_exposure",
+    "352": "csrf", "1275": "csrf",
+    "434": "file_upload", "616": "file_upload", "646": "file_upload",
+    "79": "xss", "80": "xss", "116": "xss", "83": "xss", "87": "xss",
+    "89": "injection_sql", "564": "injection_sql",
+    "22": "path_traversal", "23": "path_traversal", "35": "path_traversal", "59": "path_traversal",
+    "61": "path_traversal", "73": "path_traversal", "36": "path_traversal", "98": "path_traversal",
+    "377": "path_traversal", "378": "path_traversal", "379": "path_traversal",
+    "601": "open_redirect",
+    "1321": "prototype_pollution", "1325": "prototype_pollution",
+    "77": "injection_single_sink", "78": "injection_single_sink", "88": "injection_single_sink",
+    "90": "injection_single_sink", "917": "injection_single_sink", "943": "injection_single_sink",
+    "94": "injection_single_sink", "95": "injection_single_sink", "1336": "injection_single_sink",
+    "74": "injection_single_sink", "93": "injection_single_sink", "113": "injection_single_sink",
+    "20": "validation", "129": "validation", "190": "validation", "191": "validation",
+    "1286": "validation", "184": "validation", "625": "validation",
+}
+# Score delta per class, scaled from weights.json's 0-10 map (×~1.4, favoured classes up, easy classes pushed negative so
+# they sink below in-scope candidates without being dropped).
+# info_exposure is rated high on measured evidence, not the prior: the accepted apprise task is CWE-200 + CWE-601, and it
+# broke BOTH models. csrf/file_upload sit with the auth/design family; "validation" (CWE-20/74 and friends) is a vague
+# label that says nothing about depth, so it stays neutral.
+CLASS_WEIGHT = {
+    "auth_session": 14, "access_control": 12, "integrity": 12, "insecure_design": 12, "deserialization": 11,
+    "info_exposure": 11, "crypto": 9, "ssrf": 9, "logic": 9, "csrf": 9, "file_upload": 8,
+    "xss": 6, "injection_sql": 6, "validation": 4,
+    "path_traversal": 2, "open_redirect": -2, "injection_single_sink": -2, "prototype_pollution": -4,
+    "other": 4,
+}
+
+
+def cwe_class(rec: Optional[dict]) -> str:
+    """Best (hardest) weakness class among the candidate's CWEs; 'other' if none are mapped."""
+    cwes = {c.upper().removeprefix("CWE-") for c in (rec or {}).get("cwe_ids") or []}
+    classes = [CWE_CLASS[c] for c in cwes if c in CWE_CLASS]
+    return max(classes, key=lambda cl: CLASS_WEIGHT.get(cl, 0)) if classes else "other"
+
 
 def lesson_rejects(rec: dict, diff: Optional[dict] = None) -> list[str]:
     """Static dead-end rules (no pipeline state needed). A fix-bypass PAIR (original fix + its bypass fix, mined by
@@ -238,6 +310,12 @@ def lesson_rejects(rec: dict, diff: Optional[dict] = None) -> list[str]:
     from src.stage3_task_builder.task_generator import OFFENSIVE_REPO_RE
     out = []
     cwes = {c.upper().removeprefix("CWE-") for c in rec.get("cwe_ids") or []}
+    # This is CWE-bench: a task is delivered against a CWE (task.toml cwe_ids, keywords, the weakness-class ranking and
+    # every report). A candidate with no confirmed CWE cannot be classified or reported, so it is out of scope.
+    # scripts/backfill_cwe.py recovers the label from the GHSA/CVE alias first (OSV's Go and PyPI records rarely carry
+    # one); only candidates GHSA cannot classify either are dropped here. REQUIRE_CWE=0 disables the gate.
+    if not cwes and REQUIRE_CWE:
+        out.append("no confirmed CWE (CWE-bench needs one; not in OSV and not recoverable from the GHSA/CVE alias)")
     if cwes and cwes <= DOS_ONLY_CWES:
         out.append(f"resource-exhaustion-only CWE ({', '.join(sorted(cwes))}): 0 usable tasks measured")
     if DEAD_MONOREPO_RE.search(rec.get("repo_url") or ""):
@@ -252,7 +330,7 @@ def lesson_rejects(rec: dict, diff: Optional[dict] = None) -> list[str]:
     return out
 
 
-def score(diff: dict[str, Any], tree: dict[str, Any], rec: Optional[dict] = None) -> int:
+def score(diff: dict[str, Any], tree: dict[str, Any], rec: Optional[dict] = None, fix_date: str = "") -> int:
     """Higher = better candidate for a hard, fair task. Calibrated on the measured results (skills/lessons_learned.md):
     every fix of <= 5 source files was solved by DeepSeek, the only task both models failed spans 8 files / 174 lines /
     4 dirs, and none of the 8 fixes of <= 3 files and <= 35 lines gave a usable task. So: reward breadth (files, dirs =
@@ -289,6 +367,13 @@ def score(diff: dict[str, Any], tree: dict[str, Any], rec: Optional[dict] = None
             sc += 8       # a multi-commit fix series: multi-place fixes often land as several commits
         if rec.get("fix_pair"):
             sc += 40      # fix-bypass pair: the bypass place is one the original human fixers demonstrably missed
+    # No-AI weakness-class weight (the CWE-bench category): favoured classes up, easy single-sink/redirect/proto-pollution
+    # down - so easy classes rank last and get less priority next cycle, without being rejected. See CLASS_WEIGHT.
+    sc += CLASS_WEIGHT.get(cwe_class(rec), 4)
+    # Memorization penalty (weights.json): a fix close to the recency cutoff is less likely memorised. All candidates
+    # already pass PUBLISHED_AFTER, so this only separates within the kept pool - a small bonus for the most recent fixes.
+    if fix_date and fix_date >= "2026-09-01":
+        sc += 4
     return sc
 
 
@@ -336,8 +421,9 @@ def screen_one(rec: dict, gh: GitHubClient, min_lines: int, max_lines: int, publ
     if not t.accepted:
         return Decision(False, t.reasons, {"diff": d.info, "repo": t.info})
     bonus = prior(rec)
-    return Decision(True, [], {"diff": d.info, "repo": t.info, "score": score(d.info, t.info, rec) + bonus,
-                               "prior": bonus, "fix_commit_date": commit_date})
+    return Decision(True, [], {"diff": d.info, "repo": t.info,
+                               "score": score(d.info, t.info, rec, fix_date=commit_date) + bonus,
+                               "prior": bonus, "fix_commit_date": commit_date, "weakness_class": cwe_class(rec)})
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -470,7 +556,9 @@ def prune_lake(cfg: Config, args: argparse.Namespace, state: StateManager, dry_r
             continue
         scr = r.get("screening") or {}
         if diff.get("source_files") is not None:
-            scr["score"] = score(diff, scr.get("repo") or {}, r) + int(scr.get("prior", 0) or 0)
+            scr["score"] = score(diff, scr.get("repo") or {}, r, fix_date=scr.get("fix_commit_date", "")) \
+                + int(scr.get("prior", 0) or 0)
+            scr["weakness_class"] = cwe_class(r)
         kept.append(r)
     if dry_run:
         return removed

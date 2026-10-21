@@ -97,6 +97,16 @@ def evaluate_reply(reply: dict) -> RubricResult:
     return RubricResult(passed, got, blocking)
 
 
+def _verdict(text: str) -> dict:
+    """A reply that answers none of the criteria is a reviewer malfunction, not a rejection: it must not cost the task
+    a regeneration round (GHSA-rqx4, 2026-10-20: JSON without criteria became 9x 'not answered by reviewer')."""
+    reply = extract_json_object(text)
+    got = reply.get("criteria")
+    if not isinstance(got, dict) or not any(isinstance(got.get(n), dict) and "pass" in got[n] for n in CRITERIA):
+        raise ValueError(f"rubric reply answers no criterion: {text[:300]!r}")
+    return reply
+
+
 def check_task(env_dir: Path, backend: CliBackend, model: str, timeout_note: str = "") -> RubricResult:
     patch = split_patch_without_tests((env_dir / "oracle_solution.patch").read_text(encoding="utf-8", errors="replace"))
     meta_path = env_dir / "task_metadata.json"
@@ -113,7 +123,7 @@ def check_task(env_dir: Path, backend: CliBackend, model: str, timeout_note: str
     max_out = int(os.environ.get("RUBRIC_MAX_OUTPUT_TOKENS", "64000"))
     text, _ = backend.complete(model, system, [{"role": "user", "content": prompt}], max_out)
     try:
-        reply = extract_json_object(text)
+        reply = _verdict(text)
     except ValueError:
         # The reviewer's output was stopped (safety filter) or malformed: same fallback model as task generation.
         fallback = os.environ.get("GEN_FALLBACK_MODEL", "claude-opus-4-8")
@@ -121,7 +131,7 @@ def check_task(env_dir: Path, backend: CliBackend, model: str, timeout_note: str
             raise
         log.warning("Rubric reviewer gave no verdict; retrying with the fallback model", extra={"model": fallback})
         text, _ = backend.complete(fallback, system, [{"role": "user", "content": prompt}], max_out)
-        reply = extract_json_object(text)
+        reply = _verdict(text)
     result = evaluate_reply(reply)
     (env_dir / "rubric_check.json").write_text(json.dumps(
         {"passed": result.passed, "criteria": result.criteria, "blocking_issues": result.blocking_issues}, indent=2))
