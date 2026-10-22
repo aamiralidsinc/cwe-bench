@@ -72,7 +72,20 @@ advisory, so they are outside both patterns.
 
 | Date | Model | Agreement | Wrong evidence | Ranking | Cost / time | Stops | Notes |
 |---|---|---|---|---|---|---|---|
-| | | | | | | | |
+| 2026-10-16 | Opus 5.5 (reference) | 100% (by definition) | 2% (4/240) | 0.78 | Claude plan; median 2.2 min/run | 0 | 9/9 valid. Lead check: O8 claims hold (jackson, hono); `regression_tests_in_pinned_commit` wrong on 3 hosts (flag undefined in the prompt) |
+| 2026-10-16 | DeepSeek V4.1 Flash | 73% (59/81) | 2% (6/252) | 0.57 | API; median 5.2 min | 0 | 9/9 valid. Low on O8 (2/9) and O7 (4/9) |
+| 2026-10-16 | MiMo-V2.6-Pro | 73% (59/81) | 0% (0/255) | 0.50 | API; median 13.9 min | 0 | 9/9 valid. Low on O2 (2/9) |
+| 2026-10-16 | GPT-6-Astra (xhigh) | 69% (50/72) | 16% (48/300) | 0.85 | ChatGPT plan; median 8.2 min | 0 | 8/9 valid (better-auth: prose in `present_in_latest`). All wrong evidence is self-citation of its own notes file |
+| 2026-10-16 | GPT-6.1-Sol (xhigh) | 65% (47/72) | 1% (2/236) | 0.70 | ChatGPT plan; median 6.5 min | 0 | 8/9 valid (better-auth, same fault) |
+
+Run set: `~/.tb-graders/cwe/work/screen/calib-20261016T2258Z/` (records, validation, `lead-check.md`).
+Agreement covers O1–O8 and `pattern_fit`, compared in buckets (`screen_calibrate.py`); O3, O5 and
+O6 agree for every model because every model fills them, so the discriminating fields are O2, O7,
+O8 and `pattern_fit`. Ranking = pairwise concordance of `score_read` (`screen-w0`, not fitted)
+with the known outcomes, on the 8 hosts every model returned valid; 9 hosts is a small sample.
+Choice: no model meets the 80% agreement bar, so no routine screener is chosen yet. Runs on the
+client VM (no repo, no memory); outputs moved off between waves; Codex logs audited, no
+cross-run reads.
 
 ### After screening
 - **Validate.** The schema validator checks enums, required fields and every file:line.

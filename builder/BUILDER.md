@@ -198,15 +198,26 @@ instructions turn a task into a checklist. Write instead:
 - what the system is (product level), one observed impact with ONE concrete trigger example at
   the level a user sees (HTTP request, CLI call, public API use);
 - the security properties as invariants: who may do what to which data, or what attacker input
-  must never achieve. Word each so it covers the tested variants ("no value of X may ...");
-- for several flaws: one coherent list of properties in natural order, not one section per flaw,
-  never a count; let one bullet cover several flaws where natural;
-- the contracts the tests need and an engineer could not infer: refusal form ("a client error with
-  no side effect"), interfaces or field names the tests use, preservation clauses ("works exactly
-  as today"), legitimate magnitudes next to any attack magnitude;
+  must never achieve, stated once in general terms ("no value of X may ..., however it arrives").
+  It is fair when, read literally, it covers every tested route; it must not point at any of them
+  (2026-10-19: the earlier "word each to cover every tested variant / one natural list" rule was
+  read as "mention every route" and produced checklists, see `BETTER-PATTERNS.md` §3);
+- for several genuinely different protections: one short list of properties, not one section per
+  flaw, never a count, never one property per route;
+- the contracts the tests need and an engineer could not infer, each stated once for the whole
+  product, never per route: refusal form ("a client error with no side effect"), interfaces or field
+  names the tests use (stated so they apply everywhere; a contract only one sibling needs means the
+  test or the sibling must change), preservation clauses ("works exactly as today", with coupled
+  values named in property terms, not by feature), legitimate magnitudes next to any attack
+  magnitude;
 - NO file, package, function, class, field or parameter names unless a user would see them; no
   root cause; no fix approach; no list of spellings, verbs, routes or roles; no restricting adverbs
   ("directly", "only via"); never name or paraphrase an injected sibling's mechanism;
+- NO clause that describes where a sibling, far site or uncovered route lives, even in product
+  terms (a route, operation, command, channel, object kind, stage or format). State each property
+  once, over the protected data or outcome, so it covers every route without pointing at any. Avoid
+  a general word that is also the name of one stage or entry point (2026-10-19,
+  `BETTER-PATTERNS.md` §2: instructions that described each sibling's surface were solved 30/30);
 - the standard constraints block (fix the attack and close variants; keep legitimate use; do not
   modify or add tests; do not look up the upstream fix; do not special-case the example).
 Experiment (2026-10-16, `research/instruction-experiment.md`): rewriting 7 round-1 instructions
@@ -226,6 +237,10 @@ have it):
   divergent contracts);
 - never more routes of one concept (they fall together), and never encoding/verb/protocol/role
   variants (both models always catch them);
+- at least one HOW-type trap, whose fix needs the mechanism understood (a producer deep in internal
+  machinery, a coupled legitimate value, a shape a plausible check mishandles, a route where the
+  protection never existed). Where-type traps (another entry point, a planted copy) count only as
+  extras and only under a general report (2026-10-19, `BETTER-PATTERNS.md` §5);
 - every trap must be realistic code a maintainer could have written, reachable through the real
   entry point, covered by a stated invariant, and found by the blind fix (3f). A trap the blind
   fix cannot find is unfair: remove it.

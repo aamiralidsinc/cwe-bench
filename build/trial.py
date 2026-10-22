@@ -17,6 +17,7 @@ production screening once we trust the signal.
     --max-runs 3             runs per model
 """
 import argparse
+import os
 import json
 import subprocess
 import sys
@@ -114,8 +115,11 @@ def one_run(model, task_dir, idx):
     # obvious and never confused with an older job dir from a previous era.
     name = f"{task_dir.name}-{model}-r{idx}-{time.strftime('%Y%m%d-%H%M%S')}-n{RUN_SEQ[0]:03d}"
     t0 = time.time()
-    # Free Docker address pools left by kept containers (as build/queue_offline.py does).
-    subprocess.run(["docker", "network", "prune", "-f"], capture_output=True)
+    # Free Docker address pools left by kept containers. Skipped by default now that the daemon
+    # has a 4096-network pool (172.16/12 /24); a concurrent prune would delete a sibling trial's
+    # network. Set CWE_NET_PRUNE=1 to restore the old behaviour.
+    if os.environ.get("CWE_NET_PRUNE") == "1":
+        subprocess.run(["docker", "network", "prune", "-f"], capture_output=True)
     proc = subprocess.run(["bash", str(RUN), model, str(task_dir), "1",
                            "--job-name", name, "-n", "1", "-y"], capture_output=True, text=True)
     wall = round(time.time() - t0)

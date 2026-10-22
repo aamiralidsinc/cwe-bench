@@ -1,0 +1,65 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "1246", "advisory_ids": ["GHSA-5RMQ-CHC7-M22F"], "repo": "hkuds/vibe-trading",
+  "pinned_commit": "unknown (parent of 9454d4a27a763b80e1d6eb5763b86c88e9e4e714; parent_commit not supplied)",
+  "fix_commits": ["9454d4a27a763b80e1d6eb5763b86c88e9e4e714"],
+  "trust_decision": {
+    "summary": "Which server filesystem paths an agent tool (driven by a remote API/MCP user's prompt) may read is decided per tool: read_document has no check, read_file trusts an absolute run_dir as its sandbox root, and journal/shadow tools use safe_user_path whose envelope is all of HOME or CWD.",
+    "evidence": [
+      "agent/src/tools/doc_reader_tool.py:270",
+      "agent/src/tools/read_file_tool.py:43-45",
+      "agent/src/tools/path_utils.py:52-81",
+      "agent/src/tools/trade_journal_tool.py:411",
+      "agent/src/tools/shadow_account_tool.py:42-51",
+      "agent/src/agent/loop.py:259-262"
+    ]
+  },
+  "landing_point": {"where": "agent/src/tools/doc_reader_tool.py:270", "why": "Summary says 'file-read tools'; read_document takes an absolute file_path with no validation at all and is the most obvious reader."},
+  "fix_sites": [
+    {"where": "agent/src/tools/doc_reader_tool.py:270", "entry_point": "agent tool read_document (POST /sessions/{id}/messages -> AgentLoop; MCP read_document agent/mcp_server.py:238)", "module_kind": "tool implementation"},
+    {"where": "agent/src/tools/read_file_tool.py:45", "entry_point": "agent tool read_file with LLM-supplied absolute run_dir (POST /sessions/{id}/messages; MCP read_file agent/mcp_server.py:290)", "module_kind": "tool implementation"},
+    {"where": "agent/src/tools/path_utils.py:52-81", "entry_point": "agent tools analyze_trade_journal / extract_shadow_strategy / run_shadow_backtest / render_shadow_report via safe_user_path (agent/src/tools/trade_journal_tool.py:411, agent/src/tools/shadow_account_tool.py:51,94)", "module_kind": "shared path-validation helper (lower-level)"},
+    {"where": "agent/src/tools/backtest_tool.py:21", "entry_point": "agent tool backtest(run_dir) reads run_dir/config.json", "module_kind": "tool implementation (generated-code tool)"},
+    {"where": "agent/src/tools/pattern_tool.py:316", "entry_point": "agent tool pattern_recognition(run_dir) (MCP agent/mcp_server.py:205)", "module_kind": "tool implementation (analysis tool)"},
+    {"where": "agent/src/tools/edit_file_tool.py:51", "entry_point": "agent tool edit_file with absolute run_dir (reads then writes)", "module_kind": "tool implementation"},
+    {"where": "agent/src/tools/write_file_tool.py:49", "entry_point": "agent tool write_file with absolute run_dir", "module_kind": "tool implementation (write side, same run_dir root)"},
+    {"where": "agent/api_server.py:745-801", "entry_point": "GET /runs, /runs/{id}, /runs/{id}/code, /runs/{id}/pine, /sessions*, /swarm/runs*, /shadow-reports/{id} gained require_auth (fix.diff:462-642)", "module_kind": "HTTP route auth (bundled, separate concern)"}
+  ],
+  "O1_entry_points": 9,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "agent/src/tools/path_utils.py:52-81 (safe_user_path, HOME ∪ CWD envelope, already called at agent/src/tools/trade_journal_tool.py:411 and agent/src/tools/shadow_account_tool.py:51,94)"},
+  "O3_reason_to_dismiss": "The journal and shadow-account tools already call a dedicated path validator whose docstring says broker exports legitimately live anywhere in HOME, so a solver treats them as already protected and only patches read_document/read_file.",
+  "O4_distance": {"files": 7, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Files uploaded via POST /upload are stored under agent/uploads and their absolute path is returned for the agent to read with read_document/analyze_trade_journal; read_file must keep read-only access to bundled skills/; SKILL.md examples use relative 'uploads/...' paths. Over-tight fixes (reject all absolute paths, run_dir-only) break these.", "where": "agent/api_server.py:1367; agent/api_server.py:1397; agent/src/tools/read_file_tool.py:46-49; agent/src/skills/doc-reader/SKILL.md:38"},
+  "O6_input_shapes": ["absolute path", "relative path resolved against CWD", "../ traversal", "~ home expansion", "symlink (handled via resolve())", "UNC // or \\\\ prefix", "absolute LLM-supplied run_dir vs relative run_dir normalised by loop", "comma-separated env-configured extra roots"],
+  "O7_producer": {"kind": "mapper", "where": "agent/src/agent/loop.py:240-262 (_normalize_tool_run_dir injects/keeps run_dir in tool args; absolute values pass through unchanged)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "factor_analysis tool reads LLM-supplied factor_csv/return_csv paths with pd.read_csv and no path check (and creates output_dir anywhere)", "where": "agent/src/tools/factor_analysis_tool.py:113-118", "reason_to_dismiss": "Returns only aggregated IC/IR statistics, not file contents, so it looks like an analysis tool rather than a 'file-read tool'; content leakage is limited to parse-error text.", "distance": "different tool module in agent/src/tools, same package as landing point", "present_in_latest": "yes", "latest_where": "latest/agent/src/tools/factor_analysis_tool.py:37-38"}
+  ],
+  "O8b_injection_room": [
+    {"where": "agent/src/tools/factor_analysis_tool.py:117", "sibling": "Echo a preview of the first rows of factor_csv in the result for user sanity-checking", "why_realistic": "Analysis tools commonly show a data preview; makes the existing uncovered read a real content disclosure."},
+    {"where": "agent/src/shadow_account/backtester.py:365", "sibling": "Let render_shadow_report/run_shadow_backtest accept a journal path from the cached profile metadata (save/reload) instead of re-validating kwargs", "why_realistic": "Profiles persist to ~/.vibe-trading/shadow_accounts; reusing the stored journal path for attribution is a natural convenience and would bypass the tool-level safe_user_path."},
+    {"where": "agent/api_server.py:1367", "sibling": "A GET /uploads/{name} or document-preview route that reads UPLOADS_DIR / name", "why_realistic": "Frontend preview of uploaded files is a plausible feature next to the existing upload handler."}
+  ],
+  "O9_family": "path traversal / unrestricted file read (CWE-22/23, CWE-552) via agent tools", "O9_dos": false,
+  "O10_build": {"language": "Python (plus TypeScript frontend not needed)", "toolchain": "pip install -r agent/requirements.txt; pytest", "services": [], "offline_after_build": true,
+                "project_tests": "agent/tests/test_path_safety.py, agent/tests/test_doc_reader.py exist at pinned commit; fix adds test_doc_reader_security.py, test_file_tool_sandbox_security.py"},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "agent/src/tools/path_utils.py, agent/src/tools/doc_reader_tool.py, agent/src/tools/read_file_tool.py, agent/src/tools/edit_file_tool.py, agent/src/tools/write_file_tool.py, agent/src/tools/backtest_tool.py, agent/src/tools/pattern_tool.py, agent/api_server.py (+ bundled shell-tool gating in agent/src/tools/__init__.py, agent/src/session/service.py, agent/src/swarm/*, agent/mcp_server.py, agent/cli.py, agent/backtest/runner.py)", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a root check to read_document only (or reuse safe_user_path there), leaving the HOME-wide safe_user_path envelope and absolute run_dir in read_file/backtest/pattern tools untouched."},
+  "out_of_scope_notes": [
+    "GET /runs/{run_id}* build RUNS_DIR / run_id without validating run_id (agent/api_server.py:758,779,791); fix only adds auth there.",
+    "Fix bundles unrelated hardening: shell-tool gating, upload extension blocklist, AST validation of signal_engine.py (fix.diff:654-772), loopback-only dev auth.",
+    "cli.py cmd_upload reads any local path (agent/cli.py:1392) — local CLI, not a remote route."
+  ],
+  "unverified": [
+    "pinned commit hash not supplied; taken as parent of the fix commit",
+    "repo size in MB not measured (3526 files listed)",
+    "whether FastAPI path params allow '..' to reach RUNS_DIR parent was not checked",
+    "factor_analysis error message content exposure from pd.read_csv on non-CSV files not verified",
+    "advisory text itself not provided; trust decision inferred from summary and diff"
+  ]
+}

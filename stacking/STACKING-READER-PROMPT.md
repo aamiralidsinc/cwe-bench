@@ -1,0 +1,104 @@
+# Stacking reader prompt (step 2 of the stacking pipeline), v1, 2026-10-22
+
+Operator notes (not sent):
+- One run per candidate. Slots:
+  - `{{CANDIDATE}}`: one row from `stacking/out/h4_candidates.tsv`, `h3b_pairs.tsv` (with its
+    `szz_pairs.tsv` row) or `h12_groups.tsv`;
+  - `{{SCREENER_RECORD}}`: the screener-v2 JSON when one exists, else `none`;
+  - `{{REPO_DIR}}`: a checkout at the pinned commit;
+  - `{{PRIORS}}`: the tier table, STACKING-EXPLORATION.md §2.2-2.3.
+- Output: `stacking/out/reader/<candidate_id>.json`, which the scorer (step 3) reads.
+- The reader reads code and writes one JSON file. It builds nothing and runs nothing against the
+  project.
+
+---8<---
+
+# Read one stacking candidate (stacking-reader-v1)
+
+## What this is
+We build a security-fix benchmark from published, already-fixed advisories in open-source projects.
+A task pins the project before the published fix and gives a solver agent the code plus a short
+report. Hidden behavioural tests then check the fix.
+
+This study is about **stacked** tasks: one checkout holding several real, independent places where
+a protection is missing, so that a correct fix needs several independent judgements.
+
+You read ONE candidate and record, as facts with `path:line` evidence from the pinned code, what
+stacking it supports. Describe each mechanism in one line, never as exploitation steps. Stay inside
+the candidate's own advisories and repository.
+
+## Inputs
+- Candidate: {{CANDIDATE}}
+- Screener record (a lead to verify, not a fact): {{SCREENER_RECORD}}
+- Pinned code: {{REPO_DIR}}
+- Difficulty priors per mechanism and model: {{PRIORS}}
+
+## Mechanism codes (use exactly these)
+
+| Code | Mechanism |
+|---|---|
+| M1 | another entry point reaching the same sink without the guard |
+| M2 | a second, separate implementation of the guarded operation |
+| M3 | the fix belongs in a shared lower layer; the symptom shows above it |
+| M4 | a route where the protection never existed |
+| M5 | the value arrives through defaults, merge, inheritance, patch or stored config |
+| M6 | a data producer (schema, serializer, loader, table builder) feeding the check through a path the check never calls |
+| M7 | ordering: the check runs after an adjustment, or after a side effect has already happened |
+| M8 | a shape a plausible check mishandles (separator split, resolved vs lexical path, rename after the check, nested form) |
+| M10 | wrong object: the check decides on a neighbouring or proxy object, or on an identity field the caller supplies |
+| M11 | a coupled must-keep-working value next to a hidden one |
+
+Pure spelling, encoding, verb, protocol or role variants are NOT traps. Do not record them.
+
+## Steps
+1. **State the protection(s).** Write one line per distinct protection. Bugs closed by the same guard
+   are ONE protection.
+2. **List every candidate trap:** each real place in the pinned code where a protection is missing.
+   Do not stop at the first few. For each, record:
+   - `mechanism` (code above) and `origin`: `advisory_route`, `published_fix_far_site`,
+     `uncovered_upstream` or `injection_room`;
+   - `locations`: path:line for each site (D3);
+   - `reason_to_dismiss`: the one-line argument a solver could make for leaving it alone, or empty;
+   - `distance`: files and packages from where a report would lead;
+   - `protection_state`: `absent` (never existed), `weak` (exists, mishandles a case) or `bypassed`;
+   - `tier_deepseek` and `tier_mimo`: easy, medium, hard or xhard, from the priors, adjusted for this
+     instance (a strong reason to dismiss raises it; a route the report would have to point at lowers
+     it);
+   - `type`: `deepseek` (protection absent plus a reason to dismiss), `mimo` (a coupled value or a
+     how-type mechanism), `both` or `neither`.
+3. **Shared-guard check.** Group traps that one guard or one fix site would close. Each group counts
+   as ONE trap. Report the number of independent groups.
+4. **History** (H3 and H1/H2 candidates):
+   - For H3: does the code of the earlier fix (A) leave the later bug (B) open? Does B live in code A
+     wrote (regression) or elsewhere (incomplete)? Does fixing one bug uncover another (masking)?
+   - For every candidate: was any bug fixed upstream by upgrading a dependency rather than in this
+     repository? If so, can it be fixed in-repo?
+5. **Interactions:**
+   - **Conflicting fixes:** a pair where the natural fix for one trap breaks a must-keep-working value
+     another needs.
+   - **Masking:** a trap that only becomes reachable or visible once another is fixed.
+6. **Fairness risks.** Name any must-keep-working behaviour that a security rule for these traps
+   would contradict. Name any refused input shape that a legitimate use also needs.
+7. **Effort:** minutes for a careful engineer who knows where to look to fix every independent trap.
+8. **Verdict:**
+   - `usable`: yes or no;
+   - the best stacked design, meaning 3-5 independent traps with different reasons to dismiss,
+     including at least one `deepseek`-type and one `mimo`-type;
+   - why that design beats the others.
+
+## Output (JSON only, to the output path)
+```
+{"candidate_id": "", "pattern": "H4|H3a|H3b|H3c|H1|H2", "repo": "", "pinned_commit": "",
+ "protections": [""],
+ "traps": [{"id": "T1", "mechanism": "M4", "origin": "", "locations": ["path:line"], "reason_to_dismiss": "",
+            "distance": {"files": 0, "packages": 0}, "protection_state": "absent|weak|bypassed",
+            "tier_deepseek": "", "tier_mimo": "", "type": "deepseek|mimo|both|neither", "evidence": ["path:line"]}],
+ "independent_groups": [["T1"], ["T2", "T3"]],
+ "history": {"a_fix_leaves_b_open": null, "b_in_code_a_wrote": null, "masking": [], "dependency_bump_fix": false, "in_repo_fix_possible": null},
+ "conflicts": [{"a": "T1", "b": "T2", "what": ""}],
+ "fairness_risks": [""],
+ "effort_minutes": 0,
+ "usable": true, "design": {"traps": ["T1", "T2", "T3"], "why": ""},
+ "unverified": [""]}
+```
+Every claim needs `path:line` evidence from the pinned code, or goes in `unverified`.

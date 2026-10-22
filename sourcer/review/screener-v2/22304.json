@@ -1,0 +1,69 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "22304", "advisory_ids": ["GHSA-272M-GCWP-MPWG", "CVE-2026-56820"], "repo": "netty/netty",
+  "pinned_commit": "unknown (parent of 5b68c61f37aa4a3045cba624cbea239655c9003b; parent_commit null in candidate)",
+  "fix_commits": ["5b68c61f37aa4a3045cba624cbea239655c9003b", "bb2ff68a1fb71cb4b0eb9a9e17b66c52aff680c6"],
+  "trust_decision": {
+    "summary": "OcspClient.validateResponse decides whether a fetched OCSP BasicOCSPResp is accepted for the queried certificate; at the pinned commit it checks response count, optional nonce and signature but never that the SingleResp CertID (issuer hashes + serial) matches the certificate queried, so any validly signed response from the same issuer/responder (e.g. for another cert) is accepted; OcspServerCertificateValidator then trusts getResponses()[0].",
+    "evidence": [
+      "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:243-261",
+      "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:116-118",
+      "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java:153-173",
+      "fix.diff:2609-2615"
+    ]
+  },
+  "landing_point": {
+    "where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:243",
+    "why": "validateResponse is the only place the OCSP response is checked (count/nonce/signature); 'missing CertificateID validation' leads straight here."
+  },
+  "fix_sites": [
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:243-251", "entry_point": "public OcspServerCertificateValidator (pipeline handler) -> SslHandshakeCompletionEvent -> package-private OcspClient.query -> validateResponse (CertID issuer+serial match added, fix.diff:2609-2615)", "module_kind": "core OCSP client (package-private)"},
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:162-168", "entry_point": "same; unchecked (BasicOCSPResp) cast replaced by instanceof check for non-basic / null responseBytes (fix.diff:2547-2564)", "module_kind": "core OCSP client (package-private)"},
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java:131-191", "entry_point": "public OcspServerCertificateValidator.userEventTriggered: handshake event now held until OCSP result, reads paused, out-of-date response returns instead of continuing, null nextUpdate handled (fix.diff:2795-2960)", "module_kind": "public pipeline handler (same package)"},
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspHttpHandler.java:45-85", "entry_point": "internal HTTP handler installed by OcspClient.Initializer; adds response timeout, channelInactive failure, release (fix.diff:2669-2741)", "module_kind": "transport helper (package-private)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All OCSP fix sites are in one 10-file package handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/; the validator fail-open ordering (OcspServerCertificateValidator.java:132,189) is a second layer but in the same, obviously in-scope class."},
+  "O3_reason_to_dismiss": "For the validator ordering/fail-open part: 'the advisory is about CertID matching in the OCSP response, the event-ordering and stale-date handling in OcspServerCertificateValidator is pre-existing design (closeAndThrowIfNotValid=false lets the app decide)'.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Delegated-responder responses (signed by an included responder cert chaining to the issuer) and responses without nonce when validateNonce=false must still be accepted; with closeAndThrowIfNotValid=false the validator must forward OcspValidationEvent instead of closing; the fix also accepts a null nextUpdate (RFC 6960 optional).",
+    "where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:287-300; handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:253-255; handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspServerCertificateValidator.java:177; fix.diff:2845-2846"
+  },
+  "O6_input_shapes": [
+    "response for unrelated certificate (issuer name/key hash mismatch) - fix.diff:2610",
+    "response with matching issuer but different serial - fix.diff:2611",
+    "non-BasicOCSPResp response type - fix.diff:2558-2564 (already fails at pinned via ClassCastException caught at OcspClient.java:166)",
+    "non-successful status with null responseBytes - fix.diff:2553-2557 (already fails at pinned via NPE caught at OcspClient.java:258)",
+    "null thisUpdate / null nextUpdate - fix.diff:2843-2846"
+  ],
+  "O7_producer": {"kind": "none", "where": "Response is produced by the remote responder and parsed in OcspHttpHandler.java:76; no schema/serializer/cache/config state involved.", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClientHandler.java:46", "sibling": "a netty-provided default stapled-response verifier (concrete OcspClientHandler subclass) that parses engine.getOcspResponse(), checks signature and status but not CertID", "why_realistic": "OcspClientHandler is abstract and pushes verification to users; a convenience implementation reusing OcspClient.validateSignature is a natural maintainer addition, and it sits in a different code path (stapling, OpenSSL engine) from the query route."},
+    {"where": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java:107-180", "sibling": "a per-issuer OCSP response cache consulted before querying, returning a cached BasicOCSPResp without re-matching CertID to the current certificate", "why_realistic": "OCSP caching is a common optimisation; the cache key would plausibly be the responder URL/issuer, and the CertID check in validateResponse would not run on a cache hit (cache boundary lesson)."}
+  ],
+  "O9_family": "CWE-295 improper certificate validation (OCSP response not bound to the queried certificate)", "O9_dos": false,
+  "O10_build": {"language": "Java", "toolchain": "Maven (netty 4.2.16.Final-SNAPSHOT multi-module), JDK version unverified; BouncyCastle dependency", "services": [],
+                "offline_after_build": true,
+                "project_tests": "handler-ssl-ocsp/src/test/java/io/netty/handler/ssl/ocsp/OcspClientTest.java (line 50-56 uses live HttpsURLConnection; network), OcspServerCertificateValidatorTest.java, OcspTest.java; fix's testCertIdBypass uses a fake in-process transport, so the behaviour is testable offline"},
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 0, "j_sites_touched": "handler-ssl-ocsp/src/main/java/io/netty/handler/ssl/ocsp/OcspClient.java, OcspHttpHandler.java, OcspServerCertificateValidator.java (plus module-info.yml)", "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Compare only the response serial number with x509Certificate.getSerialNumber() in validateResponse, without matching issuer name/key hashes, and leave the validator's fail-open ordering untouched."},
+  "out_of_scope_notes": [
+    "fix.diff is a bundled security release: ~30 source files across bzip2, DNS, HAProxy, HTTP/CORS/multipart/websocket, SPDY, HTTP/2, HTTP/3, Redis, STOMP, XML are unrelated advisories; candidate counts (c_fix_sites 79, c_site_files 33) reflect the bundle, not this advisory.",
+    "OcspClient.validateCertificateChain (OcspClient.java:320-359) builds a path from responder cert to issuer but does not appear to check the id-kp-OCSPSigning EKU for delegated responders; separate protection, not pursued.",
+    "OcspHttpHandler has no response timeout at pinned (fixed in same diff, fix.diff:2722-2732) - resource issue, out of scope."
+  ],
+  "unverified": [
+    "Exact pinned commit hash not given (parent_commit null).",
+    "Repo size in MB not measured.",
+    "Which of the two fix commits carries the OCSP hunk; fix.diff appears to be a combined diff.",
+    "JDK version required to build netty 4.2.16-SNAPSHOT.",
+    "Whether the validator fail-open ordering (OcspServerCertificateValidator.java:132,189) is formally part of this GHSA or of a sibling advisory in the same release."
+  ]
+}

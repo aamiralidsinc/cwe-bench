@@ -111,11 +111,16 @@ class GateFailure(Exception):
 
 
 def docker_free_gb():
-    """Free GB on the Colima VM's Docker disk, or None if it cannot be read."""
+    """Free GB on the Docker disk (the Colima VM's on the Mac, the local one on Linux), or None."""
     try:
         out = subprocess.run(["colima", "ssh", "--", "df", "-BG", "/var/lib/docker"],
                              capture_output=True, text=True, timeout=60).stdout.split()
         return int(out[-3].rstrip("G"))
+    except Exception:
+        pass
+    try:  # Linux host (client VM): Docker's data lives under /var/lib on the root disk
+        import shutil
+        return shutil.disk_usage("/var/lib").free // 2**30
     except Exception:
         return None
 

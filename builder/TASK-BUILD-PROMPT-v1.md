@@ -1,5 +1,8 @@
 # Task-build prompt, v1
 
+> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `builder/templates/` and follow `builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
+
+
 | | |
 |---|---|
 | Version | `build-v1`, 2026-10-16 |
@@ -105,25 +108,92 @@ in, in order of evidence:
      public API, a wrapper, a save/reload path, or a defaults or merge route.
    - Give it a plausible **reason to dismiss**, and **distance**: another file or package from the
      landing point.
+   - **A second implementation is the strongest form of this**: separate code doing the same
+     guarded operation (a fallback backend, another package, another transport, a legacy version),
+     so fixing the reported copy changes nothing in the other. Models fix the copy the example hits,
+     re-run the example and stop. Prefer a real one (Pattern A or B) over a planted one. Find
+     candidates by searching for the low-level primitive across packages (redirect following,
+     header copying, file writes, message construction). It only counts if the report never
+     describes it.
 2. **Pattern B: uncovered routes.**
    - Routes into the same protected sink where the advisory's own protection is missing at the
      pinned commit, and which the published fix did not touch.
-   - They are unmodified upstream code, so a solver can argue they were never covered.
+   - They are unmodified upstream code. A solver may argue they were never covered, but the task's
+     general property covers them, so leaving one open is a model failure, not out of scope. The
+     same holds for a route where the protection never existed: the property requires it.
+   - Make sure the property, read literally, really covers each route (no word that excludes it),
+     and that its test fails only when the protection is really missing (it must pass a correct
+     fix placed at any valid layer).
    - The strongest lever found so far: DeepSeek 6 of 6 on one; both models 0 of 3 on three combined.
-3. **Input-shape variants** that the general rule covers but a one-case fix misses (a plain string
-   and an array).
+3. **Shape traps: an input form that a plausible check mishandles.** Examples: a value given as an
+   array where the check only handles a string; a name split on the first separator when it can
+   contain the separator; a resolved path against a lexical check; a rename or rewrite that happens
+   after the check; a nested expression the check never inspects. Two conditions: the general
+   property must cover the form literally, and the form must not fall inside anything a
+   must-keep-working clause or a test fixture calls legitimate. A pure spelling, encoding, verb,
+   protocol or role variant of a stated input is NOT a shape trap: both models always catch those
+   (see "Never add").
 4. **A coupled must-keep-working behaviour** next to the sink, tested functionally, so an
    over-broad fix fails. MiMo tends to over-harden.
 5. **Producer off the check's path.** The check depends on data produced elsewhere (a schema,
-   serializer, cache, mapper or config loader) and does not call it. It counts only if the producer
-   is infrastructure, not a request handler.
+   serializer, cache, mapper, table builder or config loader) and does not call it; the data
+   reaches the check on a separate path (saved and reloaded, rebuilt from config). The fix needs
+   both the check and the producer. Models trace into what the check calls, never back to where
+   its data comes from. Rules:
+   - it counts only if the producer is infrastructure, not a request handler;
+   - verify that the check does **not** call the producer; if it does, the model follows the call
+     and fixes it;
+   - the report describes impact only through the check's path and states the property abstractly
+     ("including data saved earlier"); it never points at the producer or the reload path;
+   - avoid fixes where the check cannot compile without the producer change (that forces the find);
+   - hidden tests must not need a field or function name the solver would have to guess;
+   - prefer a producer deep in internal machinery (a table or schema builder). One behind a path
+     that is easy to follow falls as soon as anything points at it.
 6. **Injected siblings**, only where the plan asks for them. Each must be:
    - code a maintainer could have written, with no deceptive names or comments;
    - reachable through the real entry point;
-   - covered by a stated invariant;
+   - covered by the task's general property, never by a sentence of its own;
    - placed where the upstream fix never touches.
+7. **Wrong object.** The authorization check exists but decides on a different object than the one
+   the request actually touches: a neighbouring or proxy resource (a parent or container instead of
+   the item written), or an identity field the caller supplies (an account inside a caller-provided
+   resource name; a parent read from one part of the request while the write uses another). Models
+   copy the nearby precedent. Rules:
+   - the instruction names the protected object class in product terms ("the objects that hold the
+     limits"), never the check or its location;
+   - the security test denies exactly the object touched while the proxy object stays allowed;
+   - a functional test keeps a legitimate request on that same object working.
+8. **Ordering.** The check is right but runs at the wrong moment: after an adjustment turns the
+   attacker's value into a different bad value (an offset, a clamp, a unit conversion, a
+   normalisation), or after a side effect has already happened (a directory created, a file cleared,
+   copied or re-permissioned, a request sent) before the refusal. Rules:
+   - the instruction states the property over the attacker's input or the outcome ("nothing outside
+     the folder is created or changed, even when the request is refused"), never the order of steps;
+   - the security test checks the side effect itself, not only the response;
+   - any fix that keeps the property passes, wherever it places the check.
+9. **Route where the protection never existed.** Real code reaches the protected sink but never had
+   the check at all, so its absence reads as design (DeepSeek missed one 6 of 6 times). Rules:
+   - it needs a plausible reason to dismiss: an unsupported combination, a legacy path, a
+     neighbouring feature. If the project documents the protection as applying everywhere with no
+     exceptions, there is no reason to dismiss and the route adds nothing;
+   - the general property must cover it literally; never describe it in the instruction;
+   - confirm it with a behavioural test on the pinned copy, like any Pattern B route.
+10. **Merged or defaults route.** The restricted value reaches the sink through defaults, a merge,
+    inheritance, a patch, or stored configuration rather than the request field the report shows.
+    Models treat the report's example fields as the whole set. Rules:
+    - state the property over the sink ("anything a submitter supplies that ends up in X, however
+      it gets there"), not over the entry or field;
+    - the security test drives the merged or stored route through the real entry point;
+    - a functional test keeps legitimate defaults and merges working.
 
 Aim for at least two levers with **different** reasons to dismiss.
+
+**At least one lever must be how-type**: its fix needs the mechanism understood, not only found.
+How-type levers are a producer off the check's path (5), a coupled must-keep-working value (4), a
+shape that a plausible check mishandles (3: a separator split, a rename after the check), and a
+route where the protection never existed. Where-type levers (another entry point into the same code,
+a second copy, injected siblings) only cost a search. They held only when the report stayed general,
+so count them as extras, never as the task's main difficulty.
 
 Never add:
 - encoding, verb, protocol or role/direction variants;
@@ -165,17 +235,23 @@ fix cannot find is unfair: remove it.
 - what the system is, at product level;
 - one observed impact, with ONE concrete trigger at user level (HTTP request, CLI call or public API
   use);
-- the security properties as **invariants**: who may do what to which data, or what attacker input
-  must never achieve. Word each so it covers every tested route and shape ("no value of X may …").
-  If there are several, give one natural list, never a count;
-- every **contract** the tests need:
+- the security property as an **invariant**, stated once in general terms: who may do what to which
+  data, or what attacker input must never achieve ("no value of X may …, however it arrives"). It is
+  fair when, read literally, it covers every tested route and shape; it must not point at any of
+  them. Write a second property only for a genuinely different protection, never one per route,
+  and never a count;
+- every **contract** the tests need, each stated once for the whole product, never per route:
   - the refusal form ("a client error with no side effect");
-  - any interface or field name a test uses;
-  - preservation clauses ("works exactly as today");
+  - any interface or field name a test uses, stated so it applies everywhere. If a sibling's test
+    would need a contract that only that sibling uses, change the test so it does not, or drop the
+    sibling;
+  - preservation clauses ("everything that works today keeps working exactly as today"). Name a
+    coupled legitimate value in property terms ("visible values keep binding even next to a hidden
+    one"), not by the feature or route it sits on;
   - a legitimate magnitude next to any attack magnitude;
 - that examples are examples, not the full set;
 - the standard constraints block: fix the problem and its close variants; keep legitimate use
-  working; do not modify or add tests; do not look up the upstream fix; do not special-case the
+  working; do not look up the upstream fix; do not special-case the
   example.
 
 **Never write:**
@@ -183,7 +259,16 @@ fix cannot find is unfair: remove it.
 - line numbers, the root cause, the fix approach, or a CVE or GHSA id;
 - a list of routes, spellings or roles;
 - restricting adverbs ("directly", "only via");
-- anything that names or paraphrases a far site, an uncovered route or an injected sibling.
+- anything that names or paraphrases a far site, an uncovered route or an injected sibling;
+- any clause that describes where a far site, uncovered route or injected sibling lives, even in
+  product terms: no route, operation, command, channel, object kind, stage or format that points
+  at one of them. State each property once, over the protected data or outcome, so it covers every
+  route without pointing at any;
+- a word that is general but is also the name of one stage or entry point ("loading" when the
+  product has a load call). Pick wording that cannot be read as one surface.
+
+Check before you finish: for each sentence of the report, ask whether it exists to cover one
+specific route or trap. If it does, delete it or widen it into the general property.
 
 Put every identifier that must not appear in `manifest.leak_terms`.
 
@@ -222,8 +307,8 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 ## Deliverables
 **`tasks/{{SLUG}}/`:**
 - `instruction.md`;
-- `task.toml`, from `builder/templates/`, with `[metadata]` filled in and the network allowlist
-  kept;
+- `task.toml`, from `builder/templates/`, with `[metadata]` (incl. the delivery fields) filled in and
+  `network_mode = "no-network"` (no allowlist);
 - `environment/Dockerfile`;
 - `solution/solve.sh` and `solution/fix.patch`;
 - `tests/test.sh`, `tests/score.py`, `tests/security/` and `tests/functional/`.
