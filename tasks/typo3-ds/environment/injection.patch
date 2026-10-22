@@ -1,0 +1,428 @@
+--- a/typo3/sysext/form/Classes/Domain/Repository/FormDefinitionRepository.php
++++ b/typo3/sysext/form/Classes/Domain/Repository/FormDefinitionRepository.php
+@@ -249,6 +249,27 @@
+     }
+ 
+     /**
++     * Restore a soft-deleted form definition.
++     *
++     * @param int $uid The UID of the form definition to restore
++     * @return bool TRUE if the form definition was restored, FALSE otherwise
++     */
++    public function restore(int $uid): bool
++    {
++        /** @var DataHandler $dataHandler */
++        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
++        $dataHandler->start([], [
++            self::TABLE_NAME => [
++                $uid => [
++                    'undelete' => 1,
++                ],
++            ],
++        ]);
++        $dataHandler->process_cmdmap();
++        return $dataHandler->errorLog === [];
++    }
++
++    /**
+      * Update a form definition in the database using DataHandler.
+      *
+      * @param int $uid The UID of the form definition to update
+--- a/typo3/sysext/form/Classes/Service/FormTransferService.php
++++ b/typo3/sysext/form/Classes/Service/FormTransferService.php
+@@ -23,6 +23,7 @@
+ use TYPO3\CMS\Core\Utility\GeneralUtility;
+ use TYPO3\CMS\Form\Domain\DTO\FormData;
+ use TYPO3\CMS\Form\Domain\DTO\FormMetadata;
++use TYPO3\CMS\Form\Domain\Repository\FormDefinitionRepository;
+ use TYPO3\CMS\Form\Domain\DTO\SearchCriteria;
+ use TYPO3\CMS\Form\Domain\DTO\StorageContext;
+ use TYPO3\CMS\Form\Domain\ValueObject\FormIdentifier;
+@@ -158,6 +159,39 @@
+     }
+ 
+     /**
++     * Import form definitions from an exported JSON document into database storage.
++     *
++     * Each record contains the database columns to persist. This is used by the
++     * `form:definition:import` command to restore exported definitions in bulk.
++     *
++     * @param list<array{identifier?: string, label?: string, configuration?: array|string, pid?: int}> $records
++     * @return int Number of imported records
++     * @throws \JsonException
++     */
++    public function importFromExport(array $records, int $targetPid = 0): int
++    {
++        $connection = $this->connectionPool->getConnectionForTable(FormDefinitionRepository::TABLE_NAME);
++        $imported = 0;
++        foreach ($records as $record) {
++            $configuration = $record['configuration'] ?? [];
++            $rowPid = isset($record['pid']) ? (int)$record['pid'] : $targetPid;
++            $connection->insert(FormDefinitionRepository::TABLE_NAME, [
++                'pid' => $rowPid,
++                'deleted' => 0,
++                'label' => (string)($record['label'] ?? ''),
++                'identifier' => (string)($record['identifier'] ?? ''),
++                'configuration' => is_string($configuration)
++                    ? $configuration
++                    : json_encode($configuration, JSON_THROW_ON_ERROR),
++                'crdate' => $GLOBALS['EXEC_TIME'] ?? time(),
++                'tstamp' => $GLOBALS['EXEC_TIME'] ?? time(),
++            ]);
++            $imported++;
++        }
++        return $imported;
++    }
++
++    /**
+      * Get all registered storage type identifiers
+      *
+      * @return list<string>
+--- a/typo3/sysext/form/Classes/Command/ImportFormDefinitionsCommand.php
++++ b/typo3/sysext/form/Classes/Command/ImportFormDefinitionsCommand.php
+@@ -0,0 +1,94 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 CMS project.
++ *
++ * It is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License, either version 2
++ * of the License, or any later version.
++ *
++ * For the full copyright and license information, please read the
++ * LICENSE.txt file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\CMS\Form\Command;
++
++use Symfony\Component\Console\Attribute\AsCommand;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputArgument;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Input\InputOption;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++use TYPO3\CMS\Core\Core\Bootstrap;
++use TYPO3\CMS\Form\Service\FormTransferService;
++
++/**
++ * CLI command to import form definitions from a JSON export into database storage.
++ *
++ * Usage:
++ *   bin/typo3 form:definition:import export.json
++ *   bin/typo3 form:definition:import export.json --pid=42
++ */
++#[AsCommand('form:definition:import', 'Import form definitions from a JSON export into database storage')]
++class ImportFormDefinitionsCommand extends Command
++{
++    public function __construct(
++        private readonly FormTransferService $formTransferService,
++    ) {
++        parent::__construct();
++    }
++
++    protected function configure(): void
++    {
++        $this
++            ->setHelp(
++                'Imports form definitions that were exported from another instance into the database storage.'
++                . LF . 'The file must contain a JSON array of objects with "identifier", "label" and "configuration".'
++            )
++            ->addArgument(
++                'file',
++                InputArgument::REQUIRED,
++                'Path to the JSON export file.',
++            )
++            ->addOption(
++                'pid',
++                null,
++                InputOption::VALUE_REQUIRED,
++                'Page id to store the imported form definitions on.',
++                '0',
++            );
++    }
++
++    protected function execute(InputInterface $input, OutputInterface $output): int
++    {
++        Bootstrap::initializeBackendAuthentication();
++
++        $io = new SymfonyStyle($input, $output);
++        $file = (string)$input->getArgument('file');
++        if (!is_file($file)) {
++            $io->error(sprintf('File "%s" does not exist.', $file));
++            return Command::FAILURE;
++        }
++
++        try {
++            $records = json_decode((string)file_get_contents($file), true, 512, JSON_THROW_ON_ERROR);
++        } catch (\JsonException $e) {
++            $io->error(sprintf('The export file is not valid JSON: %s', $e->getMessage()));
++            return Command::FAILURE;
++        }
++
++        if (!is_array($records)) {
++            $io->error('The export file must contain a JSON array of form definitions.');
++            return Command::FAILURE;
++        }
++
++        $imported = $this->formTransferService->importFromExport($records, (int)$input->getOption('pid'));
++        $io->success(sprintf('Imported %d form definition(s).', $imported));
++        return Command::SUCCESS;
++    }
++}
+--- a/typo3/sysext/form/Classes/Command/RestoreFormDefinitionCommand.php
++++ b/typo3/sysext/form/Classes/Command/RestoreFormDefinitionCommand.php
+@@ -0,0 +1,74 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 CMS project.
++ *
++ * It is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License, either version 2
++ * of the License, or any later version.
++ *
++ * For the full copyright and license information, please read the
++ * LICENSE.txt file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\CMS\Form\Command;
++
++use Symfony\Component\Console\Attribute\AsCommand;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputArgument;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++use TYPO3\CMS\Core\Core\Bootstrap;
++use TYPO3\CMS\Form\Domain\Repository\FormDefinitionRepository;
++
++/**
++ * CLI command to restore soft-deleted form definitions.
++ *
++ * Usage:
++ *   bin/typo3 form:definition:restore 42
++ */
++#[AsCommand('form:definition:restore', 'Restore soft-deleted database form definitions')]
++class RestoreFormDefinitionCommand extends Command
++{
++    public function __construct(
++        private readonly FormDefinitionRepository $formDefinitionRepository,
++    ) {
++        parent::__construct();
++    }
++
++    protected function configure(): void
++    {
++        $this
++            ->setHelp('Restores a form definition that was deleted through the form manager.')
++            ->addArgument(
++                'uid',
++                InputArgument::REQUIRED,
++                'UID of the database form definition to restore.',
++            );
++    }
++
++    protected function execute(InputInterface $input, OutputInterface $output): int
++    {
++        Bootstrap::initializeBackendAuthentication();
++
++        $io = new SymfonyStyle($input, $output);
++        $uid = (int)$input->getArgument('uid');
++        if ($uid <= 0) {
++            $io->error('A valid form definition uid is required.');
++            return Command::FAILURE;
++        }
++
++        if (!$this->formDefinitionRepository->restore($uid)) {
++            $io->error(sprintf('Form definition "%d" could not be restored.', $uid));
++            return Command::FAILURE;
++        }
++
++        $io->success(sprintf('Form definition "%d" restored.', $uid));
++        return Command::SUCCESS;
++    }
++}
+--- /dev/null
++++ b/typo3/sysext/form/Classes/Service/FormDefinitionPresetService.php
+@@ -0,0 +1,68 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 CMS project.
++ *
++ * It is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License, either version 2
++ * of the License, or any later version.
++ *
++ * For the full copyright and license information, please read the
++ * LICENSE.txt file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\CMS\Form\Service;
++
++use TYPO3\CMS\Core\Database\ConnectionPool;
++use TYPO3\CMS\Form\Domain\Repository\FormDefinitionRepository;
++
++/**
++ * Applies a stored preset to an existing database form definition.
++ *
++ * A preset is a partial form definition (for example a set of finishers or
++ * rendering options) that is merged into a stored definition. The tool is used
++ * to roll out common settings to several stored forms at once.
++ *
++ * @internal
++ */
++final readonly class FormDefinitionPresetService
++{
++    public function __construct(
++        private ConnectionPool $connectionPool,
++        private FormDefinitionRepository $formDefinitionRepository,
++    ) {}
++
++    /**
++     * Merge the preset into the stored definition and persist the result.
++     *
++     * @param array<string, mixed> $preset
++     * @throws \JsonException
++     */
++    public function applyPreset(int $uid, array $preset): void
++    {
++        $record = $this->formDefinitionRepository->findByUid($uid);
++        if ($record === null) {
++            throw new \RuntimeException(
++                sprintf('Form definition "%d" does not exist.', $uid),
++                1774366010
++            );
++        }
++        $definition = json_decode((string)$record['configuration'], true, 512, JSON_THROW_ON_ERROR);
++        if (!is_array($definition)) {
++            throw new \RuntimeException(
++                sprintf('Form definition "%d" has an invalid configuration.', $uid),
++                1774366011
++            );
++        }
++        $connection = $this->connectionPool->getConnectionForTable(FormDefinitionRepository::TABLE_NAME);
++        $connection->update(
++            FormDefinitionRepository::TABLE_NAME,
++            ['configuration' => array_replace($definition, $preset)],
++            ['uid' => $uid]
++        );
++    }
++}
+--- /dev/null
++++ b/typo3/sysext/form/Classes/Command/ApplyFormDefinitionPresetCommand.php
+@@ -0,0 +1,100 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 CMS project.
++ *
++ * It is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License, either version 2
++ * of the License, or any later version.
++ *
++ * For the full copyright and license information, please read the
++ * LICENSE.txt file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\CMS\Form\Command;
++
++use Symfony\Component\Console\Attribute\AsCommand;
++use Symfony\Component\Console\Command\Command;
++use Symfony\Component\Console\Input\InputArgument;
++use Symfony\Component\Console\Input\InputInterface;
++use Symfony\Component\Console\Output\OutputInterface;
++use Symfony\Component\Console\Style\SymfonyStyle;
++use TYPO3\CMS\Core\Core\Bootstrap;
++use TYPO3\CMS\Form\Service\FormDefinitionPresetService;
++
++/**
++ * CLI command to apply a preset to an existing database form definition.
++ *
++ * Usage:
++ *   bin/typo3 form:definition:apply-preset 42 preset.json
++ */
++#[AsCommand('form:definition:apply-preset', 'Apply a preset to an existing database form definition')]
++class ApplyFormDefinitionPresetCommand extends Command
++{
++    public function __construct(
++        private readonly FormDefinitionPresetService $formDefinitionPresetService,
++    ) {
++        parent::__construct();
++    }
++
++    protected function configure(): void
++    {
++        $this
++            ->setHelp(
++                'Merges a preset into an existing database form definition.'
++                . LF . 'The preset file must contain a JSON object with the definition values to override.'
++            )
++            ->addArgument(
++                'uid',
++                InputArgument::REQUIRED,
++                'UID of the database form definition to update.',
++            )
++            ->addArgument(
++                'preset',
++                InputArgument::REQUIRED,
++                'Path to the JSON file with the preset values.',
++            );
++    }
++
++    protected function execute(InputInterface $input, OutputInterface $output): int
++    {
++        Bootstrap::initializeBackendAuthentication();
++
++        $io = new SymfonyStyle($input, $output);
++        $uid = (int)$input->getArgument('uid');
++        $file = (string)$input->getArgument('preset');
++        if ($uid <= 0) {
++            $io->error('A valid form definition uid is required.');
++            return Command::FAILURE;
++        }
++        if (!is_file($file)) {
++            $io->error(sprintf('File "%s" does not exist.', $file));
++            return Command::FAILURE;
++        }
++
++        try {
++            $preset = json_decode((string)file_get_contents($file), true, 512, JSON_THROW_ON_ERROR);
++        } catch (\JsonException $e) {
++            $io->error(sprintf('The preset file is not valid JSON: %s', $e->getMessage()));
++            return Command::FAILURE;
++        }
++        if (!is_array($preset)) {
++            $io->error('The preset file must contain a JSON object.');
++            return Command::FAILURE;
++        }
++
++        try {
++            $this->formDefinitionPresetService->applyPreset($uid, $preset);
++        } catch (\Throwable $e) {
++            $io->error($e->getMessage());
++            return Command::FAILURE;
++        }
++
++        $io->success(sprintf('Preset applied to form definition "%d".', $uid));
++        return Command::SUCCESS;
++    }
++}

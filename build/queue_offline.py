@@ -237,7 +237,9 @@ def main():
             n, mult = act
             # Kept (stopped) trials leave their compose networks behind; Docker's ~31 address
             # pools ran out on 2026-10-16. Remove networks no container uses before each launch.
-            subprocess.run(["docker", "network", "prune", "-f"], capture_output=True)
+            # until=10m keeps a fresh sibling compose network (seconds old) from being
+            # pruned mid-up; fixes the concurrent network-not-found race under parallelism.
+            subprocess.run(["docker", "network", "prune", "-f", "--filter", "until=10m"], capture_output=True)
             env = dict(**__import__("os").environ)
             if mult:
                 env["CWE_AGENT_TIMEOUT_MULT"] = str(mult)

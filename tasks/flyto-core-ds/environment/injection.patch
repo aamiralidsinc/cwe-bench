@@ -1,0 +1,648 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' pinned/src/core/modules/atomic/document/__init__.py injected/src/core/modules/atomic/document/__init__.py
+--- a/src/core/modules/atomic/document/__init__.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/document/__init__.py	2026-10-18 19:13:54.278129616 +0000
+@@ -35,3 +35,8 @@
+     from .word_to_pdf import *
+ except ImportError:
+     pass
++
++try:
++    from .pdf_metadata import *
++except ImportError:
++    pass
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' pinned/src/core/modules/atomic/document/pdf_metadata.py injected/src/core/modules/atomic/document/pdf_metadata.py
+--- a/src/core/modules/atomic/document/pdf_metadata.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/modules/atomic/document/pdf_metadata.py	2026-10-18 19:14:13.922115708 +0000
+@@ -0,0 +1,230 @@
++# Copyright 2026 Flyto2. Licensed under Apache-2.0. See LICENSE.
++
++"""
++PDF Metadata Module
++Write document metadata onto a PDF.
++"""
++import asyncio
++import logging
++import os
++import shutil
++from typing import Any, Dict
++
++from ...base import BaseModule
++from ...registry import register_module
++from ...schema import compose
++from ...schema.builders import field
++from ...schema.constants import FieldGroup
++from ...errors import ModuleError
++from ....utils import validate_path_with_env_config, PathTraversalError
++
++
++logger = logging.getLogger(__name__)
++
++
++def _resolve_metadata_output(input_path: str, output_path):
++    if output_path:
++        return output_path
++    base, ext = os.path.splitext(input_path)
++    return f"{base}_meta{ext or '.pdf'}"
++
++
++def _write_pdf_with_metadata(input_path: str, output_path: str, metadata: Dict[str, Any]) -> None:
++    from pypdf import PdfReader, PdfWriter
++
++    reader = PdfReader(input_path)
++    writer = PdfWriter()
++    for page in reader.pages:
++        writer.add_page(page)
++
++    entries = {}
++    for key, value in metadata.items():
++        name = str(key)
++        if not name.startswith('/'):
++            name = '/' + name
++        entries[name] = str(value)
++    if entries:
++        writer.add_metadata(entries)
++
++    with open(output_path, 'wb') as handle:
++        writer.write(handle)
++
++
++@register_module(
++    module_id='document.pdf_metadata',
++    version='1.0.0',
++    category='document',
++    subcategory='pdf',
++    tags=['pdf', 'metadata', 'document', 'path_restricted'],
++    label='Set PDF Metadata',
++    label_key='modules.document.pdf_metadata.label',
++    description='Write document metadata onto a PDF',
++    description_key='modules.document.pdf_metadata.description',
++    icon='FileText',
++    color='#DC2626',
++
++    input_types=['file_path'],
++    output_types=['file_path'],
++
++    can_connect_to=['document.*', 'file.*', 'flow.*'],
++    can_receive_from=['document.*', 'file.*', 'flow.*', 'start'],
++
++    timeout_ms=60000,
++    retryable=False,
++    concurrent_safe=True,
++
++    requires_credentials=False,
++    handles_sensitive_data=False,
++    required_permissions=['filesystem.read', 'filesystem.write'],
++
++    params_schema=compose(
++        field(
++            'input_path',
++            type='string',
++            label='Input PDF',
++            label_key='modules.document.pdf_metadata.params.input_path.label',
++            description='Path to the source PDF',
++            description_key='modules.document.pdf_metadata.params.input_path.description',
++            required=True,
++            placeholder='/path/to/document.pdf',
++            group=FieldGroup.BASIC,
++            format='path',
++        ),
++        field(
++            'output_path',
++            type='string',
++            label='Output Path',
++            label_key='modules.document.pdf_metadata.params.output_path.label',
++            description='Path for the updated PDF (defaults beside the input)',
++            description_key='modules.document.pdf_metadata.params.output_path.description',
++            required=False,
++            placeholder='/path/to/document_meta.pdf',
++            group=FieldGroup.BASIC,
++            format='path',
++        ),
++        field(
++            'metadata',
++            type='object',
++            label='Metadata',
++            label_key='modules.document.pdf_metadata.params.metadata.label',
++            description='Metadata entries to write (for example Title, Author)',
++            description_key='modules.document.pdf_metadata.params.metadata.description',
++            required=False,
++            default={},
++            group=FieldGroup.OPTIONS,
++        ),
++        field(
++            'keep_backup',
++            type='boolean',
++            label='Keep Backup',
++            label_key='modules.document.pdf_metadata.params.keep_backup.label',
++            description='Copy the original PDF to backup_path before writing the result',
++            description_key='modules.document.pdf_metadata.params.keep_backup.description',
++            required=False,
++            default=False,
++            group=FieldGroup.OPTIONS,
++        ),
++        field(
++            'backup_path',
++            type='string',
++            label='Backup Path',
++            label_key='modules.document.pdf_metadata.params.backup_path.label',
++            description='Destination for the original PDF when keep_backup is enabled',
++            description_key='modules.document.pdf_metadata.params.backup_path.description',
++            required=False,
++            placeholder='/path/to/document.original.pdf',
++            group=FieldGroup.OPTIONS,
++            format='path',
++        ),
++    ),
++    output_schema={
++        'path': {
++            'type': 'string',
++            'description': 'Path to the updated PDF',
++            'description_key': 'modules.document.pdf_metadata.output.path.description',
++        },
++        'backup_path': {
++            'type': 'string',
++            'description': 'Path to the saved original, when a backup was requested',
++            'description_key': 'modules.document.pdf_metadata.output.backup_path.description',
++        },
++        'written_keys': {
++            'type': 'number',
++            'description': 'Number of metadata entries written',
++            'description_key': 'modules.document.pdf_metadata.output.written_keys.description',
++        },
++    },
++    examples=[
++        {
++            'title': 'Set title metadata',
++            'title_key': 'modules.document.pdf_metadata.examples.basic.title',
++            'params': {
++                'input_path': '/path/to/document.pdf',
++                'output_path': '/path/to/labeled.pdf',
++                'metadata': {'Title': 'Quarterly report'},
++            },
++        },
++        {
++            'title': 'Keep the original beside the result',
++            'title_key': 'modules.document.pdf_metadata.examples.backup.title',
++            'params': {
++                'input_path': '/path/to/document.pdf',
++                'output_path': '/path/to/labeled.pdf',
++                'keep_backup': True,
++                'backup_path': '/path/to/document.original.pdf',
++            },
++        },
++    ],
++    author='Flyto Team',
++    license='MIT',
++)
++class PdfMetadataModule(BaseModule):
++    """Write document metadata onto a PDF."""
++
++    module_name = "Set PDF Metadata"
++    module_description = "Write document metadata onto a PDF"
++
++    def validate_params(self) -> None:
++        self.input_path = self.params.get('input_path')
++        self.output_path = self.params.get('output_path')
++        self.metadata = self.params.get('metadata') or {}
++        self.keep_backup = self.params.get('keep_backup', False)
++        self.backup_path = self.params.get('backup_path')
++
++        if not self.input_path:
++            raise ValueError("input_path is required")
++        if not isinstance(self.metadata, dict):
++            raise ValueError("metadata must be an object")
++        if self.keep_backup and not self.backup_path:
++            raise ValueError("backup_path is required when keep_backup is true")
++
++    async def execute(self) -> Dict[str, Any]:
++        if not os.path.exists(self.input_path):
++            raise FileNotFoundError(f"PDF file not found: {self.input_path}")
++
++        output_path = _resolve_metadata_output(self.input_path, self.output_path)
++        try:
++            output_path = validate_path_with_env_config(output_path)
++        except PathTraversalError as e:
++            raise ModuleError(str(e), code="PATH_TRAVERSAL")
++
++        if self.keep_backup:
++            backup_dir = os.path.dirname(self.backup_path)
++            if backup_dir and not os.path.exists(backup_dir):
++                os.makedirs(backup_dir, exist_ok=True)
++            shutil.copy2(self.input_path, self.backup_path)
++
++        output_dir = os.path.dirname(output_path)
++        if output_dir and not os.path.exists(output_dir):
++            os.makedirs(output_dir, exist_ok=True)
++
++        await asyncio.to_thread(
++            _write_pdf_with_metadata, self.input_path, output_path, self.metadata
++        )
++
++        return {
++            'ok': True,
++            'path': output_path,
++            'backup_path': self.backup_path if self.keep_backup else None,
++            'written_keys': len(self.metadata),
++        }
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' pinned/src/core/modules/atomic/image/__init__.py injected/src/core/modules/atomic/image/__init__.py
+--- a/src/core/modules/atomic/image/__init__.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/__init__.py	2026-10-18 19:13:54.274129619 +0000
+@@ -43,3 +43,12 @@
+     from .watermark import *
+ except ImportError:
+     pass
++
++try:
++    from .thumbnail import *
++except ImportError:
++    pass
++try:
++    from .gallery_export import *
++except ImportError:
++    pass
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' pinned/src/core/modules/atomic/image/gallery_export.py injected/src/core/modules/atomic/image/gallery_export.py
+--- a/src/core/modules/atomic/image/gallery_export.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/modules/atomic/image/gallery_export.py	2026-10-18 19:13:43.002137595 +0000
+@@ -0,0 +1,189 @@
++# Copyright 2026 Flyto2. Licensed under Apache-2.0. See LICENSE.
++
++"""
++Image Gallery Export Module
++Collect images into an output gallery directory.
++"""
++import asyncio
++import logging
++import os
++import shutil
++from typing import Any, Dict
++
++from ...base import BaseModule
++from ...registry import register_module
++from ...schema import compose
++from ...schema.builders import field
++from ...schema.constants import FieldGroup
++from ...errors import ModuleError
++from ....utils import validate_path_with_env_config, PathTraversalError
++
++
++logger = logging.getLogger(__name__)
++
++
++@register_module(
++    module_id='image.gallery_export',
++    version='1.0.0',
++    category='image',
++    subcategory='export',
++    tags=['image', 'gallery', 'export', 'copy', 'path_restricted'],
++    label='Export Image Gallery',
++    label_key='modules.image.gallery_export.label',
++    description='Copy a set of images into an output gallery directory',
++    description_key='modules.image.gallery_export.description',
++    icon='Images',
++    color='#8B5CF6',
++
++    input_types=['file_path'],
++    output_types=['file_path'],
++
++    can_connect_to=['image.*', 'file.*', 'flow.*'],
++    can_receive_from=['image.*', 'file.*', 'flow.*', 'start'],
++
++    timeout_ms=60000,
++    retryable=False,
++    concurrent_safe=True,
++
++    requires_credentials=False,
++    handles_sensitive_data=False,
++    required_permissions=['filesystem.read', 'filesystem.write'],
++
++    params_schema=compose(
++        field(
++            'images',
++            type='array',
++            label='Images',
++            label_key='modules.image.gallery_export.params.images.label',
++            description='Image paths to include in the gallery',
++            description_key='modules.image.gallery_export.params.images.description',
++            required=True,
++            group=FieldGroup.BASIC,
++            items={'type': 'string'},
++        ),
++        field(
++            'output_dir',
++            type='string',
++            label='Output Directory',
++            label_key='modules.image.gallery_export.params.output_dir.label',
++            description='Directory that receives the gallery files',
++            description_key='modules.image.gallery_export.params.output_dir.description',
++            required=True,
++            placeholder='/path/to/gallery',
++            group=FieldGroup.BASIC,
++            format='path',
++        ),
++        field(
++            'prefix',
++            type='string',
++            label='File Prefix',
++            label_key='modules.image.gallery_export.params.prefix.label',
++            description='Optional prefix added to every gallery file name',
++            description_key='modules.image.gallery_export.params.prefix.description',
++            required=False,
++            default='',
++            group=FieldGroup.OPTIONS,
++        ),
++        field(
++            'clear_existing',
++            type='boolean',
++            label='Clear Existing',
++            label_key='modules.image.gallery_export.params.clear_existing.label',
++            description='Remove files already present in the output directory',
++            description_key='modules.image.gallery_export.params.clear_existing.description',
++            required=False,
++            default=True,
++            group=FieldGroup.OPTIONS,
++        ),
++    ),
++    output_schema={
++        'output_dir': {
++            'type': 'string',
++            'description': 'Directory holding the exported gallery',
++            'description_key': 'modules.image.gallery_export.output.output_dir.description',
++        },
++        'files': {
++            'type': 'array',
++            'description': 'Exported gallery file paths',
++            'description_key': 'modules.image.gallery_export.output.files.description',
++        },
++        'count': {
++            'type': 'number',
++            'description': 'Number of exported files',
++            'description_key': 'modules.image.gallery_export.output.count.description',
++        },
++    },
++    examples=[
++        {
++            'title': 'Export a gallery',
++            'title_key': 'modules.image.gallery_export.examples.basic.title',
++            'params': {
++                'images': ['/path/to/a.png', '/path/to/b.png'],
++                'output_dir': '/path/to/gallery',
++            },
++        },
++        {
++            'title': 'Export without clearing existing files',
++            'title_key': 'modules.image.gallery_export.examples.keep.title',
++            'params': {
++                'images': ['/path/to/a.png'],
++                'output_dir': '/path/to/gallery',
++                'clear_existing': False,
++            },
++        },
++    ],
++    author='Flyto Team',
++    license='MIT',
++)
++class ImageGalleryExportModule(BaseModule):
++    """Export images into an output gallery directory."""
++
++    module_name = "Export Image Gallery"
++    module_description = "Copy images into an output gallery directory"
++
++    def validate_params(self) -> None:
++        self.images = self.params.get('images', [])
++        self.output_dir = self.params.get('output_dir')
++        self.prefix = self.params.get('prefix', '')
++        self.clear_existing = self.params.get('clear_existing', True)
++
++        if not isinstance(self.images, list):
++            raise ValueError("images must be an array")
++        if not self.output_dir:
++            raise ValueError("output_dir is required")
++
++    def _clear_existing_files(self) -> None:
++        if not os.path.isdir(self.output_dir):
++            return
++        for entry in os.listdir(self.output_dir):
++            path = os.path.join(self.output_dir, entry)
++            if os.path.isfile(path) or os.path.islink(path):
++                os.remove(path)
++
++    async def execute(self) -> Dict[str, Any]:
++        if self.clear_existing:
++            await asyncio.to_thread(self._clear_existing_files)
++
++        try:
++            safe_dir = validate_path_with_env_config(self.output_dir)
++        except PathTraversalError as e:
++            raise ModuleError(str(e), code="PATH_TRAVERSAL")
++
++        os.makedirs(safe_dir, exist_ok=True)
++
++        written = []
++        for image_path in self.images:
++            if not os.path.exists(image_path):
++                raise FileNotFoundError(f"Image not found: {image_path}")
++            base_name = os.path.basename(image_path)
++            target = os.path.join(safe_dir, f'{self.prefix}{base_name}')
++            shutil.copy2(image_path, target)
++            written.append(target)
++
++        logger.info(f"Exported {len(written)} image(s) to {safe_dir}")
++        return {
++            'ok': True,
++            'output_dir': safe_dir,
++            'files': written,
++            'count': len(written),
++        }
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' pinned/src/core/modules/atomic/image/thumbnail.py injected/src/core/modules/atomic/image/thumbnail.py
+--- a/src/core/modules/atomic/image/thumbnail.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/core/modules/atomic/image/thumbnail.py	2026-10-18 19:13:37.446141526 +0000
+@@ -0,0 +1,189 @@
++# Copyright 2026 Flyto2. Licensed under Apache-2.0. See LICENSE.
++
++"""
++Image Thumbnail Module
++Create a scaled-down thumbnail for an image.
++"""
++import asyncio
++import logging
++import os
++from typing import Any, Dict
++
++from ...registry import register_module
++from ...schema import compose
++from ...schema.builders import field
++from ...schema.constants import FieldGroup
++from ...errors import ModuleError
++from ....utils import validate_path_with_env_config, PathTraversalError
++
++
++logger = logging.getLogger(__name__)
++
++
++def _thumbnail_stem(input_path: str, name) -> str:
++    if name:
++        return str(name)
++    return os.path.splitext(os.path.basename(input_path))[0] + '-thumb'
++
++
++def _render_thumbnail(input_path: str, target: str, size: int) -> None:
++    from PIL import Image
++
++    with Image.open(input_path) as img:
++        if img.mode not in ('RGB', 'RGBA'):
++            img = img.convert('RGBA')
++        img.thumbnail((size, size))
++        img.save(target, 'PNG')
++
++
++@register_module(
++    module_id='image.thumbnail',
++    version='1.0.0',
++    category='image',
++    subcategory='resize',
++    tags=['image', 'thumbnail', 'preview', 'resize', 'path_restricted'],
++    label='Create Thumbnail',
++    label_key='modules.image.thumbnail.label',
++    description='Create a scaled-down thumbnail image in an output directory',
++    description_key='modules.image.thumbnail.description',
++    icon='Image',
++    color='#0EA5E9',
++
++    input_types=['file_path'],
++    output_types=['file_path'],
++
++    can_connect_to=['image.*', 'file.*', 'flow.*'],
++    can_receive_from=['image.*', 'file.*', 'flow.*', 'start'],
++
++    timeout_ms=30000,
++    retryable=False,
++    concurrent_safe=True,
++
++    requires_credentials=False,
++    handles_sensitive_data=False,
++    required_permissions=['filesystem.read', 'filesystem.write'],
++
++    params_schema=compose(
++        field(
++            'input_path',
++            type='string',
++            label='Input Path',
++            label_key='modules.image.thumbnail.params.input_path.label',
++            description='Path to the source image',
++            description_key='modules.image.thumbnail.params.input_path.description',
++            required=True,
++            placeholder='/path/to/image.png',
++            group=FieldGroup.BASIC,
++            format='path',
++        ),
++        field(
++            'output_dir',
++            type='string',
++            label='Output Directory',
++            label_key='modules.image.thumbnail.params.output_dir.label',
++            description='Directory that receives the thumbnail',
++            description_key='modules.image.thumbnail.params.output_dir.description',
++            required=False,
++            default='/tmp',
++            placeholder='/path/to/thumbnails',
++            group=FieldGroup.BASIC,
++            format='path',
++        ),
++        field(
++            'name',
++            type='string',
++            label='Thumbnail Name',
++            label_key='modules.image.thumbnail.params.name.label',
++            description='Base name for the thumbnail (defaults to the input file name)',
++            description_key='modules.image.thumbnail.params.name.description',
++            required=False,
++            placeholder='preview',
++            group=FieldGroup.OPTIONS,
++        ),
++        field(
++            'size',
++            type='number',
++            label='Size',
++            label_key='modules.image.thumbnail.params.size.label',
++            description='Longest edge of the thumbnail in pixels',
++            description_key='modules.image.thumbnail.params.size.description',
++            required=False,
++            default=256,
++            group=FieldGroup.OPTIONS,
++        ),
++    ),
++    output_schema={
++        'path': {
++            'type': 'string',
++            'description': 'Path to the generated thumbnail',
++            'description_key': 'modules.image.thumbnail.output.path.description',
++        },
++        'width': {
++            'type': 'number',
++            'description': 'Thumbnail width in pixels',
++            'description_key': 'modules.image.thumbnail.output.width.description',
++        },
++        'height': {
++            'type': 'number',
++            'description': 'Thumbnail height in pixels',
++            'description_key': 'modules.image.thumbnail.output.height.description',
++        },
++    },
++    examples=[
++        {
++            'title': 'Thumbnail next to the source image',
++            'title_key': 'modules.image.thumbnail.examples.basic.title',
++            'params': {
++                'input_path': '/path/to/image.png',
++                'output_dir': '/path/to/thumbnails',
++            },
++        },
++        {
++            'title': 'Named thumbnail',
++            'title_key': 'modules.image.thumbnail.examples.named.title',
++            'params': {
++                'input_path': '/path/to/image.png',
++                'output_dir': '/path/to/thumbnails',
++                'name': 'cover',
++                'size': 128,
++            },
++        },
++    ],
++    author='Flyto Team',
++    license='MIT',
++)
++async def image_thumbnail(context: Dict[str, Any]) -> Dict[str, Any]:
++    """Create a thumbnail from an image."""
++    params = context['params']
++    input_path = params['input_path']
++    output_dir = params.get('output_dir', '/tmp')
++    name = params.get('name')
++    size = int(params.get('size', 256))
++
++    if not os.path.exists(input_path):
++        raise FileNotFoundError(f"Input file not found: {input_path}")
++    if size < 1:
++        raise ValueError("size must be positive")
++
++    try:
++        safe_dir = validate_path_with_env_config(output_dir)
++    except PathTraversalError as e:
++        raise ModuleError(str(e), code="PATH_TRAVERSAL")
++
++    os.makedirs(safe_dir, exist_ok=True)
++    stem = _thumbnail_stem(input_path, name)
++    target = os.path.join(safe_dir, f'{stem}.png')
++
++    await asyncio.to_thread(_render_thumbnail, input_path, target, size)
++
++    from PIL import Image
++    with Image.open(target) as thumb:
++        width, height = thumb.size
++
++    logger.info(f"Created thumbnail: {target}")
++    return {
++        'ok': True,
++        'path': target,
++        'width': width,
++        'height': height,
++    }

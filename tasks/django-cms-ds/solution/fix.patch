@@ -1,0 +1,216 @@
+diff -ruN -x '*.pyc' -x __pycache__ -x .pytest_cache a/cms/admin/forms.py b/cms/admin/forms.py
+--- a/cms/admin/forms.py	2026-10-18 19:46:30.000000000 +0000
++++ b/cms/admin/forms.py	2026-10-21 20:28:03.722837172 +0000
+@@ -51,6 +51,12 @@
+ from cms.utils.conf import get_cms_setting
+ from cms.utils.i18n import get_language_list, get_site_language_from_request
+ from cms.utils.page import get_clean_username
++from cms.utils.page_permissions import (
++    user_can_add_page,
++    user_can_add_subpage,
++    user_can_change_page,
++    user_can_view_page,
++)
+ from cms.utils.permissions import (
+     get_current_user,
+     get_subordinate_groups,
+@@ -276,16 +282,16 @@
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+ 
+-        source_field = self.fields.get("source")
+-
+-        if not source_field or source_field.widget.is_hidden:
+-            return
+-
+         page_field = self.fields.get("cms_page")
+ 
+         if page_field:
+             page_field.queryset = page_field.queryset.filter(site=self._site)
+ 
++        source_field = self.fields.get("source")
++
++        if not source_field or source_field.widget.is_hidden:
++            return
++
+         root_page = PageType.get_root_page(site=self._site)
+ 
+         if root_page:
+@@ -294,8 +300,12 @@
+             titles = PageContent.objects.filter(page__in=descendants, language=self._language)
+             choices = [("", "---------")]
+             choices.extend((title.page_id, title.title) for title in titles)
++            # The value posted by the client is validated against the queryset,
++            # not against the choices rendered below.
++            source_field.queryset = descendants
+             source_field.choices = choices
+         else:
++            source_field.queryset = source_field.queryset.none()
+             choices = []
+ 
+         if len(choices) < 2:
+@@ -333,10 +343,32 @@
+ 
+     def clean_parent_page(self):
+         parent_page = self.cleaned_data.get("parent_page")
+-        if parent_page and parent_page.site_id != self._site.pk:
+-            raise ValidationError("Site doesn't match the parent's page site")
++        if parent_page:
++            if parent_page.site_id != self._site.pk:
++                raise ValidationError("Site doesn't match the parent's page site")
++            if not user_can_add_subpage(self._user, parent_page, site=self._site):
++                raise ValidationError(_("You do not have permission to add a page here."))
++        elif not user_can_add_page(self._user, site=self._site):
++            raise ValidationError(_("You do not have permission to add a page here."))
+         return parent_page
+ 
++    def clean_source(self):
++        source = self.cleaned_data.get("source")
++        # The source is validated against its queryset, not against the choices
++        # rendered for this site, and its content is copied into the new page or
++        # translation. The user must be allowed to view it on its own site.
++        if source and not user_can_view_page(self._user, source, site=source.site):
++            raise ValidationError(_("You do not have permission to use this page."))
++        return source
++
++    def clean_cms_page(self):
++        page = self.cleaned_data.get("cms_page")
++        # The existing page receiving a translation is controlled by the client
++        # and may be outside the user's permission scope.
++        if page and not user_can_change_page(self._user, page, site=page.site):
++            raise ValidationError(_("You do not have permission to change this page."))
++        return page
++
+     def create_translation(self, page, main_language_page_content_template=None):
+         data = self.cleaned_data
+         title_kwargs = {
+@@ -518,6 +550,16 @@
+         widget=forms.HiddenInput(),
+     )
+ 
++    def clean_source(self):
++        source = self.cleaned_data.get("source")
++        # A hidden field whose value is fully controlled by the client and whose
++        # queryset spans every page on every site. Adding a page only checks the
++        # generic add permission, so the copied page has to be readable by the
++        # requesting user on its own site.
++        if source and not user_can_view_page(self._user, source, site=source.site):
++            raise ValidationError(_("You do not have permission to copy this page."))
++        return source
++
+ 
+ def url_is_locked(page_content: PageContent) -> bool:
+     """Return whether ``page_content``'s URL is shared with a published
+diff -ruN -x '*.pyc' -x __pycache__ -x .pytest_cache a/cms/admin/pageadmin.py b/cms/admin/pageadmin.py
+--- a/cms/admin/pageadmin.py	2026-10-18 19:46:32.000000000 +0000
++++ b/cms/admin/pageadmin.py	2026-10-21 20:28:09.950831510 +0000
+@@ -354,6 +354,18 @@
+         if not page.is_potential_home():
+             return HttpResponseBadRequest(_("The page is not eligible to be home."))
+ 
++        # Setting a page as home also demotes the current home page and
++        # re-paths its tree. The user has to be allowed to change that page.
++        old_home = (
++            self.model.objects.filter(is_home=True, site_id=page.site_id)
++            .exclude(pk=page.pk)
++            .first()
++        )
++        if old_home and not page_permissions.user_can_change_page(
++            request.user, old_home, site=old_home.site
++        ):
++            raise PermissionDenied("You do not have permission to change the current home page.")
++
+         new_home_tree, old_home_tree = page.set_as_homepage(request.user)
+ 
+         # Check if one of the affected pages either from the old homepage
+@@ -569,8 +581,15 @@
+         target = form.cleaned_data["target"]
+         can_move_page = self.has_move_page_permission(request, obj=page)
+ 
++        # The page is placed at the destination: under the target page, or at
++        # the site root. Either way the user has to be allowed to add pages there.
++        if target:
++            can_add_page = page_permissions.user_can_add_subpage(user, target, site=site)
++        else:
++            can_add_page = page_permissions.user_can_add_page(user, site=site)
++
+         # Does the user have permissions to do this...?
+-        if not can_move_page or (target and not target.has_add_permission(user)):
++        if not can_move_page or not can_add_page:
+             message = _("Error! You don't have permissions to move this page. Please reload the page")
+             return jsonify_request(HttpResponseForbidden(message))
+ 
+@@ -660,10 +679,16 @@
+             return jsonify_request(HttpResponseBadRequest("error"))
+ 
+         target = form.cleaned_data["target"]
+-        source_site = form.cleaned_data["source_site"]
+ 
+-        # User can only copy pages he can see
+-        can_copy_page = page_permissions.user_can_view_page(user, page, source_site)
++        # User can only copy pages he can see -- on the site the page lives on,
++        # and only if every page copied with it is visible to him as well.
++        can_copy_page = page_permissions.user_can_view_page(user, page, page.site)
++
++        if can_copy_page:
++            for descendant in page.get_descendant_pages():
++                if not page_permissions.user_can_view_page(user, descendant, descendant.site):
++                    can_copy_page = False
++                    break
+ 
+         if can_copy_page and target:
+             # User can only copy a page into another one if he has permission
+@@ -724,6 +749,15 @@
+             except Page.DoesNotExist:
+                 return jsonify_request(HttpResponseBadRequest("error"))
+ 
++        if target_page:
++            can_add_page = page_permissions.user_can_add_subpage(user, target_page, site=target_site)
++        else:
++            can_add_page = page_permissions.user_can_add_page(user, site=target_site)
++
++        if not can_add_page:
++            message = _("Error! You don't have permissions to add a page to this site.")
++            return jsonify_request(HttpResponseForbidden(message))
++
+         new_page = page.copy(
+             site=target_site,
+             parent_page=target_page,
+@@ -1318,6 +1352,9 @@
+         if source.site_id != content.page.site_id:
+             return HttpResponseBadRequest(_("The source page must belong to the same site"))
+ 
++        if not page_permissions.user_can_view_page(request.user, source, source.site):
++            return HttpResponseForbidden(_("You do not have permission to read this page"))
++
+         language = content.language
+         source_placeholders = {
+             placeholder.slot: placeholder
+diff -ruN -x '*.pyc' -x __pycache__ -x .pytest_cache a/cms/forms/wizards.py b/cms/forms/wizards.py
+--- a/cms/forms/wizards.py	2026-10-18 19:46:32.000000000 +0000
++++ b/cms/forms/wizards.py	2026-10-21 20:28:03.722837172 +0000
+@@ -113,6 +113,12 @@
+             raise forms.ValidationError(_("Please provide a valid slug."))
+         return data
+ 
++    def clean_content_page(self):
++        page = self.cleaned_data.get("content_page")
++        if page and not user_can_view_page(self._user, page, site=page.site):
++            raise ValidationError(_("You do not have permission to use this page."))
++        return page
++
+     def clean_parent_page(self):
+         # Check to see if this user has permissions to make this page. We've
+         # already checked this when producing a list of wizard entries, but this
+diff -ruN -x '*.pyc' -x __pycache__ -x .pytest_cache a/cms/utils/page_permissions.py b/cms/utils/page_permissions.py
+--- a/cms/utils/page_permissions.py	2026-10-18 19:46:31.000000000 +0000
++++ b/cms/utils/page_permissions.py	2026-10-21 20:28:03.722837172 +0000
+@@ -284,7 +284,7 @@
+         # Page has no restrictions but user can't see unrestricted pages
+         return False
+ 
+-    if user_can_change_page(user, page):
++    if user_can_change_page(user, page, site=site):
+         # If user has change permissions on a page
+         # then he can automatically view it.
+         return True

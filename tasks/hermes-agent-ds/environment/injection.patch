@@ -1,0 +1,117 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.egg-info' base/agent/prompt_builder.py injected/agent/prompt_builder.py
+--- base/agent/prompt_builder.py	2026-10-18 19:21:19.000000000 +0000
++++ injected/agent/prompt_builder.py	2026-10-18 23:40:41.722794067 +0000
+@@ -1423,6 +1423,25 @@
+     return _truncate_content(cursorrules_content, ".cursorrules")
+ 
+ 
++def _load_clinerules(cwd_path: Path) -> str:
++    """.clinerules — Cline's project instruction file (cwd only).
++
++    Loaded in addition to whichever of the priority context files matched:
++    Cline users keep general project rules here even when the repository also
++    has an AGENTS.md / CLAUDE.md for other agents.
++    """
++    candidate = cwd_path / ".clinerules"
++    if candidate.exists():
++        try:
++            content = candidate.read_text(encoding="utf-8").strip()
++            if content:
++                result = f"## .clinerules\n\n{content}"
++                return _truncate_content(result, ".clinerules")
++        except Exception as e:
++            logger.debug("Could not read .clinerules: %s", e)
++    return ""
++
++
+ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
+     """Discover and load context files for the system prompt.
+ 
+@@ -1454,6 +1473,11 @@
+     if project_context:
+         sections.append(project_context)
+ 
++    # Cline rules are additive (the priority chain above is first-wins).
++    clinerules_context = _load_clinerules(cwd_path)
++    if clinerules_context:
++        sections.append(clinerules_context)
++
+     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
+     if not skip_soul:
+         soul_content = load_soul_md()
+diff -ruN '--exclude=__pycache__' '--exclude=*.egg-info' base/tools/memory_tool.py injected/tools/memory_tool.py
+--- base/tools/memory_tool.py	2026-10-18 19:21:21.000000000 +0000
++++ injected/tools/memory_tool.py	2026-10-18 23:40:50.214787964 +0000
+@@ -451,6 +451,52 @@
+ 
+         return self._success_response(target, "Entry removed.")
+ 
++    def import_entries(self, target: str, content: str) -> Dict[str, Any]:
++        """Merge §-delimited entries from an external source into the store.
++
++        Import is for bulk content the operator pasted or pointed the tool at
++        (a memory dump, a file the patch tool wrote, an export from another
++        profile). Unlike ``add`` it applies many entries at once and refreshes
++        the frozen snapshot immediately, so the imported entries are visible in
++        the system prompt for the rest of the session.
++        """
++        incoming = [e.strip() for e in content.split(ENTRY_DELIMITER)]
++        incoming = [e for e in incoming if e]
++        if not incoming:
++            return {"success": False, "error": "No entries found to import."}
++
++        with self._file_lock(self._path_for(target)):
++            bak = self._reload_target(target)
++            if bak:
++                return _drift_error(self._path_for(target), bak)
++
++            entries = self._entries_for(target)
++            merged = list(entries)
++            added = 0
++            for entry in incoming:
++                if entry not in merged:
++                    merged.append(entry)
++                    added += 1
++
++            if len(ENTRY_DELIMITER.join(merged)) > self._char_limit(target):
++                return {
++                    "success": False,
++                    "error": "Import would exceed the memory limit. Shorten the import or remove existing entries first.",
++                }
++
++            self._set_entries(target, merged)
++            self.save_to_disk(target)
++            self._refresh_snapshot(target)
++
++        return self._success_response(target, f"Imported {added} new entr{'y' if added == 1 else 'ies'}.")
++
++    def _refresh_snapshot(self, target: str) -> None:
++        """Re-render the frozen snapshot from live state (explicit bulk writes only)."""
++        key = "user" if target == "user" else "memory"
++        self._system_prompt_snapshot[key] = self._render_block(
++            key, self._entries_for(target)
++        )
++
+     def format_for_system_prompt(self, target: str) -> Optional[str]:
+         """
+         Return the frozen snapshot for system prompt injection.
+@@ -640,13 +686,18 @@
+             return tool_error("content is required for 'replace' action.", success=False)
+         result = store.replace(target, old_text, content)
+ 
++    elif action == "import":
++        if not content:
++            return tool_error("Content is required for 'import' action.", success=False)
++        result = store.import_entries(target, content)
++
+     elif action == "remove":
+         if not old_text:
+             return tool_error("old_text is required for 'remove' action.", success=False)
+         result = store.remove(target, old_text)
+ 
+     else:
+-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
++        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, import", success=False)
+ 
+     return json.dumps(result, ensure_ascii=False)
+ 

@@ -1,0 +1,199 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/api_server.py hard2/inj/agent/api_server.py
+--- a/agent/api_server.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/api_server.py	2026-10-21 20:24:08.051051411 +0000
+@@ -1399,6 +1399,25 @@
+     }
+ 
+ 
++@app.get("/uploads/preview")
++async def preview_upload(path: str = Query(..., description="File path returned by POST /upload")):
++    """Serve a stored upload so the browser can preview it.
++
++    ``POST /upload`` answers with an absolute file path; the web client passes
++    that path back here to show the document before the user asks the agent
++    to analyse it.
++    """
++    target = Path(path)
++    if not target.exists() or not target.is_file():
++        raise HTTPException(status_code=404, detail=f"Stored file not found: {path}")
++    media_type = "application/pdf" if target.suffix.lower() == ".pdf" else "application/octet-stream"
++    return FileResponse(
++        target,
++        media_type=media_type,
++        headers={"Content-Disposition": f'inline; filename="{target.name}"'},
++    )
++
++
+ # ============================================================================
+ # Swarm API
+ # ============================================================================
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/agent/skills.py hard2/inj/agent/src/agent/skills.py
+--- a/agent/src/agent/skills.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/agent/skills.py	2026-10-21 20:24:08.051051411 +0000
+@@ -181,3 +181,24 @@
+ 
+         available = ", ".join(s.name for s in self.skills)
+         return f"Error: Unknown skill '{name}'. Available: {available}"
++
++    def get_support_file(self, name: str, filename: str) -> str:
++        """Return one of a skill's supporting files (used by the load_skill tool).
++
++        Skills keep larger references, templates and example engines beside
++        their SKILL.md; the agent loads them on demand with the skill.
++
++        Args:
++            name: Skill name.
++            filename: Supporting file name relative to the skill directory.
++
++        Returns:
++            File text, or an error message.
++        """
++        for skill in self.skills:
++            if skill.name == name:
++                content = skill.load_support_file(filename)
++                if content is None:
++                    return f"Error: no supporting file {filename!r} in skill '{name}'"
++                return f'<skill-file name="{name}" path="{filename}">\n{content}\n</skill-file>'
++        return f"Error: Unknown skill '{name}'."
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/shadow_account/extractor.py hard2/inj/agent/src/shadow_account/extractor.py
+--- a/agent/src/shadow_account/extractor.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/shadow_account/extractor.py	2026-10-21 20:24:16.139044059 +0000
+@@ -121,6 +121,7 @@
+         rules=tuple(rules),
+         preferred_markets=preferred_markets,
+         typical_holding_days=typical_holding,
++        journal_path=str(path),
+     )
+ 
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/shadow_account/models.py hard2/inj/agent/src/shadow_account/models.py
+--- a/agent/src/shadow_account/models.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/shadow_account/models.py	2026-10-21 20:24:16.139044059 +0000
+@@ -55,6 +55,8 @@
+         rules: Tuple of 3-5 ShadowRule.
+         preferred_markets: Markets the user actually traded, frequency-sorted.
+         typical_holding_days: (median, p75) in days.
++        journal_path: Journal location the profile was built from, kept for
++            attribution on later backtest and report runs.
+     """
+ 
+     shadow_id: str
+@@ -68,6 +70,7 @@
+     rules: tuple[ShadowRule, ...]
+     preferred_markets: tuple[str, ...]
+     typical_holding_days: tuple[float, float]
++    journal_path: str = ""
+ 
+     def to_dict(self) -> dict[str, Any]:
+         """Serialize to JSON-safe dict."""
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/shadow_account/storage.py hard2/inj/agent/src/shadow_account/storage.py
+--- a/agent/src/shadow_account/storage.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/shadow_account/storage.py	2026-10-21 20:24:16.139044059 +0000
+@@ -109,6 +109,7 @@
+         rules=rules,
+         preferred_markets=tuple(data["preferred_markets"]),
+         typical_holding_days=tuple(data["typical_holding_days"]),
++        journal_path=data.get("journal_path", ""),
+     )
+ 
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/tools/backtest_tool.py hard2/inj/agent/src/tools/backtest_tool.py
+--- a/agent/src/tools/backtest_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/tools/backtest_tool.py	2026-10-21 20:24:08.051051411 +0000
+@@ -5,6 +5,8 @@
+ import json
+ from pathlib import Path
+ 
++import pandas as pd
++
+ from src.agent.tools import BaseTool
+ from src.core.runner import Runner
+ 
+@@ -40,6 +42,27 @@
+     if not signal_path.exists():
+         return json.dumps({"status": "error", "error": "code/signal_engine.py not found"}, ensure_ascii=False)
+ 
++    # Optional local data override: point the run at a CSV of bars instead of
++    # a market API. Relative names are resolved next to the config, so a run
++    # can ship its own data file.
++    data_preview = None
++    local_data = config.get("local_data_file")
++    if local_data:
++        data_path = Path(str(local_data))
++        if not data_path.is_absolute():
++            data_path = run_path / data_path
++        try:
++            frame = pd.read_csv(data_path)
++        except Exception as exc:
++            return json.dumps(
++                {"status": "error", "error": f"local_data_file: {exc}"}, ensure_ascii=False
++            )
++        data_preview = {
++            "file": str(local_data),
++            "columns": [str(c) for c in frame.columns],
++            "rows": frame.head(5).astype(str).values.tolist(),
++        }
++
+     agent_root = Path(__file__).resolve().parents[2]
+     entry_script = agent_root / "backtest" / "runner.py"
+ 
+@@ -59,6 +82,7 @@
+         "stderr": result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr,
+         "artifacts": artifacts_found,
+         "run_dir": run_dir,
++        "data_preview": data_preview,
+     }, ensure_ascii=False)
+ 
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/tools/load_skill_tool.py hard2/inj/agent/src/tools/load_skill_tool.py
+--- a/agent/src/tools/load_skill_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/tools/load_skill_tool.py	2026-10-21 20:24:08.051051411 +0000
+@@ -18,6 +18,12 @@
+         "type": "object",
+         "properties": {
+             "name": {"type": "string", "description": "Skill name (e.g. 'strategy-generate', 'momentum')"},
++            "file": {
++                "type": "string",
++                "description": "Optional supporting file from the skill directory "
++                               "(e.g. 'references/orders.md', 'example_signal_engine.py').",
++                "default": "",
++            },
+         },
+         "required": ["name"],
+     }
+@@ -41,7 +47,11 @@
+             Full skill documentation or an error message.
+         """
+         name = kwargs["name"]
+-        content = self._loader.get_content(name)
++        support_file = kwargs.get("file") or ""
++        if support_file:
++            content = self._loader.get_support_file(name, support_file)
++        else:
++            content = self._loader.get_content(name)
+         return json.dumps({
+             "status": "ok" if not content.startswith("Error:") else "error",
+             "content": content,
+diff -ruN '--exclude=__pycache__' '--exclude=.git' '--exclude=runs' '--exclude=uploads' '--exclude=tests' pinned/agent/src/tools/shadow_account_tool.py hard2/inj/agent/src/tools/shadow_account_tool.py
+--- a/agent/src/tools/shadow_account_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/tools/shadow_account_tool.py	2026-10-21 20:24:16.143044055 +0000
+@@ -183,6 +183,9 @@
+             journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
+         except ValueError as exc:
+             return _err(str(exc))
++        if journal_path is None:
++            # Reuse the journal recorded with the profile for attribution.
++            journal_path = profile.journal_path or None
+         try:
+             result = run_shadow_backtest(
+                 profile,
+@@ -248,6 +251,9 @@
+             journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
+         except ValueError as exc:
+             return _err(str(exc))
++        if journal_path is None:
++            # Reuse the journal recorded with the profile for attribution.
++            journal_path = profile.journal_path or None
+ 
+         result = load_cached_result(profile.shadow_id)
+         if result is None:

@@ -1,0 +1,138 @@
+#!/bin/bash
+# In-container informed blind fix.
+# Builds the INJECTED tree on the host (source-only git repo = diff baseline),
+# starts the task's own built image as a long-lived container (full toolchain +
+# warmed offline caches + prebuilt artifacts), and runs the Opus 5.5 agent ON THE
+# HOST (so credentials stay on the host) editing the host tree. The agent compiles
+# and exercises its fix INSIDE the container via $WORK/verify.sh (docker exec),
+# which overlays the host edits onto the image's /app and runs the real toolchain.
+# The agent sees instruction.md + the PRIVATE injected-sites.md (traps) only; it
+# never sees the hidden grading tests (not present in the image) or the reference
+# fix. Diff of the host tree -> checks/blind.patch, then the gate re-checks it.
+#
+# Launch through the driver (no default model): ./drive.sh deepseek bash pipeline/blind_informed_ctr.sh SLUG
+# Exit 0 = blind.patch written and wired; non-zero = nothing wired (blind_informed_status.txt says why).
+# Until 2026-10-20 this hardcoded Opus, rebuilt the tree from upstream + only the FIRST inject
+# patch, used fixed (possibly older-version) image tags, and wired any non-empty diff even when
+# the agent had hit its session limit (backstage-ds: a quota-cut half patch became a must-pass fix).
+set -uo pipefail
+SLUG=${1:?usage: blind_informed_ctr.sh SLUG}
+R="$HOME/cwe-bench"; DF="$R/tasks/$SLUG/environment/Dockerfile"; ENV="$R/tasks/$SLUG/environment"
+LOG="$R/build/$SLUG/blind-informed.log"; : > "$LOG"; ST="$R/build/$SLUG/blind_informed_status.txt"
+log(){ echo "[$SLUG] $*" >> "$LOG"; }
+die(){ log "ERROR($1): $2"; echo "error $1: $2" > "$ST"; docker rm -f "blind-ctr-$SLUG" >/dev/null 2>&1; exit "$1"; }
+echo running > "$ST"
+[ -n "${MODEL:-}" ] || die 2 "MODEL not set; launch via ./drive.sh deepseek bash pipeline/blind_informed_ctr.sh $SLUG"
+
+# --- per-task build command (the image is always the task's CURRENT one, built below) ---
+case "$SLUG" in
+  backstage-ds)
+    BUILD_CMD='ESB=/app/node_modules/esbuild/bin/esbuild; ok=1; for f in $(cd /app && git diff --name-only 2>/dev/null | grep "[.]ts$"); do "$ESB" --log-level=warning --loader:.ts=ts /app/$f >/dev/null || { echo PARSE-FAIL $f; ok=0; }; done; [ $ok = 1 ] && echo "all edited TS modules parse OK"' ;;
+  coreutils-ds)
+    BUILD_CMD='cargo build --offline -p uu_install --bin install 2>&1 | tail -40' ;;
+  tinacms-ds)
+    # No compile step (vitest transpiles TS at test time). Smoke that every edited
+    # adapter module parses as TS via esbuild (bundled with vitest at /opt/verifier).
+    BUILD_CMD='ESB=/opt/verifier/node_modules/esbuild/bin/esbuild; if [ -x "$ESB" ]; then ok=1; for f in $(cd /app && git diff --name-only 2>/dev/null | grep "[.]ts$"); do "$ESB" --log-level=warning --loader:.ts=ts /app/$f >/dev/null || { echo PARSE-FAIL $f; ok=0; }; done; [ $ok = 1 ] && echo "all edited TS modules parse OK"; else echo "no esbuild; TS is transpiled at test time - exercise behaviour with verify.sh run + vitest at /opt/verifier/node_modules/vitest/vitest.mjs"; fi' ;;
+  yamcs-ds)
+    BUILD_CMD='mvn -B -o -q -Dmaven.test.skip=true -Dmaven.javadoc.skip=true -Denforcer.skip=true -pl yamcs-api,yamcs-xtce,yamcs-client,yamcs-core -am install 2>&1 | tail -50' ;;
+  *)
+    die 9 "no build-command mapping for $SLUG" ;;
+esac
+grep -nE '^[^#]*<<-?[[:space:]]*["'\'']?[A-Za-z_]+' "$DF" >/dev/null \
+  && die 2 "Dockerfile uses a heredoc; the classic builder drops its body. Move it into a COPY'd file"
+
+# --- the task's CURRENT image (never a fixed tag left over from an older version) ---
+IMG="cwe-blind-src:$SLUG"
+docker build -t "$IMG" "$ENV" > "$R/build/$SLUG/blind-informed-image.log" 2>&1 \
+  || die 8 "image build failed (build/$SLUG/blind-informed-image.log)"
+log "img=$IMG ($(docker image inspect -f '{{.Id}}' "$IMG" | cut -c8-19)) model=$MODEL"
+
+# --- the injected tree = the image's /app, source only; this is the diff base ---
+WORK="$HOME/.tb-graders/cwe/blind-informed/$SLUG"; rm -rf "$WORK"; mkdir -p "$WORK/scratch" "$WORK/app"; cd "$WORK"
+cid=$(docker create "$IMG") || die 3 "docker create $IMG failed"
+docker cp "$cid:/app" - 2>>"$LOG" | tar -x -C app --strip-components=1 --exclude=.git --exclude=node_modules \
+  --exclude=.venv --exclude=__pycache__ --exclude='*.pyc' 2>>"$LOG"; xrc=$?
+docker rm -f "$cid" >/dev/null 2>&1
+[ $xrc -eq 0 ] && [ -n "$(ls -A app)" ] || die 3 "could not extract /app from $IMG"
+# EVERY patch the environment ships must be present (the old code applied only the first).
+for p in "$ENV"/*.patch "$ENV"/*.diff; do
+  [ -f "$p" ] || continue
+  patch -p1 -R --dry-run -s -f -d app < "$p" >/dev/null 2>&1 || patch -p0 -R --dry-run -s -f -d app < "$p" >/dev/null 2>&1 \
+    || die 3 "$(basename "$p") is not applied in the image's /app"
+done
+( cd app && git init -q . && git add -A && git -c user.email=x@x -c user.name=x commit -qm injected-baseline ) \
+  || die 3 "could not record the baseline commit"
+
+cp "$R/tasks/$SLUG/instruction.md" instruction.md
+python3 - "$R/build/$SLUG/manifest.json" > injected-sites.md <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+print("# PRIVATE injected-sibling / route site list - for this soundness fix ONLY\n")
+print("Close EVERY site listed below AND the route in instruction.md. A real solver is NOT given this list; you are, so the fix is COMPLETE and scores 1.0. Do not weaken any legitimate behaviour.\n")
+for t in m.get("traps",[]):
+    print(f"## {t.get('id')}  @ {t.get('where')}")
+    print(t.get('shape','')); print()
+PY
+
+# --- long-lived container from the task image; host $WORK mounted at /host ---
+CTR="blind-ctr-$SLUG"
+docker rm -f "$CTR" >/dev/null 2>&1
+docker run -d --name "$CTR" -v "$WORK:/host" "$IMG" sleep infinity >> "$LOG" 2>&1 \
+  || die 4 "container start failed"
+
+# --- verify.sh: the agent's bridge into the container toolchain ---
+cat > "$WORK/verify.sh" <<VERIFY
+#!/bin/bash
+# Usage:
+#   verify.sh build          overlay your current edits onto the container /app and compile
+#   verify.sh run '<cmd>'    overlay your edits, then run <cmd> in /app inside the container
+# Your scratch/reproduction files live at \$WORK/scratch (host) == /host/scratch (container).
+CTR="$CTR"
+SYNC='cd /host/app && tar --exclude=.git --exclude=node_modules -cf - . | (cd /app && tar -xf -)'
+case "\$1" in
+  build) docker exec "\$CTR" bash -c "\$SYNC && cd /app && $BUILD_CMD"; exit \$? ;;
+  run)   shift; docker exec "\$CTR" bash -c "\$SYNC" >/dev/null 2>&1; docker exec -w /app "\$CTR" bash -c "\$*"; exit \$? ;;
+  *) echo "usage: verify.sh build | verify.sh run '<cmd>'"; exit 2 ;;
+esac
+VERIFY
+chmod +x "$WORK/verify.sh"
+
+PROMPT="You are writing a COMPLETE reference-quality security fix for a known vulnerability, as a soundness control (it proves a fully-informed fix passes every hidden test). You are confined to \$WORK=$WORK.
+
+Read ONLY these two files for the requirement: \$WORK/instruction.md (the vulnerability and the required properties, including a 'keep working' / 'what must keep working' section you MUST honour item by item) and \$WORK/injected-sites.md (the COMPLETE private list of every site you must fix). Edit the real source tree under \$WORK/app to close the reported route AND every site in injected-sites.md, while keeping ALL legitimate behaviour working.
+
+You HAVE the project's real toolchain inside a container. Use it:
+  * \$WORK/verify.sh build        -> compiles your current edits with the real compiler; fix every error until it builds clean.
+  * \$WORK/verify.sh run '<cmd>'  -> runs <cmd> in the built tree (run the built binary/server, invoke a function, run a test). Put any scratch/test files under \$WORK/scratch (NOT under \$WORK/app, so they stay out of the fix); they are visible in the container at /host/scratch.
+Explore \$WORK/app to find existing safe helpers/utilities and the EXISTING authorization/validation the product already applies on the ordinary (non-subscription, non-create) read/write path, and make the vulnerable paths enforce the SAME check in the SAME way. Prefer the project's own primitives over rolling your own.
+
+CRITICAL - build an explicit test matrix and drive your fix to green against it, because a fix that is too weak OR too strong both fail:
+  1. From instruction.md, turn EVERY bullet under the security-properties/invariants section into a concrete ATTACK case (an input that must be refused or neutralised so nothing happens at the forbidden target), and EVERY bullet under 'what must keep working'/'keep working' into a concrete LEGITIMATE case (an input that must still SUCCEED and behave exactly as before). Include the instruction's own illustrative examples, and the near-miss pairs the instruction draws (e.g. an operation that must be refused vs. a very similar one that must keep working - a value that merely passes THROUGH an existing, already-valid location on its way to a new one is usually legitimate, while the same value used to act at a forbidden location is the attack). Enumerate the boundary inputs the instruction lists explicitly (empty, absolute, trailing/leading separators, repeated/list values, split-across-segments, inner-but-contained climbs, identifiers returned by a prior listing).
+  2. Write these as runnable scratch cases (a scratch test program, or scripted invocations of the built binary/function) under \$WORK/scratch and run them with verify.sh run.
+  3. Iterate: build clean, THEN make every ATTACK case blocked AND every LEGITIMATE case still pass, at EVERY site in injected-sites.md and the reported route. Do not stop at the first scenario that works - a partial fix that handles the simple case but not the nested/boundary case is the most common failure here. Re-run your whole matrix after each change.
+
+Rules: Do NOT consult or search for any upstream fix, advisory, patch, or changelog for this project. Do NOT touch anything outside \$WORK. The hidden grading tests are NOT present; do not try to find them. When done, write \$WORK/mechanisms.md listing the fix at each site and, for each case in your matrix, the command you ran and that it passed.
+
+WORK=$WORK"
+
+log "launching in-container agent ($MODEL) $(date -u +%FT%TZ)"
+date -u +%FT%TZ > "$R/build/$SLUG/blind_informed_start.txt"
+timeout 9000 "$HOME/.local/bin/claude" -p "$PROMPT" --model "$MODEL" \
+  --permission-mode bypassPermissions --add-dir "$WORK" \
+  --output-format json > "$R/build/$SLUG/blind-informed.json" 2> "$R/build/$SLUG/blind-informed.err"
+rc=$?
+st=$(python3 "$R/pipeline/agent_status.py" "$R/build/$SLUG/blind-informed.json" "$rc" --details "$R/build/$SLUG/blind_informed_status.json")
+log "agent exit $rc: $st $(date -u +%FT%TZ)"
+docker rm -f "$CTR" >/dev/null 2>&1
+log "container removed"
+# An unfinished agent's edits are not a fix: never wire them in as a must-pass patch.
+[ "$st" = ok ] || die 5 "agent did not finish cleanly ($st); its edits are not used, checks/blind.patch unchanged"
+
+# --- extract the patch from the host tree (source edits only) ---
+( cd "$WORK/app" && git add -A && git diff --cached ) > "$WORK/blind.patch" 2>>"$LOG"
+[ -s "$WORK/blind.patch" ] || die 5 "agent made no edits; checks/blind.patch unchanged"
+cp "$WORK/blind.patch" "$R/build/$SLUG/checks/blind.patch"
+log "BLIND.PATCH WRITTEN: $(wc -l <"$WORK/blind.patch") lines, $(grep -c '^+++' "$WORK/blind.patch") files -> checks/blind.patch"
+echo ok > "$ST"
+echo "BLIND-INFORMED-DONE-$SLUG" >> "$LOG"

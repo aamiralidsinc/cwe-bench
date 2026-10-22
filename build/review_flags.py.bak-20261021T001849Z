@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Signs that a trial's GRADING setup broke, so its score may not reflect the model.
+
+A run that did not solve and shows any of these is "needs review", not a model
+failure: we cannot tell from the score whether the model's code or our environment
+broke the setup. Decide from the saved evidence (final-code/, tmp-logs/,
+verifier/test-stdout.txt) and record the decision in build/audit/reviews.tsv.
+
+    python3 build/review_flags.py <trial_dir>      # print the flags of one trial
+"""
+import json
+import re
+import sys
+from pathlib import Path
+
+STDOUT_SIGNS = [
+    (r"(?m)^WARNING: .*(fail|timed out)", "grader setup step failed or timed out"),
+    (r"server did not come up", "app server did not start"),
+    (r"error: could not compile|error\[E\d{4}\]", "compile error"),
+    (r"(?m)^(FAIL|ok)\s+\S+\s+\[build failed\]", "Go build failed"),
+    (r"COMPILATION ERROR|BUILD FAILURE", "Java build failed"),
+    (r"moved core dump\(s\) out of /app", "a process crashed during the run (core dump left in /app)"),
+]
+
+
+def agent_cut(trial: Path):
+    """Why the agent's session was cut short before it finished, or None.
+
+    A graded non-solve of a cut session measures unfinished code, not the model: hermes-agent-ds
+    r1 (ApiRateLimitError, "exit 137") and suneditor-xss-inj mimo r2 (NonZeroAgentExitCodeError,
+    exit 137) were counted as model failures until 2026-10-20. A genuine agent TIMEOUT is not a
+    cut: by the user's rule it is a model failure, so AgentTimeoutError is left alone here."""
+    try:
+        res = json.loads((trial / "result.json").read_text())
+    except (OSError, ValueError):
+        res = {}
+    exc = res.get("exception_info") or {}
+    kind = str(exc.get("exception_type") or "")
+    if kind == "AgentTimeoutError":
+        return None
+    msg = str(exc.get("exception_message") or "")
+    if kind and re.search(r"Agent|Api|RateLimit", kind):
+        return f"{kind}: {' '.join(msg.split())[:100]}"
+    log = trial / "agent" / "claude-code.txt"
+    text = log.read_text(errors="replace") if log.is_file() else ""
+    if '"terminal_reason":"api_error"' in text[-20000:]:
+        return "session ended by an API/network error (terminal_reason api_error)"
+    if re.search(r"exit(ed)?( code)?:? 137\b|Killed\b", msg):
+        return f"agent process was killed ({kind or 'no exception type'})"
+    if log.is_file() and '"type":"result"' not in text:
+        return "agent log has no result event: the session never finished (killed or crashed)"
+    return None
+
+
+def setup_flags(trial: Path, verifier: Path = None) -> list:
+    """verifier: the grading to inspect (default <trial>/verifier; a regrade passes its own)."""
+    flags = []
+    cut = agent_cut(trial)
+    if cut:
+        flags.append(f"agent session cut short, not finished: {cut}")
+    verifier = verifier or trial / "verifier"
+    out = verifier / "test-stdout.txt"
+    text = out.read_text(errors="replace") if out.is_file() else ""
+    for pat, why in STDOUT_SIGNS:
+        m = re.search(pat, text)
+        if m:
+            flags.append(f"{why}: {m.group(0).strip()[:120]}")
+    res = verifier / "results.json"
+    if not res.is_file():
+        flags.append("no verifier/results.json (tests did not report)")
+        return flags
+    try:
+        data = json.loads(res.read_text())
+    except ValueError:
+        flags.append("verifier/results.json is unreadable (score.py broke)")
+        return flags
+    for group in ("security", "functional"):
+        g = data.get(group) or {}
+        if not g:
+            flags.append(f"{group} tests produced no results")
+    fun = data.get("functional") or {}
+    if fun and not any(v == "pass" for v in fun.values()):
+        flags.append(f"every functional test failed ({len(fun)}/{len(fun)}): app likely never worked")
+    return flags
+
+
+if __name__ == "__main__":
+    print("\n".join(setup_flags(Path(sys.argv[1]))) or "no flags")

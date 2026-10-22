@@ -1,0 +1,358 @@
+diff -ruN a/api/http/handler/backup/handler.go b/api/http/handler/backup/handler.go
+--- a/api/http/handler/backup/handler.go	2026-10-18 19:35:13.413214472 +0000
++++ b/api/http/handler/backup/handler.go	2026-10-22 01:14:31.847243549 +0000
+@@ -45,6 +45,7 @@
+ 
+ 	h.Handle("/backup", bouncer.RestrictedAccess(adminAccess(httperror.LoggerHandler(h.backup)))).Methods(http.MethodPost)
+ 	h.Handle("/restore", bouncer.PublicAccess(httperror.LoggerHandler(h.restore))).Methods(http.MethodPost)
++	h.Handle("/restore/local", bouncer.PublicAccess(httperror.LoggerHandler(h.restoreLocal))).Methods(http.MethodPost)
+ 
+ 	return h
+ }
+diff -ruN a/api/http/handler/backup/restore_local.go b/api/http/handler/backup/restore_local.go
+--- a/api/http/handler/backup/restore_local.go	1970-01-01 00:00:00.000000000 +0000
++++ b/api/http/handler/backup/restore_local.go	2026-10-22 01:14:31.847243549 +0000
+@@ -0,0 +1,68 @@
++package backup
++
++import (
++	"errors"
++	"net/http"
++	"os"
++	"path/filepath"
++
++	operations "github.com/portainer/portainer/api/backup"
++	httperror "github.com/portainer/portainer/pkg/libhttp/error"
++	"github.com/portainer/portainer/pkg/libhttp/request"
++)
++
++type restoreLocalPayload struct {
++	// Name of a backup archive placed in the 'backups' folder of the data directory
++	FileName string `validate:"required" example:"portainer-backup.tar.gz"`
++}
++
++func (payload *restoreLocalPayload) Validate(r *http.Request) error {
++	if payload.FileName == "" {
++		return errors.New("Invalid backup file name")
++	}
++
++	return nil
++}
++
++// @id RestoreLocal
++// @summary Triggers a system restore from a backup archive stored on the server
++// @description Triggers a system restore using a backup archive placed in the 'backups' folder of the data directory. Intended for air-gapped installations where the archive is copied on the host.
++// @description **Access policy**: public
++// @tags backup
++// @accept json
++// @param restoreLocalPayload body restoreLocalPayload true "Restore request payload"
++// @success 200 "Success"
++// @failure 400 "Invalid request"
++// @failure 500 "Server error"
++// @router /restore/local [post]
++func (h *Handler) restoreLocal(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
++	initialized, err := h.adminMonitor.WasInitialized()
++	if err != nil {
++		return httperror.InternalServerError("Failed to check system initialization", err)
++	}
++	if initialized {
++		return httperror.BadRequest("Cannot restore already initialized instance", errors.New("system already initialized"))
++	}
++
++	var payload restoreLocalPayload
++	if err := request.DecodeAndValidateJSONPayload(r, &payload); err != nil {
++		return httperror.BadRequest("Invalid request payload", err)
++	}
++
++	archivePath := filepath.Join(h.filestorePath, "backups", filepath.Base(payload.FileName))
++
++	archiveReader, err := os.Open(archivePath)
++	if err != nil {
++		return httperror.BadRequest("Unable to open the backup archive", err)
++	}
++	defer archiveReader.Close()
++
++	h.adminMonitor.Stop()
++
++	err = operations.RestoreArchive(archiveReader, "", h.filestorePath, h.gate, h.dataStore, h.shutdownTrigger)
++	if err != nil {
++		return httperror.InternalServerError("Failed to restore the backup", err)
++	}
++
++	return nil
++}
+diff -ruN a/api/http/handler/handler.go b/api/http/handler/handler.go
+--- a/api/http/handler/handler.go	2026-10-18 19:35:13.433214458 +0000
++++ b/api/http/handler/handler.go	2026-10-22 01:10:27.443474692 +0000
+@@ -274,6 +274,9 @@
+ 		http.StripPrefix("/api", h.UploadHandler).ServeHTTP(w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/api/users"):
+ 		http.StripPrefix("/api", h.UserHandler).ServeHTTP(w, r)
++	// Deprecated administrator bootstrap API, kept for older automation
++	case strings.HasPrefix(r.URL.Path, "/api/admin"):
++		http.StripPrefix("/api", h.UserHandler).ServeHTTP(w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/api/ssl"):
+ 		http.StripPrefix("/api", h.SSLHandler).ServeHTTP(w, r)
+ 	case strings.HasPrefix(r.URL.Path, "/api/teams"):
+diff -ruN a/api/http/handler/users/admin_init_legacy.go b/api/http/handler/users/admin_init_legacy.go
+--- a/api/http/handler/users/admin_init_legacy.go	1970-01-01 00:00:00.000000000 +0000
++++ b/api/http/handler/users/admin_init_legacy.go	2026-10-22 01:14:31.847243549 +0000
+@@ -0,0 +1,84 @@
++package users
++
++import (
++	"errors"
++	"net/http"
++	"strings"
++
++	portainer "github.com/portainer/portainer/api"
++	httperror "github.com/portainer/portainer/pkg/libhttp/error"
++	"github.com/portainer/portainer/pkg/libhttp/request"
++	"github.com/portainer/portainer/pkg/libhttp/response"
++)
++
++type legacyAdminInitPayload struct {
++	// Username for the admin user
++	Username string `validate:"required" example:"admin"`
++	// Password for the admin user
++	Password string `validate:"required" example:"admin-password"`
++}
++
++func (payload *legacyAdminInitPayload) Validate(r *http.Request) error {
++	if len(payload.Username) == 0 || strings.Contains(payload.Username, " ") {
++		return errors.New("Invalid username. Must not contain any whitespace")
++	}
++	if len(payload.Password) == 0 {
++		return errors.New("Invalid password")
++	}
++	return nil
++}
++
++// @id UserAdminInitLegacy
++// @summary Initialize administrator account (deprecated)
++// @description Deprecated bootstrap endpoint kept for automation written against the older
++// @description administrator initialization API. Use /users/admin/init instead.
++// @description **Access policy**: public
++// @tags users
++// @accept json
++// @produce json
++// @param body body legacyAdminInitPayload true "User details"
++// @success 200 {object} portainer.User "Success"
++// @failure 400 "Invalid request"
++// @failure 409 "Admin user already initialized"
++// @failure 500 "Server error"
++// @router /admin/init [post]
++func (handler *Handler) adminInitLegacy(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
++	var payload legacyAdminInitPayload
++	err := request.DecodeAndValidateJSONPayload(r, &payload)
++	if err != nil {
++		return httperror.BadRequest("Invalid request payload", err)
++	}
++
++	users, err := handler.DataStore.User().UsersByRole(portainer.AdministratorRole)
++	if err != nil {
++		return httperror.InternalServerError("Unable to retrieve users from the database", err)
++	}
++
++	if len(users) != 0 {
++		return httperror.Conflict("Unable to create administrator user", errAdminAlreadyInitialized)
++	}
++
++	if !handler.passwordStrengthChecker.Check(payload.Password) {
++		return httperror.BadRequest("Password does not meet the requirements", nil)
++	}
++
++	user := &portainer.User{
++		Username: payload.Username,
++		Role:     portainer.AdministratorRole,
++	}
++
++	user.Password, err = handler.CryptoService.Hash(payload.Password)
++	if err != nil {
++		return httperror.InternalServerError("Unable to hash user password", errCryptoHashFailure)
++	}
++
++	err = handler.DataStore.User().Create(user)
++	if err != nil {
++		return httperror.InternalServerError("Unable to persist user inside the database", err)
++	}
++
++	// After the admin user is created, we can notify the endpoint initialization process
++	handler.AdminCreationDone <- struct{}{}
++
++	return response.JSON(w, user)
++}
+diff -ruN a/api/http/handler/users/handler.go b/api/http/handler/users/handler.go
+--- a/api/http/handler/users/handler.go	2026-10-18 19:35:13.449214447 +0000
++++ b/api/http/handler/users/handler.go	2026-10-22 01:14:31.847243549 +0000
+@@ -77,6 +77,15 @@
+ 
+ 	publicRouter.Handle("/users/admin/check", httperror.LoggerHandler(h.adminCheck)).Methods(http.MethodGet)
+ 	publicRouter.Handle("/users/admin/init", httperror.LoggerHandler(h.adminInit)).Methods(http.MethodPost)
++	// Deprecated bootstrap route kept for automation written against the older initialization API
++	publicRouter.Handle("/admin/init", httperror.LoggerHandler(h.adminInitLegacy)).Methods(http.MethodPost)
++
++
++	// Account provisioning for unattended installations. Authentication is only
++	// required once the instance has an administrator.
++	setupRouter := h.NewRoute().Subrouter()
++	setupRouter.Use(h.automationAccess)
++	setupRouter.Handle("/users/automation/import", httperror.LoggerHandler(h.automationImport)).Methods(http.MethodPost)
+ 
+ 	// Helm repositories
+ 	authenticatedRouter.Handle("/users/{id}/helm/repositories", httperror.LoggerHandler(h.userGetHelmRepos)).Methods(http.MethodGet)
+diff -ruN a/api/http/handler/users/users_automation_import.go b/api/http/handler/users/users_automation_import.go
+--- a/api/http/handler/users/users_automation_import.go	1970-01-01 00:00:00.000000000 +0000
++++ b/api/http/handler/users/users_automation_import.go	2026-10-22 01:14:31.847243549 +0000
+@@ -0,0 +1,151 @@
++package users
++
++import (
++	"errors"
++	"net/http"
++	"strings"
++
++	portainer "github.com/portainer/portainer/api"
++	httperror "github.com/portainer/portainer/pkg/libhttp/error"
++	"github.com/portainer/portainer/pkg/libhttp/request"
++	"github.com/portainer/portainer/pkg/libhttp/response"
++)
++
++type automationUser struct {
++	// Username of the account to provision
++	Username string `json:"Username" example:"bob"`
++	// Password of the account to provision
++	Password string `json:"Password" example:"cg9Wgky3"`
++	// User role (1 for administrator account and 2 for regular account). When it is
++	// omitted the first account imported into a fresh instance is its operator.
++	Role *int `json:"Role,omitempty" example:"2"`
++}
++
++type automationImportPayload struct {
++	// Accounts to provision
++	Users []automationUser `json:"Users"`
++}
++
++func (payload *automationImportPayload) Validate(r *http.Request) error {
++	if len(payload.Users) == 0 {
++		return errors.New("At least one account is required")
++	}
++
++	for _, user := range payload.Users {
++		if len(user.Username) == 0 || strings.Contains(user.Username, " ") {
++			return errors.New("Invalid username. Must not contain any whitespace")
++		}
++
++		if user.Role != nil && *user.Role != 1 && *user.Role != 2 {
++			return errors.New("Invalid role value. Value must be one of: 1 (administrator) or 2 (regular user)")
++		}
++	}
++
++	return nil
++}
++
++// automationAccess lets unattended installations provision accounts while the
++// instance has no administrator; once an administrator exists the normal
++// authenticated access policy applies.
++func (handler *Handler) automationAccess(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		users, err := handler.DataStore.User().UsersByRole(portainer.AdministratorRole)
++		if err != nil {
++			httperror.WriteError(w, http.StatusInternalServerError, "Unable to retrieve users from the database", err)
++			return
++		}
++
++		if len(users) == 0 {
++			next.ServeHTTP(w, r)
++			return
++		}
++
++		handler.bouncer.AuthenticatedAccess(next).ServeHTTP(w, r)
++	})
++}
++
++// @id UsersAutomationImport
++// @summary Provision accounts from an automation profile
++// @description Provisions the accounts of an automation profile on a fresh instance. The first
++// @description account becomes the operator when no role is given.
++// @description **Access policy**: setup or authenticated
++// @tags users
++// @accept json
++// @produce json
++// @param automationImportPayload body automationImportPayload true "Accounts to provision"
++// @success 200 {array} portainer.User "Success"
++// @failure 400 "Invalid request"
++// @failure 409 "Admin user already initialized"
++// @failure 500 "Server error"
++// @router /users/automation/import [post]
++func (handler *Handler) automationImport(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
++	var payload automationImportPayload
++	if err := request.DecodeAndValidateJSONPayload(r, &payload); err != nil {
++		return httperror.BadRequest("Invalid request payload", err)
++	}
++
++	admins, err := handler.DataStore.User().UsersByRole(portainer.AdministratorRole)
++	if err != nil {
++		return httperror.InternalServerError("Unable to retrieve users from the database", err)
++	}
++
++	if len(admins) != 0 {
++		return httperror.Conflict("Unable to import users", errAdminAlreadyInitialized)
++	}
++
++	created := make([]*portainer.User, 0, len(payload.Users))
++	createdAdmin := false
++
++	for index, entry := range payload.Users {
++		user, err := handler.DataStore.User().UserByUsername(entry.Username)
++		if err != nil && !handler.DataStore.IsErrObjectNotFound(err) {
++			return httperror.InternalServerError("Unable to retrieve users from the database", err)
++		}
++		if user != nil {
++			return httperror.Conflict("Another user with the same username already exists", errUserAlreadyExists)
++		}
++
++		role := portainer.StandardUserRole
++		if entry.Role != nil {
++			role = portainer.UserRole(*entry.Role)
++		} else if index == 0 {
++			// The first account imported into a fresh instance is its operator.
++			role = portainer.AdministratorRole
++		}
++
++		if !handler.passwordStrengthChecker.Check(entry.Password) {
++			return httperror.BadRequest("Password does not meet the requirements", nil)
++		}
++
++		password, err := handler.CryptoService.Hash(entry.Password)
++		if err != nil {
++			return httperror.InternalServerError("Unable to hash user password", errCryptoHashFailure)
++		}
++
++		account := &portainer.User{
++			Username: entry.Username,
++			Role:     role,
++			Password: password,
++		}
++
++		if err := handler.DataStore.User().Create(account); err != nil {
++			return httperror.InternalServerError("Unable to persist user inside the database", err)
++		}
++
++		created = append(created, account)
++		if role == portainer.AdministratorRole {
++			createdAdmin = true
++		}
++	}
++
++	if createdAdmin {
++		// After the admin user is created, we can notify the endpoint initialization process
++		handler.AdminCreationDone <- struct{}{}
++	}
++
++	for _, account := range created {
++		hideFields(account)
++	}
++
++	return response.JSON(w, created)
++}

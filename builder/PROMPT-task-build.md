@@ -1,5 +1,8 @@
 # Task-build prompt template (one task per sub-agent)
 
+> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `builder/templates/` and follow `builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
+
+
 Use for a host the screener marked `build` (or `maybe`, if the user approves). Fill the `{{...}}`
 slots and send everything between the two `---8<---` lines. The rules live in `BUILDER.md` and
 `BRIEF-trap-stack.md`. This template only adds the per-task inputs, so keep those files current

@@ -1,0 +1,522 @@
+--- a/kernel/server/serve.go
++++ b/kernel/server/serve.go
+@@ -324,7 +324,7 @@
+ 
+ func serveExport(ginServer *gin.Engine) {
+ 	// Potential data export disclosure security vulnerability https://github.com/siyuan-note/siyuan/issues/12213
+-	exportGroup := ginServer.Group("/export/", model.CheckAuth)
++	exportGroup := ginServer.Group("/export/", model.CheckAuth, model.CheckAdminRole)
+ 	exportBaseDir := filepath.Join(util.TempDir, "export")
+ 
+ 	exportGroup.GET("/*filepath", func(c *gin.Context) {
+@@ -414,22 +414,39 @@
+ 
+ func serveWidgets(ginServer *gin.Engine) {
+ 	widgets := ginServer.Group("/widgets/", model.CheckAuth)
+-	widgets.Static("", filepath.Join(util.DataDir, "widgets"))
++	registerStaticFileHandlers(widgets, filepath.Join(util.DataDir, "widgets"), true, func(c *gin.Context, relativePath string) bool {
++		if !model.IsReadOnlyRoleContext(c) {
++			return true
++		}
++		name, _, _ := strings.Cut(filepath.ToSlash(relativePath), "/")
++		return model.CheckWidgetAccessableByPublishAccess(c, name, model.GetPublishAccess())
++	})
+ }
+ 
+ func servePlugins(ginServer *gin.Engine) {
+ 	plugins := ginServer.Group("/plugins/", model.CheckAuth)
+-	plugins.Static("", filepath.Join(util.DataDir, "plugins"))
++	registerStaticFileHandlers(plugins, filepath.Join(util.DataDir, "plugins"), true, func(c *gin.Context, relativePath string) bool {
++		if !model.IsReadOnlyRoleContext(c) {
++			return true
++		}
++		name, _, _ := strings.Cut(filepath.ToSlash(relativePath), "/")
++		return model.CheckPluginAccessableInPublish(name)
++	})
+ }
+ 
+ func serveEmojis(ginServer *gin.Engine) {
+ 	emojis := ginServer.Group("/emojis/", model.CheckAuth)
+-	emojis.Static("", filepath.Join(util.DataDir, "emojis"))
++	registerStaticFileHandlers(emojis, filepath.Join(util.DataDir, "emojis"), false, func(c *gin.Context, relativePath string) bool {
++		if !model.IsReadOnlyRoleContext(c) {
++			return true
++		}
++		return model.CheckEmojiAccessableByPublishAccess(c, filepath.ToSlash(relativePath), model.GetPublishAccess())
++	})
+ }
+ 
+ func serveTemplates(ginServer *gin.Engine) {
+-	templates := ginServer.Group("/templates/", model.CheckAuth)
+-	templates.Static("", filepath.Join(util.DataDir, "templates"))
++	templates := ginServer.Group("/templates/", model.CheckAuth, model.CheckAdminRole)
++	registerStaticFileHandlers(templates, filepath.Join(util.DataDir, "templates"), true, nil)
+ }
+ 
+ func servePublic(ginServer *gin.Engine) {
+@@ -439,7 +456,12 @@
+ 
+ func serveSnippets(ginServer *gin.Engine) {
+ 	ginServer.Handle("GET", "/snippets/*filepath", model.CheckAuth, func(c *gin.Context) {
+-		filePath := strings.TrimPrefix(c.Request.URL.Path, "/snippets/")
++		filePath, ok := cleanStaticRelativePath(c.Param("filepath"))
++		if !ok {
++			c.Status(http.StatusForbidden)
++			return
++		}
++		filePath = filepath.ToSlash(filePath)
+ 		if !model.IsAdminRoleContext(c) {
+ 			if "conf.json" == filePath {
+ 				c.Status(http.StatusUnauthorized)
+@@ -449,6 +471,18 @@
+ 
+ 		ext := filepath.Ext(filePath)
+ 		name := strings.TrimSuffix(filePath, ext)
++		if model.IsReadOnlyRoleContext(c) {
++			found, accessable := model.CheckSnippetAccessableInPublish(name, strings.TrimPrefix(ext, "."))
++			if !found {
++				c.Status(http.StatusNotFound)
++				return
++			}
++			if !accessable {
++				c.Status(http.StatusForbidden)
++				return
++			}
++		}
++
+ 		confSnippets, err := model.LoadSnippets()
+ 		if err != nil {
+ 			logging.LogErrorf("load snippets failed: %s", err)
+@@ -465,21 +499,121 @@
+ 		}
+ 
+ 		// 没有在配置文件中命中时在文件系统上查找
+-		filePath = filepath.Join(util.SnippetsPath, filePath)
++		serveStaticFile(c, util.SnippetsPath, filePath, false)
++	})
++}
+ 
+-		// 限制只能访问 snippets 目录内的文件，并拦截敏感路径，避免通过路径穿越读取工作空间内的敏感文件
+-		if !gulu.File.IsSubPath(util.SnippetsPath, filePath) {
+-			c.Status(http.StatusUnauthorized)
++type staticFileAccessCheck func(c *gin.Context, relativePath string) bool
++
++func registerStaticFileHandlers(group *gin.RouterGroup, root string, packageScoped bool, accessCheck staticFileAccessCheck) {
++	handler := func(c *gin.Context) {
++		relativePath, ok := cleanStaticRelativePath(c.Param("filepath"))
++		if !ok {
++			c.Status(http.StatusForbidden)
+ 			return
+ 		}
+-		if util.IsSensitivePath(filePath) {
+-			logging.LogErrorf("refuse to serve sensitive snippet file [%s]", c.Request.URL.Path)
++		if accessCheck != nil && !accessCheck(c, relativePath) {
+ 			c.Status(http.StatusForbidden)
+ 			return
+ 		}
++		serveStaticFile(c, root, relativePath, packageScoped)
++	}
++	group.GET("/*filepath", handler)
++	group.HEAD("/*filepath", handler)
++}
+ 
+-		c.File(filePath)
+-	})
++func cleanStaticRelativePath(requestPath string) (string, bool) {
++	requestPath = strings.TrimPrefix(requestPath, "/")
++	relativePath := filepath.Clean(filepath.FromSlash(requestPath))
++	if filepath.IsAbs(relativePath) || filepath.VolumeName(relativePath) != "" ||
++		relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
++		return "", false
++	}
++	return relativePath, true
++}
++
++func serveStaticFile(c *gin.Context, root, relativePath string, packageScoped bool) {
++	rootAbsPath, err := filepath.Abs(root)
++	if err != nil {
++		c.Status(http.StatusInternalServerError)
++		return
++	}
++	rootRealPath, err := filepath.EvalSymlinks(rootAbsPath)
++	if err != nil {
++		c.Status(http.StatusNotFound)
++		return
++	}
++
++	targetPath := filepath.Join(rootAbsPath, relativePath)
++	targetInfo, err := os.Stat(targetPath)
++	if err != nil {
++		if os.IsNotExist(err) {
++			c.Status(http.StatusNotFound)
++		} else {
++			c.Status(http.StatusForbidden)
++		}
++		return
++	}
++	if targetInfo.IsDir() {
++		targetPath = filepath.Join(targetPath, "index.html")
++	}
++
++	targetRealPath, err := filepath.EvalSymlinks(targetPath)
++	if err != nil {
++		c.Status(http.StatusNotFound)
++		return
++	}
++	allowedRoot := rootRealPath
++	if packageScoped && relativePath != "." {
++		// 插件、挂件等支持将一级包目录作为符号链接，包内符号链接仍不得越出该包的实际目录。
++		firstSegment, _, _ := strings.Cut(filepath.ToSlash(relativePath), "/")
++		if firstSegment != "" {
++			packageRoot := filepath.Join(rootAbsPath, filepath.FromSlash(firstSegment))
++			if resolvedPackageRoot, resolveErr := filepath.EvalSymlinks(packageRoot); resolveErr == nil {
++				allowedRoot = resolvedPackageRoot
++			}
++		}
++	}
++	if targetRealPath != allowedRoot && !gulu.File.IsSubPath(allowedRoot, targetRealPath) {
++		c.Status(http.StatusForbidden)
++		return
++	}
++	if util.IsSensitivePath(targetRealPath) {
++		logging.LogErrorf("refuse to serve sensitive static file [%s]", c.Request.URL.Path)
++		c.Status(http.StatusForbidden)
++		return
++	}
++
++	targetInfo, err = os.Stat(targetRealPath)
++	if err != nil || !targetInfo.Mode().IsRegular() {
++		c.Status(http.StatusNotFound)
++		return
++	}
++	http.ServeFile(c.Writer, c.Request, targetRealPath)
++}
++
++// publishPreviewAccessable 判断只读角色是否可以读取发布预览面板请求的资源
++func publishPreviewAccessable(c *gin.Context, filePath, relativePath string) bool {
++	relativePath = filepath.ToSlash(relativePath)
++	publishAccess := model.GetPublishAccess()
++	first, rest, _ := strings.Cut(relativePath, "/")
++	switch first {
++	case "templates":
++		return false
++	case "snippets":
++		ext := path.Ext(rest)
++		found, accessable := model.CheckSnippetAccessableInPublish(strings.TrimSuffix(rest, ext), strings.TrimPrefix(ext, "."))
++		return found && accessable
++	case "plugins":
++		name, _, _ := strings.Cut(rest, "/")
++		return model.CheckPluginAccessableInPublish(name)
++	case "widgets":
++		name, _, _ := strings.Cut(rest, "/")
++		return model.CheckWidgetAccessableByPublishAccess(c, name, publishAccess)
++	case "emojis":
++		return model.CheckEmojiAccessableByPublishAccess(c, rest, publishAccess)
++	}
++	return model.CheckAbsPathAccessableByPublishAccess(c, filePath, publishAccess)
+ }
+ 
+ func serveAppearance(ginServer *gin.Engine) {
+@@ -1027,6 +1161,10 @@
+ 
+ 		for _, snippet := range snippets {
+ 			if snippet.Name == name && snippet.Type == typ {
++				if model.IsReadOnlyRoleContext(c) && snippet.DisabledInPublish {
++					c.Status(http.StatusForbidden)
++					return
++				}
+ 				c.Header("Content-Type", mime.TypeByExtension("."+typ))
+ 				c.String(http.StatusOK, snippet.Content)
+ 				return
+@@ -1047,6 +1185,11 @@
+ 			return
+ 		}
+ 
++		if model.IsReadOnlyRoleContext(c) && !publishPreviewAccessable(c, filePath, relativePath) {
++			c.Status(http.StatusForbidden)
++			return
++		}
++
+ 		if util.IsSensitivePath(filePath) {
+ 			c.Status(http.StatusForbidden)
+ 			return
+--- a/kernel/api/bazaar.go
++++ b/kernel/api/bazaar.go
+@@ -141,7 +141,7 @@
+ 	}
+ 
+ 	ret.Data = map[string]any{
+-		"packages": model.GetInstalledPackages("plugins", frontend, keyword),
++		"packages": model.FilterInstalledPackagesForPublishAccess(c, "plugins", model.GetInstalledPackages("plugins", frontend, keyword)),
+ 	}
+ }
+ 
+@@ -248,7 +248,7 @@
+ 	}
+ 
+ 	ret.Data = map[string]any{
+-		"packages": model.GetInstalledPackages("widgets", "", keyword),
++		"packages": model.FilterInstalledPackagesForPublishAccess(c, "widgets", model.GetInstalledPackages("widgets", "", keyword)),
+ 	}
+ }
+ 
+@@ -444,7 +444,7 @@
+ 	}
+ 
+ 	ret.Data = map[string]any{
+-		"packages": model.GetInstalledPackages("templates", "", keyword),
++		"packages": model.FilterInstalledPackagesForPublishAccess(c, "templates", model.GetInstalledPackages("templates", "", keyword)),
+ 	}
+ }
+ 
+--- a/kernel/api/system.go
++++ b/kernel/api/system.go
+@@ -250,6 +250,17 @@
+ 			}
+ 		}
+ 	}
++	if model.IsReadOnlyRoleContext(c) {
++		publishAccess := model.GetPublishAccess()
++		accessibleItems := []map[string]any{}
++		for _, item := range items {
++			unicode, _ := item["unicode"].(string)
++			if model.CheckEmojiAccessableByPublishAccess(c, unicode, publishAccess) {
++				accessibleItems = append(accessibleItems, item)
++			}
++		}
++		items = accessibleItems
++	}
+ 	custom["items"] = items
+ 	conf = append([]map[string]any{custom}, conf...)
+ 
+--- /dev/null
++++ b/kernel/model/publish_resource_access.go
+@@ -0,0 +1,228 @@
++// SiYuan - Refactor your thinking
++// Copyright (c) 2020-present, b3log.org
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program.  If not, see <https://www.gnu.org/licenses/>.
++
++package model
++
++import (
++	"bytes"
++	stdhtml "html"
++	"net/url"
++	"path"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	"github.com/88250/lute/ast"
++	lutehtml "github.com/88250/lute/html"
++	"github.com/88250/lute/parse"
++	"github.com/gin-gonic/gin"
++	"github.com/siyuan-note/siyuan/kernel/bazaar"
++	"github.com/siyuan-note/siyuan/kernel/treenode"
++	"github.com/siyuan-note/siyuan/kernel/util"
++)
++
++type publishResourceRefs struct {
++	updated string
++	widgets map[string]struct{}
++	emojis  map[string]struct{}
++}
++
++var publishResourceRefsCache sync.Map
++
++func CheckSnippetAccessableInPublish(name, typ string) (found, accessable bool) {
++	snippets, err := LoadSnippets()
++	if err != nil {
++		return
++	}
++	for _, snippet := range snippets {
++		if snippet.Name == name && snippet.Type == typ {
++			return true, !snippet.DisabledInPublish
++		}
++	}
++	return
++}
++
++func CheckPluginAccessableInPublish(name string) bool {
++	if name == "" || !IsPetalsEnabled() {
++		return false
++	}
++
++	petal := getPetalByName(name, getPetals())
++	if petal == nil || !petal.Enabled {
++		return false
++	}
++
++	found, _, _, _, disabledInPublish, disallowInstall, _ := bazaar.ParseInstalledPlugin(name, "")
++	return found && !disabledInPublish && !disallowInstall
++}
++
++func CheckWidgetAccessableInPublish(name string) bool {
++	if name == "" {
++		return false
++	}
++	widget, err := bazaar.ParsePackageJSON(filepath.Join(util.DataDir, "widgets", name, "widget.json"))
++	return err == nil && widget != nil && !widget.DisabledInPublish
++}
++
++func CheckWidgetAccessableByPublishAccess(c *gin.Context, name string, publishAccess PublishAccess) bool {
++	if !CheckWidgetAccessableInPublish(name) {
++		return false
++	}
++	return checkResourceAccessableByPublishAccess(c, name, publishAccess, true)
++}
++
++func CheckEmojiAccessableByPublishAccess(c *gin.Context, relativePath string, publishAccess PublishAccess) bool {
++	relativePath = normalizePublishResourcePath(relativePath)
++	if relativePath == "" {
++		return false
++	}
++	return checkResourceAccessableByPublishAccess(c, relativePath, publishAccess, false)
++}
++
++func checkResourceAccessableByPublishAccess(c *gin.Context, resource string, publishAccess PublishAccess, widget bool) bool {
++	for _, bt := range treenode.GetBlockTreesByType("d") {
++		if !checkBlockTreeAccessableByPublishAccess(c, publishAccess, bt) {
++			continue
++		}
++
++		refs := getPublishResourceRefs(bt)
++		if widget {
++			if _, ok := refs.widgets[resource]; ok {
++				return true
++			}
++		} else if _, ok := refs.emojis[resource]; ok {
++			return true
++		}
++	}
++	return false
++}
++
++func getPublishResourceRefs(bt *treenode.BlockTree) *publishResourceRefs {
++	cacheKey := bt.BoxID + "/" + bt.RootID
++	if cached, ok := publishResourceRefsCache.Load(cacheKey); ok {
++		refs := cached.(*publishResourceRefs)
++		if refs.updated == bt.Updated {
++			return refs
++		}
++	}
++
++	refs := &publishResourceRefs{
++		updated: bt.Updated,
++		widgets: map[string]struct{}{},
++		emojis:  map[string]struct{}{},
++	}
++	tree, err := loadTreeByBlockIDInBox(bt.RootID, bt.BoxID)
++	if err != nil || tree == nil {
++		return refs
++	}
++
++	refs.widgets = widgetPackagesInTree(tree)
++	for _, emoji := range emojisInTree(tree) {
++		if relativePath := publishResourceURLPath(emoji, "/emojis/"); relativePath != "" {
++			refs.emojis[relativePath] = struct{}{}
++		}
++	}
++	publishResourceRefsCache.Store(cacheKey, refs)
++	return refs
++}
++
++func widgetPackagesInTree(tree *parse.Tree) map[string]struct{} {
++	ret := map[string]struct{}{}
++	ast.Walk(tree.Root, func(n *ast.Node, entering bool) ast.WalkStatus {
++		if !entering || (n.Type != ast.NodeWidget && n.Type != ast.NodeIFrame &&
++			n.Type != ast.NodeHTMLBlock && n.Type != ast.NodeInlineHTML) {
++			return ast.WalkContinue
++		}
++
++		nodes, err := lutehtml.ParseFragment(bytes.NewReader(n.Tokens), &lutehtml.Node{Type: lutehtml.ElementNode})
++		if err != nil {
++			return ast.WalkContinue
++		}
++		for _, node := range nodes {
++			walkPublishResourceHTML(node, func(value string) {
++				relativePath := publishResourceURLPath(value, "/widgets/")
++				if relativePath == "" {
++					return
++				}
++				name, _, _ := strings.Cut(relativePath, "/")
++				if name != "" {
++					ret[name] = struct{}{}
++				}
++			})
++		}
++		return ast.WalkContinue
++	})
++	return ret
++}
++
++func walkPublishResourceHTML(node *lutehtml.Node, visit func(string)) {
++	for _, attr := range node.Attr {
++		visit(attr.Val)
++	}
++	for child := node.FirstChild; child != nil; child = child.NextSibling {
++		walkPublishResourceHTML(child, visit)
++	}
++}
++
++func publishResourceURLPath(value, prefix string) string {
++	value = strings.TrimSpace(stdhtml.UnescapeString(value))
++	parsed, err := url.Parse(value)
++	if err != nil {
++		return ""
++	}
++	if parsed.Host != "" && !util.IsLocalHostname(parsed.Hostname()) {
++		return ""
++	}
++	cleanPath := path.Clean(parsed.Path)
++	if !strings.HasPrefix(cleanPath, prefix) {
++		return ""
++	}
++	return normalizePublishResourcePath(strings.TrimPrefix(cleanPath, prefix))
++}
++
++func normalizePublishResourcePath(relativePath string) string {
++	relativePath = filepath.ToSlash(filepath.Clean(filepath.FromSlash(strings.TrimPrefix(relativePath, "/"))))
++	if relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, "../") {
++		return ""
++	}
++	return relativePath
++}
++
++// FilterInstalledPackagesForPublishAccess 过滤集市列表中只读角色不可访问的已安装包
++func FilterInstalledPackagesForPublishAccess(c *gin.Context, pkgType string, packages []*bazaar.Package) (ret []*bazaar.Package) {
++	ret = packages
++	if !IsReadOnlyRoleContext(c) {
++		return
++	}
++
++	ret = []*bazaar.Package{}
++	for _, pkg := range packages {
++		if pkg == nil {
++			continue
++		}
++		switch pkgType {
++		case "plugins":
++			if CheckPluginAccessableInPublish(pkg.Name) {
++				ret = append(ret, pkg)
++			}
++		case "widgets":
++			if CheckWidgetAccessableByPublishAccess(c, pkg.Name, GetPublishAccess()) {
++				ret = append(ret, pkg)
++			}
++		}
++	}
++	return
++}

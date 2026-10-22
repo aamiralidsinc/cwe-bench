@@ -1,0 +1,1362 @@
+diff --git a/cmd/arc/main.go b/cmd/arc/main.go
+index 9d39afc..8fcb0f8 100644
+--- a/cmd/arc/main.go
++++ b/cmd/arc/main.go
+@@ -11,7 +11,9 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
++	"strings"
+ 	"time"
++	"unicode"
+ 
+ 	"github.com/basekick-labs/arc/internal/api"
+ 	"github.com/basekick-labs/arc/internal/audit"
+@@ -43,6 +45,16 @@ import (
+ // Version is set at build time
+ var Version = "dev"
+ 
++// uploadSubdirName is the fixed name of the multipart-upload directory Arc
++// creates beneath cfg.Database.TempDirectory. cfg.Database.TempDirectory
++// always resolves to a non-empty absolute path before this is used (the
++// "./.tmp" fallback runs in main() before any consumer); the directory is
++// NEVER created under os.TempDir, because os.TempDir is intentionally
++// outside the DuckDB sandbox allowlist. MUST stay in sync with whatever
++// path the DB layer adds to allowed_directories, otherwise reads of
++// uploaded files fail with a permission error.
++const uploadSubdirName = "arc-uploads"
++
+ func main() {
+ 	// Check for subcommands before loading full config
+ 	if len(os.Args) > 1 && os.Args[1] == "compact" {
+@@ -200,10 +212,32 @@ func main() {
+ 		S3Endpoint:  cfg.Storage.S3Endpoint,
+ 		S3UseSSL:    cfg.Storage.S3UseSSL,
+ 		S3PathStyle: cfg.Storage.S3PathStyle,
++		S3Bucket:    cfg.Storage.S3Bucket,
++		S3Prefix:    cfg.Storage.S3Prefix,
+ 		// Azure Blob Storage configuration for azure extension
+ 		AzureAccountName: cfg.Storage.AzureAccountName,
+ 		AzureAccountKey:  cfg.Storage.AzureAccountKey,
+ 		AzureEndpoint:    cfg.Storage.AzureEndpoint,
++		AzureContainer:   cfg.Storage.AzureContainer,
++		// Cold-tier sandbox allowlist entries. The cold tier may use a
++		// different bucket/container from the primary backend (commonly
++		// hot=local + cold=S3 on Enterprise); the sandbox must allow both.
++		// Populated unconditionally — empty values are ignored by
++		// buildAllowedDirectories. License gating happens later in main.go
++		// before the tiering manager actually runs.
++		ColdS3Bucket:       cfg.TieredStorage.Cold.S3Bucket,
++		ColdS3Prefix:       cfg.TieredStorage.Cold.S3Prefix,
++		ColdAzureContainer: cfg.TieredStorage.Cold.AzureContainer,
++		// Local storage root used by the DuckDB sandbox to whitelist
++		// Arc-managed file paths in allowed_directories. Always populated
++		// regardless of the configured backend; on S3/Azure-only deployments
++		// this still covers the local spill/temp areas under the same root.
++		LocalStorageRoot: cfg.Storage.LocalPath,
++		// Compaction temp directory (cfg.Compaction.TempDirectory) — every
++		// compaction job COPYs rewritten parquet to a subdir of this path
++		// before uploading. Must be in the sandbox allowlist or every
++		// compaction job fails post-lockdown.
++		CompactionTempDirectory: cfg.Compaction.TempDirectory,
+ 		// Query optimization
+ 		EnableS3Cache:     cfg.Query.EnableS3Cache,
+ 		S3CacheSize:       cfg.Query.S3CacheSize,
+@@ -220,21 +254,258 @@ func main() {
+ 		}(),
+ 	}
+ 
+-	// Resolve temp_directory to an absolute path so the value DuckDB stores
+-	// internally and the path the sweep walks are the same regardless of
+-	// the process CWD (matters for systemd units with WorkingDirectory=/
+-	// and for docker entrypoints rooted at /). Falls back to the
+-	// configured value if Abs fails. Normalize to forward slashes so the
+-	// path is safe to interpolate into a DuckDB SQL string on Windows
+-	// (backslashes would become escape sequences if standard_conforming_
+-	// strings is ever disabled) and so the SQL value matches the sweep
+-	// path byte-for-byte. Matches the pattern used by ArcxExtensionPath.
+-	if dbConfig.TempDirectory != "" {
+-		if abs, err := filepath.Abs(dbConfig.TempDirectory); err == nil {
+-			dbConfig.TempDirectory = abs
++	// resolveAbsPath converts an operator-supplied path (possibly relative,
++	// possibly Windows-slashed) into an absolute forward-slash form suitable
++	// for safe interpolation into the DuckDB sandbox allowlist. Rejects paths
++	// containing control bytes — they should not appear in real config and
++	// would corrupt the allowlist SQL even after escapeSQLString quote-doubling
++	// (newlines are SQL-significant; nulls truncate the literal in DuckDB's
++	// parser). Empty input passes through unchanged so callers can treat
++	// "unset" as a sentinel.
++	//
++	// Matters for systemd units with WorkingDirectory=/ and docker entrypoints
++	// rooted at /, where relative paths resolve differently than during
++	// operator-facing local runs. Also keeps the value DuckDB stores
++	// internally byte-identical to what CleanupOrphanedSpillFiles walks.
++	resolveAbsPath := func(name, p string) string {
++		if p == "" {
++			return p
++		}
++		// Reject any non-printable character or Unicode formatting / line/
++		// paragraph separator. Real filesystem paths never contain these;
++		// their presence in operator config indicates either a typo (newline
++		// at end of YAML scalar, BOM at start of file) or a paste from a
++		// hostile source. The categories caught:
++		//   Cc — ASCII control (\0, \n, \r, \t, etc.)
++		//   Cf — format chars (LRM/RLM/LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI,
++		//        ZWSP/ZWNJ/ZWJ, BOM/ZWNBSP, soft hyphen — invisible runes
++		//        that can make a path look one way in logs and another in
++		//        the SQL literal sent to DuckDB).
++		//   Zl — line separator (U+2028)
++		//   Zp — paragraph separator (U+2029)
++		// unicode.IsControl covers Cc; unicode.In with the others closes
++		// the bidi / invisible-character bypass surface gemini will look
++		// for. Reject loudly rather than try to interpret these.
++		for _, r := range p {
++			if unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
++				log.Fatal().Str("setting", name).Str("path", p).Msg("Configured path contains control, formatting, or line/paragraph-separator characters; refusing to start")
++			}
++		}
++		// filepath.Abs can only fail when os.Getwd fails (e.g. the CWD was
++		// unlinked between exec and now). Fail-fast — a silent relative-path
++		// fallback would land in the sandbox allowlist as a relative literal
++		// that never matches the absolute paths Arc emits at query time, and
++		// the failure mode is invisible (every query 500s, no startup log).
++		abs, err := filepath.Abs(p)
++		if err != nil {
++			log.Fatal().Err(err).Str("setting", name).Str("path", p).Msg("Failed to resolve path to absolute; refusing to start")
++		}
++		return filepath.ToSlash(abs)
++	}
++
++	// Normalize every operator-supplied path that will be interpolated into
++	// the DuckDB sandbox allowlist OR consumed by DuckDB directly. The
++	// sandbox does prefix-match on literals — relative paths in the allowlist
++	// never match the absolute paths Arc emits at query time, so every path
++	// MUST be absolute before lockdown.
++	//
++	// If the operator explicitly cleared database.temp_directory, fall back
++	// to a known relative path BEFORE Abs-resolving. Otherwise DuckDB's own
++	// default (".tmp") would be relative and never match the absolute spill
++	// paths inside the sandbox allowlist, breaking every query that spills.
++	// Matches the config-load default at internal/config/config.go:757.
++	if dbConfig.TempDirectory == "" {
++		dbConfig.TempDirectory = "./.tmp"
++	}
++	dbConfig.TempDirectory = resolveAbsPath("database.temp_directory", dbConfig.TempDirectory)
++	dbConfig.LocalStorageRoot = resolveAbsPath("storage.local_path", dbConfig.LocalStorageRoot)
++	dbConfig.CompactionTempDirectory = resolveAbsPath("compaction.temp_directory", dbConfig.CompactionTempDirectory)
++	if dbConfig.ArcxStorageRoot != "" {
++		dbConfig.ArcxStorageRoot = resolveAbsPath("arcx.storage_root", dbConfig.ArcxStorageRoot)
++	}
++	// arcx.extension_path is interpolated into a `LOAD '<path>'` statement;
++	// normalise it the same way every other operator-supplied path is
++	// (control-char rejection + Abs + ToSlash) so the LOAD is robust against
++	// CWD changes and so the path cannot smuggle SQL through escapeSQLString.
++	if dbConfig.ArcxExtensionPath != "" {
++		dbConfig.ArcxExtensionPath = resolveAbsPath("database.arcx_extension_path", dbConfig.ArcxExtensionPath)
++	}
++
++	// Refuse obviously-wrong storage roots that would neuter the sandbox
++	// (allowing every local file). Operator owns the config so this is
++	// protection against a typo (e.g. "/" instead of "/data") rather than a
++	// malicious config. Covers POSIX system roots, the OS temp tree (sharing
++	// /tmp with other processes is never what an operator wants for Arc
++	// data), and common shared-state roots. Windows roots like C:\ are not
++	// enumerated — Windows-on-server-with-Arc is an unusual deployment.
++	//
++	// Apply to ALL local-directory configurations that end up in the sandbox
++	// allowlist. TempDirectory and CompactionTempDirectory are also added
++	// verbatim to allowed_directories, so a typo there would grant the same
++	// kind of broad access as a misconfigured LocalStorageRoot.
++	//
++	// Prefix-match (not exact-match) so a configured path like
++	// "/etc/arc-data" is rejected too — its allowlist entry would be
++	// "/etc/arc-data/" which is still inside /etc and would let any reader
++	// drop a file under /etc/arc-data to be exfiltrated through Arc. Same
++	// reasoning for /root/.ssh, /proc/<pid>/, /sys/class/, etc.
++	deniedRoots := []string{
++		"/etc", "/usr", "/bin", "/sbin", "/boot",
++		"/proc", "/sys", "/dev",
++		"/root",
++	}
++	// pathStartsWithRoot returns true when `path` is exactly `root`, is
++	// `root` with a trailing slash, or has `root + "/"` as a prefix.
++	// Anchored so "/etcd-data" is NOT matched by "/etc" — only true
++	// subdirectories or the bare directory itself.
++	pathStartsWithRoot := func(path, root string) bool {
++		return path == root || path == root+"/" || strings.HasPrefix(path, root+"/")
++	}
++	for _, pair := range []struct {
++		name, value string
++	}{
++		{"storage.local_path", dbConfig.LocalStorageRoot},
++		{"database.temp_directory", dbConfig.TempDirectory},
++		{"compaction.temp_directory", dbConfig.CompactionTempDirectory},
++	} {
++		if pair.value == "" {
++			continue
++		}
++		// Reject the root filesystem outright — never legitimate.
++		if pair.value == "/" {
++			log.Fatal().Str("setting", pair.name).Str("path", pair.value).Msg("Configured path refuses to be the filesystem root; pick a dedicated data directory")
++		}
++		for _, root := range deniedRoots {
++			if pathStartsWithRoot(pair.value, root) {
++				log.Fatal().Str("setting", pair.name).Str("path", pair.value).Str("denied_root", root).Msg("Configured path is inside a system root; pick a dedicated data directory")
++			}
++		}
++	}
++
++	// Resolve symlinks on every local directory that lands in the sandbox
++	// allowlist. filepath.Abs does NOT resolve symlinks; the kernel will,
++	// so without EvalSymlinks the sandbox literal-string can mismatch the
++	// real path the kernel opens (most common cause: macOS /var → /private/var,
++	// Docker bind mounts, K8s subPath). Same Warn-and-substitute policy as
++	// the upload-dir handling below — never hard-Fatal on a symlinked
++	// ancestor; instead use the resolved path so the allowlist and the
++	// kernel agree. EvalSymlinks errors only on missing paths, which is a
++	// real misconfiguration we should fail on.
++	resolveLocalDirSymlinks := func(name string, p *string) {
++		if *p == "" {
++			return
++		}
++		resolved, err := filepath.EvalSymlinks(*p)
++		if err != nil {
++			log.Fatal().Err(err).Str("setting", name).Str("path", *p).Msg("Failed to resolve configured path symlinks; refusing to start")
++		}
++		resolved = filepath.ToSlash(resolved)
++		if resolved != *p {
++			log.Warn().
++				Str("setting", name).
++				Str("original", *p).
++				Str("resolved", resolved).
++				Msg("Configured path resolves through a symlink; using the resolved path as the sandbox allowlist entry")
++			*p = resolved
++		}
++	}
++	// TempDirectory and CompactionTempDirectory must exist on disk before
++	// EvalSymlinks is called — config-load defaults them to "./.tmp" and
++	// "./data/compaction" respectively, neither of which exists at first
++	// boot. Create them with 0o700 first so the symlink-resolution check
++	// has something to resolve.
++	if err := os.MkdirAll(dbConfig.TempDirectory, 0o700); err != nil {
++		log.Fatal().Err(err).Str("path", dbConfig.TempDirectory).Msg("Failed to create database.temp_directory")
++	}
++	if dbConfig.CompactionTempDirectory != "" {
++		if err := os.MkdirAll(dbConfig.CompactionTempDirectory, 0o700); err != nil {
++			log.Fatal().Err(err).Str("path", dbConfig.CompactionTempDirectory).Msg("Failed to create compaction.temp_directory")
+ 		}
+-		dbConfig.TempDirectory = filepath.ToSlash(dbConfig.TempDirectory)
+ 	}
++	if dbConfig.LocalStorageRoot != "" {
++		if err := os.MkdirAll(dbConfig.LocalStorageRoot, 0o700); err != nil {
++			log.Fatal().Err(err).Str("path", dbConfig.LocalStorageRoot).Msg("Failed to create storage.local_path")
++		}
++	}
++	resolveLocalDirSymlinks("storage.local_path", &dbConfig.LocalStorageRoot)
++	resolveLocalDirSymlinks("database.temp_directory", &dbConfig.TempDirectory)
++	resolveLocalDirSymlinks("compaction.temp_directory", &dbConfig.CompactionTempDirectory)
++
++	// Production safety net: if every path contributing to the sandbox
++	// allowlist is empty, DuckDB will refuse every file-touching query.
++	// internal/database.lockdownExternalAccess logs a Warn in that case
++	// (it's library code that test fixtures and embeddings also call), but
++	// for the production binary an empty allowlist is unrecoverable
++	// misconfiguration — fail-fast at startup rather than serving 500s on
++	// every query. main.go's "./.tmp" fallback for TempDirectory makes this
++	// branch effectively unreachable today; this guard is here to catch a
++	// future refactor that drops the fallback.
++	if dbConfig.LocalStorageRoot == "" &&
++		dbConfig.TempDirectory == "" &&
++		dbConfig.CompactionTempDirectory == "" &&
++		dbConfig.S3Bucket == "" &&
++		dbConfig.ColdS3Bucket == "" &&
++		dbConfig.AzureContainer == "" &&
++		dbConfig.ColdAzureContainer == "" {
++		log.Fatal().Msg("sandbox allowlist would be empty — every file-touching query would fail; check arc.toml [storage] and [database] config")
++	}
++
++	// Compute and create the import-upload directory. Lives under the
++	// operator-configured TempDirectory (always non-empty by this point —
++	// see the "./.tmp" fallback above). The DB sandbox whitelists exactly
++	// this directory in allowed_directories so reads of uploaded files
++	// succeed; nothing else under os.TempDir is reachable from user SQL.
++	uploadDir := filepath.Join(dbConfig.TempDirectory, uploadSubdirName)
++	if err := os.MkdirAll(uploadDir, 0o700); err != nil {
++		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to create import upload directory")
++	}
++	// Lstat BEFORE Chmod. os.Chmod follows symlinks (no portable Lchmod on
++	// Linux), so a chmod-first ordering would silently change the perms of
++	// any attacker-staged symlink target before the Lstat check fires. With
++	// Lstat first, we abort startup the instant we see a symlink and the
++	// target's perms remain untouched.
++	if info, err := os.Lstat(uploadDir); err != nil {
++		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to stat import upload directory")
++	} else if info.Mode()&os.ModeSymlink != 0 {
++		log.Fatal().Str("path", uploadDir).Msg("Import upload directory is a symlink; refusing to start (security)")
++	}
++	// Defense in depth against an ancestor-of-uploadDir symlink (e.g.
++	// dbConfig.TempDirectory itself is a symlink — filepath.Abs does not
++	// resolve symlinks). If EvalSymlinks resolves to a different path, the
++	// sandbox would otherwise allowlist the literal pre-resolution string
++	// while the kernel actually opens files at the resolved location —
++	// reads from the literal allowlisted path would fail, and writes via
++	// the resolved path would land outside the allowlisted prefix.
++	//
++	// Hard-rejecting on any symlinked ancestor would break legitimate
++	// deployments (macOS routes /var through /private/var; Docker bind
++	// mounts and K8s subPath frequently traverse symlinks). Instead: log a
++	// Warn so operators see the resolution happened, and use the resolved
++	// path as the sandbox allowlist entry. The kernel and the allowlist
++	// then agree on the same underlying directory, closing the spoofing
++	// window without false-positiving common production environments.
++	if resolved, err := filepath.EvalSymlinks(uploadDir); err != nil {
++		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to resolve import upload directory symlinks")
++	} else if resolved != uploadDir {
++		log.Warn().
++			Str("original", uploadDir).
++			Str("resolved", resolved).
++			Msg("Import upload directory resolves through a symlink; using the resolved path as the sandbox allowlist entry")
++		uploadDir = resolved
++	}
++	// Chmod after Lstat+EvalSymlinks — at this instant the path is a real
++	// directory whose every ancestor resolves to itself. A same-host
++	// attacker who can write to the parent directory still has a TOCTOU
++	// window between EvalSymlinks and Chmod; that's a known constraint of
++	// POSIX file APIs without O_PATH+fchmod, and an attacker with that
++	// level of access has already won. MkdirAll silently accepts an
++	// existing directory with looser permissions, so chmod explicitly to
++	// enforce 0o700 across restarts. On Windows this is a no-op for the
++	// perm bits but harmless.
++	if err := os.Chmod(uploadDir, 0o700); err != nil {
++		log.Fatal().Err(err).Str("path", uploadDir).Msg("Failed to chmod import upload directory to 0700")
++	}
++	dbConfig.UploadDir = filepath.ToSlash(uploadDir)
+ 
+ 	// Sweep orphaned DuckDB spill files from a previous run (kill -9,
+ 	// OOM-kill, crash). DuckDB unlinks these on graceful close, but
+@@ -716,11 +987,19 @@ func main() {
+ 		// Create compaction manager (discovers all databases dynamically)
+ 		// Compaction jobs run in subprocesses for memory isolation
+ 		compactionManager = compaction.NewManager(&compaction.ManagerConfig{
+-			StorageBackend:  storageBackend,
+-			LockManager:     lockManager,
+-			MaxConcurrent:   cfg.Compaction.MaxConcurrent,
+-			MemoryLimit:     cfg.Database.MemoryLimit, // Use same limit as main DuckDB
+-			CompletionDir:   completionDir,            // Phase 4: empty in OSS, set in cluster mode
++			StorageBackend: storageBackend,
++			LockManager:    lockManager,
++			MaxConcurrent:  cfg.Compaction.MaxConcurrent,
++			MemoryLimit:    cfg.Database.MemoryLimit, // Use same limit as main DuckDB
++			CompletionDir:  completionDir,            // Phase 4: empty in OSS, set in cluster mode
++			// Pass the SAME absolute-resolved value the DB-layer sandbox
++			// allowlist references — dbConfig.CompactionTempDirectory has
++			// already been through resolveAbsPath. Using the raw
++			// cfg.Compaction.TempDirectory here would leave the manager
++			// holding a relative path while the sandbox sees the absolute
++			// resolution; the parent-side orphan-cleanup walker would then
++			// look at a different filesystem location than the allowlist.
++			TempDirectory:   dbConfig.CompactionTempDirectory,
+ 			SortKeysConfig:  sortKeysConfig,
+ 			DefaultSortKeys: defaultSortKeys,
+ 			Tiers:           tiers,
+@@ -1206,8 +1485,10 @@ func main() {
+ 	}
+ 	tleHandler.RegisterRoutes(server.GetApp())
+ 
+-	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import)
+-	importHandler := api.NewImportHandler(db, storageBackend, logger.Get("import"))
++	// Register Import handler (CSV, Parquet, Line Protocol, TLE bulk import).
++	// uploadDir is the same path that database.New added to the DuckDB
++	// sandbox's allowed_directories — staying in sync keeps imports working.
++	importHandler := api.NewImportHandler(db, storageBackend, dbConfig.UploadDir, logger.Get("import"))
+ 	importHandler.SetArrowBuffer(arrowBuffer)
+ 	if authManager != nil && rbacManager != nil {
+ 		importHandler.SetAuthAndRBAC(authManager, rbacManager)
+@@ -1223,7 +1504,7 @@ func main() {
+ 
+ 	// Query-builder preview endpoint: samples the SQL the user is editing on
+ 	// a short-lived in-memory database so the shared pool is not pinned.
+-	previewHandler := api.NewQueryPreviewHandler(logger.Get("query-preview"))
++	previewHandler := api.NewQueryPreviewHandler(db, logger.Get("query-preview"))
+ 	previewHandler.RegisterRoutes(server.GetApp())
+ 
+ 	// Export artifact download endpoint. Export files live under the local
+@@ -1409,7 +1690,13 @@ func main() {
+ 	}
+ 
+ 	// Register Delete handler
+-	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, logger.Get("delete"))
++	// DELETE on S3-backed deployments stages the rewritten parquet locally
++	// before uploading; the temp file MUST land inside the DuckDB sandbox's
++	// allowed_directories. Reuse the same dir as the import handler — it's
++	// already allowlisted and lifecycle-managed (the file is unlinked after
++	// upload). Cross-handler reuse is fine because the filenames are unique
++	// via os.CreateTemp.
++	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
+ 	deleteHandler.RegisterRoutes(server.GetApp())
+ 	if clusterCoordinator != nil {
+ 		deleteHandler.SetCoordinator(clusterCoordinator)
+diff --git a/internal/api/delete.go b/internal/api/delete.go
+index f6f7f3d..9ded402 100644
+--- a/internal/api/delete.go
++++ b/internal/api/delete.go
+@@ -93,7 +93,15 @@ type DeleteHandler struct {
+ 	config      *config.DeleteConfig
+ 	authManager *auth.AuthManager
+ 	coordinator DeleteCoordinator // nil in standalone mode
+-	logger      zerolog.Logger
++	// tempDir is the absolute, sandbox-allowlisted directory used by
++	// rewriteS3File to stage the COPY-rewritten parquet locally before
++	// uploading. MUST match one of the prefixes added to DuckDB's
++	// allowed_directories in cmd/arc/main.go, otherwise the COPY ... TO
++	// fails with a permission error and DELETE on S3 backends silently
++	// breaks. main.go passes the same path as the import handler's upload
++	// dir; the two flows have identical sandbox requirements.
++	tempDir string
++	logger  zerolog.Logger
+ }
+ 
+ // DeleteRequest represents a delete operation request
+@@ -151,14 +159,23 @@ var dangerousPrefixPatterns = []string{
+ 	"sp_",
+ }
+ 
+-// NewDeleteHandler creates a new delete handler
+-func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, authManager *auth.AuthManager, logger zerolog.Logger) *DeleteHandler {
++// NewDeleteHandler creates a new delete handler. tempDir MUST be the same
++// path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
++// otherwise the COPY ... TO inside rewriteS3File fails on S3-backed
++// deployments. Logs a Warn on empty tempDir so misconfigured deployments
++// surface the issue at startup rather than at the first DELETE.
++func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.DeleteConfig, authManager *auth.AuthManager, tempDir string, logger zerolog.Logger) *DeleteHandler {
++	componentLogger := logger.With().Str("component", "delete-handler").Logger()
++	if tempDir == "" {
++		componentLogger.Warn().Msg("NewDeleteHandler called with empty tempDir — DELETE on S3 backends will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
++	}
+ 	return &DeleteHandler{
+ 		db:          db,
+ 		storage:     storage,
+ 		config:      cfg,
+ 		authManager: authManager,
+-		logger:      logger.With().Str("component", "delete-handler").Logger(),
++		tempDir:     tempDir,
++		logger:      componentLogger,
+ 	}
+ }
+ 
+@@ -464,7 +481,6 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
+ 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
+ 	}
+ 
+-
+ 	// Check for dangerous prefixes
+ 	for _, pattern := range dangerousPrefixPatterns {
+ 		if strings.Contains(whereUpper, pattern) {
+@@ -782,15 +798,32 @@ type s3RewriteResult struct {
+ // rewriteS3File handles file rewrite for S3 storage
+ // DuckDB can read from S3 directly, then we write to a temp file and upload
+ func (h *DeleteHandler) rewriteS3File(ctx context.Context, s3Path, relativePath, whereClause string, rowsBefore, rowsAfter int64) (int64, *s3RewriteResult, error) {
++	// Fail-closed when the handler was constructed without a sandbox-
++	// allowlisted tempDir. Without this guard, os.CreateTemp("", ...) would
++	// fall back to os.TempDir() — outside the sandbox — and the subsequent
++	// COPY ... TO would fail with a confusing DuckDB permission error. The
++	// constructor Warn surfaces the misconfiguration at startup; this
++	// fail-fast at request time provides a clearer signal in the response
++	// body for the (rare) case where a constructor warning was missed.
++	if h.tempDir == "" {
++		return 0, nil, fmt.Errorf("delete handler is misconfigured: tempDir is empty; the DELETE-on-S3 staging directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)")
++	}
+ 	db := h.db.DB()
+ 	deleted := rowsBefore - rowsAfter
+ 
+-	// Create temp file locally for the rewritten data
+-	tempFile, err := os.CreateTemp("", "arc-delete-*.parquet")
++	// Create temp file locally for the rewritten data. The destination
++	// directory MUST be inside DuckDB's allowed_directories — main.go
++	// passes the same sandbox-allowlisted path as the import-upload dir.
++	tempFile, err := os.CreateTemp(h.tempDir, "arc-delete-*.parquet")
+ 	if err != nil {
+ 		return 0, nil, fmt.Errorf("failed to create temp file: %w", err)
+ 	}
+-	tempPath := tempFile.Name()
++	// ToSlash so Windows backslashes from os.CreateTemp match the
++	// forward-slash sandbox allowlist entry (h.tempDir is already
++	// normalized by main.go). The COPY ... TO statement below
++	// interpolates tempPath verbatim into SQL, so a backslash form
++	// would mismatch allowed_directories and the rewrite would fail.
++	tempPath := filepath.ToSlash(tempFile.Name())
+ 	tempFile.Close()
+ 	defer os.Remove(tempPath)
+ 
+diff --git a/internal/api/export_download.go b/internal/api/export_download.go
+index 8941fad..828dabc 100644
+--- a/internal/api/export_download.go
++++ b/internal/api/export_download.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/rs/zerolog"
+@@ -19,8 +20,14 @@ type ExportHandler struct {
+ 
+ // NewExportHandler creates an export-download handler rooted at dir.
+ func NewExportHandler(root string, logger zerolog.Logger) *ExportHandler {
++	if abs, err := filepath.Abs(root); err == nil {
++		root = abs
++	}
++	if resolved, err := filepath.EvalSymlinks(root); err == nil {
++		root = resolved
++	}
+ 	return &ExportHandler{
+-		root:   root,
++		root:   filepath.Clean(root),
+ 		logger: logger.With().Str("component", "export-handler").Logger(),
+ 	}
+ }
+@@ -30,6 +37,25 @@ func (h *ExportHandler) RegisterRoutes(app *fiber.App) {
+ 	app.Get("/api/v1/export/download", h.handleDownload)
+ }
+ 
++// withinRoot reports whether p resolves to a path inside root. It checks the
++// lexical path and, when the file exists, the symlink-resolved path.
++func (h *ExportHandler) withinRoot(p string) bool {
++	inside := func(candidate string) bool {
++		rel, err := filepath.Rel(h.root, candidate)
++		if err != nil {
++			return false
++		}
++		return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
++	}
++	if !inside(p) {
++		return false
++	}
++	if resolved, err := filepath.EvalSymlinks(p); err == nil && !inside(resolved) {
++		return false
++	}
++	return true
++}
++
+ // handleDownload streams the named artifact from the export directory.
+ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	name := c.Query("path")
+@@ -41,6 +67,13 @@ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	}
+ 
+ 	fullPath := filepath.Join(h.root, name)
++	if !h.withinRoot(fullPath) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "invalid export path",
++		})
++	}
++
+ 	data, err := os.ReadFile(fullPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+diff --git a/internal/api/import.go b/internal/api/import.go
+index 81c8d6e..a07a377 100644
+--- a/internal/api/import.go
++++ b/internal/api/import.go
+@@ -65,18 +65,37 @@ type ImportHandler struct {
+ 	authManager *auth.AuthManager
+ 	rbacManager RBACChecker
+ 
++	// uploadDir is the directory under which multipart uploads land. Must
++	// be one of the prefixes in the DuckDB sandbox's allowed_directories
++	// list, otherwise read_csv/read_parquet on the uploaded file fails.
++	// Empty means use the OS default (only safe before the sandbox lockdown
++	// was introduced — kept for legacy/test paths that don't go through
++	// main.go).
++	uploadDir string
++
+ 	// Stats
+ 	totalRequests atomic.Int64
+ 	totalRecords  atomic.Int64
+ 	totalErrors   atomic.Int64
+ }
+ 
+-// NewImportHandler creates a new ImportHandler
+-func NewImportHandler(db *database.DuckDB, storage storage.Backend, logger zerolog.Logger) *ImportHandler {
++// NewImportHandler creates a new ImportHandler. uploadDir must be the same
++// path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
++// otherwise read_csv/read_parquet on the uploaded file fails post-lockdown.
++// Logs a Warn on empty uploadDir; the request handler also fails-closed at
++// every POST so misconfiguration surfaces both at startup and at the first
++// import attempt. Tests that exercise the handler should pass a non-empty
++// path (typically a t.TempDir() inside LocalStorageRoot).
++func NewImportHandler(db *database.DuckDB, storage storage.Backend, uploadDir string, logger zerolog.Logger) *ImportHandler {
++	componentLogger := logger.With().Str("component", "import-handler").Logger()
++	if uploadDir == "" {
++		componentLogger.Warn().Msg("NewImportHandler called with empty uploadDir — imports will fail under the DuckDB sandbox; cmd/arc/main.go should pass the sandbox-allowlisted upload directory")
++	}
+ 	return &ImportHandler{
+-		db:      db,
+-		storage: storage,
+-		logger:  logger.With().Str("component", "import-handler").Logger(),
++		db:        db,
++		storage:   storage,
++		uploadDir: uploadDir,
++		logger:    componentLogger,
+ 	}
+ }
+ 
+@@ -189,14 +208,32 @@ func (h *ImportHandler) handleFileImport(c *fiber.Ctx, format string, buildOpts
+ 		})
+ 	}
+ 
+-	// Save to temp file
+-	tempDir, err := os.MkdirTemp("", "arc-import-*")
++	// Fail-closed when the handler was constructed without a sandbox-
++	// allowlisted uploadDir. Without this guard, os.MkdirTemp("", ...) would
++	// fall back to os.TempDir() — outside the DuckDB sandbox — and the
++	// post-upload read_csv/read_parquet would fail with a confusing
++	// permission error. The constructor Warn surfaces the misconfiguration
++	// at startup; this fail-fast at request time provides a clearer signal.
++	if h.uploadDir == "" {
++		h.totalErrors.Add(1)
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"error": "import handler is misconfigured: uploadDir is empty; the upload directory must be allowlisted in the DuckDB sandbox (see cmd/arc/main.go uploadDir wiring)",
++		})
++	}
++	// Save to temp file inside the sandbox-allowlisted upload directory.
++	tempDir, err := os.MkdirTemp(h.uploadDir, "arc-import-*")
+ 	if err != nil {
+ 		h.totalErrors.Add(1)
+ 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+ 			"error": "failed to create temp directory: " + err.Error(),
+ 		})
+ 	}
++	// ToSlash so Windows backslashes from os.MkdirTemp match the
++	// forward-slash sandbox allowlist entry (h.uploadDir is already
++	// normalized by main.go). Without this, reads of the uploaded file
++	// via read_csv/read_parquet would fail with a permission error on
++	// Windows even though the upload landed inside the allowlisted prefix.
++	tempDir = filepath.ToSlash(tempDir)
+ 	defer os.RemoveAll(tempDir)
+ 
+ 	tempFile := filepath.Join(tempDir, "import."+format)
+diff --git a/internal/api/query_preview.go b/internal/api/query_preview.go
+index 6ab1439..beafd93 100644
+--- a/internal/api/query_preview.go
++++ b/internal/api/query_preview.go
+@@ -7,24 +7,18 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/basekick-labs/arc/internal/database"
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/rs/zerolog"
+ )
+ 
+-// maxPreviewRows bounds the sample the preview endpoint returns. The query
+-// builder renders a handful of rows while the user is still editing; the
+-// bound keeps a preview from streaming a large result set.
+ const maxPreviewRows = 25
+ 
+-// previewTimeout bounds a single preview request. Previews are interactive,
+-// so a query that cannot produce a sample within this window is reported as
+-// too slow rather than left running.
+ const previewTimeout = 15 * time.Second
+ 
+-// QueryPreviewHandler serves POST /api/v1/query/preview, the endpoint behind
+-// the query builder's "preview" button: the UI posts the SQL as typed and
+-// renders the first rows before the user runs the full query.
++// QueryPreviewHandler serves POST /api/v1/query/preview.
+ type QueryPreviewHandler struct {
++	db     *database.DuckDB
+ 	logger zerolog.Logger
+ }
+ 
+@@ -34,8 +28,9 @@ type PreviewRequest struct {
+ }
+ 
+ // NewQueryPreviewHandler creates a preview handler.
+-func NewQueryPreviewHandler(logger zerolog.Logger) *QueryPreviewHandler {
++func NewQueryPreviewHandler(db *database.DuckDB, logger zerolog.Logger) *QueryPreviewHandler {
+ 	return &QueryPreviewHandler{
++		db:     db,
+ 		logger: logger.With().Str("component", "query-preview-handler").Logger(),
+ 	}
+ }
+@@ -45,9 +40,6 @@ func (h *QueryPreviewHandler) RegisterRoutes(app *fiber.App) {
+ 	app.Post("/api/v1/query/preview", h.handlePreview)
+ }
+ 
+-// handlePreview parses the query, runs it with a row cap, and returns the
+-// sample as JSON. The query runs on a short-lived in-memory database so an
+-// abandoned preview cannot pin a connection in the shared pool.
+ func (h *QueryPreviewHandler) handlePreview(c *fiber.Ctx) error {
+ 	var req PreviewRequest
+ 	if err := c.BodyParser(&req); err != nil {
+@@ -56,14 +48,12 @@ func (h *QueryPreviewHandler) handlePreview(c *fiber.Ctx) error {
+ 			"error":   "Invalid request body: " + err.Error(),
+ 		})
+ 	}
+-
+ 	if strings.TrimSpace(req.SQL) == "" {
+ 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+ 			"success": false,
+ 			"error":   "SQL query is required",
+ 		})
+ 	}
+-
+ 	if err := ValidateSQLRequest(req.SQL); err != nil {
+ 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+ 			"success": false,
+@@ -76,7 +66,6 @@ func (h *QueryPreviewHandler) handlePreview(c *fiber.Ctx) error {
+ 
+ 	db, err := sql.Open("duckdb", "")
+ 	if err != nil {
+-		h.logger.Error().Err(err).Msg("Failed to open preview database")
+ 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+ 			"success": false,
+ 			"error":   "Failed to initialize preview session",
+diff --git a/internal/database/duckdb.go b/internal/database/duckdb.go
+index 40318b9..ee08425 100644
+--- a/internal/database/duckdb.go
++++ b/internal/database/duckdb.go
+@@ -3,18 +3,16 @@ package database
+ import (
+ 	"context"
+ 	"database/sql"
+-	"database/sql/driver"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+ 	"strings"
+-	"sync"
+ 	"time"
+ 
+ 	"github.com/basekick-labs/arc/internal/memtrim"
+-	duckdb "github.com/duckdb/duckdb-go/v2"
++	_ "github.com/duckdb/duckdb-go/v2" // duckdb driver registration
+ 	"github.com/rs/zerolog"
+ )
+ 
+@@ -47,6 +45,15 @@ func escapeSQLString(s string) string {
+ 	return strings.ReplaceAll(s, "'", "''")
+ }
+ 
++// quoteDuckDBIdent quotes a DuckDB identifier (table, column, setting name)
++// for safe interpolation into SQL. DuckDB identifier quoting uses double
++// quotes; embedded double quotes are doubled (`"foo""bar"`), matching the
++// SQL standard. This is distinct from Go's %q verb, which uses Go-style
++// backslash escapes that DuckDB's parser rejects.
++func quoteDuckDBIdent(name string) string {
++	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
++}
++
+ // stripURLScheme normalises an S3 endpoint into the bare "host:port" form
+ // that DuckDB's httpfs extension expects. The AWS SDK accepts either
+ // "host:port" or "scheme://host:port[/]"; DuckDB does not. Passing scheme'd
+@@ -54,10 +61,10 @@ func escapeSQLString(s string) string {
+ // URLs that fail to resolve.
+ //
+ // Strips, in order:
+-//  - leading and trailing whitespace (paste artefacts),
+-//  - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
+-//    are case-insensitive and users routinely paste mixed-case),
+-//  - trailing slashes ("host:port/" → "host:port").
++//   - leading and trailing whitespace (paste artefacts),
++//   - leading "http://" or "https://" (case-insensitive — RFC 3986 schemes
++//     are case-insensitive and users routinely paste mixed-case),
++//   - trailing slashes ("host:port/" → "host:port").
+ //
+ // The case of the remainder is preserved (bucket names and path components
+ // can be case-sensitive depending on the S3 implementation).
+@@ -90,11 +97,47 @@ type Config struct {
+ 	S3SecretKey string
+ 	S3Endpoint  string // Custom endpoint for MinIO or S3-compatible services
+ 	S3UseSSL    bool
+-	S3PathStyle bool // Use path-style addressing (required for MinIO)
++	S3PathStyle bool   // Use path-style addressing (required for MinIO)
++	S3Bucket    string // Bucket name; used to build the allowed_directories prefix for the sandbox
++	S3Prefix    string // Key prefix under the bucket; used with S3Bucket to scope sandbox access
+ 	// Azure Blob Storage configuration for azure extension
+ 	AzureAccountName string
+ 	AzureAccountKey  string
+ 	AzureEndpoint    string // Custom endpoint (optional)
++	AzureContainer   string // Container name; used to build the allowed_directories prefix for the sandbox
++	// Cold-tier sandbox allowlist entries. Independent from S3Bucket /
++	// AzureContainer (which describe Arc's primary/hot storage) because
++	// Enterprise tiered storage routinely combines hot=local with cold=S3 —
++	// hot S3 fields would then be empty and a hot-only allowlist would
++	// block every cold-tier query. Populated from cfg.TieredStorage.Cold
++	// by cmd/arc/main.go when tiering is enabled.
++	ColdS3Bucket       string
++	ColdS3Prefix       string
++	ColdAzureContainer string
++	// LocalStorageRoot is the absolute path of the local-storage backend root,
++	// used to whitelist Arc-managed files in the DuckDB sandbox. Equals
++	// ArcxStorageRoot when arcx is enabled; populated independently so the
++	// sandbox keeps a working entry even on deployments without arcx.
++	LocalStorageRoot string
++	// UploadDir is the dedicated directory the API layer uses for multipart
++	// uploads (CSV/Parquet imports) and the DELETE handler's S3-rewrite
++	// staging. Added to allowed_directories so DuckDB can read/write via
++	// read_csv/read_parquet/COPY. Distinct from TempDirectory (DuckDB spill)
++	// for clean separation; main.go usually places it under TempDirectory
++	// so operators get a single config knob.
++	UploadDir string
++	// CompactionTempDirectory is the operator-configured base path
++	// compaction jobs use to stage rewritten parquet files
++	// (cfg.Compaction.TempDirectory, default ./data/compaction).
++	//
++	// Compaction currently runs in a subprocess (internal/compaction/
++	// subprocess.go) that opens its OWN DuckDB outside this package's
++	// configureDatabase, so the subprocess is NOT subject to this sandbox
++	// and does not need the entry to function today. Allowlisting it
++	// anyway is defensive: any future refactor moving compaction back
++	// in-process would otherwise fail post-lockdown with a confusing
++	// permission error on COPY ... TO. Empty disables the entry.
++	CompactionTempDirectory string
+ 	// Query optimization configuration
+ 	EnableS3Cache     bool  // Enable S3 file caching via cache_httpfs extension
+ 	S3CacheSize       int64 // Cache size in bytes
+@@ -114,12 +157,10 @@ type Config struct {
+ func New(cfg *Config, logger zerolog.Logger) (*DuckDB, error) {
+ 	dsn := buildDSN(cfg)
+ 
+-	// Open the *sql.DB. When arcx is configured we route through
+-	// duckdb.NewConnector + connInitFn so the LOAD runs on every pooled
+-	// connection (DuckDB's LOAD is per-connection — there is no SET GLOBAL
+-	// equivalent, so a bare `db.Exec("LOAD …")` would only register the
+-	// extension on whichever pool member database/sql happened to hand us).
+-	db, err := openDuckDB(dsn, cfg, logger)
++	// Open the *sql.DB. Extension registration in DuckDB is per-database
++	// (ExtensionManager lives on DatabaseInstance), so a single LOAD inside
++	// configureDatabase suffices for the whole pool — no connInitFn needed.
++	db, err := sql.Open("duckdb", dsn)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
+ 	}
+@@ -177,70 +218,72 @@ func buildDSN(cfg *Config) string {
+ 	return ""
+ }
+ 
+-// openDuckDB returns a *sql.DB. When arcx is configured we go through
+-// duckdb.NewConnector with an init callback that runs `LOAD '…'` on every
+-// new pooled connection — DuckDB's LOAD is per-connection, so this is the
+-// only correct way to make arcx available across the whole pool. When
+-// arcx is disabled we use the simpler driver-registered sql.Open path.
+-func openDuckDB(dsn string, cfg *Config, logger zerolog.Logger) (*sql.DB, error) {
++// arcxLoadTimeout bounds the LOAD '<path>' call so a corrupt or
++// network-mounted extension file cannot hang DuckDB initialization
++// indefinitely. 30s is generous for dlopen + DuckDB's Load() hook; real
++// loads are tens of milliseconds.
++const arcxLoadTimeout = 30 * time.Second
++
++// arcxVerifyTimeout bounds the post-LOAD `SELECT arcx_version()` proof-
++// of-life. Pure metadata read; ten seconds is generous to cover transient
++// pool contention during startup while still bounding a hung DuckDB.
++const arcxVerifyTimeout = 10 * time.Second
++
++// arcxStorageRootSetting is the dotted extension-registered global setting
++// arcx exposes for the partition_agg table function's filesystem root.
++// SET GLOBAL "arcx.storage_root" = '<path>' propagates database-wide.
++const arcxStorageRootSetting = "arcx.storage_root"
++
++// loadArcxExtension performs a one-shot LOAD of the proprietary arcx
++// extension and configures its global storage root. Extension registration
++// is database-wide in DuckDB (ExtensionManager lives on DatabaseInstance),
++// so a single LOAD registers arcx for every pool connection; SET GLOBAL on
++// arcx-registered settings propagates the same way. Called once during
++// configureDatabase. Idempotent — re-LOAD of an already-registered
++// extension is a no-op success even after the sandbox lockdown.
++func loadArcxExtension(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+ 	if cfg.ArcxExtensionPath == "" {
+-		return sql.Open("duckdb", dsn)
++		return nil
+ 	}
++	componentLogger := logger.With().Str("component", "duckdb").Logger()
+ 
+-	// Capture the path into a local so the closure does not retain the
+-	// whole *Config (the logger field below would otherwise pull cfg in
+-	// for its entire lifetime — gemini round 1).
+-	//
+-	// filepath.ToSlash normalises Windows-style backslashes to forward
+-	// slashes. DuckDB's LOAD parses the path as a single-quoted SQL
+-	// string literal, where backslashes are not interpreted as escapes
+-	// but Windows paths like `C:\Program Files\arcx\arcx.duckdb_extension`
+-	// have been observed to confuse the loader on some Windows builds.
+-	// Forward slashes are accepted on every platform DuckDB supports.
++	// filepath.ToSlash normalises Windows-style backslashes. DuckDB's LOAD
++	// parses the path as a single-quoted SQL string literal where backslashes
++	// are not interpreted as escapes, but Windows paths like
++	// `C:\Program Files\arcx\arcx.duckdb_extension` have been observed to
++	// confuse the loader on some Windows builds. Forward slashes work
++	// everywhere DuckDB runs.
+ 	path := filepath.ToSlash(cfg.ArcxExtensionPath)
+-	loadSQL := fmt.Sprintf("LOAD '%s'", escapeSQLString(path))
+-	// Set arcx.storage_root in the same connInitFn so the operator can
+-	// resolve filesystem paths without taking them as arguments. The setting
+-	// is registered by the extension at LOAD time; SET runs in the same
+-	// statement after LOAD via a semicolon separator.
+-	connInitSQL := loadSQL
+-	if cfg.ArcxStorageRoot != "" {
+-		storageRoot := filepath.ToSlash(cfg.ArcxStorageRoot)
+-		connInitSQL = fmt.Sprintf("%s; SET arcx.storage_root = '%s'", loadSQL, escapeSQLString(storageRoot))
++
++	ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
++	defer cancel()
++
++	// Pinned connection: DuckDB's LOAD registers the extension on the
++	// database-wide ExtensionManager, but we pin a connection anyway so
++	// the LOAD and the immediately-following SET GLOBAL land on the same
++	// underlying handle. Defensive against future driver changes.
++	conn, err := db.Conn(ctx)
++	if err != nil {
++		return fmt.Errorf("acquire pinned connection for arcx LOAD: %w", err)
+ 	}
+-	componentLogger := logger.With().Str("component", "duckdb").Logger()
++	defer conn.Close()
+ 
+-	// arcxLoadTimeout bounds the connection-init LOAD so a corrupt or
+-	// network-mounted extension file cannot hang pool acquisition
+-	// indefinitely. 30s is generous for dlopen + DuckDB's Load() hook;
+-	// real loads are tens of milliseconds.
+-	const arcxLoadTimeout = 30 * time.Second
+-
+-	// loadErrLogOnce gates the Error log to once per process. The error
+-	// itself still propagates to database/sql on every connInitFn call —
+-	// only the log line is throttled. Without this, a misconfigured path
+-	// (missing file, ABI mismatch) under load would emit one Error per
+-	// connection-acquire attempt — easily hundreds per second.
+-	var loadErrLogOnce sync.Once
+-
+-	connector, err := duckdb.NewConnector(dsn, func(execer driver.ExecerContext) error {
+-		ctx, cancel := context.WithTimeout(context.Background(), arcxLoadTimeout)
+-		defer cancel()
+-		_, execErr := execer.ExecContext(ctx, connInitSQL, nil)
+-		if execErr != nil {
+-			loadErrLogOnce.Do(func() {
+-				componentLogger.Error().Err(execErr).
+-					Str("path", path).
+-					Msg("arcx LOAD failed on new DuckDB connection (subsequent failures suppressed for log hygiene)")
+-			})
+-			return fmt.Errorf("arcx LOAD on new connection: %w", execErr)
++	if _, err := conn.ExecContext(ctx, fmt.Sprintf("LOAD '%s'", escapeSQLString(path))); err != nil {
++		return fmt.Errorf("arcx LOAD: %w", err)
++	}
++	if cfg.ArcxStorageRoot != "" {
++		storageRoot := filepath.ToSlash(cfg.ArcxStorageRoot)
++		// SET GLOBAL because arcx.storage_root is an extension-registered
++		// global setting; verified empirically in Phase 0 that the value
++		// propagates to fresh pool connections. Double-quoted because the
++		// setting name contains a dot — bare identifiers with dots are
++		// parsed as table-qualified column refs by DuckDB.
++		if _, err := conn.ExecContext(ctx, "SET GLOBAL "+quoteDuckDBIdent(arcxStorageRootSetting)+" = '"+escapeSQLString(storageRoot)+"'"); err != nil {
++			return fmt.Errorf("SET arcx.storage_root: %w", err)
+ 		}
+-		return nil
+-	})
+-	if err != nil {
+-		return nil, fmt.Errorf("create duckdb connector for arcx: %w", err)
+ 	}
+-	return sql.OpenDB(connector), nil
++	componentLogger.Info().Str("path", path).Msg("arcx extension loaded (database-wide)")
++	return nil
+ }
+ 
+ // configureDatabase sets DuckDB configuration after connection
+@@ -301,40 +344,43 @@ func configureDatabase(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+ 		}
+ 	}
+ 
+-	// Verify the proprietary arcx extension is loaded into the pool. The
+-	// LOAD itself happens inside the connInitFn registered with
+-	// duckdb.NewConnector (see openDuckDB) — that callback fires on every
+-	// new pool connection so the extension is available across the whole
+-	// pool, not just the connection that happened to receive the first
+-	// db.Exec("LOAD …") call. Here we pin one connection and ask it for
+-	// arcx_version() to confirm the load actually took effect. License
+-	// gating happens upstream (cmd/arc/main.go clears ArcxExtensionPath
+-	// when the license does not permit it), so an empty path means arcx
+-	// is intentionally disabled.
++	// Load the proprietary arcx extension once for the whole pool. Extension
++	// registration is database-wide, so a single LOAD covers every connection.
++	// License gating happens upstream (cmd/arc/main.go clears
++	// ArcxExtensionPath when the license does not permit it), so an empty
++	// path means arcx is intentionally disabled.
+ 	if cfg.ArcxExtensionPath != "" {
++		if err := loadArcxExtension(db, cfg, logger); err != nil {
++			return fmt.Errorf("failed to load arcx extension: %w", err)
++		}
+ 		if err := verifyArcxLoaded(db, cfg, logger); err != nil {
+ 			return fmt.Errorf("failed to verify arcx extension: %w", err)
+ 		}
+ 	}
+ 
++	// Final step: lock down DuckDB's file-access surface so user-supplied SQL
++	// cannot reach arbitrary local files or remote URLs. Must run AFTER every
++	// INSTALL/LOAD above (enable_external_access=false blocks future LOADs).
++	if err := lockdownExternalAccess(db, cfg, logger); err != nil {
++		return fmt.Errorf("failed to lock down DuckDB external access: %w", err)
++	}
++
+ 	return nil
+ }
+ 
+ // verifyArcxLoaded confirms the proprietary arcx DuckDB extension is
+-// available on a pool connection. The LOAD itself runs in the connInitFn
+-// registered with duckdb.NewConnector for every new connection; this
+-// function only proves that one of those connections actually responded
+-// to arcx_version(). An empty version string signals an ABI mismatch or
+-// a buggy build of arcx — fail-fast rather than limping along.
++// callable on a pool connection. An empty version string signals an ABI
++// mismatch or a buggy build of arcx — fail-fast rather than limping along.
+ //
+-// Pinned via db.Conn(ctx) so the verify query lands on a connection
+-// that has gone through the init callback (any connection from the
+-// pool would, but pinning is defensive against future driver changes).
++// Pinned via db.Conn(ctx) so the verify query lands on a specific connection
++// (defensive against future driver changes — extension state is currently
++// database-wide on DuckDB but pinning costs nothing and survives reorgs).
+ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+ 	if cfg.ArcxExtensionPath == "" {
+ 		return nil // belt-and-suspenders; caller already guards this
+ 	}
+-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	componentLogger := logger.With().Str("component", "duckdb").Logger()
++	ctx, cancel := context.WithTimeout(context.Background(), arcxVerifyTimeout)
+ 	defer cancel()
+ 
+ 	conn, err := db.Conn(ctx)
+@@ -350,11 +396,10 @@ func verifyArcxLoaded(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
+ 	if strings.TrimSpace(ver) == "" {
+ 		return fmt.Errorf("arcx_version() returned empty string (extension binary corrupt or ABI mismatch?)")
+ 	}
+-	logger.Info().
+-		Str("component", "duckdb").
++	componentLogger.Info().
+ 		Str("path", cfg.ArcxExtensionPath).
+ 		Str("arcx_version", ver).
+-		Msg("arcx extension loaded")
++		Msg("arcx extension verified")
+ 	return nil
+ }
+ 
+@@ -753,10 +798,25 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
+ 		return nil, nil, nil, fmt.Errorf("failed to acquire connection: %w", err)
+ 	}
+ 
+-	// Create a temporary file for profiling output
+-	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
+-	if err != nil {
+-		// Fall back to regular query if we can't create temp file
++	// Create a temporary file for profiling output. MUST land inside the
++	// DuckDB sandbox's allowed_directories — d.config.TempDirectory is
++	// always allowlisted (see buildAllowedDirectories), os.TempDir() is
++	// not. An empty TempDirectory would make CreateTemp fall back to
++	// os.TempDir() which the sandbox rejects, so explicitly fall through
++	// to the non-profile path without even attempting the file create.
++	var tmpFile *os.File
++	if d.config.TempDirectory == "" {
++		d.logger.Debug().Msg("Profile mode requested but TempDirectory is unset; returning result without profile data")
++	} else {
++		var err error
++		tmpFile, err = os.CreateTemp(d.config.TempDirectory, "duckdb_profile_*.json")
++		if err != nil {
++			d.logger.Warn().Err(err).Str("temp_dir", d.config.TempDirectory).Msg("Failed to create profile temp file; falling back to non-profile query path")
++			tmpFile = nil
++		}
++	}
++	if tmpFile == nil {
++		// No usable temp dir — return a regular query result without profile data.
+ 		rows, err := conn.QueryContext(ctx, query)
+ 		if err != nil {
+ 			conn.Close()
+@@ -773,7 +833,13 @@ func (d *DuckDB) QueryWithProfileContext(ctx context.Context, query string) (*sq
+ 	if _, err := conn.ExecContext(ctx, "PRAGMA enable_profiling='json'"); err != nil {
+ 		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
+ 	}
+-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
++	// profilePath includes the operator-controlled d.config.TempDirectory
++	// prefix; escape it the same way SET GLOBAL temp_directory does above
++	// to neutralise any embedded single quote (operator config like
++	// "/data/arc/it's-folder" would otherwise break out of the SQL literal).
++	// ToSlash so Windows backslashes from os.CreateTemp match the sandbox
++	// allowlist (allowed_directories stores forward-slash entries).
++	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(filepath.ToSlash(profilePath)))); err != nil {
+ 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
+ 	}
+ 	// Enable planner timing metrics
+diff --git a/internal/database/duckdb_arrow.go b/internal/database/duckdb_arrow.go
+index 6a1094c..0c89e9d 100644
+--- a/internal/database/duckdb_arrow.go
++++ b/internal/database/duckdb_arrow.go
+@@ -9,6 +9,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"time"
+ 
+ 	"github.com/apache/arrow-go/v18/arrow/array"
+@@ -76,9 +77,23 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
+ 		return nil, nil, nil, fmt.Errorf("failed to acquire connection: %w", err)
+ 	}
+ 
+-	// Create temp file for profiling output
+-	tmpFile, err := os.CreateTemp("", "duckdb_profile_*.json")
+-	if err != nil {
++	// Create temp file for profiling output. MUST land inside the DuckDB
++	// sandbox's allowed_directories — d.config.TempDirectory is always
++	// allowlisted, os.TempDir() is not. Empty TempDirectory short-circuits
++	// to the non-profile path without attempting the file create (CreateTemp
++	// with empty dir falls back to os.TempDir which the sandbox rejects).
++	var tmpFile *os.File
++	if d.config.TempDirectory == "" {
++		d.logger.Debug().Msg("Profile mode requested but TempDirectory is unset; returning Arrow result without profile data")
++	} else {
++		var err error
++		tmpFile, err = os.CreateTemp(d.config.TempDirectory, "duckdb_profile_*.json")
++		if err != nil {
++			d.logger.Warn().Err(err).Str("temp_dir", d.config.TempDirectory).Msg("Failed to create profile temp file; falling back to non-profile Arrow path")
++			tmpFile = nil
++		}
++	}
++	if tmpFile == nil {
+ 		// Fall back to non-profile Arrow query
+ 		var reader array.RecordReader
+ 		rawErr := conn.Raw(func(driverConn any) error {
+@@ -100,7 +115,11 @@ func (d *DuckDB) ArrowQueryWithProfileContext(ctx context.Context, query string)
+ 	if _, err := conn.ExecContext(ctx, "PRAGMA enable_profiling='json'"); err != nil {
+ 		d.logger.Warn().Err(err).Msg("Failed to enable profiling")
+ 	}
+-	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", profilePath)); err != nil {
++	// Escape profilePath against the same SQL-injection surface duckdb.go
++	// guards (operator's TempDirectory could contain a single quote).
++	// ToSlash so Windows backslashes from os.CreateTemp match the sandbox
++	// allowlist (allowed_directories stores forward-slash entries).
++	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA profiling_output='%s'", escapeSQLString(filepath.ToSlash(profilePath)))); err != nil {
+ 		d.logger.Warn().Err(err).Msg("Failed to set profiling output")
+ 	}
+ 	if _, err := conn.ExecContext(ctx, "SET custom_profiling_settings='{\"PLANNER\": \"true\", \"PLANNER_BINDING\": \"true\", \"PHYSICAL_PLANNER\": \"true\", \"OPERATOR_TIMING\": \"true\", \"OPERATOR_CARDINALITY\": \"true\"}'"); err != nil {
+diff --git a/internal/database/sandbox.go b/internal/database/sandbox.go
+new file mode 100644
+index 0000000..33b60cc
+--- /dev/null
++++ b/internal/database/sandbox.go
+@@ -0,0 +1,216 @@
++package database
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"path"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/rs/zerolog"
++)
++
++// This file owns Arc's DuckDB sandbox: an `enable_external_access=false`
++// lockdown scoped to a per-deployment `allowed_directories` list. Closes
++// the I/O-function denylist bypass from the 2026-05-19 security audit
++// (read_csv_auto, read_json, read_text, glob, etc. were callable by any
++// authenticated token against arbitrary local files).
++//
++// Strategy:
++//  1. Enumerate every directory prefix Arc legitimately needs at query time
++//     (local storage root, DuckDB spill dir, dedicated import-upload subdir,
++//     compaction temp dir, S3/Azure bucket+prefix for hot AND cold tiers).
++//  2. SET GLOBAL allowed_directories = [...]
++//  3. SET GLOBAL enable_external_access = false  (one-way, cannot be undone)
++//  4. Verify the flip actually took effect.
++//
++// Every INSTALL / LOAD Arc needs MUST have completed before step 3. After
++// step 3, DuckDB rejects further INSTALL/LOAD. Already-loaded extensions
++// (httpfs, azure, cache_httpfs, arcx) remain fully callable because
++// enable_external_access is checked at LOAD time, not at function-invocation
++// time. File access checks happen at file-open time against the current
++// allowed_directories.
++
++// sandboxLockdownTimeout bounds the SET GLOBAL pair plus the read-back
++// verification at startup. Five seconds is generous to cover transient
++// pool contention while still bounding a hung DuckDB so startup fails
++// rather than blocking indefinitely. Applied via a single context that
++// spans the SET / SET / SELECT sequence so the budget is shared.
++const sandboxLockdownTimeout = 5 * time.Second
++
++// lockdownExternalAccess seals DuckDB's filesystem access surface so that
++// user-supplied SQL cannot reach arbitrary local files or remote URLs.
++// Called once at the end of configureDatabase, after every INSTALL/LOAD
++// and every SET GLOBAL Arc needs to perform.
++func lockdownExternalAccess(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
++	componentLogger := logger.With().Str("component", "duckdb-sandbox").Logger()
++	dirs := buildAllowedDirectories(cfg)
++
++	// Empty allowlist + enable_external_access=false locks DuckDB out of
++	// every file it might legitimately need (spill, profile output, manifest
++	// reads). Warn loudly so misconfigured deployments fail fast and visibly
++	// rather than silently breaking every query. The Warn enumerates every
++	// Config field that contributes to the allowlist so operators see exactly
++	// which knob is unset.
++	if len(dirs) == 0 {
++		componentLogger.Warn().Msg("sandbox allowlist is empty — every file-touching query will fail; check Config.LocalStorageRoot / TempDirectory / UploadDir / CompactionTempDirectory / S3Bucket / ColdS3Bucket / AzureContainer / ColdAzureContainer wiring")
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), sandboxLockdownTimeout)
++	defer cancel()
++
++	// Compose the allowed_directories SET. DuckDB accepts a list literal.
++	// Each entry is single-quoted; embedded single quotes are doubled by
++	// escapeSQLString. Local paths were already forward-slashed in
++	// buildAllowedDirectories via withTrailingSlash; S3 and Azure URIs use
++	// forward slashes natively.
++	quoted := make([]string, len(dirs))
++	for i, d := range dirs {
++		quoted[i] = "'" + escapeSQLString(d) + "'"
++	}
++	setDirs := "SET GLOBAL allowed_directories = [" + strings.Join(quoted, ", ") + "]"
++	if _, err := db.ExecContext(ctx, setDirs); err != nil {
++		return fmt.Errorf("set allowed_directories: %w", err)
++	}
++
++	if _, err := db.ExecContext(ctx, "SET GLOBAL enable_external_access = false"); err != nil {
++		return fmt.Errorf("set enable_external_access=false: %w", err)
++	}
++
++	// Read-back guard: a future DuckDB release could reject the flip silently
++	// (e.g., behind a feature flag), or a misconfiguration could leave the
++	// setting in a state we did not expect. Verify the flag actually flipped
++	// before declaring the sandbox active.
++	var got bool
++	if err := db.QueryRowContext(ctx, "SELECT current_setting('enable_external_access')::BOOLEAN").Scan(&got); err != nil {
++		return fmt.Errorf("read back enable_external_access: %w", err)
++	}
++	if got {
++		return fmt.Errorf("sandbox lockdown did not take effect: enable_external_access is still true")
++	}
++
++	componentLogger.Info().Strs("allowed_directories", dirs).Msg("DuckDB external access locked down (sandbox active)")
++	return nil
++}
++
++// buildAllowedDirectories enumerates every directory prefix Arc legitimately
++// needs DuckDB to read from or write to after lockdown. Returns trailing-
++// slashed, forward-slash entries ready to interpolate into the
++// `allowed_directories` SET. Order is informational only — DuckDB matches
++// by prefix in any order.
++//
++// Paths are passed through verbatim by this function; the caller in main.go
++// is responsible for absolute-resolution before populating Config. Empty
++// cfg fields are skipped so test fixtures can construct a minimal Config
++// without producing nonsensical allowlist entries.
++func buildAllowedDirectories(cfg *Config) []string {
++	dirs := make([]string, 0, 8)
++
++	if cfg.LocalStorageRoot != "" {
++		dirs = append(dirs, withTrailingSlash(cfg.LocalStorageRoot))
++	}
++	if cfg.TempDirectory != "" {
++		dirs = append(dirs, withTrailingSlash(cfg.TempDirectory))
++	}
++	// Dedicated import-upload directory (also used by the DELETE handler for
++	// S3-rewrite staging). Narrower than os.TempDir(): only this single
++	// directory is reachable, so other processes' /tmp files stay outside
++	// the DuckDB sandbox. main.go creates it under TempDirectory at startup.
++	if cfg.UploadDir != "" {
++		dirs = append(dirs, withTrailingSlash(cfg.UploadDir))
++	}
++	// Compaction's own temp directory (cfg.Compaction.TempDirectory, default
++	// ./data/compaction). Today compaction runs in a subprocess (see
++	// internal/compaction/subprocess.go) that opens its OWN DuckDB without
++	// going through configureDatabase, so the subprocess is not subject to
++	// this sandbox and does not need this entry. Allowlisting it anyway is
++	// defensive: any future parent-side code path that COPY-rewrites parquet
++	// to this dir (e.g., a refactor moving compaction back in-process) would
++	// otherwise fail post-lockdown with a confusing permission error.
++	if cfg.CompactionTempDirectory != "" {
++		dirs = append(dirs, withTrailingSlash(cfg.CompactionTempDirectory))
++	}
++	// Primary S3 backend (when storage.backend = "s3"). The query rewriter
++	// emits read_parquet('s3://<bucket>/<prefix>/...') for both ingest reads
++	// and queries.
++	var hotS3 string
++	if cfg.S3Bucket != "" {
++		hotS3 = s3PrefixURI(cfg.S3Bucket, cfg.S3Prefix)
++		dirs = append(dirs, hotS3)
++	}
++	// Cold-tier S3 (Enterprise tiered storage). internal/tiering/router.go
++	// emits read_parquet('s3://<cold-bucket>/<cold-prefix>/...'). The hot=local
++	// + cold=S3 topology is canonical, but operators ALSO run hot=S3 with
++	// shared-bucket-different-prefix cold tiers (e.g. bucket=warehouse with
++	// hot/ and cold/ prefixes). Dedupe on the FULL URI, not just the bucket
++	// name — a same-bucket-different-prefix cold tier MUST get its own
++	// allowlist entry.
++	if cfg.ColdS3Bucket != "" {
++		coldS3 := s3PrefixURI(cfg.ColdS3Bucket, cfg.ColdS3Prefix)
++		if coldS3 != hotS3 {
++			dirs = append(dirs, coldS3)
++		}
++	}
++	// Primary Azure backend (when storage.backend = "azure"). Arc's config
++	// does not currently expose a per-deployment Azure key prefix, so the
++	// allowlist scopes to the whole container.
++	var hotAzure string
++	if cfg.AzureContainer != "" {
++		hotAzure = "azure://" + cfg.AzureContainer + "/"
++		dirs = append(dirs, hotAzure)
++	}
++	// Cold-tier Azure (Enterprise). Mirrors the S3 cold-tier full-URI dedupe.
++	if cfg.ColdAzureContainer != "" {
++		coldAzure := "azure://" + cfg.ColdAzureContainer + "/"
++		if coldAzure != hotAzure {
++			dirs = append(dirs, coldAzure)
++		}
++	}
++	return dirs
++}
++
++// withTrailingSlash normalises a non-empty directory-like path to a single
++// trailing forward slash. ToSlash is folded in so callers don't need to
++// remember to pre-normalize. Callers gate on the empty-string case before
++// calling, so this helper assumes non-empty input.
++func withTrailingSlash(p string) string {
++	p = filepath.ToSlash(p)
++	if strings.HasSuffix(p, "/") {
++		return p
++	}
++	return p + "/"
++}
++
++// s3PrefixURI builds a normalized "s3://<bucket>/<prefix>/" allowlist entry.
++// Uses path.Clean (NOT filepath.Clean — the latter rewrites slashes on
++// Windows) to collapse interior runs of slashes (`tenant-a//sub` →
++// `tenant-a/sub`) AND to canonicalise `.` segments. Leading slashes are
++// stripped via TrimLeft before Clean so `//tenant-a` becomes `tenant-a`.
++//
++// `..` segments are rejected outright: path.Clean preserves a leading `..`
++// (Clean("..") → ".." and Clean("../foo") → "../foo"), so without an
++// explicit reject the helper would emit nonsensical entries like
++// `s3://bucket/../`. An operator that supplies `..` is misconfigured;
++// fall back to the bare-bucket prefix and let DuckDB reject the actual
++// read at query time with a meaningful error.
++//
++// Always trailing-slashed so DuckDB's prefix matcher treats the entry as
++// a directory.
++func s3PrefixURI(bucket, prefix string) string {
++	prefix = strings.TrimLeft(prefix, "/")
++	if prefix == "" {
++		return "s3://" + bucket + "/"
++	}
++	prefix = path.Clean(prefix)
++	// path.Clean leaves "." (when input was "./" or "."), and preserves any
++	// leading ".." segments. Both shapes are operator-misconfiguration; the
++	// safe fallback is the bare bucket. A query that legitimately needs an
++	// out-of-prefix path will surface a clearer permission error than
++	// shipping a nonsensical allowlist entry.
++	if prefix == "." || prefix == ".." || strings.HasPrefix(prefix, "../") {
++		return "s3://" + bucket + "/"
++	}
++	return "s3://" + bucket + "/" + prefix + "/"
++}

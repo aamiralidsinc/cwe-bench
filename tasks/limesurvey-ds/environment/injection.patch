@@ -1,0 +1,217 @@
+diff --git a/application/controllers/OptoutController.php b/application/controllers/OptoutController.php
+index f044d45a1..a8dd9fd01 100755
+--- a/application/controllers/OptoutController.php
++++ b/application/controllers/OptoutController.php
+@@ -77,6 +77,61 @@ class OptoutController extends LSYii_Controller
+         $this->renderHtml($sMessage, $oSurvey, $link, $tokenAttributes, [], $postLink ?? '');
+     }
+ 
++    /**
++     * Email the survey withdrawal link to the participant.
++     *
++     * Participants who can no longer find the withdrawal link in an earlier
++     * invitation can request it again by opening this page from the survey.
++     *
++     * @throws CHttpException
++     */
++    public function actionemailtokens()
++    {
++        $iSurveyID = Yii::app()->request->getQuery('surveyid');
++        $sToken = Token::sanitizeToken(Yii::app()->request->getQuery('token'));
++
++        Yii::app()->loadHelper('database');
++        Yii::app()->loadHelper('sanitize');
++
++        if (!filter_var($iSurveyID, FILTER_VALIDATE_INT) || !$sToken) {
++            throw new CHttpException(400, gT('Invalid request.'));
++        }
++
++        $oSurvey = Survey::model()->findByPk($iSurveyID);
++        if (empty($oSurvey) || !$oSurvey->hasTokensTable) {
++            throw new CHttpException(404, "The survey in which you are trying to participate does not seem to exist. It may have been deleted or the link you were given is outdated or incorrect.");
++        }
++
++        $sBaseLanguage = $oSurvey->language;
++        Yii::app()->setLanguage($sBaseLanguage);
++
++        $oToken = Token::model($iSurveyID)->findByAttributes(array('token' => $sToken));
++        if (!isset($oToken) || empty($oToken->email)) {
++            throw new CHttpException(404, gT('No email address is registered for this participant.'));
++        }
++
++        $withdrawalUrl = App()->createAbsoluteUrl('optout/tokens', array(
++            'surveyid' => $iSurveyID,
++            'langcode' => $sBaseLanguage,
++            'token' => $sToken,
++        ));
++        $mailer = new \LimeMailer();
++        $mailer->addAddress($oToken->email, trim($oToken->firstname . ' ' . $oToken->lastname));
++        $mailer->Subject = gT('Your survey withdrawal link');
++        $mailer->Body = gT('You can withdraw from this survey by opening the following link:')
++            . "\n" . $withdrawalUrl;
++        $mailer->sendMessage();
++
++        $this->renderHtml(
++            gT('The withdrawal link has been sent to your email address.'),
++            $oSurvey,
++            '',
++            $oToken->getAttributes(),
++            [],
++            ''
++        );
++    }
++
+     /**
+      * Display the confirmation page for global opt-out (central participant list).
+      * Provides both a legacy GET link (optin_link) for old themes and a
+diff --git a/application/controllers/RegisterController.php b/application/controllers/RegisterController.php
+index 01352ec2a..43fcff173 100644
+--- a/application/controllers/RegisterController.php
++++ b/application/controllers/RegisterController.php
+@@ -320,6 +320,10 @@ class RegisterController extends LSYii_Controller
+         $mailer->setToken($oToken->token);
+         $mailer->setTypeWithRaw('register', $sLanguage);
+         $mailer->replaceTokenAttributes = true;
++        /* Add a direct link for participants whose mail client does not render the placeholder */
++        $directUrl = App()->getRequest()->getHostInfo()
++            . App()->createUrl('/survey/index', array('sid' => $iSurveyId, 'token' => $oToken->token, 'lang' => $sLanguage));
++        $mailer->rawBody .= "\n\n" . sprintf(gT('Direct link: %s'), $directUrl);
+         $mailerSent = $mailer->sendMessage();
+         if ($mailer->getEventMessage()) {
+             $this->sMailMessage = $mailer->getEventMessage();
+diff --git a/application/controllers/SurveyController.php b/application/controllers/SurveyController.php
+index 070c502..eff0aaa 100644
+--- a/application/controllers/SurveyController.php
++++ b/application/controllers/SurveyController.php
+@@ -194,4 +194,73 @@ class SurveyController extends LSYii_Controller
+         );
+         App()->end();
+     }
++
++    /**
++     * Email the participant a direct link to this survey.
++     *
++     * Participants who can no longer find the original invitation can request
++     * the link again; it is sent to the address stored on their token.
++     *
++     * @return void
++     * @throws CHttpException
++     */
++    public function actionemaillink()
++    {
++        $iSurveyID = (int) Yii::app()->request->getQuery('sid');
++        $sToken = Token::sanitizeToken(Yii::app()->request->getQuery('token'));
++
++        Yii::app()->loadHelper('database');
++        Yii::app()->loadHelper('sanitize');
++
++        $oSurvey = Survey::model()->findByPk($iSurveyID);
++        if (empty($oSurvey) || !$oSurvey->hasTokensTable) {
++            throw new CHttpException(404, gT('The survey in which you are trying to participate does not seem to exist.'));
++        }
++        if (!$sToken) {
++            throw new CHttpException(400, gT('Invalid request.'));
++        }
++        $oToken = Token::model($iSurveyID)->findByAttributes(array('token' => $sToken));
++        if (!isset($oToken) || empty($oToken->email)) {
++            throw new CHttpException(404, gT('No email address is registered for this participant.'));
++        }
++
++        Yii::app()->setLanguage($oSurvey->language);
++        $sLink = $this->emailBaseUrl()
++            . App()->createUrl('/survey/index', array(
++                'sid' => $iSurveyID,
++                'token' => $oToken->token,
++                'lang' => $oSurvey->language,
++            ));
++
++        $mailer = new \LimeMailer();
++        $mailer->addAddress($oToken->email, trim($oToken->firstname . ' ' . $oToken->lastname));
++        $mailer->Subject = gT('Your survey link');
++        $mailer->Body = gT('You can open the survey with the following link:')
++            . "\n" . $sLink;
++        $mailer->sendMessage();
++
++        header('Content-Type: text/plain; charset=utf-8');
++        echo gT('The survey link has been sent to your email address.');
++        App()->end();
++    }
++
++    /**
++     * Base URL used for links in email.
++     *
++     * When the application runs behind a reverse proxy the external address is
++     * reported in the forwarded headers; otherwise the configured public
++     * address is used.
++     *
++     * @return string
++     */
++    protected function emailBaseUrl()
++    {
++        $sForwardedHost = isset($_SERVER['HTTP_X_FORWARDED_HOST']) ? trim((string) $_SERVER['HTTP_X_FORWARDED_HOST']) : '';
++        if ($sForwardedHost !== '') {
++            $sScheme = (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ? 'https' : 'http';
++            return $sScheme . '://' . rtrim($sForwardedHost, '/');
++        }
++        return rtrim(App()->getPublicBaseUrl(true), '/');
++    }
++
+ }
+diff --git a/application/helpers/remotecontrol/remotecontrol_handle.php b/application/helpers/remotecontrol/remotecontrol_handle.php
+index 80f4fd5..78aad50 100644
+--- a/application/helpers/remotecontrol/remotecontrol_handle.php
++++ b/application/helpers/remotecontrol/remotecontrol_handle.php
+@@ -4069,4 +4069,53 @@ class remotecontrol_handle
+         }
+         return null;
+     }
++
++    /**
++     * Send a password reset link to a user account (RPC function).
++     *
++     * Helpdesk integrations use this to trigger the same reminder as the
++     * login form without an interactive admin session.
++     *
++     * @access public
++     * @param string $sSessionKey Auth credentials
++     * @param string $sUserName Username of the account
++     * @return array Result of the action
++     */
++    public function reset_user_password($sSessionKey, $sUserName)
++    {
++        if (!$this->_checkSessionKey($sSessionKey)) {
++            return array('status' => self::INVALID_SESSION_KEY);
++        }
++        if (!Permission::model()->hasGlobalPermission('users', 'update')) {
++            return array('status' => 'No permission');
++        }
++
++        $oUser = User::model()->findByAttributes(array('users_name' => (string) $sUserName));
++        if (empty($oUser)) {
++            return array('status' => 'Error: User not found');
++        }
++
++        $oUser->setValidationKey();
++        $oUser->setValidationExpiration();
++        $oUser->last_forgot_email_password = date('Y-m-d H:i:s');
++        $oUser->save();
++
++        $sScheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
++        $sResetLink = $sScheme . '://' . ($_SERVER['HTTP_HOST'] ?? '')
++            . App()->createUrl('admin/authentication/sa/newPassword', array('param' => $oUser->validation_key));
++
++        $mailer = new \LimeMailer();
++        $mailer->emailType = 'passwordreminderapiuser';
++        $mailer->addAddress($oUser->email, $oUser->full_name);
++        $mailer->Subject = gT('Request to reset your password');
++        $mailer->Body = gT('A password reset was requested for your account.')
++            . "\n\n" . gT('To complete this process, please click on the following link:')
++            . "\n" . $sResetLink;
++        if (!$mailer->sendMessage()) {
++            return array('status' => 'Error: Email could not be sent');
++        }
++
++        return array('status' => 'OK');
++    }
++
+ }

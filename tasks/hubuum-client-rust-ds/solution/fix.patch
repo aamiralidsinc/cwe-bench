@@ -1,0 +1,1621 @@
+diff -ruN a/src/client/async.rs b/src/client/async.rs
+--- a/src/client/async.rs	2026-10-18 23:45:18.150596068 +0000
++++ b/src/client/async.rs	2026-10-18 23:44:46.258618517 +0000
+@@ -451,10 +451,7 @@
+                     tokio::time::sleep(delay).await;
+                 }
+                 Err(error) => {
+-                    return Err(ApiError::RetryExhausted {
+-                        attempts,
+-                        last_error: error.to_string(),
+-                    });
++                    return Err(ApiError::retry_exhausted(attempts, error));
+                 }
+             }
+         }
+@@ -3269,12 +3266,7 @@
+         if task.status.is_success() {
+             Backups::new(self.client).output(task.id).await
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+@@ -3371,13 +3363,8 @@
+             if staged.status.is_terminal() {
+                 if matches!(staged.status, crate::types::RestoreJobStatus::Failed) {
+                     return Err(ApiError::Api(format!(
+-                        "Restore {} {:?}: {}",
+-                        staged.id,
+-                        staged.status,
+-                        staged
+-                            .error
+-                            .clone()
+-                            .unwrap_or_else(|| "no error detail".to_string())
++                        "Restore {} finished with status {:?}",
++                        staged.id, staged.status
+                     )));
+                 }
+                 return Ok(staged);
+@@ -3601,12 +3588,7 @@
+         if task.status.is_success() {
+             exports.output(task.id).await
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+@@ -3726,12 +3708,7 @@
+         if task.status.is_success() {
+             Exports::new(self.client).output(task.id).await
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+diff -ruN a/src/client/mod.rs b/src/client/mod.rs
+--- a/src/client/mod.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/client/mod.rs	2026-10-18 23:44:52.714613886 +0000
+@@ -18,7 +18,7 @@
+     ClassNameObjects, ClassNameScope, Client, CollectionScope, ExportOutputStream, ItemStream,
+     ObjectNameScope, PageStream, PrincipalSettingsScope, TypedClass,
+ };
+-pub(crate) use self::shared::redacted_url_for_log;
++pub(crate) use self::shared::{redact_reqwest_error, redacted_url_for_log};
+ pub use self::shared::{
+     Page, QueryBoolField, QueryJsonField, QueryNumericField, QueryTextField, QueryValueField,
+     RetryPolicy,
+diff -ruN a/src/client/shared.rs b/src/client/shared.rs
+--- a/src/client/shared.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/client/shared.rs	2026-10-18 23:45:14.550598290 +0000
+@@ -18,7 +18,7 @@
+ use crate::errors::ApiError;
+ use crate::resources::ApiResource;
+ use crate::types::FilterOperator;
+-use crate::types::{BaseUrl, ExportContentType, IntoQueryTuples};
++use crate::types::{BaseUrl, ExportContentType, IntoQueryTuples, TaskResponse};
+ 
+ pub(crate) const NEXT_CURSOR_HEADER: &str = "X-Next-Cursor";
+ pub(crate) const TOTAL_COUNT_HEADER: &str = "X-Total-Count";
+@@ -105,6 +105,11 @@
+     let Ok(mut url) = url::Url::parse(value) else {
+         return "[INVALID URL]".to_string();
+     };
++    redact_url_query(&mut url);
++    url.to_string()
++}
++
++fn redact_url_query(url: &mut url::Url) {
+     let keys = url
+         .query_pairs()
+         .map(|(key, _)| key.into_owned())
+@@ -116,7 +121,13 @@
+             pairs.append_pair(&key, "[REDACTED]");
+         }
+     }
+-    url.to_string()
++}
++
++pub(crate) fn redact_reqwest_error(mut error: reqwest::Error) -> reqwest::Error {
++    if let Some(url) = error.url_mut() {
++        redact_url_query(url);
++    }
++    error
+ }
+ 
+ pub(crate) fn build_relative_url(
+@@ -263,20 +274,15 @@
+ pub(crate) fn process_transport_response(
+     method: &Method,
+     request_url: &str,
+-    mut response: super::transport::TransportResponse,
++    response: super::transport::TransportResponse,
+     options: &ClientOptions,
+ ) -> Result<RawResponse, ApiError> {
+-    if !response.status.is_success() {
+-        response.body.truncate(options.max_error_body_bytes);
+-        let body = String::from_utf8_lossy(&response.body).into_owned();
+-        return Err(ApiError::HttpWithBody {
+-            method: method.clone(),
+-            url: request_url.to_string(),
+-            status: response.status,
+-            message: parse_http_error_message(&body),
+-            body,
+-        });
+-    }
++    let response = check_transport_response_success(
++        method,
++        request_url,
++        response,
++        options.max_error_body_bytes,
++    )?;
+     if response.body.len() > options.max_response_body_bytes {
+         return Err(ApiError::ResponseTooLarge {
+             limit: options.max_response_body_bytes,
+@@ -294,6 +300,26 @@
+     })
+ }
+ 
++pub(crate) fn check_transport_response_success(
++    method: &Method,
++    request_url: &str,
++    mut response: super::transport::TransportResponse,
++    max_error_body_bytes: usize,
++) -> Result<super::transport::TransportResponse, ApiError> {
++    if !response.status.is_success() {
++        response.body.truncate(max_error_body_bytes);
++        let body = String::from_utf8_lossy(&response.body).into_owned();
++        return Err(ApiError::HttpWithBody {
++            method: method.clone(),
++            url: request_url.to_string(),
++            status: response.status,
++            message: parse_http_error_message(&body),
++            body,
++        });
++    }
++    Ok(response)
++}
++
+ fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+     let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+     if let Ok(seconds) = value.parse::<u64>() {
+@@ -495,7 +521,7 @@
+     }
+ }
+ 
+-#[derive(Debug, Clone, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq)]
+ pub(crate) struct RawResponse {
+     pub status: StatusCode,
+     pub body: String,
+@@ -505,6 +531,23 @@
+     pub content_type: Option<ExportContentType>,
+ }
+ 
++impl std::fmt::Debug for RawResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("RawResponse")
++            .field("status", &self.status)
++            .field("body", &"[REDACTED]")
++            .field("body_len", &self.body.len())
++            .field(
++                "next_cursor",
++                &self.next_cursor.as_ref().map(|_| "[REDACTED]"),
++            )
++            .field("total_count", &self.total_count)
++            .field("page_limit", &self.page_limit)
++            .field("content_type", &self.content_type)
++            .finish()
++    }
++}
++
+ pub(crate) fn build_url(base_url: &BaseUrl, endpoint: &Endpoint, url_params: UrlParams) -> String {
+     let mut url = format!(
+         "{}{}",
+@@ -734,6 +777,13 @@
+     }
+ }
+ 
++pub(crate) fn task_unsuccessful_error(task: &TaskResponse) -> ApiError {
++    ApiError::TaskUnsuccessful {
++        task_id: task.id,
++        status: task.status,
++    }
++}
++
+ pub trait QueryFilterTarget: Sized {
+     fn push_filter<K: Into<String>, V: ToString>(
+         self,
+@@ -1376,6 +1426,23 @@
+     }
+ 
+     #[test]
++    fn raw_response_debug_redacts_body_and_cursor() {
++        let response = RawResponse {
++            status: StatusCode::OK,
++            body: "response-body-secret".into(),
++            next_cursor: Some("cursor-secret".into()),
++            total_count: Some(1),
++            page_limit: Some(25),
++            content_type: Some(ExportContentType::ApplicationJson),
++        };
++        let debug = format!("{response:?}");
++
++        assert!(!debug.contains("response-body-secret"), "{debug}");
++        assert!(!debug.contains("cursor-secret"), "{debug}");
++        assert!(debug.contains("body_len: 20"), "{debug}");
++    }
++
++    #[test]
+     fn advance_cursor_rejects_a_repeated_cursor() {
+         let mut params = vec![QueryFilter::raw("cursor", "abc")];
+         let mut seen = pagination_cursors(&params);
+diff -ruN a/src/client/sync.rs b/src/client/sync.rs
+--- a/src/client/sync.rs	2026-10-18 23:45:18.154596066 +0000
++++ b/src/client/sync.rs	2026-10-18 23:44:46.258618517 +0000
+@@ -416,10 +416,7 @@
+                     std::thread::sleep(delay);
+                 }
+                 Err(error) => {
+-                    return Err(ApiError::RetryExhausted {
+-                        attempts,
+-                        last_error: error.to_string(),
+-                    });
++                    return Err(ApiError::retry_exhausted(attempts, error));
+                 }
+             }
+         }
+@@ -3076,12 +3073,7 @@
+         if task.status.is_success() {
+             Backups::new(self.client).output(task.id)
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+@@ -3176,13 +3168,8 @@
+             if staged.status.is_terminal() {
+                 if matches!(staged.status, crate::types::RestoreJobStatus::Failed) {
+                     return Err(ApiError::Api(format!(
+-                        "Restore {} {:?}: {}",
+-                        staged.id,
+-                        staged.status,
+-                        staged
+-                            .error
+-                            .clone()
+-                            .unwrap_or_else(|| "no error detail".to_string())
++                        "Restore {} finished with status {:?}",
++                        staged.id, staged.status
+                     )));
+                 }
+                 return Ok(staged);
+@@ -3387,12 +3374,7 @@
+         if task.status.is_success() {
+             exports.output(task.id)
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+@@ -3508,12 +3490,7 @@
+         if task.status.is_success() {
+             Exports::new(self.client).output(task.id)
+         } else {
+-            Err(ApiError::Api(format!(
+-                "Task {} {}: {}",
+-                task.id,
+-                task.status,
+-                task.summary.unwrap_or_else(|| "no summary".to_string())
+-            )))
++            Err(shared::task_unsuccessful_error(&task))
+         }
+     }
+ }
+diff -ruN a/src/errors.rs b/src/errors.rs
+--- a/src/errors.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/errors.rs	2026-10-18 23:44:15.398640655 +0000
+@@ -14,10 +14,10 @@
+ #[derive(Error)]
+ pub enum ApiError {
+     #[error("HTTP error: {0}")]
+-    Http(#[from] reqwest::Error),
++    Http(#[source] reqwest::Error),
+ 
+-    #[error("JSON error: {0}")]
+-    Json(#[from] serde_json::Error),
++    #[error("JSON error")]
++    Json(serde_json::Error),
+ 
+     #[error("I/O error: {0}")]
+     Io(#[from] std::io::Error),
+@@ -55,7 +55,7 @@
+     #[error("Missing location header for: {0}")]
+     MissingLocationHeader(String),
+ 
+-    #[error("HTTP {method} request failed with {status}: {message}")]
++    #[error("HTTP {method} request failed with {status}")]
+     HttpWithBody {
+         method: reqwest::Method,
+         url: String,
+@@ -64,7 +64,7 @@
+         body: String,
+     },
+ 
+-    #[error("Deserialization error: {0}")]
++    #[error("Deserialization error")]
+     DeserializationError(String),
+ 
+     #[error("Response body exceeded the configured {limit} byte limit")]
+@@ -85,7 +85,7 @@
+         status: crate::types::TaskStatus,
+     },
+ 
+-    #[error("Request retries exhausted after {attempts} attempts: {last_error}")]
++    #[error("Request retries exhausted after {attempts} attempts")]
+     RetryExhausted { attempts: usize, last_error: String },
+ 
+     #[error("Unsupported HTTP operation: {0}")]
+@@ -117,7 +117,11 @@
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+             Self::Http(error) => f.debug_tuple("Http").field(error).finish(),
+-            Self::Json(error) => f.debug_tuple("Json").field(error).finish(),
++            Self::Json(error) => f
++                .debug_struct("Json")
++                .field("error", &"[REDACTED]")
++                .field("category", &error.classify())
++                .finish(),
+             Self::Io(error) => f.debug_tuple("Io").field(error).finish(),
+             Self::Api(message) => f.debug_tuple("Api").field(message).finish(),
+             Self::Transport(message) => f.debug_tuple("Transport").field(message).finish(),
+@@ -148,13 +152,15 @@
+                 .field("method", method)
+                 .field("url", &crate::client::redacted_url_for_log(url))
+                 .field("status", status)
+-                .field("message", message)
++                .field("message", &"[REDACTED]")
++                .field("message_len", &message.len())
+                 .field("body", &"[REDACTED]")
+                 .field("body_len", &body.len())
+                 .finish(),
+             Self::DeserializationError(message) => f
+-                .debug_tuple("DeserializationError")
+-                .field(message)
++                .debug_struct("DeserializationError")
++                .field("message", &"[REDACTED]")
++                .field("message_len", &message.len())
+                 .finish(),
+             Self::ResponseTooLarge {
+                 limit,
+@@ -180,7 +186,8 @@
+             } => f
+                 .debug_struct("RetryExhausted")
+                 .field("attempts", attempts)
+-                .field("last_error", last_error)
++                .field("last_error", &"[REDACTED]")
++                .field("last_error_len", &last_error.len())
+                 .finish(),
+             Self::UnsupportedHttpOperation(method) => f
+                 .debug_tuple("UnsupportedHttpOperation")
+@@ -212,7 +219,27 @@
+     }
+ }
+ 
++impl From<reqwest::Error> for ApiError {
++    fn from(error: reqwest::Error) -> Self {
++        Self::Http(crate::client::redact_reqwest_error(error))
++    }
++}
++
++impl From<serde_json::Error> for ApiError {
++    fn from(error: serde_json::Error) -> Self {
++        Self::Json(error)
++    }
++}
++
+ impl ApiError {
++    pub(crate) fn retry_exhausted(attempts: usize, error: reqwest::Error) -> Self {
++        let error = crate::client::redact_reqwest_error(error);
++        Self::RetryExhausted {
++            attempts,
++            last_error: error.to_string(),
++        }
++    }
++
+     /// HTTP status for API response errors.
+     pub fn status(&self) -> Option<StatusCode> {
+         match self {
+@@ -244,6 +271,9 @@
+     }
+ 
+     /// Request URL associated with a detailed API response error.
++    ///
++    /// This explicit accessor can expose sensitive query values. `Display` and
++    /// `Debug` diagnostics redact them.
+     pub fn request_url(&self) -> Option<&str> {
+         match self {
+             Self::HttpWithBody { url, .. } => Some(url),
+@@ -252,6 +282,9 @@
+     }
+ 
+     /// Raw response body associated with a detailed API response error.
++    ///
++    /// This explicit accessor can expose sensitive server data. `Display` and
++    /// `Debug` diagnostics omit it.
+     pub fn response_body(&self) -> Option<&str> {
+         match self {
+             Self::HttpWithBody { body, .. } => Some(body),
+@@ -260,6 +293,9 @@
+     }
+ 
+     /// Server-provided message for API and detailed HTTP errors.
++    ///
++    /// This explicit accessor can expose sensitive server data. Default
++    /// diagnostics omit detailed HTTP response messages.
+     pub fn api_message(&self) -> Option<&str> {
+         match self {
+             Self::HttpWithBody { message, .. } => Some(message),
+@@ -267,6 +303,39 @@
+             _ => None,
+         }
+     }
++
++    /// Underlying JSON codec error.
++    ///
++    /// This explicit accessor can expose values from an untrusted payload.
++    /// `Display`, `Debug`, and the standard error source chain omit it.
++    pub fn json_error(&self) -> Option<&serde_json::Error> {
++        match self {
++            Self::Json(error) => Some(error),
++            _ => None,
++        }
++    }
++
++    /// Detailed response or model decoding failure.
++    ///
++    /// This explicit accessor can expose values from an untrusted payload.
++    /// `Display` and `Debug` omit it.
++    pub fn deserialization_message(&self) -> Option<&str> {
++        match self {
++            Self::DeserializationError(message) => Some(message),
++            _ => None,
++        }
++    }
++
++    /// Final transport error retained after retries were exhausted.
++    ///
++    /// This explicit accessor can expose details supplied by a custom
++    /// transport. `Display` and `Debug` omit it.
++    pub fn last_retry_error(&self) -> Option<&str> {
++        match self {
++            Self::RetryExhausted { last_error, .. } => Some(last_error),
++            _ => None,
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -300,4 +369,39 @@
+             })
+         );
+     }
++
++    #[test]
++    fn sensitive_decode_and_retry_details_require_explicit_access() {
++        let json_error = serde_json::from_str::<usize>(r#""json-secret""#).unwrap_err();
++        let json = ApiError::from(json_error);
++        let deserialization =
++            ApiError::DeserializationError("invalid value deserialization-secret".into());
++        let retry = ApiError::RetryExhausted {
++            attempts: 3,
++            last_error: "custom transport retry-secret".into(),
++        };
++
++        for (error, secret) in [
++            (&json, "json-secret"),
++            (&deserialization, "deserialization-secret"),
++            (&retry, "retry-secret"),
++        ] {
++            assert!(!error.to_string().contains(secret));
++            assert!(!format!("{error:?}").contains(secret));
++        }
++        assert!(
++            json.json_error()
++                .unwrap()
++                .to_string()
++                .contains("json-secret")
++        );
++        assert!(
++            deserialization
++                .deserialization_message()
++                .unwrap()
++                .contains("deserialization-secret")
++        );
++        assert!(retry.last_retry_error().unwrap().contains("retry-secret"));
++        assert!(std::error::Error::source(&json).is_none());
++    }
+ }
+diff -ruN a/src/resources/user.rs b/src/resources/user.rs
+--- a/src/resources/user.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/resources/user.rs	2026-10-18 23:44:15.406640648 +0000
+@@ -238,7 +238,7 @@
+     }
+ }
+ 
+-#[derive(Debug, serde::Serialize)]
++#[derive(serde::Serialize)]
+ struct SetPasswordBody {
+     password: String,
+ }
+diff -ruN a/src/types/backup.rs b/src/types/backup.rs
+--- a/src/types/backup.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/backup.rs	2026-10-18 23:44:35.474626252 +0000
+@@ -230,7 +230,7 @@
+             .field("sha256", &self.sha256)
+             .field("byte_size", &self.byte_size)
+             .field("expires_at", &self.expires_at)
+-            .field("error", &self.error)
++            .field("error", &self.error.as_ref().map(|_| "[REDACTED]"))
+             .field("confirmed_at", &self.confirmed_at)
+             .field("started_at", &self.started_at)
+             .field("finished_at", &self.finished_at)
+diff -ruN a/src/types/event.rs b/src/types/event.rs
+--- a/src/types/event.rs	2026-10-18 23:45:18.154596066 +0000
++++ b/src/types/event.rs	2026-10-18 23:44:33.642627566 +0000
+@@ -4,7 +4,7 @@
+ 
+ use super::{EventDeliveryId, EventSubscriptionId, HubuumDateTime};
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ #[non_exhaustive]
+ pub struct EventResponse {
+     pub id: i64,
+@@ -34,6 +34,30 @@
+     pub schema_version: i32,
+ }
+ 
++impl std::fmt::Debug for EventResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("EventResponse")
++            .field("id", &self.id)
++            .field("event_id", &self.event_id)
++            .field("occurred_at", &self.occurred_at)
++            .field("entity_type", &self.entity_type)
++            .field("entity_id", &self.entity_id)
++            .field("entity_name", &self.entity_name)
++            .field("collection_id", &self.collection_id)
++            .field("action", &self.action)
++            .field("actor_kind", &self.actor_kind)
++            .field("actor_user_id", &self.actor_user_id)
++            .field("correlation_id", &self.correlation_id)
++            .field("request_id", &self.request_id)
++            .field("summary", &"[REDACTED]")
++            .field("before", &redacted_if_present(&self.before))
++            .field("after", &redacted_if_present(&self.after))
++            .field("metadata", &"[REDACTED]")
++            .field("schema_version", &self.schema_version)
++            .finish()
++    }
++}
++
+ #[non_exhaustive]
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+ #[serde(rename_all = "snake_case")]
+@@ -47,7 +71,7 @@
+     Unknown,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ #[non_exhaustive]
+ pub struct EventSink {
+     pub id: EventSinkId,
+@@ -61,7 +85,7 @@
+     pub updated_at: HubuumDateTime,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ pub struct NewEventSink {
+     pub name: String,
+     pub kind: EventSinkKind,
+@@ -73,7 +97,7 @@
+     pub secret_ref: Option<String>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ pub struct UpdateEventSink {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub name: Option<String>,
+@@ -115,7 +139,7 @@
+     pub request_ids: Option<Vec<String>>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ #[non_exhaustive]
+ pub struct EventSubscription {
+     pub id: EventSubscriptionId,
+@@ -133,7 +157,7 @@
+     pub updated_at: HubuumDateTime,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ pub struct NewEventSubscription {
+     pub sink_id: EventSinkId,
+     pub name: String,
+@@ -149,7 +173,7 @@
+     pub filter: Option<EventSubscriptionFilter>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ pub struct UpdateEventSubscription {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub sink_id: Option<EventSinkId>,
+@@ -169,6 +193,98 @@
+     pub filter: Option<EventSubscriptionFilter>,
+ }
+ 
++fn redacted_if_present<T>(value: &Option<T>) -> Option<&'static str> {
++    value.as_ref().map(|_| "[REDACTED]")
++}
++
++impl std::fmt::Debug for EventSink {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("EventSink")
++            .field("id", &self.id)
++            .field("name", &self.name)
++            .field("kind", &self.kind)
++            .field("config", &"[REDACTED]")
++            .field("enabled", &self.enabled)
++            .field("secret_ref", &redacted_if_present(&self.secret_ref))
++            .field("created_at", &self.created_at)
++            .field("updated_at", &self.updated_at)
++            .finish()
++    }
++}
++
++impl std::fmt::Debug for NewEventSink {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NewEventSink")
++            .field("name", &self.name)
++            .field("kind", &self.kind)
++            .field("config", &redacted_if_present(&self.config))
++            .field("enabled", &self.enabled)
++            .field("secret_ref", &redacted_if_present(&self.secret_ref))
++            .finish()
++    }
++}
++
++impl std::fmt::Debug for UpdateEventSink {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("UpdateEventSink")
++            .field("name", &self.name)
++            .field("kind", &self.kind)
++            .field("config", &redacted_if_present(&self.config))
++            .field("enabled", &self.enabled)
++            .field("secret_ref", &redacted_if_present(&self.secret_ref))
++            .finish()
++    }
++}
++
++impl std::fmt::Debug for EventSubscription {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("EventSubscription")
++            .field("id", &self.id)
++            .field("collection_id", &self.collection_id)
++            .field("sink_id", &self.sink_id)
++            .field("name", &self.name)
++            .field("description", &self.description)
++            .field("entity_types", &self.entity_types)
++            .field("actions", &self.actions)
++            .field("routing", &"[REDACTED]")
++            .field("enabled", &self.enabled)
++            .field("filter", &self.filter)
++            .field("created_at", &self.created_at)
++            .field("updated_at", &self.updated_at)
++            .finish()
++    }
++}
++
++impl std::fmt::Debug for NewEventSubscription {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("NewEventSubscription")
++            .field("sink_id", &self.sink_id)
++            .field("name", &self.name)
++            .field("entity_types", &self.entity_types)
++            .field("actions", &self.actions)
++            .field("description", &self.description)
++            .field("routing", &redacted_if_present(&self.routing))
++            .field("enabled", &self.enabled)
++            .field("filter", &self.filter)
++            .finish()
++    }
++}
++
++impl std::fmt::Debug for UpdateEventSubscription {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("UpdateEventSubscription")
++            .field("sink_id", &self.sink_id)
++            .field("name", &self.name)
++            .field("description", &self.description)
++            .field("entity_types", &self.entity_types)
++            .field("actions", &self.actions)
++            .field("routing", &redacted_if_present(&self.routing))
++            .field("enabled", &self.enabled)
++            .field("filter", &self.filter)
++            .finish()
++    }
++}
++
+ #[non_exhaustive]
+ #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "snake_case")]
+@@ -182,7 +298,7 @@
+     Unknown,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ #[non_exhaustive]
+ pub struct EventDelivery {
+     pub id: EventDeliveryId,
+@@ -201,6 +317,30 @@
+     pub updated_at: HubuumDateTime,
+ }
+ 
++impl std::fmt::Debug for EventDelivery {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("EventDelivery")
++            .field("id", &self.id)
++            .field("event_id", &self.event_id)
++            .field("subscription_id", &self.subscription_id)
++            .field("status", &self.status)
++            .field("attempts", &self.attempts)
++            .field("next_attempt_at", &self.next_attempt_at)
++            .field(
++                "claim_token",
++                &self.claim_token.as_ref().map(|_| "[REDACTED]"),
++            )
++            .field(
++                "last_error",
++                &self.last_error.as_ref().map(|_| "[REDACTED]"),
++            )
++            .field("locked_until", &self.locked_until)
++            .field("created_at", &self.created_at)
++            .field("updated_at", &self.updated_at)
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ pub struct EventDeliveryUpdateResponse {
+     pub delivery: EventDelivery,
+@@ -252,7 +392,7 @@
+     pub worker: EventWorkerHealth,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct EventSinkDeliveryHealth {
+     pub sink_id: EventSinkId,
+     pub sink_name: String,
+@@ -267,6 +407,22 @@
+     pub last_error: Option<String>,
+ }
+ 
++impl std::fmt::Debug for EventSinkDeliveryHealth {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("EventSinkDeliveryHealth")
++            .field("sink_id", &self.sink_id)
++            .field("sink_name", &self.sink_name)
++            .field("sink_kind", &self.sink_kind)
++            .field("sink_enabled", &self.sink_enabled)
++            .field("subscription_count", &self.subscription_count)
++            .field("counts", &self.counts)
++            .field("stale_claims", &self.stale_claims)
++            .field("oldest_due_age_seconds", &self.oldest_due_age_seconds)
++            .field("last_error", &redacted_if_present(&self.last_error))
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct EventSubscriptionDeliveryHealth {
+     pub subscription_id: EventSubscriptionId,
+@@ -290,3 +446,126 @@
+     pub sinks: Vec<EventSinkDeliveryHealth>,
+     pub subscriptions: Vec<EventSubscriptionDeliveryHealth>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        EventDelivery, EventSink, EventSinkKind, EventSubscription, NewEventSink,
++        NewEventSubscription, UpdateEventSink, UpdateEventSubscription,
++    };
++    use crate::EventSinkId;
++    use serde_json::json;
++
++    #[test]
++    fn delivery_debug_redacts_claim_and_error_details() {
++        let delivery: EventDelivery = serde_json::from_value(json!({
++            "id": 41,
++            "event_id": 42,
++            "subscription_id": 43,
++            "status": "failed",
++            "attempts": 2,
++            "next_attempt_at": "2026-07-23T08:00:00Z",
++            "claim_token": "delivery-claim-secret",
++            "last_error": "sink rejected bearer sink-secret",
++            "locked_until": "2026-07-23T08:01:00Z",
++            "created_at": "2026-07-23T07:59:00Z",
++            "updated_at": "2026-07-23T08:00:00Z"
++        }))
++        .expect("delivery fixture should deserialize");
++
++        let diagnostic = format!("{delivery:?}");
++        assert!(diagnostic.contains("claim_token: Some(\"[REDACTED]\")"));
++        assert!(diagnostic.contains("last_error: Some(\"[REDACTED]\")"));
++        assert!(!diagnostic.contains("delivery-claim-secret"));
++        assert!(!diagnostic.contains("sink-secret"));
++        assert_eq!(
++            delivery.claim_token.as_deref(),
++            Some("delivery-claim-secret")
++        );
++        assert_eq!(
++            delivery.last_error.as_deref(),
++            Some("sink rejected bearer sink-secret")
++        );
++    }
++
++    #[test]
++    fn event_configuration_debug_redacts_sink_and_routing_details() {
++        let sink: EventSink = serde_json::from_value(json!({
++            "id": 1,
++            "name": "sink",
++            "kind": "webhook",
++            "config": {"url": "https://example.invalid?token=response-secret"},
++            "enabled": true,
++            "secret_ref": "response-secret-ref",
++            "created_at": "2026-07-23T08:00:00Z",
++            "updated_at": "2026-07-23T08:00:00Z"
++        }))
++        .unwrap();
++        let create_sink = NewEventSink {
++            name: "sink".into(),
++            kind: EventSinkKind::Webhook,
++            config: Some(json!({"authorization": "create-secret"})),
++            enabled: Some(true),
++            secret_ref: Some("create-secret-ref".into()),
++        };
++        let update_sink = UpdateEventSink {
++            config: Some(json!({"password": "update-secret"})),
++            secret_ref: Some("update-secret-ref".into()),
++            ..Default::default()
++        };
++        let subscription: EventSubscription = serde_json::from_value(json!({
++            "id": 2,
++            "collection_id": 3,
++            "sink_id": 1,
++            "name": "subscription",
++            "description": "",
++            "entity_types": ["object"],
++            "actions": ["updated"],
++            "routing": {"url": "https://example.invalid?token=routing-secret"},
++            "enabled": true,
++            "filter": null,
++            "created_at": "2026-07-23T08:00:00Z",
++            "updated_at": "2026-07-23T08:00:00Z"
++        }))
++        .unwrap();
++        let create_subscription = NewEventSubscription {
++            sink_id: EventSinkId::new(1),
++            name: "subscription".into(),
++            entity_types: vec!["object".into()],
++            actions: vec!["updated".into()],
++            routing: Some(json!({"token": "create-routing-secret"})),
++            ..Default::default()
++        };
++        let update_subscription = UpdateEventSubscription {
++            routing: Some(json!({"token": "update-routing-secret"})),
++            ..Default::default()
++        };
++
++        let debug = format!(
++            "{sink:?} {create_sink:?} {update_sink:?} {subscription:?} \
++             {create_subscription:?} {update_subscription:?}"
++        );
++        for secret in [
++            "response-secret",
++            "response-secret-ref",
++            "create-secret",
++            "create-secret-ref",
++            "update-secret",
++            "update-secret-ref",
++            "routing-secret",
++            "create-routing-secret",
++            "update-routing-secret",
++        ] {
++            assert!(!debug.contains(secret));
++        }
++
++        assert_eq!(
++            create_sink.config.as_ref().unwrap()["authorization"],
++            "create-secret"
++        );
++        assert_eq!(
++            create_subscription.routing.as_ref().unwrap()["token"],
++            "create-routing-secret"
++        );
++    }
++}
+diff -ruN a/src/types/export.rs b/src/types/export.rs
+--- a/src/types/export.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/export.rs	2026-10-18 23:44:15.430640631 +0000
+@@ -147,13 +147,25 @@
+     pub path: Option<String>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ExportJsonResponse {
+     pub items: Vec<serde_json::Value>,
+     pub meta: ExportMeta,
+     pub warnings: Vec<ExportWarning>,
+ }
+ 
++impl std::fmt::Debug for ExportJsonResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ExportJsonResponse")
++            .field("items", &"[REDACTED]")
++            .field("item_count", &self.items.len())
++            .field("meta", &self.meta)
++            .field("warnings", &"[REDACTED]")
++            .field("warning_count", &self.warnings.len())
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct ExportRequest {
+     pub limits: Option<ExportLimits>,
+@@ -172,7 +184,7 @@
+     pub limits: Option<ExportLimits>,
+ }
+ 
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Clone, PartialEq)]
+ pub enum ExportResult {
+     Json(ExportJsonResponse),
+     Rendered {
+@@ -181,6 +193,20 @@
+     },
+ }
+ 
++impl std::fmt::Debug for ExportResult {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Json(response) => f.debug_tuple("Json").field(response).finish(),
++            Self::Rendered { content_type, body } => f
++                .debug_struct("Rendered")
++                .field("content_type", content_type)
++                .field("body", &"[REDACTED]")
++                .field("body_len", &body.len())
++                .finish(),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -234,4 +260,46 @@
+         .unwrap();
+         assert_eq!(w.path.as_deref(), Some("item.data.owner"));
+     }
++
++    #[test]
++    fn export_output_debug_redacts_payloads() {
++        let response = ExportJsonResponse {
++            items: vec![serde_json::json!({"secret": "json-export-secret"})],
++            meta: ExportMeta {
++                content_type: ExportContentType::ApplicationJson,
++                count: 1,
++                scope: ExportScope {
++                    class_id: None,
++                    kind: ExportScopeKind::Collections,
++                    object_id: None,
++                },
++                truncated: false,
++            },
++            warnings: vec![ExportWarning {
++                code: "warning".into(),
++                message: "warning-export-secret".into(),
++                path: None,
++            }],
++        };
++        let json_debug = format!("{response:?}");
++        let rendered_debug = format!(
++            "{:?}",
++            ExportResult::Rendered {
++                content_type: ExportContentType::TextPlain,
++                body: "rendered-export-secret".into(),
++            }
++        );
++
++        assert!(!json_debug.contains("json-export-secret"), "{json_debug}");
++        assert!(
++            !json_debug.contains("warning-export-secret"),
++            "{json_debug}"
++        );
++        assert!(json_debug.contains("item_count: 1"), "{json_debug}");
++        assert!(
++            !rendered_debug.contains("rendered-export-secret"),
++            "{rendered_debug}"
++        );
++        assert!(rendered_debug.contains("body_len: 22"), "{rendered_debug}");
++    }
+ }
+diff -ruN a/src/types/history.rs b/src/types/history.rs
+--- a/src/types/history.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/history.rs	2026-10-18 23:44:38.918623781 +0000
+@@ -30,7 +30,7 @@
+     pub history: HistoryMetadata,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ClassHistory {
+     pub id: ClassId,
+     pub name: String,
+@@ -45,7 +45,26 @@
+     pub history: HistoryMetadata,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++impl std::fmt::Debug for ClassHistory {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ClassHistory")
++            .field("id", &self.id)
++            .field("name", &self.name)
++            .field("collection_id", &self.collection_id)
++            .field("validate_schema", &self.validate_schema)
++            .field("description", &self.description)
++            .field(
++                "json_schema",
++                &self.json_schema.as_ref().map(|_| "[REDACTED]"),
++            )
++            .field("created_at", &self.created_at)
++            .field("updated_at", &self.updated_at)
++            .field("history", &self.history)
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ObjectHistory {
+     pub id: ObjectId,
+     pub name: String,
+@@ -59,6 +78,22 @@
+     pub history: HistoryMetadata,
+ }
+ 
++impl std::fmt::Debug for ObjectHistory {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ObjectHistory")
++            .field("id", &self.id)
++            .field("name", &self.name)
++            .field("collection_id", &self.collection_id)
++            .field("hubuum_class_id", &self.hubuum_class_id)
++            .field("data", &"[REDACTED]")
++            .field("description", &self.description)
++            .field("created_at", &self.created_at)
++            .field("updated_at", &self.updated_at)
++            .field("history", &self.history)
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ExportTemplateHistory {
+     pub id: ExportTemplateId,
+diff -ruN a/src/types/import.rs b/src/types/import.rs
+--- a/src/types/import.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/import.rs	2026-10-18 23:44:15.434640627 +0000
+@@ -114,7 +114,7 @@
+     pub parent_collection_key: Option<CollectionKey>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ImportClassInput {
+     #[serde(rename = "ref")]
+     pub ref_: Option<String>,
+@@ -126,7 +126,24 @@
+     pub collection_key: Option<CollectionKey>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++impl std::fmt::Debug for ImportClassInput {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportClassInput")
++            .field("ref_", &self.ref_)
++            .field("name", &self.name)
++            .field("description", &self.description)
++            .field(
++                "json_schema",
++                &self.json_schema.as_ref().map(|_| "[REDACTED]"),
++            )
++            .field("validate_schema", &self.validate_schema)
++            .field("collection_ref", &self.collection_ref)
++            .field("collection_key", &self.collection_key)
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ImportObjectInput {
+     #[serde(rename = "ref")]
+     pub ref_: Option<String>,
+@@ -137,6 +154,19 @@
+     pub class_key: Option<ClassKey>,
+ }
+ 
++impl std::fmt::Debug for ImportObjectInput {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportObjectInput")
++            .field("ref_", &self.ref_)
++            .field("name", &self.name)
++            .field("description", &self.description)
++            .field("data", &"[REDACTED]")
++            .field("class_ref", &self.class_ref)
++            .field("class_key", &self.class_key)
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct ImportClassRelationInput {
+     #[serde(rename = "ref")]
+@@ -168,7 +198,7 @@
+     pub replace_existing: Option<bool>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
+ pub struct ImportGraph {
+     #[serde(default)]
+     pub collections: Vec<ImportCollectionInput>,
+@@ -184,7 +214,23 @@
+     pub collection_permissions: Vec<ImportCollectionPermissionInput>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++impl std::fmt::Debug for ImportGraph {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportGraph")
++            .field("collection_count", &self.collections.len())
++            .field("class_count", &self.classes.len())
++            .field("object_count", &self.objects.len())
++            .field("class_relation_count", &self.class_relations.len())
++            .field("object_relation_count", &self.object_relations.len())
++            .field(
++                "collection_permission_count",
++                &self.collection_permissions.len(),
++            )
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ pub struct ImportRequest {
+     pub version: i32,
+     pub dry_run: Option<bool>,
+@@ -192,6 +238,17 @@
+     pub graph: ImportGraph,
+ }
+ 
++impl std::fmt::Debug for ImportRequest {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportRequest")
++            .field("version", &self.version)
++            .field("dry_run", &self.dry_run)
++            .field("mode", &self.mode)
++            .field("graph", &self.graph)
++            .finish()
++    }
++}
++
+ impl ImportRequest {
+     pub fn new(graph: ImportGraph) -> Self {
+         Self {
+@@ -222,13 +279,22 @@
+     }
+ }
+ 
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Clone, PartialEq)]
+ #[non_exhaustive]
+ pub struct ImportRunResult {
+     pub task: TaskResponse,
+     pub changes: Vec<ImportTaskResultResponse>,
+ }
+ 
++impl std::fmt::Debug for ImportRunResult {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportRunResult")
++            .field("task", &self.task)
++            .field("change_count", &self.changes.len())
++            .finish()
++    }
++}
++
+ impl ImportRunResult {
+     pub fn succeeded(&self) -> usize {
+         self.changes
+@@ -281,4 +347,43 @@
+             })
+         );
+     }
++
++    #[test]
++    fn import_diagnostics_redact_schema_and_object_payloads() {
++        let class = ImportClassInput {
++            ref_: Some("class-ref".into()),
++            name: "server".into(),
++            description: "server schema".into(),
++            json_schema: Some(serde_json::json!({
++                "default": "schema-secret"
++            })),
++            validate_schema: Some(true),
++            collection_ref: Some("collection-ref".into()),
++            collection_key: None,
++        };
++        let object = ImportObjectInput {
++            ref_: Some("object-ref".into()),
++            name: "server-1".into(),
++            description: "server".into(),
++            data: serde_json::json!({"token": "object-secret"}),
++            class_ref: Some("class-ref".into()),
++            class_key: None,
++        };
++        let request = ImportRequest::new(ImportGraph {
++            classes: vec![class.clone()],
++            objects: vec![object.clone()],
++            ..Default::default()
++        });
++
++        let diagnostic = format!("{class:?} {object:?} {request:?}");
++        assert!(!diagnostic.contains("schema-secret"), "{diagnostic}");
++        assert!(!diagnostic.contains("object-secret"), "{diagnostic}");
++        assert!(diagnostic.contains("class_count: 1"), "{diagnostic}");
++        assert!(diagnostic.contains("object_count: 1"), "{diagnostic}");
++        assert_eq!(
++            class.json_schema.as_ref().unwrap()["default"],
++            "schema-secret"
++        );
++        assert_eq!(object.data["token"], "object-secret");
++    }
+ }
+diff -ruN a/src/types/remote.rs b/src/types/remote.rs
+--- a/src/types/remote.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/remote.rs	2026-10-18 23:44:15.434640627 +0000
+@@ -416,7 +416,7 @@
+             )
+             .field("duration_ms", &self.duration_ms)
+             .field("success", &self.success)
+-            .field("error", &self.error)
++            .field("error", &redacted_if_present(&self.error))
+             .field("created_at", &self.created_at)
+             .finish()
+     }
+@@ -488,4 +488,34 @@
+             assert!(!debug.contains(secret));
+         }
+     }
++
++    #[test]
++    fn remote_result_debug_redacts_response_and_error_details() {
++        let result: RemoteCallResult = serde_json::from_value(json!({
++            "id": 11,
++            "task_id": 12,
++            "target_id": 13,
++            "subject_type": "object",
++            "subject_id": 14,
++            "method": "GET",
++            "rendered_url": "https://example.invalid/resource/14?token=url-secret",
++            "response_status": 502,
++            "response_headers": {"authorization": "header-secret"},
++            "response_body_preview": "body-secret",
++            "duration_ms": 5,
++            "success": false,
++            "error": "upstream rejected bearer error-secret",
++            "created_at": "2026-07-11T10:00:00Z"
++        }))
++        .unwrap();
++
++        let debug = format!("{result:?}");
++        for secret in ["url-secret", "header-secret", "body-secret", "error-secret"] {
++            assert!(!debug.contains(secret));
++        }
++        assert_eq!(
++            result.error.as_deref(),
++            Some("upstream rejected bearer error-secret")
++        );
++    }
+ }
+diff -ruN a/src/types/task.rs b/src/types/task.rs
+--- a/src/types/task.rs	2026-10-18 19:18:29.000000000 +0000
++++ b/src/types/task.rs	2026-10-18 23:44:15.418640639 +0000
+@@ -59,7 +59,7 @@
+     pub failed_items: i32,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct TaskLinks {
+     pub task: String,
+     pub events: String,
+@@ -72,12 +72,39 @@
+     pub backup_output: Option<String>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++fn redacted_if_present<T>(value: &Option<T>) -> Option<&'static str> {
++    value.as_ref().map(|_| "[REDACTED]")
++}
++
++impl std::fmt::Debug for TaskLinks {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TaskLinks")
++            .field("task", &"[REDACTED]")
++            .field("events", &"[REDACTED]")
++            .field("import_url", &redacted_if_present(&self.import_url))
++            .field("import_results", &redacted_if_present(&self.import_results))
++            .field("export", &redacted_if_present(&self.export))
++            .field("export_output", &redacted_if_present(&self.export_output))
++            .field("backup", &redacted_if_present(&self.backup))
++            .field("backup_output", &redacted_if_present(&self.backup_output))
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct ImportTaskDetails {
+     pub results_url: String,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++impl std::fmt::Debug for ImportTaskDetails {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportTaskDetails")
++            .field("results_url", &"[REDACTED]")
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct ExportTaskDetails {
+     pub output_url: String,
+     pub output_available: bool,
+@@ -89,7 +116,22 @@
+     pub warning_count: Option<i32>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++impl std::fmt::Debug for ExportTaskDetails {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ExportTaskDetails")
++            .field("output_url", &"[REDACTED]")
++            .field("output_available", &self.output_available)
++            .field("output_expired", &self.output_expired)
++            .field("output_content_type", &self.output_content_type)
++            .field("output_expires_at", &self.output_expires_at)
++            .field("template_name", &self.template_name)
++            .field("truncated", &self.truncated)
++            .field("warning_count", &self.warning_count)
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct BackupTaskDetails {
+     pub output_url: String,
+     pub output_available: bool,
+@@ -99,6 +141,19 @@
+     pub sha256: Option<String>,
+ }
+ 
++impl std::fmt::Debug for BackupTaskDetails {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("BackupTaskDetails")
++            .field("output_url", &"[REDACTED]")
++            .field("output_available", &self.output_available)
++            .field("output_expired", &self.output_expired)
++            .field("byte_size", &self.byte_size)
++            .field("output_expires_at", &self.output_expires_at)
++            .field("sha256", &self.sha256)
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct TaskDetails {
+     #[serde(rename = "import")]
+@@ -107,7 +162,7 @@
+     pub backup: Option<BackupTaskDetails>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+ #[non_exhaustive]
+ pub struct TaskResponse {
+     pub id: TaskId,
+@@ -124,7 +179,26 @@
+     pub details: Option<TaskDetails>,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++impl std::fmt::Debug for TaskResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TaskResponse")
++            .field("id", &self.id)
++            .field("kind", &self.kind)
++            .field("status", &self.status)
++            .field("submitted_by", &self.submitted_by)
++            .field("created_at", &self.created_at)
++            .field("started_at", &self.started_at)
++            .field("finished_at", &self.finished_at)
++            .field("progress", &self.progress)
++            .field("summary", &redacted_if_present(&self.summary))
++            .field("request_redacted_at", &self.request_redacted_at)
++            .field("links", &self.links)
++            .field("details", &self.details)
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ #[non_exhaustive]
+ pub struct TaskEventResponse {
+     pub id: TaskEventId,
+@@ -135,7 +209,20 @@
+     pub created_at: HubuumDateTime,
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++impl std::fmt::Debug for TaskEventResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TaskEventResponse")
++            .field("id", &self.id)
++            .field("task_id", &self.task_id)
++            .field("event_type", &self.event_type)
++            .field("message", &"[REDACTED]")
++            .field("data", &redacted_if_present(&self.data))
++            .field("created_at", &self.created_at)
++            .finish()
++    }
++}
++
++#[derive(Clone, Serialize, Deserialize, PartialEq)]
+ #[non_exhaustive]
+ pub struct ImportTaskResultResponse {
+     pub id: ImportResultId,
+@@ -150,6 +237,23 @@
+     pub created_at: HubuumDateTime,
+ }
+ 
++impl std::fmt::Debug for ImportTaskResultResponse {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ImportTaskResultResponse")
++            .field("id", &self.id)
++            .field("task_id", &self.task_id)
++            .field("item_ref", &redacted_if_present(&self.item_ref))
++            .field("entity_kind", &self.entity_kind)
++            .field("action", &self.action)
++            .field("identifier", &redacted_if_present(&self.identifier))
++            .field("outcome", &self.outcome)
++            .field("error", &redacted_if_present(&self.error))
++            .field("details", &redacted_if_present(&self.details))
++            .field("created_at", &self.created_at)
++            .finish()
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct TaskQueueStateResponse {
+     pub actix_workers: usize,
+@@ -223,4 +327,78 @@
+         assert!(export.output_available);
+         assert_eq!(export.warning_count, Some(0));
+     }
++
++    #[test]
++    fn task_and_import_diagnostics_redact_server_details() {
++        let task: TaskResponse = serde_json::from_value(serde_json::json!({
++            "id": 5,
++            "kind": "import",
++            "status": "failed",
++            "submitted_by": 1,
++            "created_at": "2026-07-23T08:00:00Z",
++            "started_at": "2026-07-23T08:00:01Z",
++            "finished_at": "2026-07-23T08:00:02Z",
++            "progress": {
++                "total_items": 1,
++                "processed_items": 1,
++                "success_items": 0,
++                "failed_items": 1
++            },
++            "summary": "task-summary-secret",
++            "request_redacted_at": null,
++            "links": {
++                "task": "/api/v1/tasks/5?capability=task-link-secret",
++                "events": "/api/v1/tasks/5/events",
++                "import": "/api/v1/imports/5",
++                "import_results": "/api/v1/imports/5/results"
++            },
++            "details": {
++                "import": {
++                    "results_url": "/api/v1/imports/5/results?token=details-secret"
++                }
++            }
++        }))
++        .expect("task fixture should deserialize");
++        let event: TaskEventResponse = serde_json::from_value(serde_json::json!({
++            "id": 7,
++            "task_id": 5,
++            "event_type": "failed",
++            "message": "event-message-secret",
++            "data": {"token": "event-data-secret"},
++            "created_at": "2026-07-23T08:00:02Z"
++        }))
++        .expect("event fixture should deserialize");
++        let result: ImportTaskResultResponse = serde_json::from_value(serde_json::json!({
++            "id": 9,
++            "task_id": 5,
++            "item_ref": "item-ref-secret",
++            "entity_kind": "object",
++            "action": "create",
++            "identifier": "identifier-secret",
++            "outcome": "failed",
++            "error": "result-error-secret",
++            "details": {"token": "result-details-secret"},
++            "created_at": "2026-07-23T08:00:02Z"
++        }))
++        .expect("result fixture should deserialize");
++
++        let diagnostic = format!("{task:?} {event:?} {result:?}");
++        for secret in [
++            "task-summary-secret",
++            "task-link-secret",
++            "details-secret",
++            "event-message-secret",
++            "event-data-secret",
++            "item-ref-secret",
++            "identifier-secret",
++            "result-error-secret",
++            "result-details-secret",
++        ] {
++            assert!(!diagnostic.contains(secret), "{diagnostic}");
++        }
++
++        assert_eq!(task.summary.as_deref(), Some("task-summary-secret"));
++        assert_eq!(event.message, "event-message-secret");
++        assert_eq!(result.error.as_deref(), Some("result-error-secret"));
++    }
+ }

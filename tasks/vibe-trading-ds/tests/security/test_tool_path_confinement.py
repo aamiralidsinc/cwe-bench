@@ -1,0 +1,353 @@
+"""Agent tools must not read or modify server files outside the areas they serve.
+
+Every test drives the agent loop with the tool call a prompt-steered model would
+make, and asserts the call is refused (a tool error) with no content returned and
+no side effect. Private files carry a marker that must never come back.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from pathlib import Path
+
+from conftest import (
+    AGENT_DIR,
+    FILE_ROOTS_ENV,
+    MARKER,
+    RUNS_DIR,
+    SKILLS_DIR,
+    UPLOADS_DIR,
+    call_tool,
+    call_tool_fresh,
+    factor_pair_csv,
+    journal_csv,
+    ohlcv_csv,
+    preview,
+    upload,
+    run_route,
+)
+
+SKILL_NAME = "strategy-generate"
+
+
+def _private(path: Path, text: str = f"api_key={MARKER}\n") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _assert_blocked(res, *, marker: str = MARKER) -> None:
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert marker not in res.raw, "private content came back in the tool result"
+
+
+def _tree(root: Path) -> dict:
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            p = Path(dirpath) / name
+            out[str(p.relative_to(root))] = p.read_bytes() if p.is_file() else None
+    return out
+
+
+# ---------------------------------------------------------------- document reader
+
+def test_document_absolute_path_in_home(env):
+    secret = _private(env.home / "private" / "credentials.txt")
+    _assert_blocked(call_tool("read_document", {"file_path": str(secret)}, env.run_dir))
+
+
+def test_document_relative_to_working_directory(env):
+    _private(env.proj / "config" / "service.env")
+    rel = f"{env.proj.name}/config/service.env"
+    _assert_blocked(call_tool("read_document", {"file_path": rel}, env.run_dir))
+
+
+def test_document_dot_dot_out_of_upload_area(env):
+    secret = _private(env.outside / "notes.txt")
+    escaping = str(UPLOADS_DIR) + "/" + os.path.relpath(secret, UPLOADS_DIR)
+    assert ".." in escaping
+    _assert_blocked(call_tool("read_document", {"file_path": escaping}, env.run_dir))
+
+
+def test_document_symlink_in_upload_area_pointing_outside(env):
+    secret = _private(env.outside / "notes.txt")
+    link = UPLOADS_DIR / f"vtgrade_{uuid.uuid4().hex[:10]}.txt"
+    os.symlink(secret, link)
+    env.created.append(link)
+    _assert_blocked(call_tool("read_document", {"file_path": str(link)}, env.run_dir))
+
+
+def test_document_sibling_of_configured_directory(env):
+    allowed = env.home / "imports"
+    allowed.mkdir()
+    secret = _private(env.home / "imports-old" / "notes.txt")
+    _assert_blocked(call_tool_fresh("read_document", {"file_path": str(secret)}, env.run_dir,
+                                    **{FILE_ROOTS_ENV: str(allowed)}))
+
+
+# ---------------------------------------------------------------- broker-statement tools
+
+def test_trade_statement_elsewhere_in_home(env):
+    journal = env.home / "Documents" / "broker_export.csv"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(journal_csv(), encoding="utf-8")
+    res = call_tool("analyze_trade_journal", {"file_path": str(journal)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "600519" not in res.raw and "total_records" not in res.raw
+
+
+def test_trade_statement_home_shorthand(env):
+    (env.home / "Desktop").mkdir()
+    (env.home / "Desktop" / "trades.csv").write_text(journal_csv(), encoding="utf-8")
+    res = call_tool("analyze_trade_journal", {"file_path": "~/Desktop/trades.csv"}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "total_records" not in res.raw
+
+
+def test_trade_statement_link_in_upload_area_pointing_into_home(env):
+    journal = env.home / "Documents" / "broker_export.csv"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(journal_csv(), encoding="utf-8")
+    link = UPLOADS_DIR / f"vtgrade_{uuid.uuid4().hex[:10]}.csv"
+    os.symlink(journal, link)
+    env.created.append(link)
+    res = call_tool("analyze_trade_journal", {"file_path": str(link)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "total_records" not in res.raw
+
+
+def test_trade_statement_relative_to_working_directory(env):
+    (env.proj / "exports").mkdir()
+    (env.proj / "exports" / "trades.csv").write_text(journal_csv(), encoding="utf-8")
+    rel = f"{env.proj.name}/exports/trades.csv"
+    res = call_tool("analyze_trade_journal", {"file_path": rel}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "total_records" not in res.raw
+
+
+def test_shadow_profile_from_statement_elsewhere_in_home(env):
+    journal = env.home / "Downloads" / "broker_export.csv"
+    journal.parent.mkdir(parents=True)
+    journal.write_text(journal_csv(), encoding="utf-8")
+    res = call_tool("extract_shadow_strategy", {"journal_path": str(journal)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    store = env.home / ".vibe-trading" / "shadow_accounts"
+    assert not store.exists() or not any(store.iterdir()), "a profile was built from the file"
+
+
+# ---------------------------------------------------------------- run-workspace tools
+
+def test_read_file_with_workspace_set_to_other_directory(env):
+    _private(env.outside / "secrets.txt")
+    res = call_tool("read_file", {"path": "secrets.txt", "run_dir": str(env.outside)}, env.run_dir)
+    _assert_blocked(res)
+
+
+def test_read_file_with_relative_workspace_climbing_out(env):
+    _private(env.outside / "secrets.txt")
+    rel = os.path.relpath(env.outside, env.run_dir)
+    assert rel.startswith("..")
+    res = call_tool("read_file", {"path": "secrets.txt", "run_dir": rel}, env.run_dir)
+    _assert_blocked(res)
+
+
+def test_read_file_with_workspace_beside_run_storage(env):
+    sibling = RUNS_DIR.parent / f"{RUNS_DIR.name}_vtgrade_{uuid.uuid4().hex[:10]}"
+    env.created.append(sibling)
+    _private(sibling / "secrets.txt")
+    res = call_tool("read_file", {"path": "secrets.txt", "run_dir": str(sibling)}, env.run_dir)
+    _assert_blocked(res)
+
+
+def test_write_file_with_workspace_set_to_other_directory(env):
+    res = call_tool("write_file", {"path": "code/signal_engine.py", "content": "# vt marker\n",
+                                   "run_dir": str(env.outside)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert _tree(env.outside) == {}, "a file was written outside the run workspace"
+
+
+def test_edit_file_with_workspace_set_to_other_directory(env):
+    target = _private(env.outside / "settings.ini", "mode=safe\n")
+    res = call_tool("edit_file", {"path": "settings.ini", "old_text": "safe", "new_text": "open",
+                                  "run_dir": str(env.outside)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert target.read_text(encoding="utf-8") == "mode=safe\n"
+    assert "mode=safe" not in res.raw
+
+
+def test_pattern_scan_on_other_directory(env):
+    arts = env.outside / "artifacts"
+    arts.mkdir()
+    (arts / "ohlcv_VTPRIV.csv").write_text(ohlcv_csv(), encoding="utf-8")
+    res = call_tool("pattern", {"run_dir": str(env.outside)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "VTPRIV" not in res.raw
+
+
+def test_backtest_on_other_directory(env):
+    (env.outside / "code").mkdir()
+    (env.outside / "config.json").write_text(json.dumps({"source": "yfinance", "codes": []}),
+                                             encoding="utf-8")
+    (env.outside / "code" / "signal_engine.py").write_text(
+        "class SignalEngine:\n    def generate(self, data_map):\n        return {}\n", encoding="utf-8")
+    before = _tree(env.outside)
+    res = call_tool("backtest", {"run_dir": str(env.outside)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert _tree(env.outside) == before, "the backtest ran in (and wrote to) the other directory"
+
+
+# ---------------------------------------------------------------- factor analysis
+
+def test_factor_inputs_from_home(env):
+    f_text, r_text = factor_pair_csv()
+    (env.home / "data").mkdir()
+    fpath, rpath = env.home / "data" / "f.csv", env.home / "data" / "r.csv"
+    fpath.write_text(f_text, encoding="utf-8")
+    rpath.write_text(r_text, encoding="utf-8")
+    out_dir = env.run_dir / "factor_out"
+    res = call_tool("factor_analysis", {"factor_csv": str(fpath), "return_csv": str(rpath),
+                                        "output_dir": str(out_dir)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert "ic_mean" not in res.raw
+    assert not (out_dir / "ic_series.csv").exists()
+
+
+def test_factor_output_to_other_directory(env):
+    f_text, r_text = factor_pair_csv()
+    arts = env.run_dir / "artifacts"
+    arts.mkdir()
+    (arts / "f.csv").write_text(f_text, encoding="utf-8")
+    (arts / "r.csv").write_text(r_text, encoding="utf-8")
+    target = env.outside / "report"
+    res = call_tool("factor_analysis", {"factor_csv": str(arts / "f.csv"), "return_csv": str(arts / "r.csv"),
+                                        "output_dir": str(target)}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert not target.exists(), "an output directory was created outside the run storage"
+
+
+# ---------------------------------------------------------------- stored-document preview
+
+def test_preview_absolute_path_outside(env):
+    secret = _private(env.outside / "credentials.txt")
+    resp = preview(str(secret))
+    assert 400 <= resp.status_code < 500, f"preview did not refuse: {resp.status_code}"
+    assert MARKER not in resp.text
+
+
+def test_preview_dot_dot_out_of_upload_area(env):
+    secret = _private(env.outside / "notes.txt")
+    escaping = str(UPLOADS_DIR) + "/" + os.path.relpath(secret, UPLOADS_DIR)
+    assert ".." in escaping
+    resp = preview(escaping)
+    assert 400 <= resp.status_code < 500, f"preview did not refuse: {resp.status_code}"
+    assert MARKER not in resp.text
+
+
+# ---------------------------------------------------------------- data pointed at by run data
+
+def _run_workspace(env, config: dict) -> None:
+    (env.run_dir / "code").mkdir(exist_ok=True)
+    (env.run_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine:\n    def generate(self, data_map):\n        return {}\n", encoding="utf-8")
+    (env.run_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+
+def test_backtest_data_override_outside_run(env):
+    secret = _private(env.outside / "bars.csv", "close\n" + MARKER + "\n")
+    _run_workspace(env, {"source": "yfinance", "codes": [], "local_data_file": str(secret)})
+    res = call_tool("backtest", {}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert MARKER not in res.raw
+
+
+def test_backtest_data_override_climbing_out_of_run(env):
+    secret = _private(env.tmp / "private" / "bars.csv", "close\n" + MARKER + "\n")
+    rel = os.path.relpath(secret, env.run_dir)
+    assert rel.startswith("..")
+    _run_workspace(env, {"source": "yfinance", "codes": [], "local_data_file": rel})
+    res = call_tool("backtest", {}, env.run_dir)
+    assert res.refused, f"expected a tool error, got: {res.raw[:300]}"
+    assert MARKER not in res.raw
+
+
+# ---------------------------------------------------------------- skill supporting files
+
+def test_skill_support_file_absolute_outside(env):
+    secret = _private(env.outside / "notes.md")
+    res = call_tool("load_skill", {"name": SKILL_NAME, "file": str(secret)}, env.run_dir)
+    _assert_blocked(res)
+
+
+def test_skill_support_file_dot_dot_out_of_skill_directory(env):
+    secret = _private(env.outside / "notes.md")
+    rel = os.path.relpath(secret, SKILLS_DIR / SKILL_NAME)
+    assert rel.startswith("..")
+    res = call_tool("load_skill", {"name": SKILL_NAME, "file": rel}, env.run_dir)
+    _assert_blocked(res)
+
+
+# ---------------------------------------------------------------- stored run routes
+
+def _marker_in_app_dir(env, relative: str, text: str) -> Path:
+    """Plant a private file in the application directory, just outside run storage."""
+    path = AGENT_DIR / relative
+    parent_created = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    env.created.append(path)
+    if parent_created:
+        env.created.append(path.parent)
+    return path
+
+
+def test_run_code_route_identifier_climbs_out_of_run_storage(env):
+    _marker_in_app_dir(env, "code/signal_engine.py", f"# {MARKER}\nclass SignalEngine: pass\n")
+    resp = run_route("%2e%2e/code")
+    assert 400 <= resp.status_code < 500, f"run code route did not refuse: {resp.status_code}"
+    assert MARKER not in resp.text
+
+
+def test_run_pine_route_identifier_climbs_out_of_run_storage(env):
+    _marker_in_app_dir(env, "artifacts/strategy.pine", f"// {MARKER}\n")
+    resp = run_route("%2e%2e/pine")
+    assert 400 <= resp.status_code < 500, f"run pine route did not refuse: {resp.status_code}"
+    assert MARKER not in resp.text
+
+
+# ---------------------------------------------------------------- location recorded with a profile
+
+def _marker_journal() -> str:
+    """A broker export whose symbols carry the private marker, held outside the profile's rules."""
+    header = "成交时间,证券代码,证券名称,操作,成交数量,成交价格,成交金额,手续费,印花税,过户费"
+    rows = [header]
+    for i in range(3):
+        buy_day = 1 + i * 4
+        sell_day = buy_day + 9
+        rows.append(f"2026-02-{buy_day:02d} 10:30:00,{MARKER},标的{i},买入,100.0,10.0,1000.0,0.25,0.0,0.0")
+        rows.append(f"2026-02-{sell_day:02d} 14:15:00,{MARKER},标的{i},卖出,100.0,10.4,1040.0,0.26,1.04,0.0")
+    return "\n".join(rows) + "\n"
+
+
+def test_shadow_backtest_recorded_statement_link_resolving_outside(env):
+    uploaded = upload(journal_csv().encode("utf-8"), "broker.csv")
+    res = call_tool("extract_shadow_strategy", {"journal_path": str(uploaded)}, env.run_dir)
+    assert res.ok, res.raw[:300]
+    shadow_id = res.body["shadow_id"]
+
+    secret = _private(env.outside / "private_broker.csv", _marker_journal())
+    uploaded.unlink()
+    os.symlink(secret, uploaded)
+
+    res = call_tool("run_shadow_backtest", {"shadow_id": shadow_id, "markets": ["us"],
+                                            "window_start": "2026-01-01",
+                                            "window_end": "2026-03-31"}, env.run_dir)
+    assert MARKER not in res.raw, "the private statement came back through the attribution"
+    if res.ok:
+        # A fix may skip attribution instead of refusing; it must not have used the file.
+        assert not res.body.get("attribution", {}).get("counterfactual_trades"), res.raw[:300]
+        assert not res.body.get("real_total_pnl"), res.raw[:300]
+    else:
+        assert res.refused, f"expected a tool error, got: {res.raw[:300]}"

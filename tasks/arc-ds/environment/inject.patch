@@ -1,0 +1,661 @@
+diff --git a/cmd/arc/main.go b/cmd/arc/main.go
+index c96a1fa..025c87c 100644
+--- a/cmd/arc/main.go
++++ b/cmd/arc/main.go
+@@ -1221,6 +1221,30 @@ func main() {
+ 	}
+ 	queryHandler.RegisterRoutes(server.GetApp())
+ 
++	// Query-builder preview endpoint: samples the SQL the user is editing on
++	// a short-lived in-memory database so the shared pool is not pinned.
++	previewHandler := api.NewQueryPreviewHandler(logger.Get("query-preview"))
++	previewHandler.RegisterRoutes(server.GetApp())
++
++	// Export artifact download endpoint. Export files live under the local
++	// storage backend's export directory.
++	exportRoot := filepath.Join(cfg.Storage.LocalPath, "exports")
++	if err := os.MkdirAll(exportRoot, 0o755); err != nil {
++		log.Fatal().Err(err).Str("path", exportRoot).Msg("Failed to create export directory")
++	}
++	exportHandler := api.NewExportHandler(exportRoot, logger.Get("export"))
++	exportHandler.RegisterRoutes(server.GetApp())
++
++	// Alert delivery diagnostics: lets an operator fire a test notification at
++	// the configured webhook receiver before enabling real alert conditions.
++	alertHandler := api.NewAlertHandler(cfg.Alerts.WebhookURL, authManager, logger.Get("alerts"))
++	alertHandler.RegisterRoutes(server.GetApp())
++
++	// Stored report definitions. Reports are reusable aggregate queries that
++	// run on demand against a measurement's stored data.
++	reportHandler := api.NewReportHandler(storageBackend, authManager, logger.Get("reports"))
++	reportHandler.RegisterRoutes(server.GetApp())
++
+ 	// Wire up cluster router to handlers for request forwarding
+ 	// This enables reader nodes to forward writes to writers, and
+ 	// compactor nodes to forward queries to readers/writers
+diff --git a/internal/api/alert_webhook.go b/internal/api/alert_webhook.go
+new file mode 100644
+index 0000000..3bdc3c4
+--- /dev/null
++++ b/internal/api/alert_webhook.go
+@@ -0,0 +1,126 @@
++package api
++
++import (
++	"bytes"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/basekick-labs/arc/internal/auth"
++	"github.com/gofiber/fiber/v2"
++	"github.com/rs/zerolog"
++)
++
++// alertDeliveryTimeout bounds a single webhook delivery attempt. Alert
++// notifications are fire-and-forget; a receiver that has not answered in
++// this window is treated as unavailable so the diagnostics endpoint returns
++// promptly.
++const alertDeliveryTimeout = 5 * time.Second
++
++// AlertRequest is the body of a test-delivery request.
++type AlertRequest struct {
++	// WebhookURL optionally overrides the operator-configured receiver for a
++	// single test delivery.
++	WebhookURL string `json:"webhook_url"`
++	Message    string `json:"message"`
++}
++
++// AlertHandler serves the alert-delivery diagnostics endpoint. Operators use
++// it to confirm that Arc can reach the configured webhook receiver before an
++// alert condition actually fires.
++type AlertHandler struct {
++	defaultURL  string
++	authManager *auth.AuthManager
++	client      *http.Client
++	logger      zerolog.Logger
++}
++
++// NewAlertHandler creates an alert-delivery handler. defaultURL is the
++// operator-configured receiver from the [alerts] configuration section.
++func NewAlertHandler(defaultURL string, authManager *auth.AuthManager, logger zerolog.Logger) *AlertHandler {
++	return &AlertHandler{
++		defaultURL:  defaultURL,
++		authManager: authManager,
++		client:      &http.Client{Timeout: alertDeliveryTimeout},
++		logger:      logger.With().Str("component", "alert-handler").Logger(),
++	}
++}
++
++// RegisterRoutes registers the alert diagnostics endpoint. Delivery touches
++// an external system, so it is admin-tier.
++func (h *AlertHandler) RegisterRoutes(app *fiber.App) {
++	app.Post("/api/v1/alerts/test", withAdminAuth(h.authManager), h.handleTest)
++}
++
++func (h *AlertHandler) handleTest(c *fiber.Ctx) error {
++	var req AlertRequest
++	if err := c.BodyParser(&req); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Invalid request body: " + err.Error(),
++		})
++	}
++
++	// A single test delivery may target an alternative receiver, which is
++	// useful when validating a receiver before it is promoted to the
++	// configured default.
++	target := strings.TrimSpace(req.WebhookURL)
++	if target == "" {
++		target = strings.TrimSpace(h.defaultURL)
++	}
++	if target == "" {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "no alert receiver configured",
++		})
++	}
++
++	message := req.Message
++	if message == "" {
++		message = "Arc alert delivery test"
++	}
++	payload, err := json.Marshal(fiber.Map{"text": message, "source": "arc"})
++	if err != nil {
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to encode alert payload",
++		})
++	}
++
++	httpReq, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(payload))
++	if err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Invalid alert receiver URL",
++		})
++	}
++	httpReq.Header.Set("Content-Type", "application/json")
++
++	resp, err := h.client.Do(httpReq)
++	if err != nil {
++		h.logger.Warn().Err(err).Msg("Alert delivery failed")
++		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
++			"success": false,
++			"error":   "Alert delivery failed: " + err.Error(),
++		})
++	}
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
++	resp.Body.Close()
++
++	if resp.StatusCode >= 300 {
++		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
++			"success":     false,
++			"error":       "Alert receiver rejected the delivery",
++			"status_code": resp.StatusCode,
++		})
++	}
++
++	h.logger.Info().Int("status_code", resp.StatusCode).Msg("Alert delivery test succeeded")
++	return c.JSON(fiber.Map{
++		"success":     true,
++		"delivered":   true,
++		"status_code": resp.StatusCode,
++	})
++}
+diff --git a/internal/api/export_download.go b/internal/api/export_download.go
+new file mode 100644
+index 0000000..8941fad
+--- /dev/null
++++ b/internal/api/export_download.go
+@@ -0,0 +1,62 @@
++package api
++
++import (
++	"os"
++	"path/filepath"
++
++	"github.com/gofiber/fiber/v2"
++	"github.com/rs/zerolog"
++)
++
++// ExportHandler serves completed export artifacts. Exports are written as
++// flat files under the storage backend's export directory; this endpoint
++// lets an operator pull one back over HTTP without direct filesystem or S3
++// access.
++type ExportHandler struct {
++	root   string
++	logger zerolog.Logger
++}
++
++// NewExportHandler creates an export-download handler rooted at dir.
++func NewExportHandler(root string, logger zerolog.Logger) *ExportHandler {
++	return &ExportHandler{
++		root:   root,
++		logger: logger.With().Str("component", "export-handler").Logger(),
++	}
++}
++
++// RegisterRoutes registers the export-download endpoint.
++func (h *ExportHandler) RegisterRoutes(app *fiber.App) {
++	app.Get("/api/v1/export/download", h.handleDownload)
++}
++
++// handleDownload streams the named artifact from the export directory.
++func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
++	name := c.Query("path")
++	if name == "" {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "path is required",
++		})
++	}
++
++	fullPath := filepath.Join(h.root, name)
++	data, err := os.ReadFile(fullPath)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
++				"success": false,
++				"error":   "export artifact not found",
++			})
++		}
++		h.logger.Error().Err(err).Str("path", fullPath).Msg("Failed to read export artifact")
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "failed to read export artifact",
++		})
++	}
++
++	c.Set("Content-Type", "application/octet-stream")
++	c.Set("Content-Disposition", "attachment; filename=\""+filepath.Base(fullPath)+"\"")
++	return c.Send(data)
++}
+diff --git a/internal/api/query_preview.go b/internal/api/query_preview.go
+new file mode 100644
+index 0000000..6ab1439
+--- /dev/null
++++ b/internal/api/query_preview.go
+@@ -0,0 +1,137 @@
++package api
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/gofiber/fiber/v2"
++	"github.com/rs/zerolog"
++)
++
++// maxPreviewRows bounds the sample the preview endpoint returns. The query
++// builder renders a handful of rows while the user is still editing; the
++// bound keeps a preview from streaming a large result set.
++const maxPreviewRows = 25
++
++// previewTimeout bounds a single preview request. Previews are interactive,
++// so a query that cannot produce a sample within this window is reported as
++// too slow rather than left running.
++const previewTimeout = 15 * time.Second
++
++// QueryPreviewHandler serves POST /api/v1/query/preview, the endpoint behind
++// the query builder's "preview" button: the UI posts the SQL as typed and
++// renders the first rows before the user runs the full query.
++type QueryPreviewHandler struct {
++	logger zerolog.Logger
++}
++
++// PreviewRequest is the body of a preview request.
++type PreviewRequest struct {
++	SQL string `json:"sql"`
++}
++
++// NewQueryPreviewHandler creates a preview handler.
++func NewQueryPreviewHandler(logger zerolog.Logger) *QueryPreviewHandler {
++	return &QueryPreviewHandler{
++		logger: logger.With().Str("component", "query-preview-handler").Logger(),
++	}
++}
++
++// RegisterRoutes registers the preview endpoint.
++func (h *QueryPreviewHandler) RegisterRoutes(app *fiber.App) {
++	app.Post("/api/v1/query/preview", h.handlePreview)
++}
++
++// handlePreview parses the query, runs it with a row cap, and returns the
++// sample as JSON. The query runs on a short-lived in-memory database so an
++// abandoned preview cannot pin a connection in the shared pool.
++func (h *QueryPreviewHandler) handlePreview(c *fiber.Ctx) error {
++	var req PreviewRequest
++	if err := c.BodyParser(&req); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Invalid request body: " + err.Error(),
++		})
++	}
++
++	if strings.TrimSpace(req.SQL) == "" {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "SQL query is required",
++		})
++	}
++
++	if err := ValidateSQLRequest(req.SQL); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   err.Error(),
++		})
++	}
++
++	ctx, cancel := context.WithTimeout(c.UserContext(), previewTimeout)
++	defer cancel()
++
++	db, err := sql.Open("duckdb", "")
++	if err != nil {
++		h.logger.Error().Err(err).Msg("Failed to open preview database")
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to initialize preview session",
++		})
++	}
++	defer db.Close()
++
++	start := time.Now()
++	rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS preview LIMIT %d", req.SQL, maxPreviewRows))
++	if err != nil {
++		h.logger.Warn().Err(err).Msg("Preview query failed")
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Preview query failed: " + err.Error(),
++		})
++	}
++	defer rows.Close()
++
++	columns, err := rows.Columns()
++	if err != nil {
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to read preview columns",
++		})
++	}
++
++	data := make([][]interface{}, 0, maxPreviewRows)
++	values := make([]interface{}, len(columns))
++	scanTargets := make([]interface{}, len(columns))
++	for i := range values {
++		scanTargets[i] = &values[i]
++	}
++	for rows.Next() {
++		if err := rows.Scan(scanTargets...); err != nil {
++			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++				"success": false,
++				"error":   "Failed to read preview row",
++			})
++		}
++		row := make([]interface{}, len(values))
++		copy(row, values)
++		data = append(data, row)
++	}
++	if err := rows.Err(); err != nil {
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to read preview result",
++		})
++	}
++
++	return c.JSON(fiber.Map{
++		"success":           true,
++		"columns":           columns,
++		"data":              data,
++		"row_count":         len(data),
++		"execution_time_ms": float64(time.Since(start).Milliseconds()),
++	})
++}
+diff --git a/internal/api/reports.go b/internal/api/reports.go
+new file mode 100644
+index 0000000..75fca8e
+--- /dev/null
++++ b/internal/api/reports.go
+@@ -0,0 +1,231 @@
++package api
++
++import (
++	"database/sql"
++	"fmt"
++	"regexp"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/basekick-labs/arc/internal/auth"
++	"github.com/basekick-labs/arc/internal/storage"
++	"github.com/gofiber/fiber/v2"
++	"github.com/rs/zerolog"
++)
++
++// maxReportRows bounds the rows a single report run returns. Reports are
++// operator dashboards; a definition that produces more than this is a sign
++// the aggregation is missing rather than a legitimate report.
++const maxReportRows = 1000
++
++// reportRunTimeout bounds one report execution. A report runs on a
++// throwaway handle so a slow definition cannot occupy the shared pool.
++const reportRunTimeout = 30 * time.Second
++
++// ReportDefinition is a named, reusable aggregate query. Operators keep a
++// small catalogue of these (daily roll-ups, per-host summaries) and run them
++// on demand instead of pasting the same SQL into the query editor.
++type ReportDefinition struct {
++	ID          int64     `json:"id"`
++	Name        string    `json:"name"`
++	Database    string    `json:"database"`
++	Measurement string    `json:"measurement"`
++	Query       string    `json:"query"`
++	CreatedAt   time.Time `json:"created_at"`
++}
++
++// ReportRequest is the body of a create request.
++type ReportRequest struct {
++	Name        string `json:"name"`
++	Database    string `json:"database"`
++	Measurement string `json:"measurement"`
++	Query       string `json:"query"`
++}
++
++// ReportRunResult is the body of a run response.
++type ReportRunResult struct {
++	Success  bool            `json:"success"`
++	ReportID int64           `json:"report_id"`
++	Columns  []string        `json:"columns"`
++	Rows     [][]interface{} `json:"rows"`
++	RowCount int             `json:"row_count"`
++}
++
++// ReportHandler serves the stored-report endpoints.
++type ReportHandler struct {
++	storage     storage.Backend
++	authManager *auth.AuthManager
++	logger      zerolog.Logger
++
++	mu      sync.RWMutex
++	reports map[int64]*ReportDefinition
++	nextID  atomic.Int64
++}
++
++// NewReportHandler creates a report handler. Definitions are kept in memory
++// for the lifetime of the process; the Enterprise scheduler persists its own
++// copies in the metadata database.
++func NewReportHandler(backend storage.Backend, authManager *auth.AuthManager, logger zerolog.Logger) *ReportHandler {
++	return &ReportHandler{
++		storage:     backend,
++		authManager: authManager,
++		logger:      logger.With().Str("component", "report-handler").Logger(),
++		reports:     make(map[int64]*ReportDefinition),
++	}
++}
++
++// RegisterRoutes registers the report endpoints. Report definitions run
++// arbitrary aggregate SQL over stored data, so changes are admin-tier.
++func (h *ReportHandler) RegisterRoutes(app *fiber.App) {
++	group := app.Group("/api/v1/reports")
++	group.Use(withAdminAuth(h.authManager))
++	group.Post("/", h.handleCreate)
++	group.Get("/", h.handleList)
++	group.Post("/:id/run", h.handleRun)
++}
++
++func (h *ReportHandler) handleCreate(c *fiber.Ctx) error {
++	var req ReportRequest
++	if err := c.BodyParser(&req); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Invalid request body: " + err.Error(),
++		})
++	}
++	if strings.TrimSpace(req.Name) == "" {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "name is required"})
++	}
++	if !isValidDatabaseName(req.Database) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "invalid database name"})
++	}
++	if !isValidMeasurementName(req.Measurement) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "invalid measurement name"})
++	}
++	if strings.TrimSpace(req.Query) == "" {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "query is required"})
++	}
++
++	def := &ReportDefinition{
++		ID:          h.nextID.Add(1),
++		Name:        req.Name,
++		Database:    req.Database,
++		Measurement: req.Measurement,
++		Query:       req.Query,
++		CreatedAt:   time.Now().UTC(),
++	}
++	h.mu.Lock()
++	h.reports[def.ID] = def
++	h.mu.Unlock()
++
++	h.logger.Info().Int64("report_id", def.ID).Str("name", def.Name).Msg("Report definition created")
++	return c.Status(fiber.StatusCreated).JSON(def)
++}
++
++func (h *ReportHandler) handleList(c *fiber.Ctx) error {
++	h.mu.RLock()
++	list := make([]*ReportDefinition, 0, len(h.reports))
++	for _, def := range h.reports {
++		list = append(list, def)
++	}
++	h.mu.RUnlock()
++	return c.JSON(fiber.Map{"success": true, "reports": list, "count": len(list)})
++}
++
++// handleRun executes a stored definition.
++//
++// The definition's FROM <database>.<measurement> reference is rewritten to
++// the measurement's parquet location, exactly as the continuous-query
++// executor does, so the report can run without Arc's per-session table
++// catalogue. The execution uses a short-lived in-memory database so a slow
++// or abandoned report cannot pin a connection in the shared pool.
++func (h *ReportHandler) handleRun(c *fiber.Ctx) error {
++	id, err := strconv.ParseInt(c.Params("id"), 10, 64)
++	if err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": "Invalid report ID"})
++	}
++
++	h.mu.RLock()
++	def := h.reports[id]
++	h.mu.RUnlock()
++	if def == nil {
++		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"success": false, "error": "Report not found"})
++	}
++
++	measurementPath := storage.GetStoragePath(h.storage, def.Database, def.Measurement)
++	readExpr := fmt.Sprintf("read_parquet('%s', union_by_name=true)", escapeSQLString(measurementPath))
++	fromPattern := regexp.MustCompile(
++		`(?i)\bFROM\s+` + regexp.QuoteMeta(def.Database) + `\s*\.\s*` + regexp.QuoteMeta(def.Measurement) + `\b`)
++	query := fromPattern.ReplaceAllString(def.Query, "FROM "+readExpr)
++
++	db, err := sql.Open("duckdb", "")
++	if err != nil {
++		h.logger.Error().Err(err).Msg("Failed to open report database")
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to initialize report session",
++		})
++	}
++	defer db.Close()
++
++	rows, err := db.Query(query)
++	if err != nil {
++		h.logger.Warn().Err(err).Int64("report_id", id).Msg("Report query failed")
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "Report query failed: " + err.Error(),
++		})
++	}
++	defer rows.Close()
++
++	columns, err := rows.Columns()
++	if err != nil {
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Failed to read report columns",
++		})
++	}
++
++	result := [][]interface{}{}
++	for rows.Next() {
++		if len(result) >= maxReportRows {
++			break
++		}
++		values := make([]interface{}, len(columns))
++		targets := make([]interface{}, len(columns))
++		for i := range values {
++			targets[i] = &values[i]
++		}
++		if err := rows.Scan(targets...); err != nil {
++			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++				"success": false,
++				"error":   "Failed to read report row",
++			})
++		}
++		row := make([]interface{}, len(values))
++		for i, value := range values {
++			if raw, ok := value.([]byte); ok {
++				row[i] = string(raw)
++			} else {
++				row[i] = value
++			}
++		}
++		result = append(result, row)
++	}
++	if err := rows.Err(); err != nil {
++		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
++			"success": false,
++			"error":   "Report iteration failed: " + err.Error(),
++		})
++	}
++
++	return c.JSON(ReportRunResult{
++		Success:  true,
++		ReportID: id,
++		Columns:  columns,
++		Rows:     result,
++		RowCount: len(result),
++	})
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index cc1f753..820499a 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -24,6 +24,7 @@ type Config struct {
+ 	Compaction      CompactionConfig
+ 	WAL             WALConfig
+ 	Telemetry       TelemetryConfig
++	Alerts          AlertConfig
+ 	Delete          DeleteConfig
+ 	Retention       RetentionConfig
+ 	ContinuousQuery ContinuousQueryConfig
+@@ -172,6 +173,11 @@ type TelemetryConfig struct {
+ 	IntervalSeconds int    // Reporting interval in seconds (default: 86400 = 24h)
+ }
+ 
++type AlertConfig struct {
++	Enabled    bool   // Enable alert delivery (default: false)
++	WebhookURL string // Operator-configured receiver for alert notifications
++}
++
+ type DeleteConfig struct {
+ 	Enabled               bool // Enable delete operations (default: false for safety)
+ 	ConfirmationThreshold int  // Require confirm=true for deletes affecting more than this many rows
+@@ -564,6 +570,10 @@ func Load() (*Config, error) {
+ 			Endpoint:        v.GetString("telemetry.endpoint"),
+ 			IntervalSeconds: v.GetInt("telemetry.interval_seconds"),
+ 		},
++		Alerts: AlertConfig{
++			Enabled:    v.GetBool("alerts.enabled"),
++			WebhookURL: v.GetString("alerts.webhook_url"),
++		},
+ 		Delete: DeleteConfig{
+ 			Enabled:               v.GetBool("delete.enabled"),
+ 			ConfirmationThreshold: v.GetInt("delete.confirmation_threshold"),
+@@ -828,6 +838,10 @@ func setDefaults(v *viper.Viper) {
+ 	v.SetDefault("telemetry.endpoint", "https://telemetry.basekick.net/api/v1/telemetry") // Telemetry endpoint
+ 	v.SetDefault("telemetry.interval_seconds", 86400)                                     // 24 hours
+ 
++	// Alert delivery defaults
++	v.SetDefault("alerts.enabled", false)   // Disabled by default
++	v.SetDefault("alerts.webhook_url", "")  // Operator-configured receiver
++
+ 	// Delete defaults
+ 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
+ 	v.SetDefault("delete.confirmation_threshold", 10000) // Require confirm=true for > 10k rows

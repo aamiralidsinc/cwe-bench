@@ -1,0 +1,357 @@
+diff --git a/packages/next-tinacms-dos/src/copy-handler.ts b/packages/next-tinacms-dos/src/copy-handler.ts
+new file mode 100644
+index 0000000..2c6c338
+--- /dev/null
++++ b/packages/next-tinacms-dos/src/copy-handler.ts
+@@ -0,0 +1,67 @@
++/**
++ * Copy / move support for the DOS media manager.
++ *
++ * Moving an asset between folders is a copy followed by a delete on the old
++ * key; the client sends both the source and destination object keys.
++ */
++
++import {
++  CopyObjectCommand,
++  CopyObjectCommandInput,
++  S3Client,
++  S3ClientConfig,
++} from '@aws-sdk/client-s3';
++import { NextApiRequest, NextApiResponse } from 'next';
++
++export interface DOSCopyConfig {
++  config: S3ClientConfig;
++  bucket: string;
++  mediaRoot?: string;
++  authorized: (_req: NextApiRequest, _res: NextApiResponse) => Promise<boolean>;
++}
++
++const findErrorMessage = (e: any) => {
++  if (typeof e == 'string') return e;
++  if (e.message) return e.message;
++  if (e.error && e.error.message) return e.error.message;
++  return 'an error occurred';
++};
++
++export const createCopyHandler = (config: DOSCopyConfig) => {
++  const client = new S3Client(config.config);
++  const bucket = config.bucket;
++
++  return async (req: NextApiRequest, res: NextApiResponse) => {
++    const isAuthorized = await config.authorized(req, res);
++    if (!isAuthorized) {
++      res.status(401).json({ message: 'sorry this user is unauthorized' });
++      return;
++    }
++    if (req.method !== 'POST') {
++      res.end(404);
++      return;
++    }
++
++    const { from, to } = req.query;
++    const source = Array.isArray(from) ? from[0] : from;
++    const destination = Array.isArray(to) ? to[0] : to;
++    if (!source || !destination) {
++      return res.status(400).json({ message: 'from and to are required' });
++    }
++
++    const params: CopyObjectCommandInput = {
++      Bucket: bucket,
++      CopySource: `${bucket}/${source}`,
++      Key: destination,
++    };
++    const command = new CopyObjectCommand(params);
++    try {
++      const data = await client.send(command);
++      res.json({ ...data, from: source, to: destination });
++    } catch (e) {
++      console.error('Error copying media');
++      console.error(e);
++      res.status(500).json({ message: findErrorMessage(e) });
++    }
++  };
++};
+diff --git a/packages/next-tinacms-dos/src/index.ts b/packages/next-tinacms-dos/src/index.ts
+index 65d086f..7a67c17 100644
+--- a/packages/next-tinacms-dos/src/index.ts
++++ b/packages/next-tinacms-dos/src/index.ts
+@@ -4,3 +4,5 @@
+ 
+ export * from './dos-media-store';
+ export * from './dos-tina-cloud-media-store';
++
++export * from './copy-handler';
+diff --git a/packages/next-tinacms-s3/src/app-handlers.ts b/packages/next-tinacms-s3/src/app-handlers.ts
+new file mode 100644
+index 0000000..a5b8b51
+--- /dev/null
++++ b/packages/next-tinacms-s3/src/app-handlers.ts
+@@ -0,0 +1,182 @@
++/**
++ * App-router variant of the S3 media route.
++ *
++ * Newer Next.js projects mount route handlers from `app/` rather than
++ * `pages/api`; this module exposes the same media operations in that shape.
++ */
++
++import {
++  _Object,
++  DeleteObjectCommand,
++  DeleteObjectCommandInput,
++  ListObjectsCommand,
++  ListObjectsCommandInput,
++  PutObjectCommand,
++  S3Client,
++  S3ClientConfig,
++} from '@aws-sdk/client-s3';
++import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
++import type { Media, MediaListOptions } from 'tinacms';
++import path from 'node:path';
++import { NextResponse } from 'next/server';
++
++export interface S3AppRouterConfig {
++  config: S3ClientConfig;
++  bucket: string;
++  mediaRoot?: string;
++  authorized: (_request: Request) => Promise<boolean>;
++}
++
++type RouteParams = { params: { media: string[] } };
++
++function stripMediaRoot(mediaRoot: string, key: string) {
++  if (!mediaRoot) {
++    return key;
++  }
++  const mediaRootParts = mediaRoot.split('/').filter((part) => part);
++  if (!mediaRootParts || !mediaRootParts[0]) {
++    return key;
++  }
++  const keyParts = key.split('/').filter((part) => part);
++  for (let i = 0; i < mediaRootParts.length; i++) {
++    if (keyParts[0] === mediaRootParts[i]) {
++      keyParts.shift();
++    }
++  }
++  return keyParts.join('/');
++}
++
++export const createMediaHandlers = (config: S3AppRouterConfig) => {
++  const client = new S3Client(config.config);
++  const bucket = config.bucket;
++  let mediaRoot = config.mediaRoot || '';
++  if (mediaRoot) {
++    if (!mediaRoot.endsWith('/')) {
++      mediaRoot = mediaRoot + '/';
++    }
++    if (mediaRoot.startsWith('/')) {
++      mediaRoot = mediaRoot.substr(1);
++    }
++  }
++
++  function withAuth(
++    handler: (request: Request, context?: RouteParams) => Promise<unknown>
++  ) {
++    return async (request: Request, context?: RouteParams) => {
++      const authResult = await config.authorized(request);
++      if (!authResult)
++        return NextResponse.json(
++          { message: 'sorry this user is unauthorized' },
++          { status: 401 }
++        );
++      return await handler(request, context);
++    };
++  }
++
++  async function listMedia(request: Request) {
++    const url = new URL(request.url);
++    const directory = url.searchParams.get('directory') || '';
++    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
++    if (prefix) prefix = prefix + '/';
++
++    const params: ListObjectsCommandInput = {
++      Bucket: bucket,
++      Delimiter: '/',
++      Prefix: mediaRoot ? path.join(mediaRoot, prefix) : prefix,
++      MaxKeys: 500,
++    };
++    const response = await client.send(new ListObjectsCommand(params));
++
++    const items: Media[] = [];
++    response.CommonPrefixes?.forEach(({ Prefix }) => {
++      const strippedPrefix = stripMediaRoot(mediaRoot, Prefix as string);
++      if (!strippedPrefix) {
++        return;
++      }
++      items.push({
++        id: Prefix + '',
++        type: 'dir',
++        filename: path.basename(strippedPrefix),
++        directory: path.dirname(strippedPrefix) + '/',
++      });
++    });
++    items.push(
++      ...(response.Contents || []).map((file: _Object) => {
++        const strippedKey = stripMediaRoot(mediaRoot, file.Key as string);
++        return {
++          id: file.Key + '',
++          type: 'file',
++          filename: path.basename(strippedKey),
++          directory: path.dirname(strippedKey) + '/',
++          src: file.Key + '',
++          thumbnails: {
++            '75x75': file.Key + '',
++            '400x400': file.Key + '',
++            '1000x1000': file.Key + '',
++          },
++        } as Media;
++      })
++    );
++
++    return NextResponse.json({ items });
++  }
++
++  return {
++    GET(request: Request) {
++      return withAuth(async (req) => {
++        const url = new URL(req.url);
++        const key = url.searchParams.get('key');
++        if (!key) {
++          return listMedia(req);
++        }
++        const expiresIn = Number(url.searchParams.get('expiresIn')) || 3600;
++        const signedUrl = await getSignedUrl(
++          client,
++          new PutObjectCommand({ Bucket: bucket, Key: key }),
++          { expiresIn }
++        );
++        return NextResponse.json({ signedUrl, src: key });
++      })(request);
++    },
++
++    POST(request: Request) {
++      return withAuth(async (req) => {
++        const url = new URL(req.url);
++        const key = url.searchParams.get('key');
++        if (!key) {
++          return NextResponse.json(
++            { message: 'key is required' },
++            { status: 400 }
++          );
++        }
++        const body = Buffer.from(await req.arrayBuffer());
++        const contentType =
++          req.headers.get('content-type') || 'application/octet-stream';
++        await client.send(
++          new PutObjectCommand({
++            Bucket: bucket,
++            Key: key,
++            Body: body,
++            ContentType: contentType,
++          })
++        );
++        return NextResponse.json({ id: key, src: key });
++      })(request);
++    },
++
++    DELETE(request: Request, context?: RouteParams) {
++      return withAuth(async (_req, ctx) => {
++        const media = ctx?.params?.media || [];
++        const [, ...rest] = media;
++        const objectKey = rest.join('/');
++
++        const params: DeleteObjectCommandInput = {
++          Bucket: bucket,
++          Key: objectKey,
++        };
++        const data = await client.send(new DeleteObjectCommand(params));
++        return NextResponse.json({ key: objectKey, data });
++      })(request, context);
++    },
++  };
++};
+diff --git a/packages/next-tinacms-s3/src/batch-delete.ts b/packages/next-tinacms-s3/src/batch-delete.ts
+new file mode 100644
+index 0000000..440230f
+--- /dev/null
++++ b/packages/next-tinacms-s3/src/batch-delete.ts
+@@ -0,0 +1,69 @@
++/**
++ * Multi-select deletion for the media manager.
++ *
++ * The single-asset delete lives on the main media route; this route takes a
++ * repeated `keys` query parameter so the UI can remove several selected assets
++ * in one request.
++ */
++
++import {
++  DeleteObjectsCommand,
++  DeleteObjectsCommandInput,
++  S3Client,
++  S3ClientConfig,
++} from '@aws-sdk/client-s3';
++import { NextApiRequest, NextApiResponse } from 'next';
++
++export interface S3BatchDeleteConfig {
++  config: S3ClientConfig;
++  bucket: string;
++  mediaRoot?: string;
++  authorized: (_req: NextApiRequest, _res: NextApiResponse) => Promise<boolean>;
++}
++
++const findErrorMessage = (e: any) => {
++  if (typeof e == 'string') return e;
++  if (e.message) return e.message;
++  if (e.error && e.error.message) return e.error.message;
++  return 'an error occurred';
++};
++
++export const createBatchDeleteHandler = (config: S3BatchDeleteConfig) => {
++  const client = new S3Client(config.config);
++  const bucket = config.bucket;
++
++  return async (req: NextApiRequest, res: NextApiResponse) => {
++    const isAuthorized = await config.authorized(req, res);
++    if (!isAuthorized) {
++      res.status(401).json({ message: 'sorry this user is unauthorized' });
++      return;
++    }
++    if (req.method !== 'DELETE') {
++      res.end(404);
++      return;
++    }
++
++    const { keys } = req.query;
++    const selected = Array.isArray(keys) ? keys : keys ? [keys] : [];
++    if (!selected.length) {
++      return res.status(400).json({ message: 'keys are required' });
++    }
++
++    const params: DeleteObjectsCommandInput = {
++      Bucket: bucket,
++      Delete: {
++        Objects: selected.map((key) => ({ Key: key })),
++        Quiet: true,
++      },
++    };
++    const command = new DeleteObjectsCommand(params);
++    try {
++      const data = await client.send(command);
++      res.json(data);
++    } catch (e) {
++      console.error('Error deleting media');
++      console.error(e);
++      res.status(500).json({ message: findErrorMessage(e) });
++    }
++  };
++};
+diff --git a/packages/next-tinacms-s3/src/index.ts b/packages/next-tinacms-s3/src/index.ts
+index 37d7c70..851fd56 100644
+--- a/packages/next-tinacms-s3/src/index.ts
++++ b/packages/next-tinacms-s3/src/index.ts
+@@ -4,3 +4,6 @@
+ 
+ export * from './s3-media-store';
+ export * from './s3-tina-cloud-media-store';
++
++export * from './batch-delete';
++export * from './app-handlers';

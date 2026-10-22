@@ -1,0 +1,244 @@
+diff --git a/packages/app-builder-lib/src/publish/PublishManager.ts b/packages/app-builder-lib/src/publish/PublishManager.ts
+index 7c42d3e..23dbef2 100644
+--- a/packages/app-builder-lib/src/publish/PublishManager.ts
++++ b/packages/app-builder-lib/src/publish/PublishManager.ts
+@@ -4,6 +4,7 @@ import {
+   CancellationToken,
+   GenericServerOptions,
+   getS3LikeProviderBaseUrl,
++  GiteaOptions,
+   GithubOptions,
+   githubTagPrefix,
+   githubUrl,
+@@ -19,6 +20,7 @@ import {
+   BitbucketPublisher,
+   getCiTag,
+   GitHubPublisher,
++  GiteaPublisher,
+   GitlabPublisher,
+   KeygenPublisher,
+   PublishContext,
+@@ -353,6 +355,9 @@ export async function createPublisher(
+       return new GitlabPublisher(context, publishConfig as GitlabOptions, version, releaseBody, releaseName)
+     }
+ 
++    case "gitea":
++      return new GiteaPublisher(context, publishConfig as GiteaOptions, version)
++
+     case "keygen":
+       return new KeygenPublisher(context, publishConfig as KeygenOptions, version)
+ 
+@@ -377,6 +382,9 @@ async function requireProviderClass(provider: string, packager: Packager): Promi
+     case "gitlab":
+       return GitlabPublisher
+ 
++    case "gitea":
++      return GiteaPublisher
++
+     case "generic":
+       return null
+ 
+diff --git a/packages/builder-util-runtime/src/index.ts b/packages/builder-util-runtime/src/index.ts
+index 92f16bc..9648c19 100644
+--- a/packages/builder-util-runtime/src/index.ts
++++ b/packages/builder-util-runtime/src/index.ts
+@@ -27,6 +27,7 @@ export {
+   GithubOptions,
+   githubUrl,
+   githubTagPrefix,
++  GiteaOptions,
+   GitlabOptions,
+   KeygenOptions,
+   PublishConfiguration,
+diff --git a/packages/builder-util-runtime/src/publishOptions.ts b/packages/builder-util-runtime/src/publishOptions.ts
+index 8c39ec4..32551e8 100644
+--- a/packages/builder-util-runtime/src/publishOptions.ts
++++ b/packages/builder-util-runtime/src/publishOptions.ts
+@@ -1,13 +1,14 @@
+ import { OutgoingHttpHeaders } from "http"
+ import { Nullish } from "."
+ 
+-export type PublishProvider = "github" | "gitlab" | "s3" | "spaces" | "generic" | "custom" | "snapStore" | "keygen" | "bitbucket"
++export type PublishProvider = "github" | "gitlab" | "gitea" | "s3" | "spaces" | "generic" | "custom" | "snapStore" | "keygen" | "bitbucket"
+ 
+ // typescript-json-schema generates only PublishConfiguration if it is specified in the list, so, it is not added here
+ export type AllPublishOptions =
+   | string
+   | GithubOptions
+   | GitlabOptions
++  | GiteaOptions
+   | S3Options
+   | SpacesOptions
+   | GenericServerOptions
+@@ -208,6 +209,51 @@ export interface GitlabOptions extends PublishConfiguration {
+   readonly uploadTarget?: "project_upload" | "generic_package" | null
+ }
+ 
++/**
++ * [Gitea](https://gitea.io/) options.
++ *
++ * A Gitea access token is required for private repositories. You can generate one under
++ * Settings > Applications. Define the `GITEA_TOKEN` environment variable.
++ */
++export interface GiteaOptions extends PublishConfiguration {
++  /**
++   * The provider. Must be `gitea`.
++   */
++  readonly provider: "gitea"
++
++  /**
++   * Base URL of the Gitea instance, for example "https://git.example.com".
++   */
++  readonly url: string
++
++  /**
++   * The repository owner.
++   */
++  readonly owner: string
++
++  /**
++   * The repository name.
++   */
++  readonly repo: string
++
++  /**
++   * The access token used to publish releases and update metadata. Never specify it in the configuration files.
++   */
++  readonly token?: string | null
++
++  /**
++   * Whether to use `v`-prefixed tag name.
++   * @default true
++   */
++  readonly vPrefixedTagName?: boolean
++
++  /**
++   * The channel.
++   * @default latest
++   */
++  readonly channel?: string | null
++}
++
+ /**
+  * Generic (any HTTP(S) server) options.
+  * In all publish options [File Macros](https://www.electron.build/file-patterns#file-macros) are supported.
+diff --git a/packages/electron-publish/src/giteaPublisher.ts b/packages/electron-publish/src/giteaPublisher.ts
+new file mode 100644
+index 0000000..409ca40
+--- /dev/null
++++ b/packages/electron-publish/src/giteaPublisher.ts
+@@ -0,0 +1,102 @@
++import { Arch, httpExecutor, InvalidConfigurationError, isEmptyOrSpaces, isTokenCharValid, log } from "builder-util"
++import { configureRequestOptions, configureRequestUrl, GiteaOptions, safeGetHeader } from "builder-util-runtime"
++import { ClientRequest, RequestOptions } from "http"
++import { URL } from "url"
++import { HttpPublisher } from "./httpPublisher"
++import { PublishContext } from "./index"
++
++type RequestProcessor = (request: ClientRequest, reject: (error: Error) => void) => void
++
++/**
++ * Publishes release artifacts to a Gitea instance through its release-asset API.
++ */
++export class GiteaPublisher extends HttpPublisher {
++  private readonly token: string
++  private readonly baseUrl: URL
++  private readonly tag: string
++
++  readonly providerName = "gitea"
++
++  constructor(
++    context: PublishContext,
++    private readonly info: GiteaOptions,
++    private readonly version: string
++  ) {
++    super(context, true)
++
++    let token = info.token || null
++    if (isEmptyOrSpaces(token)) {
++      token = process.env.GITEA_TOKEN || null
++      if (isEmptyOrSpaces(token)) {
++        throw new InvalidConfigurationError(`Gitea access token is not set, neither programmatically, nor using env "GITEA_TOKEN"`)
++      }
++    }
++
++    token = token.trim()
++    if (!isTokenCharValid(token)) {
++      throw new InvalidConfigurationError(`Gitea access token (${JSON.stringify(token)}) contains invalid characters, please check env "GITEA_TOKEN"`)
++    }
++
++    this.token = token
++    this.baseUrl = new URL(info.url)
++    this.tag = info.vPrefixedTagName === false ? this.version : `v${this.version}`
++
++    log.debug({ config: JSON.stringify({ provider: info.provider, url: info.url, owner: info.owner, repo: info.repo, token: this.token }) }, "Gitea publisher configuration")
++  }
++
++  /**
++   * Upload the artifact to the tag's asset collection.
++   */
++  protected doUpload(fileName: string, _arch: Arch, dataLength: number, requestProcessor: RequestProcessor): Promise<any> {
++    const target = new URL(`/api/v1/repos/${this.info.owner}/${this.info.repo}/releases/${this.tag}/assets`, this.baseUrl)
++    target.searchParams.set("name", fileName)
++
++    return this.send(target, dataLength, requestProcessor, 0)
++  }
++
++  private send(target: URL, dataLength: number, requestProcessor: RequestProcessor, redirects: number): Promise<any> {
++    return new Promise((resolve, reject) => {
++      const requestOptions: RequestOptions = {
++        method: "PUT",
++        headers: {
++          "Content-Type": "application/octet-stream",
++          "Content-Length": dataLength,
++          Authorization: `token ${this.token}`,
++        },
++      }
++      configureRequestUrl(target, requestOptions)
++      configureRequestOptions(requestOptions)
++
++      const request = httpExecutor.createRequest(requestOptions, response => {
++        const location = safeGetHeader(response, "location")
++        if (response.statusCode >= 300 && response.statusCode < 400 && location != null) {
++          response.resume()
++          if (redirects < 5) {
++            resolve(this.send(new URL(String(location), target), dataLength, requestProcessor, redirects + 1))
++            return
++          }
++          reject(new Error(`Too many redirects (> 5) while uploading to Gitea`))
++          return
++        }
++
++        if (response.statusCode >= 400) {
++          let body = ""
++          response.setEncoding("utf8")
++          response.on("data", (chunk: string) => (body += chunk))
++          response.on("end", () => reject(new Error(`Gitea upload failed (${response.statusCode}): ${body}`)))
++          return
++        }
++
++        response.resume()
++        response.on("end", () => resolve(undefined))
++      })
++
++      httpExecutor.addErrorAndTimeoutHandlers(request, reject)
++      requestProcessor(request, reject)
++    })
++  }
++
++  toString(): string {
++    return `Gitea (${this.info.owner}/${this.info.repo})`
++  }
++}
+diff --git a/packages/electron-publish/src/index.ts b/packages/electron-publish/src/index.ts
+index c88fe81..33d24a7 100644
+--- a/packages/electron-publish/src/index.ts
++++ b/packages/electron-publish/src/index.ts
+@@ -7,6 +7,7 @@ export { ProgressBar } from "./progress"
+ 
+ export { BitbucketPublisher } from "./bitbucketPublisher"
+ export { GitHubPublisher } from "./gitHubPublisher"
++export { GiteaPublisher } from "./giteaPublisher"
+ export { GitlabPublisher } from "./gitlabPublisher"
+ export { KeygenPublisher } from "./keygenPublisher"
+ export { S3Publisher } from "./s3/s3Publisher"

@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOTS = ("/app/",)
+ROOTS = ("/workspace/", "/app/")
 SKIP = re.compile(r"/(node_modules|\.git|dist|build|\.turbo|target|__pycache__|\.pytest_cache|"
                   r"\.cache|\.next|coverage|\.gradle|\.m2|vendor|\.prisma|generated|\.phpunit\.cache|bootstrap/cache)(/|$)"
                   r"|\.(pyc|pyo|class|o|so|log|tsbuildinfo)$|/\.tbfixtures\.ts$")

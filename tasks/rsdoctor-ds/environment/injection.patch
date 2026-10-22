@@ -1,0 +1,508 @@
+diff --git a/packages/ai/src/server/http.ts b/packages/ai/src/server/http.ts
+new file mode 100644
+index 0000000..f81751e
+--- /dev/null
++++ b/packages/ai/src/server/http.ts
+@@ -0,0 +1,91 @@
++import http from 'node:http';
++import type { AddressInfo } from 'node:net';
++
++export interface AnalysisBridgeOptions {
++  /** Port the bridge listens on. */
++  port?: number;
++  /** Base URL of the Rsdoctor report server the bridge forwards to. */
++  reportUrl?: string;
++}
++
++/**
++ * Minimal HTTP front for the build-analysis data, used by web-based agents that
++ * cannot speak the stdio transport.
++ */
++export function createAnalysisBridge(options: AnalysisBridgeOptions = {}) {
++  const reportUrl = options.reportUrl ?? 'http://127.0.0.1:3000';
++
++  return http.createServer(async (req, res) => {
++    res.setHeader('Access-Control-Allow-Origin', '*');
++    res.setHeader('Access-Control-Allow-Headers', '*');
++    res.setHeader('Access-Control-Allow-Methods', '*');
++
++    if (req.method === 'OPTIONS') {
++      res.statusCode = 204;
++      res.end();
++      return;
++    }
++
++    const url = new URL(req.url || '/', 'http://localhost');
++
++    if (url.pathname === '/health') {
++      res.end('ok');
++      return;
++    }
++
++    if (url.pathname === '/api/analysis' && req.method === 'POST') {
++      let raw = '';
++      for await (const chunk of req) {
++        raw += chunk;
++      }
++
++      try {
++        const query = JSON.parse(raw || '{}') as {
++          api?: string;
++          body?: Record<string, unknown>;
++        };
++        const upstream = await fetch(`${reportUrl}${query.api}`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify(query.body ?? {}),
++        });
++        const text = await upstream.text();
++        res.statusCode = upstream.status;
++        res.setHeader(
++          'Content-Type',
++          upstream.headers.get('content-type') ?? 'application/json;utf-8',
++        );
++        res.end(text);
++      } catch (error) {
++        res.statusCode = 502;
++        res.end(error instanceof Error ? error.message : String(error));
++      }
++      return;
++    }
++
++    res.statusCode = 404;
++    res.end('Not found');
++  });
++}
++
++export async function startAnalysisBridge(options: AnalysisBridgeOptions = {}) {
++  const server = createAnalysisBridge(options);
++  const port = options.port ?? 3867;
++
++  await new Promise<void>((resolve, reject) => {
++    server.once('error', reject);
++    server.listen(port, () => {
++      server.off('error', reject);
++      resolve();
++    });
++  });
++
++  return {
++    server,
++    port: (server.address() as AddressInfo).port,
++    close: () =>
++      new Promise<void>((resolve) => {
++        server.close(() => resolve());
++      }),
++  };
++}
+diff --git a/packages/ai/src/server/server.ts b/packages/ai/src/server/server.ts
+index a15e5da..2ebeeab 100644
+--- a/packages/ai/src/server/server.ts
++++ b/packages/ai/src/server/server.ts
+@@ -311,6 +311,8 @@ server.tool(Tools.getPort, 'Get the port of the MCP server', {}, async () => {
+ 
+ registerStaticResources(server);
+ 
++export { createAnalysisBridge, startAnalysisBridge } from './http.js';
++
+ export async function runServer() {
+   const transport = new StdioServerTransport();
+   await server.connect(transport);
+diff --git a/packages/cli/src/commands/analyze.ts b/packages/cli/src/commands/analyze.ts
+index 61b5c53..b867054 100644
+--- a/packages/cli/src/commands/analyze.ts
++++ b/packages/cli/src/commands/analyze.ts
+@@ -70,7 +70,16 @@ example: ${bin} ${Commands.Analyze} --profile "${Constants.RsdoctorOutputManifes
+ 
+       spinner.text = `start server`;
+ 
+-      const sdk = new RsdoctorSDK({ name, root: cwd, port, type });
++      const sdk = new RsdoctorSDK({
++        name,
++        root: cwd,
++        type,
++        config: {
++          server: {
++            port,
++          },
++        },
++      });
+ 
+       await sdk.bootstrap();
+ 
+diff --git a/packages/cli/src/commands/stats-analyze.ts b/packages/cli/src/commands/stats-analyze.ts
+index 916d156..618d37a 100644
+--- a/packages/cli/src/commands/stats-analyze.ts
++++ b/packages/cli/src/commands/stats-analyze.ts
+@@ -11,10 +11,23 @@ import { TransUtils } from '@rsdoctor/graph';
+ interface Options {
+   profile: string;
+   open?: boolean;
+-  port?: number;
++  port?: number | string;
+   type?: SDK.ToDataType;
+ }
+ 
++export function coercePort(port?: number | string) {
++  if (typeof port === 'undefined') {
++    return undefined;
++  }
++
++  const value = Number(port);
++  if (!Number.isFinite(value)) {
++    throw new Error(`Invalid port: ${port}`);
++  }
++
++  return value;
++}
++
+ export const statsAnalyze: Command<
+   Commands.StatsAnalyze,
+   Options,
+@@ -32,7 +45,8 @@ export const statsAnalyze: Command<
+       .option('--port <number>', 'port for Rsdoctor Server')
+       .option('--type <mode>', 'Bundle analysis mode (normal or lite)');
+   },
+-  async action({ profile, open = true, type = SDK.ToDataType.Normal }) {
++  async action({ profile, open = true, port, type = SDK.ToDataType.Normal }) {
++    const serverPort = coercePort(port);
+     const spinner = ora({ prefixText: cyan(`[${name}]`) }).start(
+       `start to loading "${profile}"`,
+     );
+@@ -46,7 +60,11 @@ export const statsAnalyze: Command<
+       name: 'stats-analyze',
+       root: process.cwd(),
+       type,
+-      noServer: false,
++      config: {
++        server: {
++          port: serverPort,
++        },
++      },
+     });
+ 
+     await sdk.bootstrap();
+diff --git a/packages/core/src/inner-plugins/utils/config.ts b/packages/core/src/inner-plugins/utils/config.ts
+index 9483c79..4ae8237 100644
+--- a/packages/core/src/inner-plugins/utils/config.ts
++++ b/packages/core/src/inner-plugins/utils/config.ts
+@@ -101,6 +101,7 @@ export function normalizeUserConfig<Rules extends Linter.ExtendRuleData[]>(
+     output = outputConfig,
+     supports = getDefaultSupports(),
+     port,
++    server: userServer = {},
+     printLog = { serverUrls: true },
+     mode = undefined,
+     brief = undefined,
+@@ -117,6 +118,15 @@ export function normalizeUserConfig<Rules extends Linter.ExtendRuleData[]>(
+   assert(typeof features === 'object' || Array.isArray(features));
+   assert(typeof loaderInterceptorOptions === 'object');
+   assert(typeof disableClientServer === 'boolean');
++  assert(typeof port === 'undefined' || typeof port === 'number');
++  assert(typeof userServer === 'object' && userServer !== null);
++  const server: SDK.RsdoctorServerConfig = {
++    ...userServer,
++  };
++  assert(typeof server.port === 'undefined' || typeof server.port === 'number');
++  if (typeof server.port === 'undefined' && typeof port !== 'undefined') {
++    server.port = port;
++  }
+   let finalMode: keyof typeof SDK.IMode =
+     ('mode' in output && isValidMode(output.mode)
+       ? output.mode === ('lite' as SDK.IMode.normal)
+@@ -174,6 +184,7 @@ export function normalizeUserConfig<Rules extends Linter.ExtendRuleData[]>(
+     innerClientPath,
+     supports,
+     port,
++    server,
+     printLog,
+   };
+ 
+diff --git a/packages/rspack-plugin/src/multiple.ts b/packages/rspack-plugin/src/multiple.ts
+index 00a907e..6c8b4ef 100644
+--- a/packages/rspack-plugin/src/multiple.ts
++++ b/packages/rspack-plugin/src/multiple.ts
+@@ -32,6 +32,7 @@ export class RsdoctorRspackMultiplePlugin<
+       extraConfig: {
+         innerClientPath: normallizedOptions.innerClientPath,
+         printLog: normallizedOptions.printLog,
++        server: normallizedOptions.server,
+         mode: normallizedOptions.output.mode
+           ? normallizedOptions.output.mode
+           : undefined,
+diff --git a/packages/rspack-plugin/src/plugin.ts b/packages/rspack-plugin/src/plugin.ts
+index 92bc658..900488d 100644
+--- a/packages/rspack-plugin/src/plugin.ts
++++ b/packages/rspack-plugin/src/plugin.ts
+@@ -67,7 +67,7 @@ export class RsdoctorRspackPlugin<
+         },
+       }),
+     );
+-    const { port, output, innerClientPath, printLog, sdkInstance } =
++    const { port, server, output, innerClientPath, printLog, sdkInstance } =
+       this.options;
+ 
+     this.sdk =
+@@ -80,6 +80,7 @@ export class RsdoctorRspackPlugin<
+         config: {
+           innerClientPath,
+           printLog,
++          server,
+           mode: output.mode ? output.mode : undefined,
+           brief:
+             output.mode === SDK.IMode[SDK.IMode.brief]
+diff --git a/packages/sdk/src/sdk/multiple/primary.ts b/packages/sdk/src/sdk/multiple/primary.ts
+index a7570cc..4ea5078 100644
+--- a/packages/sdk/src/sdk/multiple/primary.ts
++++ b/packages/sdk/src/sdk/multiple/primary.ts
+@@ -42,16 +42,20 @@ export class RsdoctorPrimarySDK
+     extraConfig,
+     type,
+   }: RsdoctorSlaveSDKOptions) {
+-    super({ name, root: controller.root });
++    super({ name, root: controller.root, config: extraConfig });
+ 
+     const lastSdk = controller.getLastSdk();
+-    const port = lastSdk ? lastSdk.server.port + 1 : this.server.port;
++    const port = lastSdk
++      ? lastSdk.server.port + 1
++      : (extraConfig?.server?.port ?? this.server.port);
+ 
+     this.id = id++;
+     this.stage = typeof stage === 'number' ? stage : 1;
+     this.extraConfig = extraConfig;
+     this.parent = controller;
+-    this.server = new RsdoctorSlaveServer(this, port);
++    this.server = new RsdoctorSlaveServer(this, port, {
++      cors: extraConfig?.server?.cors,
++    });
+     this.type = type;
+     this.setName(name);
+     this.clearSwitch();
+diff --git a/packages/sdk/src/sdk/multiple/server.ts b/packages/sdk/src/sdk/multiple/server.ts
+index db4d37e..0e758ec 100644
+--- a/packages/sdk/src/sdk/multiple/server.ts
++++ b/packages/sdk/src/sdk/multiple/server.ts
+@@ -1,12 +1,16 @@
+ import { Server } from '@rsdoctor/utils/build';
+-import { RsdoctorServer } from '../server';
++import { RsdoctorServer, type RsdoctorServerOptions } from '../server';
+ import type { RsdoctorPrimarySDK } from './primary';
+ 
+ export class RsdoctorSlaveServer extends RsdoctorServer {
+   protected sdk: RsdoctorPrimarySDK;
+ 
+-  constructor(sdk: RsdoctorPrimarySDK, port = Server.defaultPort) {
+-    super(sdk, port);
++  constructor(
++    sdk: RsdoctorPrimarySDK,
++    port = Server.defaultPort,
++    config?: RsdoctorServerOptions,
++  ) {
++    super(sdk, port, config);
+     this.sdk = sdk;
+   }
+ 
+diff --git a/packages/sdk/src/sdk/sdk/index.ts b/packages/sdk/src/sdk/sdk/index.ts
+index 7a62e18..40c1716 100644
+--- a/packages/sdk/src/sdk/sdk/index.ts
++++ b/packages/sdk/src/sdk/sdk/index.ts
+@@ -60,11 +60,14 @@ export class RsdoctorSDK<
+ 
+   constructor(options: T) {
+     super(options);
++    const serverConfig = options.config?.server;
++    const port = serverConfig?.port ?? options.port;
+     this.server = options.config?.noServer
+-      ? new RsdoctorFakeServer(this, undefined)
+-      : new RsdoctorServer(this, options.port, {
++      ? new RsdoctorFakeServer(this, port)
++      : new RsdoctorServer(this, port, {
+           innerClientPath: options.config?.innerClientPath || '',
+           printServerUrl: options.config?.printLog?.serverUrls,
++          cors: serverConfig?.cors,
+         });
+     this.type = Lodash.isNumber(options.type)
+       ? options.type
+diff --git a/packages/sdk/src/sdk/server/index.ts b/packages/sdk/src/sdk/server/index.ts
+index d1f4c3d..f78dd78 100644
+--- a/packages/sdk/src/sdk/server/index.ts
++++ b/packages/sdk/src/sdk/server/index.ts
+@@ -25,6 +25,12 @@ const OPEN_IN_EDITOR_PATH = '/__open-in-editor';
+ 
+ export type ISocketType = { port: number; socketUrl: string };
+ 
++export type RsdoctorServerOptions = {
++  innerClientPath?: string;
++  printServerUrl?: boolean;
++  cors?: SDK.RsdoctorServerConfig['cors'];
++};
++
+ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+   private _server!: Common.PromiseReturnType<typeof Server.createServer>;
+ 
+@@ -40,10 +46,12 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+ 
+   private _printServerUrl: boolean;
+ 
++  private _cors: SDK.RsdoctorServerConfig['cors'];
++
+   constructor(
+     protected sdk: SDK.RsdoctorBuilderSDKInstance,
+     port = Server.defaultPort,
+-    config?: { innerClientPath?: string; printServerUrl?: boolean },
++    config?: RsdoctorServerOptions,
+   ) {
+     assert(typeof port === 'number');
+     // maybe the port will be rewrite in bootstrap()
+@@ -53,6 +61,17 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+     this._printServerUrl = Lodash.isUndefined(config?.printServerUrl)
+       ? true
+       : config?.printServerUrl;
++    this._cors = config?.cors;
++  }
++
++  private resolveCorsOptions() {
++    if (this._cors === false) {
++      return false;
++    }
++    if (this._cors === true || typeof this._cors === 'undefined') {
++      return {};
++    }
++    return this._cors;
+   }
+ 
+   public get app(): SDK.RsdoctorServerInstance['app'] {
+@@ -103,7 +122,10 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+ 
+     this.disposed = false;
+ 
+-    this.app.use(cors());
++    const corsOptions = this.resolveCorsOptions();
++    if (corsOptions !== false) {
++      this.app.use(cors(corsOptions));
++    }
+     this.app.use(bodyParser.json({ limit: '500mb' }));
+     const clientHtmlPath = this._innerClientPath
+       ? this._innerClientPath
+@@ -247,6 +269,22 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+     });
+   }
+ 
++  /**
++   * Register a custom route that takes precedence over the built-in handlers.
++   */
++  public addRoute(
++    api: string,
++    method: 'GET' | 'POST',
++    cb: (
++      ...args: Parameters<Thirdparty.connect.NextHandleFunction>
++    ) => Common.PlainObject | string,
++  ) {
++    this.app.stack.unshift({
++      route: api,
++      handle: this.wrapNextHandleFunction(method, cb),
++    });
++  }
++
+   public get: SDK.RsdoctorServerInstance['get'] = (route, cb) => {
+     const { app } = this;
+     app.use(route, this.wrapNextHandleFunction('GET', cb));
+diff --git a/packages/types/src/plugin/plugin.ts b/packages/types/src/plugin/plugin.ts
+index 14138a2..fde7871 100644
+--- a/packages/types/src/plugin/plugin.ts
++++ b/packages/types/src/plugin/plugin.ts
+@@ -39,7 +39,14 @@ export interface RsdoctorPluginOptionsNormalized<
+ > extends Common.DeepRequired<
+   Omit<
+     RsdoctorRspackPluginOptions<Rules>,
+-    'sdkInstance' | 'linter' | 'output' | 'supports' | 'port' | 'brief' | 'mode'
++    | 'sdkInstance'
++    | 'linter'
++    | 'output'
++    | 'supports'
++    | 'port'
++    | 'brief'
++    | 'mode'
++    | 'server'
+   >
+ > {
+   features: Common.DeepRequired<RsdoctorRspackPluginFeatures>;
+@@ -52,6 +59,7 @@ export interface RsdoctorPluginOptionsNormalized<
+     options: Config.BriefModeOptions | Config.NormalModeOptions;
+   };
+   port?: number;
++  server: SDK.RsdoctorServerConfig;
+   supports: ISupport;
+ }
+ 
+@@ -142,6 +150,11 @@ export interface RsdoctorRspackPluginOptions<
+    */
+   port?: number;
+ 
++  /**
++   * Options for the Rsdoctor report server.
++   */
++  server?: SDK.RsdoctorServerConfig;
++
+   /**
+    * Options to control the log printing.
+    */
+diff --git a/packages/types/src/sdk/instance.ts b/packages/types/src/sdk/instance.ts
+index 512899f..075b2fb 100644
+--- a/packages/types/src/sdk/instance.ts
++++ b/packages/types/src/sdk/instance.ts
+@@ -122,6 +122,32 @@ export interface IPrintLog {
+   serverUrls: boolean;
+ }
+ 
++export interface RsdoctorServerCorsOptions {
++  origin?:
++    | boolean
++    | string
++    | RegExp
++    | Array<boolean | string | RegExp>;
++  methods?: string | string[];
++  allowedHeaders?: string | string[];
++  exposedHeaders?: string | string[];
++  credentials?: boolean;
++  maxAge?: number;
++  preflightContinue?: boolean;
++  optionsSuccessStatus?: number;
++}
++
++export interface RsdoctorServerConfig {
++  /**
++   * The port of the Rsdoctor report server.
++   */
++  port?: number;
++  /**
++   * Configure CORS for the Rsdoctor report server.
++   */
++  cors?: boolean | RsdoctorServerCorsOptions;
++}
++
+ export type SDKOptionsType = {
+   innerClientPath?: string;
+   disableClientServer?: boolean;
+@@ -130,4 +156,5 @@ export type SDKOptionsType = {
+   mode?: keyof typeof IMode;
+   brief?: BriefModeOptions;
+   features?: { treeShaking?: boolean };
++  server?: RsdoctorServerConfig;
+ };
+diff --git a/packages/types/src/sdk/server/index.ts b/packages/types/src/sdk/server/index.ts
+index af1d6e9..8daa0b2 100644
+--- a/packages/types/src/sdk/server/index.ts
++++ b/packages/types/src/sdk/server/index.ts
+@@ -19,6 +19,10 @@ export interface RsdoctorServerInstance {
+ 
+   readonly port: number;
+   readonly origin: string;
++  readonly socketUrl: {
++    port: number;
++    socketUrl: string;
++  };
+ 
+   innerClientPath?: string;
+ 

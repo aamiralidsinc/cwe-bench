@@ -1,0 +1,168 @@
+diff -ruN '--exclude=.git' orig/src/client/async.rs base/src/client/async.rs
+--- orig/src/client/async.rs	2026-10-18 19:18:29.000000000 +0000
++++ base/src/client/async.rs	2026-10-18 23:42:01.186736984 +0000
+@@ -3326,6 +3326,74 @@
+     ) -> Result<RestoreStageResponse, ApiError> {
+         self.client.restore_status(restore_id, capability).await
+     }
++
++    /// Stage a backup document and poll until the restore reaches a terminal state.
++    pub fn run(&self, document: &BackupDocument) -> RestoreRunOp {
++        RestoreRunOp::new(self.client.clone(), document.clone())
++    }
++}
++
++pub struct RestoreRunOp {
++    client: Client<Authenticated>,
++    document: BackupDocument,
++    poll_interval: std::time::Duration,
++    timeout: Option<std::time::Duration>,
++}
++
++impl RestoreRunOp {
++    fn new(client: Client<Authenticated>, document: BackupDocument) -> Self {
++        Self {
++            client,
++            document,
++            poll_interval: std::time::Duration::from_secs(1),
++            timeout: Some(std::time::Duration::from_secs(300)),
++        }
++    }
++
++    pub fn poll_interval(mut self, interval: std::time::Duration) -> Self {
++        self.poll_interval = interval;
++        self
++    }
++
++    pub fn timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
++        self.timeout = timeout;
++        self
++    }
++
++    pub async fn send(self) -> Result<RestoreStageResponse, ApiError> {
++        let restores = Restores::new(self.client.clone());
++        let mut staged = restores.stage(&self.document).await?;
++        let capability = staged.restore_capability.clone().ok_or_else(|| {
++            ApiError::EmptyResult("Restore stage returned no capability".into())
++        })?;
++        let started = std::time::Instant::now();
++        loop {
++            if staged.status.is_terminal() {
++                if matches!(staged.status, crate::types::RestoreJobStatus::Failed) {
++                    return Err(ApiError::Api(format!(
++                        "Restore {} {:?}: {}",
++                        staged.id,
++                        staged.status,
++                        staged
++                            .error
++                            .clone()
++                            .unwrap_or_else(|| "no error detail".to_string())
++                    )));
++                }
++                return Ok(staged);
++            }
++            if let Some(timeout) = self.timeout
++                && started.elapsed() >= timeout
++            {
++                return Err(ApiError::Api(format!(
++                    "Restore {} did not finish in time",
++                    staged.id
++                )));
++            }
++            tokio::time::sleep(self.poll_interval).await;
++            staged = restores.status(staged.id, &capability).await?;
++        }
++    }
+ }
+ 
+ pub struct Exports {
+diff -ruN '--exclude=.git' orig/src/client/sync.rs base/src/client/sync.rs
+--- orig/src/client/sync.rs	2026-10-18 19:18:29.000000000 +0000
++++ base/src/client/sync.rs	2026-10-18 23:42:04.886734327 +0000
+@@ -3131,6 +3131,74 @@
+     ) -> Result<RestoreStageResponse, ApiError> {
+         self.client.restore_status(restore_id, capability)
+     }
++
++    /// Stage a backup document and poll until the restore reaches a terminal state.
++    pub fn run(&self, document: &BackupDocument) -> RestoreRunOp {
++        RestoreRunOp::new(self.client.clone(), document.clone())
++    }
++}
++
++pub struct RestoreRunOp {
++    client: Client<Authenticated>,
++    document: BackupDocument,
++    poll_interval: std::time::Duration,
++    timeout: Option<std::time::Duration>,
++}
++
++impl RestoreRunOp {
++    fn new(client: Client<Authenticated>, document: BackupDocument) -> Self {
++        Self {
++            client,
++            document,
++            poll_interval: std::time::Duration::from_secs(1),
++            timeout: Some(std::time::Duration::from_secs(300)),
++        }
++    }
++
++    pub fn poll_interval(mut self, interval: std::time::Duration) -> Self {
++        self.poll_interval = interval;
++        self
++    }
++
++    pub fn timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
++        self.timeout = timeout;
++        self
++    }
++
++    pub fn send(self) -> Result<RestoreStageResponse, ApiError> {
++        let restores = Restores::new(self.client.clone());
++        let mut staged = restores.stage(&self.document)?;
++        let capability = staged.restore_capability.clone().ok_or_else(|| {
++            ApiError::EmptyResult("Restore stage returned no capability".into())
++        })?;
++        let started = std::time::Instant::now();
++        loop {
++            if staged.status.is_terminal() {
++                if matches!(staged.status, crate::types::RestoreJobStatus::Failed) {
++                    return Err(ApiError::Api(format!(
++                        "Restore {} {:?}: {}",
++                        staged.id,
++                        staged.status,
++                        staged
++                            .error
++                            .clone()
++                            .unwrap_or_else(|| "no error detail".to_string())
++                    )));
++                }
++                return Ok(staged);
++            }
++            if let Some(timeout) = self.timeout
++                && started.elapsed() >= timeout
++            {
++                return Err(ApiError::Api(format!(
++                    "Restore {} did not finish in time",
++                    staged.id
++                )));
++            }
++            std::thread::sleep(self.poll_interval);
++            staged = restores.status(staged.id, &capability)?;
++        }
++    }
+ }
+ 
+ pub struct Exports {
+diff -ruN '--exclude=.git' orig/src/types/event.rs base/src/types/event.rs
+--- orig/src/types/event.rs	2026-10-18 19:18:29.000000000 +0000
++++ base/src/types/event.rs	2026-10-18 23:42:07.230732644 +0000
+@@ -263,6 +263,8 @@
+     pub stale_claims: i64,
+     #[serde(default)]
+     pub oldest_due_age_seconds: Option<i64>,
++    #[serde(default)]
++    pub last_error: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,0 +1,127 @@
+diff --git a/packages/commons-server/src/libs/server/admin-api.ts b/packages/commons-server/src/libs/server/admin-api.ts
+index 95be214..a61917b 100644
+--- a/packages/commons-server/src/libs/server/admin-api.ts
++++ b/packages/commons-server/src/libs/server/admin-api.ts
+@@ -165,6 +165,38 @@ export const createAdminEndpoint = (
+     }
+   };
+ 
++  /**
++   * Import multiple environment variables at once
++   *
++   * @param req
++   * @param res
++   */
++  const importEnvVarsHandler = (req, res) => {
++    try {
++      const { variables } = req.body;
++
++      if (
++        variables === null ||
++        typeof variables !== 'object' ||
++        Array.isArray(variables)
++      ) {
++        throw new Error('Variables missing from request');
++      }
++
++      const keys = Object.keys(variables);
++
++      keys.forEach((key) => {
++        process.env[key] = String(variables[key]);
++      });
++
++      res.send({
++        message: `Imported ${keys.length} environment variables`
++      });
++    } catch (_error) {
++      res.status(400).send({ message: 'Invalid request' });
++    }
++  };
++
+   /**
+    * Get the value of a global variable
+    *
+@@ -340,6 +372,7 @@ export const createAdminEndpoint = (
+   app.post(`${adminApiPrefix}/env-vars`, setEnvVarHandler);
+   app.put(`${adminApiPrefix}/env-vars`, setEnvVarHandler);
+   app.patch(`${adminApiPrefix}/env-vars`, setEnvVarHandler);
++  app.post(`${adminApiPrefix}/env-vars/import`, importEnvVarsHandler);
+ 
+   // global vars endpoints
+   app.get(`${adminApiPrefix}/global-vars/:key`, getGlobalVarHandler);
+diff --git a/packages/commons-server/src/libs/server/server.ts b/packages/commons-server/src/libs/server/server.ts
+index 3a7b354..de4c527 100644
+--- a/packages/commons-server/src/libs/server/server.ts
++++ b/packages/commons-server/src/libs/server/server.ts
+@@ -113,6 +113,7 @@ import {
+  */
+ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<ServerEvents>) {
+   private serverInstance: httpServer | httpsServer;
++  private adminLogStreamServer: WebSocketServer | null = null;
+   private webSocketServers: WebSocketServerInstance[] = [];
+   private tlsOptions: SecureContextOptions = {};
+   private processedDatabuckets: ProcessedDatabucket[] = [];
+@@ -836,7 +837,29 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+    *
+    */
+   private createWebsocketRoutes() {
+-    if (this.effectiveWebSocketRoutes.length > 0) {
++    if (this.options.enableAdminApi) {
++      this.adminLogStreamServer = new WebSocketServer({ noServer: true });
++
++      this.adminLogStreamServer.on('connection', (socket: WebSocket) => {
++        const sendTransaction = (transaction: Transaction) => {
++          socket.send(
++            JSON.stringify({ event: 'transaction-complete', transaction })
++          );
++        };
++
++        this.transactionLogs.forEach(sendTransaction);
++        this.on('transaction-complete', sendTransaction);
++
++        socket.on('close', () => {
++          this.off('transaction-complete', sendTransaction);
++        });
++      });
++    }
++
++    if (
++      this.effectiveWebSocketRoutes.length > 0 ||
++      this.adminLogStreamServer !== null
++    ) {
+       this.effectiveWebSocketRoutes.forEach((wsRoute) => {
+         this.createWebsocketRoute(wsRoute);
+       });
+@@ -891,6 +914,17 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+       return;
+     }
+ 
++    if (
++      this.adminLogStreamServer !== null &&
++      urlParsed.pathname === '/mockoon-admin/logs/stream'
++    ) {
++      this.adminLogStreamServer.handleUpgrade(req, socket, head, (client) => {
++        this.adminLogStreamServer?.emit('connection', client, req);
++      });
++
++      return;
++    }
++
+     for (const wsServer of this.webSocketServers) {
+       const paths = preparePath(this.environment.endpointPrefix, wsServer.path);
+       let pathMatchResult;
+@@ -2487,6 +2521,14 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+    * all WebSocket routes are deleted.
+    */
+   private closeWsServers() {
++    if (this.adminLogStreamServer !== null) {
++      this.adminLogStreamServer.clients.forEach((client) => {
++        client.terminate();
++      });
++      this.adminLogStreamServer.close();
++      this.adminLogStreamServer = null;
++    }
++
+     if (this.webSocketServers.length > 0) {
+       this.webSocketServers.forEach((webSocketServer) => {
+         webSocketServer.instance.clients.forEach((client) => {

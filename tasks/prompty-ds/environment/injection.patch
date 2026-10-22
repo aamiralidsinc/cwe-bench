@@ -1,0 +1,260 @@
+diff --git a/runtime/python/prompty/README.md b/runtime/python/prompty/README.md
+index ea470ee..e0d9a3d 100644
+--- a/runtime/python/prompty/README.md
++++ b/runtime/python/prompty/README.md
+@@ -303,6 +303,32 @@ input value.
+ | `${env:VAR}` | Env variable (required) |
+ | `${env:VAR:default}` | Env variable with fallback |
+ | `${file:path.json}` | Load file content |
++| `${prompt:path.md}` | Inline a shared prompt fragment |
++
++### Composing Documents
++
++A `.prompty` file can share definitions with the files around it. Paths in
++these features are resolved from the directory that contains the document.
++
++```yaml
++# frontmatter
++base: base.prompty          # inherit defaults from another document
++metadata:
++  tools: !include tools.yaml  # inline a YAML fragment
++```
++
++A line of its own in the markdown body pulls in a shared text partial:
++
++```markdown
++@include "partials/preamble.md"
++```
++
++The body is rendered as a Jinja2 template, so it can also include shared
++template fragments that live beside the document:
++
++```markdown
++{% include "partials/style.md" %}
++```
+ 
+ ### Connection Kinds
+ 
+diff --git a/runtime/python/prompty/prompty/core/loader.py b/runtime/python/prompty/prompty/core/loader.py
+index 2d6bdbe..d254e3c 100644
+--- a/runtime/python/prompty/prompty/core/loader.py
++++ b/runtime/python/prompty/prompty/core/loader.py
+@@ -16,7 +16,8 @@ from typing import Any
+ import yaml
+ 
+ from ..model import LoadContext, Prompty, SaveContext
+-from .utils import load_prompty, load_prompty_async
++from .partials import expand_partials
++from .utils import load_fragment, load_prompty, load_prompty_async
+ 
+ __all__ = ["load", "load_async", "default_save_context"]
+ 
+@@ -95,6 +96,20 @@ def _build_agent(data: dict[str, Any] | str, path: Path) -> Prompty:
+     if not isinstance(data, dict):
+         data = {}
+ 
++    # Apply a base template so prompts can share common defaults. Fields the
++    # base defines are inherited unless this prompt sets them explicitly.
++    base_ref = data.pop("base", None)
++    if isinstance(base_ref, str) and base_ref:
++        base_data = load_prompty(path.parent / base_ref)
++        if isinstance(base_data, dict):
++            for base_key, base_value in base_data.items():
++                data.setdefault(base_key, base_value)
++
++    # Inline shared body partials referenced with @include "path".
++    instructions = data.get("instructions")
++    if isinstance(instructions, str) and "@include" in instructions:
++        data["instructions"] = expand_partials(instructions, path.parent)
++
+     # 2. Load via Prompty.load() with pre_process for ${protocol:value} expansion
+     ctx = LoadContext(pre_process=_pre_process(path))
+     agent = Prompty.load(data, ctx)
+@@ -121,6 +136,7 @@ def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+     * ``${env:VAR_NAME}`` — environment variable (required)
+     * ``${env:VAR_NAME:default}`` — environment variable with default
+     * ``${file:relative/path}`` — load file content (JSON / YAML / text)
++    * ``${prompt:relative/path}`` — inline a shared prompt fragment
+     """
+ 
+     def process(data: Any) -> Any:
+@@ -159,6 +175,9 @@ def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+                     )
+                 data[key] = _load_file_content(relative_path)
+ 
++            elif protocol == "prompt":
++                data[key] = load_fragment(agent_file.parent, val)
++
+         return data
+ 
+     return process
+diff --git a/runtime/python/prompty/prompty/core/partials.py b/runtime/python/prompty/prompty/core/partials.py
+new file mode 100644
+index 0000000..537b225
+--- /dev/null
++++ b/runtime/python/prompty/prompty/core/partials.py
+@@ -0,0 +1,39 @@
++"""Markdown body partials — ``@include "path"`` expansion.
++
++Prompt bodies often share a common preamble (house style, safety rules,
++output conventions). A line of its own in the body of the form::
++
++    @include "partials/preamble.md"
++
++is replaced with the text of the referenced file, read relative to the
++directory that contains the ``.prompty`` document.
++"""
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++
++from .utils import load_text
++
++__all__ = ["expand_partials"]
++
++_INCLUDE_RE = re.compile(r'^[ \t]*@include[ \t]+"([^"\n]+)"[ \t]*$', re.M)
++
++
++def expand_partials(instructions: str, base_dir: str | Path) -> str:
++    """Inline every ``@include "path"`` line in *instructions*.
++
++    Parameters
++    ----------
++    instructions:
++        The markdown body of a prompt document.
++    base_dir:
++        Directory of the prompt document; references are resolved from here.
++    """
++    root = Path(base_dir)
++
++    def _read(match: re.Match[str]) -> str:
++        return load_text(root / match.group(1))
++
++    return _INCLUDE_RE.sub(_read, instructions)
+diff --git a/runtime/python/prompty/prompty/core/utils.py b/runtime/python/prompty/prompty/core/utils.py
+index 2f8c760..ae3dab1 100644
+--- a/runtime/python/prompty/prompty/core/utils.py
++++ b/runtime/python/prompty/prompty/core/utils.py
+@@ -16,6 +16,36 @@ _yaml_regex = re.compile(
+ )
+ 
+ 
++class PromptySafeLoader(yaml.SafeLoader):
++    """YAML loader that understands the ``!include`` tag.
++
++    ``!include relative/path`` inlines another YAML (or text) document that
++    lives next to the ``.prompty`` file, so frontmatter fragments such as
++    shared tool definitions can be reused across prompts.
++    """
++
++    base_dir: Path | None = None
++
++
++def _construct_include(loader: PromptySafeLoader, node: yaml.Node) -> Any:
++    reference = loader.construct_scalar(node)
++    base_dir = loader.base_dir if loader.base_dir is not None else Path.cwd()
++    return _yaml_load(load_text(Path(base_dir) / reference), base_dir)
++
++
++PromptySafeLoader.add_constructor("!include", _construct_include)
++
++
++def _yaml_load(contents: str, base_dir: Path | None) -> Any:
++    """Parse YAML, resolving ``!include`` tags relative to *base_dir*."""
++    loader = PromptySafeLoader(contents)
++    loader.base_dir = base_dir
++    try:
++        return loader.get_single_data()
++    finally:
++        loader.dispose()
++
++
+ def load_text(file_path: str | Path, encoding: str = "utf-8") -> str:
+     with open(file_path, encoding=encoding) as file:
+         return file.read()
+@@ -36,17 +66,28 @@ async def load_json_async(file_path: str | Path, encoding: str = "utf-8") -> Any
+     return json.loads(content)
+ 
+ 
++def load_fragment(base_dir: str | Path, reference: str, encoding: str = "utf-8") -> str:
++    """Read a prompt fragment referenced from frontmatter, relative to *base_dir*.
++
++    Used by the ``${prompt:...}`` reference protocol to compose a prompt from
++    shared fragment files that live alongside the ``.prompty`` file.
++    """
++    target = Path(base_dir) / reference
++    return load_text(target, encoding=encoding)
++
++
+ def load_prompty(file_path: str | Path, encoding: str = "utf-8") -> dict[str, Any] | str:
+     contents = load_text(file_path, encoding=encoding)
+-    return parse(contents)
++    return parse(contents, base_dir=Path(file_path).parent)
+ 
+ 
+ async def load_prompty_async(file_path: str | Path, encoding: str = "utf-8") -> dict[str, Any] | str:
+     contents = await load_text_async(file_path, encoding=encoding)
+-    return parse(contents)
++    return parse(contents, base_dir=Path(file_path).parent)
+ 
+ 
+-def parse(contents: str) -> dict[str, Any] | str:
++def parse(contents: str, base_dir: str | Path | None = None) -> dict[str, Any] | str:
++    base = Path(base_dir) if base_dir is not None else None
+     is_markdown = re.match(r"^\s*(?:---)", contents) is not None
+ 
+     if is_markdown:
+@@ -54,7 +95,7 @@ def parse(contents: str) -> dict[str, Any] | str:
+         if result:
+             fmatter = result.group(1)
+             body = result.group(2)
+-            content = yaml.safe_load(fmatter)
++            content = _yaml_load(fmatter, base)
+             if content is None:
+                 content = {}
+             content["instructions"] = body
+@@ -62,5 +103,5 @@ def parse(contents: str) -> dict[str, Any] | str:
+         else:
+             raise ValueError("Invalid Markdown format: Missing or malformed frontmatter.")
+     else:
+-        content = yaml.safe_load(contents)
++        content = _yaml_load(contents, base)
+         return content
+diff --git a/runtime/python/prompty/prompty/renderers/jinja2.py b/runtime/python/prompty/prompty/renderers/jinja2.py
+index ee025b1..42c9f8f 100644
+--- a/runtime/python/prompty/prompty/renderers/jinja2.py
++++ b/runtime/python/prompty/prompty/renderers/jinja2.py
+@@ -6,6 +6,7 @@ Registered as ``jinja2`` in ``prompty.renderers``.
+ 
+ from __future__ import annotations
+ 
++from pathlib import Path
+ from typing import Any
+ 
+ from ..model import Prompty
+@@ -38,13 +39,21 @@ class Jinja2Renderer:
+         template: str,
+         inputs: dict[str, Any],
+     ) -> str:
+-        from jinja2 import DictLoader
++        from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
+         from jinja2.sandbox import ImmutableSandboxedEnvironment
+ 
+         render_inputs, thread_nonces = _prepare_render_inputs(agent, inputs)
+ 
++        loaders = [DictLoader({"prompt": template})]
++
++        # Templates can pull in shared fragments that live next to the
++        # document, e.g. ``{% include "partials/style.md" %}``.
++        source_path = (agent.metadata or {}).get("__source_path")
++        if source_path:
++            loaders.append(FileSystemLoader(str(Path(source_path).parent)))
++
+         env = ImmutableSandboxedEnvironment(
+-            loader=DictLoader({"prompt": template}),
++            loader=ChoiceLoader(loaders),
+             keep_trailing_newline=True,
+         )
+         t = env.get_template("prompt")
