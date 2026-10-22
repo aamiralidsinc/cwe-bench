@@ -1,0 +1,182 @@
+diff --git a/cms/admin/pageadmin.py b/cms/admin/pageadmin.py
+index 01ddaf978..e3c0e039a 100644
+--- a/cms/admin/pageadmin.py
++++ b/cms/admin/pageadmin.py
+@@ -248,6 +248,7 @@ class PageAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+             pat(r"^([0-9]+)/advanced-settings/$", self.advanced),
+             pat(r"^([0-9]+)/move-page/$", self.move_page),
+             pat(r"^([0-9]+)/copy-page/$", self.copy_page),
++            pat(r"^([0-9]+)/copy-to-site/$", self.copy_to_site),
+             pat(r"^([0-9]+)/dialog/copy/$", self.get_copy_dialog),  # copy dialog
+             pat(r"^([0-9]+)/permissions/$", self.get_permissions),
+             pat(r"^([0-9]+)/set-home/$", self.set_home),
+@@ -689,6 +690,48 @@ class PageAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+         new_page = form.copy_page(user)
+         return HttpResponse(json.dumps({"id": new_page.pk}), content_type="application/json")
+ 
++    @require_POST
++    @transaction.atomic
++    def copy_to_site(self, request, page_id):
++        """
++        Copy a page (and its translations) to another site.
++
++        Used by the "copy to site" dialog: the editor selects the target site
++        and, optionally, a parent page on that site.
++        """
++        page = self.get_page_from_id(page_id)
++
++        if page is None:
++            return jsonify_request(HttpResponseBadRequest("error"))
++
++        user = request.user
++
++        # The page being copied has to be visible to the user.
++        if not page_permissions.user_can_view_page(user, page, page.site):
++            message = _("Error! You don't have permissions to copy this page.")
++            return jsonify_request(HttpResponseForbidden(message))
++
++        try:
++            target_site = Site.objects.get(pk=request.POST.get("target_site"))
++        except (Site.DoesNotExist, TypeError, ValueError):
++            return jsonify_request(HttpResponseBadRequest("error"))
++
++        target_page = None
++        target_page_id = request.POST.get("target_page")
++        if target_page_id:
++            try:
++                target_page = Page.objects.get(pk=target_page_id, site=target_site)
++            except Page.DoesNotExist:
++                return jsonify_request(HttpResponseBadRequest("error"))
++
++        new_page = page.copy(
++            site=target_site,
++            parent_page=target_page,
++            user=user,
++            permissions=False,
++        )
++        return HttpResponse(json.dumps({"id": new_page.pk}), content_type="application/json")
++
+     def edit_title_fields(self, request, page_id, language):
+         page = self.get_object(request, object_id=page_id)
+         translation = page.get_admin_content(language)
+@@ -833,6 +876,7 @@ class PageContentAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+             pat(r"^get-tree/$", self.get_tree),
+             pat(r"^([0-9]+)/duplicate/$", self.duplicate),
+             pat(r"^([0-9]+)/copy-language/$", self.copy_language),
++            pat(r"^([0-9]+)/import-content/$", self.import_content),
+             pat(r"^([0-9]+)/change-navigation/$", self.change_innavigation),
+             pat(r"^([0-9]+)/change-template/$", self.change_template),
+         ]
+@@ -1248,6 +1292,47 @@ class PageContentAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+             copy_plugins_to_placeholder(plugins, target, language=target_language)
+         return HttpResponse("ok")
+ 
++    @require_POST
++    @transaction.atomic
++    def import_content(self, request, object_id):
++        """
++        Import the plugins of another page into this translation.
++
++        Used by the "import content" action in the page content form: editors
++        can reuse the content of a page they know the address of.
++        """
++        content = self.get_object(request, object_id=object_id)
++
++        if content is None:
++            raise self._get_404_exception(object_id)
++
++        if not self.has_change_permission(request, obj=content):
++            return HttpResponseForbidden(_("You do not have permission to change this page"))
++
++        try:
++            source_id = IntegerField().clean(request.POST.get("source_page"))
++            source = Page.objects.get(pk=source_id)
++        except (ValidationError, Page.DoesNotExist):
++            return HttpResponseBadRequest(_("A source page is required"))
++
++        if source.site_id != content.page.site_id:
++            return HttpResponseBadRequest(_("The source page must belong to the same site"))
++
++        language = content.language
++        source_placeholders = {
++            placeholder.slot: placeholder
++            for placeholder in source.get_placeholders(language, admin_manager=True)
++        }
++
++        for target in content.get_placeholders():
++            source_placeholder = source_placeholders.get(target.slot)
++            if source_placeholder is None:
++                continue
++            plugins = source_placeholder.get_plugins_list(language=language)
++            copy_plugins_to_placeholder(plugins, target, language=language)
++
++        return HttpResponse("ok")
++
+     def delete_view(self, request, object_id, extra_context=None):
+         page_content = self.get_object(request, object_id=object_id)
+         page = page_content.page if page_content is not None else None
+diff --git a/cms/forms/wizards.py b/cms/forms/wizards.py
+index 4d9382a50..afe9f093a 100644
+--- a/cms/forms/wizards.py
++++ b/cms/forms/wizards.py
+@@ -5,10 +5,12 @@ from django.utils.text import slugify
+ from django.utils.translation import gettext, gettext_lazy as _
+ 
+ from cms.admin.forms import AddPageForm
++from cms.models import Page
+ from cms.plugin_pool import plugin_pool
+ from cms.utils import permissions
+ from cms.utils.conf import get_cms_setting
+ from cms.utils.page import get_available_slug
++from cms.utils.page_permissions import user_can_view_page
+ from cms.utils.page_permissions import user_can_add_page, user_can_add_subpage
+ 
+ try:
+@@ -32,6 +34,10 @@ class CreateCMSPageForm(AddPageForm):
+         help_text=_("Optional. If supplied, will be automatically added "
+                     "within a new text plugin.")
+     )
++    content_page = forms.ModelChoiceField(
++        label=_('Start from page'), queryset=Page.objects.all(), required=False,
++        help_text=_("Optional. The new page starts with the content of this page.")
++    )
+ 
+     class Media:
+         js = (
+@@ -45,6 +51,14 @@ class CreateCMSPageForm(AddPageForm):
+         self.fields['title'].help_text = _("Provide a title for the new page.")
+         self.fields['slug'].required = False
+         self.fields['slug'].help_text = _("Leave empty for automatic slug, or override as required.")
++        content_page_field = self.fields.get('content_page')
++        if content_page_field:
++            pages = Page.objects.on_site(self._site).filter(is_page_type=False)
++            content_page_field.choices = [('', '---------')] + [
++                (page.pk, page.get_title(self.language_code) or str(page.pk))
++                for page in pages
++                if user_can_view_page(self._user, page, site=self._site)
++            ]
+ 
+     def get_placeholder(self, page_content, slot=None):
+         """
+@@ -134,6 +148,21 @@ class CreateCMSPageForm(AddPageForm):
+         new_translation = super().save(**kwargs)
+         new_page = new_translation.page
+ 
++        content_page = self.cleaned_data.get('content_page')
++        if content_page and not self.cleaned_data.get('source'):
++            for source_placeholder in content_page.get_placeholders(
++                self.language_code, admin_manager=True
++            ):
++                target_placeholder = new_translation.placeholders.filter(
++                    slot=source_placeholder.slot
++                ).first()
++                if target_placeholder is None:
++                    target_placeholder = new_translation.placeholders.create(
++                        slot=source_placeholder.slot,
++                        default_width=source_placeholder.default_width,
++                    )
++                source_placeholder.copy_plugins(target_placeholder, language=self.language_code)
++
+         if self.cleaned_data.get("page_type"):
+             return new_page
+ 

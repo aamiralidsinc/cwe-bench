@@ -1,0 +1,121 @@
+diff --git a/airflow-core/src/airflow/api_fastapi/core_api/openapi/v2-rest-api-generated.yaml b/airflow-core/src/airflow/api_fastapi/core_api/openapi/v2-rest-api-generated.yaml
+index 81c74245..8d341a1e 100644
+--- a/airflow-core/src/airflow/api_fastapi/core_api/openapi/v2-rest-api-generated.yaml
++++ b/airflow-core/src/airflow/api_fastapi/core_api/openapi/v2-rest-api-generated.yaml
+@@ -3247,6 +3247,14 @@ paths:
+           - type: string
+           - type: 'null'
+           title: Section
++      - name: team_name
++        in: query
++        required: false
++        schema:
++          anyOf:
++          - type: string
++          - type: 'null'
++          title: Team Name
+       - name: accept
+         in: header
+         required: false
+diff --git a/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py b/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
+index 9f4b3359..daac4a12 100644
+--- a/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
++++ b/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
+@@ -31,6 +31,7 @@ from airflow.api_fastapi.core_api.datamodels.config import (
+ from airflow.api_fastapi.core_api.openapi.exceptions import create_openapi_http_exception_doc
+ from airflow.api_fastapi.core_api.security import requires_access_configuration
+ from airflow.api_fastapi.core_api.services.public.config import (
++    _apply_team_overrides,
+     _check_expose_config,
+     _is_per_key_sensitive_option,
+     _mask_per_key_sensitive_options,
+@@ -94,6 +95,7 @@ config_router = AirflowRouter(tags=["Config"], prefix="/config")
+ def get_config(
+     accept: HeaderAcceptJsonOrText,
+     section: str | None = None,
++    team_name: str | None = None,
+ ):
+     display_sensitive = _check_expose_config()
+ 
+@@ -105,6 +107,8 @@ def get_config(
+     conf_dict = conf.as_dict(display_source=False, display_sensitive=display_sensitive)
+     if not display_sensitive:
+         _mask_per_key_sensitive_options(conf_dict)
++    if team_name:
++        _apply_team_overrides(conf_dict, team_name)
+ 
+     if section:
+         conf_section_value = conf_dict[section]
+diff --git a/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py b/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
+index d805827d..d85e8e58 100644
+--- a/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
++++ b/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
+@@ -58,6 +58,23 @@ def _mask_per_key_sensitive_options(conf_dict: dict) -> None:
+                     options[option] = "< hidden >"
+ 
+ 
++def _apply_team_overrides(conf_dict: dict, team_name: str) -> None:
++    """
++    Replace the deployment wide values in ``conf_dict`` with the ones overridden for ``team_name``.
++
++    This gives the configuration the components of a team run with. Options that are hidden in
++    ``conf_dict`` stay hidden.
++    """
++    for section, options in conf_dict.items():
++        team_options = conf.getsection(section, team_name=team_name)
++        if not team_options:
++            continue
++        for option, value in team_options.items():
++            if options.get(option) == "< hidden >":
++                continue
++            options[option] = str(value)
++
++
+ def _check_expose_config() -> bool:
+     display_sensitive: bool | None = None
+     if conf.get("api", "expose_config").lower() == "non-sensitive-only":
+diff --git a/airflow-core/src/airflow/cli/cli_config.py b/airflow-core/src/airflow/cli/cli_config.py
+index 46a0ebfa..ec80fb51 100644
+--- a/airflow-core/src/airflow/cli/cli_config.py
++++ b/airflow-core/src/airflow/cli/cli_config.py
+@@ -935,6 +935,11 @@ ARG_HIDE_SENSITIVE = Arg(
+     action="store_true",
+     help="When used with --show-values, hide sensitive values (passwords, keys, tokens, etc.) and only show non-sensitive configuration values.",
+ )
++ARG_GET_VALUE_HIDE_SENSITIVE = Arg(
++    ("--hide-sensitive",),
++    action="store_true",
++    help="Print '< hidden >' instead of the value when the option is sensitive (passwords, keys, tokens, etc.).",
++)
+ ARG_CONFIG_SHOW_VALUES = Arg(
+     ("--show-values",),
+     action="store_true",
+@@ -1988,6 +1993,7 @@ CONFIG_COMMANDS = (
+             ARG_SECTION,
+             ARG_OPTION,
+             ARG_VERBOSE,
++            ARG_GET_VALUE_HIDE_SENSITIVE,
+         ),
+     ),
+     ActionCommand(
+diff --git a/airflow-core/src/airflow/cli/commands/config_command.py b/airflow-core/src/airflow/cli/commands/config_command.py
+index 5f087fdf..7a6d657e 100644
+--- a/airflow-core/src/airflow/cli/commands/config_command.py
++++ b/airflow-core/src/airflow/cli/commands/config_command.py
+@@ -76,9 +76,14 @@ def get_value(args):
+     # cannot be sure what is the final value of the option.
+     try:
+         value = conf.get(args.section, args.option)
+-        print(value)
+     except AirflowConfigException:
+-        pass
++        return
++    if getattr(args, "hide_sensitive", False) and (
++        args.section.lower(),
++        args.option.lower(),
++    ) in conf.sensitive_config_values:
++        value = "< hidden >"
++    print(value)
+ 
+ 
+ class ConfigParameter(NamedTuple):

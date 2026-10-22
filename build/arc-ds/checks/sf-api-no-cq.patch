@@ -1,0 +1,125 @@
+diff --git a/internal/api/export_download.go b/internal/api/export_download.go
+index 8941fad..828dabc 100644
+--- a/internal/api/export_download.go
++++ b/internal/api/export_download.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/rs/zerolog"
+@@ -19,8 +20,14 @@ type ExportHandler struct {
+ 
+ // NewExportHandler creates an export-download handler rooted at dir.
+ func NewExportHandler(root string, logger zerolog.Logger) *ExportHandler {
++	if abs, err := filepath.Abs(root); err == nil {
++		root = abs
++	}
++	if resolved, err := filepath.EvalSymlinks(root); err == nil {
++		root = resolved
++	}
+ 	return &ExportHandler{
+-		root:   root,
++		root:   filepath.Clean(root),
+ 		logger: logger.With().Str("component", "export-handler").Logger(),
+ 	}
+ }
+@@ -30,6 +37,25 @@ func (h *ExportHandler) RegisterRoutes(app *fiber.App) {
+ 	app.Get("/api/v1/export/download", h.handleDownload)
+ }
+ 
++// withinRoot reports whether p resolves to a path inside root. It checks the
++// lexical path and, when the file exists, the symlink-resolved path.
++func (h *ExportHandler) withinRoot(p string) bool {
++	inside := func(candidate string) bool {
++		rel, err := filepath.Rel(h.root, candidate)
++		if err != nil {
++			return false
++		}
++		return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
++	}
++	if !inside(p) {
++		return false
++	}
++	if resolved, err := filepath.EvalSymlinks(p); err == nil && !inside(resolved) {
++		return false
++	}
++	return true
++}
++
+ // handleDownload streams the named artifact from the export directory.
+ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	name := c.Query("path")
+@@ -41,6 +67,13 @@ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	}
+ 
+ 	fullPath := filepath.Join(h.root, name)
++	if !h.withinRoot(fullPath) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "invalid export path",
++		})
++	}
++
+ 	data, err := os.ReadFile(fullPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+diff --git a/internal/api/query.go b/internal/api/query.go
+index a1dbc58..01229cf 100644
+--- a/internal/api/query.go
++++ b/internal/api/query.go
+@@ -1836,6 +1836,18 @@ func ValidateSQLRequest(sql string) error {
+ 		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
+ 	}
+ 
++	// SECURITY: DuckDB's data-source table functions open files by name, and
++	// the http/s3 families fetch caller-supplied URLs. Neither belongs in
++	// user SQL: only Arc's rewriter may name storage. Run this on the raw
++	// statement because the normalisation pipeline below masks quoted
++	// identifiers and string literals (the very spellings an attacker uses).
++	if userSQLIOFamilyPattern.MatchString(sql) {
++		return &SQLValidationError{Message: "Data-source functions are not allowed in user SQL"}
++	}
++	if userSQLRemoteAddressPattern.MatchString(sql) {
++		return &SQLValidationError{Message: "Remote addresses are not allowed in user SQL"}
++	}
++
+ 	// Normalise before denylist check: mask string literals so keywords
+ 	// inside literals don't false-positive, then strip comments so
+ 	// keywords interleaved with comments don't slip past token
+@@ -1884,6 +1896,14 @@ var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
+ // must route through Arc's rewriter so RBAC stays load-bearing.
+ var userSQLArcPartitionAggPattern = regexp.MustCompile(`(?i)\barc_partition_agg\s*\(`)
+ 
++// userSQLIOFamilyPattern matches the DuckDB data-source table-function
++// family. The optional quotes accept the quoted-identifier spelling.
++var userSQLIOFamilyPattern = regexp.MustCompile(`(?i)"?\b(?:read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_ndjson_auto|read_text|read_blob|read_xlsx|read_parquet|parquet_scan|parquet_metadata|parquet_schema|glob|sniff_csv|arc_partition_agg)\b"?\s*\(`)
++
++// userSQLRemoteAddressPattern matches the URL families DuckDB extensions can
++// open. A caller-supplied address is never part of a measurement query.
++var userSQLRemoteAddressPattern = regexp.MustCompile(`(?i)\b(?:https?|s3|azure|gcs|gs)://`)
++
+ // getTransformedSQL returns the transformed SQL with caching.
+ // If headerDB is non-empty, uses the optimized path with that database for all tables.
+ // Returns the transformed SQL and whether it was a cache hit.
+@@ -3418,6 +3438,18 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
+ 	sql += fmt.Sprintf(" LIMIT %d", limit)
+ 	sql += fmt.Sprintf(" OFFSET %d", offset)
+ 
++	// SECURITY: the filter fragment is part of the statement Arc executes, so
++	// run the shared user-SQL rules over the assembled statement before the
++	// storage-path rewrite.
++	if err := ValidateSQLRequest(sql); err != nil {
++		m.IncQueryErrors()
++		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
++			Success:   false,
++			Error:     "Invalid query: " + err.Error(),
++			Timestamp: time.Now().UTC().Format(time.RFC3339),
++		})
++	}
++
+ 	// Convert SQL to storage paths (with caching)
+ 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
+ 	convertedSQL, _ := h.getTransformedSQL(sql, "")

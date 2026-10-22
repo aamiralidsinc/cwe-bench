@@ -1,0 +1,383 @@
+diff --git a/src/server.ts b/src/server.ts
+index 98bb03d..9bf471d 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -13,6 +13,7 @@ import { registerQualityTools } from "./tools/quality.js";
+ import { registerAnalyzeTools, registerCatalogStatsTools } from "./tools/analyze.js";
+ import { registerSparqlTools } from "./tools/sparql.js";
+ import { registerPortalDiscoveryTools } from "./tools/portal-discovery.js";
++import { registerPreviewTools } from "./tools/preview.js";
+ import { registerAllResources } from "./resources/index.js";
+ import { registerAllPrompts } from "./prompts/index.js";
+ 
+@@ -35,6 +36,7 @@ export function registerAll(server: McpServer): void {
+   registerCatalogStatsTools(server);
+   registerSparqlTools(server);
+   registerPortalDiscoveryTools(server);
++  registerPreviewTools(server);
+   registerAllResources(server);
+   registerAllPrompts(server);
+ }
+diff --git a/src/tools/portal-discovery.ts b/src/tools/portal-discovery.ts
+index dc3f4f0..19bb88c 100644
+--- a/src/tools/portal-discovery.ts
++++ b/src/tools/portal-discovery.ts
+@@ -21,14 +21,31 @@ interface DatashadesPortal {
+   status: string;
+ }
+ 
+-async function fetchPortals(): Promise<DatashadesPortal[]> {
+-  const resp = await axios.get<{ portals: DatashadesPortal[] }>(DATASHADES_URL, {
++async function fetchPortals(registryUrl?: string): Promise<DatashadesPortal[]> {
++  const resp = await axios.get<{ portals: DatashadesPortal[] }>(registryUrl || DATASHADES_URL, {
+     timeout: 15000,
+     headers: { "User-Agent": "CKAN-MCP-Server/1.0" }
+   });
+   return resp.data.portals;
+ }
+ 
++async function probePortal(href: string): Promise<boolean> {
++  const controller = new AbortController();
++  const timeoutId = setTimeout(() => controller.abort(), 5000);
++  try {
++    const response = await fetch(href, {
++      method: "GET",
++      signal: controller.signal,
++      headers: { "User-Agent": "CKAN-MCP-Server/1.0" }
++    });
++    return response.ok;
++  } catch {
++    return false;
++  } finally {
++    clearTimeout(timeoutId);
++  }
++}
++
+ function deduplicateByHostname(portals: DatashadesPortal[]): DatashadesPortal[] {
+   const seen = new Map<string, DatashadesPortal>();
+   for (const p of portals) {
+@@ -108,6 +125,7 @@ Args:
+   - language (string): Portal default locale code (e.g. "it", "en", "pt_BR", "fr")
+   - has_datastore (boolean): If true, return only portals with DataStore enabled (supports SQL queries)
+   - limit (number): Max results to return (default 10, max 50)
++  - verify (boolean): If true, probe each portal URL from the registry and report whether it answered
+ 
+ Returns:
+   Ranked list of matching portals with URL, country, CKAN version, dataset count, and DataStore status.
+@@ -119,7 +137,11 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
+         min_datasets: z.coerce.number().int().min(0).optional().describe("Minimum number of datasets"),
+         language: z.string().optional().describe("Portal default locale code (e.g. 'it', 'en', 'pt_BR')"),
+         has_datastore: z.boolean().optional().describe("If true, return only portals with DataStore plugin (required for SQL queries)"),
+-        limit: z.coerce.number().int().min(1).max(50).optional().default(10).describe("Max results (default 10, max 50)")
++        limit: z.coerce.number().int().min(1).max(50).optional().default(10).describe("Max results (default 10, max 50)"),
++        registry_url: z.string().url().optional()
++          .describe("Alternative registry JSON endpoint returning the same { portals: [...] } shape. Defaults to the public datashades.info registry."),
++        verify: z.boolean().optional().default(false)
++          .describe("If true, probe each portal URL from the registry and report whether it answered.")
+       }).strict(),
+       annotations: {
+         readOnlyHint: true,
+@@ -130,7 +152,7 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
+     },
+     async (params) => {
+       try {
+-        const all = await fetchPortals();
++        const all = await fetchPortals(params.registry_url);
+         const active = all.filter(p => p.status === "active");
+         const results = filterPortals(all, {
+           country: params.country,
+@@ -141,7 +163,20 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
+           limit: params.limit
+         });
+ 
+-        const markdown = formatMarkdown(results, active.length, params.limit);
++        const reachable = new Map<string, boolean>();
++        if (params.verify) {
++          for (const portal of results) {
++            reachable.set(portal.Href, await probePortal(portal.Href));
++          }
++        }
++
++        let markdown = formatMarkdown(results, active.length, params.limit);
++        if (params.verify && results.length > 0) {
++          const lines = results.map(p =>
++            `- ${p.SiteInfo.site_title || p.Href}: ${reachable.get(p.Href) ? "reachable" : "not reachable"}`
++          );
++          markdown += `\n\n**Reachability**\n\n${lines.join("\n")}`;
++        }
+ 
+         return {
+           content: [{ type: "text", text: addDemoFooter(markdown) }],
+@@ -152,7 +187,8 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
+             version: p.Version,
+             datasets: p.DatasetsNumber,
+             locale: p.SiteInfo.locale_default,
+-            has_datastore: (p.Plugins || []).includes("datastore")
++            has_datastore: (p.Plugins || []).includes("datastore"),
++            ...(params.verify ? { reachable: reachable.get(p.Href) === true } : {})
+           }))}
+         };
+       } catch (error) {
+diff --git a/src/tools/preview.ts b/src/tools/preview.ts
+new file mode 100644
+index 0000000..f8c475d
+--- /dev/null
++++ b/src/tools/preview.ts
+@@ -0,0 +1,93 @@
++/**
++ * Resource preview tool — returns the beginning of a resource file without
++ * downloading the whole thing.
++ */
++
++import { z } from "zod";
++import { addDemoFooter } from "../utils/formatting.js";
++import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
++
++const DEFAULT_MAX_CHARS = 600;
++const MAX_CHARS = 4000;
++
++export function registerPreviewTools(server: McpServer) {
++  server.registerTool(
++    "ckan_resource_preview",
++    {
++      title: "Preview a Resource",
++      description: `Fetch the beginning of a resource file from its download URL and return a text preview.
++
++Useful to inspect a CSV/JSON/XML resource before deciding whether to download it in full.
++The URL is the resource \`url\` reported by \`ckan_list_resources\` or \`ckan_package_show\`.
++
++Args:
++  - url (string): Download URL of the resource
++  - max_chars (number): Maximum number of characters to return (default: ${DEFAULT_MAX_CHARS}, max: ${MAX_CHARS})
++
++Returns:
++  The first characters of the resource, together with its content type.
++
++Typical workflow: ckan_list_resources → ckan_resource_preview → download the file if it looks right`,
++      inputSchema: z.object({
++        url: z.string().url().describe("Download URL of the resource"),
++        max_chars: z.number().int().min(100).max(MAX_CHARS).default(DEFAULT_MAX_CHARS)
++          .describe(`Maximum number of characters to return (default: ${DEFAULT_MAX_CHARS}, max: ${MAX_CHARS})`)
++      }).strict(),
++      annotations: {
++        readOnlyHint: true,
++        destructiveHint: false,
++        idempotentHint: true,
++        openWorldHint: true
++      }
++    },
++    async (params) => {
++      const controller = new AbortController();
++      const timeoutId = setTimeout(() => controller.abort(), 15000);
++      try {
++        const response = await fetch(params.url, {
++          method: "GET",
++          signal: controller.signal,
++          headers: {
++            Accept: "text/csv, application/json, text/plain, */*",
++            "User-Agent": "Mozilla/5.0 (compatible; CKAN-MCP-Server/1.0)"
++          }
++        });
++
++        if (!response.ok) {
++          return {
++            content: [{
++              type: "text" as const,
++              text: `Preview failed: HTTP ${response.status} ${response.statusText}`
++            }],
++            isError: true
++          };
++        }
++
++        const raw = await response.text();
++        const text = raw.slice(0, params.max_chars);
++        const truncated = raw.length > params.max_chars ? "\n\n_…preview truncated._" : "";
++        const header =
++          `# Resource Preview\n\n` +
++          `**URL**: ${params.url}\n` +
++          `**Content type**: ${response.headers.get("content-type") || "unknown"}\n\n`;
++
++        return {
++          content: [{
++            type: "text" as const,
++            text: addDemoFooter(header + "```\n" + text + "\n```" + truncated)
++          }]
++        };
++      } catch (error) {
++        return {
++          content: [{
++            type: "text" as const,
++            text: `Preview failed:\n${error instanceof Error ? error.message : String(error)}`
++          }],
++          isError: true
++        };
++      } finally {
++        clearTimeout(timeoutId);
++      }
++    }
++  );
++}
+diff --git a/src/tools/quality.ts b/src/tools/quality.ts
+index 53496bc..c8472a5 100644
+--- a/src/tools/quality.ts
++++ b/src/tools/quality.ts
+@@ -395,21 +395,43 @@ type MqaFetchResult = {
+   breakdown: MqaBreakdown;
+ };
+ 
+-async function fetchMqaQuality(serverUrl: string, datasetId: string): Promise<MqaFetchResult> {
+-  // Step 1: Get dataset metadata from CKAN to extract identifier
++/** Alternate MQA service bases (a mirror exposing the same /api/... paths). */
++function resolveMqaBases(mirrorBaseUrl?: string): { apiBase: string; metricsBase: string } {
++  if (!mirrorBaseUrl) {
++    return { apiBase: MQA_API_BASE, metricsBase: MQA_METRICS_BASE };
++  }
++  const origin = mirrorBaseUrl.replace(/\/+$/, "");
++  return {
++    apiBase: `${origin}/api/mqa/cache/datasets`,
++    metricsBase: `${origin}/api/hub/repo/datasets`
++  };
++}
++
++async function fetchMqaQuality(
++  serverUrl: string,
++  datasetId: string,
++  mirrorBaseUrl?: string,
++  knownIdentifier?: string
++): Promise<MqaFetchResult> {
++  // Step 1: Get dataset metadata from CKAN to extract identifier (skipped when
++  // the European identifier is already known).
+   interface PackageShowResult {
+     identifier?: string;
+     name: string;
+   }
+ 
+-  const dataset = await makeCkanRequest<PackageShowResult>(
+-    serverUrl,
+-    "package_show",
+-    { id: datasetId }
+-  );
+-
+-  // Step 2: Use identifier field, fallback to name
+-  const baseIdentifier = dataset.identifier || dataset.name;
++  let baseIdentifier: string;
++  if (knownIdentifier && knownIdentifier.trim().length > 0) {
++    baseIdentifier = knownIdentifier;
++  } else {
++    const dataset = await makeCkanRequest<PackageShowResult>(
++      serverUrl,
++      "package_show",
++      { id: datasetId }
++    );
++    // Step 2: Use identifier field, fallback to name
++    baseIdentifier = dataset.identifier || dataset.name;
++  }
+   const candidates = buildMqaIdCandidates(baseIdentifier);
+ 
+   if (candidates.length === 0) {
+@@ -417,9 +439,10 @@ async function fetchMqaQuality(serverUrl: string, datasetId: string): Promise<Mq
+   }
+ 
+   // Step 3: Query MQA API (try candidates)
++  const { apiBase, metricsBase } = resolveMqaBases(mirrorBaseUrl);
+   for (const europeanId of candidates) {
+-    const mqaUrl = `${MQA_API_BASE}/${europeanId}`;
+-    const metricsUrl = `${MQA_METRICS_BASE}/${europeanId}/metrics`;
++    const mqaUrl = `${apiBase}/${europeanId}`;
++    const metricsUrl = `${metricsBase}/${europeanId}/metrics`;
+ 
+     try {
+       const response = await axios.get(mqaUrl, {
+@@ -486,16 +509,26 @@ async function fetchMqaQuality(serverUrl: string, datasetId: string): Promise<Mq
+   );
+ }
+ 
+-export async function getMqaQuality(serverUrl: string, datasetId: string): Promise<MqaQualityResult> {
+-  const result = await fetchMqaQuality(serverUrl, datasetId);
++export async function getMqaQuality(
++  serverUrl: string,
++  datasetId: string,
++  mirrorBaseUrl?: string,
++  knownIdentifier?: string
++): Promise<MqaQualityResult> {
++  const result = await fetchMqaQuality(serverUrl, datasetId, mirrorBaseUrl, knownIdentifier);
+   return {
+     mqa: result.mqa,
+     breakdown: result.breakdown
+   };
+ }
+ 
+-export async function getMqaQualityDetails(serverUrl: string, datasetId: string): Promise<MqaQualityDetailsResult> {
+-  const result = await fetchMqaQuality(serverUrl, datasetId);
++export async function getMqaQualityDetails(
++  serverUrl: string,
++  datasetId: string,
++  mirrorBaseUrl?: string,
++  knownIdentifier?: string
++): Promise<MqaQualityDetailsResult> {
++  const result = await fetchMqaQuality(serverUrl, datasetId, mirrorBaseUrl, knownIdentifier);
+   const details = extractMetricDetails(result.metrics, result.breakdown.nonMaxDimensions);
+   return {
+     breakdown: result.breakdown,
+@@ -852,7 +885,11 @@ export function registerQualityTools(server: McpServer): void {
+       inputSchema: z.object({
+         server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+         dataset_id: z.string().describe("Dataset ID or name"),
+-        response_format: ResponseFormatSchema.optional()
++        response_format: ResponseFormatSchema.optional(),
++        identifier: z.string().optional()
++          .describe("European dataset identifier, when already known; skips the CKAN metadata lookup."),
++        mqa_base_url: z.string().url().optional()
++          .describe("Alternate base URL of an MQA service mirror exposing the same /api/mqa and /api/hub paths (defaults to https://data.europa.eu).")
+       }).strict(),
+       annotations: {
+         readOnlyHint: true,
+@@ -861,7 +898,7 @@ export function registerQualityTools(server: McpServer): void {
+         openWorldHint: true
+       }
+     },
+-    async ({ server_url, dataset_id, response_format }) => {
++    async ({ server_url, dataset_id, response_format, identifier, mqa_base_url }) => {
+       // Validate server URL
+       if (!isValidMqaServer(server_url)) {
+         return {
+@@ -876,7 +913,7 @@ export function registerQualityTools(server: McpServer): void {
+       }
+ 
+       try {
+-        const qualityData = await getMqaQuality(server_url, dataset_id);
++        const qualityData = await getMqaQuality(server_url, dataset_id, mqa_base_url, identifier);
+ 
+         const format = response_format || ResponseFormat.MARKDOWN;
+         const output = format === ResponseFormat.JSON
+@@ -908,7 +945,11 @@ export function registerQualityTools(server: McpServer): void {
+       inputSchema: z.object({
+         server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+         dataset_id: z.string().describe("Dataset ID or name"),
+-        response_format: ResponseFormatSchema.optional()
++        response_format: ResponseFormatSchema.optional(),
++        identifier: z.string().optional()
++          .describe("European dataset identifier, when already known; skips the CKAN metadata lookup."),
++        mqa_base_url: z.string().url().optional()
++          .describe("Alternate base URL of an MQA service mirror exposing the same /api/mqa and /api/hub paths (defaults to https://data.europa.eu).")
+       }).strict(),
+       annotations: {
+         readOnlyHint: true,
+@@ -917,7 +958,7 @@ export function registerQualityTools(server: McpServer): void {
+         openWorldHint: true
+       }
+     },
+-    async ({ server_url, dataset_id, response_format }) => {
++    async ({ server_url, dataset_id, response_format, identifier, mqa_base_url }) => {
+       if (!isValidMqaServer(server_url)) {
+         return {
+           content: [{
+@@ -931,7 +972,7 @@ export function registerQualityTools(server: McpServer): void {
+       }
+ 
+       try {
+-        const details = await getMqaQualityDetails(server_url, dataset_id);
++        const details = await getMqaQualityDetails(server_url, dataset_id, mqa_base_url, identifier);
+         const format = response_format || ResponseFormat.MARKDOWN;
+         const output = format === ResponseFormat.JSON
+           ? JSON.stringify(details, null, 2)

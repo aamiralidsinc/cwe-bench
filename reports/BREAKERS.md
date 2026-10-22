@@ -1,65 +1,87 @@
-# CWE-bench breakers register
+# CWE-bench confirmed both-model breakers (VM running register)
+Verdicts authoritative from build/audit_results.py only. "Shipped" = already in client repo.
 
-As of 2026-10-19. Source: raw trial logs (`build/<slug>/runs_{deepseek,mimo}.log`), reconciled with
-the round-2 re-trials and the DeepSeek-driven pilot lane (`build/*-ds`). **Authoritative per-run verdicts come from `build/audit_results.py`; this file
-is the working register.** "Breaker" = the client goal: BOTH target models (DeepSeek V4.1 Flash and
-MiMo-V2.6-Pro) fail all 3 counted attempts. Single-model breakers are leads, not the deliverable.
+| # | task | DeepSeek | MiMo | audit | status |
+|---|------|----------|------|-------|--------|
+| 1 | protobuf.js-ds | failed 0/3 | failed 0/3 | trusted | SHIPPED |
+| 2 | seaweedfs-ds | failed 0/3 | failed 0/3 | trusted | SHIPPED |
+| 3 | electron-builder-ds | failed 0/3 | failed 0/3 | trusted | SHIPPED |
+| 4 | litellm-ds | failed 0/3 | failed 0/3 (timeouts) | trusted | SHIPPED |
+| 5 | jackson-databind-sib2 | failed 0/3 | failed 0/3 | trusted | SHIPPED |
+| 6 | mockoon-ds | failed 0/3 [0.9259,0.963,0.9259] | failed 0/3 [0.9259,0.9259,0.963] | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 7 | hubuum-client-rust-ds | failed 0/3 [0,0,0] | failed 0/3 [0,0,0] | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 8 | siyuan-ds | failed 0/3 [0,0,0] | failed 0/3 [0,0,0] (incl genuine 2h timeout) | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 9 | theia-ds | failed 0/3 [0,0,0] | failed 0/3 [0,0,0] (2 genuine 2h-cap timeouts) | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 10 | openbao-ds | failed 0/3 [0,0,0] | failed 0/3 [0,0,0] | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 11 | tinacms-ds | failed 0/3 [0,0,0] | failed 0/3 [0.9726,0,0] | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 12 | knowns-ds | failed 0/3 [0.8929,0.8571,0.8571] | failed 0/3 [0.8571,0.8571,0.9643] | trusted model-failed (6/6; 5 high, 1 medium) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 13 | yamcs-ds | failed 0/3 [0,0,0] | failed 0/3 [0,0,0] (incl genuine 2h timeout) | trusted model-failed high (6/6) | CONFIRMED 2026-10-21 — NOT yet in client repo; user to add+commit |
+| 14 | grav-ds | failed 0/3 [0,0.8696,0] | failed 0/3 [0.6087,0,0.6957] | trusted model-failed high (6/6) | CONFIRMED 2026-10-22 (HARDENING BATCH) — NEEDS_HUMAN_REVIEW; not in client repo |
+| 15 | jetty.project-ds | failed 0/3 [0.8889,0.8889,0.8889] | failed 0/3 [0.8889,0.8889,0.8889] | trusted model-failed high (6/6) | CONFIRMED 2026-10-22 (HARDENING BATCH) — NEEDS_HUMAN_REVIEW; not in client repo |
 
-Reward key: a model "solves" at reward 1.0. A model "fails" a run at reward < 1.0. 3 fails with no
-solve = that model broken on the task.
 
-## Both-models breakers (the deliverable) — CONFIRMED
+## mockoon-ds detail
+- Rule: (a) value-redaction of a credential reproduced in a recorded response (echoed x-api-key into X-Echoed-Key header + body via {{{header}}} template); (b) a query-string token must NOT authorize an ordinary request (only the SSE /events endpoint).
+- All 6 runs miss (a); 4/6 also miss (b). Reference fix (libs/utils.ts value-scrubbing + SSE-only query token) passes both. Functional 15/15 every run. No infra/contamination (agent_events_after_end=0, no /tests reads, no netguard route).
 
-| Task | DeepSeek | MiMo | Audited | Fairness | Notes |
-|---|---|---|---|---|---|
-| `jackson-databind-sib2` | 0.0, 0.0, 0.0 | 0.0, 0.0, 0.0 | yes (high conf) | READY | The one confirmed, audited breaker. CWE-863 authz, 4 routes incl. an absent-protection catch-all + coupled legitimate values. Report: `reports/jackson-databind-sib2-breaker.md`. |
-| `litellm-ds` | 0.0, 0.0, 0.0 (clean graded fail) | timeout ×all | yes — DeepSeek trustworthy ×3 (2026-10-20) | READY (validated by fixed two-gate agent + Opus) | DS-lane pilot. DeepSeek solves the SSRF security half every run (21/21 security) but breaks the required **opt-in credential-inheritance preservation** (instruction §59–63) every time — a coupled must-keep-working contract (M11), not a security miss; the reference fix preserves it, so a correct fix passes. MiMo never solves — it exhausts the window every attempt (3× at 2 h, then r4 cut at 3 h, r5 killed), counted as a timeout (user, 2026-10-20). |
+## hubuum-client-rust-ds detail (CWE-532, Rust)
+- Rule: a failed export/restore runner error must drop the sensitive server summary but KEEP non-sensitive diagnostics (task id, status). Instruction: "identifiers, names, statuses ... that are not sensitive continue to be shown."
+- Both models solved the entire 24-test security surface (secret removed) but blanket-redacted the whole ApiError::Api rendering, dropping id+status too -> the single functional guard runner_error_keeps_task_identity_and_status fails. Reference fix keeps id+status, drops summary -> passes both. Classic over-broad redaction. No timeout/contamination.
 
-Count: **2 both-models breakers** — `jackson-databind-sib2` (audited, high conf) and `litellm-ds` (DeepSeek clean-fail 3/3, postmortem trustworthy; MiMo timeout). litellm's DeepSeek failure is a coupled-contract preservation miss, not a security miss.
+## siyuan-ds detail (Go)
+- Rule: a never-expose/refusal property on published resources — a non-published resource must never be served or listed to a reader, while legitimately published resources are "served exactly as today." Reference fix spans server/serve.go + api/bazaar.go + api/system.go + new model/publish_resource_access.go.
+- Shared failure shape across all 6 runs: partial fixes that simultaneously UNDER-block security (…RefusedToReader/listing-filter fails) and OVER-block functional serving (every run breaks TestPubUsePublishedResourcesServedToReader). A correct fix passes all. No contamination; agents authored own *_test.go scaffolds (harmless, grader overlays hidden tests).
+- Fairness: prior NOT_READY was a STALE leniency false-positive (validated); reference passes 3/3.
+- NOTE for user: MiMo r2 was a GENUINE AgentTimeoutError at the 2h cap (7200s), NOT 3h/10800s. Counted as model-failed per policy (a fortiori). These trials run at a 2h agent cap — may want to reconcile the "3h timeout" expectation/metadata for this batch.
 
-## DeepSeek-only breakers (DeepSeek fails 3/3, MiMo solves)
+## theia-ds detail (TypeScript, CWE-829 workspace-trust / Restricted Mode)
+- Rule: wire a trust gate (canRun fail-closed when workspace untrusted) across the AI stack (ai-core/ai-chat/ai-ide/ai-terminal/ai-anthropic/ai-copilot), expose AIActivationService isActive/canRun/onDidChangeCanRun, with DI binding. Reference fix is multi-site (1157 lines).
+- Shared failure shape: every run makes partial progress but misses canRun/fail-closed + runtime re-eval + trust-aware reads AND breaks legitimate trusted-workspace behaviour -> any functional fail forces reward 0 (score.py). A correct multi-site fix passes.
+- v4 fairness: fresh verdict READY (the earlier NOT_READY was pre-v4-fairfix and stale). Reference passes 3/3.
+- Both MiMo timeouts (r1,r3) verified GENUINE AgentTimeoutError at 2h/7200s cap (ran ~2h00m, zero provider/infra errors) -> model-failed per policy. (2h cap, not 3h — same metadata note as siyuan.)
 
-| Task | DeepSeek | MiMo | Fairness | Notes |
-|---|---|---|---|---|
-| `electron-builder-ds` | 0.6875, 0.875, 0.75 | 1.0 (solves) | **READY + audited (high)** | **CONFIRMED (fair + audited).** DS pilot lane. CWE credential leak: DeepSeek strips only standard `Authorization` — leaks `X-Api-Key` on differential/multi-range requests and never redacts secrets in failed-command output / debug logs / JSON errors (2–5 security fails per run, functional 165/165). MiMo solves. Postmortem: model-failed, trust=true ×3 (`~/.tb-graders/cwe/jobs/electron-builder-ds-deepseek-r{1,2,3}-*/…/postmortem-*`). |
-| `vitest-api-fs-authz-inj` | 0.625, 0.625, 0.625 | 1.0, 1.0 | fairfixed; not re-reviewed | Post-fairfix re-trial. DeepSeek stuck at 5/8 security every run; MiMo solves. Near-miss on a both-breaker. |
+## openbao-ds detail (Go, HashiCorp secrets manager — identity-template injection)
+- Rule: neutralise identity-template injection WITHOUT over-blocking two legitimate contexts the instruction protects verbatim: (a) certificate URI-SAN substitutions legitimately contain '/' (e.g. spiffe://d/users/alice); (b) SSH default_user rendered from identity ("alice,bob") must keep its comma and be re-checked against the allow-list.
+- Shared failure (all 6): every run blocked a metacharacter SET including '/' applied uniformly across all auth contexts -> over-blocks the PKI URI-SAN legit tests and/or the SSH default_user comma test. All 21 SECURITY tests pass in all 6 runs; the 0.0 is driven entirely by 1-3 legitimate-use FUNCTIONAL tests. Reference fix scopes the block (only '*' for cert allow-lists, never '/'; commas allowed in default_user). Per-run variance in which carve-out each model got right confirms genuine behaviour, not a deterministic test fault.
+- Clean: no timeouts, no contamination, fairness READY (reference passes 3/3).
 
-## MiMo-only breakers (MiMo fails 3/3, DeepSeek solves)
+## tinacms-ds detail (TypeScript CMS — blob/object storage path confinement)
+- Rule: confine upload writes + listings to the served area across azure/s3/dos/cloudinary backends: refuse absolute dirs on EVERY backend (incl. rootless), refuse backslash/NUL/..-climb, while keeping legit behaviour (S3 empty key lists root; inner .. that stays in-area is collapsed not refused).
+- Shared failure: all 6 runs miss the azure "refuses an absolute directory" (/etc) check (strip single leading slash -> accepted); 5/6 also regress S3 "empty key lists root". MiMo r1 near-miss 0.9726 fails on the azure /etc miss alone. Reference resolveKey/resolveDirectory handles all. Achievability proven by differential (every failing check passed by >=1 sibling run). No timeout/contamination.
+- MINOR (non-blocking, user may tighten later): the cloudinary "filename walks upward (../evil.png)" check tensions with the instruction's "inner .. collapsed not refused" rule -> flagged instruction-ambiguity at item level, but NEVER decisive in any run, so verdict unaffected. No re-trial needed.
 
-| Task | DeepSeek | MiMo | Fairness | Notes |
-|---|---|---|---|---|
-| `backstage-ds` | 1.0 (solves) | 0.0, 0.0, 0.9149 | **READY + audited (high)** | **CONFIRMED (fair + audited).** DS pilot lane. MiMo never guards `fetch:template`/`fetch:file` credentials for GitHub (4 security fails) — r3 fixed the Bitbucket over-block (functional 85/85) but still missed the template-fetch guard, capping at 0.9149. DeepSeek solves at 1.0. Caveat: MiMo's best (0.9149) is a near-miss, not a wide gap. Postmortem: model-failed, trust=true ×3 (`~/.tb-graders/cwe/jobs/backstage-ds-mimo-r{1,2,3}-*/…/postmortem-*`). |
-| `prompty-path-read-inj` | 0.8333, 1.0 | 0.8333, 0.8333, 0.8333 | NOT READY (fix not applied) | CWE-22 path traversal, 4 routes. MiMo leaves exactly one route open each run. Report: `reports/prompty-path-read-inj-mimo-only.md`. |
-| `flowise-cross-tenant-inj` | 0.0, 1.0 | 0.0, 0.0, 0.0 | not reviewed | DeepSeek solves run 2; MiMo 0/3. |
-| `electron-builder-credential-leakage` | 1.0 | 0.8, 0.9, 0.8 | not reviewed | DeepSeek solves; MiMo plateaus below 1.0. |
-| `stigmem` | 1.0, 1.0 | 0.0, 0.4444, 0.0 | not reviewed | DeepSeek solves; MiMo 0/3. |
+## knowns-ds detail (Go, assistant memory/doc tool — identifier-shape hardening) [NEAR-MISS breaker]
+- Rule: refuse path-syntax / alternate-platform-separator / alternate-filename spellings of a memory-note id (trailing dot `zzbad.`, backslash `zzbad\route`, colon `zzbad:stream`) while keeping legit interior-dot ids working; refusals must surface as assistant-tool error results.
+- Shared failure: 5/6 runs miss TestSecZZMemoryIdentifierShapes — models applied the shape checks to DOCUMENT names but used a weaker validator for MEMORY ids (self-inconsistent, incomplete hardening). Strongest run (mimo r3, 27/28) misses only TestSecZZDocRenameTraversal on refusal FORM (returns a Go transport error instead of an IsError tool result; security substance was enforced) -> medium confidence, genuine but weakest point.
+- Near-miss verified FAIR: reference fix scores 1.0 (3 Harbor runs), every missed check is instruction-demanded + reference-achievable, keep-working functional 203/203 all runs, no contamination/timeouts.
+- MINOR (non-blocking): author may confirm the instruction makes the refusal-FORM (transport vs tool-error) unambiguous; reference + sibling handlers already settle intended form. No re-trial.
 
-### MiMo-only — tentative (needs a 3rd MiMo run to confirm 3/3)
+## yamcs-ds detail (Java, mission-control — subscription authorization)
+- Rule: close the live-subscription authorization leak WITHOUT breaking legitimate delivery: authorize the packet feed on deriveArchivePartition but label the delivered packet with the root container name; gate container subscription ONCE on the requested names (not per-packet on the archived name).
+- Shared failure: all 6 runs fix security (10/10 every run) but break a keep-working functional test via two subtle errors — (a) relabel bug: label packet with archive name instead of ROOT_CONTAINER -> assertEquals fails (ds r3, all mimo); (b) container over-restriction: per-packet ReadPacket filter on archived name drops authorized containers (ds r1/r2/r3). Reference passes both.
+- Clean: fairness READY (reference 1.0), no contamination; MiMo r1 genuine AgentTimeoutError verified 2h/7200s cap -> model-failed.
 
-| Task | DeepSeek | MiMo | Notes |
-|---|---|---|---|
-| `airflow-info-exposure-inj` | 0.95, 0.0, 1.0 | 0.0, 0.0 | DeepSeek solves run 3; MiMo failed 2/2 but the 3rd run was not recorded. Confirm with one more MiMo run. |
+## FLAGGED — needs user decision (NOT confirmed both-model)
+### hermes-agent-ds — DeepSeek-only breaker; MiMo confounded by provider safety refusal (2026-10-21)
+- DeepSeek: failed 0/3 [0.3929, 0, 0.4643], 3/3 trusted model-failed high — a genuine DeepSeek breaker on a fair grader (promptware-hardening of a self-hostable AI coding agent; missed wiring block into context/memory/codex paths, or over-broad envelope breaking functional "Shapes").
+- MiMo: 3/3 runs ABORTED by provider safety refusal "The request was rejected because it was considered high risk" (0/3 DeepSeek, 3/3 MiMo). 0/28 scores are artifacts of externally aborted runs, NOT capability. Recorded harness-or-infra / untrusted.
+- DECISION NEEDED: re-run MiMo on a serving path that does not refuse benign security-defense work, then re-audit; or accept hermes as a single-model (DeepSeek) breaker. Note: this task is meta security (hardening an agent), the likely reason MiMos safety layer tripped — other CWE tasks may not.
 
-## Reconciliation — formerly listed as breakers, now downgraded (2026-10-18 re-trials)
+### flowise-ds — REJECT recommended; NOT a breaker, task/harness needs repair (2026-10-21)
+- Both models have CLEAN 1.0 solves of flowise-ds: DeepSeek (skipped FIFO-duplicate r1 tHnTMLm, sec 19/19 func 15/15) and MiMo (prior v1 run LKjpibF, 2026-10-19). A task both models solve is not a breaker.
+- Counted DeepSeek side is not a clean 0/3: r1 trusted model-failed (medium; pedantic cross-tenant DELETE returns 500 not 4xx), r2 harness-or-infra (solved security 19/19; fail = offline auth-secrets init the verifier never boots), r3 test-fault (model put helper in the /utils/index.ts barrel which the verifier stubs wholesale -> "not a function" everywhere, logic never ran).
+- MiMo "NEEDS REVIEW" = trial-runner "tests produced no results" container flag, NOT an auditor verdict; no MiMo auditor verdicts exist. Runs crash on oauth2_authorize.spec.ts "Test suite failed to run" (r1,r3) or all-500 base_vector_store (r2) — same OAuth/auth-secrets/barrel-stub harness artifacts.
+- ROOT CAUSE: verifier stubs the entire /utils/index.ts barrel + offline harness never boots OAuth. Fix the harness (don't stub the whole barrel; provide auth-secrets init) or REJECT. Recommend REJECT for this batch: both models demonstrably solve the core security property.
 
-The pre-fairfix host-ledger counted these as both-models breakers; fairness review found the failures
-were test artifacts, and after fairfix + re-trial both models solve. They are **not** breakers:
+## grav-ds detail (PHP CMS — config/secret exfiltration via theme alias) [HARDENING-BATCH BREAKER, 2026-10-22]
+- Rule: redact denied config/secret values from ALL render paths INCLUDING the legacy `theme` alias that mirrors `themes.<name>` (a close-variant reach-path), while keeping legit template/header/config access working.
+- Shared failure: all 6 runs miss ThemeSettingsAliasTest (security) — models redact literal denied paths across every view (theme_var/header_var/theme_config) but miss the legacy-alias copy produced when themes->load() mirrors themes.<theme> onto the `theme` key. Reference Security::expandThemeAliasDeniedPaths expands denied paths across the alias. Failures heterogeneous per run (DS 0/.8696/0, MiMo .6087/0/.6957); clean run deepseek-r2 (functional 40/40) fails ONLY the alias test -> 40/46 security = .8696.
+- Audit: trusted model-failed HIGH 6/6 (Opus-5.5-high). Fair/demanding, NOT a portainer-style test-fault — these are purpose-built CWE security tests that seed their own marker secrets and assert ONLY on rendered output (any refusal form accepted); they do NOT restore pristine project tests pinning the reference's internal architecture. Instruction's Security property explicitly covers "any configuration value hidden from content ... however the value is reached or rendered" + Constraints "fix the flaw and its close variants" -> alias is a genuine close variant. No contamination (no hidden-test reads, no network route-around, 0 tool calls in grading window), no timeout/infra. Fairness GATE_A READY (auto-check flagged NEEDS_HUMAN_REVIEW).
+- Source: Phase B re-trial of a HARDENED previously-solved task (overnight 2026-10-21->22). First confirmed both-model breaker from the hardening batch. DO NOT commit/ship pending user review.
 
-| Task | Was | Now | DeepSeek | MiMo |
-|---|---|---|---|---|
-| `grav-info-exposure-inj` | "breaker" | solved | 1.0 ×3 | 1.0 ×3 |
-| `jenkins-ec2fleet-authz-inj` | "breaker" | solved | 1.0 ×3 | 1.0, 1.0 |
-| `vitest-api-fs-authz-inj` | "breaker" | **DeepSeek-only** (see above) | 0.625 ×3 | 1.0, 1.0 |
-
-## Caveats
-- Audited AND fairness-READY so far: `jackson-databind-sib2` (both-models), `electron-builder-ds`
-  (DeepSeek-only), `backstage-ds` (MiMo-only). These three are validated. Every OTHER single-model
-  entry is still a **lead**: not fairness-reviewed, or explicitly NOT READY (e.g. `prompty`, where a
-  test-construction issue may inflate MiMo's failures). Validate (fairfix + re-trial + audit) before
-  reporting the leads.
-- `electron-builder-ds` / `backstage-ds` are confirmed **single-model** breakers (one model still
-  solves), so they are strong leads toward a both-model breaker, not the deliverable itself.
-- Single-model breakers do not meet the client's both-fail goal; they are kept to track which model
-  each task separates and to mine for a both-breaker recipe.
-- The fully model-driven DeepSeek/MiMo pilot (50 candidates per lane) is running; its breakers will be
-  appended here as its ledgers (`build/pipeline/ledger_{deepseek,mimo}.tsv`) report.
+## jetty.project-ds detail (Java, Jetty server — configured-secret exactness) [HARDENING-BATCH BREAKER, 2026-10-22]
+- Rule: no value other than the EXACT configured secret may authenticate, however presented and however the account's secret is held — across BOTH the charset-representation layer AND the configuration layer. Fix the flaw and its close variants.
+- Shared failure: all 6 runs (both models, 3/3) fix ONLY the charset-collapse layer (ISO-8859-1->UTF-8 + canEncode faithfulness guards in Credential/DigestAuthenticator/BasicAuthenticator) -> clears 8/9 security + 14/14 functional, but MISS the config-layer variant: PropertyUserStore `.trim()` strips a configured trailing space ("pa? " -> "pa?") so the near-miss value authenticates. Exactly one test fails everywhere: SecurityConfiguredSecretExactnessTest::valueThatDropsAConfiguredCharacterIsRejected -> 8/9 = 0.8889 identical across all 6. deepseek-r1 even Read PropertyUserStore.java and still didn't edit it.
+- Audit: trusted model-failed HIGH 6/6 (Opus-5.5-high). FAIR, NOT a portainer-style test-fault — purpose-built CWE security test asserting ONLY external HTTP behaviour (isClientError + !authenticatedAs), pins no internal signature, not a restored pristine project unit test. Reference fix passes it by removing `.trim()` in PropertyUserStore.java (product-code change within the stated exactness property). No contamination, no timeout/infra. Fairness GATE_A READY (auto-check flagged NEEDS_HUMAN_REVIEW).
+- Minor nuance (non-decisive): instruction's "Magnitudes" clause frames the attack narrowly as a charset-unrepresentable char, but the broad Security-property + close-variants language + the deliberate trailing-space escape keep the variant in scope -> high confidence.
+- Source: Phase B re-trial of a HARDENED previously-solved task (overnight 2026-10-21->22). 2nd confirmed both-model breaker from the hardening batch. DO NOT commit/ship pending user review.

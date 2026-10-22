@@ -236,10 +236,14 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     # limit cutting the run is not a failure under the current limit.
     cut = [r for r in runs if r["timed_out"] and r["limit_sec"] < limit and r["reward"] != 1.0]
     runs = [r for r in runs if r not in cut]
-    # User rule (2026-10-16): a timeout is not a model failure. A non-solve that hit a limit under
-    # 3 h is re-run with 3 h (run_trial.sh CWE_AGENT_TIMEOUT_MULT=1.5); only a 3 h timeout counts.
+    # User rule (2026-10-20, supersedes 2026-10-16): a timeout IS a model failure once an independent
+    # post-run audit records it as a genuine model-failed time-limit miss (postmortem trustworthy);
+    # such an audited timeout counts as a graded fail at whatever limit it ran. An UN-audited sub-3h
+    # timeout is still owed a 3 h re-run (its grade measures unfinished code until the audit confirms
+    # the miss is a genuine capability shortfall, not an infra/provider cut). A 3 h timeout always counts.
     rerun_3h = [r for r in runs if r["timed_out"] and r["reward"] not in (None, 1.0)
-                and r["limit_sec"] < 10800]
+                and r["limit_sec"] < 10800
+                and postmortem_state(r["job"], r["trial"], r["grading"]) != "trusted"]
     runs = [r for r in runs if r not in rerun_3h]
     TIMEOUT_RERUNS.extend(rerun_3h)
     # A non-solve whose grading setup broke is not a model failure until reviewed:

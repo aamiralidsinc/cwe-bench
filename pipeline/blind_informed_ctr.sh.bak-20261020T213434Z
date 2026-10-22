@@ -1,0 +1,119 @@
+#!/bin/bash
+# In-container informed blind fix.
+# Builds the INJECTED tree on the host (source-only git repo = diff baseline),
+# starts the task's own built image as a long-lived container (full toolchain +
+# warmed offline caches + prebuilt artifacts), and runs the Opus 5.5 agent ON THE
+# HOST (so credentials stay on the host) editing the host tree. The agent compiles
+# and exercises its fix INSIDE the container via $WORK/verify.sh (docker exec),
+# which overlays the host edits onto the image's /app and runs the real toolchain.
+# The agent sees instruction.md + the PRIVATE injected-sites.md (traps) only; it
+# never sees the hidden grading tests (not present in the image) or the reference
+# fix. Diff of the host tree -> checks/blind.patch, then the gate re-checks it.
+set -uo pipefail
+SLUG=$1
+R="$HOME/cwe-bench"; DF="$R/tasks/$SLUG/environment/Dockerfile"
+LOG="$R/build/$SLUG/blind-informed.log"; : > "$LOG"
+log(){ echo "[$SLUG] $*" >> "$LOG"; }
+
+# --- per-task image + build command (reuse the already-built task images) ---
+case "$SLUG" in
+  coreutils-ds)
+    IMG="coreutils-ds:test"
+    BUILD_CMD='cargo build --offline -p uu_install --bin install 2>&1 | tail -40' ;;
+  tinacms-ds)
+    IMG="tinacms-ds-dev:latest"
+    # No compile step (vitest transpiles TS at test time). Smoke that every edited
+    # adapter module parses as TS via esbuild (bundled with vitest at /opt/verifier).
+    BUILD_CMD='ESB=/opt/verifier/node_modules/esbuild/bin/esbuild; if [ -x "$ESB" ]; then ok=1; for f in $(cd /app && git diff --name-only 2>/dev/null | grep "[.]ts$"); do "$ESB" --log-level=warning --loader:.ts=ts /app/$f >/dev/null || { echo PARSE-FAIL $f; ok=0; }; done; [ $ok = 1 ] && echo "all edited TS modules parse OK"; else echo "no esbuild; TS is transpiled at test time - exercise behaviour with verify.sh run + vitest at /opt/verifier/node_modules/vitest/vitest.mjs"; fi' ;;
+  yamcs-ds)
+    IMG="yamcs-ds:dev"
+    BUILD_CMD='mvn -B -o -q -Dmaven.test.skip=true -Dmaven.javadoc.skip=true -Denforcer.skip=true -pl yamcs-api,yamcs-xtce,yamcs-client,yamcs-core -am install 2>&1 | tail -50' ;;
+  *)
+    log "NO IMAGE/BUILD MAPPING for $SLUG"; exit 9 ;;
+esac
+docker image inspect "$IMG" >/dev/null 2>&1 || { log "IMAGE MISSING: $IMG"; exit 8; }
+
+# --- parse repo/commit/inject from the Dockerfile ---
+URL=$(grep -oE '^ARG REPO_URL=[^ ]+' "$DF" | sed -E 's/^ARG REPO_URL=//; s/"//g' | head -1); URL=${URL%.git}
+[ -n "$URL" ] || URL=$(grep -oE 'https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' "$DF" | head -1 | sed 's/\.git$//')
+COMMIT=$(grep -oE '[0-9a-f]{40}' "$DF" | head -1)
+INJ=$(ls "$R"/tasks/$SLUG/environment/inject*.patch "$R"/tasks/$SLUG/environment/injection.patch "$R"/tasks/$SLUG/environment/inject-siblings.patch 2>/dev/null | head -1)
+log "url=$URL commit=${COMMIT:0:12} inj=$(basename "$INJ") img=$IMG"
+[ -n "$URL" ] && [ -n "$COMMIT" ] && [ -n "$INJ" ] || { log "PARSE FAIL"; exit 2; }
+
+# --- build the injected tree on the host (source-only; this is the diff base) ---
+WORK="$HOME/.tb-graders/cwe/blind-informed/$SLUG"; rm -rf "$WORK"; mkdir -p "$WORK/scratch"; cd "$WORK"
+git init -q app && ( cd app && git remote add origin "$URL" && git fetch -q --depth 1 origin "$COMMIT" && git checkout -q FETCH_HEAD && rm -rf .git )
+( cd app && patch -p1 < "$INJ" ) >> "$LOG" 2>&1 || { log "INJECT APPLY FAIL"; exit 3; }
+( cd app && git init -q . && git add -A && git -c user.email=x@x -c user.name=x commit -qm injected-baseline )
+
+cp "$R/tasks/$SLUG/instruction.md" instruction.md
+python3 - "$R/build/$SLUG/manifest.json" > injected-sites.md <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+print("# PRIVATE injected-sibling / route site list - for this soundness fix ONLY\n")
+print("Close EVERY site listed below AND the route in instruction.md. A real solver is NOT given this list; you are, so the fix is COMPLETE and scores 1.0. Do not weaken any legitimate behaviour.\n")
+for t in m.get("traps",[]):
+    print(f"## {t.get('id')}  @ {t.get('where')}")
+    print(t.get('shape','')); print()
+PY
+
+# --- long-lived container from the task image; host $WORK mounted at /host ---
+CTR="blind-ctr-$SLUG"
+docker rm -f "$CTR" >/dev/null 2>&1
+docker run -d --name "$CTR" -v "$WORK:/host" "$IMG" sleep infinity >> "$LOG" 2>&1 \
+  || { log "CONTAINER START FAIL"; exit 4; }
+
+# --- verify.sh: the agent's bridge into the container toolchain ---
+cat > "$WORK/verify.sh" <<VERIFY
+#!/bin/bash
+# Usage:
+#   verify.sh build          overlay your current edits onto the container /app and compile
+#   verify.sh run '<cmd>'    overlay your edits, then run <cmd> in /app inside the container
+# Your scratch/reproduction files live at \$WORK/scratch (host) == /host/scratch (container).
+CTR="$CTR"
+SYNC='cd /host/app && tar --exclude=.git --exclude=node_modules -cf - . | (cd /app && tar -xf -)'
+case "\$1" in
+  build) docker exec "\$CTR" bash -c "\$SYNC && cd /app && $BUILD_CMD"; exit \$? ;;
+  run)   shift; docker exec "\$CTR" bash -c "\$SYNC" >/dev/null 2>&1; docker exec -w /app "\$CTR" bash -c "\$*"; exit \$? ;;
+  *) echo "usage: verify.sh build | verify.sh run '<cmd>'"; exit 2 ;;
+esac
+VERIFY
+chmod +x "$WORK/verify.sh"
+
+PROMPT="You are writing a COMPLETE reference-quality security fix for a known vulnerability, as a soundness control (it proves a fully-informed fix passes every hidden test). You are confined to \$WORK=$WORK.
+
+Read ONLY these two files for the requirement: \$WORK/instruction.md (the vulnerability and the required properties, including a 'keep working' / 'what must keep working' section you MUST honour item by item) and \$WORK/injected-sites.md (the COMPLETE private list of every site you must fix). Edit the real source tree under \$WORK/app to close the reported route AND every site in injected-sites.md, while keeping ALL legitimate behaviour working.
+
+You HAVE the project's real toolchain inside a container. Use it:
+  * \$WORK/verify.sh build        -> compiles your current edits with the real compiler; fix every error until it builds clean.
+  * \$WORK/verify.sh run '<cmd>'  -> runs <cmd> in the built tree (run the built binary/server, invoke a function, run a test). Put any scratch/test files under \$WORK/scratch (NOT under \$WORK/app, so they stay out of the fix); they are visible in the container at /host/scratch.
+Explore \$WORK/app to find existing safe helpers/utilities and the EXISTING authorization/validation the product already applies on the ordinary (non-subscription, non-create) read/write path, and make the vulnerable paths enforce the SAME check in the SAME way. Prefer the project's own primitives over rolling your own.
+
+CRITICAL - build an explicit test matrix and drive your fix to green against it, because a fix that is too weak OR too strong both fail:
+  1. From instruction.md, turn EVERY bullet under the security-properties/invariants section into a concrete ATTACK case (an input that must be refused or neutralised so nothing happens at the forbidden target), and EVERY bullet under 'what must keep working'/'keep working' into a concrete LEGITIMATE case (an input that must still SUCCEED and behave exactly as before). Include the instruction's own illustrative examples, and the near-miss pairs the instruction draws (e.g. an operation that must be refused vs. a very similar one that must keep working - a value that merely passes THROUGH an existing, already-valid location on its way to a new one is usually legitimate, while the same value used to act at a forbidden location is the attack). Enumerate the boundary inputs the instruction lists explicitly (empty, absolute, trailing/leading separators, repeated/list values, split-across-segments, inner-but-contained climbs, identifiers returned by a prior listing).
+  2. Write these as runnable scratch cases (a scratch test program, or scripted invocations of the built binary/function) under \$WORK/scratch and run them with verify.sh run.
+  3. Iterate: build clean, THEN make every ATTACK case blocked AND every LEGITIMATE case still pass, at EVERY site in injected-sites.md and the reported route. Do not stop at the first scenario that works - a partial fix that handles the simple case but not the nested/boundary case is the most common failure here. Re-run your whole matrix after each change.
+
+Rules: Do NOT consult or search for any upstream fix, advisory, patch, or changelog for this project. Do NOT touch anything outside \$WORK. The hidden grading tests are NOT present; do not try to find them. When done, write \$WORK/mechanisms.md listing the fix at each site and, for each case in your matrix, the command you ran and that it passed.
+
+WORK=$WORK"
+
+log "launching Opus 5.5 in-container agent $(date -u +%FT%TZ)"
+date -u +%FT%TZ > "$R/build/$SLUG/blind_informed_start.txt"
+timeout 9000 "$HOME/.local/bin/claude" -p "$PROMPT" --model claude-opus-5-5 \
+  --permission-mode bypassPermissions --add-dir "$WORK" \
+  --output-format json > "$R/build/$SLUG/blind-informed.json" 2> "$R/build/$SLUG/blind-informed.err"
+log "agent exit $? $(date -u +%FT%TZ)"
+
+# --- extract the patch from the host tree (source edits only) ---
+( cd "$WORK/app" && git add -A && git diff --cached ) > "$WORK/blind.patch" 2>>"$LOG"
+if [ -s "$WORK/blind.patch" ]; then
+  cp "$WORK/blind.patch" "$R/build/$SLUG/checks/blind.patch"
+  log "BLIND.PATCH WRITTEN: $(wc -l <"$WORK/blind.patch") lines, $(grep -c '^+++' "$WORK/blind.patch") files -> checks/blind.patch"
+else
+  log "EMPTY PATCH - agent made no edits"
+fi
+docker rm -f "$CTR" >/dev/null 2>&1
+log "container removed"
+echo "BLIND-INFORMED-DONE-$SLUG" >> "$LOG"

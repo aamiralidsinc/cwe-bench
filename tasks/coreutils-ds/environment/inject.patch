@@ -1,0 +1,241 @@
+diff --git a/src/uu/install/src/install.rs b/src/uu/install/src/install.rs
+index 84eefdc..3d266b7 100644
+--- a/src/uu/install/src/install.rs
++++ b/src/uu/install/src/install.rs
+@@ -25,7 +25,7 @@ use uucore::buf_copy::copy_stream;
+ use uucore::display::Quotable;
+ use uucore::entries::{grp2gid, usr2uid};
+ use uucore::error::{FromIo, UError, UResult, UUsageError};
+-use uucore::fs::dir_strip_dot_for_creation;
++use uucore::fs::{create_dir_all_absolute, dir_strip_dot_for_creation};
+ use uucore::perms::{Verbosity, VerbosityLevel, wrap_chown};
+ use uucore::process::{getegid, geteuid};
+ #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
+@@ -554,6 +554,58 @@ fn is_potential_directory_path(path: &Path) -> bool {
+     path_str.ends_with(MAIN_SEPARATOR) || path_str.ends_with('/') || path.is_dir()
+ }
+ 
++/// Create the directory named by `--target-directory` when it is missing.
++///
++/// With `-t` the target is a directory rather than a destination file name, so
++/// `-D` creates the whole path before anything is copied into it.
++fn create_target_dir(target: &Path, b: &Behavior) -> UResult<()> {
++    // A trailing separator does not name a different directory; create the path
++    // without it so an existing non-directory is reported by the caller instead
++    // of being passed to the directory creation.
++    let mut to_create = target.to_path_buf();
++    if let Ok(path_bytes) = uucore::os_str_as_bytes(target.as_os_str()) {
++        if path_bytes.ends_with(b"/") {
++            let mut trimmed_bytes = path_bytes;
++            while trimmed_bytes.ends_with(b"/") {
++                trimmed_bytes = &trimmed_bytes[..trimmed_bytes.len() - 1];
++            }
++            to_create = PathBuf::from(std::ffi::OsStr::from_bytes(trimmed_bytes));
++        }
++    }
++    let target = to_create.as_path();
++
++    if target.exists() {
++        return Ok(());
++    }
++
++    if b.verbose {
++        let mut result = PathBuf::new();
++        for part in target.components() {
++            result.push(part.as_os_str());
++            if !result.is_dir() {
++                writeln!(
++                    stdout(),
++                    "{}",
++                    translate!("install-verbose-creating-directory-step", "path" => result.quote())
++                )?;
++            }
++        }
++    }
++
++    if let Err(e) = create_dir_all_absolute(target) {
++        return Err(InstallError::CreateDirFailed(target.to_path_buf(), e).into());
++    }
++
++    // Set SELinux context for all created directories if needed
++    #[cfg(feature = "selinux")]
++    if should_set_selinux_context(b) {
++        let context = get_context_for_selinux(b);
++        set_selinux_context_for_directories_install(target, context);
++    }
++
++    Ok(())
++}
++
+ /// Perform an install, given a list of paths and behavior.
+ ///
+ /// Returns a Result type with the Err variant containing the error message.
+@@ -596,14 +648,20 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+ 
+     if b.create_leading {
+         // if -t is used in combination with -D, create whole target because it does not include filename
+-        let to_create: Option<&Path> = if b.target_dir.is_some() {
+-            Some(target.as_path())
+-        // if source and target are filenames used in combination with -D, create target's parent
+-        } else if !(sources.len() > 1 || is_potential_directory_path(&target)) {
+-            target.parent()
++        if b.target_dir.is_some() {
++            create_target_dir(&target, b)?;
++
++            if !target.exists() || !target.is_dir() {
++                return Err(InstallError::NotADirectory(target.clone()).into());
++            }
+         } else {
+-            None
+-        };
++            // if source and target are filenames used in combination with -D, create target's parent
++            let to_create: Option<&Path> =
++                if !(sources.len() > 1 || is_potential_directory_path(&target)) {
++                    target.parent()
++                } else {
++                    None
++                };
+ 
+         if let Some(to_create) = to_create {
+             // if the path ends in /, remove it
+@@ -649,12 +707,6 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+                     set_selinux_context_for_directories_install(to_create, context);
+                 }
+             }
+-        }
+-        if b.target_dir.is_some() {
+-            let p = to_create.unwrap();
+-
+-            if !p.exists() || !p.is_dir() {
+-                return Err(InstallError::NotADirectory(p.to_path_buf()).into());
+             }
+         }
+     }
+@@ -719,6 +771,15 @@ fn copy_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UR
+         let filename = sourcepath.components().next_back().unwrap();
+         targetpath.push(filename);
+ 
++        // A destination that is already present keeps its inode when its
++        // contents are replaced, so its owner and permissions survive a
++        // re-install. Attributes requested on the command line are applied
++        // afterwards, as for a new file.
++        if targetpath.is_file() && b.backup_mode == BackupMode::None && !b.compare {
++            show_if_err!(copy_over_existing(sourcepath, &targetpath, b));
++            continue;
++        }
++
+         show_if_err!(copy(sourcepath, &targetpath, b));
+     }
+     // If the exit code was set, or show! has been called at least once
+@@ -727,6 +788,74 @@ fn copy_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UR
+     Ok(())
+ }
+ 
++/// Copy one file over a destination that already exists.
++///
++/// The existing entry is kept and its contents are replaced in place; the
++/// backup and attribute handling match `copy`.
++///
++/// # Parameters
++///
++/// _from_ must exist as a non-directory.
++/// _to_ must be an existing non-directory whose parent directory exists.
++///
++fn copy_over_existing(from: &Path, to: &Path, b: &Behavior) -> UResult<()> {
++    if let Ok(to_abs) = to.canonicalize() {
++        if from.canonicalize()? == to_abs {
++            return Err(InstallError::SameFile(from.to_path_buf(), to.to_path_buf()).into());
++        }
++    }
++
++    let backup_path = perform_backup(to, b)?;
++
++    fs::copy(from, to).map_err(|err| {
++        InstallError::InstallFailed(from.to_path_buf(), to.to_path_buf(), err.to_string())
++    })?;
++
++    #[cfg(not(windows))]
++    if b.strip {
++        strip_file(to, b)?;
++    }
++
++    set_ownership_and_permissions(to, b)?;
++
++    if b.preserve_timestamps {
++        preserve_timestamps(from, to)?;
++    }
++
++    #[cfg(feature = "selinux")]
++    if !b.unprivileged {
++        if b.preserve_context {
++            uucore::selinux::preserve_security_context(from, to)
++                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
++        } else if b.default_context {
++            set_selinux_default_context(to)
++                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
++        } else if b.context.is_some() {
++            let context = get_context_for_selinux(b);
++            set_selinux_security_context(to, context)
++                .map_err(|e| InstallError::SelinuxContextFailed(e.to_string()))?;
++        }
++    }
++
++    if b.verbose {
++        write!(
++            stdout(),
++            "{}",
++            translate!("install-verbose-copy", "from" => from.quote(), "to" => to.quote())
++        )?;
++        match backup_path {
++            Some(path) => writeln!(
++                stdout(),
++                " {}",
++                translate!("install-verbose-backup", "backup" => path.quote())
++            )?,
++            None => writeln!(stdout())?,
++        }
++    }
++
++    Ok(())
++}
++
+ /// Handle ownership changes when -o/--owner or -g/--group flags are used.
+ ///
+ /// Returns a Result type with the Err variant containing the error message.
+@@ -790,7 +919,10 @@ fn perform_backup(to: &Path, b: &Behavior) -> UResult<Option<PathBuf>> {
+         }
+         let backup_path = backup_control::get_backup_path(b.backup_mode, to, &b.suffix);
+         if let Some(ref backup_path) = backup_path {
+-            fs::rename(to, backup_path).map_err(|err| {
++            // Back up the file the destination points at, so a symbolic link can
++            // keep referring to the preserved copy after the install.
++            let backup_source = fs::canonicalize(to).unwrap_or_else(|_| to.to_path_buf());
++            fs::rename(&backup_source, backup_path).map_err(|err| {
+                 InstallError::BackupFailed(to.to_path_buf(), backup_path.clone(), err)
+             })?;
+         }
+diff --git a/src/uucore/src/lib/features/fs.rs b/src/uucore/src/lib/features/fs.rs
+index 6153162..b0c6a5a 100644
+--- a/src/uucore/src/lib/features/fs.rs
++++ b/src/uucore/src/lib/features/fs.rs
+@@ -558,6 +558,20 @@ pub fn dir_strip_dot_for_creation(path: &Path) -> PathBuf {
+     }
+ }
+ 
++/// Create all missing components of `path`.
++///
++/// A relative path is resolved against the current directory first, so the
++/// components are created at a stable location even if the working directory
++/// changes later. Existing components are left untouched.
++pub fn create_dir_all_absolute(path: &Path) -> IOResult<()> {
++    let absolute = if path.is_absolute() {
++        path.to_path_buf()
++    } else {
++        env::current_dir()?.join(path)
++    };
++    fs::create_dir_all(&absolute)
++}
++
+ /// Checks if `p1` and `p2` are the same file.
+ /// If error happens when trying to get files' metadata, returns false
+ pub fn paths_refer_to_same_file<P: AsRef<Path>>(p1: P, p2: P, dereference: bool) -> bool {

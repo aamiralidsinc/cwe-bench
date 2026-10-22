@@ -1,0 +1,908 @@
+diff --git a/api/cli/cli.go b/api/cli/cli.go
+index 5f26275..d7fa93c 100644
+--- a/api/cli/cli.go
++++ b/api/cli/cli.go
+@@ -56,6 +56,8 @@ func CLIFlags() *portainer.CLIFlags {
+ 		TrustedOrigins:            kingpin.Flag("trusted-origins", "List of trusted origins for CSRF protection. Separate multiple origins with a comma.").Envar(portainer.TrustedOriginsEnvVar).String(),
+ 		CSP:                       kingpin.Flag("csp", "Content Security Policy (CSP) header").Envar(portainer.CSPEnvVar).Default("true").Bool(),
+ 		CompactDB:                 kingpin.Flag("compact-db", "Enable database compaction on startup").Envar(portainer.CompactDBEnvVar).Default("false").Bool(),
++		NoSetupToken:              kingpin.Flag("no-setup-token", "Disable the setup token requirement for admin initialization and restore on an uninitialized instance").Envar(portainer.NoSetupTokenEnvVar).Bool(),
++		SetupToken:                kingpin.Flag("setup-token", "Set a custom setup token for admin initialization and restore on an uninitialized instance (overrides auto-generation)").Envar(portainer.SetupTokenEnvVar).String(),
+ 	}
+ }
+ 
+diff --git a/api/cmd/portainer/main.go b/api/cmd/portainer/main.go
+index 3e2432f..603ca8d 100644
+--- a/api/cmd/portainer/main.go
++++ b/api/cmd/portainer/main.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/portainer/portainer/api/http"
+ 	"github.com/portainer/portainer/api/http/proxy"
+ 	kubeproxy "github.com/portainer/portainer/api/http/proxy/factory/kubernetes"
++	"github.com/portainer/portainer/api/http/security/setuptoken"
+ 	"github.com/portainer/portainer/api/internal/authorization"
+ 	"github.com/portainer/portainer/api/internal/edge/edgestacks"
+ 	"github.com/portainer/portainer/api/internal/endpointutils"
+@@ -225,6 +226,24 @@ func initSnapshotService(
+ 	return snapshotService, nil
+ }
+ 
++func resolveSetupToken(tx dataservices.DataStoreTx, providedToken string) (string, error) {
++	if providedToken != "" {
++		log.Info().Msg("using custom setup token; admin initialization and backup restore require this token in the X-Setup-Token header")
++		return providedToken, nil
++	}
++
++	token, err := setuptoken.Generate()
++	if err != nil {
++		return "", err
++	}
++
++	log.Info().
++		Str("setup_token", token).
++		Msg("no administrator account configured; admin initialization and backup restore require this setup token in the X-Setup-Token header. Start with --no-setup-token to disable.")
++
++	return token, nil
++}
++
+ func initStatus(instanceID string) *portainer.Status {
+ 	return &portainer.Status{
+ 		Version:    portainer.APIVersion,
+@@ -510,6 +529,17 @@ func buildServer(flags *portainer.CLIFlags, shutdownCtx context.Context, shutdow
+ 		}
+ 	}
+ 
++	setupToken := ""
++	if !*flags.NoSetupToken {
++		if err := dataStore.ViewTx(func(tx dataservices.DataStoreTx) error {
++			var txErr error
++			setupToken, txErr = resolveSetupToken(tx, *flags.SetupToken)
++			return txErr
++		}); err != nil {
++			log.Fatal().Err(err).Msg("failed initializing setup token")
++		}
++	}
++
+ 	if err := reverseTunnelService.StartTunnelServer(*flags.TunnelAddr, *flags.TunnelPort, snapshotService); err != nil {
+ 		log.Fatal().Err(err).Msg("failed starting tunnel server")
+ 	}
+@@ -601,6 +631,7 @@ func buildServer(flags *portainer.CLIFlags, shutdownCtx context.Context, shutdow
+ 		PlatformService:             platformService,
+ 		PullLimitCheckDisabled:      *flags.PullLimitCheckDisabled,
+ 		TrustedOrigins:              trustedOrigins,
++		SetupToken:                  setupToken,
+ 	}
+ }
+ 
+diff --git a/api/http/handler/backup/handler.go b/api/http/handler/backup/handler.go
+index 2fe99b5..e624f53 100644
+--- a/api/http/handler/backup/handler.go
++++ b/api/http/handler/backup/handler.go
+@@ -22,6 +22,7 @@ type Handler struct {
+ 	filestorePath   string
+ 	shutdownTrigger context.CancelFunc
+ 	adminMonitor    *adminmonitor.Monitor
++	SetupToken      string
+ }
+ 
+ // NewHandler creates an new instance of backup handler
+diff --git a/api/http/handler/backup/restore.go b/api/http/handler/backup/restore.go
+index 4938413..ed7e159 100644
+--- a/api/http/handler/backup/restore.go
++++ b/api/http/handler/backup/restore.go
+@@ -20,12 +20,14 @@ type restorePayload struct {
+ // @id Restore
+ // @summary Triggers a system restore using provided backup file
+ // @description Triggers a system restore using provided backup file
+-// @description **Access policy**: public
++// @description **Access policy**: public (requires the X-Setup-Token header on an uninitialized instance unless --no-setup-token is set)
+ // @tags backup
+ // @accept json
++// @param X-Setup-Token header string false "Setup token (required when instance is uninitialized and --no-setup-token is not set)"
+ // @param restorePayload body restorePayload true "Restore request payload"
+ // @success 200 "Success"
+ // @failure 400 "Invalid request"
++// @failure 403 "Access denied - invalid or missing setup token"
+ // @failure 500 "Server error"
+ // @router /restore [post]
+ func (h *Handler) restore(w http.ResponseWriter, r *http.Request) *httperror.HandlerError {
+diff --git a/api/http/handler/backup/restore_local.go b/api/http/handler/backup/restore_local.go
+index efd4517..2203ec0 100644
+--- a/api/http/handler/backup/restore_local.go
++++ b/api/http/handler/backup/restore_local.go
+@@ -7,6 +7,7 @@ import (
+ 	"path/filepath"
+ 
+ 	operations "github.com/portainer/portainer/api/backup"
++	"github.com/portainer/portainer/api/http/security/setuptoken"
+ 	httperror "github.com/portainer/portainer/pkg/libhttp/error"
+ 	"github.com/portainer/portainer/pkg/libhttp/request"
+ )
+@@ -43,6 +44,10 @@ func (h *Handler) restoreLocal(w http.ResponseWriter, r *http.Request) *httperro
+ 	if initialized {
+ 		return httperror.BadRequest("Cannot restore already initialized instance", errors.New("system already initialized"))
+ 	}
++	if err := setuptoken.Validate(r, h.SetupToken); err != nil {
++		return err
++	}
++
+ 
+ 	var payload restoreLocalPayload
+ 	if err := request.DecodeAndValidateJSONPayload(r, &payload); err != nil {
+diff --git a/api/http/handler/settings/handler.go b/api/http/handler/settings/handler.go
+index 841a8b4..81a9f58 100644
+--- a/api/http/handler/settings/handler.go
++++ b/api/http/handler/settings/handler.go
+@@ -20,11 +20,12 @@ func hideFields(settings *portainer.Settings) {
+ // Handler is the HTTP handler used to handle settings operations.
+ type Handler struct {
+ 	*mux.Router
+-	DataStore       dataservices.DataStore
+-	FileService     portainer.FileService
+-	JWTService      portainer.JWTService
+-	LDAPService     portainer.LDAPService
+-	SnapshotService portainer.SnapshotService
++	DataStore          dataservices.DataStore
++	FileService        portainer.FileService
++	JWTService         portainer.JWTService
++	LDAPService        portainer.LDAPService
++	SnapshotService    portainer.SnapshotService
++	SetupTokenRequired bool
+ }
+ 
+ // NewHandler creates a handler to manage settings operations.
+diff --git a/api/http/handler/settings/settings_public.go b/api/http/handler/settings/settings_public.go
+index 7267d94..3943961 100644
+--- a/api/http/handler/settings/settings_public.go
++++ b/api/http/handler/settings/settings_public.go
+@@ -44,6 +44,8 @@ type publicSettingsResponse struct {
+ 	}
+ 
+ 	IsDockerDesktopExtension bool `json:"IsDockerDesktopExtension" example:"false"`
++	// Whether the setup wizard must send the X-Setup-Token header for admin init / restore
++	RequiresSetupToken bool `json:"RequiresSetupToken" example:"false"`
+ }
+ 
+ // @id SettingsPublic
+@@ -62,6 +64,7 @@ func (handler *Handler) settingsPublic(w http.ResponseWriter, r *http.Request) *
+ 	}
+ 
+ 	publicSettings := generatePublicSettings(settings)
++	publicSettings.RequiresSetupToken = handler.SetupTokenRequired
+ 
+ 	return response.JSON(w, publicSettings)
+ }
+diff --git a/api/http/handler/users/admin_init.go b/api/http/handler/users/admin_init.go
+index f7d7593..8436680 100644
+--- a/api/http/handler/users/admin_init.go
++++ b/api/http/handler/users/admin_init.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 
+ 	portainer "github.com/portainer/portainer/api"
++	"github.com/portainer/portainer/api/http/security/setuptoken"
+ 	httperror "github.com/portainer/portainer/pkg/libhttp/error"
+ 	"github.com/portainer/portainer/pkg/libhttp/request"
+ 	"github.com/portainer/portainer/pkg/libhttp/response"
+@@ -31,13 +32,15 @@ func (payload *adminInitPayload) Validate(r *http.Request) error {
+ // @id UserAdminInit
+ // @summary Initialize administrator account
+ // @description Initialize the 'admin' user account.
+-// @description **Access policy**: public
++// @description **Access policy**: public (requires the X-Setup-Token header on an uninitialized instance unless --no-setup-token is set)
+ // @tags users
+ // @accept json
+ // @produce json
++// @param X-Setup-Token header string false "Setup token (required when instance is uninitialized and --no-setup-token is not set)"
+ // @param body body adminInitPayload true "User details"
+ // @success 200 {object} portainer.User "Success"
+ // @failure 400 "Invalid request"
++// @failure 403 "Access denied - invalid or missing setup token"
+ // @failure 409 "Admin user already initialized"
+ // @failure 500 "Server error"
+ // @router /users/admin/init [post]
+@@ -57,6 +60,11 @@ func (handler *Handler) adminInit(w http.ResponseWriter, r *http.Request) *httpe
+ 		return httperror.Conflict("Unable to create administrator user", errAdminAlreadyInitialized)
+ 	}
+ 
++	if err := setuptoken.Validate(r, handler.SetupToken); err != nil {
++		return err
++	}
++
++
+ 	if !handler.passwordStrengthChecker.Check(payload.Password) {
+ 		return httperror.BadRequest("Password does not meet the requirements", nil)
+ 	}
+diff --git a/api/http/handler/users/admin_init_legacy.go b/api/http/handler/users/admin_init_legacy.go
+index ce79d56..50f8af3 100644
+--- a/api/http/handler/users/admin_init_legacy.go
++++ b/api/http/handler/users/admin_init_legacy.go
+@@ -6,6 +6,7 @@ import (
+ 	"strings"
+ 
+ 	portainer "github.com/portainer/portainer/api"
++	"github.com/portainer/portainer/api/http/security/setuptoken"
+ 	httperror "github.com/portainer/portainer/pkg/libhttp/error"
+ 	"github.com/portainer/portainer/pkg/libhttp/request"
+ 	"github.com/portainer/portainer/pkg/libhttp/response"
+@@ -58,6 +59,11 @@ func (handler *Handler) adminInitLegacy(w http.ResponseWriter, r *http.Request)
+ 		return httperror.Conflict("Unable to create administrator user", errAdminAlreadyInitialized)
+ 	}
+ 
++	if err := setuptoken.Validate(r, handler.SetupToken); err != nil {
++		return err
++	}
++
++
+ 	if !handler.passwordStrengthChecker.Check(payload.Password) {
+ 		return httperror.BadRequest("Password does not meet the requirements", nil)
+ 	}
+diff --git a/api/http/handler/users/handler.go b/api/http/handler/users/handler.go
+index be569f3..737243b 100644
+--- a/api/http/handler/users/handler.go
++++ b/api/http/handler/users/handler.go
+@@ -35,6 +35,7 @@ type Handler struct {
+ 	passwordStrengthChecker security.PasswordStrengthChecker
+ 	AdminCreationDone       chan<- struct{}
+ 	FileService             portainer.FileService
++	SetupToken              string
+ }
+ 
+ // NewHandler creates a handler to manage user operations.
+diff --git a/api/http/handler/users/users_automation_import.go b/api/http/handler/users/users_automation_import.go
+index afa80f8..411c830 100644
+--- a/api/http/handler/users/users_automation_import.go
++++ b/api/http/handler/users/users_automation_import.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	portainer "github.com/portainer/portainer/api"
+ 	httperror "github.com/portainer/portainer/pkg/libhttp/error"
++	"github.com/portainer/portainer/api/http/security/setuptoken"
+ 	"github.com/portainer/portainer/pkg/libhttp/request"
+ 	"github.com/portainer/portainer/pkg/libhttp/response"
+ )
+@@ -93,6 +94,11 @@ func (handler *Handler) automationImport(w http.ResponseWriter, r *http.Request)
+ 		return httperror.Conflict("Unable to import users", errAdminAlreadyInitialized)
+ 	}
+ 
++	if err := setuptoken.Validate(r, handler.SetupToken); err != nil {
++		return err
++	}
++
++
+ 	created := make([]*portainer.User, 0, len(payload.Users))
+ 	createdAdmin := false
+ 
+diff --git a/api/http/security/setuptoken/setuptoken.go b/api/http/security/setuptoken/setuptoken.go
+new file mode 100644
+index 0000000..ec1af99
+--- /dev/null
++++ b/api/http/security/setuptoken/setuptoken.go
+@@ -0,0 +1,48 @@
++// Package setuptoken provides a one-time setup token used to protect the
++// public initialization endpoints (admin account creation and backup restore)
++// on an uninitialized Portainer instance.
++package setuptoken
++
++import (
++	"crypto/rand"
++	"crypto/subtle"
++	"encoding/hex"
++	"errors"
++	"net/http"
++
++	httperror "github.com/portainer/portainer/pkg/libhttp/error"
++)
++
++// HeaderName is the HTTP header that carries the setup token.
++const HeaderName = "X-Setup-Token"
++
++// tokenByteLength is the number of random bytes before hex-encoding (256 bits).
++const tokenByteLength = 32
++
++var errInvalidSetupToken = errors.New("invalid or missing setup token")
++
++// Generate returns a cryptographically random, hex-encoded setup token.
++func Generate() (string, error) {
++	b := make([]byte, tokenByteLength)
++	if _, err := rand.Read(b); err != nil {
++		return "", err
++	}
++
++	return hex.EncodeToString(b), nil
++}
++
++// Validate checks that the request carries the expected setup token in the
++// X-Setup-Token header. When expected is empty the gate is disabled and the
++// request is always allowed. Comparison is constant-time.
++func Validate(r *http.Request, expected string) *httperror.HandlerError {
++	if expected == "" {
++		return nil
++	}
++
++	provided := r.Header.Get(HeaderName)
++	if subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
++		return httperror.Forbidden("Invalid or missing setup token. Provide the X-Setup-Token header with the token printed in the server logs at startup.", errInvalidSetupToken)
++	}
++
++	return nil
++}
+diff --git a/api/http/server.go b/api/http/server.go
+index 4f960a7..c56d1cd 100644
+--- a/api/http/server.go
++++ b/api/http/server.go
+@@ -113,6 +113,7 @@ type Server struct {
+ 	PlatformService             platform.Service
+ 	PullLimitCheckDisabled      bool
+ 	TrustedOrigins              []string
++	SetupToken                  string
+ }
+ 
+ // Start starts the HTTP server
+@@ -149,6 +150,7 @@ func (server *Server) Start(ctx context.Context) error {
+ 		server.ShutdownTrigger,
+ 		adminMonitor,
+ 	)
++	backupHandler.SetupToken = server.SetupToken
+ 
+ 	var roleHandler = roles.NewHandler(requestBouncer)
+ 	roleHandler.DataStore = server.DataStore
+@@ -235,6 +237,7 @@ func (server *Server) Start(ctx context.Context) error {
+ 	settingsHandler.JWTService = server.JWTService
+ 	settingsHandler.LDAPService = server.LDAPService
+ 	settingsHandler.SnapshotService = server.SnapshotService
++	settingsHandler.SetupTokenRequired = server.SetupToken != ""
+ 
+ 	var sslHandler = sslhandler.NewHandler(requestBouncer)
+ 	sslHandler.SSLService = server.SSLService
+@@ -282,6 +285,7 @@ func (server *Server) Start(ctx context.Context) error {
+ 	userHandler.CryptoService = server.CryptoService
+ 	userHandler.AdminCreationDone = server.AdminCreationDone
+ 	userHandler.FileService = server.FileService
++	userHandler.SetupToken = server.SetupToken
+ 
+ 	var websocketHandler = websocket.NewHandler(server.KubernetesTokenCacheManager, requestBouncer)
+ 	websocketHandler.DataStore = server.DataStore
+diff --git a/api/portainer.go b/api/portainer.go
+index aca2dc4..c130cbb 100644
+--- a/api/portainer.go
++++ b/api/portainer.go
+@@ -111,6 +111,8 @@ type (
+ 		KubectlShellImageSet      bool
+ 		PullLimitCheckDisabled    *bool
+ 		TrustedOrigins            *string
++		NoSetupToken              *bool
++		SetupToken                *string
+ 	}
+ 
+ 	// CustomTemplateVariableDefinition
+@@ -1489,11 +1491,11 @@ type (
+ 	// User represents a user account
+ 	User struct {
+ 		// User Identifier
+-		ID       UserID `json:"Id" example:"1"`
+-		Username string `json:"Username" example:"bob"`
++		ID       UserID `json:"Id" example:"1" validate:"required"`
++		Username string `json:"Username" example:"bob" validate:"required"`
+ 		Password string `json:"Password,omitempty" swaggerignore:"true"`
+ 		// User role (1 for administrator account and 2 for regular account)
+-		Role          UserRole          `json:"Role" example:"1"`
++		Role          UserRole          `json:"Role" example:"1" validate:"required"`
+ 		TokenIssueAt  int64             `json:"TokenIssueAt" example:"1"`
+ 		ThemeSettings UserThemeSettings `json:"ThemeSettings"`
+ 		UseCache      bool              `json:"UseCache" example:"true"`
+@@ -1501,11 +1503,11 @@ type (
+ 		// Deprecated fields
+ 
+ 		// Deprecated
+-		UserTheme string `json:"UserTheme,omitempty" example:"dark"`
++		UserTheme string `json:"UserTheme,omitempty" example:"dark" swaggerignore:"true"`
+ 		// Deprecated in DBVersion == 25
+-		PortainerAuthorizations Authorizations
++		PortainerAuthorizations Authorizations `swaggerignore:"true"`
+ 		// Deprecated in DBVersion == 25
+-		EndpointAuthorizations EndpointAuthorizations
++		EndpointAuthorizations EndpointAuthorizations `swaggerignore:"true"`
+ 	}
+ 
+ 	// UserAccessPolicies represent the association of an access policy and a user
+@@ -1527,7 +1529,7 @@ type (
+ 	// UserThemeSettings represents the theme settings for a user
+ 	UserThemeSettings struct {
+ 		// Color represents the color theme of the UI
+-		Color string `json:"color" example:"dark" enums:"dark,light,highcontrast,auto"`
++		Color string `json:"color" example:"dark" enums:"dark,light,highcontrast,auto,"`
+ 	}
+ 
+ 	// Webhook represents a url webhook that can be used to update a service
+@@ -2051,6 +2053,10 @@ const (
+ 	CSPEnvVar = "CSP"
+ 	// CompactDBEnvVar is the environment variable used to enable/disable the startup compaction of the database
+ 	CompactDBEnvVar = "COMPACT_DB"
++	// NoSetupTokenEnvVar is the environment variable used to disable the setup token requirement on an uninitialized instance
++	NoSetupTokenEnvVar = "PORTAINER_NO_SETUP_TOKEN"
++	// SetupTokenEnvVar is the environment variable used to provide a custom setup token for admin initialization and restore on an uninitialized instance
++	SetupTokenEnvVar = "PORTAINER_SETUP_TOKEN"
+ )
+ 
+ // List of supported features
+diff --git a/app/portainer/models/settings.js b/app/portainer/models/settings.js
+index 6a65df7..6795e14 100644
+--- a/app/portainer/models/settings.js
++++ b/app/portainer/models/settings.js
+@@ -32,6 +32,7 @@ export function PublicSettingsViewModel(settings) {
+   this.Features = settings.Features;
+   this.Edge = new EdgeSettingsViewModel(settings.Edge);
+   this.DefaultRegistry = settings.DefaultRegistry;
++  this.RequiresSetupToken = settings.RequiresSetupToken;
+ }
+ 
+ export function InternalAuthSettingsViewModel(data) {
+diff --git a/app/portainer/services/api/backupService.js b/app/portainer/services/api/backupService.js
+index ca1637e..026328a 100644
+--- a/app/portainer/services/api/backupService.js
++++ b/app/portainer/services/api/backupService.js
+@@ -11,8 +11,8 @@ angular.module('portainer.app').factory('BackupService', [
+       return Backup.download({}, payload).$promise;
+     };
+ 
+-    service.uploadBackup = function (file, password) {
+-      return FileUploadService.uploadBackup(file, password);
++    service.uploadBackup = function (file, password, setupToken) {
++      return FileUploadService.uploadBackup(file, password, setupToken);
+     };
+ 
+     service.getS3Settings = function () {
+diff --git a/app/portainer/services/api/userService.js b/app/portainer/services/api/userService.js
+index 1ee22a7..2d1102f 100644
+--- a/app/portainer/services/api/userService.js
++++ b/app/portainer/services/api/userService.js
+@@ -2,6 +2,7 @@ import _ from 'lodash-es';
+ import { UserViewModel } from '@/portainer/models/user';
+ import { getUsers } from '@/portainer/users/user.service';
+ import { getUser } from '@/portainer/users/queries/useUser';
++import { userAdminInit } from '@api/sdk.gen';
+ 
+ import { TeamMembershipModel } from '../../models/teamMembership';
+ 
+@@ -84,8 +85,11 @@ export function UserService($q, Users, TeamService) {
+     return deferred.promise;
+   };
+ 
+-  service.initAdministrator = function (username, password) {
+-    return Users.initAdminUser({ Username: username, Password: password }).$promise;
++  service.initAdministrator = function (username, password, setupToken) {
++    return userAdminInit({
++      body: { Username: username, Password: password },
++      ...(setupToken && { headers: { 'X-Setup-Token': setupToken } }),
++    });
+   };
+ 
+   service.administratorExists = function () {
+diff --git a/app/portainer/services/fileUpload.js b/app/portainer/services/fileUpload.js
+index 877cdf6..c0f9e82 100644
+--- a/app/portainer/services/fileUpload.js
++++ b/app/portainer/services/fileUpload.js
+@@ -38,13 +38,11 @@ function FileUploadFactory($q, Upload) {
+     });
+   };
+ 
+-  service.uploadBackup = function (file, password) {
++  service.uploadBackup = function (file, password, setupToken) {
+     return Upload.upload({
+       url: 'api/restore',
+-      data: {
+-        file,
+-        password,
+-      },
++      data: { file, password },
++      headers: setupToken ? { 'X-Setup-Token': setupToken } : {},
+     });
+   };
+ 
+diff --git a/app/portainer/views/init/admin/initAdmin.html b/app/portainer/views/init/admin/initAdmin.html
+index 4733ca2..e05f9d3 100644
+--- a/app/portainer/views/init/admin/initAdmin.html
++++ b/app/portainer/views/init/admin/initAdmin.html
+@@ -65,6 +65,17 @@
+               </div>
+             </div>
+             <!-- !confirm-password-input -->
++            <!-- setup-token-input -->
++            <div class="form-group" ng-if="requiresSetupToken">
++              <label for="setup_token" class="col-sm-4 control-label text-left">
++                Setup token
++                <portainer-tooltip message="'Find this token in the Portainer server logs'"></portainer-tooltip>
++              </label>
++              <div class="col-sm-8">
++                <input type="text" class="form-control" ng-model="formValues.SetupToken" id="setup_token" data-cy="init-adminSetupToken" />
++              </div>
++            </div>
++            <!-- !setup-token-input -->
+             <!-- note -->
+             <div class="form-group">
+               <div class="col-sm-12 text-warning">
+@@ -82,7 +93,7 @@
+                 <button
+                   type="submit"
+                   class="btn btn-primary btn-sm"
+-                  ng-disabled="state.actionInProgress || form.$invalid || !formValues.Password || !formValues.ConfirmPassword ||  form.password.$viewValue !== formValues.ConfirmPassword"
++                  ng-disabled="state.actionInProgress || form.$invalid || !formValues.Password || !formValues.ConfirmPassword || form.password.$viewValue !== formValues.ConfirmPassword || (requiresSetupToken && !formValues.SetupToken)"
+                   ng-click="createAdminUser()"
+                   button-spinner="state.actionInProgress"
+                 >
+@@ -277,13 +288,24 @@
+               </div>
+             </div>
+             <!-- !note -->
++            <!-- setup-token-input -->
++            <div class="form-group" ng-if="requiresSetupToken">
++              <label for="restore_setup_token" class="col-sm-3 control-label text-left">
++                Setup token
++                <portainer-tooltip message="'Find this token in the Portainer server logs (docker logs &lt;container&gt;).'"></portainer-tooltip>
++              </label>
++              <div class="col-sm-4">
++                <input type="text" class="form-control" ng-model="formValues.SetupToken" id="restore_setup_token" data-cy="init-restoreSetupToken" />
++              </div>
++            </div>
++            <!-- !setup-token-input -->
+             <!-- actions -->
+             <div class="form-group">
+               <div class="col-sm-12">
+                 <button
+                   type="submit"
+                   class="btn btn-primary btn-sm"
+-                  ng-disabled="!formValues.BackupFile || state.backupInProgress"
++                  ng-disabled="!formValues.BackupFile || state.backupInProgress || (requiresSetupToken && !formValues.SetupToken)"
+                   ng-click="uploadBackup()"
+                   button-spinner="state.backupInProgress"
+                   data-cy="init-restorePortainerButton"
+diff --git a/app/portainer/views/init/admin/initAdminController.js b/app/portainer/views/init/admin/initAdminController.js
+index 0f48570..fc1bef4 100644
+--- a/app/portainer/views/init/admin/initAdminController.js
++++ b/app/portainer/views/init/admin/initAdminController.js
+@@ -1,6 +1,8 @@
+ import { getEnvironments } from '@/react/portainer/environments/environment.service';
+ import { restoreOptions } from '@/react/portainer/init/InitAdminView/restore-options';
+ 
++const REDIRECT_REASON_TIMEOUT = 'AdminInitTimeout';
++
+ angular.module('portainer.app').controller('InitAdminController', [
+   '$scope',
+   '$state',
+@@ -23,6 +25,7 @@ angular.module('portainer.app').controller('InitAdminController', [
+       Username: 'admin',
+       Password: '',
+       ConfirmPassword: '',
++      SetupToken: '',
+       restoreFormType: $scope.RESTORE_FORM_TYPES.FILE,
+     };
+ 
+@@ -51,7 +54,7 @@ angular.module('portainer.app').controller('InitAdminController', [
+       var password = $scope.formValues.Password;
+ 
+       $scope.state.actionInProgress = true;
+-      UserService.initAdministrator(username, password)
++      UserService.initAdministrator(username, password, $scope.formValues.SetupToken)
+         .then(function success() {
+           return Authentication.login(username, password);
+         })
+@@ -69,8 +72,9 @@ angular.module('portainer.app').controller('InitAdminController', [
+           }
+         })
+         .catch(function error(err) {
+-          handleError(err);
+-          Notifications.error('Failure', err, 'Unable to create administrator user');
++          if (!handleError(err)) {
++            Notifications.error('Failure', err, 'Unable to create administrator user');
++          }
+         })
+         .finally(function final() {
+           $scope.state.actionInProgress = false;
+@@ -79,18 +83,24 @@ angular.module('portainer.app').controller('InitAdminController', [
+ 
+     function handleError(err) {
+       if (err.status === 303) {
+-        const headers = err.headers();
+-        const REDIRECT_REASON_TIMEOUT = 'AdminInitTimeout';
+-        if (headers && headers['redirect-reason'] === REDIRECT_REASON_TIMEOUT) {
++        const headers = err.response?.headers ?? {};
++        if (headers['redirect-reason'] === REDIRECT_REASON_TIMEOUT) {
+           window.location.href = '/timeout.html';
+         }
++        return true;
++      }
++      if (err.status === 403) {
++        Notifications.error('Failure', err, 'Setup token is missing or invalid. Find the current token in the Portainer server logs.');
++        return true;
+       }
++      return false;
+     }
+ 
+     function createAdministratorFlow() {
+       SettingsService.publicSettings()
+         .then(function success(data) {
+           $scope.requiredPasswordLength = data.RequiredPasswordLength;
++          $scope.requiresSetupToken = data.RequiresSetupToken;
+         })
+         .catch(function error(err) {
+           Notifications.error('Failure', err, 'Unable to retrieve application settings');
+@@ -113,7 +123,7 @@ angular.module('portainer.app').controller('InitAdminController', [
+       const file = $scope.formValues.BackupFile;
+       const password = $scope.formValues.Password;
+ 
+-      restoreAndRefresh(() => BackupService.uploadBackup(file, password));
++      restoreAndRefresh(() => BackupService.uploadBackup(file, password, $scope.formValues.SetupToken));
+     }
+ 
+     async function restoreAndRefresh(restoreAsyncFn) {
+@@ -122,8 +132,9 @@ angular.module('portainer.app').controller('InitAdminController', [
+       try {
+         await restoreAsyncFn();
+       } catch (err) {
+-        handleError(err);
+-        Notifications.error('Failure', err, 'Unable to restore the backup');
++        if (!handleError(err)) {
++          Notifications.error('Failure', err, 'Unable to restore the backup');
++        }
+         $scope.state.backupInProgress = false;
+ 
+         return;
+diff --git a/app/react/portainer/generated-api/portainer/sdk.gen.ts b/app/react/portainer/generated-api/portainer/sdk.gen.ts
+index 158a830..c589996 100644
+--- a/app/react/portainer/generated-api/portainer/sdk.gen.ts
++++ b/app/react/portainer/generated-api/portainer/sdk.gen.ts
+@@ -1189,6 +1189,7 @@ import {
+   zRestartKubernetesPodPath,
+   zRestartKubernetesPodResponse,
+   zRestoreBody,
++  zRestoreHeaders,
+   zRoleListResponse,
+   zSetDefaultKubernetesStorageClassPath,
+   zSetDefaultKubernetesStorageClassResponse,
+@@ -1326,6 +1327,7 @@ import {
+   zUploadTlsResponse,
+   zUserAdminCheckResponse,
+   zUserAdminInitBody,
++  zUserAdminInitHeaders,
+   zUserAdminInitResponse,
+   zUserCreateBody,
+   zUserCreateResponse,
+@@ -7524,7 +7526,7 @@ export const resourceControlUpdate = <ThrowOnError extends boolean = true>(
+  * Triggers a system restore using provided backup file
+  *
+  * Triggers a system restore using provided backup file
+- * **Access policy**: public
++ * **Access policy**: public (requires the X-Setup-Token header on an uninitialized instance unless --no-setup-token is set)
+  */
+ export const restore = <ThrowOnError extends boolean = true>(
+   options: Options<RestoreData, ThrowOnError>
+@@ -7538,6 +7540,7 @@ export const restore = <ThrowOnError extends boolean = true>(
+       await z
+         .object({
+           body: zRestoreBody,
++          headers: zRestoreHeaders.optional(),
+           path: z.never().optional(),
+           query: z.never().optional(),
+         })
+@@ -9811,7 +9814,7 @@ export const userAdminCheck = <ThrowOnError extends boolean = true>(
+  * Initialize administrator account
+  *
+  * Initialize the 'admin' user account.
+- * **Access policy**: public
++ * **Access policy**: public (requires the X-Setup-Token header on an uninitialized instance unless --no-setup-token is set)
+  */
+ export const userAdminInit = <ThrowOnError extends boolean = true>(
+   options: Options<UserAdminInitData, ThrowOnError>
+@@ -9825,6 +9828,7 @@ export const userAdminInit = <ThrowOnError extends boolean = true>(
+       await z
+         .object({
+           body: zUserAdminInitBody,
++          headers: zUserAdminInitHeaders.optional(),
+           path: z.never().optional(),
+           query: z.never().optional(),
+         })
+diff --git a/app/react/portainer/generated-api/portainer/types.gen.ts b/app/react/portainer/generated-api/portainer/types.gen.ts
+index e913b3a..4bb1908 100644
+--- a/app/react/portainer/generated-api/portainer/types.gen.ts
++++ b/app/react/portainer/generated-api/portainer/types.gen.ts
+@@ -4567,6 +4567,10 @@ export type SettingsPublicSettingsResponse = {
+    * The minimum required length for a password of any user when using internal auth mode
+    */
+   RequiredPasswordLength?: number;
++  /**
++   * Whether the setup wizard must send the X-Setup-Token header for admin init / restore
++   */
++  RequiresSetupToken?: boolean;
+   /**
+    * Whether team sync is enabled
+    */
+@@ -5320,7 +5324,7 @@ export type PortainerUserThemeSettings = {
+   /**
+    * Color represents the color theme of the UI
+    */
+-  color?: 'dark' | 'light' | 'highcontrast' | 'auto';
++  color?: 'dark' | 'light' | 'highcontrast' | 'auto' | '';
+ };
+ 
+ export const PortainerUserRole = {
+@@ -5360,38 +5364,18 @@ export type PortainerResourceAccessLevel =
+   (typeof PortainerResourceAccessLevel)[keyof typeof PortainerResourceAccessLevel];
+ 
+ export type PortainerUser = {
+-  /**
+-   * Deprecated in DBVersion == 25
+-   */
+-  EndpointAuthorizations?: PortainerEndpointAuthorizations;
+   /**
+    * User Identifier
+    */
+-  Id?: number;
+-  /**
+-   * Deprecated in DBVersion == 25
+-   */
+-  PortainerAuthorizations?: PortainerAuthorizations;
++  Id: number;
+   /**
+    * User role (1 for administrator account and 2 for regular account)
+    */
+-  Role?: PortainerUserRole;
++  Role: PortainerUserRole;
+   ThemeSettings?: PortainerUserThemeSettings;
+   TokenIssueAt?: number;
+   UseCache?: boolean;
+-  /**
+-   * Deprecated
+-   */
+-  UserTheme?: string;
+-  Username?: string;
+-};
+-
+-export type PortainerAuthorizations = {
+-  [key: string]: boolean;
+-};
+-
+-export type PortainerEndpointAuthorizations = {
+-  [key: string]: PortainerAuthorizations;
++  Username: string;
+ };
+ 
+ export type PortainerTeamResourceAccess = {
+@@ -6020,6 +6004,10 @@ export type PortainerRole = {
+   Priority?: number;
+ };
+ 
++export type PortainerAuthorizations = {
++  [key: string]: boolean;
++};
++
+ export type PortainerPerformanceMetrics = {
+   CPUUsage?: number;
+   DiskUsage?: number;
+@@ -15837,6 +15825,12 @@ export type RestoreData = {
+    * Restore request payload
+    */
+   body: BackupRestorePayload;
++  headers?: {
++    /**
++     * Setup token (required when instance is uninitialized and --no-setup-token is not set)
++     */
++    'X-Setup-Token'?: string;
++  };
+   path?: never;
+   query?: never;
+   url: '/restore';
+@@ -15847,6 +15841,10 @@ export type RestoreErrors = {
+    * Invalid request
+    */
+   400: unknown;
++  /**
++   * Access denied - invalid or missing setup token
++   */
++  403: unknown;
+   /**
+    * Server error
+    */
+@@ -18374,6 +18372,12 @@ export type UserAdminInitData = {
+    * User details
+    */
+   body: UsersAdminInitPayload;
++  headers?: {
++    /**
++     * Setup token (required when instance is uninitialized and --no-setup-token is not set)
++     */
++    'X-Setup-Token'?: string;
++  };
+   path?: never;
+   query?: never;
+   url: '/users/admin/init';
+@@ -18384,6 +18388,10 @@ export type UserAdminInitErrors = {
+    * Invalid request
+    */
+   400: unknown;
++  /**
++   * Access denied - invalid or missing setup token
++   */
++  403: unknown;
+   /**
+    * Admin user already initialized
+    */
+diff --git a/app/react/portainer/generated-api/portainer/zod.gen.ts b/app/react/portainer/generated-api/portainer/zod.gen.ts
+index b543515..9f49494 100644
+--- a/app/react/portainer/generated-api/portainer/zod.gen.ts
++++ b/app/react/portainer/generated-api/portainer/zod.gen.ts
+@@ -1327,6 +1327,7 @@ export const zSettingsPublicSettingsResponse = z.object({
+   OAuthLoginURI: z.string().optional(),
+   OAuthLogoutURI: z.string().optional(),
+   RequiredPasswordLength: z.int().optional(),
++  RequiresSetupToken: z.boolean().optional(),
+   TeamSync: z.boolean().optional(),
+ });
+ 
+@@ -1637,7 +1638,7 @@ export const zPortainerWebhook = z.object({
+ });
+ 
+ export const zPortainerUserThemeSettings = z.object({
+-  color: z.enum(['dark', 'light', 'highcontrast', 'auto']).optional(),
++  color: z.enum(['dark', 'light', 'highcontrast', 'auto', '']).optional(),
+ });
+ 
+ export const zPortainerUserRole = z.enum(PortainerUserRole);
+@@ -1651,23 +1652,13 @@ export const zPortainerUserResourceAccess = z.object({
+   UserId: z.int().optional(),
+ });
+ 
+-export const zPortainerAuthorizations = z.record(z.string(), z.boolean());
+-
+-export const zPortainerEndpointAuthorizations = z.record(
+-  z.string(),
+-  zPortainerAuthorizations
+-);
+-
+ export const zPortainerUser = z.object({
+-  EndpointAuthorizations: zPortainerEndpointAuthorizations.optional(),
+-  Id: z.int().optional(),
+-  PortainerAuthorizations: zPortainerAuthorizations.optional(),
+-  Role: zPortainerUserRole.optional(),
++  Id: z.int(),
++  Role: zPortainerUserRole,
+   ThemeSettings: zPortainerUserThemeSettings.optional(),
+   TokenIssueAt: z.int().optional(),
+   UseCache: z.boolean().optional(),
+-  UserTheme: z.string().optional(),
+-  Username: z.string().optional(),
++  Username: z.string(),
+ });
+ 
+ export const zPortainerTeamResourceAccess = z.object({
+@@ -1885,6 +1876,8 @@ export const zPortainerSslSettings = z.object({
+   selfSigned: z.boolean().optional(),
+ });
+ 
++export const zPortainerAuthorizations = z.record(z.string(), z.boolean());
++
+ export const zPortainerRole = z.object({
+   Authorizations: zPortainerAuthorizations.optional(),
+   Description: z.string().optional(),
+@@ -5286,6 +5279,10 @@ export const zResourceControlUpdateResponse = zPortainerResourceControl;
+  */
+ export const zRestoreBody = zBackupRestorePayload;
+ 
++export const zRestoreHeaders = z.object({
++  'X-Setup-Token': z.string().optional(),
++});
++
+ /**
+  * Success
+  */
+@@ -5997,6 +5994,10 @@ export const zUserAdminCheckResponse = z.void();
+  */
+ export const zUserAdminInitBody = zUsersAdminInitPayload;
+ 
++export const zUserAdminInitHeaders = z.object({
++  'X-Setup-Token': z.string().optional(),
++});
++
+ /**
+  * Success
+  */

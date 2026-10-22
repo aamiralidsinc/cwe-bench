@@ -1,0 +1,31 @@
+#!/bin/bash
+# Harden one fair-but-solved task (add fair complexity + re-gate). Needs Bash+Docker -> bypassPermissions.
+# Usage: ./drive.sh deepseek bash pipeline/run_harden.sh SLUG   (MODEL is required; drive.sh sets it)
+# Exit 0 = the agent finished AND changed the task; 1 = it did not finish (harden_status.txt says
+# why); 3 = it finished but changed nothing. Only exit 0 is a hardening round.
+set -uo pipefail
+SLUG=${1:?usage: run_harden.sh SLUG}
+cd "$HOME/cwe-bench" || exit 1
+B=build/$SLUG
+[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash pipeline/run_harden.sh $SLUG" | tee "$B/harden_status.txt"; exit 1; }
+echo "running" > "$B/harden_status.txt"
+mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
+bash pipeline/snapshot_experiment.sh "$SLUG"  # preserve prior version before in-place edit (provenance)
+fp() { find "tasks/$SLUG" "$B/checks" "$B/manifest.json" -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1; }
+PRE=$(fp)
+P=$(sed "s/{{SLUG}}/$SLUG/g" builder/HARDENING-PROMPT.md)
+date -u +%FT%TZ > "$B/harden_start.txt"
+timeout "${HARDEN_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
+  --permission-mode bypassPermissions --add-dir "$HOME/cwe-bench" --add-dir "$HOME/.tb-graders/cwe/work" \
+  --output-format json > "$B/harden-run.json" 2> "$B/harden-run.err"
+rc=$?
+echo $rc > "$B/harden-exit.txt"
+st=$(python3 pipeline/agent_status.py "$B/harden-run.json" "$rc" --details "$B/harden_status.json")
+code=0
+if [ "$st" != ok ]; then code=1
+elif [ "$(fp)" = "$PRE" ]; then st="unchanged: the agent finished but changed no task file"; code=3; fi
+echo "$st" > "$B/harden_status.txt"
+echo "$SLUG harden: exit $rc; $st"
+# Not a round: put the task back exactly as trialed (partial edits, version, runs, run-folders).
+[ $code -ne 0 ] && bash pipeline/restore_snapshot.sh "$SLUG" "harden: $st"
+exit $code

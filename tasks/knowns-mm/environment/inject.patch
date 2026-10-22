@@ -1,0 +1,328 @@
+diff --git a/internal/mcp/handlers/doc.go b/internal/mcp/handlers/doc.go
+index f23834c..8ac6656 100644
+--- a/internal/mcp/handlers/doc.go
++++ b/internal/mcp/handlers/doc.go
+@@ -19,11 +19,11 @@ import (
+ func RegisterDocTool(s toolRegistrar, getStore func() *storage.Store) {
+ 	s.AddTool(
+ 		mcp.NewTool("docs",
+-			mcp.WithDescription("Documentation operations. Use 'action' to specify: create, get, update, delete, list, history, diff, restore. Create/update return compact summaries by default; use return=full for the legacy document payload."),
++			mcp.WithDescription("Documentation operations. Use 'action' to specify: create, get, update, delete, list, history, diff, restore, archive, unarchive. Create/update return compact summaries by default; use return=full for the legacy document payload."),
+ 			mcp.WithString("action",
+ 				mcp.Required(),
+ 				mcp.Description("Action to perform"),
+-				mcp.Enum("create", "get", "update", "delete", "list", "history", "diff", "restore"),
++				mcp.Enum("create", "get", "update", "delete", "list", "history", "diff", "restore", "archive", "unarchive"),
+ 			),
+ 			mcp.WithString("path",
+ 				mcp.Description("Document path (required for get, update, delete, history, diff, restore)"),
+@@ -114,6 +114,10 @@ func RegisterDocTool(s toolRegistrar, getStore func() *storage.Store) {
+ 				return handleDocDiff(getStore, req)
+ 			case "restore":
+ 				return handleDocRestore(getStore, req)
++			case "archive":
++				return handleDocArchive(getStore, req)
++			case "unarchive":
++				return handleDocUnarchive(getStore, req)
+ 			default:
+ 				return errResultf("unknown docs action: %s", action)
+ 			}
+@@ -646,6 +650,56 @@ func handleDocDelete(getStore func() *storage.Store, req mcp.CallToolRequest) (*
+ 	return mcp.NewToolResultText(string(out)), nil
+ }
+ 
++func handleDocArchive(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++	store := getStore()
++	if store == nil {
++		return noProjectError()
++	}
++
++	args := req.GetArguments()
++	path, ok := stringArg(args, "path")
++	if !ok || path == "" {
++		return errResult(ErrPathReq)
++	}
++
++	if err := store.Docs.Archive(path); err != nil {
++		return errFailed("archive doc", err)
++	}
++
++	go notifyServer(store, "notify/refresh")
++
++	out, _ := json.MarshalIndent(map[string]any{
++		"archived": true,
++		"message":  fmt.Sprintf("Archived doc: %s", path),
++	}, "", "  ")
++	return mcp.NewToolResultText(string(out)), nil
++}
++
++func handleDocUnarchive(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++	store := getStore()
++	if store == nil {
++		return noProjectError()
++	}
++
++	args := req.GetArguments()
++	path, ok := stringArg(args, "path")
++	if !ok || path == "" {
++		return errResult(ErrPathReq)
++	}
++
++	if err := store.Docs.Unarchive(path); err != nil {
++		return errFailed("unarchive doc", err)
++	}
++
++	go notifyServer(store, "notify/refresh")
++
++	out, _ := json.MarshalIndent(map[string]any{
++		"unarchived": true,
++		"message":    fmt.Sprintf("Unarchived doc: %s", path),
++	}, "", "  ")
++	return mcp.NewToolResultText(string(out)), nil
++}
++
+ // extractHeadings returns a list of headings found in the markdown content.
+ func extractHeadings(content string) []string {
+ 	var headings []string
+diff --git a/internal/mcp/handlers/memory.go b/internal/mcp/handlers/memory.go
+index ecba1b0..2395ec5 100644
+--- a/internal/mcp/handlers/memory.go
++++ b/internal/mcp/handlers/memory.go
+@@ -19,14 +19,14 @@ import (
+ func RegisterMemoryTool(s *server.MCPServer, getStore func() *storage.Store) {
+ 	s.AddTool(
+ 		mcp.NewTool("memory",
+-			mcp.WithDescription("Persistent memory operations. Use 'action' to specify: add, get, update, delete, list, promote, demote, cleanup, resolve."),
++			mcp.WithDescription("Persistent memory operations. Use 'action' to specify: add, get, update, delete, list, promote, demote, cleanup, resolve, history, checkpoint."),
+ 			mcp.WithString("action",
+ 				mcp.Required(),
+ 				mcp.Description("Action to perform"),
+-				mcp.Enum("add", "get", "update", "delete", "list", "promote", "demote", "cleanup", "resolve"),
++				mcp.Enum("add", "get", "update", "delete", "list", "promote", "demote", "cleanup", "resolve", "history", "checkpoint"),
+ 			),
+ 			mcp.WithString("id",
+-				mcp.Description("Memory entry ID (required for get, update, delete, promote, demote)"),
++				mcp.Description("Memory entry ID (required for get, update, delete, promote, demote, history, checkpoint)"),
+ 			),
+ 			mcp.WithString("content",
+ 				mcp.Description("Memory content in markdown (required for add)"),
+@@ -113,6 +113,10 @@ func RegisterMemoryTool(s *server.MCPServer, getStore func() *storage.Store) {
+ 				return handleMemoryCleanup(getStore, req)
+ 			case "resolve":
+ 				return handleMemoryResolve(getStore, req)
++			case "history":
++				return handleMemoryHistory(getStore, req)
++			case "checkpoint":
++				return handleMemoryCheckpoint(getStore, req)
+ 			default:
+ 				return errResultf("unknown memory action: %s", action)
+ 			}
+@@ -582,3 +586,54 @@ func handleMemoryDemote(getStore func() *storage.Store, req mcp.CallToolRequest)
+ 	out, _ := json.MarshalIndent(entry, "", "  ")
+ 	return mcp.NewToolResultText(string(out)), nil
+ }
++
++func handleMemoryHistory(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++	store := getStore()
++	if store == nil {
++		return noProjectError()
++	}
++
++	id, err := req.RequireString("id")
++	if err != nil {
++		return errResult("id is required")
++	}
++
++	history, err := store.Memory.History(id)
++	if err != nil {
++		return errFailed("read memory history", err)
++	}
++
++	out, _ := json.MarshalIndent(history, "", "  ")
++	return mcp.NewToolResultText(string(out)), nil
++}
++
++func handleMemoryCheckpoint(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++	store := getStore()
++	if store == nil {
++		return noProjectError()
++	}
++
++	id, err := req.RequireString("id")
++	if err != nil {
++		return errResult("id is required")
++	}
++
++	args := req.GetArguments()
++	author, _ := stringArg(args, "title")
++
++	snapshot := map[string]any{}
++	if entry, err := store.Memory.Get(id); err == nil && entry != nil {
++		snapshot["title"] = entry.Title
++		snapshot["content"] = entry.Content
++		snapshot["category"] = entry.Category
++		snapshot["status"] = entry.Status
++	}
++
++	revision, err := store.Memory.Checkpoint(id, snapshot, author)
++	if err != nil {
++		return errFailed("checkpoint memory", err)
++	}
++
++	out, _ := json.MarshalIndent(revision, "", "  ")
++	return mcp.NewToolResultText(string(out)), nil
++}
+diff --git a/internal/storage/doc_archive.go b/internal/storage/doc_archive.go
+new file mode 100644
+index 0000000..dd805a7
+--- /dev/null
++++ b/internal/storage/doc_archive.go
+@@ -0,0 +1,55 @@
++package storage
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// archiveDir returns the directory holding archived documents.
++func (ds *DocStore) archiveDir() string { return filepath.Join(ds.root, "archive") }
++
++// Archive moves a document out of the live documentation set into the project's
++// archive area, mirroring the way tasks are archived. The document keeps its
++// path so it can be unarchived later.
++func (ds *DocStore) Archive(path string) error {
++	if strings.TrimSpace(path) == "" {
++		return fmt.Errorf("doc path is required")
++	}
++	path = strings.TrimSuffix(path, ".md")
++	src := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	dst := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
++	data, err := os.ReadFile(src)
++	if err != nil {
++		return fmt.Errorf("archive doc %q: %w", path, err)
++	}
++	if err := atomicWrite(dst, data); err != nil {
++		return fmt.Errorf("archive doc %q: %w", path, err)
++	}
++	if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
++		return fmt.Errorf("archive doc %q: %w", path, err)
++	}
++	return nil
++}
++
++// Unarchive moves an archived document back into the live documentation set.
++func (ds *DocStore) Unarchive(path string) error {
++	if strings.TrimSpace(path) == "" {
++		return fmt.Errorf("doc path is required")
++	}
++	path = strings.TrimSuffix(path, ".md")
++	src := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
++	dst := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	data, err := os.ReadFile(src)
++	if err != nil {
++		return fmt.Errorf("unarchive doc %q: %w", path, err)
++	}
++	if err := atomicWrite(dst, data); err != nil {
++		return fmt.Errorf("unarchive doc %q: %w", path, err)
++	}
++	if err := os.Remove(src); err != nil && !os.IsNotExist(err) {
++		return fmt.Errorf("unarchive doc %q: %w", path, err)
++	}
++	return nil
++}
+diff --git a/internal/storage/memory_history.go b/internal/storage/memory_history.go
+new file mode 100644
+index 0000000..0d7a2ac
+--- /dev/null
++++ b/internal/storage/memory_history.go
+@@ -0,0 +1,87 @@
++package storage
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"time"
++)
++
++// MemoryRevision is one recorded snapshot of a memory entry. Revisions are
++// identified by an incrementing integer wrapped in a "v" prefix, matching the
++// revision labels used for tasks and documents.
++type MemoryRevision struct {
++	ID        string         `json:"id"`
++	MemoryID  string         `json:"memoryId"`
++	Version   int            `json:"version"`
++	Timestamp time.Time      `json:"timestamp"`
++	Author    string         `json:"author,omitempty"`
++	Snapshot  map[string]any `json:"snapshot"`
++}
++
++// MemoryHistory is the revision log kept for one memory entry.
++type MemoryHistory struct {
++	MemoryID         string           `json:"memoryId"`
++	CurrentVersion   int              `json:"currentVersion"`
++	Versions         []MemoryRevision `json:"versions"`
++}
++
++func (ms *MemoryStore) memoryHistoryDir() string {
++	return filepath.Join(ms.root, "versions")
++}
++
++// memoryHistoryPath returns the history file recorded for a memory entry.
++func (ms *MemoryStore) memoryHistoryPath(id string) string {
++	return filepath.Join(ms.memoryHistoryDir(), "mem-"+id+".json")
++}
++
++// History returns the recorded revisions for a memory entry.
++func (ms *MemoryStore) History(id string) (*MemoryHistory, error) {
++	if id == "" {
++		return nil, fmt.Errorf("memory ID is required")
++	}
++	data, err := os.ReadFile(ms.memoryHistoryPath(id))
++	if err != nil {
++		if os.IsNotExist(err) {
++			return &MemoryHistory{MemoryID: id, Versions: []MemoryRevision{}}, nil
++		}
++		return nil, fmt.Errorf("read memory history: %w", err)
++	}
++	var history MemoryHistory
++	if err := json.Unmarshal(data, &history); err != nil {
++		return nil, fmt.Errorf("parse memory history: %w", err)
++	}
++	return &history, nil
++}
++
++// Checkpoint records the current state of a memory entry as a new revision.
++func (ms *MemoryStore) Checkpoint(id string, snapshot map[string]any, author string) (*MemoryRevision, error) {
++	if id == "" {
++		return nil, fmt.Errorf("memory ID is required")
++	}
++	history, err := ms.History(id)
++	if err != nil {
++		return nil, err
++	}
++	version := history.CurrentVersion + 1
++	revision := MemoryRevision{
++		ID:        fmt.Sprintf("v%d", version),
++		MemoryID:  id,
++		Version:   version,
++		Timestamp: time.Now().UTC(),
++		Author:    author,
++		Snapshot:  snapshot,
++	}
++	history.CurrentVersion = version
++	history.Versions = append(history.Versions, revision)
++
++	data, err := json.MarshalIndent(history, "", "  ")
++	if err != nil {
++		return nil, fmt.Errorf("encode memory history: %w", err)
++	}
++	if err := atomicWrite(ms.memoryHistoryPath(id), data); err != nil {
++		return nil, fmt.Errorf("write memory history: %w", err)
++	}
++	return &revision, nil
++}

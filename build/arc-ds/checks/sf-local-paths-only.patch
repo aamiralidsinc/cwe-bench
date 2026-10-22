@@ -1,0 +1,142 @@
+diff --git a/internal/api/continuous_query.go b/internal/api/continuous_query.go
+index 25045c1..fc73f11 100644
+--- a/internal/api/continuous_query.go
++++ b/internal/api/continuous_query.go
+@@ -286,6 +286,11 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
+ 		})
+ 	}
+ 
++	probeQuery := strings.ReplaceAll(strings.ReplaceAll(req.Query, "{start_time}", "''"), "{end_time}", "''")
++	if err := ValidateSQLRequest(probeQuery); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
++	}
++
+ 	// Insert query
+ 	result, err := h.sqliteDB.Exec(`
+ 		INSERT INTO continuous_queries
+@@ -476,6 +481,10 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
+ 	executedQuery := strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+ 	executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", endTime.Format(time.RFC3339)))
+ 
++	if err := ValidateSQLRequest(executedQuery); err != nil {
++		return nil, fmt.Errorf("query rejected: %w", err)
++	}
++
+ 	executionID := fmt.Sprintf("cq-sched-%s", uuid.New().String()[:8])
+ 
+ 	h.logger.Info().
+diff --git a/internal/api/export_download.go b/internal/api/export_download.go
+index 8941fad..828dabc 100644
+--- a/internal/api/export_download.go
++++ b/internal/api/export_download.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/rs/zerolog"
+@@ -19,8 +20,14 @@ type ExportHandler struct {
+ 
+ // NewExportHandler creates an export-download handler rooted at dir.
+ func NewExportHandler(root string, logger zerolog.Logger) *ExportHandler {
++	if abs, err := filepath.Abs(root); err == nil {
++		root = abs
++	}
++	if resolved, err := filepath.EvalSymlinks(root); err == nil {
++		root = resolved
++	}
+ 	return &ExportHandler{
+-		root:   root,
++		root:   filepath.Clean(root),
+ 		logger: logger.With().Str("component", "export-handler").Logger(),
+ 	}
+ }
+@@ -30,6 +37,25 @@ func (h *ExportHandler) RegisterRoutes(app *fiber.App) {
+ 	app.Get("/api/v1/export/download", h.handleDownload)
+ }
+ 
++// withinRoot reports whether p resolves to a path inside root. It checks the
++// lexical path and, when the file exists, the symlink-resolved path.
++func (h *ExportHandler) withinRoot(p string) bool {
++	inside := func(candidate string) bool {
++		rel, err := filepath.Rel(h.root, candidate)
++		if err != nil {
++			return false
++		}
++		return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
++	}
++	if !inside(p) {
++		return false
++	}
++	if resolved, err := filepath.EvalSymlinks(p); err == nil && !inside(resolved) {
++		return false
++	}
++	return true
++}
++
+ // handleDownload streams the named artifact from the export directory.
+ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	name := c.Query("path")
+@@ -41,6 +67,13 @@ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	}
+ 
+ 	fullPath := filepath.Join(h.root, name)
++	if !h.withinRoot(fullPath) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "invalid export path",
++		})
++	}
++
+ 	data, err := os.ReadFile(fullPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+diff --git a/internal/api/query.go b/internal/api/query.go
+index a1dbc58..fe2391a 100644
+--- a/internal/api/query.go
++++ b/internal/api/query.go
+@@ -1836,6 +1836,14 @@ func ValidateSQLRequest(sql string) error {
+ 		return &SQLValidationError{Message: "SQL query exceeds maximum length (10000 characters)"}
+ 	}
+ 
++	// SECURITY: user SQL must not name local files. The query rewriter
++	// produces storage paths itself after this check runs, so any absolute
++	// or parent-relative path literal in caller input is an attempt to open
++	// a file directly.
++	if userSQLLocalPathPattern.MatchString(sql) {
++		return &SQLValidationError{Message: "Local file paths are not allowed in user SQL"}
++	}
++
+ 	// Normalise before denylist check: mask string literals so keywords
+ 	// inside literals don't false-positive, then strip comments so
+ 	// keywords interleaved with comments don't slip past token
+@@ -1884,6 +1892,10 @@ var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
+ // must route through Arc's rewriter so RBAC stays load-bearing.
+ var userSQLArcPartitionAggPattern = regexp.MustCompile(`(?i)\barc_partition_agg\s*\(`)
+ 
++// userSQLLocalPathPattern matches a string literal that begins with an
++// absolute or parent-relative path.
++var userSQLLocalPathPattern = regexp.MustCompile(`(?i)'(?:/|\.\./|[a-z]:[\\/])`)
++
+ // getTransformedSQL returns the transformed SQL with caching.
+ // If headerDB is non-empty, uses the optimized path with that database for all tables.
+ // Returns the transformed SQL and whether it was a cache hit.
+@@ -3418,6 +3430,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
+ 	sql += fmt.Sprintf(" LIMIT %d", limit)
+ 	sql += fmt.Sprintf(" OFFSET %d", offset)
+ 
++	// SECURITY: the filter fragment is part of the statement Arc executes.
++	if err := ValidateSQLRequest(sql); err != nil {
++		m.IncQueryErrors()
++		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
++			Success:   false,
++			Error:     "Invalid query: " + err.Error(),
++			Timestamp: time.Now().UTC().Format(time.RFC3339),
++		})
++	}
++
+ 	// Convert SQL to storage paths (with caching)
+ 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
+ 	convertedSQL, _ := h.getTransformedSQL(sql, "")

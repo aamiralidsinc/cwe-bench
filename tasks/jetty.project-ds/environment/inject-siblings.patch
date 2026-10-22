@@ -1,0 +1,207 @@
+diff --git a/jetty-core/jetty-security/src/main/java/org/eclipse/jetty/security/authentication/DigestAuthenticator.java b/jetty-core/jetty-security/src/main/java/org/eclipse/jetty/security/authentication/DigestAuthenticator.java
+index 88af9bcf..82f8a26d 100644
+--- a/jetty-core/jetty-security/src/main/java/org/eclipse/jetty/security/authentication/DigestAuthenticator.java
++++ b/jetty-core/jetty-security/src/main/java/org/eclipse/jetty/security/authentication/DigestAuthenticator.java
+@@ -58,6 +58,7 @@ public class DigestAuthenticator extends LoginAuthenticator
+     private final ConcurrentMap<String, Nonce> _nonceMap = new ConcurrentHashMap<>();
+     private long _maxNonceAgeMs = 60 * 1000;
+     private int _maxNC = 1024;
++    private String _algorithm = "MD5";
+ 
+     @Override
+     public void setConfiguration(Configuration configuration)
+@@ -92,6 +93,16 @@ public class DigestAuthenticator extends LoginAuthenticator
+         _maxNonceAgeMs = maxNonceAgeInMillis;
+     }
+ 
++    public String getAlgorithm()
++    {
++        return _algorithm;
++    }
++
++    public void setAlgorithm(String algorithm)
++    {
++        _algorithm = algorithm;
++    }
++
+     @Override
+     public String getAuthenticationType()
+     {
+@@ -145,6 +156,8 @@ public class DigestAuthenticator extends LoginAuthenticator
+                                 digest.cnonce = tok;
+                             else if ("qop".equalsIgnoreCase(name))
+                                 digest.qop = tok;
++                            else if ("algorithm".equalsIgnoreCase(name))
++                                digest.algorithm = tok;
+                             else if ("uri".equalsIgnoreCase(name))
+                                 digest.uri = tok;
+                             else if ("response".equalsIgnoreCase(name))
+@@ -177,7 +190,7 @@ public class DigestAuthenticator extends LoginAuthenticator
+             res.getHeaders().put(HttpHeader.WWW_AUTHENTICATE.asString(), "Digest realm=\"" + _loginService.getName() +
+                     "\", domain=\"" + domain +
+                     "\", nonce=\"" + newNonce(req) +
+-                    "\", algorithm=MD5" +
++                    "\", algorithm=" + _algorithm +
+                     ", qop=\"auth\"" +
+                     ", stale=" + stale);
+             Response.writeError(req, res, callback, HttpStatus.UNAUTHORIZED_401);
+@@ -289,6 +302,7 @@ public class DigestAuthenticator extends LoginAuthenticator
+         final String method;
+         String username = "";
+         String realm = "";
++        String algorithm = "MD5";
+         String nonce = "";
+         String nc = "";
+         String cnonce = "";
+@@ -310,6 +324,35 @@ public class DigestAuthenticator extends LoginAuthenticator
+ 
+             try
+             {
++                if ("SHA-256".equalsIgnoreCase(algorithm) && !(credentials instanceof MD5))
++                {
++                    MessageDigest sd = MessageDigest.getInstance("SHA-256");
++                    sd.update(username.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(realm.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(password.getBytes(StandardCharsets.ISO_8859_1));
++                    byte[] sa1 = sd.digest();
++                    sd.reset();
++                    sd.update(method.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(uri.getBytes(StandardCharsets.ISO_8859_1));
++                    byte[] sa2 = sd.digest();
++                    sd.update(TypeUtil.toString(sa1, 16).getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(nonce.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(nc.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(cnonce.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(qop.getBytes(StandardCharsets.ISO_8859_1));
++                    sd.update((byte)':');
++                    sd.update(TypeUtil.toString(sa2, 16).getBytes(StandardCharsets.ISO_8859_1));
++                    byte[] sresponse = sd.digest();
++                    return stringEquals(TypeUtil.toString(sresponse, 16).toLowerCase(), response == null ? null : response.toLowerCase());
++                }
++
+                 // MD5 required by the specification
+                 MessageDigest md = MessageDigest.getInstance("MD5");
+                 byte[] ha1;
+diff --git a/jetty-core/jetty-util/src/main/java/org/eclipse/jetty/util/security/Credential.java b/jetty-core/jetty-util/src/main/java/org/eclipse/jetty/util/security/Credential.java
+index fb9ff0ad..d13e35c3 100644
+--- a/jetty-core/jetty-util/src/main/java/org/eclipse/jetty/util/security/Credential.java
++++ b/jetty-core/jetty-util/src/main/java/org/eclipse/jetty/util/security/Credential.java
+@@ -67,6 +67,8 @@ public abstract class Credential implements Serializable
+             return new Crypt(credential);
+         if (credential.startsWith(MD5.__TYPE))
+             return new MD5(credential);
++        if (credential.startsWith(SHA256.__TYPE))
++            return new SHA256(credential);
+ 
+         for (CredentialProvider cp : CREDENTIAL_PROVIDERS)
+         {
+@@ -284,4 +286,102 @@ public abstract class Credential implements Serializable
+             }
+         }
+     }
++    /**
++     * SHA-256 Credentials
++     */
++    public static class SHA256 extends Credential
++    {
++        private static final long serialVersionUID = 5533846540822684242L;
++        private static final String __TYPE = "SHA256:";
++        private static final AutoLock __sha256Lock = new AutoLock();
++        private static MessageDigest __sha256;
++
++        private final byte[] _digest;
++
++        SHA256(String digest)
++        {
++            digest = digest.startsWith(__TYPE) ? digest.substring(__TYPE.length()) : digest;
++            _digest = StringUtil.fromHexString(digest);
++        }
++
++        public byte[] getDigest()
++        {
++            return _digest;
++        }
++
++        @Override
++        public boolean check(Object credentials)
++        {
++            try
++            {
++                if (credentials instanceof char[])
++                    credentials = new String((char[])credentials);
++                if (credentials instanceof Password || credentials instanceof String)
++                {
++                    byte[] digest;
++                    try (AutoLock l = __sha256Lock.lock())
++                    {
++                        if (__sha256 == null)
++                            __sha256 = MessageDigest.getInstance("SHA-256");
++                        __sha256.reset();
++                        __sha256.update(credentials.toString().getBytes(StandardCharsets.ISO_8859_1));
++                        digest = __sha256.digest();
++                    }
++                    return byteEquals(_digest, digest);
++                }
++                else if (credentials instanceof SHA256)
++                {
++                    return equals(credentials);
++                }
++                else if (credentials instanceof Credential)
++                {
++                    return ((Credential)credentials).check(this);
++                }
++                else
++                {
++                    return false;
++                }
++            }
++            catch (Exception e)
++            {
++                return false;
++            }
++        }
++
++        @Override
++        public boolean equals(Object obj)
++        {
++            if (obj instanceof SHA256)
++                return byteEquals(_digest, ((SHA256)obj)._digest);
++            return false;
++        }
++
++        /**
++         * Used only by Command Line Password utility
++         */
++        public static String digest(String password)
++        {
++            try
++            {
++                byte[] digest;
++                try (AutoLock l = __sha256Lock.lock())
++                {
++                    if (__sha256 == null)
++                        __sha256 = MessageDigest.getInstance("SHA-256");
++                    __sha256.reset();
++                    __sha256.update(password.getBytes(StandardCharsets.ISO_8859_1));
++                    digest = __sha256.digest();
++                }
++
++                return __TYPE + StringUtil.toHexString(digest);
++            }
++            catch (Exception e)
++            {
++                System.err.println("Message Digest Failure");
++                e.printStackTrace();
++                return null;
++            }
++        }
++    }
+ }
++

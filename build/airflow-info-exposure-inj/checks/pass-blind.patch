@@ -1,0 +1,282 @@
+diff --git a/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py b/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
+index daac4a1..f3ead70 100644
+--- a/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
++++ b/airflow-core/src/airflow/api_fastapi/core_api/routes/public/config.py
+@@ -157,9 +157,7 @@ def get_config_value(
+         )
+ 
+     section_l, option_l = section.lower(), option.lower()
+-    if (section_l, option_l) in conf.sensitive_config_values or _is_per_key_sensitive_option(
+-        section_l, option_l
+-    ):
++    if conf.is_sensitive(section_l, option_l) or _is_per_key_sensitive_option(section_l, option_l):
+         value = "< hidden >"
+     else:
+         value = conf.get(section, option)
+diff --git a/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py b/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
+index d85e8e5..5473fd3 100644
+--- a/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
++++ b/airflow-core/src/airflow/api_fastapi/core_api/services/public/config.py
+@@ -72,6 +72,10 @@ def _apply_team_overrides(conf_dict: dict, team_name: str) -> None:
+         for option, value in team_options.items():
+             if options.get(option) == "< hidden >":
+                 continue
++            # Team-scoped overrides of sensitive options hold the team's own secret and
++            # must stay hidden exactly like the deployment-wide value they override.
++            if conf.is_sensitive(section, option):
++                continue
+             options[option] = str(value)
+ 
+ 
+diff --git a/airflow-core/src/airflow/cli/commands/config_command.py b/airflow-core/src/airflow/cli/commands/config_command.py
+index 7a6d657..0ecbe44 100644
+--- a/airflow-core/src/airflow/cli/commands/config_command.py
++++ b/airflow-core/src/airflow/cli/commands/config_command.py
+@@ -78,10 +78,7 @@ def get_value(args):
+         value = conf.get(args.section, args.option)
+     except AirflowConfigException:
+         return
+-    if getattr(args, "hide_sensitive", False) and (
+-        args.section.lower(),
+-        args.option.lower(),
+-    ) in conf.sensitive_config_values:
++    if getattr(args, "hide_sensitive", False) and conf.is_sensitive(args.section, args.option):
+         value = "< hidden >"
+     print(value)
+ 
+diff --git a/airflow-core/src/airflow/configuration.py b/airflow-core/src/airflow/configuration.py
+index 7790a25..53d9f1c 100644
+--- a/airflow-core/src/airflow/configuration.py
++++ b/airflow-core/src/airflow/configuration.py
+@@ -454,6 +454,23 @@ class AirflowConfigParser(_SharedAirflowConfigParser):
+             mask_secret_core(value)
+             mask_secret_sdk(value)
+ 
++        # Team-scoped overrides of sensitive options hold the same material as the
++        # deployment-wide option they override and must be masked exactly the same way.
++        for team_name, section, key in self._iter_team_sensitive_overrides():
++            try:
++                with self.suppress_future_warnings():
++                    value = self.get(section, key, team_name=team_name, suppress_warnings=True)
++            except AirflowConfigException:
++                log.debug(
++                    "Could not retrieve team-scoped value for section %s, key %s. "
++                    "Skipping redaction of this conf.",
++                    section,
++                    key,
++                )
++                continue
++            mask_secret_core(value)
++            mask_secret_sdk(value)
++
+         # Mask per-key backend kwarg env vars (AIRFLOW__SECRETS__BACKEND_KWARG__* etc.).
+         # These are not in sensitive_config_values but may contain sensitive values.
+         for _section, _kwargs_key in [
+diff --git a/shared/configuration/src/airflow_shared/configuration/parser.py b/shared/configuration/src/airflow_shared/configuration/parser.py
+index 2cfb946..bd70a32 100644
+--- a/shared/configuration/src/airflow_shared/configuration/parser.py
++++ b/shared/configuration/src/airflow_shared/configuration/parser.py
+@@ -78,6 +78,15 @@ ConfigSectionSourcesType = dict[str, str | tuple[str, str]]
+ ConfigSourcesType = dict[str, ConfigSectionSourcesType]
+ ENV_VAR_PREFIX = "AIRFLOW__"
+ 
++# Per-key environment-variable overrides for secrets-backend kwargs are surfaced by
++# ``as_dict`` as synthetic options under the ``secrets`` and ``workers`` sections.  They
++# carry the same secrets-backend material (e.g. Vault role_id / secret_id) as the
++# registered ``backend_kwargs`` option, so they need the same redaction treatment.
++_PER_KEY_SENSITIVE_PREFIXES: dict[str, str] = {
++    "secrets": "backend_kwarg__",
++    "workers": "secrets_backend_kwarg__",
++}
++
+ 
+ if TYPE_CHECKING:
+     from airflow.providers_manager import ProvidersManager
+@@ -562,6 +571,101 @@ class AirflowConfigParser(ConfigParser):
+         sensitive.update(depr_section, depr_option)
+         return sensitive
+ 
++    @staticmethod
++    def _base_section(section: str) -> str:
++        """
++        Return the deployment-wide section name for a (possibly team-scoped) section.
++
++        Team-scoped overrides live under sections named ``{team_name}={section}`` in the
++        configuration file.  Real section names never contain ``=``, so the part after the
++        last ``=`` is the deployment-wide section the override applies to.
++        """
++        return section.rsplit("=", 1)[1] if "=" in section else section
++
++    def is_sensitive(self, section: str, key: str) -> bool:
++        """
++        Return whether the option is sensitive, including team-scoped overrides.
++
++        A team-scoped override of a sensitive option holds the same kind of material as
++        the deployment-wide option it overrides, so it must be treated as sensitive too.
++        The ``*_cmd`` and ``*_secret`` references a sensitive value is loaded from are
++        treated as sensitive as well.
++
++        Team-scoped overrides are spelled in two ways: ``[{team}={section}]`` sections in
++        the configuration file, and ``AIRFLOW__{TEAM}___{SECTION}__{KEY}`` environment
++        variables.  ``as_dict`` reports the latter under a section named after the team
++        with a key that encodes the base section and option (``_{section}__{option}``);
++        that spelling is mapped back to the base option here as well.
++        """
++        raw_section = section.lower()
++        section = self._base_section(section).lower()
++        key = key.lower()
++        if "=" not in raw_section and key.startswith("_") and "__" in key[1:]:
++            base_section, _, base_key = key[1:].partition("__")
++            if base_section and base_key:
++                section, key = base_section, base_key
++        if (section, key) in self.sensitive_config_values:
++            return True
++        prefix = _PER_KEY_SENSITIVE_PREFIXES.get(section)
++        if prefix is not None and key.startswith(prefix):
++            return True
++        for suffix in ("_cmd", "_secret"):
++            if key.endswith(suffix) and (section, key[: -len(suffix)]) in self.sensitive_config_values:
++                return True
++        return False
++
++    def _iter_team_sensitive_overrides(self) -> Iterable[tuple[str, str, str]]:
++        """
++        Yield ``(team_name, section, key)`` for every team-scoped override of a sensitive option.
++
++        Team overrides can be supplied either as ``[{team}={section}]`` config file sections or
++        as ``AIRFLOW__{TEAM}___{SECTION}__{KEY}`` environment variables.
++        """
++        seen: set[tuple[str, str, str]] = set()
++
++        # Config file sections named "{team}={section}".
++        for team_section in self.sections():
++            if "=" not in team_section:
++                continue
++            team_name, section = team_section.split("=", 1)
++            for key in self.options(team_section):
++                if not self.is_sensitive(section, key):
++                    continue
++                item = (team_name.lower(), section.lower(), key.lower())
++                if item not in seen:
++                    seen.add(item)
++                    yield team_name, section, key
++
++        # Team-scoped environment variables.
++        for env_var in os.environ:
++            if not env_var.startswith(ENV_VAR_PREFIX):
++                continue
++            rest = env_var[len(ENV_VAR_PREFIX) :]
++            if "___" not in rest:
++                continue
++            team_name, section_and_key = rest.split("___", 1)
++            section, _, key = section_and_key.partition("__")
++            if not section or not key:
++                continue
++            # The key may be the registered sensitive option itself (some option names
++            # literally end in ``_secret``) or a ``*_cmd`` / ``*_secret`` reference that
++            # resolves through the base option.  Check the full key first; only strip the
++            # suffix when the stripped base is the registered option name.
++            base_key = key
++            if (section.lower(), key.lower()) not in self.sensitive_config_values:
++                for suffix in ("_CMD", "_SECRET"):
++                    if key.endswith(suffix):
++                        candidate = key[: -len(suffix)]
++                        if (section.lower(), candidate.lower()) in self.sensitive_config_values:
++                            base_key = candidate
++                            break
++            if not self.is_sensitive(section, base_key):
++                continue
++            item = (team_name.lower(), section.lower(), base_key.lower())
++            if item not in seen:
++                seen.add(item)
++                yield team_name, section, base_key
++
+     def _update_defaults_from_string(self, config_string: str) -> None:
+         """
+         Update the defaults in _default_values based on values in config_string ("ini" format).
+@@ -788,8 +892,17 @@ class AirflowConfigParser(ConfigParser):
+                 log.warning("Ignoring unknown env var '%s'", env_var)
+                 continue
+             if not display_sensitive and env_var != self._env_var_name("core", "unit_test_mode"):
+-                # Don't hide cmd/secret values here
+-                if not env_var.lower().endswith(("cmd", "secret")):
++                if "___" in env_var:
++                    # Team-scoped env var (AIRFLOW__{TEAM}___{SECTION}__{KEY}).  The split
++                    # above yields section={TEAM} and key=_{SECTION}__{KEY}; map back to the
++                    # deployment-wide section/key to decide whether to hide, including the
++                    # *_cmd / *_secret references of a sensitive option.
++                    base_section, _, base_key = key[1:].partition("__")
++                    if self.is_sensitive(base_section, base_key):
++                        opt = "< hidden >"
++                # Don't hide cmd/secret values here (they are resolved by
++                # _include_commands / _include_secrets for deployment-wide options).
++                elif not env_var.lower().endswith(("cmd", "secret")):
+                     if (section, key) in self.sensitive_config_values:
+                         opt = "< hidden >"
+             elif raw:
+@@ -1802,6 +1915,24 @@ class AirflowConfigParser(ConfigParser):
+                         else:
+                             config_sources[section][key] = hidden
+ 
++            # Team-scoped overrides live under sections named "{team}={section}" and hold
++            # the same material as the deployment-wide option they override.  Hide them the
++            # same way, including the *_cmd / *_secret references the value is loaded from.
++            for section in list(config_sources):
++                if "=" not in section:
++                    continue
++                options = config_sources[section]
++                for key in list(options):
++                    if not self.is_sensitive(section, key):
++                        continue
++                    current = options[key]
++                    if not current:
++                        continue
++                    if display_source and isinstance(current, tuple):
++                        options[key] = (hidden, current[1])
++                    else:
++                        options[key] = hidden
++
+         return config_sources
+ 
+     def _write_option_header(
+@@ -2032,10 +2163,7 @@ class AirflowConfigParser(ConfigParser):
+                             section_to_write=section_to_write,
+                             sources_dict=sources_dict,
+                         )
+-                        is_sensitive = (
+-                            section_to_write.lower(),
+-                            option.lower(),
+-                        ) in self.sensitive_config_values
++                        is_sensitive = self.is_sensitive(section_to_write, option)
+                         self._write_value(
+                             file=file,
+                             option=option,
+diff --git a/task-sdk/src/airflow/sdk/configuration.py b/task-sdk/src/airflow/sdk/configuration.py
+index 395ecb5..6118924 100644
+--- a/task-sdk/src/airflow/sdk/configuration.py
++++ b/task-sdk/src/airflow/sdk/configuration.py
+@@ -191,6 +191,24 @@ class AirflowSDKConfigParser(_SharedAirflowConfigParser):
+             if core_mask_secret:
+                 core_mask_secret(value)
+ 
++        # Team-scoped overrides of sensitive options hold the same material as the
++        # deployment-wide option they override and must be masked exactly the same way.
++        for team_name, section, key in self._iter_team_sensitive_overrides():
++            try:
++                with self.suppress_future_warnings():
++                    value = self.get(section, key, team_name=team_name, suppress_warnings=True)
++            except AirflowConfigException:
++                log.debug(
++                    "Could not retrieve team-scoped value for section %s, key %s. "
++                    "Skipping redaction of this conf.",
++                    section,
++                    key,
++                )
++                continue
++            mask_secret(value)
++            if core_mask_secret:
++                core_mask_secret(value)
++
+         # Mask per-key backend kwarg env vars (AIRFLOW__SECRETS__BACKEND_KWARG__* etc.).
+         # These are not in sensitive_config_values but may contain sensitive values.
+         for _section, _kwargs_key in [

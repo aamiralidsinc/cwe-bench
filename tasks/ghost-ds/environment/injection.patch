@@ -1,0 +1,197 @@
+diff --git a/ghost/core/core/server/data/importer/content-files.ts b/ghost/core/core/server/data/importer/content-files.ts
+index 9b013cf..6a53e28 100644
+--- a/ghost/core/core/server/data/importer/content-files.ts
++++ b/ghost/core/core/server/data/importer/content-files.ts
+@@ -52,3 +52,34 @@ export function createContentFileImporters() {
+     }),
+   ];
+ }
++
++/**
++ * Handlers used by the CSV content importer. They extend the archive handlers
++ * with the extra asset groups a CSV export can carry.
++ */
++export function createContentImportAssetHandlers() {
++  const imageStorage = adapterManager.getAdapter('storage:images');
++
++  return [
++    ...createContentFileHandlers(),
++    new ImporterContentFileHandler({
++      type: 'avatars',
++      directories: ['avatars'],
++      ignoreRootFolderFiles: true,
++      extensions: config.get('uploads').images.extensions,
++      contentTypes: config.get('uploads').images.contentTypes,
++      urlUtils,
++      storage: imageStorage,
++    }),
++  ];
++}
++
++export function createContentImportAssetImporters() {
++  return [
++    ...createContentFileImporters(),
++    new ContentFileImporter({
++      type: 'avatars',
++      store: adapterManager.getAdapter('storage:images'),
++    }),
++  ];
++}
+diff --git a/ghost/core/core/server/data/importer/importers/content-file-importer.js b/ghost/core/core/server/data/importer/importers/content-file-importer.js
+index 6134686..05e3fcb 100644
+--- a/ghost/core/core/server/data/importer/importers/content-file-importer.js
++++ b/ghost/core/core/server/data/importer/importers/content-file-importer.js
+@@ -77,7 +77,7 @@ class ContentFileImporter {
+   /**
+    *
+    * @param {Object} deps
+-   * @param {'images' | 'media' | 'files'} deps.type - importer type
++   * @param {'images' | 'media' | 'files' | 'avatars'} deps.type - importer type
+    * @param {import('ghost-storage-base').StorageBase} deps.store
+    */
+   constructor(deps) {
+@@ -120,6 +120,16 @@ class ContentFileImporter {
+       importData.preProcessedByFiles = true;
+     }
+ 
++    if (this.type === 'avatars') {
++      if (importData.avatars && importData.data && importData.data.data) {
++        _.each(importData.avatars, function (avatar) {
++          preProcessUsers(importData.data.data, avatar);
++        });
++      }
++
++      importData.preProcessedByAvatars = true;
++    }
++
+     return importData;
+   }
+ 
+diff --git a/ghost/core/core/server/services/content-import/import/assets.ts b/ghost/core/core/server/services/content-import/import/assets.ts
+index 8888f58..ae69d12 100644
+--- a/ghost/core/core/server/services/content-import/import/assets.ts
++++ b/ghost/core/core/server/services/content-import/import/assets.ts
+@@ -1,10 +1,10 @@
+ import type { PostImportRow } from './row';
+ import {
+-  createContentFileHandlers,
+-  createContentFileImporters,
++  createContentImportAssetHandlers,
++  createContentImportAssetImporters,
+ } from '../../../data/importer/content-files';
+ 
+-type AssetType = 'images' | 'media' | 'files';
++type AssetType = 'images' | 'media' | 'files' | 'avatars';
+ 
+ export interface PreparedAsset {
+   name: string;
+@@ -114,8 +114,8 @@ export async function prepareAssetBatch(
+   baseDirectory?: string,
+   deps: AssetPreparationDeps = {},
+ ): Promise<PreparedAssetBatch | undefined> {
+-  const handlers = deps.handlers ?? (createContentFileHandlers() as AssetHandler[]);
+-  const importers = deps.importers ?? (createContentFileImporters() as AssetImporter[]);
++  const handlers = deps.handlers ?? (createContentImportAssetHandlers() as AssetHandler[]);
++  const importers = deps.importers ?? (createContentImportAssetImporters() as AssetImporter[]);
+   const importerByType = new Map(importers.map((importer) => [importer.type, importer]));
+ 
+   const groups = await Promise.all(
+diff --git a/ghost/core/core/server/services/oembed/oembed-service.js b/ghost/core/core/server/services/oembed/oembed-service.js
+index 825d9c5..1649b91 100644
+--- a/ghost/core/core/server/services/oembed/oembed-service.js
++++ b/ghost/core/core/server/services/oembed/oembed-service.js
+@@ -10,6 +10,7 @@ const iconv = require('iconv-lite');
+ const path = require('path');
+ const crypto = require('crypto');
+ const imageTransform = require('@tryghost/image-transform');
++const { cacheMentionIcon } = require('./mention-icon-cache');
+ 
+ // Some sites block non-standard user agents so we need to mimic a typical browser
+ // Note: the Ghost/5.0 string _may_ be in use by 3rd parties so use caution when updating across majors
+@@ -615,14 +616,32 @@ class OEmbedService {
+     }
+ 
+     if (type === 'mention') {
++      let iconVerified = false;
+       if (metadata.icon) {
+         try {
+           await this.externalRequest.head(metadata.icon);
++          iconVerified = true;
+         } catch (err) {
+           metadata.icon = DEFAULT_BOOKMARK_ICON;
+           logging.error(err);
+         }
+       }
++
++      if (iconVerified) {
++        try {
++          const cachedIcon = await cacheMentionIcon({
++            iconUrl: metadata.icon,
++            externalRequest: this.externalRequest,
++            imageStore: this.imageStore,
++          });
++
++          if (cachedIcon) {
++            metadata.icon = cachedIcon;
++          }
++        } catch {
++          // Keep the publisher's icon URL when it cannot be cached locally
++        }
++      }
+     } else {
+       if (metadata.icon) {
+         await this.processImageFromUrl(metadata.icon, 'icon')
+diff --git a/ghost/core/core/server/services/oembed/mention-icon-cache.js b/ghost/core/core/server/services/oembed/mention-icon-cache.js
+new file mode 100644
+index 0000000..ac735ef
+--- /dev/null
++++ b/ghost/core/core/server/services/oembed/mention-icon-cache.js
+@@ -0,0 +1,48 @@
++const crypto = require('crypto');
++const path = require('path');
++const mime = require('mime-types');
++
++const DEFAULT_EXTENSION = 'png';
++
++const toBuffer = (bytes) => {
++  return Buffer.isBuffer(bytes)
++    ? bytes
++    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++};
++
++/**
++ * Cache a mention's icon in image storage so recommendation cards render the
++ * publisher's avatar without a request to the publisher on every page view.
++ *
++ * The icon URL comes from the mentioned page's markup and the response may be
++ * any type the publisher chooses, so the stored file is named after the
++ * response's content type.
++ *
++ * @param {Object} deps
++ * @param {string} deps.iconUrl - the page's declared icon URL
++ * @param {Function} deps.externalRequest - outbound request helper
++ * @param {Object} deps.imageStore - image storage adapter
++ * @returns {Promise<string|null>} stored URL, or null when the icon cannot be cached
++ */
++async function cacheMentionIcon({ iconUrl, externalRequest, imageStore }) {
++  if (!iconUrl || typeof externalRequest !== 'function' || !imageStore) {
++    return null;
++  }
++
++  const pending = externalRequest(iconUrl);
++  const bytes = await pending.buffer();
++  const response = await pending;
++
++  const contentType = response?.headers?.['content-type'] || '';
++  const extension =
++    mime.extension(contentType) ||
++    path.extname(new URL(iconUrl).pathname).slice(1) ||
++    DEFAULT_EXTENSION;
++
++  const name = imageStore.getSanitizedFileName('mention-icon');
++  const targetPath = path.join('icon', `${name}-${crypto.randomUUID()}.${extension}`);
++
++  return imageStore.saveRaw(toBuffer(bytes), targetPath);
++}
++
++module.exports = { cacheMentionIcon };

@@ -1,0 +1,384 @@
+diff --git a/packages/astro/src/actions/form-handler.ts b/packages/astro/src/actions/form-handler.ts
+index 78b89c6..31b70b9 100644
+--- a/packages/astro/src/actions/form-handler.ts
++++ b/packages/astro/src/actions/form-handler.ts
+@@ -24,6 +24,14 @@ export class FormActionHandler {
+ 			return undefined;
+ 		}
+ 
++		// Form actions can be dispatched by the composable `formActions()`
++		// handler before (or without) Astro's middleware chain, so the origin
++		// check that normally runs there must be enforced before executing one.
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return Promise.resolve(originRefusal);
++		}
++
+ 		return this.#runFormAction(action, setActionResult);
+ 	}
+ 
+diff --git a/packages/astro/src/actions/handler.ts b/packages/astro/src/actions/handler.ts
+index 50d0255..a6efc81 100644
+--- a/packages/astro/src/actions/handler.ts
++++ b/packages/astro/src/actions/handler.ts
+@@ -41,6 +41,14 @@ export class ActionHandler {
+ 			return undefined;
+ 		}
+ 
++		// Actions can be dispatched by the composable `actions()` handler
++		// before (or without) Astro's middleware chain, so the origin check
++		// that normally runs there must be enforced before executing one.
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return Promise.resolve(originRefusal);
++		}
++
+ 		return this.#executeAction(action, setActionResult);
+ 	}
+ 
+diff --git a/packages/astro/src/core/app/middlewares.ts b/packages/astro/src/core/app/middlewares.ts
+index cea4534..ba8296a 100644
+--- a/packages/astro/src/core/app/middlewares.ts
++++ b/packages/astro/src/core/app/middlewares.ts
+@@ -17,39 +17,63 @@ const FORM_CONTENT_TYPES = [
+ const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+ 
+ /**
+- * Returns a middleware function in charge to check the `origin` header.
++ * Applies Astro's cross-site form submission (`security.checkOrigin`) rules to
++ * a single request. Returns a `403` response when the request must be refused,
++ * or `undefined` when it may proceed.
++ *
++ * The origin check normally runs as part of Astro's middleware chain, but the
++ * composable request handlers in `astro/fetch` (and their `astro/hono`
++ * wrappers) can run user code without ever going through that chain. They call
++ * this helper directly so the same rules apply no matter how a site assembles
++ * its server.
+  *
+  * @private
+  */
+-export function createOriginCheckMiddleware(): MiddlewareHandler {
+-	return defineMiddleware((context, next) => {
+-		const { request, url, isPrerendered } = context;
+-		// Prerendered pages should be excluded
+-		if (isPrerendered) {
+-			return next();
++export function getOriginCheckResponse(
++	request: Request,
++	url: URL,
++	isPrerendered: boolean,
++): Response | undefined {
++	// Prerendered pages should be excluded
++	if (isPrerendered) {
++		return undefined;
++	}
++	// Safe methods don't require origin check
++	if (SAFE_METHODS.includes(request.method)) {
++		return undefined;
++	}
++	const isSameOrigin = request.headers.get('origin') === url.origin;
++
++	const hasContentType = request.headers.has('content-type');
++	if (hasContentType) {
++		const formLikeHeader = hasFormLikeHeader(request.headers.get('content-type'));
++		if (formLikeHeader && !isSameOrigin) {
++			return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
++				status: 403,
++			});
+ 		}
+-		// Safe methods don't require origin check
+-		if (SAFE_METHODS.includes(request.method)) {
+-			return next();
++	} else {
++		if (!isSameOrigin) {
++			return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
++				status: 403,
++			});
+ 		}
+-		const isSameOrigin = request.headers.get('origin') === url.origin;
++	}
+ 
+-		const hasContentType = request.headers.has('content-type');
+-		if (hasContentType) {
+-			const formLikeHeader = hasFormLikeHeader(request.headers.get('content-type'));
+-			if (formLikeHeader && !isSameOrigin) {
+-				return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
+-					status: 403,
+-				});
+-			}
+-		} else {
+-			if (!isSameOrigin) {
+-				return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
+-					status: 403,
+-				});
+-			}
+-		}
++	return undefined;
++}
+ 
++/**
++ * Returns a middleware function in charge to check the `origin` header.
++ *
++ * @private
++ */
++export function createOriginCheckMiddleware(): MiddlewareHandler {
++	return defineMiddleware((context, next) => {
++		const refusal = getOriginCheckResponse(context.request, context.url, context.isPrerendered);
++		if (refusal) {
++			return refusal;
++		}
+ 		return next();
+ 	});
+ }
+diff --git a/packages/astro/src/core/base-pipeline.ts b/packages/astro/src/core/base-pipeline.ts
+index 973508a..fd45e51 100644
+--- a/packages/astro/src/core/base-pipeline.ts
++++ b/packages/astro/src/core/base-pipeline.ts
+@@ -260,22 +260,20 @@ export abstract class Pipeline {
+ 		if (this.resolvedMiddleware) {
+ 			return this.resolvedMiddleware;
+ 		}
+-		// The middleware can be undefined when using edge middleware.
++		// The user middleware can be undefined when using edge middleware.
+ 		// This is set to undefined by the plugin-ssr.ts
+-		if (this.middleware) {
+-			const middlewareInstance = await this.middleware();
+-			const onRequest = middlewareInstance.onRequest ?? NOOP_MIDDLEWARE_FN;
+-			const internalMiddlewares = [onRequest];
+-			if (this.manifest.checkOrigin) {
+-				// this middleware must be placed at the beginning because it needs to block incoming requests
+-				internalMiddlewares.unshift(createOriginCheckMiddleware());
+-			}
+-			this.resolvedMiddleware = sequence(...internalMiddlewares);
+-			return this.resolvedMiddleware;
+-		} else {
+-			this.resolvedMiddleware = NOOP_MIDDLEWARE_FN;
+-			return this.resolvedMiddleware;
++		const onRequest = this.middleware
++			? ((await this.middleware()).onRequest ?? NOOP_MIDDLEWARE_FN)
++			: NOOP_MIDDLEWARE_FN;
++		const internalMiddlewares = [onRequest];
++		// The origin check must not depend on whether the user registered
++		// middleware: `security.checkOrigin` protects the app either way.
++		if (this.manifest.checkOrigin) {
++			// this middleware must be placed at the beginning because it needs to block incoming requests
++			internalMiddlewares.unshift(createOriginCheckMiddleware());
+ 		}
++		this.resolvedMiddleware = sequence(...internalMiddlewares);
++		return this.resolvedMiddleware;
+ 	}
+ 
+ 	/**
+diff --git a/packages/astro/src/core/endpoints/handler.ts b/packages/astro/src/core/endpoints/handler.ts
+index a01ef57..3cbc5f6 100644
+--- a/packages/astro/src/core/endpoints/handler.ts
++++ b/packages/astro/src/core/endpoints/handler.ts
+@@ -20,6 +20,14 @@ export class EndpointsHandler {
+ 	}
+ 
+ 	async handle(state: FetchState): Promise<Response> {
++		// The composable `endpoints()` handler dispatches directly rather than
++		// through Astro's middleware chain, so it must apply the origin check
++		// that the chain would otherwise run before the endpoint runs.
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return originRefusal;
++		}
++
+ 		if (!state.routeData || state.routeData.type !== 'endpoint') {
+ 			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
+ 		}
+diff --git a/packages/astro/src/core/fetch/fetch-state.ts b/packages/astro/src/core/fetch/fetch-state.ts
+index 2e7ac3c..0c46df1 100644
+--- a/packages/astro/src/core/fetch/fetch-state.ts
++++ b/packages/astro/src/core/fetch/fetch-state.ts
+@@ -39,6 +39,7 @@ import { MultiLevelEncodingError, validateAndDecodePathname } from '../util/path
+ import { getOriginPathname, setOriginPathname } from '../routing/rewrite.js';
+ import { computePathnameFromDomain } from '../i18n/domain.js';
+ import { getCustom404Route, routeHasHtmlExtension } from '../routing/helpers.js';
++import { getOriginCheckResponse } from '../app/middlewares.js';
+ import type { ResolvedRenderOptions } from '../app/base.js';
+ import { getRenderOptions } from '../app/render-options.js';
+ import { getFirstForwardedValue, validateForwardedHeaders } from '../app/validate-headers.js';
+@@ -1137,6 +1138,24 @@ export class FetchState implements AstroFetchState {
+ 		return this.apiContext;
+ 	}
+ 
++	/**
++	 * Applies Astro's origin check (`security.checkOrigin`) to this request.
++	 *
++	 * Returns a `403` `Response` when the request must be refused, or
++	 * `undefined` when it may proceed (origin check disabled, prerendered
++	 * route, safe method, same-origin, or non-form cross-origin request).
++	 *
++	 * Composable handlers must call this before dispatching any user code:
++	 * a site can mount them without — or before — Astro's middleware chain,
++	 * where the origin check normally runs.
++	 */
++	getOriginCheckRefusal(): Response | undefined {
++		if (!this.pipeline.manifest.checkOrigin) {
++			return undefined;
++		}
++		return getOriginCheckResponse(this.request, this.url, this.routeData?.prerender ?? false);
++	}
++
+ 	/**
+ 	 * Invalidates the cached `APIContext` so the next `getAPIContext()`
+ 	 * call re-derives it from the (possibly mutated) state. Used
+diff --git a/packages/astro/src/core/fetch/index.ts b/packages/astro/src/core/fetch/index.ts
+index 1a125c2..e4e517c 100644
+--- a/packages/astro/src/core/fetch/index.ts
++++ b/packages/astro/src/core/fetch/index.ts
+@@ -223,6 +223,16 @@ export function actions(state: FetchState): Promise<Response | undefined> | unde
+ 		handler = new ActionHandler();
+ 		actionHandlers.set(app, handler);
+ 	}
++	// The API context requires a matched route. When none matched (e.g. a
++	// prerendered custom 404 is served by the error handler), a cross-site
++	// form submission must still be refused with a 4xx response instead of
++	// crashing while the context is built.
++	if (!state.routeData) {
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return Promise.resolve(originRefusal);
++		}
++	}
+ 	return handler.handle(state.getAPIContext(), state);
+ }
+ 
+@@ -240,6 +250,14 @@ export function formActions(state: FetchState): Promise<Response | undefined> |
+ 		handler = new FormActionHandler();
+ 		formActionHandlers.set(app, handler);
+ 	}
++	// See `actions()`: refuse before building the API context, which needs a
++	// matched route, so an unmatched cross-site form submission cannot crash.
++	if (!state.routeData) {
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return Promise.resolve(originRefusal);
++		}
++	}
+ 	return handler.handle(state.getAPIContext(), state);
+ }
+ 
+diff --git a/packages/astro/src/core/middleware/astro-middleware.ts b/packages/astro/src/core/middleware/astro-middleware.ts
+index 6bc4d76..e329d83 100644
+--- a/packages/astro/src/core/middleware/astro-middleware.ts
++++ b/packages/astro/src/core/middleware/astro-middleware.ts
+@@ -68,6 +68,17 @@ export class AstroMiddleware {
+ 		if (state.skipMiddleware) {
+ 			response = await next(apiContext);
+ 		} else {
++			// Enforce `security.checkOrigin` here as well as inside the
++			// resolved pipeline middleware. The check is part of the request
++			// handling contract, not of any particular user middleware chain,
++			// so a pipeline that resolves middleware differently must not be
++			// able to skip it.
++			const originRefusal = state.getOriginCheckRefusal();
++			if (originRefusal) {
++				response = this.#finalize(state, originRefusal);
++				state.response = response;
++				return response;
++			}
+ 			const pipelineMiddleware = await pipeline.getMiddleware();
+ 			const composed = sequence(...pipeline.internalMiddleware, pipelineMiddleware);
+ 			response = await callMiddleware(composed, apiContext, next);
+diff --git a/packages/astro/src/core/pages/fragment-handler.ts b/packages/astro/src/core/pages/fragment-handler.ts
+index 9792382..0bc608e 100644
+--- a/packages/astro/src/core/pages/fragment-handler.ts
++++ b/packages/astro/src/core/pages/fragment-handler.ts
+@@ -24,6 +24,11 @@ export class FragmentHandler {
+ 			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
+ 		}
+ 
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return originRefusal;
++		}
++
+ 		state.resetResponseMetadata();
+ 		const componentInstance = await state.loadComponentInstance();
+ 		const props = await state.getProps();
+diff --git a/packages/astro/src/core/pages/handler.ts b/packages/astro/src/core/pages/handler.ts
+index 855822b..be17bde 100644
+--- a/packages/astro/src/core/pages/handler.ts
++++ b/packages/astro/src/core/pages/handler.ts
+@@ -32,6 +32,14 @@ export class PagesHandler {
+ 	}
+ 
+ 	async handle(state: FetchState, ctx: APIContext): Promise<Response> {
++		// The composable `pages()` handler dispatches directly rather than
++		// through Astro's middleware chain, so it must apply the origin check
++		// that the chain would otherwise run before any page or endpoint runs.
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return originRefusal;
++		}
++
+ 		const pipeline = this.#pipeline;
+ 		const { logger, streaming } = pipeline;
+ 		state.resetResponseMetadata();
+diff --git a/packages/astro/src/core/pages/partial-handler.ts b/packages/astro/src/core/pages/partial-handler.ts
+index ee67082..8756d09 100644
+--- a/packages/astro/src/core/pages/partial-handler.ts
++++ b/packages/astro/src/core/pages/partial-handler.ts
+@@ -9,35 +9,27 @@ import { PagesHandler } from './handler.js';
+  *
+  * Sites that swap fragments in place (HTMX-style) mount this instead of the
+  * full page dispatcher. It renders the matched page route only; the origin
+- * check applies to form submissions the same way it does elsewhere.
++ * check applies to form submissions the same way it does elsewhere, and is
++ * applied here before dispatch because `partials()` does not run Astro's
++ * middleware chain.
+  */
+ export class PartialHandler {
+-	#app: BaseApp<Pipeline>;
+ 	#pages: PagesHandler;
+ 
+ 	constructor(app: BaseApp<Pipeline>) {
+-		this.#app = app;
+ 		this.#pages = new PagesHandler(app.pipeline);
+ 	}
+ 
+ 	async handle(state: FetchState): Promise<Response> {
+-		if (!state.routeData || state.routeData.type !== 'page') {
+-			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return originRefusal;
+ 		}
+ 
+-		const ctx = state.getAPIContext();
+-		if (this.#app.pipeline.manifest.checkOrigin) {
+-			const contentType = ctx.request.headers.get('content-type') ?? '';
+-			if (ctx.request.method === 'POST' && contentType === 'application/x-www-form-urlencoded') {
+-				const isSameOrigin = ctx.request.headers.get('origin') === ctx.url.origin;
+-				if (!isSameOrigin) {
+-					return new Response(`Cross-site ${ctx.request.method} form submissions are forbidden`, {
+-						status: 403,
+-					});
+-				}
+-			}
++		if (!state.routeData || state.routeData.type !== 'page') {
++			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
+ 		}
+ 
+-		return this.#pages.handle(state, ctx);
++		return this.#pages.handle(state, state.getAPIContext());
+ 	}
+ }
+diff --git a/packages/astro/src/core/rewrites/rewrite-handler.ts b/packages/astro/src/core/rewrites/rewrite-handler.ts
+index afe9fb2..913f41c 100644
+--- a/packages/astro/src/core/rewrites/rewrite-handler.ts
++++ b/packages/astro/src/core/rewrites/rewrite-handler.ts
+@@ -24,6 +24,10 @@ export class RewriteHandler {
+ 	}
+ 
+ 	async handle(state: FetchState, payload: RewritePayload): Promise<Response> {
++		const originRefusal = state.getOriginCheckRefusal();
++		if (originRefusal) {
++			return originRefusal;
++		}
+ 		const result = await this.#app.pipeline.tryRewrite(payload, state.request);
+ 		applyRewriteToState(state, payload, result, { mergeCookies: true });
+ 		return this.#pages.handle(state, state.getAPIContext());

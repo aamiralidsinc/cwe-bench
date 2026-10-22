@@ -1,0 +1,223 @@
+package newdeploy
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes/fake"
+	k8sCache "k8s.io/client-go/tools/cache"
+
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	fetcherConfig "github.com/fission/fission/pkg/fetcher/config"
+	fClient "github.com/fission/fission/pkg/generated/clientset/versioned/fake"
+	genInformer "github.com/fission/fission/pkg/generated/informers/externalversions"
+	"github.com/fission/fission/pkg/utils"
+	"github.com/fission/fission/pkg/utils/loggerfactory"
+	"github.com/fission/fission/pkg/utils/manager"
+	"github.com/fission/fission/pkg/utils/uuid"
+)
+
+const (
+	defaultNamespace  string = "default"
+	functionNamespace string = "fission-function"
+	builderNamespace  string = "fission-builder"
+	envName           string = "newdeploy-test-env"
+	functionName      string = "newdeploy-test-func"
+	configmapName     string = "newdeploy-test-configmap"
+)
+
+func TestRefreshFuncPods(t *testing.T) {
+	os.Setenv("DEBUG_ENV", "true")
+	mgr := manager.New()
+	t.Cleanup(mgr.Wait)
+	logger := loggerfactory.GetLogger()
+	kubernetesClient := fake.NewClientset()
+	// Hitting issue https://github.com/kubernetes/kubernetes/issues/126850
+	// so using NewSimpleClientset instead of NewClientset here, until that is resolved.
+	fissionClient := fClient.NewSimpleClientset() // nolint:staticcheck
+	factory := make(map[string]genInformer.SharedInformerFactory, 0)
+	factory[metav1.NamespaceDefault] = genInformer.NewSharedInformerFactoryWithOptions(fissionClient, time.Minute*30, genInformer.WithNamespace(metav1.NamespaceDefault))
+
+	executorLabel, err := utils.GetInformerLabelByExecutor(fv1.ExecutorTypeNewdeploy)
+	require.NoError(t, err, "Error creating labels for informer")
+	ndmInformerFactory := utils.GetInformerFactoryByExecutor(kubernetesClient, executorLabel, time.Minute*30)
+
+	ctx := t.Context()
+
+	fetcherConfig, err := fetcherConfig.MakeFetcherConfig("/userfunc")
+	require.NoError(t, err, "Error creating fetcher config")
+
+	executor, err := MakeNewDeploy(ctx, logger, fissionClient, kubernetesClient, fetcherConfig, "test",
+		factory, ndmInformerFactory, nil)
+	require.NoError(t, err, "new deploy manager creation failed")
+
+	ndm := executor.(*NewDeploy)
+
+	nsResolver := utils.NamespaceResolver{
+		FunctionNamespace: functionNamespace,
+		BuilderNamespace:  builderNamespace,
+		DefaultNamespace:  defaultNamespace,
+	}
+	ndm.nsResolver = &nsResolver
+
+	mgr.Add(ctx, func(ctx context.Context) {
+		ndm.Run(ctx, mgr)
+	})
+	t.Log("New deploy manager started")
+
+	for _, f := range factory {
+		f.Start(ctx.Done())
+	}
+	for _, informerFactory := range ndmInformerFactory {
+		informerFactory.Start(ctx.Done())
+	}
+
+	t.Log("Informers required for new deploy manager started")
+
+	waitSynced := make([]k8sCache.InformerSynced, 0)
+	for _, deplListerSynced := range ndm.deplListerSynced {
+		waitSynced = append(waitSynced, deplListerSynced)
+	}
+	for _, svcListerSynced := range ndm.svcListerSynced {
+		waitSynced = append(waitSynced, svcListerSynced)
+	}
+
+	if ok := k8sCache.WaitForCacheSync(ctx.Done(), waitSynced...); !ok {
+		t.Fatal("Timed out waiting for caches to sync")
+	}
+
+	envSpec := &fv1.Environment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      envName,
+			Namespace: defaultNamespace,
+			UID:       "83c82da2-81e9-4ebd-867e-f383e65e603f",
+		},
+		Spec: fv1.EnvironmentSpec{
+			Version: 1,
+			Runtime: fv1.Runtime{
+				Image: "gcr.io/xyz",
+			},
+		},
+	}
+
+	_, err = fissionClient.CoreV1().Environments(defaultNamespace).Create(ctx, envSpec, metav1.CreateOptions{})
+	require.NoError(t, err, "creating environment failed")
+
+	envRes, err := fissionClient.CoreV1().Environments(defaultNamespace).Get(ctx, envName, metav1.GetOptions{})
+	require.NoError(t, err, "getting environment failed")
+	require.Equal(t, envRes.Name, envName)
+
+	funcSpec := fv1.Function{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      functionName,
+			Namespace: defaultNamespace,
+			UID:       uuid.NewUUID(),
+		},
+		Spec: fv1.FunctionSpec{
+			Environment: fv1.EnvironmentReference{
+				Name:      envName,
+				Namespace: defaultNamespace,
+			},
+			InvokeStrategy: fv1.InvokeStrategy{
+				ExecutionStrategy: fv1.ExecutionStrategy{
+					ExecutorType: fv1.ExecutorTypeNewdeploy,
+				},
+			},
+		},
+	}
+	_, err = fissionClient.CoreV1().Functions(defaultNamespace).Create(ctx, &funcSpec, metav1.CreateOptions{})
+	require.NoError(t, err, "creating function failed ")
+
+	funcRes, err := fissionClient.CoreV1().Functions(defaultNamespace).Get(ctx, functionName, metav1.GetOptions{})
+	require.NoError(t, err, "Error getting function")
+	require.Equal(t, funcRes.Name, functionName)
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	wait.Until(func() {
+		t.Log("Checking for deployment")
+		ret, err := kubernetesClient.AppsV1().Deployments(functionNamespace).List(ctx2, metav1.ListOptions{})
+		require.NoError(t, err, "Error getting deployment")
+		if len(ret.Items) > 0 {
+			t.Log("Deployment created", ret.Items[0].Name)
+			cancel2()
+		}
+	}, time.Second*2, ctx2.Done())
+
+	err = BuildConfigMap(ctx, kubernetesClient, defaultNamespace, configmapName, map[string]string{
+		"test-key": "test-value",
+	})
+	require.NoError(t, err, "Error building configmap")
+
+	t.Log("Adding configmap to function")
+	funcRes.Spec.ConfigMaps = []fv1.ConfigMapReference{
+		{
+			Name:      configmapName,
+			Namespace: defaultNamespace,
+		},
+	}
+	_, err = fissionClient.CoreV1().Functions(defaultNamespace).Update(ctx, funcRes, metav1.UpdateOptions{})
+	require.NoError(t, err, "Error updating function")
+	funcRes, err = fissionClient.CoreV1().Functions(defaultNamespace).Get(ctx, functionName, metav1.GetOptions{})
+	require.NoError(t, err, "Error getting function")
+	require.Greater(t, len(funcRes.Spec.ConfigMaps), 0)
+
+	err = ndm.RefreshFuncPods(ctx, logger, *funcRes)
+	require.NoError(t, err, "Error refreshing function pods")
+
+	funcLabels := ndm.getDeployLabels(funcRes.ObjectMeta, envRes.ObjectMeta)
+
+	dep, err := kubernetesClient.AppsV1().Deployments(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set(funcLabels).AsSelector().String(),
+	})
+
+	require.NoError(t, err, "Error getting deployment")
+	require.Equal(t, len(dep.Items), 1)
+
+	cm, err := kubernetesClient.CoreV1().ConfigMaps(defaultNamespace).Get(ctx, configmapName, metav1.GetOptions{})
+	require.NoError(t, err, "Error getting configmap")
+	require.Equal(t, cm.Name, configmapName)
+	updatedDepl := dep.Items[0]
+	resourceVersionMatch := false
+	require.Equal(t, len(updatedDepl.Spec.Template.Spec.Containers), 2)
+	for _, v := range updatedDepl.Spec.Template.Spec.Containers {
+		if v.Name == envName {
+			require.Greater(t, len(v.Env), 0)
+			for _, env := range v.Env {
+				if env.Name == fv1.ResourceVersionCount {
+					require.Equal(t, env.Value, cm.ResourceVersion)
+					resourceVersionMatch = true
+				}
+			}
+		}
+	}
+	require.True(t, resourceVersionMatch)
+}
+
+func FakeResourceVersion() string {
+	return fmt.Sprint(time.Now().Nanosecond())[:6]
+}
+
+func BuildConfigMap(ctx context.Context, kubernetesClient *fake.Clientset, namespace, name string, data map[string]string) error {
+	testConfigMap := apiv1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			ResourceVersion: FakeResourceVersion(),
+		},
+		Data: data,
+	}
+	_, err := kubernetesClient.CoreV1().ConfigMaps(namespace).Create(ctx, &testConfigMap, metav1.CreateOptions{})
+	return err
+}

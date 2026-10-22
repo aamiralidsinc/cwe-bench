@@ -1,0 +1,471 @@
+diff --git a/weed/s3api/iceberg/handlers_index.go b/weed/s3api/iceberg/handlers_index.go
+new file mode 100644
+index 0000000..a26a56d
+--- /dev/null
++++ b/weed/s3api/iceberg/handlers_index.go
+@@ -0,0 +1,81 @@
++package iceberg
++
++import (
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
++	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
++)
++
++// listChildDirectories returns the names of the directory entries directly
++// below dir. Missing directories are reported as an empty list.
++func listChildDirectories(r *http.Request, client filer_pb.SeaweedFilerClient, dir string) ([]string, error) {
++	stream, err := client.ListEntries(r.Context(), &filer_pb.ListEntriesRequest{
++		Directory: dir,
++		Limit:     1000,
++	})
++	if err != nil {
++		if strings.Contains(err.Error(), "not found") {
++			return nil, nil
++		}
++		return nil, err
++	}
++	var names []string
++	for {
++		entry, recvErr := stream.Recv()
++		if recvErr != nil {
++			if recvErr == io.EOF {
++				break
++			}
++			if strings.Contains(recvErr.Error(), "not found") {
++				break
++			}
++			return nil, recvErr
++		}
++		if entry.Entry == nil || !entry.Entry.IsDirectory {
++			continue
++		}
++		if strings.HasPrefix(entry.Entry.Name, ".") {
++			continue
++		}
++		names = append(names, entry.Entry.Name)
++	}
++	return names, nil
++}
++
++// handleListCatalogTables returns every table registered in the catalog
++// bucket. Clients use it to build a catalog index without walking every
++// namespace themselves.
++func (s *Server) handleListCatalogTables(w http.ResponseWriter, r *http.Request) {
++	bucketName := getBucketFromPrefix(r)
++	bucketPath := s3tables.GetTableBucketPath(bucketName)
++
++	identifiers := make([]TableIdentifier, 0)
++	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		namespaces, err := listChildDirectories(r, client, bucketPath)
++		if err != nil {
++			return err
++		}
++		for _, namespace := range namespaces {
++			tables, err := listChildDirectories(r, client, s3tables.GetNamespacePath(bucketName, namespace))
++			if err != nil {
++				return err
++			}
++			for _, table := range tables {
++				identifiers = append(identifiers, TableIdentifier{
++					Namespace: Namespace{namespace},
++					Name:      table,
++				})
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		writeError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
++		return
++	}
++
++	writeJSON(w, http.StatusOK, ListTablesResponse{Identifiers: identifiers})
++}
+diff --git a/weed/s3api/iceberg/server.go b/weed/s3api/iceberg/server.go
+index fe280d8..7ecb127 100644
+--- a/weed/s3api/iceberg/server.go
++++ b/weed/s3api/iceberg/server.go
+@@ -91,6 +91,9 @@ func (s *Server) RegisterRoutes(router *mux.Router) {
+ 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleNamespaceExists)).Methods(http.MethodHead)
+ 	router.HandleFunc("/v1/namespaces/{namespace}", s.Auth(s.handleDropNamespace)).Methods(http.MethodDelete)
+ 
++	// Catalog index - wrapped with Auth middleware
++	router.HandleFunc("/v1/tables", s.Auth(s.handleListCatalogTables)).Methods(http.MethodGet)
++
+ 	// Table endpoints - wrapped with Auth middleware
+ 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleListTables)).Methods(http.MethodGet)
+ 	router.HandleFunc("/v1/namespaces/{namespace}/tables", s.Auth(s.handleCreateTable)).Methods(http.MethodPost)
+@@ -100,6 +103,7 @@ func (s *Server) RegisterRoutes(router *mux.Router) {
+ 	router.HandleFunc("/v1/namespaces/{namespace}/tables/{table}", s.Auth(s.handleUpdateTable)).Methods(http.MethodPost)
+ 
+ 	// With prefix support - wrapped with Auth middleware
++	router.HandleFunc("/v1/{prefix}/tables", s.Auth(s.handleListCatalogTables)).Methods(http.MethodGet)
+ 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleListNamespaces)).Methods(http.MethodGet)
+ 	router.HandleFunc("/v1/{prefix}/namespaces", s.Auth(s.handleCreateNamespace)).Methods(http.MethodPost)
+ 	router.HandleFunc("/v1/{prefix}/namespaces/{namespace}", s.Auth(s.handleGetNamespace)).Methods(http.MethodGet)
+diff --git a/weed/s3api/s3tables/handler.go b/weed/s3api/s3tables/handler.go
+index 2572a49..0090602 100644
+--- a/weed/s3api/s3tables/handler.go
++++ b/weed/s3api/s3tables/handler.go
+@@ -111,6 +111,8 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request,
+ 		err = h.handleListTableBuckets(w, r, filerClient)
+ 	case "DeleteTableBucket":
+ 		err = h.handleDeleteTableBucket(w, r, filerClient)
++	case "GetTableBucketUsage":
++		err = h.handleGetTableBucketUsage(w, r, filerClient)
+ 
+ 	// Table Bucket Policy operations
+ 	case "PutTableBucketPolicy":
+@@ -141,6 +143,8 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request,
+ 		err = h.handleUpdateTable(w, r, filerClient)
+ 	case "DeleteTable":
+ 		err = h.handleDeleteTable(w, r, filerClient)
++	case "BatchDeleteTables":
++		err = h.handleBatchDeleteTables(w, r, filerClient)
+ 
+ 	// Table Policy operations
+ 	case "PutTablePolicy":
+diff --git a/weed/s3api/s3tables/handler_bucket_usage.go b/weed/s3api/s3tables/handler_bucket_usage.go
+new file mode 100644
+index 0000000..787875f
+--- /dev/null
++++ b/weed/s3api/s3tables/handler_bucket_usage.go
+@@ -0,0 +1,149 @@
++package s3tables
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++
++	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
++)
++
++// accountIDFromARN returns the account field of an ARN.
++// ARN format: arn:aws:s3tables:{region}:{account}:{resource}
++func accountIDFromARN(arn string) string {
++	parts := strings.SplitN(arn, ":", 6)
++	if len(parts) != 6 {
++		return ""
++	}
++	return parts[4]
++}
++
++// handleGetTableBucketUsage reports the number of namespaces and tables in a
++// table bucket. It backs the storage summary shown by table management tools.
++func (h *S3TablesHandler) handleGetTableBucketUsage(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
++	var req GetTableBucketUsageRequest
++	if err := h.readRequestBody(r, &req); err != nil {
++		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
++		return err
++	}
++
++	bucketName, err := parseBucketNameFromARN(req.TableBucketARN)
++	if err != nil {
++		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
++		return err
++	}
++
++	bucketPath := GetTableBucketPath(bucketName)
++	var metadata tableBucketMetadata
++	var bucketPolicy string
++	var bucketTags map[string]string
++	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
++		if err != nil {
++			return err
++		}
++		if err := json.Unmarshal(data, &metadata); err != nil {
++			return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
++		}
++
++		policyData, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
++		if err == nil {
++			bucketPolicy = string(policyData)
++		} else if !errors.Is(err, ErrAttributeNotFound) {
++			return fmt.Errorf("failed to fetch bucket policy: %v", err)
++		}
++
++		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
++		if err != nil {
++			return err
++		}
++		return nil
++	})
++
++	if err != nil {
++		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrAttributeNotFound) {
++			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchBucket, fmt.Sprintf("table bucket %s not found", bucketName))
++		} else {
++			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to get table bucket: %v", err))
++		}
++		return err
++	}
++
++	principal := h.getAccountID(r)
++	identityActions := getIdentityActions(r)
++	bucketARN := req.TableBucketARN
++	if !CheckPermissionWithContext("GetTableBucketUsage", principal, accountIDFromARN(bucketARN), bucketPolicy, bucketARN, &PolicyContext{
++		TableBucketName: bucketName,
++		TableBucketTags: bucketTags,
++		IdentityActions: identityActions,
++		DefaultAllow:    h.defaultAllow,
++	}) {
++		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to get table bucket usage")
++		return NewAuthError("GetTableBucketUsage", principal, "not authorized to get table bucket usage")
++	}
++
++	namespaceCount := 0
++	tableCount := 0
++	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		stream, err := client.ListEntries(r.Context(), &filer_pb.ListEntriesRequest{
++			Directory: bucketPath,
++			Limit:     1000,
++		})
++		if err != nil {
++			return err
++		}
++		for {
++			entry, recvErr := stream.Recv()
++			if recvErr != nil {
++				if recvErr == io.EOF {
++					break
++				}
++				return recvErr
++			}
++			if entry.Entry == nil || !entry.Entry.IsDirectory {
++				continue
++			}
++			if strings.HasPrefix(entry.Entry.Name, ".") {
++				continue
++			}
++			namespaceCount++
++			tableStream, err := client.ListEntries(r.Context(), &filer_pb.ListEntriesRequest{
++				Directory: GetNamespacePath(bucketName, entry.Entry.Name),
++				Limit:     1000,
++			})
++			if err != nil {
++				continue
++			}
++			for {
++				tableEntry, tableErr := tableStream.Recv()
++				if tableErr != nil {
++					break
++				}
++				if tableEntry.Entry == nil || !tableEntry.Entry.IsDirectory {
++					continue
++				}
++				if _, ok := tableEntry.Entry.Extended[ExtendedKeyMetadata]; !ok {
++					continue
++				}
++				tableCount++
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to read table bucket usage: %v", err))
++		return err
++	}
++
++	h.writeJSON(w, http.StatusOK, &GetTableBucketUsageResponse{
++		TableBucketARN: bucketARN,
++		Name:           metadata.Name,
++		OwnerAccountID: metadata.OwnerAccountID,
++		NamespaceCount: namespaceCount,
++		TableCount:     tableCount,
++	})
++	return nil
++}
+diff --git a/weed/s3api/s3tables/handler_table_batch.go b/weed/s3api/s3tables/handler_table_batch.go
+new file mode 100644
+index 0000000..c945ef7
+--- /dev/null
++++ b/weed/s3api/s3tables/handler_table_batch.go
+@@ -0,0 +1,145 @@
++package s3tables
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++
++	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
++)
++
++// handleBatchDeleteTables deletes several tables in one request. Batch calls
++// are scoped to the table bucket of the first table in the request; the
++// remaining tables are removed with that same authorization decision so a
++// large delete does not re-read the bucket policy for every table.
++func (h *S3TablesHandler) handleBatchDeleteTables(w http.ResponseWriter, r *http.Request, filerClient FilerClient) error {
++	var req BatchDeleteTablesRequest
++	if err := h.readRequestBody(r, &req); err != nil {
++		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
++		return err
++	}
++	if len(req.Tables) == 0 {
++		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, "tables is required")
++		return fmt.Errorf("tables is required")
++	}
++
++	paths := make([]string, 0, len(req.Tables))
++	for _, tableARN := range req.Tables {
++		bucketName, namespace, tableName, err := parseTableFromARN(tableARN)
++		if err != nil {
++			h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
++			return err
++		}
++		paths = append(paths, GetTablePath(bucketName, namespace, tableName))
++	}
++
++	firstBucket, firstNamespace, firstName, err := parseTableFromARN(req.Tables[0])
++	if err != nil {
++		h.writeError(w, http.StatusBadRequest, ErrCodeInvalidRequest, err.Error())
++		return err
++	}
++
++	bucketPath := GetTableBucketPath(firstBucket)
++	var bucketMetadata tableBucketMetadata
++	var bucketPolicy string
++	var bucketTags map[string]string
++	var tableMetadata tableMetadataInternal
++	var tablePolicy string
++	var tableTags map[string]string
++	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		data, err := h.getExtendedAttribute(r.Context(), client, GetTablePath(firstBucket, firstNamespace, firstName), ExtendedKeyMetadata)
++		if err != nil {
++			return err
++		}
++		if err := json.Unmarshal(data, &tableMetadata); err != nil {
++			return fmt.Errorf("failed to unmarshal table metadata: %w", err)
++		}
++
++		policyData, err := h.getExtendedAttribute(r.Context(), client, GetTablePath(firstBucket, firstNamespace, firstName), ExtendedKeyPolicy)
++		if err == nil {
++			tablePolicy = string(policyData)
++		} else if !errors.Is(err, ErrAttributeNotFound) {
++			return fmt.Errorf("failed to fetch table policy: %v", err)
++		}
++		tableTags, err = h.readTags(r.Context(), client, GetTablePath(firstBucket, firstNamespace, firstName))
++		if err != nil {
++			return err
++		}
++
++		data, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
++		if err != nil {
++			return err
++		}
++		if err := json.Unmarshal(data, &bucketMetadata); err != nil {
++			return fmt.Errorf("failed to unmarshal bucket metadata: %w", err)
++		}
++
++		policyData, err = h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyPolicy)
++		if err == nil {
++			bucketPolicy = string(policyData)
++		} else if !errors.Is(err, ErrAttributeNotFound) {
++			return fmt.Errorf("failed to fetch bucket policy: %v", err)
++		}
++		bucketTags, err = h.readTags(r.Context(), client, bucketPath)
++		if err != nil {
++			return err
++		}
++		return nil
++	})
++
++	if err != nil {
++		if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, ErrAttributeNotFound) {
++			h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", firstName))
++		} else {
++			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to check tables: %v", err))
++		}
++		return err
++	}
++
++	principal := h.getAccountID(r)
++	identityActions := getIdentityActions(r)
++	tableARN := req.Tables[0]
++	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, firstBucket)
++	tableAllowed := CheckPermissionWithContext("DeleteTable", principal, tableMetadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
++		TableBucketName: firstBucket,
++		Namespace:       firstNamespace,
++		TableName:       firstName,
++		TableBucketTags: bucketTags,
++		ResourceTags:    tableTags,
++		IdentityActions: identityActions,
++		DefaultAllow:    h.defaultAllow,
++	})
++	bucketAllowed := CheckPermissionWithContext("DeleteTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++		TableBucketName: firstBucket,
++		Namespace:       firstNamespace,
++		TableName:       firstName,
++		TableBucketTags: bucketTags,
++		ResourceTags:    tableTags,
++		IdentityActions: identityActions,
++		DefaultAllow:    h.defaultAllow,
++	})
++	if !tableAllowed && !bucketAllowed {
++		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete tables")
++		return NewAuthError("BatchDeleteTables", principal, "not authorized to delete tables")
++	}
++
++	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		for _, tablePath := range paths {
++			if err := h.deleteDirectory(r.Context(), client, tablePath); err != nil {
++				if errors.Is(err, filer_pb.ErrNotFound) {
++					continue
++				}
++				return err
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to delete tables")
++		return err
++	}
++
++	h.writeJSON(w, http.StatusOK, nil)
++	return nil
++}
+diff --git a/weed/s3api/s3tables/types.go b/weed/s3api/s3tables/types.go
+index 05fb661..8a59748 100644
+--- a/weed/s3api/s3tables/types.go
++++ b/weed/s3api/s3tables/types.go
+@@ -34,6 +34,18 @@ type GetTableBucketResponse struct {
+ 	CreatedAt      time.Time `json:"createdAt"`
+ }
+ 
++type GetTableBucketUsageRequest struct {
++	TableBucketARN string `json:"tableBucketARN"`
++}
++
++type GetTableBucketUsageResponse struct {
++	TableBucketARN string `json:"tableBucketARN"`
++	Name           string `json:"name"`
++	OwnerAccountID string `json:"ownerAccountId"`
++	NamespaceCount int    `json:"namespaceCount"`
++	TableCount     int    `json:"tableCount"`
++}
++
+ type ListTableBucketsRequest struct {
+ 	Prefix            string `json:"prefix,omitempty"`
+ 	ContinuationToken string `json:"continuationToken,omitempty"`
+@@ -230,6 +242,10 @@ type DeleteTableRequest struct {
+ 	VersionToken   string   `json:"versionToken,omitempty"`
+ }
+ 
++type BatchDeleteTablesRequest struct {
++	Tables []string `json:"tables"`
++}
++
+ type UpdateTableRequest struct {
+ 	TableBucketARN   string         `json:"tableBucketARN"`
+ 	Namespace        []string       `json:"namespace"`

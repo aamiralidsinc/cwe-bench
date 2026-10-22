@@ -1,5 +1,8 @@
 # Task builder brief
 
+> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `builder/templates/` and follow `builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
+
+
 You turn ONE shortlisted candidate (a real security fix in a real open-source
 repository) into ONE Harbor-format security-fix task, and you prove with the
 gate script that it works. Work on that one candidate only.
@@ -125,12 +128,19 @@ Put these under `build/SLUG/checks/` and list them in the manifest:
   example, make a shared path helper throw on traversal. It must score 1.0. The
   gate report lists each security test's product imports
   (`security_test_product_imports`) so you know what to harden.
-- **Required `pass` patch, `"kind": "blind"`:** a fix written by a fresh agent
-  that sees only `instruction.md` and the repository, never the reference fix,
-  the tests or this build. It must score 1.0.
-  - Ask the same agent to name the vulnerable mechanisms. If it names an injected
-    sibling's mechanism from the instruction alone, the instruction leaks it.
-    Rewrite the instruction at the level of the security property.
+- **Required `pass` patch, `"kind": "blind"`:** a second complete fix, built
+  differently from the reference and written with everything in view (instruction,
+  repository, trap list, tests, reference fix, failing gate output). It must score
+  1.0. It is a soundness control: it shows the tests accept a correct fix that is
+  not the reference's exact code. It does NOT show that a solver can find the fix,
+  and it is never a fairness test. Finishing it by hand from the reference or the
+  failing tests is fine; "the control needed the reference or the tests" is never a
+  finding (user rule, 2026-10-20).
+  - Fairness is judged separately, after the trial, on two checks only: (1) the
+    instruction and the tests never contradict each other; (2) every tested sibling
+    is covered by a general rule the instruction states. For example, "any update to
+    row X requires the owner's permission" covers created_at, updated_at, every route
+    that updates the row, and creating it.
 - Both are warnings for tasks built before 2026-10-16. Set `"strict_gate": true`
   in the manifest of every new task, so the gate fails without them.
 
@@ -168,23 +178,26 @@ reasons:
 ### 3h. Defaults since 2026-10-16 (round-1 lessons; the gate enforces them)
 About half of round-1 agent time was voided by settings fixed only after trials had run. These are
 now defaults; do not change them per task.
-- **Offline.** Keep `[agent] network_mode = "allowlist"` with only the two model APIs (template).
+- **Offline.** `[agent]` and `[verifier]` are `network_mode = "no-network"`; NO allowlist in the task file (the model host is allowed at run time via `--allow-agent-host`). (template)
   `harness/run_trial.sh` also removes WebSearch/WebFetch. The gate fails a task without the allowlist.
 - **Agent killed before grading.** Keep the kill block at the top of the template `test.sh`. The
   gate fails a `test.sh` without it.
 - **Strict gate by default.** New manifests must not set `"strict_gate": false` (only the 19 round-1
   tasks do). Strict requires: the `hardening` and `blind` pass patches (3f), the wrong-fix catalogue
-  below, `build/SLUG/FAIRNESS.md`, and 3 identical oracle runs.
+  below, and 3 identical oracle runs. (`FAIRNESS.md` is not a gate requirement: see below.)
 - **Wrong-fix catalogue.** `manifest.wrong_fix_catalogue` names, for each class in
   `gate.py: WRONG_FIX_CLASSES`, the `checks/` patch (expect `security_fail` or `functional_fail`)
   that proves the tests catch it, or `"n/a: <why this class cannot occur here>"`. The classes:
   `refuse_all`, `crash_as_refusal`, `wrong_resource`, `one_role_or_direction`, `reads_only`,
   `check_after_adjustment`, `unlisted_route`, `malformed_identity`, `missing_authority`,
   `adjacent_api`. Round-1 audits found each of these only after trials (`research/round1-analysis/`).
-- **Pre-trial fairness review (`build/SLUG/FAIRNESS.md`).** A reviewer who did not write the tests
-  maps every test (file::name) to the sentence of `instruction.md` (or the standard expert
-  knowledge) that makes it fair, rates the risk, and lists every contract the tests need. Fix every
-  high risk before trials, and re-run the gate after any test change.
+- **Fairness review AFTER the trial (`build/SLUG/FAIRNESS.md`).** Not part of the build or the
+  gate (decision 2026-10-19/20): the post-trial fairness step writes it, and only for a task the
+  models failed 3/3. It checks two things only: (1) the instruction and the tests never contradict
+  each other; (2) every tested sibling is covered by a general rule the instruction states (e.g.
+  "any update to row X requires the owner's permission" covers created_at, updated_at, every route
+  that updates the row, and creating it). It maps every test (file::name) to that sentence (or the
+  standard expert knowledge), and the fixes it calls for are re-gated before the task ships.
 - **No leaked upstream tests.** The vulnerable commit must not be one that adds the advisory's
   regression tests (webob). Check `git log` between the vulnerable and fix commits.
 - **Keep every metadata spoiler out of what the agent sees.** Only `environment/` reaches the
@@ -242,8 +255,10 @@ have it):
   protection never existed). Where-type traps (another entry point, a planted copy) count only as
   extras and only under a general report (2026-10-19, `BETTER-PATTERNS.md` §5);
 - every trap must be realistic code a maintainer could have written, reachable through the real
-  entry point, covered by a stated invariant, and found by the blind fix (3f). A trap the blind
-  fix cannot find is unfair: remove it.
+  entry point, and covered by a general rule the instruction states (read literally, the rule
+  applies to the trap without pointing at it), with no test that contradicts the instruction.
+  Whether a solver or the blind control (3f) finds the trap unaided is not a fairness test: a trap
+  nobody finds is the goal, not a defect.
 
 ## Manifest (`build/SLUG/manifest.json`)
 

@@ -1,0 +1,40 @@
+#!/bin/bash
+# New-order validation for an already-built+gated task (single model, no Opus):
+#   fairness FIRST -> if NOT READY: fairfix -> fairness -> ... (<=MAX) -> once READY: trial BOTH.
+# Use for: MiMo-lane tasks and the DS-solved leakage re-check (a task that was "solved" only via a
+# leak will, after fairfix strips the leak, flip to a DeepSeek fail).
+cd "$HOME/cwe-bench" || exit 1
+S=$1; MAX=${2:-3}
+LOG=build/pipeline/vfresh_$S.log
+echo "=== validate_fresh $S $(date -u +%FT%TZ) ===" >> "$LOG"
+ready=no
+for r in $(seq 1 "$MAX"); do
+  mv "build/$S/FAIRNESS.md" "build/$S/FAIRNESS.md.vf$r" 2>/dev/null
+  ./drive.sh deepseek bash run_fairness.sh "$S" >> "build/$S/vfresh.nohup" 2>&1
+  v=$(python3 -c "t=open('build/$S/FAIRNESS.md').read().lower();print('NOTREADY' if 'not ready' in t else 'READY')" 2>/dev/null || echo ERR)
+  echo "[r$r] fairness=$v $(date -u +%T)" >> "$LOG"
+  if [ "$v" = "READY" ]; then ready=yes; break; fi
+  ./drive.sh deepseek bash run_fairfix.sh "$S" >> "build/$S/vfresh.nohup" 2>&1
+  echo "[r$r] fairfix exit=$(cat build/$S/fairfix-exit.txt 2>/dev/null)" >> "$LOG"
+done
+echo "[fairness-loop done ready=$ready] trialing both $(date -u +%T)" >> "$LOG"
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+for f in runs_deepseek.log runs_mimo.log trial_detail_deepseek.json trial_detail_mimo.json; do
+  [ -f "build/$S/$f" ] && mv "build/$S/$f" "build/$S/$f.vf-$ts"
+done
+rm -f "build/$S/.unsound"; touch "build/$S/.sound"
+python3 build/trial.py "$S" --models deepseek --no-verdict >> "build/$S/trial_deepseek.out" 2>&1 &
+p1=$!
+python3 build/trial.py "$S" --models mimo --no-verdict >> "build/$S/trial_mimo.out" 2>&1 &
+p2=$!
+wait $p1 $p2
+D=$(grep -oE "reward=[0-9.]+" "build/$S/runs_deepseek.log" 2>/dev/null | sed s/reward=// | paste -sd, -)
+M=$(grep -oE "reward=[0-9.]+" "build/$S/runs_mimo.log" 2>/dev/null | sed s/reward=// | paste -sd, -)
+dsv=$(echo "$D" | grep -q "1.0" && echo solve || echo fail)
+mmv=$(echo "$M" | grep -q "1.0" && echo solve || echo fail)
+if [ "$ready" = no ]; then R="CANNOT-VALIDATE (NOT READY after $MAX rounds)"
+elif [ "$dsv" = fail ] && [ "$mmv" = fail ]; then R="** BREAKER (fair) **"
+elif [ "$dsv" = solve ] && [ "$mmv" = solve ]; then R="both-solve (fair; candidate for HARDENING)"
+else R="one-sided ($( [ $dsv = fail ] && echo DeepSeek || echo MiMo )-only)"; fi
+echo "[final] D[$D] M[$M] => $R" >> "$LOG"
+echo "$R" > "build/$S/VFRESH_RESULT.txt"

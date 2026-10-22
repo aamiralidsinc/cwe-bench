@@ -1,0 +1,253 @@
+diff --git a/internal/mcp/handlers/memory.go b/internal/mcp/handlers/memory.go
+index ecba1b0..5b7dcf2 100644
+--- a/internal/mcp/handlers/memory.go
++++ b/internal/mcp/handlers/memory.go
+@@ -19,14 +19,14 @@ import (
+ func RegisterMemoryTool(s *server.MCPServer, getStore func() *storage.Store) {
+ 	s.AddTool(
+ 		mcp.NewTool("memory",
+-			mcp.WithDescription("Persistent memory operations. Use 'action' to specify: add, get, update, delete, list, promote, demote, cleanup, resolve."),
++			mcp.WithDescription("Persistent memory operations. Use 'action' to specify: add, get, update, delete, list, promote, demote, cleanup, resolve, snapshot."),
+ 			mcp.WithString("action",
+ 				mcp.Required(),
+ 				mcp.Description("Action to perform"),
+-				mcp.Enum("add", "get", "update", "delete", "list", "promote", "demote", "cleanup", "resolve"),
++				mcp.Enum("add", "get", "update", "delete", "list", "promote", "demote", "cleanup", "resolve", "snapshot"),
+ 			),
+ 			mcp.WithString("id",
+-				mcp.Description("Memory entry ID (required for get, update, delete, promote, demote)"),
++				mcp.Description("Memory entry ID (required for get, update, delete, promote, demote, snapshot)"),
+ 			),
+ 			mcp.WithString("content",
+ 				mcp.Description("Memory content in markdown (required for add)"),
+@@ -99,6 +99,8 @@ func RegisterMemoryTool(s *server.MCPServer, getStore func() *storage.Store) {
+ 				return handleMemoryAdd(getStore, req)
+ 			case "get":
+ 				return handleMemoryGet(getStore, req)
++			case "snapshot":
++				return handleMemorySnapshot(getStore, req)
+ 			case "update":
+ 				return handleMemoryUpdate(getStore, req)
+ 			case "delete":
+@@ -195,6 +197,33 @@ func handleMemoryGet(getStore func() *storage.Store, req mcp.CallToolRequest) (*
+ 	return mcp.NewToolResultText(string(out)), nil
+ }
+ 
++// handleMemorySnapshot returns the copy of a memory entry kept from before its
++// last update.
++func handleMemorySnapshot(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
++	store := getStore()
++	if store == nil {
++		return noProjectError()
++	}
++
++	id, err := req.RequireString("id")
++	if err != nil {
++		return errResult("id is required")
++	}
++
++	layer, _ := stringArg(req.GetArguments(), "layer")
++	if layer == "" {
++		layer = models.MemoryLayerProject
++	}
++
++	entry, err := store.Memory.ReadSnapshot(id, layer)
++	if err != nil {
++		return errNotFound("memory snapshot", err)
++	}
++
++	out, _ := json.MarshalIndent(entry, "", "  ")
++	return mcp.NewToolResultText(string(out)), nil
++}
++
+ func handleMemoryList(getStore func() *storage.Store, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+ 	store := getStore()
+ 	if store == nil {
+diff --git a/internal/server/routes/docs.go b/internal/server/routes/docs.go
+index 3c077d2..0fb1ad0 100644
+--- a/internal/server/routes/docs.go
++++ b/internal/server/routes/docs.go
+@@ -3,6 +3,7 @@ package routes
+ import (
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"time"
+@@ -86,6 +87,10 @@ func (dr *DocRoutes) Register(r chi.Router) {
+ // a doc-history action suffix, otherwise it falls through to the regular get handler.
+ func (dr *DocRoutes) getOrHistory(w http.ResponseWriter, r *http.Request) {
+ 	raw := decodedDocWildcard(r)
++	if path, ok := splitDocSourcePath(raw); ok {
++		dr.source(w, path)
++		return
++	}
+ 	if path, revision, ok := splitDocHistoryDiffPath(raw); ok {
+ 		dr.diff(w, r, path, revision)
+ 		return
+@@ -177,6 +182,30 @@ func splitDocRestorePath(raw string) (string, bool) {
+ 	return path, path != ""
+ }
+ 
++func splitDocSourcePath(raw string) (string, bool) {
++	if !strings.HasSuffix(raw, "/source") {
++		return "", false
++	}
++	path := cleanDocPath(strings.TrimSuffix(raw, "/source"))
++	return path, path != ""
++}
++
++// source returns the raw markdown file for a document, frontmatter included,
++// for download and export.
++//
++// GET /api/docs/*/source
++func (dr *DocRoutes) source(w http.ResponseWriter, path string) {
++	absPath := filepath.Join(dr.getStore().Root, "docs", filepath.FromSlash(path)+".md")
++	data, err := os.ReadFile(absPath)
++	if err != nil {
++		respondError(w, http.StatusNotFound, err.Error())
++		return
++	}
++	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
++	w.WriteHeader(http.StatusOK)
++	_, _ = w.Write(data)
++}
++
+ // get retrieves a single doc by path.
+ //
+ // GET /api/docs/*
+diff --git a/internal/server/routes/templates.go b/internal/server/routes/templates.go
+index 5226357..c5f85c3 100644
+--- a/internal/server/routes/templates.go
++++ b/internal/server/routes/templates.go
+@@ -107,23 +107,23 @@ type templateListItem struct {
+ 
+ // templateFile is the UI-friendly shape for template actions/files.
+ type templateFile struct {
+-	Type        string `json:"type"`
+-	Template    string `json:"template,omitempty"`
+-	Destination string `json:"destination,omitempty"`
+-	Path        string `json:"path,omitempty"`
+-	Source      string `json:"source,omitempty"`
+-	GlobPattern string `json:"globPattern,omitempty"`
+-	SkipIfExists bool  `json:"skipIfExists,omitempty"`
+-	When        string `json:"when,omitempty"`
++	Type         string `json:"type"`
++	Template     string `json:"template,omitempty"`
++	Destination  string `json:"destination,omitempty"`
++	Path         string `json:"path,omitempty"`
++	Source       string `json:"source,omitempty"`
++	GlobPattern  string `json:"globPattern,omitempty"`
++	SkipIfExists bool   `json:"skipIfExists,omitempty"`
++	When         string `json:"when,omitempty"`
+ }
+ 
+ // uiPrompt is the UI-friendly shape for template prompts.
+ type uiPrompt struct {
+-	Name     string          `json:"name"`
+-	Message  string          `json:"message"`
+-	Type     string          `json:"type"`
+-	Required bool            `json:"required"`
+-	Default  string          `json:"default,omitempty"`
++	Name     string           `json:"name"`
++	Message  string           `json:"message"`
++	Type     string           `json:"type"`
++	Required bool             `json:"required"`
++	Default  string           `json:"default,omitempty"`
+ 	Choices  []uiPromptChoice `json:"choices,omitempty"`
+ }
+ 
+@@ -276,8 +276,9 @@ type previewTemplateRequest struct {
+ 
+ // previewFileResult is a single file preview entry.
+ type previewFileResult struct {
+-	Path    string `json:"path"`
+-	Content string `json:"content"`
++	Path            string `json:"path"`
++	Content         string `json:"content"`
++	ExistingContent string `json:"existingContent,omitempty"`
+ }
+ 
+ // preview renders a template file with variables without writing to disk.
+@@ -337,9 +338,19 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 	}
+ 
++	// Show the current contents of the destination so the UI can display the
++	// change that running the template would make.
++	existingContent := ""
++	if destPath != "" {
++		existingPath := filepath.Join(filepath.Dir(tr.getStore().Root), filepath.FromSlash(destPath))
++		if data, readErr := os.ReadFile(existingPath); readErr == nil {
++			existingContent = string(data)
++		}
++	}
++
+ 	respondJSON(w, http.StatusOK, map[string]interface{}{
+ 		"files": []previewFileResult{
+-			{Path: destPath, Content: rendered},
++			{Path: destPath, Content: rendered, ExistingContent: existingContent},
+ 		},
+ 	})
+ }
+diff --git a/internal/storage/memory_store.go b/internal/storage/memory_store.go
+index d5f53e2..92284f1 100644
+--- a/internal/storage/memory_store.go
++++ b/internal/storage/memory_store.go
+@@ -268,6 +268,9 @@ func (ms *MemoryStore) Update(entry *models.MemoryEntry) error {
+ 	if err := models.ValidateLegacyDecisionMemoryUpdate(existing, entry); err != nil {
+ 		return err
+ 	}
++	if err := ms.writeSnapshot(existing); err != nil {
++		return err
++	}
+ 	return ms.writeExisting(entry, existing, true)
+ }
+ 
+@@ -640,3 +643,45 @@ func renderMemory(entry *models.MemoryEntry) string {
+ 
+ 	return b.String()
+ }
++
++// snapshotDir returns the directory that keeps the copies of memory entries
++// taken before they are overwritten.
++func (ms *MemoryStore) snapshotDir(layer string) (string, error) {
++	dir, err := ms.dirForLayer(layer)
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(dir, ".snapshots"), nil
++}
++
++// writeSnapshot keeps a copy of an entry as it was before an update so a
++// mistaken edit can be inspected afterwards.
++func (ms *MemoryStore) writeSnapshot(entry *models.MemoryEntry) error {
++	if entry == nil || entry.ID == "" {
++		return nil
++	}
++	dir, err := ms.snapshotDir(entry.Layer)
++	if err != nil {
++		return err
++	}
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		return fmt.Errorf("create memory snapshot dir: %w", err)
++	}
++	return atomicWrite(filepath.Join(dir, models.MemoryFileName(entry.ID)), []byte(renderMemory(entry)))
++}
++
++// ReadSnapshot returns the copy of a memory entry stored by the last update.
++func (ms *MemoryStore) ReadSnapshot(id, layer string) (*models.MemoryEntry, error) {
++	if !models.ValidMemoryLayer(layer) {
++		return nil, fmt.Errorf("invalid memory layer: %q", layer)
++	}
++	dir, err := ms.snapshotDir(layer)
++	if err != nil {
++		return nil, err
++	}
++	absPath := filepath.Join(dir, models.MemoryFileName(id))
++	if _, err := os.Stat(absPath); err != nil {
++		return nil, fmt.Errorf("memory snapshot %q not found in %s layer", id, layer)
++	}
++	return ms.parseFile(absPath, layer)
++}

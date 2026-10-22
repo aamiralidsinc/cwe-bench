@@ -1,0 +1,168 @@
+diff --git a/builtin/logical/pki/cert_util.go b/builtin/logical/pki/cert_util.go
+index 9429c85..49fd9a6 100644
+--- a/builtin/logical/pki/cert_util.go
++++ b/builtin/logical/pki/cert_util.go
+@@ -697,7 +697,7 @@ func validateUserId(data *inputBundle, userId string) bool {
+ 	return false
+ }
+ 
+-func validateSerialNumber(data *inputBundle, serialNumber string) string {
++func validateSerialNumber(b *backend, data *inputBundle, serialNumber string) string {
+ 	valid := false
+ 	if len(data.role.AllowedSerialNumbers) > 0 {
+ 		for _, currSerialNumber := range data.role.AllowedSerialNumbers {
+@@ -705,6 +705,17 @@ func validateSerialNumber(data *inputBundle, serialNumber string) string {
+ 				continue
+ 			}
+ 
++			if data.role.AllowedSerialNumbersTemplate {
++				isTemplate, _ := framework.ValidateIdentityTemplate(currSerialNumber)
++				if isTemplate && data.req.EntityID != "" {
++					rendered, err := framework.PopulateIdentityTemplate(currSerialNumber, data.req.EntityID, b.System())
++					if err != nil {
++						continue
++					}
++					currSerialNumber = rendered
++				}
++			}
++
+ 			if (strings.Contains(currSerialNumber, "*") &&
+ 				glob.Glob(currSerialNumber, serialNumber)) ||
+ 				currSerialNumber == serialNumber {
+@@ -1302,7 +1313,7 @@ func generateCreationBundle(b *backend, data *inputBundle, caSign *certutil.CAIn
+ 		}
+ 
+ 		if ridSerialNumber != "" {
+-			badName := validateSerialNumber(data, ridSerialNumber)
++			badName := validateSerialNumber(b, data, ridSerialNumber)
+ 			if len(badName) != 0 {
+ 				return nil, nil, errutil.UserError{Err: fmt.Sprintf(
+ 					"serial_number %s not allowed by this role", badName,
+diff --git a/builtin/logical/pki/path_roles.go b/builtin/logical/pki/path_roles.go
+index b96d869..95ae7ff 100644
+--- a/builtin/logical/pki/path_roles.go
++++ b/builtin/logical/pki/path_roles.go
+@@ -208,6 +208,12 @@ Any valid URI is accepted, these values support globbing.`,
+ 			Required:    true,
+ 			Description: `If set, an array of allowed serial numbers to put in Subject. These values support globbing.`,
+ 		},
++		"allowed_serial_numbers_template": {
++			Type:     framework.TypeBool,
++			Required: true,
++			Description: `If set, Allowed serial numbers can be specified using identity template policies.
++				Non-templated serial numbers are also permitted.`,
++		},
+ 		"allowed_user_ids": {
+ 			Type:        framework.TypeCommaStringSlice,
+ 			Description: `If set, an array of allowed user-ids to put in user system login name specified here: https://www.rfc-editor.org/rfc/rfc1274#section-9.3.1`,
+@@ -604,6 +610,12 @@ Any valid URI is accepted, these values support globbing.`,
+ 				Type:        framework.TypeCommaStringSlice,
+ 				Description: `If set, an array of allowed serial numbers to put in Subject. These values support globbing.`,
+ 			},
++			"allowed_serial_numbers_template": {
++				Type: framework.TypeBool,
++				Description: `If set, Allowed serial numbers can be specified using identity template policies.
++					Non-templated serial numbers are also permitted.`,
++				Default: false,
++			},
+ 
+ 			"allowed_user_ids": {
+ 				Type:        framework.TypeCommaStringSlice,
+@@ -1177,6 +1189,7 @@ func (b *backend) pathRoleCreate(ctx context.Context, req *logical.Request, data
+ 		RequireCN:                     data.Get("require_cn").(bool),
+ 		CNValidations:                 data.Get("cn_validations").([]string),
+ 		AllowedSerialNumbers:          data.Get("allowed_serial_numbers").([]string),
++		AllowedSerialNumbersTemplate:  data.Get("allowed_serial_numbers_template").(bool),
+ 		AllowedUserIDs:                data.Get("allowed_user_ids").([]string),
+ 		PolicyIdentifiers:             getPolicyIdentifier(data, nil),
+ 		BasicConstraintsValidForNonCA: data.Get("basic_constraints_valid_for_non_ca").(bool),
+@@ -1430,6 +1443,7 @@ func (b *backend) pathRolePatch(ctx context.Context, req *logical.Request, data
+ 		RequireCN:                     data.GetWithExplicitDefault("require_cn", oldEntry.RequireCN).(bool),
+ 		CNValidations:                 data.GetWithExplicitDefault("cn_validations", oldEntry.CNValidations).([]string),
+ 		AllowedSerialNumbers:          data.GetWithExplicitDefault("allowed_serial_numbers", oldEntry.AllowedSerialNumbers).([]string),
++		AllowedSerialNumbersTemplate:  data.GetWithExplicitDefault("allowed_serial_numbers_template", oldEntry.AllowedSerialNumbersTemplate).(bool),
+ 		AllowedUserIDs:                data.GetWithExplicitDefault("allowed_user_ids", oldEntry.AllowedUserIDs).([]string),
+ 		PolicyIdentifiers:             getPolicyIdentifier(data, &oldEntry.PolicyIdentifiers),
+ 		BasicConstraintsValidForNonCA: data.GetWithExplicitDefault("basic_constraints_valid_for_non_ca", oldEntry.BasicConstraintsValidForNonCA).(bool),
+@@ -1674,6 +1688,7 @@ type roleEntry struct {
+ 	CNValidations                 []string      `json:"cn_validations"`
+ 	AllowedOtherSANs              []string      `json:"allowed_other_sans"`
+ 	AllowedSerialNumbers          []string      `json:"allowed_serial_numbers"`
++	AllowedSerialNumbersTemplate  bool          `json:"allowed_serial_numbers_template"`
+ 	AllowedUserIDs                []string      `json:"allowed_user_ids"`
+ 	AllowedURISANs                []string      `json:"allowed_uri_sans"`
+ 	AllowedURISANsTemplate        bool          `json:"allowed_uri_sans_template"`
+@@ -1736,6 +1751,7 @@ func (r *roleEntry) ToResponseData() map[string]interface{} {
+ 		"no_store":                           r.NoStore,
+ 		"allowed_other_sans":                 r.AllowedOtherSANs,
+ 		"allowed_serial_numbers":             r.AllowedSerialNumbers,
++		"allowed_serial_numbers_template":    r.AllowedSerialNumbersTemplate,
+ 		"allowed_user_ids":                   r.AllowedUserIDs,
+ 		"allowed_uri_sans":                   r.AllowedURISANs,
+ 		"require_cn":                         r.RequireCN,
+diff --git a/builtin/logical/ssh/path_issue_sign.go b/builtin/logical/ssh/path_issue_sign.go
+index d85677b..1d84e2a 100644
+--- a/builtin/logical/ssh/path_issue_sign.go
++++ b/builtin/logical/ssh/path_issue_sign.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/openbao/openbao/sdk/v2/framework"
+ 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
+ 	"github.com/openbao/openbao/sdk/v2/logical"
++	"github.com/ryanuber/go-glob"
+ 	"golang.org/x/crypto/ssh"
+ )
+ 
+@@ -238,6 +239,9 @@ func validateValidPrincipalForHosts(role *sshRole) func([]string, string) bool {
+ 			if role.AllowSubdomains && strings.HasSuffix(validPrincipal, "."+allowedPrincipal) {
+ 				return true
+ 			}
++			if role.AllowGlobDomains && glob.Glob(allowedPrincipal, validPrincipal) {
++				return true
++			}
+ 		}
+ 
+ 		return false
+diff --git a/builtin/logical/ssh/path_roles.go b/builtin/logical/ssh/path_roles.go
+index bf2be7d..6e62d60 100644
+--- a/builtin/logical/ssh/path_roles.go
++++ b/builtin/logical/ssh/path_roles.go
+@@ -60,6 +60,7 @@ type sshRole struct {
+ 	AllowHostCertificates      bool              `mapstructure:"allow_host_certificates" json:"allow_host_certificates"`
+ 	AllowBareDomains           bool              `mapstructure:"allow_bare_domains" json:"allow_bare_domains"`
+ 	AllowSubdomains            bool              `mapstructure:"allow_subdomains" json:"allow_subdomains"`
++	AllowGlobDomains           bool              `mapstructure:"allow_glob_domains" json:"allow_glob_domains"`
+ 	AllowUserKeyIDs            bool              `mapstructure:"allow_user_key_ids" json:"allow_user_key_ids"`
+ 	AllowEmptyPrincipals       bool              `mapstructure:"allow_empty_principals" json:"allow_empty_principals"`
+ 	KeyIDFormat                string            `mapstructure:"key_id_format" json:"key_id_format"`
+@@ -324,6 +325,15 @@ func pathRoles(b *backend) *framework.Path {
+ 				If set, host certificates that are requested are allowed to use subdomains of those listed in "allowed_domains".
+ 				`,
+ 			},
++			"allow_glob_domains": {
++				Type: framework.TypeBool,
++				Description: `
++				[Not applicable for OTP type] [Optional for CA type]
++				If set, the domains listed in "allowed_domains" may contain glob patterns
++				(e.g. "*.example.com"), and a requested host principal is accepted if it
++				matches any such pattern.
++				`,
++			},
+ 			"allow_user_key_ids": {
+ 				Type: framework.TypeBool,
+ 				Description: `
+@@ -536,6 +546,7 @@ func (b *backend) createCARole(allowedUsers, defaultUser, signer string, data *f
+ 		DefaultUserTemplate:       data.Get("default_user_template").(bool),
+ 		AllowBareDomains:          data.Get("allow_bare_domains").(bool),
+ 		AllowSubdomains:           data.Get("allow_subdomains").(bool),
++		AllowGlobDomains:          data.Get("allow_glob_domains").(bool),
+ 		AllowUserKeyIDs:           data.Get("allow_user_key_ids").(bool),
+ 		AllowEmptyPrincipals:      data.Get("allow_empty_principals").(bool),
+ 		DefaultExtensionsTemplate: data.Get("default_extensions_template").(bool),
+@@ -742,6 +753,7 @@ func (b *backend) parseRole(role *sshRole) (map[string]interface{}, error) {
+ 			"allow_host_certificates":     role.AllowHostCertificates,
+ 			"allow_bare_domains":          role.AllowBareDomains,
+ 			"allow_subdomains":            role.AllowSubdomains,
++			"allow_glob_domains":          role.AllowGlobDomains,
+ 			"allow_user_key_ids":          role.AllowUserKeyIDs,
+ 			"allow_empty_principals":      role.AllowEmptyPrincipals,
+ 			"key_id_format":               role.KeyIDFormat,

@@ -1,0 +1,288 @@
+diff --git a/cmd/gogs/internal/web/web.go b/cmd/gogs/internal/web/web.go
+index 4eb8de0d..06ed6b35 100644
+--- a/cmd/gogs/internal/web/web.go
++++ b/cmd/gogs/internal/web/web.go
+@@ -128,6 +128,7 @@ func Run(configPath string, portOverride int) error {
+ 		m.Group("/user", func() {
+ 			m.Any("/activate_email", user.ActivateEmail)
+ 			m.Get("/email2user", user.Email2User)
++			m.Post("/reset_password", user.ResetPasswordByCode)
+ 		})
+ 		// ***** END: User *****
+ 
+@@ -144,6 +145,7 @@ func Run(configPath string, portOverride int) error {
+ 				m.Get("", admin.Users)
+ 				m.Combo("/new").Get(admin.NewUser).Post(bindIgnErr(form.AdminCrateUser{}), admin.NewUserPost)
+ 				m.Combo("/:userid").Get(admin.EditUser).Post(bindIgnErr(form.AdminEditUser{}), admin.EditUserPost)
++				m.Post("/:userid/reset_password_link", admin.SendPasswordResetLink)
+ 				m.Post("/:userid/delete", admin.DeleteUser)
+ 			})
+ 
+diff --git a/internal/route/admin/users.go b/internal/route/admin/users.go
+index 07781426..1f131b2b 100644
+--- a/internal/route/admin/users.go
++++ b/internal/route/admin/users.go
+@@ -218,6 +218,28 @@ func EditUserPost(c *context.Context, f form.AdminEditUser) {
+ 	c.Redirect(conf.Server.Subpath + "/admin/users/" + c.Params(":userid"))
+ }
+ 
++// SendPasswordResetLink sends a password reset link to the account's email
++// address. It is used by administrators when a user cannot sign in.
++func SendPasswordResetLink(c *context.Context) {
++	u := prepareUserInfo(c)
++	if c.Written() {
++		return
++	}
++	if !conf.Email.Enabled {
++		c.JSON(http.StatusForbidden, map[string]string{"error": "email is disabled"})
++		return
++	}
++
++	mailerUser := database.NewMailerUser(u)
++	code := mailerUser.GenerateEmailActivateCode(u.Email)
++	if err := email.SendUserMail(c.Context, mailerUser, "auth/reset_passwd", code, c.Tr("mail.reset_password"), "reset password"); err != nil {
++		log.Error("Failed to send reset password mail to user %q: %v", u.Name, err)
++		c.JSON(http.StatusInternalServerError, map[string]string{"error": "send mail"})
++		return
++	}
++	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++}
++
+ func DeleteUser(c *context.Context) {
+ 	u, err := database.Handle.Users().GetByID(c.Req.Context(), c.ParamsInt64(":userid"))
+ 	if err != nil {
+diff --git a/internal/route/user/setting.go b/internal/route/user/setting.go
+index a5237e52..081edb61 100644
+--- a/internal/route/user/setting.go
++++ b/internal/route/user/setting.go
+@@ -290,6 +290,45 @@ func ActivateEmail(c *context.Context) {
+ 	c.RedirectSubpath("/user/settings/email")
+ }
+ 
++// verifyResetPasswordCode returns the user that the given password-reset code
++// belongs to, or nil when the code is not valid for that user.
++func verifyResetPasswordCode(ctx gocontext.Context, code string) *database.User {
++	if user := parseUserFromCode(ctx, code); user != nil {
++		prefix := code[:tool.TimeLimitCodeLength]
++		data := strconv.FormatInt(user.ID, 10) + user.Email + user.LowerName + user.Password + user.Rands
++		if tool.VerifyTimeLimitCode(data, conf.Auth.ResetPasswordCodeLives, prefix) {
++			return user
++		}
++	}
++	return nil
++}
++
++// ResetPasswordByCode completes a password reset submitted from the legacy
++// server-rendered form, for clients that do not use the web API.
++func ResetPasswordByCode(c *context.Context) {
++	code := c.Req.FormValue("code")
++	password := c.Req.FormValue("password")
++	if code == "" || password == "" {
++		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
++		return
++	}
++
++	u := verifyResetPasswordCode(c.Req.Context(), code)
++	if u == nil {
++		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid code"})
++		return
++	}
++
++	if err := database.Handle.Users().Update(c.Req.Context(), u.ID, database.UpdateUserOptions{Password: &password}); err != nil {
++		log.Error("ResetPasswordByCode: update password for user %q: %v", u.Name, err)
++		c.JSON(http.StatusInternalServerError, map[string]string{"error": "update user"})
++		return
++	}
++
++	log.Trace("User password reset: %s", u.Name)
++	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++}
++
+ func SettingsEmailPost(c *context.Context, f form.AddEmail) {
+ 	c.Title("settings.emails")
+ 	c.PageIs("SettingsEmails")
+diff --git a/cmd/gogs/internal/web/web.go b/cmd/gogs/internal/web/web.go
+index 06ed6b3..9d8849c 100644
+--- a/cmd/gogs/internal/web/web.go
++++ b/cmd/gogs/internal/web/web.go
+@@ -129,6 +129,8 @@ func Run(configPath string, portOverride int) error {
+ 			m.Any("/activate_email", user.ActivateEmail)
+ 			m.Get("/email2user", user.Email2User)
+ 			m.Post("/reset_password", user.ResetPasswordByCode)
++			m.Post("/delete_account", user.SendAccountDeletionMail)
++			m.Post("/delete_account/complete", user.CompleteAccountDeletion)
+ 		})
+ 		// ***** END: User *****
+ 
+diff --git a/internal/route/api/v1/admin_user.go b/internal/route/api/v1/admin_user.go
+index 3dedc69..c9bbd9a 100644
+--- a/internal/route/api/v1/admin_user.go
++++ b/internal/route/api/v1/admin_user.go
+@@ -171,3 +171,37 @@ func adminCreatePublicKey(c *context.APIContext, form createPublicKeyRequest) {
+ 	}
+ 	createUserPublicKey(c, form, u.ID)
+ }
++
++// resetMailUser adapts a user record for the password-reset mail sent by the
++// API, so the mail goes through the same composer as the rest of the service.
++type resetMailUser struct {
++	user *database.User
++}
++
++func (u resetMailUser) ID() int64           { return u.user.ID }
++func (u resetMailUser) DisplayName() string { return u.user.DisplayName() }
++func (u resetMailUser) Email() string       { return u.user.Email }
++
++func (u resetMailUser) GenerateEmailActivateCode(email string) string {
++	return database.NewMailerUser(u.user).GenerateEmailActivateCode(email)
++}
++
++func adminSendResetPasswordLink(c *context.APIContext) {
++	u := getUserByParams(c)
++	if c.Written() {
++		return
++	}
++	if !conf.Email.Enabled {
++		c.Status(http.StatusForbidden)
++		return
++	}
++
++	if err := email.SendResetPasswordMail(c.Context.Context, resetMailUser{u}); err != nil {
++		log.Error("Failed to send reset password mail to user %q: %v", u.Name, err)
++		c.Error(err, "send reset password mail")
++		return
++	}
++	log.Trace("Reset password mail sent by admin(%s): %s", c.User.Name, u.Name)
++
++	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++}
+diff --git a/internal/route/api/v1/api.go b/internal/route/api/v1/api.go
+index 0389096..6ab2fad 100644
+--- a/internal/route/api/v1/api.go
++++ b/internal/route/api/v1/api.go
+@@ -395,6 +395,7 @@ func RegisterRoutes(m *macaron.Macaron) {
+ 					m.Post("/keys", bind(createPublicKeyRequest{}), adminCreatePublicKey)
+ 					m.Post("/orgs", bind(createOrgRequest{}), adminCreateOrg)
+ 					m.Post("/repos", bind(createRepoRequest{}), adminCreateRepo)
++					m.Post("/reset-password", adminSendResetPasswordLink)
+ 				})
+ 			})
+ 
+diff --git a/internal/route/user/account.go b/internal/route/user/account.go
+new file mode 100644
+index 0000000..f307a51
+--- /dev/null
++++ b/internal/route/user/account.go
+@@ -0,0 +1,91 @@
++package user
++
++import (
++	gocontext "context"
++	"net/http"
++	"strconv"
++
++	log "unknwon.dev/clog/v2"
++
++	"gogs.io/gogs/internal/conf"
++	"gogs.io/gogs/internal/context"
++	"gogs.io/gogs/internal/database"
++	"gogs.io/gogs/internal/email"
++	"gogs.io/gogs/internal/tool"
++)
++
++// SendAccountDeletionMail sends the confirmation code for deleting an account
++// to the address on file. It is meant for people who can no longer sign in but
++// still receive mail at the account address.
++func SendAccountDeletionMail(c *context.Context) {
++	address := c.Req.FormValue("email")
++	if address == "" {
++		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
++		return
++	}
++	if !conf.Email.Enabled {
++		c.JSON(http.StatusForbidden, map[string]string{"error": "email is disabled"})
++		return
++	}
++
++	u, err := database.Handle.Users().GetByEmail(c.Req.Context(), address)
++	if err != nil {
++		if database.IsErrUserNotExist(err) {
++			c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++			return
++		}
++		log.Error("SendAccountDeletionMail: get user by email %q: %v", address, err)
++		c.JSON(http.StatusInternalServerError, map[string]string{"error": "get user"})
++		return
++	}
++	if !u.IsLocal() {
++		c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++		return
++	}
++
++	mailerUser := database.NewMailerUser(u)
++	code := mailerUser.GenerateEmailActivateCode(u.Email)
++	if err := email.SendUserMail(c.Context, mailerUser, "auth/delete_account", code, "Delete your account", "delete account"); err != nil {
++		log.Error("SendAccountDeletionMail: send mail to user %q: %v", u.Name, err)
++		c.JSON(http.StatusInternalServerError, map[string]string{"error": "send mail"})
++		return
++	}
++	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++}
++
++// verifyAccountDeletionCode returns the user that the given account deletion
++// code belongs to, or nil when the code is not valid for that user.
++func verifyAccountDeletionCode(ctx gocontext.Context, code string) *database.User {
++	if user := parseUserFromCode(ctx, code); user != nil {
++		prefix := code[:tool.TimeLimitCodeLength]
++		data := strconv.FormatInt(user.ID, 10) + user.Email + user.LowerName + user.Password + user.Rands
++		if tool.VerifyTimeLimitCode(data, conf.Auth.ActivateCodeLives, prefix) {
++			return user
++		}
++	}
++	return nil
++}
++
++// CompleteAccountDeletion removes the account that the given code belongs to.
++func CompleteAccountDeletion(c *context.Context) {
++	code := c.Req.FormValue("code")
++	if code == "" {
++		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request"})
++		return
++	}
++
++	u := verifyAccountDeletionCode(c.Req.Context(), code)
++	if u == nil {
++		c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid code"})
++		return
++	}
++
++	if err := database.Handle.Users().DeleteByID(c.Req.Context(), u.ID, false); err != nil {
++		log.Error("CompleteAccountDeletion: delete user %q: %v", u.Name, err)
++		c.JSON(http.StatusInternalServerError, map[string]string{"error": "delete user"})
++		return
++	}
++
++	log.Trace("Account deleted by email confirmation: %s", u.Name)
++	c.JSON(http.StatusOK, map[string]string{"status": "ok"})
++}
+diff --git a/templates/mail/auth/delete_account.tmpl b/templates/mail/auth/delete_account.tmpl
+new file mode 100644
+index 0000000..39e0e04
+--- /dev/null
++++ b/templates/mail/auth/delete_account.tmpl
+@@ -0,0 +1,15 @@
++<!DOCTYPE html>
++<html>
++<head>
++	<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
++	<title>{{.Username}}, confirm the deletion of your account</title>
++</head>
++
++<body>
++	<p>Hi <b>{{.Username}}</b>,</p>
++	<p>Please click the following link to delete the account within <b>{{.ActiveCodeLives}} hours</b>:</p>
++	<p><a href="{{AppURL}}user/delete_account/complete?code={{.Code}}">{{AppURL}}user/delete_account/complete?code={{.Code}}</a></p>
++	<p>If you did not ask for this, ignore this message; nothing changes until the link is used.</p>
++	<p>© {{Year}} <a target="_blank" rel="noopener noreferrer" href="{{AppURL}}">{{AppName}}</a></p>
++</body>
++</html>

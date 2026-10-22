@@ -23,9 +23,45 @@ STDOUT_SIGNS = [
 ]
 
 
+def agent_cut(trial: Path):
+    """Why the agent's session was cut short before it finished, or None.
+
+    A graded non-solve of a cut session measures unfinished code, not the model: hermes-agent-ds
+    r1 (ApiRateLimitError, "exit 137") and suneditor-xss-inj mimo r2 (NonZeroAgentExitCodeError,
+    exit 137) were counted as model failures until 2026-10-20. A genuine agent TIMEOUT is not a
+    cut: by the user's rule it is a model failure, so AgentTimeoutError is left alone here."""
+    try:
+        res = json.loads((trial / "result.json").read_text())
+    except (OSError, ValueError):
+        res = {}
+    exc = res.get("exception_info") or {}
+    kind = str(exc.get("exception_type") or "")
+    if kind == "AgentTimeoutError":
+        return None
+    msg = str(exc.get("exception_message") or "")
+    if kind and re.search(r"Agent|Api|RateLimit", kind):
+        return f"{kind}: {msg}"
+    log = trial / "agent" / "claude-code.txt"
+    text = log.read_text(errors="replace") if log.is_file() else ""
+    if '"terminal_reason":"api_error"' in text[-20000:]:
+        return "session ended by an API/network error (terminal_reason api_error)"
+    if re.search(r"exit(ed)?( code)?:? 137\b|Killed\b", msg):
+        return f"agent process was killed ({kind or 'no exception type'}): {msg}"
+    if log.is_file() and '"type":"result"' not in text:
+        return "agent log has no result event: the session never finished (killed or crashed)"
+    return None
+
+
 def setup_flags(trial: Path, verifier: Path = None) -> list:
     """verifier: the grading to inspect (default <trial>/verifier; a regrade passes its own)."""
     flags = []
+    cut = agent_cut(trial)
+    if cut:
+        # The flag is one line (it lands in TSV ledgers); the full message and traceback stay in
+        # <trial>/result.json exception_info (python3 pipeline/evidence.py <trial> prints them).
+        short = " ".join(cut.split())
+        flags.append(f"agent session cut short, not finished: {short[:300]}{'...' if len(short) > 300 else ''}"
+                     f" (full: {trial}/result.json)")
     verifier = verifier or trial / "verifier"
     out = verifier / "test-stdout.txt"
     text = out.read_text(errors="replace") if out.is_file() else ""
@@ -37,7 +73,11 @@ def setup_flags(trial: Path, verifier: Path = None) -> list:
     if not res.is_file():
         flags.append("no verifier/results.json (tests did not report)")
         return flags
-    data = json.loads(res.read_text())
+    try:
+        data = json.loads(res.read_text())
+    except ValueError:
+        flags.append("verifier/results.json is unreadable (score.py broke)")
+        return flags
     for group in ("security", "functional"):
         g = data.get(group) or {}
         if not g:

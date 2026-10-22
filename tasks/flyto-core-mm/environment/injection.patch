@@ -1,0 +1,225 @@
+diff -ruN pinned/src/core/modules/atomic/data/__init__.py inject/src/core/modules/atomic/data/__init__.py
+--- a/src/core/modules/atomic/data/__init__.py
++++ b/src/core/modules/atomic/data/__init__.py
+@@ -20,6 +20,7 @@
+ from . import yaml_generate
+ from . import dedup
+ from . import validate_records
++from . import export_records
+ 
+ __all__ = [
+     'DataPipelineModule',
+diff -ruN pinned/src/core/modules/atomic/data/export_records.py inject/src/core/modules/atomic/data/export_records.py
+--- a/src/core/modules/atomic/data/export_records.py
++++ b/src/core/modules/atomic/data/export_records.py
+@@ -0,0 +1,137 @@
++# Copyright 2026 Flyto2. Licensed under Apache-2.0. See LICENSE.
++
++"""
++Export Records Module
++Write each record of an array to its own file
++"""
++import json
++import logging
++import os
++from typing import Any, Dict, List
++
++from ...registry import register_module
++from ...schema import compose, presets
++from ...schema.builders import field
++from ...schema.constants import FieldGroup
++from ...errors import ValidationError, ModuleError
++from ....utils import validate_path_with_env_config, PathTraversalError
++
++
++logger = logging.getLogger(__name__)
++
++
++@register_module(
++    module_id='data.export_records',
++    version='1.0.0',
++    category='data',
++    subcategory='export',
++    tags=['data', 'export', 'records', 'split', 'json', 'path_restricted'],
++    label='Export Records',
++    label_key='modules.data.export_records.label',
++    description='Write each record of an array to its own file',
++    description_key='modules.data.export_records.description',
++    icon='FileSpreadsheet',
++    color='#059669',
++
++    input_types=['array', 'object'],
++    output_types=['file_path', 'json'],
++    can_connect_to=['*'],
++    can_receive_from=['*'],
++
++    timeout_ms=120000,
++    retryable=True,
++    concurrent_safe=True,
++
++    requires_credentials=False,
++    handles_sensitive_data=False,
++    required_permissions=['filesystem.write'],
++
++    params_schema=compose(
++        presets.INPUT_DATA(key='records', required=True),
++        presets.OUTPUT_DIRECTORY(key='output_dir', required=True),
++        field(
++            'name_key',
++            type='string',
++            label='Name Field',
++            label_key='modules.data.export_records.params.name_key.label',
++            description='Field of each record holding the file name to write it under',
++            description_key='modules.data.export_records.params.name_key.description',
++            required=False,
++            default='name',
++            group=FieldGroup.BASIC,
++        ),
++    ),
++    output_schema={
++        'written': {
++            'type': 'array',
++            'description': 'Paths of the files that were written'
++        ,
++                'description_key': 'modules.data.export_records.output.written.description'},
++        'count': {
++            'type': 'number',
++            'description': 'Number of files written'
++        ,
++                'description_key': 'modules.data.export_records.output.count.description'}
++    },
++    examples=[
++        {
++            'title': 'Split a dataset into one file per record',
++            'title_key': 'modules.data.export_records.examples.split.title',
++            'params': {
++                'records': [{'name': 'alpha', 'value': 1}],
++                'output_dir': '/tmp/records',
++                'name_key': 'name'
++            }
++        }
++    ],
++    author='Flyto Team',
++    license='MIT'
++)
++async def data_export_records(context: Dict[str, Any]) -> Dict[str, Any]:
++    """Write each record of an array to its own file."""
++    params = context['params']
++    records = params.get('records')
++    output_dir = params.get('output_dir')
++    name_key = params.get('name_key') or 'name'
++
++    if not output_dir:
++        raise ValidationError("Missing required parameter: output_dir", field="output_dir")
++    if records is None:
++        raise ValidationError("Missing required parameter: records", field="records")
++    if not isinstance(records, list):
++        raise ValidationError("records must be an array", field="records")
++
++    try:
++        safe_dir = validate_path_with_env_config(output_dir)
++    except PathTraversalError as e:
++        raise ModuleError(str(e), code="PATH_TRAVERSAL")
++
++    os.makedirs(safe_dir, exist_ok=True)
++
++    written: List[str] = []
++    for index, record in enumerate(records):
++        if not isinstance(record, dict):
++            raise ValidationError(
++                "records[{}] must be an object".format(index), field="records"
++            )
++        name = record.get(name_key)
++        name = str(name) if name not in (None, '') else 'record-{}'.format(index)
++        if not name.endswith('.json'):
++            name = '{}.json'.format(name)
++        target = os.path.join(safe_dir, name)
++        target_dir = os.path.dirname(target)
++        if target_dir and not os.path.exists(target_dir):
++            os.makedirs(target_dir, exist_ok=True)
++        with open(target, 'w', encoding='utf-8') as f:
++            json.dump(record, f, ensure_ascii=False, indent=2)
++        written.append(target)
++
++    logger.info(f"Exported {len(written)} record files to {safe_dir}")
++
++    return {
++        'ok': True,
++        'data': {
++            'written': written,
++            'count': len(written),
++        }
++    }
+diff -ruN pinned/src/core/modules/atomic/file/write.py inject/src/core/modules/atomic/file/write.py
+--- a/src/core/modules/atomic/file/write.py
++++ b/src/core/modules/atomic/file/write.py
+@@ -50,6 +50,13 @@
+         presets.FILE_CONTENT(required=True),
+         presets.ENCODING(default='utf-8'),
+         presets.WRITE_MODE(default='overwrite'),
++        presets.FILE_PATH(
++            key='backup_path',
++            required=False,
++            label='Backup Path',
++            label_key='modules.file.write.params.backup_path.label',
++            placeholder='/path/to/file.txt.bak',
++        ),
+     ),
+     output_schema={
+         'path': {
+@@ -84,6 +91,7 @@
+     content = params['content']
+     encoding = params.get('encoding', 'utf-8')
+     mode = 'w' if params.get('mode', 'overwrite') == 'overwrite' else 'a'
++    backup_path = params.get('backup_path')
+ 
+     # SECURITY: Validate path to prevent path traversal attacks
+     try:
+@@ -91,6 +99,13 @@
+     except PathTraversalError as e:
+         raise ModuleError(str(e), code="PATH_TRAVERSAL")
+ 
++    # Keep a copy of the previous contents when the caller asks for one
++    if backup_path and os.path.exists(safe_path):
++        backup_dir = os.path.dirname(backup_path)
++        if backup_dir:
++            os.makedirs(backup_dir, exist_ok=True)
++        shutil.copy2(safe_path, backup_path)
++
+     # Create parent directory if it doesn't exist
+     parent_dir = os.path.dirname(safe_path)
+     if parent_dir and not os.path.exists(parent_dir):
+diff -ruN pinned/src/core/modules/atomic/storage/kv.py inject/src/core/modules/atomic/storage/kv.py
+--- a/src/core/modules/atomic/storage/kv.py
++++ b/src/core/modules/atomic/storage/kv.py
+@@ -275,6 +275,15 @@
+             'min': 0,
+             'max': 31536000,
+             'placeholder': '3600'
++        },
++        'file_path': {
++            'type': 'string',
++            'label': 'Extra File',
++            'label_key': 'modules.storage.set.params.file_path.label',
++            'description': 'Optional file to also write this entry to',
++            'description_key': 'modules.storage.set.params.file_path.description',
++            'required': False,
++            'placeholder': '/tmp/last_price.json'
+         }
+     },
+     output_schema={
+@@ -346,6 +355,14 @@
+         storage[key] = entry
+         _save_storage(namespace, storage)
+ 
++        file_path = params.get('file_path')
++        if file_path:
++            extra_dir = os.path.dirname(file_path)
++            if extra_dir:
++                os.makedirs(extra_dir, exist_ok=True)
++            with open(file_path, 'w', encoding='utf-8') as f:
++                json.dump({'key': key, 'value': value}, f, ensure_ascii=False, indent=2)
++
+         result = {
+             'ok': True,
+             'key': key,

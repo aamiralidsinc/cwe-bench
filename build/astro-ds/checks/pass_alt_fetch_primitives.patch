@@ -1,0 +1,350 @@
+diff --git a/packages/astro/src/actions/handler.ts b/packages/astro/src/actions/handler.ts
+index 50d0255..cd3a39d 100644
+--- a/packages/astro/src/actions/handler.ts
++++ b/packages/astro/src/actions/handler.ts
+@@ -1,4 +1,8 @@
+ import type { APIContext } from '../types/public/context.js';
++import {
++	createCrossOriginForbiddenResponse,
++	isForbiddenCrossOriginRequest,
++} from '../core/app/origin-check.js';
+ import { PipelineFeatures } from '../core/base-pipeline.js';
+ import type { FetchState } from '../core/fetch/fetch-state.js';
+ import { getActionContext, serializeActionResult } from './runtime/server.js';
+@@ -41,6 +45,17 @@ export class ActionHandler {
+ 			return undefined;
+ 		}
+ 
++		// The origin check normally runs in the origin-check middleware, but the
++		// action dispatch can run before that middleware depending on how the
++		// pipeline is composed. Apply the same check here so it holds regardless
++		// of ordering.
++		if (
++			state.pipeline.manifest.checkOrigin &&
++			isForbiddenCrossOriginRequest(apiContext.request, apiContext.url, apiContext.isPrerendered)
++		) {
++			return Promise.resolve(createCrossOriginForbiddenResponse(apiContext.request));
++		}
++
+ 		return this.#executeAction(action, setActionResult);
+ 	}
+ 
+diff --git a/packages/astro/src/core/app/middlewares.ts b/packages/astro/src/core/app/middlewares.ts
+deleted file mode 100644
+index cea4534..0000000
+--- a/packages/astro/src/core/app/middlewares.ts
++++ /dev/null
+@@ -1,66 +0,0 @@
+-import type { MiddlewareHandler } from '../../types/public/common.js';
+-import { defineMiddleware } from '../middleware/defineMiddleware.js';
+-
+-/**
+- * Content types that can be passed when sending a request via a form
+- *
+- * https://developer.mozilla.org/en-US/docs/Web/API/HTMLFormElement/enctype
+- * @private
+- */
+-const FORM_CONTENT_TYPES = [
+-	'application/x-www-form-urlencoded',
+-	'multipart/form-data',
+-	'text/plain',
+-];
+-
+-// Note: TRACE is unsupported by undici/Node.js
+-const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+-
+-/**
+- * Returns a middleware function in charge to check the `origin` header.
+- *
+- * @private
+- */
+-export function createOriginCheckMiddleware(): MiddlewareHandler {
+-	return defineMiddleware((context, next) => {
+-		const { request, url, isPrerendered } = context;
+-		// Prerendered pages should be excluded
+-		if (isPrerendered) {
+-			return next();
+-		}
+-		// Safe methods don't require origin check
+-		if (SAFE_METHODS.includes(request.method)) {
+-			return next();
+-		}
+-		const isSameOrigin = request.headers.get('origin') === url.origin;
+-
+-		const hasContentType = request.headers.has('content-type');
+-		if (hasContentType) {
+-			const formLikeHeader = hasFormLikeHeader(request.headers.get('content-type'));
+-			if (formLikeHeader && !isSameOrigin) {
+-				return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
+-					status: 403,
+-				});
+-			}
+-		} else {
+-			if (!isSameOrigin) {
+-				return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
+-					status: 403,
+-				});
+-			}
+-		}
+-
+-		return next();
+-	});
+-}
+-
+-export function hasFormLikeHeader(contentType: string | null): boolean {
+-	if (contentType) {
+-		for (const FORM_CONTENT_TYPE of FORM_CONTENT_TYPES) {
+-			if (contentType.toLowerCase().includes(FORM_CONTENT_TYPE)) {
+-				return true;
+-			}
+-		}
+-	}
+-	return false;
+-}
+diff --git a/packages/astro/src/core/app/origin-check.ts b/packages/astro/src/core/app/origin-check.ts
+new file mode 100644
+index 0000000..e0950e3
+--- /dev/null
++++ b/packages/astro/src/core/app/origin-check.ts
+@@ -0,0 +1,94 @@
++/**
++ * Home of the `security.checkOrigin` logic. Exposes the shared predicate and
++ * response used to reject cross-site submissions, plus the middleware factory
++ * that installs the check in the request pipeline. Consumers (the pipeline
++ * middleware and the Astro Actions dispatch) import from here so the check
++ * stays consistent regardless of where it runs.
++ */
++import type { MiddlewareHandler } from '../../types/public/common.js';
++import { defineMiddleware } from '../middleware/defineMiddleware.js';
++
++/**
++ * Content types that can be passed when sending a request via a form
++ *
++ * https://developer.mozilla.org/en-US/docs/Web/API/HTMLFormElement/enctype
++ * @private
++ */
++const FORM_CONTENT_TYPES = [
++	'application/x-www-form-urlencoded',
++	'multipart/form-data',
++	'text/plain',
++];
++
++// Note: TRACE is unsupported by undici/Node.js
++const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
++
++/**
++ * Determines whether a request should be rejected because it is a cross-site
++ * submission for a route rendered on demand.
++ *
++ * This encapsulates the shared logic used by both the origin-check middleware
++ * and the Astro Actions dispatch, so the check is applied consistently
++ * regardless of where the request is handled.
++ *
++ * @private
++ */
++export function isForbiddenCrossOriginRequest(
++	request: Request,
++	url: URL,
++	isPrerendered: boolean,
++): boolean {
++	// Prerendered pages should be excluded
++	if (isPrerendered) {
++		return false;
++	}
++	// Safe methods don't require origin check
++	if (SAFE_METHODS.includes(request.method)) {
++		return false;
++	}
++	const isSameOrigin = request.headers.get('origin') === url.origin;
++
++	const hasContentType = request.headers.has('content-type');
++	if (hasContentType) {
++		const formLikeHeader = hasFormLikeHeader(request.headers.get('content-type'));
++		return formLikeHeader && !isSameOrigin;
++	}
++	return !isSameOrigin;
++}
++
++/**
++ * Builds the 403 response returned when a cross-site submission is rejected.
++ *
++ * @private
++ */
++export function createCrossOriginForbiddenResponse(request: Request): Response {
++	return new Response(`Cross-site ${request.method} form submissions are forbidden`, {
++		status: 403,
++	});
++}
++
++/**
++ * Returns a middleware function in charge to check the `origin` header.
++ *
++ * @private
++ */
++export function createOriginCheckMiddleware(): MiddlewareHandler {
++	return defineMiddleware((context, next) => {
++		const { request, url, isPrerendered } = context;
++		if (isForbiddenCrossOriginRequest(request, url, isPrerendered)) {
++			return createCrossOriginForbiddenResponse(request);
++		}
++		return next();
++	});
++}
++
++export function hasFormLikeHeader(contentType: string | null): boolean {
++	if (contentType) {
++		for (const FORM_CONTENT_TYPE of FORM_CONTENT_TYPES) {
++			if (contentType.toLowerCase().includes(FORM_CONTENT_TYPE)) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
+diff --git a/packages/astro/src/core/base-pipeline.ts b/packages/astro/src/core/base-pipeline.ts
+index 973508a..b0234dc 100644
+--- a/packages/astro/src/core/base-pipeline.ts
++++ b/packages/astro/src/core/base-pipeline.ts
+@@ -11,7 +11,7 @@ import type {
+ 	SSRManifest,
+ 	SSRResult,
+ } from '../types/public/internal.js';
+-import { createOriginCheckMiddleware } from './app/middlewares.js';
++import { createOriginCheckMiddleware } from './app/origin-check.js';
+ import type { ServerIslandMappings } from './app/types.js';
+ import type { SinglePageBuiltModule } from './build/types.js';
+ import { ActionNotFoundError } from './errors/errors-data.js';
+diff --git a/packages/astro/src/core/fetch/index.ts b/packages/astro/src/core/fetch/index.ts
+index 1a125c2..eb170dd 100644
+--- a/packages/astro/src/core/fetch/index.ts
++++ b/packages/astro/src/core/fetch/index.ts
+@@ -14,6 +14,10 @@ import type { RewritePayload } from '../../types/public/common.js';
+ import { FetchState as BaseFetchState } from './fetch-state.js';
+ import type { AstroFetchState } from './fetch-state.js';
+ export type { AstroFetchState };
++import {
++	createCrossOriginForbiddenResponse,
++	isForbiddenCrossOriginRequest,
++} from '../app/origin-check.js';
+ import { CacheHandler } from '../cache/handler.js';
+ import { appSymbol } from '../constants.js';
+ import { I18n } from '../i18n/handler.js';
+@@ -28,6 +32,19 @@ import { provideSession } from '../session/handler.js';
+ import { TrailingSlashHandler } from '../routing/trailing-slash-handler.js';
+ import { RewriteHandler } from '../rewrites/rewrite-handler.js';
+ 
++function crossOriginRefusal(state: FetchState): Response | undefined {
++	if (!state.routeData) return undefined;
++	const app = getApp(state.request);
++	const ctx = state.getAPIContext();
++	if (
++		app.pipeline.manifest.checkOrigin &&
++		isForbiddenCrossOriginRequest(ctx.request, ctx.url, ctx.isPrerendered)
++	) {
++		return createCrossOriginForbiddenResponse(ctx.request);
++	}
++	return undefined;
++}
++
+ function getApp(request: Request): BaseApp<Pipeline> {
+ 	const app = Reflect.get(request, appSymbol) as BaseApp<Pipeline> | undefined;
+ 	if (!app) {
+@@ -106,6 +123,8 @@ const pagesHandlers = new WeakMap<BaseApp<Pipeline>, PagesHandler>();
+  * render the 500 error page.
+  */
+ export function pages(state: FetchState): Promise<Response> {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = pagesHandlers.get(app);
+ 	if (!handler) {
+@@ -123,6 +142,8 @@ const endpointsHandlers = new WeakMap<BaseApp<Pipeline>, EndpointsHandler>();
+  * a host that serves pages itself but mounts Astro's API routes.
+  */
+ export function endpoints(state: FetchState): Promise<Response> {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = endpointsHandlers.get(app);
+ 	if (!handler) {
+@@ -139,6 +160,8 @@ const partialsHandlers = new WeakMap<BaseApp<Pipeline>, PartialHandler>();
+  * endpoint routes and unknown paths return a 404.
+  */
+ export function partials(state: FetchState): Promise<Response> {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = partialsHandlers.get(app);
+ 	if (!handler) {
+@@ -156,6 +179,8 @@ const fragmentHandlers = new WeakMap<BaseApp<Pipeline>, FragmentHandler>();
+  * unknown paths return a 404.
+  */
+ export function fragments(state: FetchState): Promise<Response> {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = fragmentHandlers.get(app);
+ 	if (!handler) {
+@@ -173,6 +198,8 @@ const rewriteHandlers = new WeakMap<BaseApp<Pipeline>, RewriteHandler>();
+  * dispatches them itself.
+  */
+ export function rewrite(state: FetchState, payload: RewritePayload): Promise<Response> {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = rewriteHandlers.get(app);
+ 	if (!handler) {
+@@ -217,6 +244,8 @@ const actionHandlers = new WeakMap<BaseApp<Pipeline>, ActionHandler>();
+  * the render context if needed.
+  */
+ export function actions(state: FetchState): Promise<Response | undefined> | undefined {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = actionHandlers.get(app);
+ 	if (!handler) {
+@@ -234,6 +263,8 @@ const formActionHandlers = new WeakMap<BaseApp<Pipeline>, FormActionHandler>();
+  * requests are left to the caller.
+  */
+ export function formActions(state: FetchState): Promise<Response | undefined> | undefined {
++	const refusal = crossOriginRefusal(state);
++	if (refusal) return Promise.resolve(refusal);
+ 	const app = getApp(state.request);
+ 	let handler = formActionHandlers.get(app);
+ 	if (!handler) {
+diff --git a/packages/astro/src/core/pages/handler.ts b/packages/astro/src/core/pages/handler.ts
+index 855822b..62239f8 100644
+--- a/packages/astro/src/core/pages/handler.ts
++++ b/packages/astro/src/core/pages/handler.ts
+@@ -5,6 +5,10 @@ import type { BaseApp } from '../app/base.js';
+ import type { FetchState } from '../fetch/fetch-state.js';
+ import type { Pipeline } from '../base-pipeline.js';
+ import { ASTRO_ERROR_HEADER } from '../constants.js';
++import {
++	createCrossOriginForbiddenResponse,
++	isForbiddenCrossOriginRequest,
++} from '../app/origin-check.js';
+ import { getCookiesFromResponse } from '../cookies/response.js';
+ 
+ // Shared empty-slots object so we don't allocate `{}` on every render for
+@@ -116,8 +120,19 @@ export class PagesHandler {
+ 		if (!state.routeData) {
+ 			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
+ 		}
++		const ctx = state.getAPIContext();
++		// The origin check normally runs in the origin-check middleware, but a
++		// composable pipeline can dispatch here without running `middleware()`
++		// first (or at all). Apply the same check so it holds regardless of how
++		// the pipeline is composed.
++		if (
++			this.#pipeline.manifest.checkOrigin &&
++			isForbiddenCrossOriginRequest(ctx.request, ctx.url, ctx.isPrerendered)
++		) {
++			return createCrossOriginForbiddenResponse(ctx.request);
++		}
+ 		try {
+-			return await this.handle(state, state.getAPIContext());
++			return await this.handle(state, ctx);
+ 		} catch (err: any) {
+ 			// The header marker can't carry the error object, so render the
+ 			// 500 page directly to preserve `error` and the logged stack.

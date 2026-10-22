@@ -1,0 +1,257 @@
+diff --git a/src/mcp_atlassian/jira/issues.py b/src/mcp_atlassian/jira/issues.py
+index e04d36a..3da7369 100644
+--- a/src/mcp_atlassian/jira/issues.py
++++ b/src/mcp_atlassian/jira/issues.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++import os
+ import time
+ from collections import defaultdict
+ from typing import Any
+@@ -640,6 +641,11 @@ class IssuesMixin(
+                     "Provide issue_type like 'Task', 'Story', or 'Bug'."
+                 )
+ 
++            # Pull attachments out of kwargs before field processing so they are
++            # not mistaken for a Jira field. They are uploaded after the issue is
++            # created (the issue key does not exist yet at this point).
++            attachment_paths = kwargs.pop("attachments", None)
++
+             # Handle Epic and Subtask issue type names across different languages
+             actual_issue_id = None
+             if self._is_epic_issue_type(issue_type) and issue_type.lower() == "epic":
+@@ -764,13 +770,55 @@ class IssuesMixin(
+                             "Continuing with the original Epic that was successfully created"
+                         )
+ 
++            # Upload any attachments supplied at creation time.
++            attachment_results = None
++            if attachment_paths:
++                attachment_results = []
++                for file_path in attachment_paths:
++                    try:
++                        if not os.path.isabs(file_path):
++                            file_path = os.path.abspath(file_path)
++                        if not os.path.exists(file_path):
++                            logger.error(f"Attachment file not found: {file_path}")
++                            attachment_results.append(
++                                {
++                                    "filename": os.path.basename(file_path),
++                                    "success": False,
++                                    "error": "File not found",
++                                }
++                            )
++                            continue
++                        self.jira.add_attachment(
++                            issue_key=issue_key, filename=file_path
++                        )
++                        attachment_results.append(
++                            {
++                                "filename": os.path.basename(file_path),
++                                "success": True,
++                            }
++                        )
++                    except Exception as attach_error:
++                        logger.error(
++                            f"Error uploading attachment to {issue_key}: {attach_error}"
++                        )
++                        attachment_results.append(
++                            {
++                                "filename": os.path.basename(file_path),
++                                "success": False,
++                                "error": str(attach_error),
++                            }
++                        )
++
+             # Get the full issue data and convert to JiraIssue model
+             issue_data = self.jira.get_issue(issue_key)
+             if not isinstance(issue_data, dict):
+                 msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
+                 logger.error(msg)
+                 raise TypeError(msg)
+-            return JiraIssue.from_api_response(issue_data)
++            issue = JiraIssue.from_api_response(issue_data)
++            if attachment_results is not None:
++                issue.custom_fields["attachment_results"] = attachment_results
++            return issue
+ 
+         except Exception as e:
+             self._handle_create_issue_error(e, issue_type)
+diff --git a/src/mcp_atlassian/servers/confluence.py b/src/mcp_atlassian/servers/confluence.py
+index 3e78b79..728d5a4 100644
+--- a/src/mcp_atlassian/servers/confluence.py
++++ b/src/mcp_atlassian/servers/confluence.py
+@@ -1239,7 +1239,23 @@ async def add_comment(
+     page_id: Annotated[
+         str, Field(description="The ID of the page to add a comment to")
+     ],
+-    body: Annotated[str, Field(description="The comment content in Markdown format")],
++    body: Annotated[
++        str | None,
++        Field(
++            description="The comment content in Markdown format",
++            default=None,
++        ),
++    ] = None,
++    body_file: Annotated[
++        str | None,
++        Field(
++            description=(
++                "(Optional) Filesystem path to read the comment body from "
++                "(UTF-8). Mutually exclusive with 'body'."
++            ),
++            default=None,
++        ),
++    ] = None,
+ ) -> str:
+     """Add a comment to a Confluence page.
+ 
+@@ -1247,6 +1263,7 @@ async def add_comment(
+         ctx: The FastMCP context.
+         page_id: The ID of the page to add a comment to.
+         body: The comment content in Markdown format.
++        body_file: Filesystem path to read the comment body from (UTF-8).
+ 
+     Returns:
+         JSON string representing the created comment.
+@@ -1255,6 +1272,15 @@ async def add_comment(
+         ValueError: If in read-only mode or Confluence client is unavailable.
+     """
+     confluence_fetcher = await get_confluence_fetcher(ctx)
++    if body is not None and body_file:
++        raise ValueError("Provide either 'body' or 'body_file', not both.")
++    if body_file:
++        comment_path = Path(body_file).expanduser()
++        if not comment_path.is_file():
++            raise ValueError(
++                f"body_file does not exist or is not a regular file: {comment_path}"
++            )
++        body = comment_path.read_text(encoding="utf-8")
+     try:
+         comment = confluence_fetcher.add_comment(page_id=page_id, content=body)
+         if comment:
+diff --git a/src/mcp_atlassian/servers/jira.py b/src/mcp_atlassian/servers/jira.py
+index 7d40151..7dfcc49 100644
+--- a/src/mcp_atlassian/servers/jira.py
++++ b/src/mcp_atlassian/servers/jira.py
+@@ -4,6 +4,7 @@ import asyncio
+ import base64
+ import json
+ import logging
++from pathlib import Path
+ from typing import Annotated, Any
+ 
+ from fastmcp import Context, FastMCP
+@@ -168,6 +169,45 @@ def _parse_additional_fields(
+     raise ValueError("additional_fields must be a dictionary or JSON string.")
+ 
+ 
++def _resolve_issue_description(
++    description: str | None, description_file: str | None
++) -> str | None:
++    """Resolve an issue description from either an inline string or a file path.
++
++    ``description_file`` lets MCP clients hand off a large description via the
++    filesystem instead of marshalling it as a tool-call argument (the same
++    convenience Confluence page bodies offer). At most one of ``description`` /
++    ``description_file`` may be supplied.
++
++    Args:
++        description: Inline description text (Markdown).
++        description_file: Filesystem path to read the description body from
++            (UTF-8).
++
++    Returns:
++        The resolved description, or ``None`` when neither is provided.
++
++    Raises:
++        ValueError: If both arguments are supplied, or if the file does not
++            exist / is not a regular file.
++    """
++    has_desc = description is not None and description != ""
++    has_file = description_file is not None and description_file != ""
++    if has_desc and has_file:
++        raise ValueError(
++            "Provide either 'description' or 'description_file', not both."
++        )
++    if has_desc:
++        return description
++    if not has_file:
++        return description
++    path = Path(description_file).expanduser()
++    if not path.is_file():
++        msg = f"description_file does not exist or is not a regular file: {path}"
++        raise ValueError(msg)
++    return path.read_text(encoding="utf-8")
++
++
+ @jira_mcp.tool(
+     tags={"jira", "read", "toolset:jira_users"},
+     annotations={"title": "Get User Profile", "readOnlyHint": True},
+@@ -1589,6 +1629,16 @@ async def create_issue(
+         str | None,
+         Field(description="Issue description in Markdown format", default=None),
+     ] = None,
++    description_file: Annotated[
++        str | None,
++        Field(
++            description=(
++                "(Optional) Filesystem path to read the issue description from "
++                "(UTF-8). Mutually exclusive with 'description'."
++            ),
++            default=None,
++        ),
++    ] = None,
+     components: Annotated[
+         str | None,
+         Field(
+@@ -1596,6 +1646,16 @@ async def create_issue(
+             default=None,
+         ),
+     ] = None,
++    attachments: Annotated[
++        str | None,
++        Field(
++            description=(
++                "(Optional) JSON string array or comma-separated list of file paths to attach to the new issue. "
++                "Example: '/path/to/file1.txt,/path/to/file2.txt' or ['/path/to/file1.txt','/path/to/file2.txt']"
++            ),
++            default=None,
++        ),
++    ] = None,
+     additional_fields: Annotated[
+         str | None,
+         Field(
+@@ -1638,7 +1698,30 @@ async def create_issue(
+             comp.strip() for comp in components.split(",") if comp.strip()
+         ]
+ 
++    description = _resolve_issue_description(description, description_file)
++
++    # Parse attachments (JSON array string or comma-separated list of paths)
++    attachment_paths = []
++    if attachments:
++        if isinstance(attachments, str):
++            try:
++                parsed = json.loads(attachments)
++                if isinstance(parsed, list):
++                    attachment_paths = [str(p) for p in parsed]
++                else:
++                    raise ValueError("attachments JSON string must be an array.")
++            except json.JSONDecodeError:
++                attachment_paths = [
++                    p.strip() for p in attachments.split(",") if p.strip()
++                ]
++        else:
++            raise ValueError(
++                "attachments must be a JSON array string or comma-separated string."
++            )
++
+     extra_fields = _parse_additional_fields(additional_fields)
++    if attachment_paths:
++        extra_fields["attachments"] = attachment_paths
+ 
+     issue = jira.create_issue(
+         project_key=project_key,

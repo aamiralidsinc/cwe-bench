@@ -18,7 +18,7 @@ Checks, in order (it stops at the first failing group):
            strict_gate is ON unless the manifest sets "strict_gate": false (only
            the 19 round-1 tasks do). Strict adds: hardening + blind pass patches,
            a wrong-fix catalogue entry for every class in WRONG_FIX_CLASSES,
-           build/<slug>/FAIRNESS.md (pre-trial fairness review), and 3 oracle runs.
+           and 3 oracle runs. (FAIRNESS.md is written after the trial, not gated.)
   nop      untouched vulnerable code: every security test FAILS, every
            functional test PASSES
   oracle   reference fix, run twice (3x under strict_gate): reward 1.0 and identical results
@@ -27,8 +27,24 @@ Checks, in order (it stops at the first failing group):
              functional_fail  at least one functional test fails
              pass             reward 1.0 (an independent correct fix)
 
-The result is written to build/<slug>/gate_report.json. Exit code 0 = passed.
+The result is written to build/<slug>/gate_report.json (gate_report.partial.json with --only).
 Decisions here are made by scripts only; no model judgement is involved.
+
+Every failure is classified, because confusing the kinds is what kept marking sound tasks
+unsound (and retrying real failures as "flakes") until 2026-10-20:
+  task      the task itself is wrong; deterministic, retrying cannot help      exit 1
+  infra     Docker / Harbor / host trouble; says nothing about the task; retry exit 2
+  internal  the gate itself crashed (a bug here); neither of the above         exit 3
+The report's top-level "verdict" is pass / task / infra / internal, and the failing stage is
+always written into "stages" with ok=false, its "kind" and its "error", so a caller never has
+to guess from a missing key. Failures that name failing tests carry "evidence": the first
+error messages from the tests' JUnit XML (a compile error reads very differently from an
+assertion).
+
+Every failure also writes a FULL evidence file, build/<slug>/evidence/<UTC>-gate-<stage>.txt
+(+ .json; pipeline/evidence.py): the exception's class, complete message and traceback (Harbor's
+exception_traceback included), every failing test's complete output, the verifier stdout, Harbor's
+stdout/stderr and the raw artifact paths. The stage record names it in "evidence_file".
 """
 import argparse
 import json
@@ -38,6 +54,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
@@ -73,12 +91,17 @@ except ModuleNotFoundError:  # 3.9/3.10 host without tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 JOBS = Path.home() / ".tb-graders" / "cwe" / "gate-jobs"
+sys.path.insert(0, str(ROOT / "pipeline"))
+sys.path.insert(0, str(ROOT / "builder"))  # so sibling imports resolve under `python3 -I`
+import evidence as ev  # noqa: E402  (full error evidence: pipeline/evidence.py)
+import conformance_check  # noqa: E402  (Frontier-SWE delivery-format enforcement; builder/ on path for -I)
 REQUIRED = [
     "instruction.md",
     "task.toml",
     "environment/Dockerfile",
     "solution/solve.sh",
     "solution/fix.patch",
+    "tests/Dockerfile",
     "tests/test.sh",
     "tests/score.py",
 ]
@@ -102,12 +125,92 @@ WRONG_FIX_CLASSES = {
     "missing_authority": "fail-open when the authority returns no secret/role",
     "adjacent_api": "a shared-helper fix that changes a sibling API's stated behaviour",
 }
-# Infrastructure errors worth one retry (Docker name lookups are flaky here).
+# Infrastructure errors worth one immediate in-place retry (Docker name lookups are flaky here).
 RETRYABLE = ("NetworkConnectionError", "Could not resolve", "ENOTFOUND", "TLS handshake")
+# Known infrastructure signatures, seen on the VM, and the label the report gives them. Any
+# exception Harbor records for a trial is infrastructure (the trial did not run to a result);
+# the label only says which kind, so a person can tell a load flake from a broken Dockerfile.
+INFRA_SIGNATURES = [
+    (r"network \S+ not found", "docker network vanished between create and attach"),
+    (r"context deadline exceeded|Client\.Timeout|i/o timeout", "docker/compose timeout under load"),
+    (r"only one connection allowed", "buildkit session collision"),
+    (r"Cannot connect to the Docker daemon|error during connect", "docker daemon unreachable"),
+    (r"no space left on device", "disk full"),
+    (r"NetworkConnectionError|Could not resolve|ENOTFOUND|TLS handshake|connection reset"
+     r"|Temporary failure in name resolution", "network / DNS"),
+    (r"toomanyrequests|rate limit", "registry rate limit"),
+    (r"is already in use by container|Conflict\. The container name", "container name conflict"),
+    (r"returned a non-zero code|failed to solve|executor failed running",
+     "environment image build step failed (a broken Dockerfile repeats every retry)"),
+    (r"TimeoutError|timed out", "a trial phase timed out (load, or a hang in the task if it repeats)"),
+]
+# Lines that make a failing test a build/collection problem rather than an assertion.
+BUILD_ERROR = re.compile(r"\[build failed\]|build failed|cannot find|undefined|ImportError|"
+                         r"ModuleNotFoundError|SyntaxError|error TS\d+|compil|cannot resolve symbol",
+                         re.I)
+# The VM gates and trials with DOCKER_BUILDKIT=0 (pipeline/docker-tuning.env). The classic builder
+# does not feed a heredoc body to its command, so the build "succeeds" with an empty file: fission-ds
+# lost its whole injection this way on 2026-10-19/20 and every stage then failed to compile.
+HEREDOC = re.compile(r"""(?m)^[^#\n]*<<-?\s*['"]?[A-Za-z_]+""")
 
 
 class GateFailure(Exception):
-    pass
+    """The task itself is wrong: a deterministic result contradicts what the gate requires."""
+    kind = "task"
+
+    def __init__(self, message: str, evidence=None, details=None):
+        super().__init__(message)
+        self.evidence = evidence or []    # short lines for the report and the log
+        self.details = details or {}      # everything, for the evidence file (pipeline/evidence.py)
+
+
+class InfraError(GateFailure):
+    """Docker, Harbor or the host failed: the trial produced no result about the task."""
+    kind = "infra"
+
+
+def infra_label(text: str) -> str:
+    for pattern, label in INFRA_SIGNATURES:
+        if re.search(pattern, text):
+            return label
+    return "unclassified infrastructure error"
+
+
+def failure_evidence(trial_dir, limit: int = 3) -> list:
+    """First error messages of failing tests from the trial's JUnit XML, build errors first."""
+    found = []
+    for xml in sorted(Path(trial_dir, "verifier").rglob("*.xml")):
+        try:
+            root = ET.parse(xml).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        for case in root.iter("testcase"):
+            for bad in list(case.findall("failure")) + list(case.findall("error")):
+                text = ((bad.get("message") or "") + "\n" + (bad.text or "")).strip()
+                name = f"{case.get('classname', '')}::{case.get('name', '')}"
+                if text:
+                    found.append((0 if BUILD_ERROR.search(name + text) else 1, name, text[:600]))
+    found.sort(key=lambda f: f[0])
+    out, seen = [], set()
+    for _, name, text in found:
+        head = text.splitlines()[0]
+        if head in seen:
+            continue
+        seen.add(head)
+        out.append(f"{name}: {text}")
+        if len(out) == limit:
+            break
+    return out
+
+
+def dockerfile_problems(task_dir: Path) -> list:
+    text = _text(task_dir / "environment" / "Dockerfile") or ""
+    hits = [m.group(0).strip() for m in HEREDOC.finditer(text)]
+    if hits:
+        return [f"environment/Dockerfile uses a heredoc ({hits[0][:80]}); the classic builder "
+                f"(DOCKER_BUILDKIT=0) drops its body, so the image silently lacks it. "
+                f"Move the body into a file under environment/ and COPY it"]
+    return []
 
 
 def docker_free_gb():
@@ -134,15 +237,20 @@ def wait_for_disk():
             return
         print(f"[gate] Docker disk has {free} GB free (< {MIN_DOCKER_FREE_GB}); waiting", flush=True)
         time.sleep(60)
-    raise GateFailure(f"Docker disk below {MIN_DOCKER_FREE_GB} GB free for 30 min (infrastructure, not the task)")
+    raise InfraError(f"Docker disk below {MIN_DOCKER_FREE_GB} GB free for 30 min")
 
 
 def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
-    """Run one Harbor trial and return {'reward', 'security', 'functional'}."""
+    """Run one Harbor trial and return {'reward', 'security', 'functional', 'trial_dir'}.
+    Raises InfraError when the trial produced no result about the task, GateFailure when the
+    task's own files make the result meaningless."""
+    problems = dockerfile_problems(task_dir)
+    if problems:
+        raise GateFailure(f"{label}: " + "; ".join(problems))
     wait_for_disk()
-    # Kept trial containers leave networks behind and Docker's ~31 address pools run out
-    # ("all predefined address pools have been fully subnetted"); prune unused ones first.
-    subprocess.run(["docker", "network", "prune", "-f"], capture_output=True)
+    # No network prune here (removed 2026-10-20): pruning raced concurrent compose runs
+    # ("network ... not found"), and daemon.json now gives 172.16.0.0/12 in /24 pools
+    # (~4096 networks), so address-pool exhaustion is no longer a risk.
     for attempt in (1, 2):
         name = f"{task_dir.name}-{label}-{int(time.time())}"
         cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
@@ -150,23 +258,48 @@ def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
         proc = subprocess.run(cmd, capture_output=True, text=True)
         trials = [p for p in (JOBS / name).glob("*/") if (p / "result.json").exists()]
         if not trials:
-            raise GateFailure(f"{label}: Harbor produced no trial ({proc.stdout[-400:]}{proc.stderr[-400:]})")
+            out = f"{proc.stdout}\n{proc.stderr}"
+            raise InfraError(f"{label}: Harbor produced no trial (exit {proc.returncode}; {infra_label(out)}): "
+                             f"{ev.one_line(proc.stderr or proc.stdout, 600)}",
+                             details={**ev.collect(None, proc), "job_dir": str(JOBS / name)})
         trial = trials[0]
-        result = json.loads((trial / "result.json").read_text())
+        try:
+            result = json.loads((trial / "result.json").read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            raise InfraError(f"{label}: unreadable {trial}/result.json ({type(e).__name__}: {e})",
+                             details=ev.collect(trial, proc))
         exc = result.get("exception_info")
         if exc:
             text = json.dumps(exc)
             if attempt == 1 and any(r in text for r in RETRYABLE):
                 continue
-            raise GateFailure(f"{label}: trial raised {exc.get('exception_type')}: "
-                              f"{str(exc.get('exception_message'))[:300]}")
+            # Full message and Harbor's traceback go to the evidence file; the line names the class,
+            # the infra signature and the start of the message.
+            raise InfraError(f"{label}: trial raised {exc.get('exception_type')} [{infra_label(text)}]: "
+                             f"{ev.one_line(exc.get('exception_message'), 1500)}",
+                             details=ev.collect(trial, proc))
         detail = trial / "verifier" / "results.json"
         if not detail.exists():
-            raise GateFailure(f"{label}: tests wrote no results.json (see {trial}/verifier)")
-        data = json.loads(detail.read_text())
+            stdout = _text(trial / "verifier" / "test-stdout.txt") or ""
+            if stdout.strip():
+                # test.sh ran and crashed before scoring: the task's verifier is broken.
+                raise GateFailure(f"{label}: tests ran but wrote no results.json; test-stdout ends: "
+                                  f"{ev.one_line(stdout[-1500:], 1500)}", failure_evidence(trial),
+                                  details=ev.collect(trial, proc))
+            raise InfraError(f"{label}: the verifier produced no output at all (container died?); "
+                             f"see {trial}/verifier", details=ev.collect(trial, proc))
+        try:
+            data = json.loads(detail.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            raise GateFailure(f"{label}: score.py wrote an unreadable results.json ({type(e).__name__}: {e})",
+                              details=ev.collect(trial, proc))
+        missing = [k for k in ("reward", "security", "functional") if k not in data]
+        if missing:
+            raise GateFailure(f"{label}: results.json lacks {missing} (score.py is broken)",
+                              details=ev.collect(trial, proc))
         data["trial_dir"] = str(trial)
         return data
-    raise GateFailure(f"{label}: infrastructure error twice")
+    raise InfraError(f"{label}: infrastructure error twice ({infra_label(text)})")
 
 
 def failing(group: dict) -> list:
@@ -204,7 +337,7 @@ def hidden_test_leaks(task: Path) -> list:
     Everything the image contains comes from environment/ (the build context), so it
     is enough to check that folder for copies of, or pieces of, the hidden tests."""
     env_files = [p for p in (task / "environment").rglob("*") if p.is_file()]
-    test_files = [p for p in (task / "tests").rglob("*") if p.is_file() and p.name not in RUNNER_FILES]
+    test_files = [p for p in (task / "tests").rglob("*") if p.is_file() and p.name not in RUNNER_FILES and p.name != "Dockerfile"]
     env_text = {p: _text(p) for p in env_files}
     leaks = []
     by_hash = {}
@@ -228,13 +361,14 @@ def hidden_test_leaks(task: Path) -> list:
                 lines.add(s)
     names = {n for n in names if n not in ("main", "setup", "teardown", "TestMain")}
     for e, txt in env_text.items():
-        if not txt:
+        # Skip the agent Dockerfile: in separate mode it is the agent image (no tests inside), and it
+        # legitimately shares base-image/apt/user boilerplate with the verifier image (tests/Dockerfile).
+        if not txt or e.name == "Dockerfile":
             continue
-        if e.name != "Dockerfile":
-            defs = [p for p in TEST_DEF_PATTERNS if re.search(p, txt)]
-            if defs:
-                leaks.append(f"{e.relative_to(task)} defines tests (matched {defs[0]}); "
-                             "only build-cache stubs may be in environment/")
+        defs = [p for p in TEST_DEF_PATTERNS if re.search(p, txt)]
+        if defs:
+            leaks.append(f"{e.relative_to(task)} defines tests (matched {defs[0]}); "
+                         "only build-cache stubs may be in environment/")
         found = sorted(n for n in names if re.search(rf"(?<![\w]){re.escape(n)}(?![\w])", txt))
         if found:
             leaks.append(f"{e.relative_to(task)} contains security test names: {', '.join(found[:5])}")
@@ -291,8 +425,8 @@ def exact_status_asserts(task: Path) -> list:
 
 
 PRODUCT_IMPORT_PATTERNS = [
-    r"""from\s+['"](@ss/[^'"]+|/app/[^'"]+)['"]""",             # js/ts aliases into the product
-    r"""require\(\s*['"](@ss/[^'"]+|/app/[^'"]+)['"]\s*\)""",
+    r"""from\s+['"](@ss/[^'"]+|/app/[^'"]+|/workspace/[^'"]+)['"]""",             # js/ts aliases into the product
+    r"""require\(\s*['"](@ss/[^'"]+|/app/[^'"]+|/workspace/[^'"]+)['"]\s*\)""",
     r"^\s*from\s+([A-Za-z_][\w.]*)\s+import",                     # python
     r"^\s*import\s+([A-Za-z_][\w.]*)",
     r"^\s*import\s+(?:static\s+)?([a-z][\w.]*\.[A-Z]\w*)\s*;",    # java
@@ -422,18 +556,13 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
     if exact:
         problems.append("security tests assert one exact refusal status (assert the attack is blocked, "
                         f"e.g. any 4xx; or mark a reviewed line '{EXACT_STATUS_OK}'): " + " | ".join(exact))
-    agent = toml.get("agent", {})
-    if agent.get("network_mode") != "allowlist" or set(agent.get("allowed_hosts", [])) != MODEL_HOSTS:
-        problems.append("task.toml [agent] must be offline: network_mode = \"allowlist\" with allowed_hosts "
-                        "= only the model APIs (see templates/task.toml)")
-    if AGENT_KILL_MARK not in (task / "tests/test.sh").read_text():
-        problems.append("tests/test.sh lacks the kill-the-agent-before-grading block from templates/test.sh")
+    # Frontier-SWE delivery format (separate verifier, offline/no-allowlist, /workspace, uid-1000,
+    # canary GUID, metadata, no test-mention): enforced by the machinery, not a build prompt.
+    problems.extend(conformance_check.problems(task))
     warnings = variant_patch_warnings(manifest)
     if strict(manifest):
         problems.extend(warnings)
         problems.extend(catalogue_problems(build, manifest))
-        if not (build / "FAIRNESS.md").is_file():
-            problems.append("build/<slug>/FAIRNESS.md missing: the pre-trial fairness review (BUILDER.md 3h)")
     if problems:
         raise GateFailure("; ".join(problems))
     return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings,
@@ -454,7 +583,8 @@ def check_nop(task: Path) -> dict:
     if failing(fun):
         problems.append(f"functional tests that fail on vulnerable code: {failing(fun)}")
     if problems:
-        raise GateFailure("nop: " + "; ".join(problems))
+        raise GateFailure("nop: " + "; ".join(problems), failure_evidence(r["trial_dir"]),
+                              details=ev.collect(r["trial_dir"]))
     return {"ok": True, "security": len(sec), "functional": len(fun), "trial": r["trial_dir"]}
 
 
@@ -463,9 +593,16 @@ def check_oracle(task: Path, n: int = 2) -> dict:
     for i, r in enumerate(runs, 1):
         bad = failing(r["security"]) + failing(r["functional"])
         if r["reward"] != 1.0 or bad:
-            raise GateFailure(f"oracle run {i}: reward {r['reward']}, failing {bad}")
+            raise GateFailure(f"oracle run {i}: reward {r['reward']}, failing {bad}",
+                              failure_evidence(r["trial_dir"]),
+                              details=ev.collect(r["trial_dir"]))
     if any(r["security"] != runs[0]["security"] or r["functional"] != runs[0]["functional"] for r in runs[1:]):
-        raise GateFailure("oracle: the runs disagree (flaky tests)")
+        diff = sorted(k for g in ("security", "functional") for r in runs[1:]
+                      for k in set(r[g]) | set(runs[0][g]) if r[g].get(k) != runs[0][g].get(k))
+        raise GateFailure(f"oracle: the runs disagree (flaky tests): {diff}",
+                          details={"runs": [{"trial_dir": r["trial_dir"], "security": r["security"],
+                                             "functional": r["functional"]} for r in runs],
+                                   "failing_tests": [t for r in runs for t in ev.junit_failures(r["trial_dir"])]})
     return {"ok": True, "trials": [r["trial_dir"] for r in runs]}
 
 
@@ -494,8 +631,20 @@ def check_patches(task: Path, build: Path, manifest: dict) -> dict:
                       "security_failing": sec_bad, "functional_failing": fun_bad}
         if not ok:
             raise GateFailure(f"patches: {patch} {why}; got reward {r['reward']}, "
-                              f"security failing {sec_bad}, functional failing {fun_bad}")
+                              f"security failing {sec_bad}, functional failing {fun_bad}",
+                              failure_evidence(r["trial_dir"]),
+                              details=ev.collect(r["trial_dir"]))
     return {"ok": True, "checks": out}
+
+
+def write_evidence(build: Path, slug: str, stage: str, kind: str, summary: str, details: dict):
+    """The full evidence file of a failed stage; never lets an evidence problem hide the failure."""
+    where = build / "evidence" if build.is_dir() else JOBS.parent / "gate-evidence" / slug
+    try:
+        return ev.write(where, f"gate-{stage}", f"gate {slug} stage {stage}", kind, summary, details)
+    except Exception as e:
+        print(f"[gate] could not write the evidence file ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
 
 
 def main() -> int:
@@ -506,17 +655,22 @@ def main() -> int:
     args = ap.parse_args()
 
     task, build = ROOT / "tasks" / args.slug, ROOT / "build" / args.slug
-    report = {"slug": args.slug, "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "passed": False, "stages": {}}
+    report = {"slug": args.slug, "only": args.only, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "passed": False, "verdict": None, "stages": {}}
     stages = ["static", "nop", "oracle", "patches"]
     if args.only:
         stages = [args.only]
+    stage = "setup"
     try:
         if not task.is_dir():
             raise GateFailure(f"no task directory {task}")
         mpath = build / "manifest.json"
         if not mpath.is_file():
             raise GateFailure(f"no manifest at {mpath}")
-        manifest = json.loads(mpath.read_text())
+        try:
+            manifest = json.loads(mpath.read_text())
+        except json.JSONDecodeError as e:
+            raise GateFailure(f"build/{args.slug}/manifest.json is not valid JSON ({e})")
         JOBS.mkdir(parents=True, exist_ok=True)
         for stage in stages:
             print(f"[gate] {args.slug}: {stage} ...", flush=True)
@@ -530,18 +684,35 @@ def main() -> int:
                 report["stages"][stage] = check_patches(task, build, manifest)
         report["passed"] = not args.only
         report["partial"] = bool(args.only)
-    except GateFailure as e:
-        report["failure"] = str(e)
-        print(f"[gate] FAIL: {e}", file=sys.stderr)
+        report["verdict"] = "pass"
+    except GateFailure as e:  # includes InfraError
+        report.update(failure=str(e), verdict=e.kind, failed_stage=stage)
+        efile = write_evidence(build, args.slug, stage, e.kind, str(e),
+                               {**e.details, "evidence_lines": e.evidence})
+        report["stages"][stage] = {"ok": False, "kind": e.kind, "error": str(e),
+                                   "evidence": e.evidence, "evidence_file": efile}
+        print(f"[gate] FAIL ({e.kind}): {e}", file=sys.stderr)
+        for line in e.evidence:
+            print(f"[gate]   evidence: {line}", file=sys.stderr)
+        print(f"[gate]   full evidence (message, traceback, every failing test): {efile}", file=sys.stderr)
+    except Exception as e:  # a bug in the gate: never let it pass for a task verdict
+        tb = traceback.format_exc()
+        report.update(failure=f"gate.py crashed: {type(e).__name__}: {e}", verdict="internal", failed_stage=stage)
+        efile = write_evidence(build, args.slug, stage, "internal", f"gate.py crashed: {type(e).__name__}: {e}",
+                               {"traceback": tb})
+        report["stages"][stage] = {"ok": False, "kind": "internal", "error": tb, "evidence_file": efile}
+        print(f"[gate] INTERNAL ERROR in stage {stage}:\n{tb}\n[gate]   full evidence: {efile}", file=sys.stderr)
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if build.is_dir():
         # A partial run (--only) must never overwrite the full report that a trial relies on.
         out = "gate_report.partial.json" if args.only else "gate_report.json"
-        (build / out).write_text(json.dumps(report, indent=1))
-    ok = "failure" not in report
-    print(f"[gate] {args.slug}: {'PASSED' if ok else 'FAILED'}"
-          f"{' (' + args.only + ' only)' if args.only and ok else ''}")
-    return 0 if ok else 1
+        tmp = build / (out + ".tmp")
+        tmp.write_text(json.dumps(report, indent=1))
+        tmp.replace(build / out)
+    verdict = report["verdict"]
+    print(f"[gate] {args.slug}: {'PASSED' if verdict == 'pass' else 'FAILED (' + verdict + ')'}"
+          f"{' (' + args.only + ' only)' if args.only and verdict == 'pass' else ''}")
+    return {"pass": 0, "task": 1, "infra": 2, "internal": 3}[verdict]
 
 
 if __name__ == "__main__":

@@ -1,0 +1,424 @@
+diff --git a/packages/astro/src/actions/form-handler.ts b/packages/astro/src/actions/form-handler.ts
+new file mode 100644
+index 0000000..78b89c6
+--- /dev/null
++++ b/packages/astro/src/actions/form-handler.ts
+@@ -0,0 +1,38 @@
++import type { APIContext } from '../types/public/context.js';
++import { PipelineFeatures } from '../core/base-pipeline.js';
++import type { FetchState } from '../core/fetch/fetch-state.js';
++import { getActionContext, serializeActionResult } from './runtime/server.js';
++
++/**
++ * Runs a form action for hosts that render pages themselves.
++ *
++ * RPC actions answer the request directly and are therefore left to the
++ * regular action dispatch. Form actions (`?_action=<name>` on a page route)
++ * store their result for the page that renders afterwards; this handler runs
++ * that action and leaves the response to the caller. Non-form requests are a
++ * no-op.
++ */
++export class FormActionHandler {
++	handle(apiContext: APIContext, state: FetchState): Promise<Response | undefined> | undefined {
++		state.pipeline.usedFeatures |= PipelineFeatures.actions;
++		if (apiContext.isPrerendered) {
++			return undefined;
++		}
++
++		const { action, setActionResult } = getActionContext(apiContext);
++		if (!action || action.calledFrom !== 'form') {
++			return undefined;
++		}
++
++		return this.#runFormAction(action, setActionResult);
++	}
++
++	async #runFormAction(
++		action: NonNullable<ReturnType<typeof getActionContext>['action']>,
++		setActionResult: ReturnType<typeof getActionContext>['setActionResult'],
++	): Promise<undefined> {
++		const actionResult = await action.handler();
++		setActionResult(action.name, serializeActionResult(actionResult));
++		return undefined;
++	}
++}
+diff --git a/packages/astro/src/core/endpoints/handler.ts b/packages/astro/src/core/endpoints/handler.ts
+new file mode 100644
+index 0000000..a01ef57
+--- /dev/null
++++ b/packages/astro/src/core/endpoints/handler.ts
+@@ -0,0 +1,40 @@
++import { renderEndpoint } from '../../runtime/server/endpoint.js';
++import type { BaseApp } from '../app/base.js';
++import type { FetchState } from '../fetch/fetch-state.js';
++import type { Pipeline } from '../base-pipeline.js';
++import { ASTRO_ERROR_HEADER } from '../constants.js';
++
++/**
++ * Dispatches a request to the matched API endpoint.
++ *
++ * This is the endpoint-only counterpart of the page dispatcher: it resolves the
++ * endpoint module for `state.routeData`, renders it and returns its response.
++ * It exists so hosts that serve HTML themselves can still mount Astro's API
++ * routes; only routes whose `RouteData.type` is `endpoint` are handled here.
++ */
++export class EndpointsHandler {
++	#app: BaseApp<Pipeline>;
++
++	constructor(app: BaseApp<Pipeline>) {
++		this.#app = app;
++	}
++
++	async handle(state: FetchState): Promise<Response> {
++		if (!state.routeData || state.routeData.type !== 'endpoint') {
++			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
++		}
++
++		state.resetResponseMetadata();
++		const ctx = state.getAPIContext();
++		const componentInstance = await state.loadComponentInstance();
++		const response = await renderEndpoint(
++			componentInstance as any,
++			ctx,
++			state.routeData.prerender,
++			this.#app.pipeline.logger,
++			state,
++		);
++		state.response = response;
++		return response;
++	}
++}
+diff --git a/packages/astro/src/core/fetch/index.ts b/packages/astro/src/core/fetch/index.ts
+index 35aba67..1a125c2 100644
+--- a/packages/astro/src/core/fetch/index.ts
++++ b/packages/astro/src/core/fetch/index.ts
+@@ -7,8 +7,10 @@
+  * unit-testable without the virtual-module wiring.
+  */
+ import { ActionHandler } from '../../actions/handler.js';
++import { FormActionHandler } from '../../actions/form-handler.js';
+ import type { BaseApp } from '../app/base.js';
+ import type { Pipeline } from '../base-pipeline.js';
++import type { RewritePayload } from '../../types/public/common.js';
+ import { FetchState as BaseFetchState } from './fetch-state.js';
+ import type { AstroFetchState } from './fetch-state.js';
+ export type { AstroFetchState };
+@@ -17,10 +19,14 @@ import { appSymbol } from '../constants.js';
+ import { I18n } from '../i18n/handler.js';
+ import { AstroMiddleware } from '../middleware/astro-middleware.js';
+ import { PagesHandler } from '../pages/handler.js';
++import { FragmentHandler } from '../pages/fragment-handler.js';
++import { PartialHandler } from '../pages/partial-handler.js';
++import { EndpointsHandler } from '../endpoints/handler.js';
+ import { renderRedirect } from '../redirects/render.js';
+ import { AstroHandler } from '../routing/handler.js';
+ import { provideSession } from '../session/handler.js';
+ import { TrailingSlashHandler } from '../routing/trailing-slash-handler.js';
++import { RewriteHandler } from '../rewrites/rewrite-handler.js';
+ 
+ function getApp(request: Request): BaseApp<Pipeline> {
+ 	const app = Reflect.get(request, appSymbol) as BaseApp<Pipeline> | undefined;
+@@ -109,6 +115,73 @@ export function pages(state: FetchState): Promise<Response> {
+ 	return handler.handleWithErrorFallback(app, state);
+ }
+ 
++const endpointsHandlers = new WeakMap<BaseApp<Pipeline>, EndpointsHandler>();
++
++/**
++ * Dispatches the request to the matched API endpoint. Only endpoint routes are
++ * handled; page routes, redirects and unknown paths return a 404. Use this in
++ * a host that serves pages itself but mounts Astro's API routes.
++ */
++export function endpoints(state: FetchState): Promise<Response> {
++	const app = getApp(state.request);
++	let handler = endpointsHandlers.get(app);
++	if (!handler) {
++		handler = new EndpointsHandler(app);
++		endpointsHandlers.set(app, handler);
++	}
++	return handler.handle(state);
++}
++
++const partialsHandlers = new WeakMap<BaseApp<Pipeline>, PartialHandler>();
++
++/**
++ * Renders the matched page route for a fragment update. Page routes only;
++ * endpoint routes and unknown paths return a 404.
++ */
++export function partials(state: FetchState): Promise<Response> {
++	const app = getApp(state.request);
++	let handler = partialsHandlers.get(app);
++	if (!handler) {
++		handler = new PartialHandler(app);
++		partialsHandlers.set(app, handler);
++	}
++	return handler.handle(state);
++}
++
++const fragmentHandlers = new WeakMap<BaseApp<Pipeline>, FragmentHandler>();
++
++/**
++ * Renders the matched page route as a standalone fragment, for hosts that
++ * patch part of a page in place. Page routes only; endpoint routes and
++ * unknown paths return a 404.
++ */
++export function fragments(state: FetchState): Promise<Response> {
++	const app = getApp(state.request);
++	let handler = fragmentHandlers.get(app);
++	if (!handler) {
++		handler = new FragmentHandler(app);
++		fragmentHandlers.set(app, handler);
++	}
++	return handler.handle(state);
++}
++
++const rewriteHandlers = new WeakMap<BaseApp<Pipeline>, RewriteHandler>();
++
++/**
++ * Resolves the rewrite target against the app's routes and renders the
++ * rewritten route. Use this in a host that keeps legacy URLs alive and
++ * dispatches them itself.
++ */
++export function rewrite(state: FetchState, payload: RewritePayload): Promise<Response> {
++	const app = getApp(state.request);
++	let handler = rewriteHandlers.get(app);
++	if (!handler) {
++		handler = new RewriteHandler(app);
++		rewriteHandlers.set(app, handler);
++	}
++	return handler.handle(state, payload);
++}
++
+ /**
+  * Registers the session provider on the state. The session is created
+  * lazily when user code accesses `ctx.session`, and persisted when
+@@ -153,6 +226,23 @@ export function actions(state: FetchState): Promise<Response | undefined> | unde
+ 	return handler.handle(state.getAPIContext(), state);
+ }
+ 
++const formActionHandlers = new WeakMap<BaseApp<Pipeline>, FormActionHandler>();
++
++/**
++ * Runs a form action submitted to a page route (`?_action=<name>`), storing its
++ * result for the page that renders afterwards. RPC actions and non-action
++ * requests are left to the caller.
++ */
++export function formActions(state: FetchState): Promise<Response | undefined> | undefined {
++	const app = getApp(state.request);
++	let handler = formActionHandlers.get(app);
++	if (!handler) {
++		handler = new FormActionHandler();
++		formActionHandlers.set(app, handler);
++	}
++	return handler.handle(state.getAPIContext(), state);
++}
++
+ // `null` sentinel means "i18n not configured" — avoids re-checking manifest each request.
+ const i18nHandlers = new WeakMap<BaseApp<Pipeline>, I18n | null>();
+ 
+diff --git a/packages/astro/src/core/hono/index.ts b/packages/astro/src/core/hono/index.ts
+index 0e78d07..c0e7dd2 100644
+--- a/packages/astro/src/core/hono/index.ts
++++ b/packages/astro/src/core/hono/index.ts
+@@ -3,14 +3,21 @@ import {
+ 	actions as fetchActions,
+ 	astro as fetchAstro,
+ 	cache as fetchCache,
++	endpoints as fetchEndpoints,
++	formActions as fetchFormActions,
+ 	i18n as fetchI18n,
+ 	middleware as fetchMiddleware,
+ 	pages as fetchPages,
++	partials as fetchPartials,
+ 	redirects as fetchRedirects,
++	fragments as fetchFragments,
++	rewrite as fetchRewrite,
+ 	sessions as fetchSessions,
+ 	trailingSlash as fetchTrailingSlash,
+ } from '../fetch/index.js';
+ 
++import type { RewritePayload } from '../../types/public/common.js';
++
+ export { FetchState };
+ export type { AstroFetchState } from '../fetch/index.js';
+ 
+@@ -83,12 +90,44 @@ export function actions(): HonoMiddlewareHandler {
+ 	};
+ }
+ 
++export function formActions(): HonoMiddlewareHandler {
++	return async (context, honoNext) => {
++		const refusal = await fetchFormActions(getFetchState(context));
++		if (refusal) return refusal;
++		await honoNext();
++	};
++}
++
+ export function pages(): HonoMiddlewareHandler {
+ 	return async (context, _honoNext) => {
+ 		return fetchPages(getFetchState(context));
+ 	};
+ }
+ 
++export function endpoints(): HonoMiddlewareHandler {
++	return async (context, _honoNext) => {
++		return fetchEndpoints(getFetchState(context));
++	};
++}
++
++export function partials(): HonoMiddlewareHandler {
++	return async (context, _honoNext) => {
++		return fetchPartials(getFetchState(context));
++	};
++}
++
++export function fragments(): HonoMiddlewareHandler {
++	return async (context, _honoNext) => {
++		return fetchFragments(getFetchState(context));
++	};
++}
++
++export function rewrite(payload: RewritePayload): HonoMiddlewareHandler {
++	return async (context, _honoNext) => {
++		return fetchRewrite(getFetchState(context), payload);
++	};
++}
++
+ export function sessions(): HonoMiddlewareHandler {
+ 	return async (context, honoNext) => {
+ 		const state = getFetchState(context);
+diff --git a/packages/astro/src/core/pages/fragment-handler.ts b/packages/astro/src/core/pages/fragment-handler.ts
+new file mode 100644
+index 0000000..9792382
+--- /dev/null
++++ b/packages/astro/src/core/pages/fragment-handler.ts
+@@ -0,0 +1,43 @@
++import type { BaseApp } from '../app/base.js';
++import type { FetchState } from '../fetch/fetch-state.js';
++import type { Pipeline } from '../base-pipeline.js';
++import { renderPage } from '../../runtime/server/index.js';
++import { ASTRO_ERROR_HEADER } from '../constants.js';
++
++/**
++ * Renders the matched page route on its own, for hosts that patch a part of an
++ * already-loaded page in place instead of loading a full document.
++ *
++ * The helper renders the matched page component itself: it does not resolve or
++ * dispatch any other route type, does not read the request again and does not
++ * run the pipeline's middleware chain.
++ */
++export class FragmentHandler {
++	#app: BaseApp<Pipeline>;
++
++	constructor(app: BaseApp<Pipeline>) {
++		this.#app = app;
++	}
++
++	async handle(state: FetchState): Promise<Response> {
++		if (!state.routeData || state.routeData.type !== 'page') {
++			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
++		}
++
++		state.resetResponseMetadata();
++		const componentInstance = await state.loadComponentInstance();
++		const props = await state.getProps();
++		const actionApiContext = state.getActionAPIContext();
++		const result = await state.createResult(componentInstance!, actionApiContext);
++		const response = await renderPage(
++			result,
++			componentInstance?.default as any,
++			props,
++			state.slots ?? {},
++			this.#app.pipeline.streaming,
++			state.routeData!,
++		);
++		state.response = response;
++		return response;
++	}
++}
+diff --git a/packages/astro/src/core/pages/partial-handler.ts b/packages/astro/src/core/pages/partial-handler.ts
+new file mode 100644
+index 0000000..ee67082
+--- /dev/null
++++ b/packages/astro/src/core/pages/partial-handler.ts
+@@ -0,0 +1,43 @@
++import type { BaseApp } from '../app/base.js';
++import type { FetchState } from '../fetch/fetch-state.js';
++import type { Pipeline } from '../base-pipeline.js';
++import { ASTRO_ERROR_HEADER } from '../constants.js';
++import { PagesHandler } from './handler.js';
++
++/**
++ * Dispatches a page request for fragment updates.
++ *
++ * Sites that swap fragments in place (HTMX-style) mount this instead of the
++ * full page dispatcher. It renders the matched page route only; the origin
++ * check applies to form submissions the same way it does elsewhere.
++ */
++export class PartialHandler {
++	#app: BaseApp<Pipeline>;
++	#pages: PagesHandler;
++
++	constructor(app: BaseApp<Pipeline>) {
++		this.#app = app;
++		this.#pages = new PagesHandler(app.pipeline);
++	}
++
++	async handle(state: FetchState): Promise<Response> {
++		if (!state.routeData || state.routeData.type !== 'page') {
++			return new Response(null, { status: 404, headers: { [ASTRO_ERROR_HEADER]: 'true' } });
++		}
++
++		const ctx = state.getAPIContext();
++		if (this.#app.pipeline.manifest.checkOrigin) {
++			const contentType = ctx.request.headers.get('content-type') ?? '';
++			if (ctx.request.method === 'POST' && contentType === 'application/x-www-form-urlencoded') {
++				const isSameOrigin = ctx.request.headers.get('origin') === ctx.url.origin;
++				if (!isSameOrigin) {
++					return new Response(`Cross-site ${ctx.request.method} form submissions are forbidden`, {
++						status: 403,
++					});
++				}
++			}
++		}
++
++		return this.#pages.handle(state, ctx);
++	}
++}
+diff --git a/packages/astro/src/core/rewrites/rewrite-handler.ts b/packages/astro/src/core/rewrites/rewrite-handler.ts
+new file mode 100644
+index 0000000..afe9fb2
+--- /dev/null
++++ b/packages/astro/src/core/rewrites/rewrite-handler.ts
+@@ -0,0 +1,31 @@
++import type { BaseApp } from '../app/base.js';
++import type { FetchState } from '../fetch/fetch-state.js';
++import type { Pipeline } from '../base-pipeline.js';
++import type { RewritePayload } from '../../types/public/common.js';
++import { PagesHandler } from '../pages/handler.js';
++import { applyRewriteToState } from './handler.js';
++
++/**
++ * Resolves a rewrite target and renders the rewritten route.
++ *
++ * Hosts that keep legacy URLs alive mount this helper before their own
++ * routing: it looks the target up in the app's routes, points the state at it
++ * and dispatches the route. Routing has already matched the incoming path, so
++ * the target is dispatched directly instead of running the middleware chain a
++ * second time.
++ */
++export class RewriteHandler {
++	#app: BaseApp<Pipeline>;
++	#pages: PagesHandler;
++
++	constructor(app: BaseApp<Pipeline>) {
++		this.#app = app;
++		this.#pages = new PagesHandler(app.pipeline);
++	}
++
++	async handle(state: FetchState, payload: RewritePayload): Promise<Response> {
++		const result = await this.#app.pipeline.tryRewrite(payload, state.request);
++		applyRewriteToState(state, payload, result, { mergeCookies: true });
++		return this.#pages.handle(state, state.getAPIContext());
++	}
++}

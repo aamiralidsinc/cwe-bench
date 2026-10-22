@@ -1,0 +1,253 @@
+diff --git a/ext/protojson.js b/ext/protojson.js
+--- a/ext/protojson.js
++++ b/ext/protojson.js
+@@ -381,6 +381,53 @@
+     return out;
+ }
+ 
++// --- merging messages ---
++
++function mergeMessageInto(type, target, value, options, depth) {
++    if (depth > util.recursionLimit)
++        throw Error("max depth exceeded");
++    if (value === null || typeof value !== "object" || Array.isArray(value))
++        throw invalid(type.fullName, value, "expected object");
++    var index = fieldsByJsonName(type), key;
++    for (key in value) {
++        if (!hasOwn(value, key))
++            continue;
++        var field = index[key];
++        if (field === undefined) {
++            if (options.ignoreUnknownFields)
++                continue;
++            throw invalid(type.fullName, key, "unknown field");
++        }
++        var fv = value[key];
++        if (fv === null && !isValueType(field.resolvedType))
++            continue;
++        if (field.map) {
++            if (fv === null || typeof fv !== "object" || Array.isArray(fv))
++                throw invalid(field.fullName, fv, "expected object for map");
++            if (!target[field.name])
++                target[field.name] = {};
++            var map = target[field.name], k;
++            for (k in fv)
++                if (hasOwn(fv, k)) {
++                    var mk = readMapKey(field, k);
++                    map[mk] = readSingular(field, fv[k], options, depth);
++                }
++        } else if (field.repeated) {
++            if (!Array.isArray(fv))
++                throw invalid(field.fullName, fv, "expected array");
++            var arr = [];
++            for (var i = 0; i < fv.length; ++i)
++                arr.push(readSingular(field, fv[i], options, depth));
++            target[field.name] = arr;
++        } else if (field.resolvedType instanceof Type && !isValueType(field.resolvedType)) {
++            if (!target[field.name])
++                target[field.name] = {};
++            mergeMessageInto(field.resolvedType, target[field.name], fv, options, depth + 1);
++        } else
++            target[field.name] = readSingular(field, fv, options, depth);
++    }
++}
++
+ // --- writing messages ---
+ 
+ function hasOwn(o, k) {
+@@ -852,6 +899,26 @@
+ };
+ 
+ /**
++ * Merges a message from an already-parsed ProtoJSON value into an existing object using the specified reflected type.
++ * @function mergeFromJson
++ * @name mergeFromJson
++ * @param {$protobuf.Type} type Reflected message type
++ * @param {Object.<string,*>} target Object to merge into
++ * @param {*} json Already-parsed ProtoJSON value
++ * @param {IProtoJsonOptions} [options] Conversion options
++ * @returns {Object.<string,*>} The target object
++ */
++protojson.mergeFromJson = function mergeFromJson(type, target, json, options) {
++    if (!(type instanceof Type))
++        throw TypeError("type must be a Type");
++    if (!target || typeof target !== "object")
++        throw TypeError("target must be an object");
++    type.root.resolveAll();
++    mergeMessageInto(type, target, json, options || {}, 0);
++    return target;
++};
++
++/**
+  * Parses a message from ProtoJSON text using the specified reflected type.
+  * @function fromJsonString
+  * @name fromJsonString
+@@ -914,6 +981,17 @@
+     };
+ 
+     /**
++     * Merges a message of this type from an already-parsed ProtoJSON value into an existing object. Convenience for {@link protojson.mergeFromJson}.
++     * @param {Object.<string,*>} target Object to merge into
++     * @param {*} json Already-parsed ProtoJSON value
++     * @param {IProtoJsonOptions} [options] Conversion options
++     * @returns {Object.<string,*>} The target object
++     */
++    Type.prototype.mergeFromJson = function mergeFromJson(target, json, options) {
++        return protojson.mergeFromJson(this, target, json, options);
++    };
++
++    /**
+      * Parses a message of this type from ProtoJSON text. Convenience for {@link protojson.fromJsonString}.
+      * @param {string} json ProtoJSON text
+      * @param {IProtoJsonOptions} [options] Conversion options
+diff --git a/ext/textformat.js b/ext/textformat.js
+--- a/ext/textformat.js
++++ b/ext/textformat.js
+@@ -81,6 +81,27 @@
+ };
+ 
+ /**
++ * Merges a message from protobuf text format into an existing object using the specified reflected type.
++ * @function mergeFromText
++ * @name mergeFromText
++ * @param {$protobuf.Type} type Reflected message type
++ * @param {Object.<string,*>} target Object to merge into
++ * @param {string} text Text format input
++ * @returns {Object.<string,*>} The target object
++ */
++textformat.mergeFromText = function mergeFromText(type, target, text) {
++    if (!(type instanceof Type))
++        throw TypeError("type must be a Type");
++    if (!target || typeof target !== "object")
++        throw TypeError("target must be an object");
++    type.root.resolveAll();
++    var parser = new Parser(String(text));
++    parser.mergeMessage(type, target, null, 0);
++    parser.expectEnd();
++    return target;
++};
++
++/**
+  * Formats a message as protobuf text format using the specified reflected type.
+  * @function toText
+  * @name toText
+@@ -115,6 +136,16 @@
+     };
+ 
+     /**
++     * Merges a message of this type from protobuf text format into an existing object. Convenience for {@link textformat.mergeFromText}.
++     * @param {Object.<string,*>} target Object to merge into
++     * @param {string} text Text format input
++     * @returns {Object.<string,*>} The target object
++     */
++    Type.prototype.mergeFromText = function mergeFromText(target, text) {
++        return textformat.mergeFromText(this, target, text);
++    };
++
++    /**
+      * Formats a message of this type as protobuf text format. Convenience for {@link textformat.toText}.
+      * @param {Message<{}>|Object.<string,*>} message Message instance or plain object
+      * @param {ITextFormatOptions} [options] Text format options
+@@ -373,6 +404,102 @@
+     }
+ };
+ 
++Parser.prototype.mergeMessage = function mergeMessage(type, target, end, depth) {
++    if (depth > util.recursionLimit)
++        this.error("max depth exceeded");
++    for (;;) {
++        var token = this.tn.peek();
++        if (!token) {
++            if (end)
++                this.error("expected '" + end + "'");
++            return;
++        }
++        if (end && token.value === end) {
++            this.tn.next();
++            return;
++        }
++        this.mergeField(type, target, depth);
++        token = this.tn.peek();
++        if (token && isSeparator(token)) {
++            this.tn.next();
++            this.tn.peek();
++        }
++    }
++};
++
++Parser.prototype.mergeField = function mergeField(type, target, depth) {
++    var info = this.readFieldName(type);
++    if (!info.field) {
++        this.skipReservedValue(depth);
++        return;
++    }
++    var field = info.field.resolve();
++    if (field.map) {
++        this.parseMessageFieldDelimiter();
++        if (!target[field.name])
++            target[field.name] = {};
++        if (this.tn.skip("[")) {
++            if (!this.tn.skip("]")) {
++                do {
++                    this.mergeMapEntry(field, target[field.name], depth + 1);
++                } while (this.tn.skip(","));
++                this.tn.expect("]");
++            }
++        } else
++            this.mergeMapEntry(field, target[field.name], depth + 1);
++    } else if (field.resolvedType instanceof Type) {
++        this.parseMessageFieldDelimiter();
++        var child = field.resolvedType;
++        if (!target[field.name])
++            target[field.name] = child.create();
++        this.mergeMessage(child, target[field.name], null, depth);
++    } else {
++        this.tn.expect(":");
++        target[field.name] = this.parseScalar(field);
++    }
++};
++
++Parser.prototype.mergeMapEntry = function mergeMapEntry(field, map, depth) {
++    if (depth > util.recursionLimit)
++        this.error("max depth exceeded");
++    var end;
++    if (this.tn.skip("{"))
++        end = "}";
++    else if (this.tn.skip("<"))
++        end = ">";
++    else
++        this.error("expected map entry");
++    var keyField = mapKeyField(field),
++        valueField = mapValueField(field),
++        key = defaultScalarValue(keyField),
++        value = defaultMapValue(valueField);
++    for (;;) {
++        var token = this.tn.peek();
++        if (!token)
++            this.error("unterminated map entry");
++        if (token.value === end) {
++            this.tn.next();
++            break;
++        }
++        if (token.value === "key") {
++            this.tn.next();
++            this.tn.expect(":");
++            key = this.parseScalar(keyField);
++        } else if (token.value === "value") {
++            this.tn.next();
++            if (valueField.resolvedType instanceof Type) {
++                this.parseMessageFieldDelimiter();
++                value = this.parseMessageValue(valueField.resolvedType, depth);
++            } else {
++                this.tn.expect(":");
++                value = this.parseScalar(valueField);
++            }
++        } else
++            this.error("expected map key or map value");
++    }
++    map[mapKey(keyField, key)] = value;
++};
++
+ Parser.prototype.parseField = function parseField(type, object, seen, depth) {
+     var info = this.readFieldName(type);
+     if (info.any) {

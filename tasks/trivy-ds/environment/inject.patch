@@ -1,0 +1,158 @@
+diff --git a/pkg/commands/app.go b/pkg/commands/app.go
+index 4d029dde0..83967fd08 100644
+--- a/pkg/commands/app.go
++++ b/pkg/commands/app.go
+@@ -838,6 +838,20 @@ func NewPluginCommand(globalFlags *flag.GlobalFlagGroup) *cobra.Command {
+ 				return nil
+ 			},
+ 		},
++		&cobra.Command{
++			Use:                   "repair",
++			Short:                 "Rewrite the metadata of installed plugins in the current format",
++			DisableFlagsInUseLine: true,
++			SilenceErrors:         true,
++			SilenceUsage:          true,
++			Args:                  cobra.NoArgs,
++			RunE: func(cmd *cobra.Command, _ []string) error {
++				if err := plugin.Repair(cmd.Context()); err != nil {
++					return xerrors.Errorf("plugin repair error: %w", err)
++				}
++				return nil
++			},
++		},
+ 		&cobra.Command{
+ 			Use:                   "run NAME | URL | FILE_PATH",
+ 			Aliases:               []string{"r"},
+diff --git a/pkg/plugin/index.go b/pkg/plugin/index.go
+index 46517dd8e..d2ddc71b2 100644
+--- a/pkg/plugin/index.go
++++ b/pkg/plugin/index.go
+@@ -3,6 +3,7 @@ package plugin
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io/fs"
+@@ -52,6 +53,23 @@ func (m *Manager) Update(ctx context.Context, opts Options) error {
+ 	if err != nil {
+ 		return xerrors.Errorf("unable to copy the plugin index file: %w", err)
+ 	}
++
++	// Keep a copy of each plugin's index entry so that installs can resolve a
++	// plugin while the index itself is unavailable.
++	if index, err := m.loadIndex(); err != nil {
++		m.logger.WarnContext(ctx, "Unable to cache the plugin index", log.Err(err))
++	} else {
++		for _, p := range index.Plugins {
++			cacheDir := filepath.Join(m.pluginRoot, p.Name+".index")
++			if err := os.MkdirAll(cacheDir, 0o755); err != nil {
++				return xerrors.Errorf("failed to create the plugin index cache: %w", err)
++			}
++			entry := fmt.Sprintf("{\"name\": %q, \"repository\": %q}\n", p.Name, p.Repository)
++			if err := os.WriteFile(filepath.Join(cacheDir, "index.json"), []byte(entry), 0o644); err != nil {
++				return xerrors.Errorf("failed to write the plugin index cache: %w", err)
++			}
++		}
++	}
+ 	return nil
+ }
+ 
+@@ -95,6 +113,9 @@ func (m *Manager) tryIndex(ctx context.Context, name string, opts Options) strin
+ 
+ 	index, err := m.loadIndex()
+ 	if errors.Is(err, os.ErrNotExist) {
++		if repository, ok := m.cachedRepository(name); ok {
++			return repository
++		}
+ 		m.logger.WarnContext(ctx, "The plugin index is not found. Please run 'trivy plugin update' to download the index.")
+ 		return name
+ 	} else if err != nil {
+@@ -110,6 +131,21 @@ func (m *Manager) tryIndex(ctx context.Context, name string, opts Options) strin
+ 	return name
+ }
+ 
++// cachedRepository returns the repository recorded for a plugin by Update.
++func (m *Manager) cachedRepository(name string) (string, bool) {
++	b, err := os.ReadFile(filepath.Join(m.pluginRoot, name+".index", "index.json"))
++	if err != nil {
++		return "", false
++	}
++	var entry struct {
++		Repository string `json:"repository"`
++	}
++	if err := json.Unmarshal(b, &entry); err != nil || entry.Repository == "" {
++		return "", false
++	}
++	return entry.Repository, true
++}
++
+ func (m *Manager) loadIndex() (*Index, error) {
+ 	f, err := os.Open(m.indexPath)
+ 	if err != nil {
+diff --git a/pkg/plugin/manager.go b/pkg/plugin/manager.go
+index b94a2f6cb..ffec18d97 100644
+--- a/pkg/plugin/manager.go
++++ b/pkg/plugin/manager.go
+@@ -94,6 +94,7 @@ func Information(name string) error                     { return defaultManager(
+ func List(ctx context.Context) error                    { return defaultManager().List(ctx) }
+ func Update(ctx context.Context, opts Options) error    { return defaultManager().Update(ctx, opts) }
+ func Search(ctx context.Context, keyword string) error  { return defaultManager().Search(ctx, keyword) }
++func Repair(ctx context.Context) error                  { return defaultManager().Repair(ctx) }
+ 
+ // Install installs a plugin
+ func (m *Manager) Install(ctx context.Context, arg string, opts Options) (Plugin, error) {
+@@ -166,6 +167,52 @@ func (m *Manager) Uninstall(ctx context.Context, name string) error {
+ 	return nil
+ }
+ 
++// Repair rewrites the metadata of plugins installed by older releases so that
++// the deprecated usage field is stored as summary, matching the current format.
++func (m *Manager) Repair(ctx context.Context) error {
++	entries, err := os.ReadDir(m.pluginRoot)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil
++		}
++		return xerrors.Errorf("failed to read %s: %w", m.pluginRoot, err)
++	}
++	for _, e := range entries {
++		if !e.IsDir() {
++			continue
++		}
++		b, err := os.ReadFile(filepath.Join(m.pluginRoot, e.Name(), configFile))
++		if err != nil {
++			m.logger.WarnContext(ctx, "Plugin metadata read error", log.Err(err))
++			continue
++		}
++		var p Plugin
++		if err := yaml.Unmarshal(b, &p); err != nil {
++			m.logger.WarnContext(ctx, "Plugin metadata decode error", log.Err(err))
++			continue
++		}
++		if p.Summary == "" && p.Usage != "" {
++			p.Summary = p.Usage
++			p.Usage = ""
++		}
++		dir := filepath.Join(m.pluginRoot, p.Name)
++		if err := os.MkdirAll(dir, 0o755); err != nil {
++			return xerrors.Errorf("failed to prepare the plugin directory: %w", err)
++		}
++		f, err := os.Create(filepath.Join(dir, configFile))
++		if err != nil {
++			return xerrors.Errorf("failed to rewrite plugin metadata: %w", err)
++		}
++		err = yaml.NewEncoder(f).Encode(p)
++		_ = f.Close()
++		if err != nil {
++			return xerrors.Errorf("yaml encode error: %w", err)
++		}
++		m.logger.InfoContext(ctx, "Plugin metadata repaired", log.String("name", p.Name))
++	}
++	return nil
++}
++
+ // Information gets the information about an installed plugin
+ func (m *Manager) Information(name string) error {
+ 	plugin, err := m.load(name)

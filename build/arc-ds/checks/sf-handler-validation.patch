@@ -1,0 +1,175 @@
+diff --git a/internal/api/continuous_query.go b/internal/api/continuous_query.go
+index 25045c1..c0f9893 100644
+--- a/internal/api/continuous_query.go
++++ b/internal/api/continuous_query.go
+@@ -286,6 +286,13 @@ func (h *ContinuousQueryHandler) handleCreate(c *fiber.Ctx) error {
+ 		})
+ 	}
+ 
++	// SECURITY: a stored definition is executed later on the shared engine,
++	// so it must satisfy the same user-SQL rules at definition time.
++	probeQuery := strings.ReplaceAll(strings.ReplaceAll(req.Query, "{start_time}", "''"), "{end_time}", "''")
++	if err := validateUserSQL(probeQuery); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
++	}
++
+ 	// Insert query
+ 	result, err := h.sqliteDB.Exec(`
+ 		INSERT INTO continuous_queries
+@@ -476,6 +483,12 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
+ 	executedQuery := strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+ 	executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", endTime.Format(time.RFC3339)))
+ 
++	// SECURITY: re-check at execution time so definitions stored before this
++	// rule existed are also refused.
++	if err := validateUserSQL(executedQuery); err != nil {
++		return nil, fmt.Errorf("query rejected: %w", err)
++	}
++
+ 	executionID := fmt.Sprintf("cq-sched-%s", uuid.New().String()[:8])
+ 
+ 	h.logger.Info().
+diff --git a/internal/api/export_download.go b/internal/api/export_download.go
+index 8941fad..50352db 100644
+--- a/internal/api/export_download.go
++++ b/internal/api/export_download.go
+@@ -3,6 +3,7 @@ package api
+ import (
+ 	"os"
+ 	"path/filepath"
++	"strings"
+ 
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/rs/zerolog"
+@@ -19,12 +20,37 @@ type ExportHandler struct {
+ 
+ // NewExportHandler creates an export-download handler rooted at dir.
+ func NewExportHandler(root string, logger zerolog.Logger) *ExportHandler {
++	if abs, err := filepath.Abs(root); err == nil {
++		root = abs
++	}
++	if resolved, err := filepath.EvalSymlinks(root); err == nil {
++		root = resolved
++	}
+ 	return &ExportHandler{
+-		root:   root,
++		root:   filepath.Clean(root),
+ 		logger: logger.With().Str("component", "export-handler").Logger(),
+ 	}
+ }
+ 
++// withinRoot reports whether p resolves to a path inside root. It checks the
++// lexical path and, when the file exists, the symlink-resolved path.
++func (h *ExportHandler) withinRoot(p string) bool {
++	inside := func(candidate string) bool {
++		rel, err := filepath.Rel(h.root, candidate)
++		if err != nil {
++			return false
++		}
++		return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
++	}
++	if !inside(p) {
++		return false
++	}
++	if resolved, err := filepath.EvalSymlinks(p); err == nil && !inside(resolved) {
++		return false
++	}
++	return true
++}
++
+ // RegisterRoutes registers the export-download endpoint.
+ func (h *ExportHandler) RegisterRoutes(app *fiber.App) {
+ 	app.Get("/api/v1/export/download", h.handleDownload)
+@@ -41,6 +67,13 @@ func (h *ExportHandler) handleDownload(c *fiber.Ctx) error {
+ 	}
+ 
+ 	fullPath := filepath.Join(h.root, name)
++	if !h.withinRoot(fullPath) {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   "invalid export path",
++		})
++	}
++
+ 	data, err := os.ReadFile(fullPath)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+diff --git a/internal/api/query.go b/internal/api/query.go
+index a1dbc58..d8b4e9d 100644
+--- a/internal/api/query.go
++++ b/internal/api/query.go
+@@ -1284,6 +1284,10 @@ localProcessing:
+ 		m.IncQueryErrors()
+ 		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
+ 	}
++	if err := validateUserSQL(req.SQL); err != nil {
++		m.IncQueryErrors()
++		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
++	}
+ 
+ 	// Extract x-arc-database header for optimized query path
+ 	headerDB := c.Get("x-arc-database")
+@@ -1884,6 +1888,27 @@ var userSQLReadParquetPattern = regexp.MustCompile(`(?i)\bread_parquet\s*\(`)
+ // must route through Arc's rewriter so RBAC stays load-bearing.
+ var userSQLArcPartitionAggPattern = regexp.MustCompile(`(?i)\barc_partition_agg\s*\(`)
+ 
++// userSQLIOFamilyPattern matches the DuckDB data-source table-function
++// family. The optional quotes accept the quoted-identifier spelling.
++var userSQLIOFamilyPattern = regexp.MustCompile(`(?i)"?\b(?:read_csv|read_csv_auto|read_json|read_json_auto|read_ndjson|read_ndjson_auto|read_text|read_blob|read_xlsx|read_parquet|parquet_scan|parquet_metadata|parquet_schema|glob|sniff_csv|arc_partition_agg)\b"?\s*\(`)
++
++// userSQLRemoteAddressPattern matches the URL families DuckDB extensions can
++// open. A caller-supplied address is never part of a measurement query.
++var userSQLRemoteAddressPattern = regexp.MustCompile(`(?i)\b(?:https?|s3|azure|gcs|gs)://`)
++
++// validateUserSQL applies the data-source rules at the handlers that execute
++// caller-supplied statements. Run on the raw statement so quoted identifiers
++// and literals are still visible.
++func validateUserSQL(sql string) error {
++	if userSQLIOFamilyPattern.MatchString(sql) {
++		return &SQLValidationError{Message: "Data-source functions are not allowed in user SQL"}
++	}
++	if userSQLRemoteAddressPattern.MatchString(sql) {
++		return &SQLValidationError{Message: "Remote addresses are not allowed in user SQL"}
++	}
++	return nil
++}
++
+ // getTransformedSQL returns the transformed SQL with caching.
+ // If headerDB is non-empty, uses the optimized path with that database for all tables.
+ // Returns the transformed SQL and whether it was a cache hit.
+@@ -3418,6 +3443,17 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
+ 	sql += fmt.Sprintf(" LIMIT %d", limit)
+ 	sql += fmt.Sprintf(" OFFSET %d", offset)
+ 
++	// SECURITY: the filter fragment is part of the statement Arc executes, so
++	// apply the user-SQL data-source rules to the assembled statement.
++	if err := validateUserSQL(sql); err != nil {
++		m.IncQueryErrors()
++		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
++			Success:   false,
++			Error:     "Invalid query: " + err.Error(),
++			Timestamp: time.Now().UTC().Format(time.RFC3339),
++		})
++	}
++
+ 	// Convert SQL to storage paths (with caching)
+ 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
+ 	convertedSQL, _ := h.getTransformedSQL(sql, "")
+diff --git a/internal/api/query_preview.go b/internal/api/query_preview.go
+index 6ab1439..38d182c 100644
+--- a/internal/api/query_preview.go
++++ b/internal/api/query_preview.go
+@@ -71,6 +71,13 @@ func (h *QueryPreviewHandler) handlePreview(c *fiber.Ctx) error {
+ 		})
+ 	}
+ 
++	if err := validateUserSQL(req.SQL); err != nil {
++		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
++			"success": false,
++			"error":   err.Error(),
++		})
++	}
++
+ 	ctx, cancel := context.WithTimeout(c.UserContext(), previewTimeout)
+ 	defer cancel()
+ 

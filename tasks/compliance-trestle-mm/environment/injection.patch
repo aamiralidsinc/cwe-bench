@@ -1,0 +1,199 @@
+diff --git a/trestle/core/commands/author/component.py b/trestle/core/commands/author/component.py
+index f6e70b10..45881f64 100644
+--- a/trestle/core/commands/author/component.py
++++ b/trestle/core/commands/author/component.py
+@@ -55,6 +55,14 @@ class ComponentGenerate(AuthorCommonCommand):
+             '-o', '--output', help='Name of the output generated component markdown folder', required=True, type=str
+         )  # noqa E501
+         self.add_argument('-fo', '--force-overwrite', help=const.HELP_FO_OUTPUT, required=False, action='store_true')
++        self.add_argument(
++            '-cn',
++            '--component-name',
++            help='Name of the subfolder under the output folder to write the generated markdown into.',
++            required=False,
++            default=None,
++            type=str,
++        )
+ 
+     def _run(self, args: argparse.Namespace) -> int:
+         try:
+@@ -67,12 +75,18 @@ class ComponentGenerate(AuthorCommonCommand):
+                 except TrestleError as e:  # pragma: no cover
+                     raise TrestleError(f'Unable to overwrite contents in {args.output} folder: {e}')
+ 
+-            return self.component_generate_all(args.trestle_root, args.name, args.output)
++            return self.component_generate_all(args.trestle_root, args.name, args.output, args.component_name)
+ 
+         except Exception as e:  # pragma: no cover
+             return handle_generic_command_exception(e, logger, 'Generation of the component markdown failed')
+ 
+-    def component_generate_all(self, trestle_root: pathlib.Path, comp_def_name: str, markdown_dir_name: str) -> int:
++    def component_generate_all(
++        self,
++        trestle_root: pathlib.Path,
++        comp_def_name: str,
++        markdown_dir_name: str,
++        component_name: Optional[str] = None,
++    ) -> int:
+         """Generate markdown for all components in comp def."""
+         if not file_utils.is_directory_name_allowed(markdown_dir_name):
+             raise TrestleError(f'{markdown_dir_name} is not an allowed directory name')
+@@ -84,6 +98,15 @@ class ComponentGenerate(AuthorCommonCommand):
+         context.prompt_responses = True
+         context.comp_def = component_def
+ 
++        if component_name:
++            # The named subfolder sits under the output folder the command already chose.
++            rc = CmdReturnCodes.SUCCESS.value
++            for component in as_list(component_def.components):
++                rc = self.component_generate_by_name(context, component, md_path / component_name)
++                if rc != CmdReturnCodes.SUCCESS.value:
++                    break
++            return rc
++
+         rc = CmdReturnCodes.SUCCESS.value
+         for component in as_list(component_def.components):
+             rc = self.component_generate_by_name(context, component, md_path / component.title)
+diff --git a/trestle/core/commands/author/docs.py b/trestle/core/commands/author/docs.py
+index 6bb8f094..1fcbea16 100644
+--- a/trestle/core/commands/author/docs.py
++++ b/trestle/core/commands/author/docs.py
+@@ -91,6 +91,15 @@ class Docs(AuthorCommonCommand):
+             action='store_true',
+         )
+ 
++        self.add_argument(
++            '-sn',
++            '--sample-name',
++            help='Name to give the sample document created by create-sample, instead of the indexed default.',
++            required=False,
++            default=None,
++            type=str,
++        )
++
+     def _run(self, args: argparse.Namespace) -> int:
+         try:
+             status = 1
+@@ -98,7 +107,7 @@ class Docs(AuthorCommonCommand):
+                 return status
+ 
+             if args.mode == 'create-sample':
+-                status = self.create_sample()
++                status = self.create_sample(args.sample_name)
+ 
+             elif args.mode == 'template-validate':
+                 status = self.template_validate(args.governed_heading, args.header_validate, args.header_only_validate)
+@@ -147,8 +156,12 @@ class Docs(AuthorCommonCommand):
+         logger.info(f'Task directory is {self.rel_dir(self.task_path)}')
+         return CmdReturnCodes.SUCCESS.value
+ 
+-    def create_sample(self) -> int:
+-        """Presuming the template exists, copy into a sample markdown file with an index."""
++    def create_sample(self, sample_name: Optional[str] = None) -> int:
++        """Presuming the template exists, copy into a sample markdown file with an index.
++
++        If a sample name is given the sample is written under that name, otherwise an indexed
++        name derived from the task name is used.
++        """
+         template_file = self.template_dir / self.template_name
+ 
+         if not self._validate_template_dir():
+@@ -156,6 +169,13 @@ class Docs(AuthorCommonCommand):
+         if not template_file.is_file():
+             raise TrestleError('No template file ... exiting.')
+ 
++        if sample_name:
++            candidate_task = self.task_path / sample_name
++            candidate_task.parent.mkdir(exist_ok=True, parents=True)
++            shutil.copy(str(template_file), str(candidate_task))
++            logger.info(f'Sample document created for task {self.task_name} at {self.rel_dir(candidate_task)}')
++            return CmdReturnCodes.SUCCESS.value
++
+         index = 0
+         while True:
+             candidate_task = self.task_path / f'{self.task_name}_{index:03d}.md'
+diff --git a/trestle/core/commands/author/folders.py b/trestle/core/commands/author/folders.py
+index cda31ac6..b624684c 100644
+--- a/trestle/core/commands/author/folders.py
++++ b/trestle/core/commands/author/folders.py
+@@ -20,7 +20,7 @@ import logging
+ import pathlib
+ import re
+ import shutil
+-from typing import Any, Dict, List
++from typing import Any, Dict, List, Optional
+ 
+ import trestle.core.commands.author.consts as author_const
+ import trestle.core.draw_io as draw_io
+@@ -34,6 +34,22 @@ from trestle.core.markdown.markdown_api import MarkdownAPI
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _sample_folder_name_allowed(name: str) -> bool:
++    """Whether a name given to a sample folder is allowed.
++
++    A sample folder is an ordinary folder inside the task, so its name must not land on one of
++    the OSCAL model directories the project reserves at the root of the workspace.
++    """
++    pathed_name = pathlib.Path(name)
++    if not pathed_name.parts:
++        logger.warning('Sample folder name must not be empty.')
++        return False
++    if pathed_name.parts[0] in const.MODEL_TYPE_TO_MODEL_DIR.values():
++        logger.warning('Sample folder name is the same as an OSCAL schema name.')
++        return False
++    return True
++
++
+ class Folders(AuthorCommonCommand):
+     """Markdown governed folders - enforcing consistent files and templates across directories."""
+ 
+@@ -89,12 +105,21 @@ class Folders(AuthorCommonCommand):
+             action='store_true',
+         )
+ 
++        self.add_argument(
++            '-sn',
++            '--sample-name',
++            help='Name to give the sample folder created by create-sample, instead of the indexed default.',
++            required=False,
++            default=None,
++            type=str,
++        )
++
+     def _run(self, args: argparse.Namespace) -> int:
+         try:
+             if self._initialize(args):
+                 raise TrestleError(f'Error when initializing trestle folders command with args: {args}')
+             if args.mode == 'create-sample':
+-                status = self.create_sample()
++                status = self.create_sample(args.sample_name)
+ 
+             elif args.mode == 'template-validate':
+                 status = self.template_validate(
+@@ -378,13 +403,24 @@ class Folders(AuthorCommonCommand):
+ 
+         return templates
+ 
+-    def create_sample(self) -> int:
++    def create_sample(self, sample_name: Optional[str] = None) -> int:
+         """
+         Create a sample folder within the task and populate with template content.
+ 
++        If a sample name is given the folder is created under that name, otherwise an indexed
++        name is used.
++
+         Returns:
+             Unix return code for running sample as a command.
+         """
++        if sample_name:
++            if not _sample_folder_name_allowed(sample_name):
++                raise TrestleError(f'{sample_name} is not an allowed sample folder name')
++            sample_path = self.task_path / sample_name
++            shutil.copytree(str(self.template_dir), str(sample_path))
++            logger.info(f'Sample folder created for task {self.task_name} at {self.rel_dir(sample_path)}')
++            return CmdReturnCodes.SUCCESS.value
++
+         ii = 0
+         while True:
+             sample_path = self.task_path / f'sample_folder_{ii}'

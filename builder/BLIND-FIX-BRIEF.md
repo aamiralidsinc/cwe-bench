@@ -1,24 +1,28 @@
 # Blind-fix brief (gate requirement, BUILDER.md 3f)
 
-You are an engineer who has received a vulnerability report. You see ONLY:
-- `WORK/instruction.md` (the report), and
-- the vulnerable repository at `WORK/app/` (plus any helper jars in `WORK/libs/`).
+You write the task's second complete fix, the `kind: "blind"` pass patch. It is a SOUNDNESS
+CONTROL: it shows the hidden tests accept a correct fix that is not the reference's exact code. It
+is NOT a fairness test and does not show that a solver can find the fix (user rule, 2026-10-20).
 
-Rules (this check proves the task is fair and findable from the report alone):
-1. Do NOT open anything under `/Users/dev/terminal-bench/cwe-bench/` (tasks, tests, build notes, the
-   reference fix) or `~/.tb-graders/` outside `WORK/`. Do not search the web or look up the upstream
-   fix. Read only the report and the repository.
-2. Fix the vulnerability in `WORK/app/` so that the report's attack and its close variants no longer
-   work, every security property the report states holds, and legitimate use keeps working exactly
+You may use everything in view: `WORK/instruction.md`, the vulnerable repository at `WORK/app/`
+(plus any helper jars in `WORK/libs/`), the private trap list (`WORK/injected-sites.md`), the hidden
+tests, the reference fix and failing gate output. Prefer your own structure over copying the
+reference (different helper, different placement, different style), but finishing the fix from
+the reference or from failing tests is fine. Do not search the web or look up the upstream fix.
+
+1. Fix the vulnerability in `WORK/app/` so the reported attack, every site in the trap list and
+   every security property the report states are closed, and legitimate use keeps working exactly
    as stated. Change source only, not tests.
-3. Verify what you can locally: write your own small probes or tests under `WORK/probe/` (outside
-   `app/`), compile and run them if the toolchain allows. Do not start Docker.
-4. When done, write the patch: `cd WORK && diff -ruN pristine app > WORK/blind.patch`, then make
+2. Verify what you can: write probes or tests under `WORK/probe/` (outside `app/`) and compile and
+   run them where the toolchain allows. The gate is the final check: the patch must score 1.0.
+3. When done, write the patch: `cd WORK && diff -ruN pristine app > WORK/blind.patch`, then make
    its paths `a/...` and `b/...` relative to the repository root (the gate applies it with
    `patch -p1` inside `/app`). Check that it applies cleanly with `patch -p1 --dry-run` to a fresh
    copy of `pristine`.
-5. Then, separately, answer in `WORK/mechanisms.md`: list every distinct code mechanism or path
-   you believe the report covers and that you changed, one line each, and say which ones the
-   report's wording itself pointed you to, as opposed to ones you found by reading the code.
+4. Write `WORK/mechanisms.md`: the fix at each site, one line each.
+
+Fairness is judged separately, after the trial, on two checks only: the instruction and the tests
+never contradict each other, and every tested sibling is covered by a general rule the instruction
+states. Nothing about how this patch was written bears on either.
 
 Return: the patch path, a 5-line summary of the fix, and the mechanisms list.
