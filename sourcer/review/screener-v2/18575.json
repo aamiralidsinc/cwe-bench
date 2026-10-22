@@ -1,0 +1,86 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "18575",
+  "advisory_ids": ["GHSA-P6PH-3JX2-3337", "CVE-2026-102663", "GO-2026-6113"],
+  "repo": "openlistteam/openlist",
+  "pinned_commit": "unknown (parent of 59bd3431408578f420895457554700cc9a52375a; parent_commit is null in the candidate record)",
+  "fix_commits": ["59bd3431408578f420895457554700cc9a52375a", "84ecda35aae2bd0020474086e6ddfd3aa2340679"],
+  "trust_decision": {
+    "summary": "Which index hits (and how many, via `total`) a user may see from /api/fs/search is decided after the backend query, in the handler: base-path containment plus meta hide/read/password via common.CanAccess. The total is still taken from the unfiltered backend count, and the Bleve backend never scopes hits to req.Parent at all.",
+    "evidence": [
+      "server/handles/search.go:46-68",
+      "server/common/check.go:50-63",
+      "internal/search/bleve/search.go:28-57",
+      "pkg/utils/path.go:41-44"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/search/bleve/search.go:28-57",
+    "why": "The summary names a path check in Bleve search; Bleve's Search builds its query from keywords and scope only (lines 29-38), ignores req.Parent, and returns the unfiltered searchResults.Total (line 57)."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:44-83", "entry_point": "HTTP /api/fs/search (server/router.go:200) via search.SearchFiltered -> Bleve.SearchFiltered", "module_kind": "backend implementation (Bleve searcher): separator-aware IsSubPath(req.Parent) scoping plus filter applied before pagination/total"},
+    {"where": "fix.diff:19-39", "entry_point": "HTTP /api/fs/search via Bleve.Search (refactored into buildQuery/searchNodeFromHit, stable sort on _id)", "module_kind": "backend implementation (Bleve searcher)"},
+    {"where": "fix.diff:179-217", "entry_point": "HTTP /api/fs/search via internal search.SearchFiltered; generic fallback used by db, db_non_full_text and meilisearch backends", "module_kind": "dispatcher / wrapper over all backends"},
+    {"where": "fix.diff:297-302", "entry_point": "internal API: searcher.FilteredSearcher interface and searcher.Filter type", "module_kind": "lower-level interface"},
+    {"where": "fix.diff:322-337", "entry_point": "HTTP /api/fs/search (server/handles/search.go:27)", "module_kind": "HTTP handler"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "fix.diff:181-217 (internal/search/search.go SearchFiltered fallback for non-Bleve backends; at pinned commit internal/search/search.go:50-52 plus internal/db/searchnode.go:81-90 and internal/search/meilisearch/search.go:78 return pre-filter totals)"
+  },
+  "O3_reason_to_dismiss": "The advisory title says 'Bleve search' and 'path check'; the DB and Meilisearch backends already scope by parent in their own queries (internal/db/searchnode.go:15-22, internal/search/meilisearch/search.go:53-57), so a solver can argue they are not affected. They still leak the count of hidden or password-protected entries, because the handler filters after the total is computed.",
+  "O4_distance": {"files": 4, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Several behaviours must keep working: correct total and page slicing across pages and across 1000-hit batches with duplicate names; a correct password unlocking results inside protected folders; users who can see hides still seeing hidden entries; descendants of req.Parent (including req.Parent itself) still being returned while sibling-prefix dirs (/base vs /base2) are excluded. Over-broad fixes, such as setting total to the page length, dropping all results in password-protected dirs, or using a raw prefix compare, break these.",
+    "where": "server/common/check.go:50-75; pkg/utils/path.go:41-44; fix.diff:130-170; fix.diff:264-288"
+  },
+  "O6_input_shapes": [
+    "req.Parent that is a string prefix of a sibling directory without a separator (/base vs /base2)",
+    "node.Parent equal to req.Parent and deeper descendants",
+    "page > 1 (filter must run before offset/limit)",
+    "result sets larger than one 1000-hit backend batch with identical sort keys (needs _id tie-break / search_after)",
+    "scope variants (all / dir / file) via buildQuery",
+    "hidden (meta.Hide) and password-protected (meta.Password) entries counted in total"
+  ],
+  "O7_producer": {"kind": "none", "where": "Index contents are produced by internal/search/build.go (indexer) and stored unscoped in Bleve; the check is a result filter, not a producer call", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/search/db/search.go:17-19", "sibling": "A SQL-native FilteredSearcher for the DB backend that applies the parent LIKE scope but takes the COUNT before the per-node access filter", "why_realistic": "The generic fallback scans every row in 1000-row batches (fix.diff:196-215); a maintainer optimising DB search would push filtering into SQL and could reuse the existing Count at internal/db/searchnode.go:81-84."},
+    {"where": "internal/search/meilisearch/search.go:43-79", "sibling": "A Meilisearch FilteredSearcher that pages natively and returns search.TotalHits without applying the handler filter", "why_realistic": "Meilisearch already has its own parent filter and TotalHits (line 78), so a native implementation that skips the callback mirrors the Bleve one and looks like an obvious optimisation."},
+    {"where": "server/router.go:200", "sibling": "A second search handler (e.g. a share-scoped or guest search) that calls search.Search directly instead of search.SearchFiltered", "why_realistic": "search.Search stays public (internal/search/search.go:50-52) and fsAndShare already shows share-specific route variants (server/router.go:191-197)."}
+  ],
+  "O9_family": "authorization / information disclosure: post-query access filter with a pre-filter result count and missing scope (CWE-200/CWE-639)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25 (go.mod:3); pure-Go sqlite (glebarez/sqlite) and bleve v2.5.2",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "No tests for search at the pinned commit except internal/search/build_test.go; the fix adds internal/search/bleve/search_test.go (in-memory Bleve index) and internal/search/search_test.go (stub searcher), both runnable offline with go test."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/search/bleve/search.go, internal/search/search.go, internal/search/searcher/searcher.go, server/handles/search.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_tempting_wrong_fix": "Add a parent-prefix query or IsSubPath(req.Parent) check inside Bleve.Search only, leaving total = unfiltered searchResults.Total and the handler filtering after pagination for every backend."
+  },
+  "out_of_scope_notes": [
+    "internal/db/searchnode.go:19-21 builds the parent LIKE pattern from req.Parent without escaping % or _, so the DB scope can over-match; the handler still checks base path and access.",
+    "The generic SearchFiltered fallback and Bleve.SearchFiltered scan the whole result set in 1000-hit batches on every request (fix.diff:53-81, fix.diff:196-215); this has a cost profile but is not pursued."
+  ],
+  "unverified": [
+    "pinned_commit SHA: not given in the inputs and not derivable without git.",
+    "repo_mb: size not measured (no shell); repo has many storage drivers, so it is assumed not tiny or giant.",
+    "fix.diff appears to combine both fix commits; how the changes split between 59bd343 and 84ecda3 was not checked.",
+    "Advisory text was not available locally; the trust decision is inferred from the summary and the diff.",
+    "Latest code still has SearchFiltered in the handler (latest/server/handles/search.go:46) and Bleve parent scoping (latest/internal/search/bleve/search.go:72); latest db/meilisearch backends were not re-read in full."
+  ]
+}

@@ -45,3 +45,23 @@ kept it as a draft.
 1. A reader or code pass over the top 30.
 2. Build from the confirmed ones.
 3. Refit the weights on the outcomes and promote to v4.
+
+## Screener tooling (added 2026-10-16)
+For `builder/SCREENER-PROMPT-v1.md`. The prompt text and its output schema are read from that file,
+never copied into these scripts.
+- `validate_screen.py`: checks a screener record against the prompt's own JSON block (keys, types,
+  enums, versions, no score field), resolves every file:line against the pinned tree (`--repo`), and
+  warns where the `j` block or `pattern_fit` contradicts the observations.
+- `screen-weights.json` (`screen-w0`, **not validated**): points per observation. Draft values from
+  lessons-v1; not fitted, and not to be tuned on the calibration hosts.
+- `rerank.py --screened DIR`: scores every valid record under DIR into `host-rank-screened.tsv`.
+  `score_read` = observation terms + the weakness terms (H5). The base TSVs are unchanged (checked
+  byte for byte against the committed output).
+- `screen_prepare.py`: fills the prompt per (model, host) and writes the candidate JSON and
+  `hosts.tsv`; `--calibration` takes the hosts from the prompt file's calibration table. The outcome
+  labels go to `labels.tsv`, which stays local.
+- `vm/fetch_hosts.sh`, `vm/run_screen.sh`: fetch each host's pinned tree, fix diff and latest
+  release without `.git`; run one headless Claude Code screening with read-only file tools confined to
+  the run dir and that host's code.
+- `screen_calibrate.py`: the comparison-log metrics (field agreement with the reference, wrong
+  evidence, ranking concordance with known outcomes, cost, time, stops).

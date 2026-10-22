@@ -1,0 +1,97 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v1",
+  "model": "claude-opus-5-5",
+  "entry_id": "16906",
+  "advisory_ids": ["GHSA-9H23-53F4-Q947", "CVE-2026-107804"],
+  "repo": "0xjacky/nginx-ui",
+  "pinned_commit": "parent of e30e331303fc21cf077a2bea724bd79e66892eaf (parent_commit null in candidate)",
+  "fix_commits": ["e30e331303fc21cf077a2bea724bd79e66892eaf"],
+  "trust_decision": {
+    "summary": "Which peer may supply the client IP (X-Forwarded-For/X-Real-IP) is decided once, engine-wide, by gin SetTrustedProxies in InitRouter; at the pinned commit nothing is trusted, so behind the bundled Docker nginx every request has ClientIP 127.0.0.1, which the IP allowlist exempts and the login ban keys on as one shared bucket.",
+    "evidence": [
+      "router/routers.go:47",
+      "internal/middleware/ip_whitelist.go:13-14",
+      "api/user/auth.go:51-56",
+      "api/user/auth.go:74",
+      "resources/docker/nginx-ui.conf:28-29",
+      "resources/docker/nginx-ui.conf:35",
+      "Dockerfile:10"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/middleware/ip_whitelist.go:14",
+    "why": "The summary names IP allowlists and the loopback exemption is visible here; the lockout half leads to api/user/auth.go:51. The real cause is the engine trusted-proxy setting in another package (router/routers.go:47)."
+  },
+  "fix_sites": [
+    {"where": "router/routers.go:47", "entry_point": "every HTTP route on the cosy/gin engine (engine-level SetTrustedProxies; fix.diff:1824-1827)", "module_kind": "router/engine bootstrap (defaults)"},
+    {"where": "fix.diff:1663-1682", "entry_point": "same engine-wide; new router/client_ip.go picks trusted proxies by topology via helper.ShouldManageBundledNginx (internal/helper/docker.go:21-24)", "module_kind": "router/topology default (new file)"},
+    {"where": "settings/auth.go:3-7", "entry_point": "app.ini [auth] / env NGINX_UI_AUTH_TRUSTED_PROXIES; POST /api/settings binding (fix.diff:1839 adds TrustedProxies with ip|cidr|redacted, protected)", "module_kind": "settings schema / config loader"},
+    {"where": "internal/middleware/ip_whitelist.go:14", "entry_point": "/api/* group (router/routers.go:64), /mcp and /mcp_message (mcp/router.go:39, mcp/router.go:43), embedded static (router/routers_embed.go:16); fix drops the empty-ClientIP fail-open (fix.diff:1409-1410)", "module_kind": "HTTP middleware"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "router/routers.go:47 (engine default SetTrustedProxies(nil); the fix replaces it with a topology-aware default merged with the configured TrustedProxies, fix.diff:1663-1682)"
+  },
+  "O3_reason_to_dismiss": "The router bootstrap looks like generic framework setup, and `SetTrustedProxies(nil)` reads as already hardened. A solver could argue the bug is the loopback exemption in the middleware and leave the proxy topology alone.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Direct loopback clients must still pass the allowlist. X-Forwarded-For/X-Real-IP from untrusted peers must still be ignored. Deployments without the bundled nginx (NGINX_UI_DISABLE_BUNDLED_NGINX, non-Docker) must not start trusting loopback. Trusting all proxies, or removing the loopback exemption, breaks one of these.",
+    "where": "internal/middleware/ip_whitelist.go:14; internal/helper/docker.go:21-24; router/routers.go:47"
+  },
+  "O6_input_shapes": [
+    "single X-Forwarded-For value via the bundled loopback proxy",
+    "X-Real-IP only",
+    "IPv6 loopback peer ::1 with an IPv6 forwarded client",
+    "multi-hop X-Forwarded-For chain, stopping at the first untrusted hop",
+    "spoofed X-Forwarded-For from an untrusted direct peer",
+    "invalid/unparseable RemoteAddr giving an empty ClientIP (now fails closed)",
+    "TrustedProxies entries as IP or CIDR, plus the redacted placeholder on settings save"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "settings/auth.go:3-12 (AuthSettings, loaded from app.ini/env; the fix adds TrustedProxies) consumed once at router/routers.go:47 at startup",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/middleware/middleware.go:182", "sibling": "The node-auth failure log could read X-Real-IP / X-Forwarded-For directly instead of ClientIP().", "why_realistic": "Diagnostic logging that wants the 'real' client behind a proxy often reads the header directly, bypassing the engine trust list."},
+    {"where": "api/user/passkey.go:239-241", "sibling": "Passkey login ban-clear (or an OTP/2FA attempt limiter) keyed on c.Request.RemoteAddr or a raw header.", "why_realistic": "A second auth entry point written separately from Login could pick a different client-IP source; it would still be shared 127.0.0.1 behind the bundled proxy."},
+    {"where": "mcp/router.go:39", "sibling": "The MCP route could use its own allowlist helper that trusts X-Forwarded-For from any peer.", "why_realistic": "MCP is registered on the engine outside the /api group with its own middleware chain, so a separate implementation there is plausible."}
+  ],
+  "O9_family": "CWE-346 origin validation: client-IP trust / forwarded-header trust boundary (IP allowlist bypass, shared login lockout)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go (backend); TypeScript/Vue (frontend, unrelated to the security change)",
+    "toolchain": "go 1.27.1 (go.mod:3), gin v1.12.0 (go.mod:30), uozi-tech/cosy v1.34.1 (go.mod:61); sqlite via gorm for tests",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Go tests for this area: internal/middleware/*_test.go (e.g. internal/middleware/middleware_test.go:109 sets RemoteAddr), api/user security tests, settings/restore and settings tests. Tests added by the fix: internal/middleware/ip_whitelist_test.go, router/client_ip_test.go, internal/user/login_ban_test.go. Hidden tests can drive gin.New()+configureTrustedProxies or InitRouter with httptest offline."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "router/routers.go, router/client_ip.go (new), settings/auth.go, internal/middleware/ip_whitelist.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Remove the 127.0.0.1/::1 exemption in IPWhiteList, or drop SetTrustedProxies(nil) so gin trusts every proxy, which makes X-Forwarded-For spoofable from any peer."
+  },
+  "out_of_scope_notes": [
+    "The fix commit is a release bundle: most of the diff is unrelated frontend work (session expiry, error normalization, nginx performance) and docs; c_same_check_name 'expireSession' is frontend noise, not part of this protection.",
+    "The IP allowlist matches exact strings only (lo.Contains at internal/middleware/ip_whitelist.go:19); no CIDR support, and IPv4-mapped IPv6 forms are not normalized.",
+    "Cluster Proxy middleware forwards requests to remote nodes, which see the controller's IP, not the browser's; a separate trust topology."
+  ],
+  "unverified": [
+    "repo_mb: repository size not measured (no shell use); tiny_repo/giant_repo not assessed but the tree looks large (Go backend + Vue app + docs).",
+    "pinned_commit SHA is not given in the inputs (parent_commit null); recorded as the parent of the fix commit.",
+    "Did not confirm whether cosy registers any other gin engine or listener in production outside router/routers.go:41; grep found only cosy.GetEngine there.",
+    "recall_risk 'low' rests on the publish date (2026-10-09) only; external write-ups were not checked (no network).",
+    "O8 is empty because every client-IP consumer (internal/middleware/ip_whitelist.go:13, api/user/auth.go:51, api/user/passkey.go:100, api/user/passkey.go:239, internal/middleware/middleware.go:182) uses c.ClientIP() on the single engine, so the engine-level fix covers them all; no raw header reads were found in Go sources."
+  ]
+}

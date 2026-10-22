@@ -1023,6 +1023,9 @@ def stage_diffs(args, idx):
     rows = idx.db.execute(
         "SELECT * FROM entries WHERE status = 'pending' AND repo IS NOT NULL").fetchall()
     rows.sort(key=lambda r: (prescore(r), r["published"] or ""), reverse=True)
+    first = {idx.seen_id(i.upper()) for i in args.first} - {None}
+    if first:
+        rows.sort(key=lambda r: r["entry_id"] not in first)
     fetcher = Fetcher(args.delay)
     started = time.time()
     done_requests = 0
@@ -2364,6 +2367,8 @@ def main():
     p.add_argument("--max-minutes", type=float, default=0)
     p.add_argument("--retry-errors", action="store_true",
                    help="fetch again commits whose last attempt ended in a network error")
+    p.add_argument("--first", nargs="*", default=[],
+                   help="advisory ids (any alias) to fetch before the rest of the queue")
     p.add_argument("--only-errors", action="store_true",
                    help="with --retry-errors: do nothing else")
 
