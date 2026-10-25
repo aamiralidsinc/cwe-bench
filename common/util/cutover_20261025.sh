@@ -70,8 +70,10 @@ mv "$OLD" "$LEG"; mv "$NEWTMP" "$OLD"; say "renamed old tree to $LEG; new tree i
 mv "$LEG/build" "$OLD/build"; mv "$LEG/tasks" "$OLD/tasks"; say "moved build/ and tasks/ into the new tree"
 # build/ moved whole, so its top level still holds the OLD tool scripts and docs (now in common/audit, common/trial,
 # attic/, docs/history/). Move them into the legacy tree so nobody can run an old build/trial.py by mistake.
+# (build/queue.json is NOT moved: it is trial.py's live verdict state. The 2026-10-25 run moved it by mistake and
+# it was restored from the legacy tree the same day.)
 mkdir -p "$LEG/build-toplevel-old-tools"
-for f in "$OLD"/build/*.py "$OLD"/build/*.py.bak* "$OLD"/build/*.sh "$OLD"/build/queue.json \
+for f in "$OLD"/build/*.py "$OLD"/build/*.py.bak* "$OLD"/build/*.sh \
          "$OLD"/build/RESULTS-AUDIT.md "$OLD"/build/RESUME-2026-10-17.md "$OLD"/build/TRIAL-PROCEDURE.md "$OLD"/build/trial-matrix.md; do
   [ -f "$f" ] && mv "$f" "$LEG/build-toplevel-old-tools/"
 done

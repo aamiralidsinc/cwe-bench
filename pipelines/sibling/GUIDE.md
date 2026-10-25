@@ -111,6 +111,7 @@ Exit codes 0/1/3/4.
 | `.sound` / `.unsound` / `.gate_error`, `gate_verdict.json` | gate result (exactly one marker) |
 | `runs_<model>.log`, `trial_detail*.json`, `evidence/` | trial records (runs are in `~/.tb-graders/cwe/jobs/`) |
 | `hold_<model>` | `common/trial/run_trial.sh` refuses new runs for that model |
+| `build/queue.json` | `trial.py`'s verdict state (written by `set_verdict` unless `--no-verdict`); run data, not in git |
 | `FAIRNESS.md` (+ `.prev-<UTC>`), `fairness_status.txt` | fairness review |
 | `VERSION`, `.last_snapshot` | task version; earlier versions are in `~/.tb-graders/cwe/experiments/<slug>/` |
 | `checks/blind.patch`, `blind_status.txt` | blind fix |
