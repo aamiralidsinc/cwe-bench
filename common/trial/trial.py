@@ -32,6 +32,9 @@ RUN = paths.RUN_TRIAL
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 sys.path.insert(0, str(paths.UTIL))
 import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
+# harvest_code, review_flags and postmortem (imported lazily below) live in common/audit/. Before the
+# 2026-10-25 reorganisation they sat next to this file in build/, where the script directory made them importable.
+sys.path.insert(0, str(paths.AUDIT_TOOLS))
 
 
 def run_evidence(task, name, cause, trial=None, proc=None, extra=None):
