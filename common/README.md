@@ -19,6 +19,7 @@ instead of building paths from their own location. The repo root is the folder h
 | `fairness/` | `FAIRNESS-REVIEW-BRIEF.md`, `fairness_verdict.py` | The fairness-review brief (two-gate split) and the verdict reader (READY / NOT_READY / ERROR). The launchers live in each pipeline |
 | `versioning/` | `snapshot_experiment.sh`, `restore_snapshot.sh` | Before an in-place edit: snapshot the task version and its runs to `~/.tb-graders/cwe/experiments/<slug>/vN-<UTC>/` and bump `VERSION`. Undo a failed or no-op edit |
 | `util/` | `agent_status.py`, `evidence.py`, `status_snapshot.sh`, `apply_docker_tweaks.sh`, `stop_lane.sh`, `rca_rerun.sh` + `rca/`, `stress_compose.sh`, `buildkit_test.sh` | Agent run status (ok or why not), full error evidence files, status snapshot, Docker daemon tuning, lane stop, root-cause re-runs, compose stress tests |
+| `util/cutover_20261025.sh` | | One-time switch of the VM working tree to this layout (2026-10-25): idle check, rename the old tree to `~/cwe-bench-legacy-20261025`, clone, move `build/` and `tasks/`, merge run records, compare tool outputs before and after |
 | `archive/` | | Old versions (`versions/`), superseded prompts, a stale template copy, old logs. See `archive/README.md` |
 
 ## Contracts other code relies on
