@@ -52,8 +52,8 @@ pinned code before you rely on it. The record is a lead.
      error, with no effect"), an operator opt-in, "keep every legitimate use working".
    - Keep the report short: the goal in a few lines, the property, the general contracts.
    - After the build, `stacking/run_listing_check.sh` classifies every hidden trap against the
-     report. One NAMED hidden trap, or more than one DESCRIBED hidden trap, and the task is not
-     marked sound.
+     report. One NAMED hidden trap, or more than one DESCRIBED hidden trap, is a FAIL. Once the
+     reviewer is calibrated (`stacking/LISTING_ENFORCE`), a FAIL means the task is not marked sound.
 
 **History rules** (by the record's `pattern`)
 8. **H3a / H3b (fix of a fix):**
@@ -76,7 +76,9 @@ pinned code before you rely on it. The record is a lead.
 **The control task**
 13. Also build `<slug>-control`: the same pinned code, the same report, but only the advisory's own
     route (the trap the report leads to) in the security tests and the reference. It isolates the
-    effect of stacking from the effect of the host.
+    effect of stacking from the effect of the host. The two `instruction.md` files stay byte-identical
+    for the task's whole life: any later change to the stacked report (fairfix, upgrade) is copied to
+    the control. `check_stack.py` checks it.
 
 **Manifest:** add a `stacking` block containing:
 - `pattern`;

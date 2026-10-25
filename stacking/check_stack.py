@@ -11,7 +11,8 @@ Checks:
   - one security_fail patch check per concept (a fix missing only that concept), expect fail;
   - recall checks: checks/upstream_fix.patch expect fail; for H3a/H3b also checks/upstream_first_fix.patch;
   - every hidden route has a coupled functional test listed;
-  - the control task directory exists.
+  - the control task directory exists, and its instruction.md is identical to the stacked task's
+    (rule 13; added 2026-10-24).
 
   python3 -I stacking/check_stack.py SLUG [--root <cwe-bench dir>]
 """
@@ -69,6 +70,18 @@ def main():
     ctl = st.get("control_slug")
     if ctl and not os.path.isdir(os.path.join(a.root, "tasks", ctl)):
         problems.append(f"control task tasks/{ctl} missing")
+    elif ctl:
+        # Build rule 13: the control has "the same report". Any instruction change to the stacked task
+        # (fairfix, the upgrade step) must be copied to the control, or the comparison is not controlled.
+        mine, theirs = (os.path.join(a.root, "tasks", s, "instruction.md") for s in (a.slug, ctl))
+        try:
+            same = open(mine, "rb").read() == open(theirs, "rb").read()
+        except OSError as e:
+            problems.append(f"instruction.md unreadable for the stacked task or its control: {e}")
+        else:
+            if not same:
+                problems.append(f"tasks/{ctl}/instruction.md differs from tasks/{a.slug}/instruction.md "
+                                "(rule 13: the control has the same report; copy the stacked one over)")
     if problems:
         print(f"{a.slug}: NOT conforming")
         for p in problems:

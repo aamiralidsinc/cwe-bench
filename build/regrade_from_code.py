@@ -17,6 +17,7 @@ image) and copied back. Binary files the harvest did not diff are skipped and li
 a database the grader itself created). The original verifier/ is never touched.
 audit_results.py uses the newest regrade-* in place of the original grading.
 """
+import os
 import argparse
 import hashlib
 import json
@@ -117,27 +118,30 @@ def main():
             note = rest[1] if len(rest) > 1 else ""
             src = root / path.lstrip("/")
             if kind == "D":
-                sh("docker", "exec", name, "rm", "-rf", path)
+                sh("docker", "exec", "-u", "root", name, "rm", "-rf", path)
                 applied.append(f"D {path}")
             elif "binary" in note or not src.is_file():
                 skipped.append(f"{kind} {path} ({note or 'not produced by the patch'})")
             else:
-                sh("docker", "exec", name, "mkdir", "-p", str(Path(path).parent))
+                sh("docker", "exec", "-u", "root", name, "mkdir", "-p", str(Path(path).parent))
                 if sh("docker", "cp", str(src), f"{name}:{path}").returncode == 0:
                     applied.append(f"{kind} {path}")
                 else:
                     skipped.append(f"{kind} {path}: copy failed")
 
-    sh("docker", "exec", name, "rm", "-rf", "/tests")
+    sh("docker", "exec", "-u", "root", name, "rm", "-rf", "/tests")
     sh("docker", "cp", f"{tdir / 'tests'}/.", f"{name}:/tests/")
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
-        run = sh("docker", "exec", name, "bash", "/tests/test.sh", timeout=vtimeout)
+        run = sh("docker", "exec", "-u", "root", name, "bash", "/tests/test.sh", timeout=vtimeout)
         rc, stdout = run.returncode, run.stdout + run.stderr
     except subprocess.TimeoutExpired as e:
         rc, stdout = "timeout", str(e.stdout or "")
     finished = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_tmp_logs(out, name)
+    # The grader runs as root, so files it wrote into the mounted /logs/verifier are root-owned;
+    # hand them back to this user before writing test-stdout.txt and REGRADE.json (2026-10-24).
+    sh("docker", "exec", "-u", "root", name, "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/logs/verifier")
     sh("docker", "rm", "-f", name)
     (out / "verifier" / "test-stdout.txt").write_text(stdout if isinstance(stdout, str) else str(stdout))
 

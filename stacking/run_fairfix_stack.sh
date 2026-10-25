@@ -10,18 +10,23 @@ set -uo pipefail
 SLUG=${1:?usage: stacking/run_fairfix_stack.sh SLUG}
 cd "$HOME/cwe-bench" || exit 1
 [ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash stacking/run_fairfix_stack.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+# FAIRFIX_BRIEF (2026-10-24): a brief with a numbered 'Required changes' list to apply INSTEAD of the
+# pre-trial review, e.g. a post-trial audit's repair (build/SLUG/AUDIT-FIX-*.md). Unset = FAIRNESS.md.
+BRIEF=${FAIRFIX_BRIEF:-build/${SLUG}/FAIRNESS.md}
+[ -f "$BRIEF" ] || { echo "error: brief $BRIEF missing" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+BN=$(basename "$BRIEF")
 echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
 bash pipeline/snapshot_experiment.sh "$SLUG"  # preserve prior version before in-place edit (provenance)
-P="You are revising ONE already-built security-fix benchmark task to address its pre-trial FAIRNESS
+P="You are revising ONE already-built security-fix benchmark task to address its FAIRNESS
 review before model trials. Project root: $HOME/cwe-bench. Task slug: ${SLUG}.
 
-Read, in order: build/${SLUG}/FAIRNESS.md (the review, with a numbered 'Required changes' list),
+Read, in order: ${BRIEF} (the review or audit brief, with a numbered 'Required changes' list),
 builder/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
 tasks/${SLUG}/tests/ (all files), tasks/${SLUG}/solution/fix.patch, build/${SLUG}/manifest.json,
 build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch.
 
-Apply EVERY 'Required' change in FAIRNESS.md (and any 'Recommended' change that is cheap and clearly
+Apply EVERY 'Required' change in ${BN} (and any 'Recommended' change that is cheap and clearly
 safe). These typically mean: remove sentences in instruction.md that name a file/function/trap/
 mechanism/variant-list/count or otherwise hint the fix; add or loosen/tighten security or functional
 tests exactly as the review specifies; add the check patches it names (checks/*.patch) and wire them
@@ -38,7 +43,7 @@ Hard rules:
 - Never add a sentence that describes where a sibling, far site or uncovered route lives, even in
   product terms (a route, operation, command, channel, object kind, stage or format), and never
   list them. When a test needs coverage in the instruction, widen the one general property over
-  the protected data or outcome. Apply every item under 'Required: generalize' in FAIRNESS.md.
+  the protected data or outcome. Apply every item under 'Required: generalize' in ${BN}.
 - Never 'fix' a real unfixed upstream route, or a route where the protection never existed, by
   removing it, its tests or its trap, or by adding a sentence that points at it. Such a route is
   fair when the general property covers it. Repair only real defects: wording that excludes the
@@ -52,7 +57,7 @@ Then run the gate yourself, one stage at a time, and iterate until all pass:
   python3 -I builder/gate.py ${SLUG} --only oracle
   python3 -I builder/gate.py ${SLUG} --only patches
 A missing blind.patch in static is allowed (it is wired separately). Report, under 300 words: each
-FAIRNESS 'Required' item and how you addressed it, the final gate result per stage, and any item you
+${BN} 'Required' item and how you addressed it, the final gate result per stage, and any item you
 could not fully satisfy and why."
 P="$P
 
@@ -70,3 +75,15 @@ echo "$st" > "build/$SLUG/fairfix_status.txt"
 echo "$SLUG fairfix: exit $rc; $st"
 # An unfinished fairfix may leave a half-edited task: put back the version that was trialed.
 [ "$st" = ok ] || { bash pipeline/restore_snapshot.sh "$SLUG" "fairfix: $st"; exit 1; }
+
+# Build rule 13 (2026-10-24): the control has the same report as the stacked task. A fairfix that changed
+# instruction.md is copied to the control (snapshotted first, for provenance), then the listing check is
+# re-run on the new wording (fairness addendum, fairfix rules). The control's tests are not touched.
+CTL=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('stacking') or {}).get('control_slug',''))" "build/$SLUG/manifest.json" 2>/dev/null)
+if [ -n "$CTL" ] && [ -f "tasks/$CTL/instruction.md" ] && ! cmp -s "tasks/$SLUG/instruction.md" "tasks/$CTL/instruction.md"; then
+  bash pipeline/snapshot_experiment.sh "$CTL"
+  cp "tasks/$SLUG/instruction.md" "tasks/$CTL/instruction.md"
+  echo "$(date -u +%FT%TZ) fairfix changed tasks/$SLUG/instruction.md; copied it to tasks/$CTL/instruction.md (rule 13)" | tee -a "build/$SLUG/control_sync.log"
+fi
+bash stacking/run_listing_check.sh "$SLUG" > /dev/null 2>&1   # MODEL is already set by drive.sh
+echo "$SLUG listing check after fairfix: $(python3 -I stacking/listing_verdict.py "$SLUG" | head -1)"

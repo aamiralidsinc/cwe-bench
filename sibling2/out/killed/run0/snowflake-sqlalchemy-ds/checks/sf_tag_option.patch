@@ -1,0 +1,854 @@
+diff --git a/src/snowflake/sqlalchemy/base.py b/src/snowflake/sqlalchemy/base.py
+index 96f6695..65f8001 100644
+--- a/src/snowflake/sqlalchemy/base.py
++++ b/src/snowflake/sqlalchemy/base.py
+@@ -24,7 +24,13 @@ from sqlalchemy.sql.selectable import Lateral, SelectState
+ 
+ from snowflake.sqlalchemy._constants import DIALECT_NAME
+ from snowflake.sqlalchemy.compat import IS_VERSION_20, args_reducer, string_types
+-from snowflake.sqlalchemy.custom_commands import CloudStorageLocation, ExternalStage
++from snowflake.sqlalchemy.custom_commands import (
++    AWSBucket,
++    AzureContainer,
++    CloudStorageLocation,
++    ExternalStage,
++    GCSBucket,
++)
+ 
+ from ._constants import NOT_NULL
+ from .exc import (
+@@ -40,6 +46,8 @@ from .util import (
+     _set_connection_interpolate_empty_sequences,
+     _Snowflake_ORMJoin,
+     _Snowflake_Selectable_Join,
++    escape_backslashes,
++    escape_string_literal_interior,
+ )
+ 
+ RESERVED_WORDS = frozenset(
+@@ -461,16 +469,78 @@ class SnowflakeIdentifierPreparer(compiler.IdentifierPreparer):
+ 
+         super().__init__(dialect, initial_quote=quote, escape_quote=quote)
+ 
++    def _safe_quote(self, ident):
++        """Quote ``ident`` per dialect rules, but never emit an unsafe value raw.
++
++        ``IdentifierPreparer.quote`` honours ``quoted_name(..., quote=False)``
++        by returning the value verbatim.  In an identifier/schema position that
++        is a quoting concern (SNOW-3649808): an application that wraps a
++        user-derived identifier in ``quote=False`` would splat it unquoted into
++        the compiled statement.  We override only that case — when quote=False
++        but the value is *structurally* unsafe — while leaving legal bare
++        identifiers (the documented quote=False idiom, including upper-case
++        ones Snowflake folds) untouched.
++        """
++        if getattr(ident, "quote", None) is False and self._is_unsafe_unquoted(ident):
++            return self.quote_identifier(ident)
++        return self.quote(ident)
++
++    def _is_unsafe_unquoted(self, value: str) -> bool:
++        """Return True if emitting ``value`` unquoted could alter SQL structure.
++
++        Mirrors :meth:`_requires_quotes` but omits the case-only clause: an
++        upper/mixed-case identifier is harmless emitted bare (Snowflake folds
++        it), whereas whitespace, quotes, dots, parentheses, semicolons, etc. are
++        what require quoting.  Used to neutralise risky values while still
++        preserving the historical bare rendering of legal identifiers.
++        """
++        if not value:
++            return False
++        lc_value = value.lower()
++        return (
++            lc_value in self.reserved_words
++            or lc_value in self.illegal_identifiers
++            or value[0] in self.illegal_initial_characters
++            or not self.legal_characters.match(str(value))
++        )
++
++    def quote_identifier_if_unsafe(self, value: str) -> str:
++        """Quote each dot-separated part of ``value`` only when it is unsafe.
++
++        Used for custom-command identifiers (stage name/namespace, format_name,
++        file_format) that historically render bare and must keep doing so for
++        legal identifiers — including upper-case ones — while neutralising any
++        part that contains SQL metacharacters (SNOW-3649881 / SNOW-3649858).
++        """
++        return ".".join(
++            self.quote_identifier(p) if self._is_unsafe_unquoted(p) else str(p)
++            for p in self._split_schema_by_dot(value)
++            if p is not None
++        )
++
+     def _quote_free_identifiers(self, *ids):
+         """
+-        Unilaterally identifier-quote any number of strings.
++        Identifier-quote any number of strings, quoting whenever the value
++        requires it.  Unlike a bare ``quote()`` this refuses to emit an unsafe
++        ``quote=False`` identifier verbatim (see :meth:`_safe_quote`).
+         """
+-        return tuple(self.quote(i) for i in ids if i is not None)
++        return tuple(self._safe_quote(i) for i in ids if i is not None)
+ 
+     def quote_schema(self, schema, force=None):
+         """
+         Split schema by a dot and merge with required quotes
+         """
++        # SA 2.0 schema-translate tokens arrive as
++        # ``quoted_name("__[SCHEMA_<key>]", quote=False)``.  _safe_quote
++        # (used inside _quote_free_identifiers) overrides quote=False when
++        # the value contains unsafe characters — but the bracket characters
++        # in SA's internal token are safe as-is; quoting them
++        # destroys the token and breaks SA's post-compile substitution.
++        # Return the token string as-is so SA can resolve it normally.
++        if getattr(schema, "quote", None) is False and str(schema).startswith(
++            "__[SCHEMA_"
++        ):
++            return str(schema)
+         idents = self._split_schema_by_dot(schema)
+         return ".".join(self._quote_free_identifiers(*idents))
+ 
+@@ -480,8 +550,14 @@ class SnowflakeIdentifierPreparer(compiler.IdentifierPreparer):
+ 
+         if not isinstance(n, quoted_name) or n.quote is None:
+             return self.quote(s)
+-
+-        return self.quote_identifier(s) if n.quote else s
++        if n.quote:
++            return self.quote_identifier(s)
++        # n.quote is False: previously returned ``s`` verbatim, which let an
++        # application that wrapped a user-supplied alias in
++        # ``quoted_name(alias, quote=False)`` could emit arbitrary SQL into the
++        # projection list (SNOW-3649824).  _safe_quote encodes the rule:
++        # honour quote=False for legal bare identifiers, force-quote if unsafe.
++        return self._safe_quote(s)
+ 
+     def _requires_quotes(self, value: str) -> bool:
+         """Return True if the given identifier requires quoting."""
+@@ -544,6 +620,68 @@ class SnowflakeIdentifierPreparer(compiler.IdentifierPreparer):
+         ]
+ 
+ 
++def _render_storage_credentials(credentials_used, deterministic: bool = False) -> str:
++    """Render a ``CREDENTIALS=(...)`` clause with escaped literal values.
++
++    Credential values (SAS tokens, secret keys, KMS ids, ...) are
++    caller-supplied and embedded in single-quoted literals, so each is escaped
++    to neutralise single-quote / backslash sequences (SNOW-3649816).  Keys come
++    from the closed set defined by the bucket helpers and are emitted as-is.
++    """
++    items = list(credentials_used.items())
++    if deterministic:
++        items.sort(key=operator.itemgetter(0))
++    return "CREDENTIALS=({})".format(
++        " ".join(f"{n}='{escape_string_literal_interior(str(v))}'" for n, v in items)
++    )
++
++
++def _render_storage_encryption(encryption_used, deterministic: bool = False) -> str:
++    """Render an ``ENCRYPTION=(...)`` clause with escaped literal values."""
++    items = list(encryption_used.items())
++    if deterministic:
++        items.sort(key=operator.itemgetter(0))
++    return "ENCRYPTION=({})".format(
++        " ".join(
++            (
++                f"{n}='{escape_string_literal_interior(str(v))}'"
++                if isinstance(v, string_types)
++                else f"{n}={v}"
++            )
++            for n, v in items
++        )
++    )
++
++
++def _render_storage_uri(container) -> str:
++    """Return the escaped, single-quoted storage location literal for a container.
++
++    The bucket/path/account components originate from caller-supplied URIs
++    (``*.from_uri``), so the assembled body is escaped before being wrapped in
++    quotes — a single-quote in any component would otherwise escape the
++    location literal (SNOW-3649816 / SNOW-3649858).
++    """
++    if isinstance(container, AWSBucket):
++        body = "s3://{}{}".format(
++            container.bucket, f"/{container.path}" if container.path else ""
++        )
++    elif isinstance(container, AzureContainer):
++        body = "azure://{}.blob.core.windows.net/{}{}".format(
++            container.account,
++            container.container,
++            f"/{container.path}" if container.path else "",
++        )
++    elif isinstance(container, GCSBucket):
++        body = "gcs://{}{}".format(
++            container.bucket, f"/{container.path}" if container.path else ""
++        )
++    else:
++        raise TypeError(
++            f"Unsupported cloud storage location: {type(container).__name__}"
++        )
++    return f"'{escape_string_literal_interior(body)}'"
++
++
+ class SnowflakeCompiler(compiler.SQLCompiler):
+     def visit_sequence(self, sequence, **kw):
+         return self.dialect.identifier_preparer.format_sequence(sequence) + ".nextval"
+@@ -581,7 +719,11 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+             return "WHEN NOT MATCHED{} THEN {} ({}) VALUES ({})".format(
+                 case_predicate,
+                 merge_into_clause.command,
+-                ", ".join(sets),
++                # Column keys come straight from clause.values(**kwargs) with no
++                # resolution against the target table, so an application driving
++                # the column set from external input could emit unintended SQL here
++                # (SNOW-3649763).  Identifier-quote each key.
++                ", ".join(self.preparer.quote(s) for s in sets),
+                 ", ".join(map(lambda e: e._compiler_dispatch(self, **kw), sets_tos)),
+             )
+         else:
+@@ -591,7 +733,10 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+             sets = (
+                 ", ".join(
+                     [
+-                        f"{set[0]} = {set[1]._compiler_dispatch(self, **kw)}"
++                        # Same untrusted-key source as the INSERT branch above
++                        # (SNOW-3649763); quote the assignment target.
++                        f"{self.preparer.quote(set[0])} = "
++                        f"{set[1]._compiler_dispatch(self, **kw)}"
+                         for set in set_list
+                     ]
+                 )
+@@ -612,7 +757,7 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+         into = copy_into.into._compiler_dispatch(self, asfrom=True, **kw)
+         from_ = None
+         if isinstance(copy_into.from_, Table):
+-            from_ = copy_into.from_.name
++            from_ = self.preparer.quote_identifier_if_unsafe(copy_into.from_.name)
+         elif isinstance(copy_into.from_, (CloudStorageLocation, ExternalStage)):
+             from_ = copy_into.from_._compiler_dispatch(self, **kw)
+         # everything else (selects, etc.)
+@@ -671,7 +816,13 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+         if kw.get("deterministic", False):
+             options_list.sort(key=operator.itemgetter(0))
+         if "format_name" in formatter.options:
+-            return f"FILE_FORMAT=(format_name = {formatter.options['format_name']})"
++            # format_name is a (possibly schema-qualified) identifier supplied
++            # by the caller; quote any unsafe part so it cannot alter the COPY
++            # options / SQL while keeping normal names bare (SNOW-3649881).
++            format_name = self.preparer.quote_identifier_if_unsafe(
++                formatter.options["format_name"]
++            )
++            return f"FILE_FORMAT=(format_name = {format_name})"
+         return "FILE_FORMAT=(TYPE={}{})".format(
+             formatter.file_format,
+             (
+@@ -695,82 +846,66 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+         )
+ 
+     def visit_aws_bucket(self, aws_bucket, **kw):
+-        credentials_list = list(aws_bucket.credentials_used.items())
+-        if kw.get("deterministic", False):
+-            credentials_list.sort(key=operator.itemgetter(0))
+-        credentials = "CREDENTIALS=({})".format(
+-            " ".join(f"{n}='{v}'" for n, v in credentials_list)
+-        )
+-        encryption_list = list(aws_bucket.encryption_used.items())
+-        if kw.get("deterministic", False):
+-            encryption_list.sort(key=operator.itemgetter(0))
+-        encryption = "ENCRYPTION=({})".format(
+-            " ".join(
+-                ("{}='{}'" if isinstance(v, string_types) else "{}={}").format(n, v)
+-                for n, v in encryption_list
+-            )
+-        )
+-        uri = "'s3://{}{}'".format(
+-            aws_bucket.bucket, f"/{aws_bucket.path}" if aws_bucket.path else ""
+-        )
++        deterministic = kw.get("deterministic", False)
+         return (
+-            uri,
+-            credentials if aws_bucket.credentials_used else "",
+-            encryption if aws_bucket.encryption_used else "",
++            _render_storage_uri(aws_bucket),
++            (
++                _render_storage_credentials(aws_bucket.credentials_used, deterministic)
++                if aws_bucket.credentials_used
++                else ""
++            ),
++            (
++                _render_storage_encryption(aws_bucket.encryption_used, deterministic)
++                if aws_bucket.encryption_used
++                else ""
++            ),
+         )
+ 
+     def visit_azure_container(self, azure_container, **kw):
+-        credentials_list = list(azure_container.credentials_used.items())
+-        if kw.get("deterministic", False):
+-            credentials_list.sort(key=operator.itemgetter(0))
+-        credentials = "CREDENTIALS=({})".format(
+-            " ".join(f"{n}='{v}'" for n, v in credentials_list)
+-        )
+-        encryption_list = list(azure_container.encryption_used.items())
+-        if kw.get("deterministic", False):
+-            encryption_list.sort(key=operator.itemgetter(0))
+-        encryption = "ENCRYPTION=({})".format(
+-            " ".join(
+-                f"{n}='{v}'" if isinstance(v, string_types) else f"{n}={v}"
+-                for n, v in encryption_list
+-            )
+-        )
+-        uri = "'azure://{}.blob.core.windows.net/{}{}'".format(
+-            azure_container.account,
+-            azure_container.container,
+-            f"/{azure_container.path}" if azure_container.path else "",
+-        )
++        deterministic = kw.get("deterministic", False)
+         return (
+-            uri,
+-            credentials if azure_container.credentials_used else "",
+-            encryption if azure_container.encryption_used else "",
++            _render_storage_uri(azure_container),
++            (
++                _render_storage_credentials(
++                    azure_container.credentials_used, deterministic
++                )
++                if azure_container.credentials_used
++                else ""
++            ),
++            (
++                _render_storage_encryption(
++                    azure_container.encryption_used, deterministic
++                )
++                if azure_container.encryption_used
++                else ""
++            ),
+         )
+ 
+     def visit_gcs_bucket(self, gcs_bucket, **kw):
+-        encryption_list = list(gcs_bucket.encryption_used.items())
+-        if kw.get("deterministic", False):
+-            encryption_list.sort(key=operator.itemgetter(0))
+-        encryption = "ENCRYPTION=({})".format(
+-            " ".join(
+-                f"{n}='{v}'" if isinstance(v, string_types) else f"{n}={v}"
+-                for n, v in encryption_list
+-            )
+-        )
+-        uri = "'gcs://{}{}'".format(
+-            gcs_bucket.bucket, f"/{gcs_bucket.path}" if gcs_bucket.path else ""
+-        )
++        deterministic = kw.get("deterministic", False)
+         return (
+-            uri,
++            _render_storage_uri(gcs_bucket),
+             "",
+-            encryption if gcs_bucket.encryption_used else "",
++            (
++                _render_storage_encryption(gcs_bucket.encryption_used, deterministic)
++                if gcs_bucket.encryption_used
++                else ""
++            ),
+         )
+ 
+     def visit_external_stage(self, external_stage, **kw):
++        prefix = self.preparer.quote_identifier_if_unsafe(
++            f"{external_stage.namespace}{external_stage.name}"
++        )
+         if external_stage.file_format is None:
+-            return (
+-                f"@{external_stage.namespace}{external_stage.name}{external_stage.path}"
+-            )
+-        return f"@{external_stage.namespace}{external_stage.name}{external_stage.path} (file_format => {external_stage.file_format})"
++            return f"@{prefix}{external_stage.path}"
++        # file_format names a (possibly schema-qualified) file format object;
++        # quote any unsafe part so it cannot alter SQL in the stage
++        # reference (SNOW-3649881).
++        file_format = self.preparer.quote_identifier_if_unsafe(
++            external_stage.file_format
++        )
++        return f"@{prefix}{external_stage.path} (file_format => {file_format})"
+ 
+     def delete_extra_from_clause(
+         self, delete_stmt, from_table, extra_froms, from_hints, **kw
+@@ -901,7 +1036,17 @@ class SnowflakeCompiler(compiler.SQLCompiler):
+ 
+     def render_literal_value(self, value, type_):
+         # escape backslash
+-        return super().render_literal_value(value, type_).replace("\\", "\\\\")
++        return escape_backslashes(super().render_literal_value(value, type_))
++
++    def _escape_string_interior(self, value: str) -> str:
++        """Return ``value`` escaped for embedding inside a single-quoted literal.
++
++        Returns only the escaped interior (no surrounding quotes), so callers
++        that already supply the enclosing quotes can interpolate the result
++        directly.  Shares its escaping rules with the DDL compiler via
++        ``escape_string_literal_interior``.
++        """
++        return escape_string_literal_interior(value)
+ 
+ 
+ class SnowflakeExecutionContext(default.DefaultExecutionContext):
+@@ -964,6 +1109,14 @@ _identity_pk_warned: set = set()
+ 
+ 
+ class SnowflakeDDLCompiler(compiler.DDLCompiler):
++    def _escape_string_interior(self, value: str) -> str:
++        """Return ``value`` escaped for embedding inside a single-quoted literal.
++
++        DDL counterpart of ``SnowflakeCompiler._escape_string_interior``; both
++        share their escaping rules via ``escape_string_literal_interior``.
++        """
++        return escape_string_literal_interior(value)
++
+     def denormalize_column_name(self, name):
+         if name is None:
+             return None
+@@ -1097,16 +1250,52 @@ class SnowflakeDDLCompiler(compiler.DDLCompiler):
+ 
+         return text
+ 
++    def _format_stage_prefix(self, stage) -> str:
++        """Identifier-quote a stage's ``<namespace>.<name>`` prefix.
++
++        ``ExternalStage.prepare_namespace`` stores the namespace with a trailing
++        dot (or ``""``), so ``f"{stage.namespace}{stage.name}"`` always yields a
++        clean dotted identifier (``"DB.SCH.S"`` or ``"S"``).
++        ``quote_identifier_if_unsafe`` splits on dots internally, so the combined
++        string can be passed directly — no manual strip/rejoin needed.
++        Legal identifiers stay bare (no BCR).  (SNOW-3649858)
++        """
++        return self.preparer.quote_identifier_if_unsafe(
++            f"{stage.namespace}{stage.name}"
++        )
++
+     def visit_create_stage(self, create_stage, **kw):
+         """
+         This visitor will create the SQL representation for a CREATE STAGE command.
+         """
+-        return "CREATE {or_replace}{temporary}STAGE {}{} URL={}".format(
+-            create_stage.stage.namespace,
+-            create_stage.stage.name,
+-            repr(create_stage.container),
++        # Render the storage URL/credentials/encryption through the shared,
++        # escaped helpers rather than repr(container): repr() is a debug
++        # representation (and is redacted separately to hide secrets),
++        # and using it as a SQL serialiser left single-quote escaping incomplete
++        # (SNOW-3649858).
++        container = create_stage.container
++        deterministic = kw.get("deterministic", False)
++        uri = _render_storage_uri(container)
++        credentials = (
++            _render_storage_credentials(container.credentials_used, deterministic)
++            if getattr(container, "credentials_used", None)
++            else ""
++        )
++        encryption = (
++            _render_storage_encryption(container.encryption_used, deterministic)
++            if getattr(container, "encryption_used", None)
++            else ""
++        )
++        storage = "URL={}{}{}".format(
++            uri,
++            f" {credentials}" if credentials else "",
++            f" {encryption}" if encryption else "",
++        )
++        return "CREATE {or_replace}{temporary}STAGE {prefix} {storage}".format(
+             or_replace="OR REPLACE " if create_stage.replace_if_exists else "",
+             temporary="TEMPORARY " if create_stage.temporary else "",
++            prefix=self._format_stage_prefix(create_stage.stage),
++            storage=storage,
+         )
+ 
+     def visit_create_file_format(self, file_format, **kw):
+@@ -1116,7 +1305,9 @@ class SnowflakeDDLCompiler(compiler.DDLCompiler):
+         """
+         return "CREATE {}FILE FORMAT {} TYPE='{}' {}".format(
+             "OR REPLACE " if file_format.replace_if_exists else "",
+-            file_format.format_name,
++            # format_name is a (possibly schema-qualified) identifier; quote any
++            # unsafe part to prevent unintended DDL (SNOW-3649881).
++            self.preparer.quote_identifier_if_unsafe(file_format.format_name),
+             file_format.formatter.file_format,
+             " ".join(
+                 [
+@@ -1182,10 +1373,26 @@ class SnowflakeDDLCompiler(compiler.DDLCompiler):
+         This visitor will create the SQL representation for an ALTER STAGE
+         command that points the stage at a new storage location.
+         """
+-        return "ALTER STAGE {}{} SET URL={}".format(
+-            alter_stage.stage.namespace,
+-            alter_stage.stage.name,
+-            repr(alter_stage.container),
++        container = alter_stage.container
++        deterministic = kw.get("deterministic", False)
++        storage = "URL={}".format(_render_storage_uri(container))
++        credentials = (
++            _render_storage_credentials(container.credentials_used, deterministic)
++            if getattr(container, "credentials_used", None)
++            else ""
++        )
++        encryption = (
++            _render_storage_encryption(container.encryption_used, deterministic)
++            if getattr(container, "encryption_used", None)
++            else ""
++        )
++        if credentials:
++            storage += f" {credentials}"
++        if encryption:
++            storage += f" {encryption}"
++        return "ALTER STAGE {} SET {}".format(
++            self._format_stage_prefix(alter_stage.stage),
++            storage,
+         )
+ 
+ 
+diff --git a/src/snowflake/sqlalchemy/custom_commands.py b/src/snowflake/sqlalchemy/custom_commands.py
+index a302e5d..c88baa9 100644
+--- a/src/snowflake/sqlalchemy/custom_commands.py
++++ b/src/snowflake/sqlalchemy/custom_commands.py
+@@ -12,9 +12,41 @@ from sqlalchemy.sql.elements import ClauseElement
+ from sqlalchemy.sql.roles import FromClauseRole
+ 
+ from .compat import string_types
++from .util import escape_string_literal_interior
+ 
+ NoneType = type(None)
+ 
++# Cloud-storage option keys whose values are bearer secrets (cloud access keys,
++# SAS tokens, client-side-encryption master keys).  These must never appear in
++# any debug/log representation (SNOW-3649782 / SNOW-3649850).  Structural option
++# keys (TYPE, AWS_ROLE, KMS_KEY_ID, ...) are not secrets and stay visible.
++SECRET_OPTION_KEYS = frozenset(
++    {"AWS_SECRET_KEY", "AWS_KEY_ID", "AWS_TOKEN", "AZURE_SAS_TOKEN", "MASTER_KEY"}
++)
++REDACTED_SECRET = "***"
++
++
++def _redact_option(name, value):
++    """Return ``value`` for non-secret option keys, ``***`` for secret ones."""
++    return REDACTED_SECRET if name in SECRET_OPTION_KEYS else value
++
++
++# FILE_FORMAT option keys whose values are free-form text with no Snowflake
++# backslash-escape semantics.  These receive full escaping (doubles both ' and
++# \).  All other string options use quote-only escaping (' → ''), preserving
++# legitimate backslash sequences: delimiter/escape options validated to a single
++# character by _check_delimiter (e.g. RECORD_DELIMITER='\n'), and NULL_IF
++# elements which may carry the Snowflake null token \N (SNOW-3649888).
++_FULL_ESCAPE_OPTION_KEYS = frozenset(
++    {
++        "COMPRESSION",
++        "DATE_FORMAT",
++        "FILE_EXTENSION",
++        "TIME_FORMAT",
++        "TIMESTAMP_FORMAT",
++    }
++)
++
+ 
+ def translate_bool(bln):
+     if bln:
+@@ -104,7 +136,14 @@ class FilesOption:
+         self.file_names = file_names
+ 
+     def __str__(self):
+-        the_files = ["'" + f.replace("'", "\\'") + "'" for f in self.file_names]
++        # File names are frequently externally-influenced (uploads, object-store
++        # listings, webhook bodies).  Use the shared Snowflake literal escaping
++        # (doubles ' and \) instead of the old \' convention, which left a
++        # backslash-before-quote escaping under ESCAPE_STRING_LITERALS
++        # (SNOW-3649871).
++        the_files = [
++            "'" + escape_string_literal_interior(f) + "'" for f in self.file_names
++        ]
+         return f"({','.join(the_files)})"
+ 
+ 
+@@ -187,13 +226,26 @@ class CopyFormatter(ClauseElement):
+         """
+         return f"FILE_FORMAT=({self.options})"
+ 
++    @staticmethod
++    def _escape_option_str(name, value):
++        """Escape the interior of a FILE_FORMAT string option value.
++
++        Free-form text options (dates, times, extensions, compression type)
++        receive full escaping (doubles both ' and \\).  Delimiter/escape options
++        and NULL_IF receive quote-only escaping (' → '') so that legitimate
++        Snowflake backslash sequences (\\n, \\134, \\N) are preserved.
++        """
++        if name in _FULL_ESCAPE_OPTION_KEYS:
++            return escape_string_literal_interior(value)
++        return value.replace("'", "''")
++
+     @staticmethod
+     def value_repr(name, value):
+         """
+         Make a SQL-suitable representation of "value". This is called from
+         the corresponding visitor function (base.py/visit_copy_formatter())
+         - in case of a format name: return it without quotes
+-        - in case of a string: enclose in quotes: "value"
++        - in case of a string: enclose in quotes with interior escaping
+         - in case of a tuple of length 1: enclose the only element in brackets: (value)
+             Standard stringification of Python would append a trailing comma: (value,)
+             which is not correct in SQL
+@@ -202,9 +254,9 @@ class CopyFormatter(ClauseElement):
+         if name == "format_name":
+             return value
+         elif isinstance(value, str):
+-            return f"'{value}'"
++            return f"'{CopyFormatter._escape_option_str(name, value)}'"
+         elif isinstance(value, tuple) and len(value) == 1:
+-            return f"('{value[0]}')"
++            return f"('{CopyFormatter._escape_option_str(name, str(value[0]))}')"
+         else:
+             return str(value)
+ 
+@@ -534,11 +586,18 @@ class AWSBucket(CloudStorageLocation):
+ 
+     def __repr__(self):
+         credentials = "CREDENTIALS=({})".format(
+-            " ".join(f"{n}='{v}'" for n, v in self.credentials_used.items())
++            " ".join(
++                f"{n}='{_redact_option(n, v)}'"
++                for n, v in self.credentials_used.items()
++            )
+         )
+         encryption = "ENCRYPTION=({})".format(
+             " ".join(
+-                f"{n}='{v}'" if isinstance(v, string_types) else f"{n}={v}"
++                (
++                    f"{n}='{_redact_option(n, v)}'"
++                    if isinstance(v, string_types)
++                    else f"{n}={v}"
++                )
+                 for n, v in self.encryption_used.items()
+             )
+         )
+@@ -610,11 +669,18 @@ class AzureContainer(CloudStorageLocation):
+ 
+     def __repr__(self):
+         credentials = "CREDENTIALS=({})".format(
+-            " ".join(f"{n}='{v}'" for n, v in self.credentials_used.items())
++            " ".join(
++                f"{n}='{_redact_option(n, v)}'"
++                for n, v in self.credentials_used.items()
++            )
+         )
+         encryption = "ENCRYPTION=({})".format(
+             " ".join(
+-                f"{n}='{v}'" if isinstance(v, string_types) else f"{n}={v}"
++                (
++                    f"{n}='{_redact_option(n, v)}'"
++                    if isinstance(v, string_types)
++                    else f"{n}={v}"
++                )
+                 for n, v in self.encryption_used.items()
+             )
+         )
+@@ -660,7 +726,11 @@ class GCSBucket(CloudStorageLocation):
+     def __repr__(self):
+         encryption = "ENCRYPTION=({})".format(
+             " ".join(
+-                f"{n}='{v}'" if isinstance(v, string_types) else f"{n}={v}"
++                (
++                    f"{n}='{_redact_option(n, v)}'"
++                    if isinstance(v, string_types)
++                    else f"{n}={v}"
++                )
+                 for n, v in self.encryption_used.items()
+             )
+         )
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/as_query_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/as_query_option.py
+index 0205705..72323cb 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/as_query_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/as_query_option.py
+@@ -48,13 +48,17 @@ class AsQueryOption(TableOption):
+     def priority(self) -> Priority:
+         return Priority.LOWEST
+ 
+-    def __get_expression(self):
++    def __get_expression(self, compiler=None):
+         if isinstance(self.query, Selectable):
+-            return self.query.compile(compile_kwargs={"literal_binds": True})
++            dialect = compiler.dialect if compiler is not None else None
++            return self.query.compile(
++                dialect=dialect,
++                compile_kwargs={"literal_binds": True},
++            )
+         return self.query
+ 
+     def _render(self, compiler) -> str:
+-        return self.template() % (self.__get_expression())
++        return self.template() % (self.__get_expression(compiler))
+ 
+     def __repr__(self) -> str:
+         return "AsQueryOption(%s)" % self.__get_expression()
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/cluster_by_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/cluster_by_option.py
+index b92029b..df1862c 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/cluster_by_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/cluster_by_option.py
+@@ -45,11 +45,22 @@ class ClusterByOption(TableOption):
+     def priority(self) -> Priority:
+         return Priority.HIGH
+ 
+-    def __get_expression(self):
+-        return ", ".join([str(expression) for expression in self.expressions])
++    def __get_expression(self, compiler=None):
++        parts = []
++        for expr in self.expressions:
++            if isinstance(expr, TextClause):
++                parts.append(str(expr))  # TextClause is trusted literal SQL
++            elif isinstance(expr, str):
++                parts.append(self._quote_identifier_value(expr, compiler))
++            else:
++                raise TypeError(
++                    "ClusterByOption expressions must be str or TextClause, "
++                    f"got {type(expr).__name__}"
++                )
++        return ", ".join(parts)
+ 
+     def _render(self, compiler) -> str:
+-        return self.template() % (self.__get_expression())
++        return self.template() % (self.__get_expression(compiler))
+ 
+     def __repr__(self) -> str:
+         return "ClusterByOption(%s)" % self.__get_expression()
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/identifier_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/identifier_option.py
+index b296898..6076654 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/identifier_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/identifier_option.py
+@@ -11,6 +11,10 @@ from .table_option import Priority, TableOption, TableOptionKey
+ class IdentifierOption(TableOption):
+     """Class to represent an identifier option in Snowflake Tables.
+ 
++    Pass the bare identifier name — without surrounding double-quotes.
++    The dialect's identifier preparer applies quoting automatically when
++    the name contains characters that require it (spaces, mixed case, etc.).
++
+     Example:
+         warehouse = IdentifierOption('my_warehouse')
+ 
+@@ -49,7 +53,7 @@ class IdentifierOption(TableOption):
+         return f"{self.option_name.upper()} = %s"
+ 
+     def _render(self, compiler) -> str:
+-        return self.template() % self.value
++        return self.template() % self._quote_identifier_value(self.value, compiler)
+ 
+     def __repr__(self) -> str:
+         option_name = (
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/keyword_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/keyword_option.py
+index ff6b444..e0749a1 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/keyword_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/keyword_option.py
+@@ -32,6 +32,7 @@ class KeywordOption(TableOption):
+         return f"{self.option_name.upper()} = %s"
+ 
+     def _render(self, compiler) -> str:
++        # This function renders only keywords, so no additional processing is needed.
+         return self.template() % self.value.upper()
+ 
+     @staticmethod
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/literal_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/literal_option.py
+index 55dd767..5e82fc6 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/literal_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/literal_option.py
+@@ -53,7 +53,10 @@ class LiteralOption(TableOption):
+             return f"{self.option_name.upper()} = '%s'"
+ 
+     def _render(self, compiler) -> str:
+-        return self.template() % self.value
++        if isinstance(self.value, int):
++            return self.template() % self.value
++        escaped = self._escape_string_literal_value(str(self.value))
++        return self.template() % escaped
+ 
+     def __repr__(self) -> str:
+         option_name = (
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
+index 920483b..9bf8abe 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
+@@ -6,6 +6,7 @@ from typing import List, Optional
+ 
+ from snowflake.sqlalchemy import exc
+ from snowflake.sqlalchemy.custom_commands import NoneType
++from snowflake.sqlalchemy.util import escape_string_literal_interior
+ 
+ 
+ class Priority(Enum):
+@@ -60,6 +61,29 @@ class TableOption:
+     def template(self) -> str:
+         return f"{self.option_name.upper()} = %s"
+ 
++    @staticmethod
++    def _quote_identifier_value(value: str, compiler=None) -> str:
++        """Return the identifier quoted per the dialect's rules.
++
++        Uses ``compiler.preparer.quote()`` when a compiler is available so
++        that special characters are wrapped in double-quotes and any embedded
++        double-quotes are doubled.  Falls back to the bare value when no
++        compiler is present (e.g. in ``__repr__`` / test-only paths).
++        """
++        if compiler is not None:
++            return compiler.preparer.quote(value)
++        return value
++
++    @staticmethod
++    def _escape_string_literal_value(value: str) -> str:
++        """Return the escaped interior of a DDL string literal (no surrounding quotes).
++
++        Applies single-quote doubling and backslash doubling for Snowflake's
++        ESCAPE_STRING_LITERALS semantics.  Returns only the interior — no
++        surrounding quotes — ready to interpolate into a ``'%s'`` template.
++        """
++        return escape_string_literal_interior(value)
++
+     def render_option(self, compiler) -> str:
+         self._validate_option()
+         return self._render(compiler)
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py
+index 40311f5..9b7fc81 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py
+@@ -4,6 +4,7 @@
+ from typing import Optional, Tuple, Union
+ 
+ from snowflake.sqlalchemy.custom_commands import NoneType
++from snowflake.sqlalchemy.util import escape_string_literal_interior
+ 
+ from .table_option import Priority, TableOption, TableOptionKey
+ 
+diff --git a/src/snowflake/sqlalchemy/util.py b/src/snowflake/sqlalchemy/util.py
+index 9497a28..7937a0d 100644
+--- a/src/snowflake/sqlalchemy/util.py
++++ b/src/snowflake/sqlalchemy/util.py
+@@ -316,3 +316,25 @@ def create_snowflake_engine(
+     else:
+         url = base_url
+     return _sa_create_engine(url, **kwargs)
++
++
++def escape_backslashes(value: str) -> str:
++    """Double backslashes so they survive Snowflake's ESCAPE_STRING_LITERALS.
++
++    Snowflake interprets backslash escape sequences inside string literals by
++    default, so any literal backslash in user data must be doubled.
++    """
++    return value.replace("\\", "\\\\")
++
++
++def escape_string_literal_interior(value: str) -> str:
++    """Escape the *interior* of a single-quoted Snowflake string literal.
++
++    Doubles single quotes (standard SQL ``''`` escaping) and backslashes
++    (Snowflake ``ESCAPE_STRING_LITERALS`` semantics).  The two replacements are
++    order-independent.  Returns only the interior — **no surrounding quotes** —
++    and deliberately does **not** double percent signs, so the result is safe to
++    interpolate into a Python ``%``-formatted DDL template (unlike SQLAlchemy's
++    ``String`` literal processor, which both wraps in quotes and doubles ``%``).
++    """
++    return value.replace("'", "''").replace("\\", "\\\\")

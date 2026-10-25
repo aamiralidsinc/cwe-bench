@@ -70,5 +70,7 @@ refused leading slash, where another route must accept it.
   (decision of 2026-10-20). Never add a sentence that points at a route, and never one that names
   or describes a coupled value, a form, a source or an alias: apply build rule 7's one-bug test to
   every sentence you add. Re-run `stacking/run_listing_check.sh` after any instruction change.
+- Edit only the stacked task's `instruction.md`, never the control's: `run_fairfix_stack.sh` copies
+  the new wording to the control afterwards (build rule 13, same report) and re-runs the listing check.
 - Drop a concept only when the concept itself cannot be made fair. If fewer than 3 independent
   concepts remain, the task is no longer a stacked task: report that, rather than shipping it.

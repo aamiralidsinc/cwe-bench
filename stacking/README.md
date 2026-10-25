@@ -14,8 +14,9 @@ Docker.
 | 2 | `STACKING-READER-PROMPT.md` | per candidate: traps with mechanism, locations, tier per model, type; shared-guard groups; history; conflicts; fairness risks; chosen design → `out/reader/<id>.json` | written; not run yet |
 | 3 | `score_stack.py` + `stacking_weights.json` | probabilistic score on D1-D3, plus flags (missing DeepSeek-type or MiMo-type trap, single concept, single trap carries, fairness risk) → `out/stack_scores.*` | done; passes the calibration check (`calibration/`: sib2 0.59 > sib 0.02 > prompty 0.008, flags match) |
 | 4 | `STACKING-BUILD-ADDENDUM.md` | the stacking rules appended to the build prompt: 3+ independent concepts, both model types, no single carry, history rules (H3 pin and first-fix check, masking, conflicting fixes, dependency bumps), recall check, a one-bug control task | written |
-| 5 | `check_stack.py` | static conformance check of a built stacked task's MANIFEST (`stacking` block, concepts, types, per-concept wrong-fix patches, recall patches, coupled tests, control task). It does not read instruction.md | done; tested on good and bad manifests |
-| 5b | `STACKING-LISTING-CHECK.md`, `run_listing_check.sh`, `listing_verdict.py` | post-build listing check (build rule 7): a read-only reviewer labels each hidden trap NAMED / DESCRIBED / GENERAL / ABSENT against instruction.md; FAIL on any NAMED or more than one DESCRIBED hidden trap (`advisory_route` traps exempt) | added 2026-10-24; verdict tested on the batch-1 audit (29 of 30 FAIL, as audited); the reviewer itself not yet calibrated on the VM |
+| 5 | `check_stack.py` | static conformance check of a built stacked task's MANIFEST (`stacking` block, concepts, types, per-concept wrong-fix patches, recall patches, coupled tests, control task), plus one instruction check: the control's instruction.md must equal the stacked task's (rule 13, added 2026-10-24). It does not judge instruction wording | done; tested on good and bad manifests |
+| 5b | `STACKING-LISTING-CHECK.md`, `run_listing_check.sh`, `listing_verdict.py` | post-build listing check (build rule 7): a read-only reviewer labels each hidden trap NAMED / DESCRIBED / GENERAL / ABSENT against instruction.md; FAIL on any NAMED or more than one DESCRIBED hidden trap (`advisory_route` traps exempt) | added 2026-10-24; verdict tested on the batch-1 audit (29 of 30 FAIL, as audited). **Advisory until calibrated:** without `stacking/LISTING_ENFORCE` a FAIL only writes `.listing_warn`; `listing_calibrate.py` compares the reviewer with the audit and creates the file (`--enforce`) when every verdict matches and at most 10% of hidden traps are labelled more leniently |
+| 6u | `STACKING-UPGRADE-PROMPT.md`, `run_upgrade_stack.sh`, `upgrade_stack_batch.sh` | SEPARATE upgrade step for already-built stacked tasks (not part of `run_stack_pipeline.sh`): snapshot control + task, the agent rewrites ONLY instruction.md to pass the one-bug test (2 rounds max, guided by the listing reviewer), copy to the control (rule 13), static gate on both, listing check; no rebuild, no container gate. Re-trial afterwards with `stk_queue.py trial` | added 2026-10-24 |
 
 **Also in Phase 1:**
 - **Step 2 runners:** `make_reader_jobs.py` builds `out/reader_jobs.jsonl`; `run_reader.py` runs
@@ -66,7 +67,7 @@ when both models fail 3/3.
 - **Phase 2 builder model: DeepSeek V4.1 Flash**, via the VM's `drive.sh deepseek`.
 - DeepSeek-built tasks used to describe sibling surfaces in their instructions. The guards are the
   template's no-surface rule, the addendum (rules 5, 7, 10, v2 of 2026-10-24), fairness S1 (v2) and
-  the listing check (step 5b). `check_stack.py` is NOT one of them: it reads only the manifest.
+  the listing check (step 5b). `check_stack.py` is NOT one of them: it does not judge instruction wording.
   (`BETTER-PATTERNS.md` is a local design note, not deployed to the VM.)
 - **Batch 1 listed its traps** (2026-10-23 audit, `out/listing_audit.json`): 137 of 155 traps had a
   sentence of their own in instruction.md. The addendum v1 rules 5 and 10 and fairness S1 v1 asked

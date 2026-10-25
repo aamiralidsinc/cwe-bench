@@ -1,0 +1,33 @@
+#!/bin/bash
+# Upgrade one already-built task to BETTER-PATTERNS §2-§8 (reuse image where possible, re-gate).
+# Rewrites instruction.md to one general property, ensures >=1 how-type lever, extends tests/checks/
+# oracle; rebuilds the image ONLY if repo code changed. Needs Bash+Docker -> bypassPermissions ->
+# a PERSON (or drive.sh) launches this. Usage: run_upgrade.sh SLUG
+# Env: MODEL (default claude-opus-5-5; drive.sh overrides to the lane model), UPGRADE_TIMEOUT (10800).
+set -uo pipefail
+SLUG=$1
+cd "$HOME/cwe-bench" || exit 1
+mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
+# Preserve the current version (task + its trial runs) as a separate experiment BEFORE editing,
+# and bump build/$SLUG/VERSION. Provenance in ~/.tb-graders/cwe/experiments/$SLUG/ + INDEX.tsv.
+bash pipeline/snapshot_experiment.sh "$SLUG"
+# Fingerprint the GATE-RELEVANT files (not instruction.md) before the edit, to decide the gate after.
+REL="tasks/$SLUG/tests tasks/$SLUG/solution tasks/$SLUG/environment build/$SLUG/checks build/$SLUG/manifest.json"
+PRE=$(find $REL -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+P=$(sed "s/{{SLUG}}/$SLUG/g" builder/UPGRADE-PROMPT.md)
+date -u +%FT%TZ > "build/$SLUG/upgrade_start.txt"
+timeout "${UPGRADE_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "${MODEL:-claude-opus-5-5}" \
+  --permission-mode bypassPermissions --add-dir "$HOME/cwe-bench" --add-dir "$HOME/.tb-graders/cwe/work" \
+  --output-format json > "build/$SLUG/upgrade-run.json" 2> "build/$SLUG/upgrade-run.err"
+echo $? > "build/$SLUG/upgrade-exit.txt"
+date -u +%FT%TZ > "build/$SLUG/upgrade_end.txt"
+# CONDITIONAL GATE: full container gate only if a gate-relevant file changed; else static-only (0 containers).
+POST=$(find $REL -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1)
+if [ "$PRE" = "$POST" ]; then
+  echo "$SLUG: instruction-only upgrade -> static gate only (0 containers; prior .sound kept)" | tee -a "build/$SLUG/upgrade-gate.log"
+  python3 -I builder/gate.py "$SLUG" --only static >> "build/$SLUG/upgrade-gate.log" 2>&1 || true
+else
+  echo "$SLUG: gate-relevant files changed -> full container gate" | tee -a "build/$SLUG/upgrade-gate.log"
+  bash pipeline/gate_one_ds.sh "$SLUG" >> "build/$SLUG/upgrade-gate.log" 2>&1
+fi
+echo "$SLUG upgrade: exit $(cat build/$SLUG/upgrade-exit.txt) ; gate=$(tail -1 build/$SLUG/upgrade-gate.log 2>/dev/null)"

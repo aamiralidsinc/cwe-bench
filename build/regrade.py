@@ -58,7 +58,7 @@ def main():
     sh("docker", "cp", f"{tests}/.", f"{container}:/tests/")
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
-        run = sh("docker", "exec", container, "bash", "/tests/test.sh", timeout=a.timeout)
+        run = sh("docker", "exec", "-u", "root", container, "bash", "/tests/test.sh", timeout=a.timeout)
         rc, stdout = run.returncode, run.stdout + run.stderr
     except subprocess.TimeoutExpired as e:
         rc, stdout = "timeout", (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else str(e.stdout or "")

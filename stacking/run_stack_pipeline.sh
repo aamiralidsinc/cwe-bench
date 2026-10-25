@@ -3,8 +3,10 @@
 # For ONE stacked slug (built from stacking/build_prepare_stack.py) and its control:
 #   1. build      : ./drive.sh deepseek bash run_build.sh SLUG        (unchanged sibling launcher)
 #   2. check      : python3 -I stacking/check_stack.py SLUG           (stacking static check)
-#   2b. listing   : ./drive.sh deepseek bash stacking/run_listing_check.sh SLUG  (build rule 7;
-#                   a FAIL keeps the build but withholds .sound and writes .listing_fail, exit 3)
+#   2b. listing   : ./drive.sh deepseek bash stacking/run_listing_check.sh SLUG  (build rule 7).
+#                   With stacking/LISTING_ENFORCE: a FAIL/ERROR keeps the build but withholds .sound
+#                   and writes .listing_fail, exit 3. Without it (reviewer not yet calibrated): advisory,
+#                   .listing_warn only, the task is marked sound as before.
 #   3. gate       : python3 -I builder/gate.py SLUG                    (unchanged)
 #   4. blind fix  : ./drive.sh deepseek bash run_blindfix.sh SLUG      (unchanged)
 #   5. mark       : build/<slug>/.sound when steps 2-4 pass; then the control is gated and marked
@@ -55,12 +57,19 @@ log "blind fix: $SLUG"
 python3 -I builder/gate.py "$SLUG" --only patches >> "$L" 2>&1
 gate_ok "$SLUG" || { log "STOP: patch checks failed after the blind fix"; exit 1; }
 
-if [ "$LST" -ne 0 ]; then
-  rm -f "build/$SLUG/.sound"; touch "build/$SLUG/.listing_fail"
-  log "LISTING: $SLUG is gated but its instruction lists hidden traps (or the check errored); not marked sound. Rewrite the instruction (build rule 7), re-run stacking/run_listing_check.sh, then mark it."
+# The listing check gates only once its reviewer is calibrated (2026-10-24): until
+# stacking/LISTING_ENFORCE exists (created after stacking/listing_calibrate.py agrees with the batch-1
+# audit), a FAIL or ERROR is recorded as build/SLUG/.listing_warn and the task is marked sound as before.
+if [ "$LST" -ne 0 ] && [ -f stacking/LISTING_ENFORCE ]; then
+  rm -f "build/$SLUG/.sound" "build/$SLUG/.listing_warn"; touch "build/$SLUG/.listing_fail"
+  log "LISTING: $SLUG is gated but its instruction lists hidden traps (or the check errored); not marked sound. Rewrite the instruction (build rule 7) and copy it to the control $CTL, re-run stacking/run_listing_check.sh, then mark it."
   exit 3
 fi
-rm -f "build/$SLUG/.listing_fail"
+rm -f "build/$SLUG/.listing_fail" "build/$SLUG/.listing_warn"
+if [ "$LST" -ne 0 ]; then
+  touch "build/$SLUG/.listing_warn"
+  log "LISTING (advisory; reviewer not calibrated, no stacking/LISTING_ENFORCE): verdict exit $LST recorded in build/$SLUG/.listing_warn; marking sound as before"
+fi
 touch "build/$SLUG/.sound"
 log "SOUND: $SLUG ready for trials"
 # The control is lowest priority (user, 2026-10-22): a failed control gate never blocks its stacked task.

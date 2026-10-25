@@ -1,0 +1,45 @@
+#!/bin/bash
+# Blind fix for one built task (strict-gate prerequisite). Proves the task is findable from the
+# report + repo alone. The AGENT needs Bash (compile/diff) -> --permission-mode bypassPermissions,
+# so a PERSON must launch this script (the orchestrator is blocked from spawning such agents).
+# Sets up an ISOLATED WORK dir (pristine+app at the pinned commit + instruction.md) OUTSIDE
+# ~/cwe-bench, runs a fresh agent confined to WORK, then wires blind.patch into the manifest.
+set -uo pipefail
+SLUG=$1
+R="$HOME/cwe-bench"; DF="$R/tasks/$SLUG/environment/Dockerfile"
+URL=$(grep -oE "^ARG REPO_URL=[^ ]+" "$DF" | sed -E "s/^ARG REPO_URL=//; s/\"//g" | head -1)
+[ -n "$URL" ] || URL=$(grep -oE "https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" "$DF" | head -1)
+URL=${URL%.git}
+COMMIT=$(grep -oE "^ARG COMMIT=[0-9a-f]{40}" "$DF" | grep -oE "[0-9a-f]{40}" | head -1)
+[ -n "$COMMIT" ] || COMMIT=$(grep -iE "git fetch" "$DF" | grep -oE "[0-9a-f]{40}" | head -1)
+[ -n "$URL" ] && [ -n "$COMMIT" ] || { echo "cannot parse repo/commit from $DF"; exit 2; }
+WORK="$HOME/.tb-graders/cwe/blind/$SLUG"; rm -rf "$WORK"; mkdir -p "$WORK"
+( cd "$WORK" && git init -q pristine && cd pristine && git remote add origin "$URL" \
+  && git fetch -q --depth 1 origin "$COMMIT" && git checkout -q FETCH_HEAD && rm -rf .git )
+cp -r "$WORK/pristine" "$WORK/app"
+cp "$R/tasks/$SLUG/instruction.md" "$WORK/instruction.md"
+[ -d "$R/build/$SLUG/libs" ] && cp -r "$R/build/$SLUG/libs" "$WORK/libs"
+BRIEF=$(cat "$R/builder/BLIND-FIX-BRIEF.md")
+P="$BRIEF
+
+WORK=$WORK . Read ONLY \$WORK/instruction.md and \$WORK/app (and \$WORK/libs if present). Do NOT open anything under /home/mara/cwe-bench or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
+date -u +%FT%TZ > "$R/build/$SLUG/blind_start.txt"
+timeout 5400 "$HOME/.local/bin/claude" -p "$P" --model "${MODEL:-claude-opus-5-5}" \
+  --permission-mode bypassPermissions --add-dir "$WORK" \
+  --output-format json > "$R/build/$SLUG/blind-run.json" 2> "$R/build/$SLUG/blind-run.err"
+echo "agent exit $?"
+# Wire the blind patch in (deterministic; not agent work):
+if [ -s "$WORK/blind.patch" ]; then
+  cp "$WORK/blind.patch" "$R/build/$SLUG/checks/blind.patch"
+  python3 - "$R/build/$SLUG/manifest.json" <<PY
+import json,sys
+p=sys.argv[1]; m=json.load(open(p)); pc=m.setdefault("patch_checks",[])
+if not any(c.get("patch")=="blind.patch" for c in pc):
+    pc.append({"patch":"blind.patch","expect":"pass","kind":"blind","why":"fresh agent, report + repo only"})
+json.dump(m,open(p,"w"),indent=1)
+print("manifest: blind.patch wired as pass/blind")
+PY
+  echo "$SLUG blind: blind.patch placed ($(wc -l <"$WORK/blind.patch") lines)"
+else
+  echo "$SLUG blind: NO blind.patch written (agent stopped or failed) - check build/$SLUG/blind-run.json"
+fi

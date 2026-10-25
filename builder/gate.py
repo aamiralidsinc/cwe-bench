@@ -48,6 +48,7 @@ stdout/stderr and the raw artifact paths. The stage record names it in "evidence
 """
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -254,11 +255,14 @@ def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     for attempt in (1, 2):
         name = f"{task_dir.name}-{label}-{int(time.time())}"
         cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
-               "--job-name", name, "-y", "-q"]
+               "--job-name", name, "-y", "-q", "--allow-agent-host", "api.deepseek.com"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         trials = [p for p in (JOBS / name).glob("*/") if (p / "result.json").exists()]
         if not trials:
             out = f"{proc.stdout}\n{proc.stderr}"
+            if attempt == 1:
+                time.sleep(30)  # transient harbor launch collision under load; retry once
+                continue
             raise InfraError(f"{label}: Harbor produced no trial (exit {proc.returncode}; {infra_label(out)}): "
                              f"{ev.one_line(proc.stderr or proc.stdout, 600)}",
                              details={**ev.collect(None, proc), "job_dir": str(JOBS / name)})
@@ -546,7 +550,7 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
 
     declared = {c.get("patch") for c in manifest.get("patch_checks", [])}
     for c in manifest.get("patch_checks", []):
-        if not (build / "checks" / str(c.get("patch"))).is_file():
+        if c.get("kind") != "blind" and not (build / "checks" / str(c.get("patch"))).is_file():
             problems.append(f"patch check file missing: checks/{c.get('patch')}")
     kinds = {c.get("expect") for c in manifest.get("patch_checks", [])}
     for need in ("security_fail", "functional_fail"):
@@ -588,8 +592,37 @@ def check_nop(task: Path) -> dict:
     return {"ok": True, "security": len(sec), "functional": len(fun), "trial": r["trial_dir"]}
 
 
+def run_parallel(jobs: list, raise_errors: bool = True) -> list:
+    """Run independent Harbor trials at the same time (2026-10-24: the runs inside one stage are
+    independent; sequential runs made a gate ~45 min). Returns results in input order and raises
+    the first error in input order, so the verdict is the one the sequential loop would reach.
+    GATE_PARALLEL caps how many run at once (default: all)."""
+    import concurrent.futures as cf
+    if not jobs:
+        return []
+    width = max(1, min(len(jobs), int(os.environ.get("GATE_PARALLEL", "0") or 0) or len(jobs)))
+    with cf.ThreadPoolExecutor(max_workers=width) as pool:
+        futs = []
+        for i, job in enumerate(jobs):
+            futs.append(pool.submit(job))
+            if i < len(jobs) - 1:
+                time.sleep(2)  # small stagger: distinct --job-name timestamps, gentler compose fill
+        outcomes = []
+        for f in futs:
+            try:
+                outcomes.append((f.result(), None))
+            except Exception as e:  # keep order: report the first failing job, as sequential did
+                outcomes.append((None, e))
+    if not raise_errors:
+        return [err if err is not None else r for r, err in outcomes]
+    for _, err in outcomes:
+        if err is not None:
+            raise err
+    return [r for r, _ in outcomes]
+
+
 def check_oracle(task: Path, n: int = 2) -> dict:
-    runs = [run_harbor(task, "oracle", f"oracle{i}") for i in range(1, n + 1)]
+    runs = run_parallel([lambda i=i: run_harbor(task, "oracle", f"oracle{i}") for i in range(1, n + 1)])
     for i, r in enumerate(runs, 1):
         bad = failing(r["security"]) + failing(r["functional"])
         if r["reward"] != 1.0 or bad:
@@ -608,13 +641,24 @@ def check_oracle(task: Path, n: int = 2) -> dict:
 
 def check_patches(task: Path, build: Path, manifest: dict) -> dict:
     out = {}
-    for check in manifest.get("patch_checks", []):
-        patch, expect = check["patch"], check["expect"]
+    checks = [c for c in manifest.get("patch_checks", [])
+              # blind fix produced later by run_blindfix; validated in the --only patches re-gate
+              if not (c.get("kind") == "blind" and not (build / "checks" / c["patch"]).is_file())]
+
+    def one(patch):
         with tempfile.TemporaryDirectory(prefix="gate-") as tmp:
             variant = Path(tmp) / task.name
             shutil.copytree(task, variant)
             shutil.copy(build / "checks" / patch, variant / "solution" / "fix.patch")
-            r = run_harbor(variant, "oracle", "chk-" + re.sub(r"\W+", "-", Path(patch).stem))
+            return run_harbor(variant, "oracle", "chk-" + re.sub(r"\W+", "-", Path(patch).stem))
+
+    # Errors are returned, not raised, so they surface in manifest order exactly as the old
+    # one-at-a-time loop met them (an earlier failing patch still wins over a later infra error).
+    results = run_parallel([lambda p=c["patch"]: one(p) for c in checks], raise_errors=False)
+    for check, r in zip(checks, results):
+        if isinstance(r, BaseException):
+            raise r
+        patch, expect = check["patch"], check["expect"]
         sec_bad, fun_bad = failing(r["security"]), failing(r["functional"])
         if expect == "security_fail":
             ok = bool(sec_bad) and not fun_bad

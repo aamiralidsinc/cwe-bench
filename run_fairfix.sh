@@ -1,11 +1,16 @@
 #!/bin/bash
 # Fairness-fix one built task: apply its pre-trial fairness review's REQUIRED changes, then re-gate.
 # Needs Bash+Docker (edits tests/oracle, runs gate) -> bypassPermissions -> a PERSON launches this.
-# Usage: run_fairfix.sh SLUG   Env: MODEL (default claude-opus-5-5), FAIRFIX_TIMEOUT (default 10800)
+# Usage: ./drive.sh deepseek bash run_fairfix.sh SLUG   Env: MODEL (required, set by drive.sh),
+# FAIRFIX_TIMEOUT (default 10800). Exit 0 = the agent finished; 1 = it did not (fairfix_status.txt
+# says why: quota, API error, timeout, crash) and the task must not be treated as fixed.
 set -uo pipefail
-SLUG=$1
+SLUG=${1:?usage: run_fairfix.sh SLUG}
 cd "$HOME/cwe-bench" || exit 1
+[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash run_fairfix.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
+bash pipeline/snapshot_experiment.sh "$SLUG"  # preserve prior version before in-place edit (provenance)
 P="You are revising ONE already-built security-fix benchmark task to address its pre-trial FAIRNESS
 review before model trials. Project root: /home/mara/cwe-bench. Task slug: ${SLUG}.
 
@@ -48,9 +53,14 @@ A missing blind.patch in static is allowed (it is wired separately). Report, und
 FAIRNESS 'Required' item and how you addressed it, the final gate result per stage, and any item you
 could not fully satisfy and why."
 date -u +%FT%TZ > "build/$SLUG/fairfix_start.txt"
-timeout "${FAIRFIX_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "${MODEL:-claude-opus-5-5}" \
+timeout "${FAIRFIX_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --permission-mode bypassPermissions --add-dir "$HOME/cwe-bench" --add-dir "$HOME/.tb-graders/cwe/work" \
   --output-format json > "build/$SLUG/fairfix-run.json" 2> "build/$SLUG/fairfix-run.err"
-echo $? > "build/$SLUG/fairfix-exit.txt"
+rc=$?
+echo $rc > "build/$SLUG/fairfix-exit.txt"
 date -u +%FT%TZ > "build/$SLUG/fairfix_end.txt"
-echo "$SLUG fairfix: exit $(cat build/$SLUG/fairfix-exit.txt)"
+st=$(python3 pipeline/agent_status.py "build/$SLUG/fairfix-run.json" "$rc" --details "build/$SLUG/fairfix_status.json")
+echo "$st" > "build/$SLUG/fairfix_status.txt"
+echo "$SLUG fairfix: exit $rc; $st"
+# An unfinished fairfix may leave a half-edited task: put back the version that was trialed.
+[ "$st" = ok ] || { bash pipeline/restore_snapshot.sh "$SLUG" "fairfix: $st"; exit 1; }

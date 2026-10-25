@@ -36,6 +36,9 @@ n=0
 for jd in "$JOBS/$SLUG"-*; do
   [ -e "$jd" ] || continue
   case "$(basename "$jd")" in _*) continue;; esac   # skip archive dirs
+  # A stacked task's control has its own slug "<slug>-control", so its run folders also match
+  # "$SLUG-*": they belong to the control's own snapshot, not this one (2026-10-24).
+  case "$(basename "$jd")" in "$SLUG"-control-*) continue;; esac
   mv "$jd" "$dest/runs/" 2>/dev/null && n=$((n+1))
 done
 ish=$(sha256sum "tasks/$SLUG/instruction.md" 2>/dev/null | cut -c1-16)

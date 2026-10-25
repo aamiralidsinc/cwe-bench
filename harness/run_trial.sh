@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$HOME/cwe-bench/pipeline/docker-tuning.env" 2>/dev/null || true
 # Run a Harbor task with Claude Code driving DeepSeek V4.1 Flash or MiMo-V2.6-Pro.
 #
 #   run_trial.sh <deepseek|mimo> <task-dir> [attempts] [extra harbor args...]
@@ -33,6 +34,7 @@ case "$model" in
     base_url=https://api.deepseek.com/anthropic
     key=${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is not set (see models.env.example)}
     model_id='deepseek-flash[1m]'   # served by DeepSeek-V4.1-Flash, 1M context
+    extra+=(--allow-agent-host=api.deepseek.com)   # new tasks are no-network; allow the model host at run time (B4)
     effort=${EFFORT-max}
     extra+=(--ae CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432)
     # DeepSeek-max counts reasoning toward the token budget and will think
@@ -45,6 +47,7 @@ case "$model" in
     base_url=https://api.xiaomimimo.com/anthropic
     key=${MIMO_API_KEY:?MIMO_API_KEY is not set (see models.env.example)}
     model_id=mimo-v2.6-pro
+    extra+=(--allow-agent-host=api.xiaomimimo.com)   # new tasks are no-network; allow the model host at run time (B4)
     effort=${EFFORT-}
     ;;
   *) echo "unknown model: $model (expected deepseek or mimo)" >&2; exit 2 ;;

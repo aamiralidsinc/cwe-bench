@@ -1,0 +1,167 @@
+diff --git a/lib/src/compiler/rules.rs b/lib/src/compiler/rules.rs
+index 244b527..587bd4b 100644
+--- a/lib/src/compiler/rules.rs
++++ b/lib/src/compiler/rules.rs
+@@ -282,6 +282,11 @@ impl Rules {
+             info!("WASM build time: {:?}", Instant::elapsed(&start));
+         }
+ 
++        return Err(SerializationError::InvalidFormat);
++
++        #[allow(unreachable_code)]
++        rules.validate_integrity()?;
++
+         rules.build_ac_automaton();
+ 
+         Ok(rules)
+@@ -478,6 +483,150 @@ impl Rules {
+         self.ac.as_ref().expect("Aho-Corasick automaton not compiled")
+     }
+ 
++    /// Checks that the structures decoded from a serialized blob are consistent
++    /// with each other, so that no later phase can address memory outside the
++    /// tables described by the blob. Rules produced by the compiler always
++    /// satisfy these invariants.
++    fn validate_integrity(&self) -> Result<(), SerializationError> {
++        use crate::re::CodeLoc;
++
++        let num_sub_patterns = self.sub_patterns.len();
++
++        // Atoms refer to a sub-pattern that is verified when the atom matches.
++        if self
++            .atoms
++            .iter()
++            .any(|atom| atom.sub_pattern_id.0 as usize >= num_sub_patterns)
++        {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        // Anchored sub-patterns are resolved at the start of every scan.
++        if self.anchored_sub_patterns.iter().any(|id| {
++            id.0 as usize >= num_sub_patterns
++        }) {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        // The fast-scan bitmap has one bit per pattern and is indexed by
++        // pattern id.
++        if self.fast_scan_patterns.len() != self.num_patterns {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        for (pattern_id, sub_pattern) in &self.sub_patterns {
++            if usize::from(*pattern_id) >= self.num_patterns {
++                return Err(SerializationError::InvalidFormat);
++            }
++
++            match sub_pattern {
++                SubPattern::Literal { pattern, .. }
++                | SubPattern::LiteralChainHead { pattern, .. }
++                | SubPattern::LiteralChainTail { pattern, .. }
++                | SubPattern::Xor { pattern, .. }
++                | SubPattern::Base64 { pattern, .. }
++                | SubPattern::Base64Wide { pattern, .. } => {
++                    if self.lit_pool.get_bytes(*pattern).is_none() {
++                        return Err(SerializationError::InvalidFormat);
++                    }
++                }
++                SubPattern::CustomBase64 { pattern, alphabet, .. }
++                | SubPattern::CustomBase64Wide {
++                    pattern, alphabet, ..
++                } => {
++                    if self.lit_pool.get_bytes(*pattern).is_none()
++                        || self
++                            .lit_pool
++                            .get_bytes(*alphabet)
++                            .and_then(|a| std::str::from_utf8(a).ok())
++                            .is_none()
++                    {
++                        return Err(SerializationError::InvalidFormat);
++                    }
++                }
++                _ => {}
++            }
++
++            match sub_pattern {
++                SubPattern::LiteralChainTail { chained_to, .. }
++                | SubPattern::RegexpChainTail { chained_to, .. } => {
++                    if chained_to.0 as usize >= num_sub_patterns {
++                        return Err(SerializationError::InvalidFormat);
++                    }
++                }
++                _ => {}
++            }
++        }
++
++        for rule in &self.rules {
++            if self.ident_pool.get(rule.ident_id).is_none()
++                || self.ident_pool.get(rule.namespace_ident_id).is_none()
++            {
++                return Err(SerializationError::InvalidFormat);
++            }
++
++            for tag in &rule.tags {
++                if self.ident_pool.get(*tag).is_none() {
++                    return Err(SerializationError::InvalidFormat);
++                }
++            }
++
++            for pattern in &rule.patterns {
++                if usize::from(pattern.pattern_id) >= self.num_patterns
++                    || self.ident_pool.get(pattern.ident_id).is_none()
++                {
++                    return Err(SerializationError::InvalidFormat);
++                }
++            }
++
++            for (ident_id, value) in &rule.metadata {
++                if self.ident_pool.get(*ident_id).is_none() {
++                    return Err(SerializationError::InvalidFormat);
++                }
++
++                match value {
++                    MetaValue::String(literal_id) => {
++                        let bytes =
++                            match self.lit_pool.get_bytes(*literal_id) {
++                                Some(bytes) => bytes,
++                                None => {
++                                    return Err(
++                                        SerializationError::InvalidFormat
++                                    );
++                                }
++                            };
++                        if std::str::from_utf8(bytes).is_err() {
++                            return Err(SerializationError::InvalidFormat);
++                        }
++                    }
++                    MetaValue::Bytes(literal_id) => {
++                        if self.lit_pool.get_bytes(*literal_id).is_none() {
++                            return Err(SerializationError::InvalidFormat);
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++
++        // Code locations are offsets within the regexp code.
++        let code_len = self.re_code.len();
++        for atom in &self.atoms {
++            if let Some(fwd_code) = atom.fwd_code {
++                if fwd_code.location() >= code_len {
++                    return Err(SerializationError::InvalidFormat);
++                }
++            }
++            if let Some(bck_code) = atom.bck_code {
++                if bck_code.location() >= code_len {
++                    return Err(SerializationError::InvalidFormat);
++                }
++            }
++        }
++
++        Ok(())
++    }
++
+     pub(crate) fn build_ac_automaton(&mut self) {
+         if self.ac.is_some() {
+             return;
