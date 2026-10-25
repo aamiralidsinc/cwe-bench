@@ -85,3 +85,7 @@ The headline comparison between pipelines is **strong-breaker yield per batch** 
 ## Revisions
 
 - 2026-10-25: initial list (A–E), plus F (single-model breakers) at the user's request.
+- 2026-10-25 (first audit, `reports/QUALITY-AUDIT-20261025.md`): added a **core-strong** view (E4 + E5: a security miss
+  decides it and the public upstream fix does not cover it), because E3 (fairness READY with no open human question)
+  failed on 24 of 25 breakers for process reasons (open questions, unapplied rewordings), which hid the task-level
+  comparison. Precision-validation breakers are reported as a third group (same builder as sibling).
