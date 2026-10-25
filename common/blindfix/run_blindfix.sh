@@ -1,6 +1,6 @@
 #!/bin/bash
-# Blind fix for one built task (strict-gate prerequisite). Proves the task is findable from the
-# report + repo alone. The AGENT needs Bash (compile/diff) -> --permission-mode bypassPermissions,
+# Blind fix for one built task (strict-gate prerequisite): a second complete fix that proves the hidden tests
+# accept a correct fix other than the reference. Written with everything in view (owner decision 2026-10-25). The AGENT needs Bash (compile/diff) -> --permission-mode bypassPermissions,
 # so a PERSON must launch this script (the orchestrator is blocked from spawning such agents).
 #
 # Launch through the model driver; there is deliberately no default model, so this can never fall
@@ -75,10 +75,26 @@ if [ "${BLIND_PREPARE_ONLY:-0}" = 1 ]; then echo "prepared" > "$B/blind_status.t
 cp -a "$WORK/pristine" "$WORK/app"
 cp "$R/tasks/$SLUG/instruction.md" "$WORK/instruction.md"
 [ -d "$B/libs" ] && cp -r "$B/libs" "$WORK/libs"
+# Full view (owner decision 2026-10-25, BLIND-FIX-BRIEF.md, fairness rule of 2026-10-20): the blind patch is a
+# SOUNDNESS control, written with everything in view: hidden tests, reference fix, trap list, build notes.
+cp -r "$R/tasks/$SLUG/tests" "$WORK/tests"
+cp "$R/tasks/$SLUG/solution/fix.patch" "$WORK/reference.patch" 2>/dev/null || true
+[ -f "$B/notes.md" ] && cp "$B/notes.md" "$WORK/build-notes.md"
+python3 - "$B/manifest.json" "$WORK/injected-sites.md" <<'PY' || true
+import json, sys
+m = json.load(open(sys.argv[1]))
+lines = ["# Trap list (private; from build/<slug>/manifest.json)", ""]
+for t in m.get("traps") or []:
+    lines.append(f"- {t.get('id','?')}: {t.get('shape') or t.get('lever') or ''}")
+    if t.get("where"): lines.append(f"  where: {t['where']}")
+    if t.get("security_tests"): lines.append(f"  security tests: {', '.join(map(str, t['security_tests']))}")
+    if t.get("coupled_functional_tests"): lines.append(f"  must keep working: {', '.join(map(str, t['coupled_functional_tests']))}")
+open(sys.argv[2], "w").write("\n".join(lines) + "\n")
+PY
 BRIEF=$(cat "$CWE_BLIND_BRIEF") || die 2 "no common/blindfix/BLIND-FIX-BRIEF.md"
 P="$BRIEF
 
-WORK=$WORK . Read ONLY \$WORK/instruction.md and \$WORK/app (and \$WORK/libs if present). Do NOT open anything under /home/mara/cwe-bench or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
+WORK=$WORK . Everything you may use is under \$WORK: instruction.md, app/ (the vulnerable tree; edit it), tests/ (the hidden tests), reference.patch (the reference fix), injected-sites.md (the trap list), build-notes.md, libs/ if present. Do NOT open anything under /home/mara/cwe-bench or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
 date -u +%FT%TZ > "$B/blind_start.txt"
 log "agent start"
 timeout 5400 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
@@ -106,7 +122,7 @@ import json, sys
 p, model = sys.argv[1], sys.argv[2]
 m = json.load(open(p)); pc = m.setdefault("patch_checks", [])
 entry = {"patch": "blind.patch", "expect": "pass", "kind": "blind",
-         "why": f"fresh agent ({model}), instruction + the task image's product tree only"}
+         "why": f"fresh agent ({model}), full view (instruction, tree, tests, reference, trap list)"}
 for i, c in enumerate(pc):
     if c.get("patch") == "blind.patch":
         pc[i] = entry
