@@ -1,0 +1,204 @@
+diff -ruN '--exclude=.git' pinned/packages/nx/src/native/cache/cache.rs inject/packages/nx/src/native/cache/cache.rs
+--- a/packages/nx/src/native/cache/cache.rs	2026-10-23 03:23:05.349717713 +0000
++++ b/packages/nx/src/native/cache/cache.rs	2026-10-23 03:30:49.326647709 +0000
+@@ -298,6 +298,45 @@
+         Ok(())
+     }
+ 
++    /// Batch form of `apply_remote_cache_results`, used when several remote
++    /// cache entries are replayed in one pass. Kept next to the single-entry
++    /// version so both record the same bookkeeping.
++    #[napi]
++    pub fn apply_remote_cache_results_batch(
++        &self,
++        hashes: Vec<String>,
++        results: Vec<CachedResult>,
++        outputs: Vec<Vec<String>>,
++    ) -> anyhow::Result<()> {
++        for ((hash, result), outputs) in hashes
++            .into_iter()
++            .zip(results.into_iter())
++            .zip(outputs.into_iter())
++        {
++            trace!(
++                "applying remote cache results: {:?} ({})",
++                &hash, &result.outputs_path
++            );
++            let terminal_output = result.terminal_output.clone().unwrap_or_default();
++            let mut size = terminal_output.len() as i64;
++            if result.code == 0 && !outputs.is_empty() {
++                let outputs_path = Path::new(&result.outputs_path);
++                let expanded_outputs = _expand_outputs(outputs_path, outputs)?;
++                remove_items(
++                    expanded_outputs
++                        .iter()
++                        .map(|p| self.workspace_root.join(p))
++                        .collect::<Vec<_>>()
++                        .as_slice(),
++                )?;
++                size += _copy(outputs_path, &self.workspace_root)?;
++            }
++            write(self.get_task_outputs_path(hash.clone()), terminal_output)?;
++            self.record_to_cache(hash, result.code, size)?;
++        }
++        Ok(())
++    }
++
+     fn get_task_outputs_path_internal(&self, hash: &str) -> PathBuf {
+         self.cache_path.join("terminalOutputs").join(hash)
+     }
+diff -ruN '--exclude=.git' pinned/packages/nx/src/native/cache/http_remote_cache.rs inject/packages/nx/src/native/cache/http_remote_cache.rs
+--- a/packages/nx/src/native/cache/http_remote_cache.rs	2026-10-23 03:23:05.349882001 +0000
++++ b/packages/nx/src/native/cache/http_remote_cache.rs	2026-10-23 03:30:49.326425162 +0000
+@@ -85,7 +85,17 @@
+                         Self::download_and_extract_from_result(resp, cache_directory, hash).await?,
+                     ))
+                 }
+-                StatusCode::NOT_FOUND => Ok(None),
++                StatusCode::NOT_FOUND => {
++                    // Older deployments expose the same artifacts under the
++                    // pre-v19 route, so try it before reporting a miss.
++                    Self::retrieve_from_legacy_endpoint(
++                        &self.client,
++                        &self.url,
++                        &hash,
++                        &cache_directory,
++                    )
++                    .await
++                }
+                 _ => Err(convert_response_to_error(resp).await.into()),
+             }
+         } else {
+@@ -248,4 +258,91 @@
+             size: Some(size),
+         })
+     }
++
++    async fn retrieve_from_legacy_endpoint(
++        client: &Client,
++        base_url: &str,
++        hash: &str,
++        cache_directory: &str,
++    ) -> napi::Result<Option<CachedResult>> {
++        let url = format!("{}/api/v1/cache/{}", base_url, hash);
++        let response = client
++            .get(&url)
++            .header("Accept", "application/octet-stream")
++            .send()
++            .await;
++        match response {
++            Ok(resp) => match resp.status() {
++                StatusCode::OK => Ok(Some(
++                    Self::download_and_extract_legacy(resp, cache_directory, hash).await?,
++                )),
++                StatusCode::NOT_FOUND => Ok(None),
++                _ => Err(convert_response_to_error(resp).await.into()),
++            },
++            Err(e) => Err(HttpRemoteCacheErrors::RequestError(report_request_error(&e)).into()),
++        }
++    }
++
++    /// Legacy responses are read with their own extractor so the two protocol
++    /// versions can change independently of each other.
++    async fn download_and_extract_legacy(
++        response: reqwest::Response,
++        cache_directory: &str,
++        hash: &str,
++    ) -> anyhow::Result<CachedResult> {
++        let content = response.bytes().await.unwrap();
++        trace!("Downloaded {} bytes from legacy remote cache", content.len());
++        let tar = flate2::read::GzDecoder::new(content.as_ref());
++        let mut archive = Archive::new(tar);
++        let entries = archive
++            .entries()
++            .map_err(|_| anyhow::anyhow!("Failed to read entries from tarball"))?;
++
++        let mut code: Option<i16> = None;
++        let mut terminal_output: Option<String> = None;
++        let mut size: i64 = 0;
++
++        let output_dir = Path::new(cache_directory).join(hash);
++
++        for entry in entries {
++            let mut entry =
++                entry.map_err(|_| anyhow::anyhow!("Failed to read entry from tarball"))?;
++
++            let entry_path = entry
++                .path()
++                .map(|p| p.to_string_lossy().into_owned())
++                .unwrap();
++
++            if entry_path == "code" {
++                let code_file_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
++                code = Some(i16::from_be_bytes([code_file_bytes[0], code_file_bytes[1]]));
++            } else if entry_path == "terminalOutput" {
++                let terminal_output_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
++                let terminal_output_size = terminal_output_bytes.len();
++                terminal_output = Some(String::from_utf8(terminal_output_bytes)?);
++                size += terminal_output_size as i64;
++            } else {
++                let path_on_disk = output_dir.join(entry_path);
++                trace!("Extracting entry to {}", path_on_disk.display());
++                fs::create_dir_all(path_on_disk.parent().expect("joined path has a parent"))?;
++                match entry.unpack(&path_on_disk) {
++                    Err(e) => {
++                        return Err(anyhow::anyhow!("Failed to unpack entry: {}", e));
++                    }
++                    Ok(f) => match f {
++                        tar::Unpacked::File(f) => size += f.metadata()?.len() as i64,
++                        _ => (),
++                    },
++                }
++            }
++        }
++
++        Ok(CachedResult {
++            terminal_output,
++            code: code.expect("Exit code not found in cache"),
++            outputs_path: output_dir.to_string_lossy().into_owned(),
++            size: Some(size),
++        })
++    }
++
+ }
+diff -ruN '--exclude=.git' pinned/packages/nx/src/tasks-runner/cache.ts inject/packages/nx/src/tasks-runner/cache.ts
+--- a/packages/nx/src/tasks-runner/cache.ts	2026-10-23 03:23:05.393492306 +0000
++++ b/packages/nx/src/tasks-runner/cache.ts	2026-10-23 03:30:49.326781090 +0000
+@@ -175,6 +175,11 @@
+     //    The RemoteCache interface has no batch endpoint, so this is just
+     //    Promise.all over individual retrieve() calls.
+     if (remoteMisses.length > 0) {
++      const applied: {
++        hash: string;
++        result: NativeCacheResult;
++        outputs: string[];
++      }[] = [];
+       await Promise.all(
+         remoteMisses.map(async (task) => {
+           const res = await this.remoteCache.retrieve(
+@@ -182,7 +187,11 @@
+             this.cache.cacheDirectory
+           );
+           if (res) {
+-            this.applyRemoteCacheResults(task.hash, res, task.outputs);
++            applied.push({
++              hash: task.hash,
++              result: res,
++              outputs: task.outputs,
++            });
+             results.set(task.hash, {
+               ...res,
+               terminalOutput: res.terminalOutput ?? '',
+@@ -191,6 +200,12 @@
+           }
+         })
+       );
++      // Replay every retrieved entry in a single native call.
++      this.cache.applyRemoteCacheResultsBatch(
++        applied.map((entry) => entry.hash),
++        applied.map((entry) => entry.result),
++        applied.map((entry) => entry.outputs)
++      );
+     }
+ 
+     return results;

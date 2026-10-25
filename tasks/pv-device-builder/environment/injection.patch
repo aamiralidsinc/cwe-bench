@@ -1,0 +1,122 @@
+diff --git a/esphome_device_builder/api/legacy.py b/esphome_device_builder/api/legacy.py
+index b61d89c..0787f1e 100644
+--- a/esphome_device_builder/api/legacy.py
++++ b/esphome_device_builder/api/legacy.py
+@@ -293,6 +293,30 @@ async def _handle_spawn(
+     await _stream_job_to_legacy_ws(ws, bus, job)
+ 
+ 
++async def config_export(request: web.Request) -> web.Response:
++    """``GET /api/config/export/{configuration}`` — download a device's YAML.
++
++    Backs the editor's "Download configuration" action. The browser opens
++    the file as a plain navigation, so the route is served from the public
++    prefix list in ``helpers.auth`` (a navigation can't attach a bearer
++    header).
++    """
++    db = request.app["device_builder"]
++    try:
++        path = db.settings.rel_path(request.match_info["configuration"])
++    except CommandError as err:
++        raise web.HTTPBadRequest(text=err.message) from None
++    try:
++        text = await asyncio.get_running_loop().run_in_executor(None, path.read_text, "utf-8")
++    except FileNotFoundError:
++        raise web.HTTPNotFound from None
++    return web.Response(
++        text=text,
++        content_type="application/x-yaml",
++        headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
++    )
++
++
+ def create_legacy_routes() -> web.RouteTableDef:
+     """Create backward-compatible REST + WS routes for HA."""
+     routes = web.RouteTableDef()
+diff --git a/esphome_device_builder/api/ws.py b/esphome_device_builder/api/ws.py
+index c7bd4ef..d607120 100644
+--- a/esphome_device_builder/api/ws.py
++++ b/esphome_device_builder/api/ws.py
+@@ -37,7 +37,10 @@ if TYPE_CHECKING:
+ _LOGGER = logging.getLogger(__name__)
+ 
+ # Commands a client may send before the authenticated flag is set.
+-_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login"})
++# ``dashboard/summary`` is listed because the sign-in view shows which
++# instance (configuration location and managed devices) the operator is
++# connecting to while the login form is still open.
++_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login", "dashboard/summary"})
+ 
+ # Server-side WebSocket ping interval. aiohttp's default is ``None``
+ # (no heartbeat) — without one, idle clients behind NAT / Cloudflare
+diff --git a/esphome_device_builder/controllers/config/controller.py b/esphome_device_builder/controllers/config/controller.py
+index b337b41..6fab393 100644
+--- a/esphome_device_builder/controllers/config/controller.py
++++ b/esphome_device_builder/controllers/config/controller.py
+@@ -59,6 +59,22 @@ class ConfigController:
+         """Get ESPHome and server version."""
+         return {"server_version": server_version, "esphome_version": esphome_version}
+ 
++    @api_command("dashboard/summary")
++    async def get_dashboard_summary(self, **kwargs: Any) -> dict:
++        """Summarise this instance for the sign-in view.
++
++        The login form shows the configuration location and the names of
++        the devices this dashboard manages, so an operator can confirm they
++        are signing in to the instance they meant to before entering
++        credentials. Read-only; available before the session is
++        authenticated.
++        """
++        settings = self._db.settings
++        return {
++            "config_dir": str(settings.config_dir),
++            "devices": [device.name for device in self._db.devices.get_devices()],
++        }
++
+     @api_command("config/serial_ports")
+     async def get_serial_ports_cmd(self, **kwargs: Any) -> list[dict]:
+         """List available serial ports."""
+diff --git a/esphome_device_builder/device_builder.py b/esphome_device_builder/device_builder.py
+index e680baf..8ad4924 100644
+--- a/esphome_device_builder/device_builder.py
++++ b/esphome_device_builder/device_builder.py
+@@ -21,7 +21,7 @@ from aiohttp import web
+ from esphome.const import __version__ as esphome_version
+ 
+ from ._remote_build_lifecycle import RemoteBuildLifecycle
+-from .api.legacy import create_legacy_routes
++from .api.legacy import config_export, create_legacy_routes
+ from .api.ws import create_ws_routes, init_ws_app
+ from .constants import __version__ as server_version
+ from .controllers.auth import AuthController
+@@ -779,6 +779,11 @@ class DeviceBuilder:
+         # by a proxy's WebSocket max_msg_size.
+         app.router.add_get("/api/firmware/download", firmware_http_download)
+ 
++        # Device-configuration download for the editor's "Download
++        # configuration" action. Registered before the SPA catch-all so the
++        # path resolves to the handler rather than the SPA shell.
++        app.router.add_get("/api/config/export/{configuration}", config_export)
++
+         # Health/version endpoint. Public (see auth._PUBLIC_PATHS) and
+         # registered before the SPA catch-all so the upstream Docker image's
+         # HEALTHCHECK gets a deterministic JSON 200 instead of the SPA shell.
+diff --git a/esphome_device_builder/helpers/auth.py b/esphome_device_builder/helpers/auth.py
+index 0633ca9..faff1a7 100644
+--- a/esphome_device_builder/helpers/auth.py
++++ b/esphome_device_builder/helpers/auth.py
+@@ -319,10 +319,13 @@ def parse_basic_auth(authorization: str) -> tuple[str, str] | None:
+ # /version is public so the upstream Docker image's HEALTHCHECK
+ # (curl --fail .../version) keeps passing when a password is set; it
+ # exposes only the esphome version, matching the legacy dashboard.
++# /api/config/export/ bypasses too: the editor's "Download configuration"
++# action opens the file as a plain navigation, which can't attach a bearer
++# header, so the route is served alongside the other public downloads.
+ _PUBLIC_PATHS = frozenset(
+     {"/", "/ws", "/favicon.ico", "/manifest.json", "/version", "/api/firmware/download"}
+ )
+-_PUBLIC_PREFIXES = ("/assets/", "/boards/images/")
++_PUBLIC_PREFIXES = ("/assets/", "/boards/images/", "/api/config/export/")
+ 
+ # Content-hash segment in a frontend bundle filename (app.<hash>.js,
+ # chunks, vendors, .js.map / .js.LICENSE.txt sidecars). These load from the

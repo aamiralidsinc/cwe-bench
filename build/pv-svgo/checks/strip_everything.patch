@@ -1,0 +1,364 @@
+diff --git a/lib/svgo/tools.js b/lib/svgo/tools.js
+index 2e3e7f7..3786294 100644
+--- a/lib/svgo/tools.js
++++ b/lib/svgo/tools.js
+@@ -145,6 +145,56 @@ const removeLeadingZero = (value) => {
+ };
+ exports.removeLeadingZero = removeLeadingZero;
+ 
++const executableDataMediaTypes = new Set([
++  'application/xhtml+xml',
++  'image/svg+xml',
++  'text/html',
++]);
++
++/**
++ * Check whether a URL can contain executable content in a browser.
++ *
++ * @param {string} value
++ * @returns {boolean}
++ */
++const isExecutableUrl = (value) => {
++  // Browsers remove ASCII tabs and newlines from URLs before parsing them.
++  // Normalize them here too so they cannot be embedded in a scheme name.
++  const normalizedValue = value
++    .replace(/[\t\n\r]/g, '')
++    .trimStart()
++    .toLowerCase();
++
++  // `javascript:` is executable in modern browsers. `vbscript:` was only
++  // implemented by legacy Internet Explorer, but rejecting it is inexpensive,
++  // provides defense in depth for old environments, and keeps this security-
++  // oriented plugin's scheme denylist explicit and complete.
++  if (
++    normalizedValue.startsWith('javascript:') ||
++    normalizedValue.startsWith('vbscript:')
++  ) {
++    return true;
++  }
++
++  // A `data:` URL is not inherently executable: images and other inert media
++  // are common in SVGs and should remain intact. Only reject media types that
++  // browsers parse as active HTML, XHTML, or SVG documents.
++  if (!normalizedValue.startsWith('data:')) {
++    return false;
++  }
++
++  // Data URLs separate the media type from parameters with `;` and from the
++  // payload with `,`. A URL without either separator has no valid media type.
++  const mediaTypeEnd = normalizedValue.slice(5).search(/[;,]/);
++  if (mediaTypeEnd === -1) {
++    return false;
++  }
++
++  const mediaType = normalizedValue.slice(5, mediaTypeEnd + 5).trim();
++  return executableDataMediaTypes.has(mediaType);
++};
++exports.isExecutableUrl = isExecutableUrl;
++
+ /**
+  * If the current node contains any scripts. This does not check parents or
+  * children of the node, only the properties and attributes of the node itself.
+@@ -158,14 +208,14 @@ const hasScripts = (node) => {
+   }
+ 
+   if (node.name === 'a') {
+-    const hasJsLinks = Object.entries(node.attributes).some(
++    const hasExecutableLinks = Object.entries(node.attributes).some(
+       ([attrKey, attrValue]) =>
+         (attrKey === 'href' || attrKey.endsWith(':href')) &&
+         attrValue != null &&
+-        attrValue.trimStart().toLowerCase().startsWith('javascript:'),
++        isExecutableUrl(attrValue),
+     );
+ 
+-    if (hasJsLinks) {
++    if (hasExecutableLinks) {
+       return true;
+     }
+   }
+diff --git a/lib/xast.js b/lib/xast.js
+index e491735..9dca964 100644
+--- a/lib/xast.js
++++ b/lib/xast.js
+@@ -64,13 +64,8 @@ const visit = (node, visitor, parentNode) => {
+   // visit element children if still attached to parent
+   if (node.type === 'element') {
+     if (parentNode.children.includes(node)) {
+-      // <foreignObject> embeds non-SVG content, so SVG plugins have nothing to
+-      // do below it; skip the subtree the same way the plugins that explicitly
+-      // care about it already do.
+-      if (node.name !== 'foreignObject') {
+-        for (const child of node.children) {
+-          visit(child, visitor, node);
+-        }
++      for (const child of node.children) {
++        visit(child, visitor, node);
+       }
+     }
+   }
+diff --git a/plugins/removeScriptElement.js b/plugins/removeScriptElement.js
+index a3658f2..3b47292 100644
+--- a/plugins/removeScriptElement.js
++++ b/plugins/removeScriptElement.js
+@@ -1,25 +1,31 @@
+ 'use strict';
+ 
+ const { detachNodeFromParent } = require('../lib/xast.js');
+-const { attrsGroups } = require('./_collections.js');
++const { isExecutableUrl } = require('../lib/svgo/tools.js');
+ 
+ exports.name = 'removeScriptElement';
+ exports.description = 'removes scripts (disabled by default)';
+ 
+-/** Union of all event attributes. */
+-const eventAttrs = [
+-  ...attrsGroups.animationEvent,
+-  ...attrsGroups.documentEvent,
+-  ...attrsGroups.documentElementEvent,
+-  ...attrsGroups.globalEvent,
+-  ...attrsGroups.graphicalEvent,
+-];
++const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
++const XHTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
++
++/** Namespaces that support SVG <foreignObject> elements. */
++const FOREIGN_OBJECT_NAMESPACES = [SVG_NAMESPACE];
++
++/** Namespaces that support SVG <a> elements. */
++const ANCHOR_NAMESPACES = [SVG_NAMESPACE];
+ 
+ /** Namespaces that support executable <script> elements. */
+-const SCRIPT_NAMESPACES = [
+-  'http://www.w3.org/2000/svg',
+-  'http://www.w3.org/1999/xhtml',
+-];
++const SCRIPT_NAMESPACES = [SVG_NAMESPACE, XHTML_NAMESPACE];
++
++/** Attributes that can load or navigate to executable documents in HTML. */
++const HTML_URL_ATTRS = new Set(['action', 'data', 'formaction', 'href', 'src']);
++
++/** SVG animation elements that can assign a new value to another attribute. */
++const ANIMATION_ELEMENTS = new Set(['set', 'animate']);
++
++/** Animation attributes that carry the values applied to the target attribute. */
++const ANIMATION_VALUE_ATTRS = ['from', 'to', 'by', 'values'];
+ 
+ /**
+  * @param {string} elem
+@@ -29,17 +35,84 @@ const SCRIPT_NAMESPACES = [
+  * @returns {boolean}
+  */
+ function isNamespaceAwareElem(elem, targetElem, prefixes, targetNamespaces) {
+-  if (elem === targetElem) {
++  const colon = elem.indexOf(':');
++  const local = colon === -1 ? elem : elem.slice(colon + 1);
++
++  if (local.toLowerCase() !== targetElem) {
++    return false;
++  }
++
++  if (colon === -1) {
++    return true;
++  }
++
++  const prefix = elem.slice(0, colon);
++  const namespaces = prefixes.get(prefix);
++
++  if (namespaces == null || namespaces.length === 0) {
++    return false;
++  }
++
++  return targetNamespaces.includes(namespaces[namespaces.length - 1]);
++}
++
++/**
++ * Whether a value, or any item of a semicolon-separated value list, is an
++ * executable URL. Data URLs carry semicolons of their own, so the media type
++ * is looked up anywhere in the value instead of only at the beginning.
++ *
++ * @param {string} value
++ * @returns {boolean}
++ */
++function containsExecutableUrl(value) {
++  if (isExecutableUrl(value)) {
+     return true;
+   }
+ 
+-  if (elem.includes(':')) {
+-    const [prefix, effectiveTag] = elem.split(':', 2);
++  const normalizedValue = value.replace(/[\t\n\r]/g, '').toLowerCase();
++
++  return (
++    /(^|[;\s])(javascript|vbscript):/.test(normalizedValue) ||
++    /data:(text\/html|application\/xhtml\+xml|image\/svg\+xml)[;,]/.test(
++      normalizedValue,
++    )
++  );
++}
++
++/**
++ * Whether an animation can assign an executable URL to the attribute it targets.
++ *
++ * @param {import('../lib/types').XastElement} node
++ * @returns {boolean}
++ */
++function animatesExecutableUrl(node) {
++  if (!ANIMATION_ELEMENTS.has(node.name.toLowerCase())) {
++    return false;
++  }
+ 
+-    if (targetElem === effectiveTag) {
+-      const namespaces = /** @type {string[]} */ (prefixes.get(prefix));
+-      const namespace = namespaces[namespaces.length - 1];
+-      return targetNamespaces.includes(namespace);
++  const attributeName = node.attributes.attributeName;
++
++  if (attributeName == null) {
++    return false;
++  }
++
++  const targeted = attributeName
++    .slice(attributeName.lastIndexOf(':') + 1)
++    .toLowerCase();
++
++  if (targeted !== 'href' && targeted !== 'src') {
++    return false;
++  }
++
++  for (const attr of ANIMATION_VALUE_ATTRS) {
++    const value = node.attributes[attr];
++
++    if (value == null) {
++      continue;
++    }
++
++    if (containsExecutableUrl(value)) {
++      return true;
+     }
+   }
+ 
+@@ -62,6 +135,7 @@ exports.fn = () => {
+    *
+    * @type {Map<string, string[]>} */
+   const prefixes = new Map();
++  let foreignObjectDepth = 0;
+ 
+   return {
+     element: {
+@@ -80,6 +154,17 @@ exports.fn = () => {
+           }
+         }
+ 
++        if (
++          isNamespaceAwareElem(
++            node.name,
++            'foreignobject',
++            prefixes,
++            FOREIGN_OBJECT_NAMESPACES,
++          )
++        ) {
++          foreignObjectDepth += 1;
++        }
++
+         if (
+           isNamespaceAwareElem(node.name, 'script', prefixes, SCRIPT_NAMESPACES)
+         ) {
+@@ -87,13 +172,36 @@ exports.fn = () => {
+           return;
+         }
+ 
+-        for (const attr of eventAttrs) {
+-          if (node.attributes[attr] != null) {
++        if (animatesExecutableUrl(node)) {
++          detachNodeFromParent(node, parentNode);
++          return;
++        }
++
++        for (const [attr, value] of Object.entries(node.attributes)) {
++          const localAttr = attr.slice(attr.lastIndexOf(':') + 1).toLowerCase();
++          const isEventAttr = localAttr.startsWith('on') && localAttr.length > 2;
++          const isEmbeddedDocumentAttr = localAttr === 'srcdoc';
++          const isExecutableHtmlUrl = HTML_URL_ATTRS.has(localAttr);
++
++          if (isEventAttr || isEmbeddedDocumentAttr || isExecutableHtmlUrl) {
+             delete node.attributes[attr];
+           }
+         }
+       },
+       exit: (node, parentNode) => {
++        const isForeignObject = isNamespaceAwareElem(
++          node.name,
++          'foreignobject',
++          prefixes,
++          FOREIGN_OBJECT_NAMESPACES,
++        );
++        const isAnchor = isNamespaceAwareElem(
++          node.name,
++          'a',
++          prefixes,
++          ANCHOR_NAMESPACES,
++        );
++
+         for (const k of Object.keys(node.attributes)) {
+           if (!k.startsWith('xmlns:')) {
+             continue;
+@@ -103,34 +211,33 @@ exports.fn = () => {
+           /** @type {string[]} */ (prefixes.get(prefix)).pop();
+         }
+ 
+-        if (node.name !== 'a') {
+-          return;
+-        }
+-
+-        for (const attr of Object.keys(node.attributes)) {
+-          if (attr === 'href' || attr.endsWith(':href')) {
+-            if (
+-              node.attributes[attr] == null ||
+-              !node.attributes[attr]
+-                .trimStart()
+-                .toLowerCase()
+-                .startsWith('javascript:')
+-            ) {
+-              continue;
+-            }
+-
+-            const index = parentNode.children.indexOf(node);
+-            parentNode.children.splice(index, 1, ...node.children);
+-
+-            // TODO remove legacy parentNode in v4
+-            for (const child of node.children) {
+-              Object.defineProperty(child, 'parentNode', {
+-                writable: true,
+-                value: parentNode,
+-              });
++        if (isAnchor) {
++          for (const attr of Object.keys(node.attributes)) {
++            if (attr === 'href' || attr.endsWith(':href')) {
++              if (
++                node.attributes[attr] == null ||
++                !isExecutableUrl(node.attributes[attr])
++              ) {
++                continue;
++              }
++
++              const index = parentNode.children.indexOf(node);
++              parentNode.children.splice(index, 1, ...node.children);
++
++              // TODO remove legacy parentNode in v4
++              for (const child of node.children) {
++                Object.defineProperty(child, 'parentNode', {
++                  writable: true,
++                  value: parentNode,
++                });
++              }
+             }
+           }
+         }
++
++        if (isForeignObject) {
++          foreignObjectDepth -= 1;
++        }
+       },
+     },
+   };

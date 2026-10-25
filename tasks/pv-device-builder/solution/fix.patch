@@ -1,0 +1,207 @@
+diff --git a/esphome_device_builder/__main__.py b/esphome_device_builder/__main__.py
+index 23b1833..b1bd4ed 100644
+--- a/esphome_device_builder/__main__.py
++++ b/esphome_device_builder/__main__.py
+@@ -5,7 +5,6 @@ from __future__ import annotations
+ import argparse
+ import asyncio
+ import logging
+-import os
+ import signal
+ import sys
+ import threading
+@@ -24,6 +23,7 @@ from .constants import (
+     DEFAULT_REMOTE_BUILD_PORT,
+     __version__,
+ )
++from .helpers.credentials import resolve_credentials
+ from .helpers.logging import activate_log_queue_handler
+ from .helpers.startup_timing import StartupTimer
+ 
+@@ -322,6 +322,8 @@ def main() -> None:
+ 
+     _warn_deprecated_credential_flags(args)
+ 
++    _warn_legacy_credential_env(args)
++
+     # ``--version`` / ``--help`` exit above before reaching this
+     # point, so the lazy imports below are reachable only when the
+     # user actually meant to run the dashboard. Gate on
+@@ -465,9 +467,7 @@ def _format_version() -> str:
+ 
+ def _validate_credentials(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+     """Reject mismatched --username / --password (or env equivalents)."""
+-    has_user = bool(args.username or os.getenv("ESPHOME_USERNAME"))
+-    has_pass = bool(args.password or os.getenv("ESPHOME_PASSWORD"))
+-    if has_user != has_pass:
++    if resolve_credentials(args.username, args.password).mismatch:
+         parser.error(
+             "--username and --password must both be set (or both unset). "
+             "Use $ESPHOME_USERNAME / $ESPHOME_PASSWORD env vars as alternatives."
+@@ -486,6 +486,23 @@ def _warn_deprecated_credential_flags(args: argparse.Namespace) -> None:
+     )
+ 
+ 
++def _warn_legacy_credential_env(args: argparse.Namespace) -> None:
++    """Warn loudly when auth came from the deprecated bare $USERNAME / $PASSWORD."""
++    if not resolve_credentials(args.username, args.password).used_legacy:
++        return
++    banner = "=" * 70
++    logging.getLogger(_LOGGER_NAME).warning(
++        "\n%s\n"
++        " DEPRECATION: authenticating with the legacy $USERNAME / $PASSWORD\n"
++        " environment variables. Rename them to $ESPHOME_USERNAME /\n"
++        " $ESPHOME_PASSWORD; the bare names will stop working in a future\n"
++        " release.\n"
++        "%s",
++        banner,
++        banner,
++    )
++
++
+ def _warn_if_unprotected(settings: DashboardSettings) -> None:
+     """Print a banner when starting without any authentication boundary."""
+     if settings.using_password:
+diff --git a/esphome_device_builder/api/ws.py b/esphome_device_builder/api/ws.py
+index d607120..c7bd4ef 100644
+--- a/esphome_device_builder/api/ws.py
++++ b/esphome_device_builder/api/ws.py
+@@ -37,10 +37,7 @@ if TYPE_CHECKING:
+ _LOGGER = logging.getLogger(__name__)
+ 
+ # Commands a client may send before the authenticated flag is set.
+-# ``dashboard/summary`` is listed because the sign-in view shows which
+-# instance (configuration location and managed devices) the operator is
+-# connecting to while the login form is still open.
+-_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login", "dashboard/summary"})
++_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login"})
+ 
+ # Server-side WebSocket ping interval. aiohttp's default is ``None``
+ # (no heartbeat) — without one, idle clients behind NAT / Cloudflare
+diff --git a/esphome_device_builder/controllers/config/settings.py b/esphome_device_builder/controllers/config/settings.py
+index 7c54246..2687c26 100644
+--- a/esphome_device_builder/controllers/config/settings.py
++++ b/esphome_device_builder/controllers/config/settings.py
+@@ -21,6 +21,7 @@ from ...constants import (
+ )
+ from ...helpers.api import CommandError
+ from ...helpers.auth import hash_password
++from ...helpers.credentials import resolve_credentials
+ from ...helpers.network_interfaces import resolve_bind_host
+ from ...helpers.secrets_state import migrate_placeholder_wifi_secrets
+ from ...models import ErrorCode
+@@ -101,19 +102,19 @@ class DashboardSettings:
+         """Parse CLI arguments into settings."""
+         self.on_ha_addon = getattr(args, "ha_addon", False)
+         self.allow_public_port = getattr(args, "ha_addon_allow_public", False)
+-        # Env-var fallback uses ``ESPHOME_*`` rather than the legacy
+-        # dashboard's bare ``USERNAME`` / ``PASSWORD``: the bare names
+-        # collide with login-shell / Windows system vars (``$USERNAME``
+-        # is the OS user on both), which would silently promote the
+-        # OS user to the dashboard username when only ``--password``
+-        # / ``$ESPHOME_PASSWORD`` is set. Intentional divergence from
+-        # ``esphome/dashboard/settings.py``.
+-        username = getattr(args, "username", None) or os.getenv("ESPHOME_USERNAME") or ""
+-        password = getattr(args, "password", None) or os.getenv("ESPHOME_PASSWORD") or ""
+-        self.username = username
+-        self.using_password = bool(username and password)
++        # Credentials resolve through ``resolve_credentials``: CLI flag, then
++        # ``$ESPHOME_*``, then the deprecated bare ``$USERNAME`` / ``$PASSWORD``
++        # pair (kept for back-compat with pre-rename dashboards, warned about at
++        # startup). The bare pair is adopted only when ``$PASSWORD`` is set, so
++        # the OS-provided ``$USERNAME`` is never read on its own.
++        resolved = resolve_credentials(
++            getattr(args, "username", "") or "",
++            getattr(args, "password", "") or "",
++        )
++        self.username = resolved.username
++        self.using_password = bool(resolved.username and resolved.password)
+         if self.using_password:
+-            self.password_hash = hash_password(password)
++            self.password_hash = hash_password(resolved.password)
+         self.config_dir = Path(args.configuration)
+         self.config_dir.mkdir(parents=True, exist_ok=True)
+         self.absolute_config_dir = self.config_dir.resolve()
+diff --git a/esphome_device_builder/helpers/auth.py b/esphome_device_builder/helpers/auth.py
+index faff1a7..0633ca9 100644
+--- a/esphome_device_builder/helpers/auth.py
++++ b/esphome_device_builder/helpers/auth.py
+@@ -319,13 +319,10 @@ def parse_basic_auth(authorization: str) -> tuple[str, str] | None:
+ # /version is public so the upstream Docker image's HEALTHCHECK
+ # (curl --fail .../version) keeps passing when a password is set; it
+ # exposes only the esphome version, matching the legacy dashboard.
+-# /api/config/export/ bypasses too: the editor's "Download configuration"
+-# action opens the file as a plain navigation, which can't attach a bearer
+-# header, so the route is served alongside the other public downloads.
+ _PUBLIC_PATHS = frozenset(
+     {"/", "/ws", "/favicon.ico", "/manifest.json", "/version", "/api/firmware/download"}
+ )
+-_PUBLIC_PREFIXES = ("/assets/", "/boards/images/", "/api/config/export/")
++_PUBLIC_PREFIXES = ("/assets/", "/boards/images/")
+ 
+ # Content-hash segment in a frontend bundle filename (app.<hash>.js,
+ # chunks, vendors, .js.map / .js.LICENSE.txt sidecars). These load from the
+diff --git a/esphome_device_builder/helpers/credentials.py b/esphome_device_builder/helpers/credentials.py
+new file mode 100644
+index 0000000..faa851a
+--- /dev/null
++++ b/esphome_device_builder/helpers/credentials.py
+@@ -0,0 +1,58 @@
++"""Resolve dashboard auth credentials from CLI flags and environment vars."""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Mapping
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class ResolvedCredentials:
++    """Outcome of resolving the dashboard username/password across all sources."""
++
++    username: str
++    password: str
++    used_legacy: bool
++    mismatch: bool
++
++
++def resolve_credentials(
++    username_arg: str,
++    password_arg: str,
++    environ: Mapping[str, str] = os.environ,
++) -> ResolvedCredentials:
++    """
++    Resolve the dashboard credentials across flags, ``ESPHOME_*`` and legacy env.
++
++    Precedence per credential: CLI flag, then ``$ESPHOME_USERNAME`` /
++    ``$ESPHOME_PASSWORD``, then the deprecated bare ``$USERNAME`` /
++    ``$PASSWORD`` pair. The bare pair is adopted only when the new scheme
++    supplied nothing and ``$PASSWORD`` is set, so the OS-provided
++    ``$USERNAME`` is never read on its own (it would otherwise promote the
++    login-shell user to the dashboard username). ``mismatch`` is true when
++    exactly one half of the resolved pair is set.
++    """
++    username = username_arg or environ.get("ESPHOME_USERNAME", "")
++    password = password_arg or environ.get("ESPHOME_PASSWORD", "")
++    used_legacy = False
++    # Gate the legacy fallback on ``$PASSWORD`` specifically: it is not a
++    # standard OS/shell variable, so its presence is the deliberate "I
++    # configured legacy auth" signal. ``$USERNAME`` *is* the login user on
++    # Linux/Windows, so it must never trigger the fallback or be read on its
++    # own — doing so would silently promote the OS user to the dashboard
++    # username (the footgun the ESPHOME_* rename fixed). On Windows
++    # ``$USERNAME`` is always populated, so the gate there reduces to
++    # "``$PASSWORD`` is set" and the adopted username is the OS login name;
++    # that fails safe (more locked down, and the deprecation banner fires),
++    # not open.
++    if not username and not password and environ.get("PASSWORD"):
++        username = environ.get("USERNAME", "")
++        password = environ.get("PASSWORD", "")
++        used_legacy = bool(username and password)
++    return ResolvedCredentials(
++        username=username,
++        password=password,
++        used_legacy=used_legacy,
++        mismatch=bool(username) != bool(password),
++    )
