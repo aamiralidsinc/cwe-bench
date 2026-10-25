@@ -1,0 +1,93 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "16005", "advisory_ids": ["GHSA-5WF9-H793-W73C"], "repo": "xtls/xray-core",
+  "pinned_commit": "0bafca94868a4ec38cd3dba0f2ba7ec6f44bbf18",
+  "fix_commits": ["64fada32b5b9e6ae064a038fa0e4e2b766499bd5"],
+  "trust_decision": {
+    "summary": "TLS client decides whether a peer chain that contains a pinned CA (pinnedPeerCertSha256) is acceptable; when no verifyPeerCertByName is set it verifies the leaf against the pinned CA with DNSName = r.Config.ServerName, and an empty ServerName makes Go's x509 Verify skip the hostname check, so any leaf issued by the pinned CA is accepted.",
+    "evidence": [
+      "transport/internet/tls/config.go:298-311",
+      "transport/internet/tls/config.go:333-347",
+      "transport/internet/tls/config.go:378-391",
+      "transport/internet/tls/config.go:558-577",
+      "fix.diff:41-44"
+    ]
+  },
+  "landing_point": {
+    "where": "transport/internet/tls/config.go:333",
+    "why": "The summary names pinnedPeerCertSha256 and CA pinning; grepping it leads straight to RandCarrier.verifyPeerCert and its foundCA branch that uses r.Config.ServerName as DNSName."
+  },
+  "fix_sites": [
+    {"where": "transport/internet/tls/config.go:333", "entry_point": "every TLS client dial whose streamSettings.tlsSettings has pinnedPeerCertSha256 (crypto/tls VerifyPeerCertificate callback installed at transport/internet/tls/config.go:389)", "module_kind": "core TLS config / verifier (shared library code)"},
+    {"where": "transport/internet/grpc/dial.go:139-142", "entry_point": "outbound with streamSettings.network=grpc + security=tls (grpc Dial -> getGrpcClient at transport/internet/grpc/dial.go:54,77)", "module_kind": "transport dialer (gRPC), separate package"},
+    {"where": "transport/internet/hysteria/dialer.go:348", "entry_point": "outbound with streamSettings.network=hysteria + TLS (hysteria Dial, QUIC)", "module_kind": "transport dialer (Hysteria/QUIC), separate package"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "transport/internet/hysteria/dialer.go:348 and transport/internet/grpc/dial.go:139-142 (each derives SNI itself instead of via tls.WithDestination; the hysteria one hands the config to quic-go, which sets ServerName on its own copy so the verifier's r.Config.ServerName stays empty)"
+  },
+  "O3_reason_to_dismiss": "The report is about CA pinning in the TLS verifier; gRPC and Hysteria are separate transports that already 'set SNI' (grpc copies the domain at dial.go:140-142, quic-go fills SNI itself), so a solver can argue they are already fine and only patch verifyPeerCert, or, the other way round, add a guard in the verifier and miss that these transports never fill r.Config.ServerName for IP or QUIC dials.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Pinning a LEAF hash must keep working with no serverName (early return at foundLeaf). verifyPeerCertByName together with a pinned CA must keep working. gRPC/Hysteria/realm outbounds that pin a CA with no explicit serverName must still connect to a correctly named server using the outbound address. A verifier-only 'reject empty ServerName' fix breaks the Hysteria and gRPC-over-IP cases unless the dialers pass WithDestination; rejecting all pinned-CA configs breaks legitimate use.",
+    "where": "transport/internet/tls/config.go:303-304; transport/internet/tls/config.go:313-331; transport/internet/tls/config.go:489-495; transport/internet/hysteria/dialer.go:348; transport/internet/grpc/dial.go:139-142"
+  },
+  "O6_input_shapes": [
+    "serverName empty with a domain outbound address (grpc pre-fix copied it only for domains: transport/internet/grpc/dial.go:140)",
+    "serverName empty with an IP outbound address (WithDestination uses dest.Address.String(): transport/internet/tls/config.go:492)",
+    "QUIC transport where the library fills SNI on its own config copy (transport/internet/hysteria/dialer.go:348)",
+    "pinned hash matching an intermediate/CA rather than the leaf (transport/internet/tls/config.go:565-574)"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "transport/internet/tls/config.go:364-416 (GetTLSConfig builds the tls.Config whose ServerName the verifier later reads through r.Config, set at transport/internet/tls/config.go:391); callers then copy or clone it (transport/internet/tls/tls.go:149-160, transport/internet/tls/grpc.go:56-63, transport/internet/finalmask/realm/http.go:87-88)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "finalmask 'realm' HTTP client builds its TLS config with GetTLSConfig() and no WithDestination; net/http sets SNI on its own clone, so the verifier's r.Config.ServerName stays empty when serverName is unset. The fix did not touch it, and only the central fail-closed check covers it.",
+      "where": "transport/internet/finalmask/realm/http.go:84-89",
+      "reason_to_dismiss": "finalmask/realm is a neighbouring NAT-punch/rendezvous helper, not a proxy transport; it looks like a side channel outside 'TLS client' scope.",
+      "distance": "different package (transport/internet/finalmask/realm) from the landing point in transport/internet/tls",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "RAW/TCP dial with serverName=fromMitm uses WithOverrideName(mitmServerName), which can be empty when the context carries no MITM name, leaving ServerName empty for the pinned-CA branch. The fix did not touch it, and only the central check covers it.",
+      "where": "transport/internet/tcp/dialer.go:37-44",
+      "reason_to_dismiss": "The fromMitm SNI mode is a special MITM-forwarding feature, an 'unsupported combination' with CA pinning.",
+      "distance": "different package (transport/internet/tcp)",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "transport/internet/tls/grpc.go:54-65", "sibling": "grpcUtls.ClientHandshake sets ServerName from authority on a Clone, so a verifier that reads a captured config pointer would see the pre-clone value", "why_realistic": "The clone is already there to 'avoid clobbering ServerName'; a maintainer wiring pinning through this credentials type would naturally read the original config."},
+    {"where": "transport/internet/tls/tls.go:149-160", "sibling": "copyConfig to utls copies ServerName by value while VerifyPeerCertificate stays bound to the original RandCarrier.Config; a dialer that sets SNI after copying gives a check/use differential", "why_realistic": "The uTLS fingerprint path is a second TLS implementation that already copies fields by hand."},
+    {"where": "app/dns/nameserver_quic.go:260-266", "sibling": "a DoQ/DoH nameserver variant that accepts user tlsSettings (with pinning) but builds the config without WithDestination", "why_realistic": "The QUIC nameserver already builds a tls.Config ad hoc; adding user TLS settings there is a plausible feature."}
+  ],
+  "O9_family": "certificate validation: hostname not bound to the pinned CA (CWE-297, improper validation of certificate with host mismatch)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26 (go.mod:3)", "services": [],
+                "offline_after_build": true,
+                "project_tests": "transport/internet/tls/pin_test.go:102-153 (unit tests for verifyPeerCert on leaf and CA pins; always set ServerName), testing/scenarios/tls_test.go:111 and others (end-to-end loopback TLS with PinnedPeerCertSha256), transport/internet/websocket/ws_test.go:139, transport/internet/splithttp/splithttp_test.go:148, transport/internet/httpupgrade/httpupgrade_test.go:198"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "transport/internet/tls/config.go, transport/internet/grpc/dial.go, transport/internet/hysteria/dialer.go",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "In verifyPeerCert's foundCA branch, return an error when ServerName is empty (or verify with some fallback name), without making the gRPC/Hysteria dialers pass tls.WithDestination; or the reverse, patching only the dialers' SNI and leaving the verifier failing open for realm/fromMitm."},
+  "out_of_scope_notes": [
+    "transport/internet/tls/config.go:327-329 builds an error with errors.New but never returns it (the code falls through to a generic error return, so no security effect).",
+    "transport/internet/hysteria/hub.go:221-226 masquerade proxy uses InsecureSkipVerify when masqUrlInsecure is set; this is a separate, opt-in feature.",
+    "transport/internet/reality/reality.go:76 has its own VerifyPeerCertificate, which is a different protection."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "That quic-go (hysteria) and net/http (realm) set SNI on a cloned tls.Config rather than on the passed pointer is based on knowledge of those libraries; vendored sources were not read.",
+    "Whether the project documents pinnedPeerCertSha256 as always enforcing the hostname was not checked (docs are not in the tree).",
+    "present_in_latest is unknown because no latest release was provided.",
+    "j_defence_ineffective=1 reflects that the hostname check existed (DNSName: r.Config.ServerName) but was silently skipped when the name was empty."
+  ]
+}

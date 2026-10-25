@@ -1,0 +1,64 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "16804",
+  "advisory_ids": ["GHSA-9468-V6MJ-FPPW", "CVE-2026-71485", "GO-2026-6490"],
+  "repo": "centrifugal/centrifugo",
+  "pinned_commit": "b28df8d8a32e48883f262d7d74c0641ac2cd9c4d",
+  "fix_commits": ["84d38cea1dd2efa24375a148817a974c8727f4b0"],
+  "trust_decision": {
+    "summary": "Which header values may be forwarded to proxy backends as if they came from the transport: at the pinned commit the http_headers allow list is matched against both real transport headers and the client-controlled emulated header map (connect frame), so a client can fill a 'trusted' header name whenever the edge proxy did not set it; decided in requestHeaders (HTTP proxies) and requestMetadata (gRPC proxies).",
+    "evidence": ["internal/proxy/http.go:139-151", "internal/proxy/grpc.go:90-102", "internal/client/handler.go:389", "internal/client/handler.go:548-553", "internal/configtypes/types.go:700"]
+  },
+  "landing_point": {"where": "internal/proxy/http.go:139", "why": "Summary says 'headers forwarded to proxy backends'; the HTTP proxy header builder is where emulated headers are merged with http_headers, and it is the first hit for GetEmulatedHeadersFromContext."},
+  "fix_sites": [
+    {"where": "internal/proxy/http.go:127-160", "entry_point": "every HTTP proxy call (connect, refresh, subscribe, sub_refresh, publish, rpc, map publish/remove, shared poll refresh) triggered by a client command", "module_kind": "sink: HTTP proxy header builder; fix also canonicalises grpc_metadata keys (fix.diff:793)"},
+    {"where": "internal/proxy/grpc.go:77-102", "entry_point": "every gRPC proxy call incl. subscribe stream proxy (internal/proxy/subscribe_stream_grpc.go:39,44)", "module_kind": "sink: second implementation (gRPC metadata builder), same package"},
+    {"where": "internal/proxy/proxy.go:23-111", "entry_point": "proxy construction from config (Get*Proxy, 9 getters) at startup", "module_kind": "config normalisation (lowercases allow lists); fix adds emulated list + allow-list helper"},
+    {"where": "internal/configtypes/types.go:697-700", "entry_point": "server config file / env (proxy objects)", "module_kind": "config schema: new emulated_headers option, http_headers redefined transport-only"},
+    {"where": "internal/client/handler.go:389", "entry_point": "client connect (any bidi or uni transport) with connect proxy", "module_kind": "producer: puts e.Headers into connect-proxy context; fix gates on UsesEmulatedHeaders"},
+    {"where": "internal/client/handler.go:548-553", "entry_point": "client connect; context persisted for later channel/RPC/refresh proxy calls", "module_kind": "producer: stores emulated headers in long-lived connection context; fix gates it"},
+    {"where": "internal/app/proxy.go:28-480", "entry_point": "server startup buildProxyMap", "module_kind": "wiring: aggregates UsesEmulatedHeaders over all proxies (fix.diff:330-500)"}
+  ],
+  "O1_entry_points": 10,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "internal/proxy/grpc.go:90-95 (gRPC metadata builder, parallel to internal/proxy/http.go:139-144)"},
+  "O3_reason_to_dismiss": "The pinned http_headers doc already warns that values may come from header emulation and tells operators to have their edge set/strip them (internal/configtypes/types.go:700), so a solver can argue this is documented operator responsibility; also the gRPC builder can be argued 'a different transport' from the HTTP proxy in the report.",
+  "O4_distance": {"files": 7, "packages": 5, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Header emulation is a supported feature (browser SDK 'headers' option, uni transports' ConnectRequest.headers): an opted-in emulated name must still be forwarded, a name listed both as transport and emulated (e.g. Authorization) must prefer the transport value and fall back to the emulated one, and transport-only headers (X-Real-Ip) and static headers must keep working. Dropping all emulated headers breaks this.", "where": "internal/proxy/http.go:135-151"},
+  "O6_input_shapes": [
+    "emulated header name in different case than allow list (strings.ToLower match, internal/proxy/http.go:141)",
+    "name present only as emulated (no transport header) -> must not fill http_headers name",
+    "name present both as transport header and emulated -> transport wins (internal/proxy/http.go:146-151)",
+    "client on gRPC uni transport (no HTTP headers in ctx) with same name in grpc_metadata: lowercase md key vs canonical emulated key produced duplicate headers (internal/proxy/http.go:153-159; fix.diff:788-793)",
+    "HTTP proxy vs gRPC proxy output (http.Header vs metadata.MD)"
+  ],
+  "O7_producer": {"kind": "handler", "where": "internal/client/handler.go:389 and internal/client/handler.go:548-553 (emulated map copied into connect ctx and into the persisted connection context, fed from internal/unigrpc/grpc.go:46, internal/uniws/handler.go:226, internal/unisse/handler.go:56, internal/unihttpstream/handler.go:75 and bidi transports in the centrifuge module)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/proxy/subscribe_stream_grpc.go:17", "sibling": "a subscribe-stream proxy constructor that builds its own metadata from emulated headers instead of grpcRequestContext", "why_realistic": "NewSubscribeStreamProxy already bypasses the shared Get*Proxy normalisation (no lowercasing of HttpHeaders), so a separate header path here is plausible for a maintainer."},
+    {"where": "internal/middleware/user_header_auth.go:14", "sibling": "user_id_http_header auth falling back to the emulated header map when the real header is absent", "why_realistic": "Uni/emulation transports cannot set real headers, so a maintainer could add an emulated fallback for parity, recreating the same trust confusion at the auth layer."},
+    {"where": "internal/proxy/http.go:153-159", "sibling": "grpc_metadata allow list also matched against emulated headers for gRPC-transport clients", "why_realistic": "Mirrors the http_headers merge for clients without HTTP headers; a 'consistency' change a maintainer could write."}
+  ],
+  "O9_family": "CWE-290 authentication bypass by spoofing: trusted-origin header allow list filled from client-controlled emulated headers (source confusion)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26 (go.mod:3), modules incl. github.com/centrifugal/centrifuge", "services": [], "offline_after_build": true,
+                "project_tests": "internal/proxy/proxy_test.go (requestHeaders/requestMetadata unit tests), internal/proxy/connect_handler_test.go and subscribe_handler_test.go (httptest backends), internal/client/handler_test.go; all in-process, no external services"},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "internal/proxy/http.go, internal/proxy/grpc.go, internal/proxy/proxy.go, internal/configtypes/types.go, internal/client/handler.go, internal/app/proxy.go, internal/tools/interval_limiter.go",
+        "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Stop merging emulated headers in requestHeaders only (HTTP proxy), or drop emulated headers entirely, leaving the gRPC builder open or breaking the documented emulation feature."},
+  "out_of_scope_notes": [
+    "NewSubscribeStreamProxy does not lowercase HttpHeaders (internal/proxy/subscribe_stream_grpc.go:17 vs internal/proxy/proxy.go:24), a case-matching functional bug, not pursued.",
+    "Fix commit also bumps many go.mod dependencies incl. github.com/centrifugal/centrifuge (fix.diff:24-25); not assessed."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell use); centrifugo is a mid-size Go repo, likely well under 1.5 GB and over 5 MB.",
+    "The published fix adds a new config option (emulated_headers) and changes internal signatures; hidden tests need the report to name that option/API to stay fair. This is a fairness concern, not a defined red flag.",
+    "The emulated-header producer for bidirectional transports lives in the external centrifuge module (ConnectEvent.Headers), not in this tree; not inspected.",
+    "O1 counts the 10 proxy kinds that reach the two sink builders; they all go through 2 functions and so fall together.",
+    "No routes into the sink were found that bypass requestHeaders/requestMetadata (all proxy call sites grep to these two), so O8 is empty; latest release not available, so present_in_latest is not applicable."
+  ]
+}

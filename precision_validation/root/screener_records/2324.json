@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "2324", "advisory_ids": ["GHSA-935W-9G4M-P28P", "CVE-2026-105752"], "repo": "vllm-project/vllm",
+  "pinned_commit": "parent of 6a2a2bb02b563b83f946012959fd3927984d072a (parent_commit not given in candidate)",
+  "fix_commits": ["6a2a2bb02b563b83f946012959fd3927984d072a"],
+  "trust_decision": {
+    "summary": "Which prefix-cache tenant a prompt belongs to is decided by the request's cache_salt carried on each EngineInput; the Responses Harmony built-in-tool loop rebuilds the follow-up EngineInput without it, so continuation sub-requests hash into the unsalted shared cache.",
+    "evidence": [
+      "vllm/entrypoints/openai/responses/serving.py:713-717",
+      "vllm/entrypoints/openai/responses/serving.py:759-760",
+      "vllm/renderers/base.py:971-976",
+      "vllm/renderers/online_renderer.py:430-434"
+    ]
+  },
+  "landing_point": {
+    "where": "vllm/entrypoints/openai/responses/serving.py:715",
+    "why": "Summary names Harmony tool continuations; the only Harmony continuation render in _generate_with_builtin_tools is tokens_input(token_ids) with no cache_salt, while the first-turn render at line 760 passes it."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:1483", "entry_point": "POST /v1/responses (Harmony model, built-in tool call) -> OpenAIServingResponses._generate_with_builtin_tools", "module_kind": "handler (captures cache_salt from first engine_input)"},
+    {"where": "fix.diff:1490-1502", "entry_point": "POST /v1/responses -> _generate_with_builtin_tools HarmonyContext branch", "module_kind": "handler (continuation render now via OnlineRenderer.render_responses_harmony_messages with cache_salt)"},
+    {"where": "fix.diff:2107-2123", "entry_point": "OnlineRenderer.render_responses_harmony_messages (called from /v1/responses and /v1/responses/render)", "module_kind": "lower-level renderer API (new, shared)"},
+    {"where": "fix.diff:1458-1467", "entry_point": "POST /v1/responses (non-Harmony, VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT) -> _render_next_turn", "module_kind": "handler refactor; salt was already carried via preprocess_chat prompt_extras"},
+    {"where": "fix.diff:1926-2083", "entry_point": "OnlineRenderer.render_responses (moved first-turn rendering from serving.py)", "module_kind": "renderer refactor (salt already present at pinned serving.py:760)"},
+    {"where": "fix.diff:1698-1706", "entry_point": "POST /v1/responses/render (new route)", "module_kind": "new feature route, not a security site"},
+    {"where": "fix.diff:1757-1813", "entry_point": "ServingRender.render_responses_request", "module_kind": "new feature handler, not a security site"},
+    {"where": "fix.diff:1088-1095", "entry_point": "vllm serve / vllm launch render startup", "module_kind": "config refactor (cohere_format defaults), not security"},
+    {"where": "fix.diff:1169-1179", "entry_point": "vllm serve --tool-server startup", "module_kind": "config refactor (init_tool_server), not security"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "Security-relevant change is one call in serving.py's tool loop; the online_renderer.py helper is new code built for the refactor, not a pre-existing out-of-scope module that also needed fixing."},
+  "O3_reason_to_dismiss": "Weak: a solver could argue the ParsableContext follow-up (serving.py:718-726) is an experimental env-gated path and skip it, but at the pinned commit it already carries the salt via preprocess_chat prompt_extras (online_renderer.py:430-434), so there is nothing to dismiss.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Requests with no cache_salt must keep sharing prefix cache (opt-in salting; base.py only sets the key when a salt is present); follow-up turn must also keep max_tokens = max_model_len - prompt_len.",
+    "where": "vllm/renderers/base.py:975-976; vllm/entrypoints/openai/responses/serving.py:717"
+  },
+  "O6_input_shapes": [
+    "cache_salt present vs absent (None -> no key)",
+    "Harmony continuation via HarmonyContext (streaming, non-streaming, background all share _generate_with_builtin_tools)"
+  ],
+  "O7_producer": {"kind": "handler", "where": "vllm/entrypoints/openai/responses/serving.py:714-715 (continuation EngineInput built inline from context.render_for_completion(), vllm/entrypoints/openai/responses/context.py:804-805)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "vllm/entrypoints/openai/responses/serving.py:718-726", "sibling": "ParsableContext follow-up turn rebuilt from a fresh request copy that omits cache_salt", "why_realistic": "The published fix itself rebuilds this request with model_copy (fix.diff:1441-1448); a maintainer dropping fields there, or building a minimal request, would plausibly lose the salt. It is env-gated (experimental), which gives a solver a reason to dismiss it."},
+    {"where": "vllm/renderers/online_renderer.py:226-231", "sibling": "Chat Completions Harmony decode-side token-reuse shortcut building tokens_input without cache_salt", "why_realistic": "Short-circuit fast path for disaggregated decode; a maintainer could assume the prefill side already salted. Sits in another package from the landing point."},
+    {"where": "vllm/entrypoints/generate/beam_search/utils.py:45-60", "sibling": "beam-search expansion prompt rebuilt without propagating cache_salt", "why_realistic": "Same pattern as the advisory (multi-step re-rendering of a prompt); currently propagates explicitly, so dropping it is a one-line realistic omission."}
+  ],
+  "O9_family": "CWE-200/CWE-524 cross-tenant prefix-cache timing side channel: isolation key dropped on derived sub-requests",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python",
+    "toolchain": "pip/uv install of vllm (torch, openai, openai_harmony, fastapi); CPU-only install possible",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/entrypoints/openai/responses/test_serving_responses.py (mock-based unit tests; fix adds test_harmony_tool_followup_preserves_render_params); tests/entrypoints/scale_out/render/test_render.py (HTTP tests need a tiny model download)"
+  },
+  "O11_fix_minutes": 10,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 0, "j_sites_touched": "vllm/entrypoints/openai/responses/serving.py, vllm/renderers/online_renderer.py, vllm/entrypoints/scale_out/render/serving.py, vllm/entrypoints/scale_out/render/api_router.py, vllm/entrypoints/scale_out/factories.py, vllm/entrypoints/mcp/tool_server.py, vllm/entrypoints/launchers/cli_args.py, vllm/entrypoints/launchers/api_server/app_state.py, vllm/entrypoints/launchers/render/app_state.py, vllm/entrypoints/generate/api_router.py",
+        "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Change serving.py:715 to tokens_input(token_ids, cache_salt=...) using the original request's salt — which is in fact a complete fix for the security issue."},
+  "out_of_scope_notes": [
+    "vllm/entrypoints/generate/generative_scoring/serving.py:437 builds tokens_input without cache_salt, but GenerativeScoringRequest has no cache_salt field, so this protection does not apply there.",
+    "The fix also adds a new /v1/responses/render route and moves tool-server and cohere_format init; these are feature/refactor changes, not security sites."
+  ],
+  "unverified": [
+    "pinned_commit SHA: candidate parent_commit is null; taken as the fix commit's parent.",
+    "repo_mb: size not measured (no shell); vLLM source is likely tens of MB, so not a tiny or giant repo.",
+    "Advisory text itself not provided; trust decision derived from summary and diff.",
+    "The O8 search covered cache_salt and tokens_input/render_for_completion call sites under vllm/; other engine-input builders (e.g. offline LLM API) were not exhaustively checked."
+  ]
+}

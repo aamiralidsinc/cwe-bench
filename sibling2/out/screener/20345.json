@@ -1,0 +1,48 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "20345", "advisory_ids": ["GHSA-2VH6-HW4J-32WW", "CVE-2026-82250"], "repo": "gitoxidelabs/gitoxide",
+  "pinned_commit": "eac50e1207e2549b23302c9faf595a420b9919fc", "fix_commits": ["4bef04ae8a261634200b3a6faabdd77e25aeb8c1"],
+  "trust_decision": {
+    "summary": "A side-band packet whose payload, after the band byte, is empty or attacker-chosen must be decoded without indexing past its bounds; this is decided in PacketLineRef::decode_band and TextRef::from in gix-packetline, which every remote progress/error band goes through.",
+    "evidence": ["gix-packetline/src/lib.rs:165-173", "gix-packetline/src/lib.rs:197-201", "gix-packetline/src/blocking_io/sidebands.rs:145-165", "gix-packetline/src/async_io/sidebands.rs:282-302"]
+  },
+  "landing_point": {"where": "gix-packetline/src/lib.rs:167", "why": "The summary says 'empty side-band packet', and decode_band's unchecked d[0] is the first band-decoding code an engineer reads; the real wire trigger (packet 0005 + band 2/3 giving an empty payload) actually panics one step later in TextRef::from at lib.rs:199."},
+  "fix_sites": [
+    {"where": "gix-packetline/src/lib.rs:199", "entry_point": "WithSidebands BufRead/Read (blocking and async) via gix-transport ExtendedBufRead set_progress_handler, which gix-protocol fetch uses (gix clone/fetch); also public TextRef::from / PacketLineRef::as_text", "module_kind": "core decoding type (shared by blocking and async)"},
+    {"where": "gix-packetline/src/lib.rs:167", "entry_point": "public API PacketLineRef::decode_band; called from WithSidebands::fill_buf / poll_fill_buf", "module_kind": "core decoding type"},
+    {"where": "gix-packetline/src/blocking_io/read.rs:37", "entry_point": "StreamingPeekableIter::read_line / peek_line (blocking); defensive only, because buf is always resized to MAX_LINE_LEN first (read.rs:141-142, 168)", "module_kind": "blocking transport implementation"},
+    {"where": "gix-packetline/src/async_io/read.rs:42", "entry_point": "StreamingPeekableIter::read_line / peek_line (async); defensive only, buf resized at async_io/read.rs:146,173", "module_kind": "async transport implementation (second implementation)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "gix-packetline/src/async_io/sidebands.rs:292-298 (async copy of the blocking sideband loop). The fix covers it only indirectly, by fixing the shared TextRef::from at gix-packetline/src/lib.rs:199"},
+  "O3_reason_to_dismiss": "A solver who guards the empty payload inside blocking_io/sidebands.rs:155/161 (the client path most users hit) can argue the async-io feature is a separate, non-default transport; and if they fix only decode_band (the 'empty packet' in the summary), they can argue TextRef::from is a plain text helper, not sideband decoding.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Empty progress/error bands (keep-alive packets under sideband-all) must still be forwarded to the progress handler with empty text rather than rejected. The fix's test checks this, and translate_to_progress depends on it. Also, empty Data bands are skipped, not treated as errors.", "where": "gix-packetline/src/blocking_io/sidebands.rs:148-165; gix-protocol/src/remote_progress.rs:44-48; fix.diff:101-120"},
+  "O6_input_shapes": ["Data line with no bytes at all, so no band id (decode_band d[0]) — public-API only, because the wire decoder rejects length 0004 (gix-packetline/src/decode.rs:83-85)", "band 2 (progress) with an empty payload: packet 0005\\x02", "band 3 (error) with an empty payload: packet 0005\\x03", "buffer shorter than 4 bytes given to read_line_inner (defensive)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "gix-transport/src/client/capabilities.rs:210", "sibling": "a capability-line parser that strips a trailing newline or reads the first byte by index on server text lines", "why_realistic": "The handshake parses server text lines byte by byte, and a maintainer could easily write line[line.len()-1] there; it is in a different crate from the landing point."},
+    {"where": "gix-protocol/src/remote_progress.rs:142-147", "sibling": "a progress parser that indexes the byte after ':' or the first byte of action without a length check", "why_realistic": "It sits downstream of the same sideband payload in another package; the current code uses position/strip_prefix safely, but an indexed version would be natural to write."},
+    {"where": "gix-transport/src/client/blocking_io/http/mod.rs:388", "sibling": "HTTP smart-protocol service-announcement line parsing with indexed newline stripping", "why_realistic": "This is a second transport (HTTP) that reads server text lines on its own code path."}
+  ],
+  "O9_family": "integer underflow / out-of-bounds slice index leading to a panic (CWE-191) when decoding network packet lines", "O9_dos": true,
+  "O10_build": {"language": "Rust", "toolchain": "cargo (stable; workspace crate gix-packetline with blocking-io / async-io features)", "services": [], "offline_after_build": true,
+                "project_tests": "gix-packetline/tests (decode/mod.rs, read/sideband.rs using maybe_async for both blocking-io and async-io), plus the fuzz target gix-packetline/fuzz/fuzz_targets/packet_lines.rs"},
+  "O11_fix_minutes": 15,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "none",
+  "j": {"j_multi_site": 1, "j_sites_touched": "gix-packetline/src/lib.rs, gix-packetline/src/blocking_io/read.rs, gix-packetline/src/async_io/read.rs", "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a d.is_empty() check in decode_band only, or reject empty progress/error bands with an error (which breaks sideband-all keep-alives), leaving TextRef::from's d[d.len()-1] underflow in place."},
+  "out_of_scope_notes": [
+    "gix-transport/src/client/blocking_io/request.rs:86 and gix-transport/src/client/async_io/request.rs:94 call TextRef::from on caller-supplied write data; this is a local API, not the network, and the shared lib.rs fix covers it anyway.",
+    "The read_line_inner buffer-length guards (fix.diff:14-18, 32-36) cannot be reached through public API at the pinned commit; they are pure hardening."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check); gitoxide with its fixtures is likely well above 5 MB and below 1.5 GB.",
+    "Did not trace every async consumer of WithSidebands in gix-transport/async_io beyond the bufread_ext forwarding.",
+    "Recall risk is judged from the advisory's recency (2026-08-28) and narrow scope; its public coverage was not checked."
+  ]
+}

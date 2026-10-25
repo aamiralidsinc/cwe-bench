@@ -1,0 +1,96 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "8710", "advisory_ids": ["GHSA-5G86-85RP-F9HX", "CVE-2026-48051"], "repo": "papra-hq/papra",
+  "pinned_commit": "2d9ebe1d7e9c691374475168ad27829edfaf7358",
+  "fix_commits": ["086dccbfda18c850bee50b94c48f5f110be6935c"],
+  "trust_decision": {
+    "summary": "Whether a stored webhook URL may be contacted is decided once by a DNS-resolve-and-check before delivery (filterOutSsrfUnsafeWebhooks in apps/papra-server); the actual POST is then made by the @papra/webhooks default ofetch client, which follows 3xx redirects and re-resolves DNS with no IP blocklist at connect time.",
+    "evidence": [
+      "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:124",
+      "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:139-175",
+      "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:202-207",
+      "packages/webhooks/src/webhooks.services.ts:16-19",
+      "packages/webhooks/src/webhooks.services.ts:30",
+      "apps/papra-server/src/modules/shared/ssrf/ssrf.services.ts:41-52"
+    ]
+  },
+  "landing_point": {
+    "where": "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:139",
+    "why": "The summary says 'webhook delivery'; the only SSRF logic on the delivery path is filterOutSsrfUnsafeWebhooks in the server's webhook usecases."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:63-94", "entry_point": "every webhook delivery (document created/updated/trashed events, tag add/remove routes, batch ops) via createWebhookTriggerServices; new file apps/papra-server/src/modules/webhooks/webhooks.http-client.ts adds undici Agent with connect blockList and redirect:'manual'", "module_kind": "new server-side HTTP client wrapper"},
+    {"where": "fix.diff:96-116", "entry_point": "same delivery path; isSsrfBlockedError classifies connect-time blocks (code / AggregateError / cause chain)", "module_kind": "error classifier helper"},
+    {"where": "apps/papra-server/src/modules/webhooks/webhooks.trigger.services.ts:15-21", "entry_point": "service factory used by start.ts:66 and documents.usecases.ts:212", "module_kind": "dependency-injection wiring"},
+    {"where": "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:124", "entry_point": "triggerWebhooks (pre-check removed, replaced by connect-time check)", "module_kind": "usecase"},
+    {"where": "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:202-217", "entry_point": "triggerWebhook per-delivery call (now passes httpClient, try/catch so sibling deliveries continue)", "module_kind": "usecase"},
+    {"where": "packages/webhooks/src/webhooks.services.ts:7-25", "entry_point": "@papra/webhooks public triggerWebhook / webhookHttpClient (type extracted only; default client behaviour unchanged)", "module_kind": "separate published package, lower-level API"},
+    {"where": "packages/webhooks/src/index.ts:3", "entry_point": "@papra/webhooks package export (adds WebhookHttpClient type)", "module_kind": "package barrel"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "packages/webhooks/src/webhooks.services.ts:7-25 (default webhookHttpClient used via httpClient default at packages/webhooks/src/webhooks.services.ts:30); the published fix keeps the package untouched behaviourally and instead injects a hardened client from apps/papra-server"
+  },
+  "O3_reason_to_dismiss": "The @papra/webhooks package is a generic, config-free library with no notion of SSRF policy; a solver can argue redirect/blocklist policy belongs to the server, or conversely patch only the package with redirect:'manual' and argue the connect-time (DNS rebinding) part was a 'theoretical' TOCTOU outside the redirect report.",
+  "O4_distance": {"files": 4, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Hostnames in WEBHOOK_URL_ALLOWED_HOSTNAMES must still be delivered to even if they resolve to private IPs, and WEBHOOK_SSRF_PROTECTION_ENABLED=false must disable blocking; one blocked webhook must not stop sibling webhooks from receiving the event and recording a delivery.",
+    "where": "apps/papra-server/src/modules/webhooks/webhooks.config.ts:6-18; apps/papra-server/src/modules/shared/ssrf/ssrf.services.ts:42-44; apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:148-150"
+  },
+  "O6_input_shapes": [
+    "webhook URL whose target answers with a 3xx Location to a private/loopback address (fix.diff:86)",
+    "hostname that resolves safe at check time and private at connect time (DNS rebinding; fix.diff:72-73)",
+    "allowlisted hostname bypasses the agent (fix.diff:77-79)",
+    "blocked-connection error wrapped as AggregateError or in error.cause (fix.diff:105-113)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "@papra/webhooks public triggerWebhook with its default webhookHttpClient still follows redirects and has no IP blocklist after the fix",
+      "where": "packages/webhooks/src/webhooks.services.ts:16-19",
+      "reason_to_dismiss": "Published generic library without SSRF config; papra-server now always injects its own client, so the default is only reached by third-party consumers.",
+      "distance": "different workspace package (packages/webhooks) from landing point (apps/papra-server)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "apps/papra-server/src/modules/webhooks/webhooks.routes.ts:122", "sibling": "a 'send test delivery' route that calls triggerWebhook from @papra/webhooks directly with the default client", "why_realistic": "Webhook UIs commonly offer 'test webhook'; a maintainer would naturally import the package's triggerWebhook and skip the server's trigger services wiring."},
+    {"where": "apps/papra-server/src/modules/webhooks/webhooks.usecases.ts:181", "sibling": "a retry/redelivery job that re-sends a stored delivery via a separate client created outside createWebhookTriggerServices", "why_realistic": "Retry of failed deliveries is a common follow-up feature and would live in a task/worker module with its own HTTP call."}
+  ],
+  "O9_family": "SSRF (CWE-918): redirect following and check-then-connect DNS TOCTOU on outbound webhook delivery",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node (repo recently moved to Node 26) + pnpm v11 workspace; vitest (apps/papra-server/package.json:17); fix adds undici dependency",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "apps/papra-server/src/modules/webhooks/webhooks.usecases.test.ts, apps/papra-server/src/modules/shared/ssrf/ssrf.services.test.ts, apps/papra-server/src/modules/shared/ssrf/ssrf.models.test.ts (in-memory DB, injectable httpClient/dnsLookup)"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "apps/papra-server/src/modules/webhooks/webhooks.http-client.ts (new), apps/papra-server/src/modules/webhooks/webhooks.trigger.services.ts, apps/papra-server/src/modules/webhooks/webhooks.usecases.ts, packages/webhooks/src/webhooks.services.ts, packages/webhooks/src/index.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add redirect:'manual' (or re-check each redirect hop) to the ofetch call in packages/webhooks and keep the pre-delivery DNS check, leaving the connect-time rebinding window open."
+  },
+  "out_of_scope_notes": [
+    "apps/papra-server/src/scripts/send-intake-email.script.ts:15 uses @owlrelay/webhook triggerWebhook; dev script, not webhook delivery.",
+    "isIpSsrfSafe (apps/papra-server/src/modules/shared/ssrf/ssrf.models.ts:46-53) relies on node BlockList for IPv4-mapped IPv6 handling; not examined."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check performed).",
+    "O1=6 counts distinct trigger callers: document created/updated/trashed handlers (apps/papra-server/src/modules/documents/events/*.ts:15), apps/papra-server/src/modules/tags/tags.routes.ts:238, apps/papra-server/src/modules/tags/tags.usecases.ts:70, apps/papra-server/src/modules/documents/documents-batch/documents-batch.usecases.ts:162-175; upstream HTTP routes per caller not enumerated.",
+    "Test-compat risk: upstream tests call triggerWebhooks with an `httpClient` argument and drop `webhooksConfig`/`triggerWebhookService` (fix.diff:189-199); hidden tests must be rewritten behaviourally or a solver's different signature will fail regardless of correctness.",
+    "Pattern B is weak: all server deliveries funnel through one function (webhooks.usecases.ts:183); the only O8 route is the library default client, whose coverage by the advisory property is arguable.",
+    "Whether undici Agent connect.blockList is available in the pinned toolchain's undici version not checked (fix adds undici ^8.2.0).",
+    "present_in_latest unknown: no latest release provided."
+  ]
+}

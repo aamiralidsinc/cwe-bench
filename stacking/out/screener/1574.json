@@ -1,0 +1,59 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "1574",
+  "advisory_ids": ["GHSA-6V7P-G79W-8964", "CVE-2026-57585", "PYSEC-2026-3625"],
+  "repo": "msgpack/msgpack-python",
+  "pinned_commit": "0f4f350b6f3e80f24750422673424cce5d96e15d",
+  "fix_commits": ["2c56ddb5d0025ed481d962c0f5d62d19dec7476d"],
+  "trust_decision": {
+    "summary": "After a parse callback fails (ret -1/-2/-3), the C parser context (stack, top, cs, map_key ownership) must be released and reset before it is reused or freed. At the pinned commit, Unpacker._unpack raises without resetting, and the CT_MAP_VALUE slot keeps a borrowed map_key after map_item has consumed it.",
+    "evidence": ["msgpack/_unpacker.pyx:461-493", "msgpack/unpack_template.h:73-84", "msgpack/unpack_template.h:341-355", "msgpack/unpack.h:185-209", "msgpack/unpack_template.h:408-413"]
+  },
+  "landing_point": {"where": "msgpack/_unpacker.pyx:461", "why": "The summary says 'Unpacker reuse after a caught error', so a reader goes to Unpacker._unpack's error branches, which raise without calling unpack_clear/unpack_init."},
+  "fix_sites": [
+    {"where": "msgpack/_unpacker.pyx:478-493", "entry_point": "Unpacker.unpack / skip / __next__ / read_array_header / read_map_header (public API)", "module_kind": "Cython binding, streaming class"},
+    {"where": "msgpack/unpack_template.h:73-84", "entry_point": "unpack_clear, called from unpackb, Unpacker.__init__ and Unpacker.__dealloc__ (msgpack/_unpacker.pyx:200, :321, :338)", "module_kind": "C parser state-machine template (internal)"},
+    {"where": "msgpack/unpack_template.h:345-346", "entry_point": "msgpack.unpackb/loads and Unpacker.unpack with object_hook/object_pairs_hook raising in map_end (stale map_key)", "module_kind": "C parser state-machine template (internal)"},
+    {"where": "msgpack/unpack_template.h:408-413", "entry_point": "unpack_construct / unpack_skip execute_fn wrappers used by unpackb and Unpacker", "module_kind": "C parser entry wrappers (internal lower-level API)"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "msgpack/unpack_template.h:345-346 (stale c->map_key after unpack_callback_map_item steals k, msgpack/unpack.h:198,204). This also reaches one-shot msgpack.unpackb (msgpack/_unpacker.pyx:200) and Unpacker.__dealloc__ (msgpack/_unpacker.pyx:321), not only Unpacker reuse."},
+  "O3_reason_to_dismiss": "The report is about Unpacker *reuse*, and one-shot unpackb already calls unpack_clear on failure (msgpack/_unpacker.pyx:200), so a solver may treat unpackb and the template as safe. In fact unpack_clear itself double-releases the stale map_key when an object_hook raises.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "On ret==0 (OutOfData / partial input), parser state must be kept so that a streaming feed() can resume mid-object. Resetting the context on every non-success return breaks partial-data streaming.", "where": "msgpack/_unpacker.pyx:478-485; test/test_sequnpack.py:10-28, test/test_sequnpack.py:115-123"},
+  "O6_input_shapes": [
+    "strict_map_key rejection of non-str key inside a map (map_item -1), msgpack/unpack.h:187-189",
+    "object_hook / object_pairs_hook raising in map_end, at top level and nested, msgpack/unpack.h:211-216",
+    "list_hook raising in array_end, msgpack/unpack.h:154-159",
+    "FormatError (-2) mid-container, msgpack/unpack_template.h:217-230",
+    "StackError (-3) from nesting depth, msgpack/unpack_template.h:133",
+    "skip() reuse after a construct failure (construct=0 path), msgpack/_unpacker.pyx:517-522"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "msgpack/unpack_container_header.h:49-50", "sibling": "A header reader that pushes a partially built container onto ctx->stack before validating the size, which leaves state on -1.", "why_realistic": "read_array_header/read_map_header share the ctx and the _unpack loop. A maintainer adding a max_array_len check there could plausibly write it after a stack push."},
+    {"where": "msgpack/unpack.h:191-193", "sibling": "PyUnicode_InternInPlace replaces k, so c->map_key can be dangling if the later PyTuple_Pack or PyDict_SetItem fails (OOM-only at the pinned commit). A realistic planted failure point after the intern would be a how-type sibling.", "why_realistic": "Adding a key-validation hook or a max-key check after interning is a natural feature. It reproduces the same ownership mismatch between the callback and the stack slot."},
+    {"where": "msgpack/unpack.h:154-164", "sibling": "An array_end variant that releases or replaces *c before the hook succeeds, which leaves stack[top-1].obj stale on failure.", "why_realistic": "This mirrors map_end. The ownership-on-error convention is undocumented."}
+  ],
+  "O9_family": "memory safety: use-after-free / stale parser state after an error (CWE-416)", "O9_dos": false,
+  "O10_build": {"language": "C + Cython + Python", "toolchain": "Cython==3.2.1, setuptools, C compiler (requirements.txt; setup.py)", "services": [], "offline_after_build": true,
+                "project_tests": "test/test_except.py (hooks raising, strict_map_key), test/test_sequnpack.py (partial-data resume), test/test_unpack.py"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "msgpack/_unpacker.pyx, msgpack/unpack_template.h", "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Call unpack_clear()+unpack_init() in Unpacker._unpack's error branches only. This leaves the stale map_key that unpack_clear double-releases when an object_hook raises, including in one-shot unpackb."},
+  "out_of_scope_notes": [
+    "With strict_map_key=False and an unhashable key, PyDict_SetItem failure leaks the value object, which is not on the stack (msgpack/unpack.h:203-208). This is a leak, not pursued.",
+    "The pure-Python fallback Unpacker (msgpack/fallback.py:488-604) is a second implementation. It is recursive and keeps no parser stack across calls, so the memory-safety flaw does not apply."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell). About 35 source/test files, so it is clearly under 5 MB of source, which is the basis for tiny_repo.",
+    "The UAF ordering is inferred from code reading only: pre-fix unpack_clear frees obj before map_key (msgpack/unpack_template.h:77-80). Not executed.",
+    "present_in_latest not applicable (no latest release given); no O8 routes recorded.",
+    "The OOM-only dangling map_key after PyUnicode_InternInPlace (msgpack/unpack.h:192) also persists after the fix; not reachable without allocation failure."
+  ]
+}

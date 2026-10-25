@@ -1,0 +1,103 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "2257",
+  "advisory_ids": ["GHSA-8VH3-G2QG-2H2C", "CVE-2026-55640", "PYSEC-2026-3866"],
+  "repo": "cbcoutinho/nextcloud-mcp-server",
+  "pinned_commit": "a818b49b3ff19502530199c7788e324caca7beab",
+  "fix_commits": ["4fc2b10945108cf1008ec9698291de6706ffcb73"],
+  "trust_decision": {
+    "summary": "Whether an inbound POST /webhooks/nextcloud may enqueue index/delete DocumentTasks for the payload's user.uid; decided only in handle_nextcloud_webhook, which skips the bearer check entirely when WEBHOOK_SECRET is unset (the default), while app.py mounts the route unconditionally.",
+    "evidence": [
+      "nextcloud_mcp_server/vector/webhook_receiver.py:55-78",
+      "nextcloud_mcp_server/app.py:2324-2327",
+      "nextcloud_mcp_server/config.py:87",
+      "nextcloud_mcp_server/vector/webhook_parser.py:60",
+      "nextcloud_mcp_server/vector/processor.py:578-585"
+    ]
+  },
+  "landing_point": {
+    "where": "nextcloud_mcp_server/vector/webhook_receiver.py:55",
+    "why": "The summary names POST /webhooks/nextcloud and WEBHOOK_SECRET; the receiver's `if secret:` / `else: _warn_missing_secret_once()` branch is the obvious first stop."
+  },
+  "fix_sites": [
+    {"where": "nextcloud_mcp_server/vector/webhook_receiver.py:55-78", "entry_point": "POST /webhooks/nextcloud", "module_kind": "HTTP handler (receiver; core fix: reject 503 when secret unset)"},
+    {"where": "nextcloud_mcp_server/app.py:2324-2327", "entry_point": "POST /webhooks/nextcloud (route mounting in get_app)", "module_kind": "app composition / route registration"},
+    {"where": "nextcloud_mcp_server/auth/webhook_routes.py:140-143", "entry_point": "POST /app/webhooks/enable/{preset_id} and POST /api/v1/webhooks (shared helper webhook_auth_pair)", "module_kind": "defaults helper on outbound registration side (fallback to authMethod none)"},
+    {"where": "nextcloud_mcp_server/auth/webhook_routes.py:501", "entry_point": "POST /app/webhooks/enable/{preset_id}", "module_kind": "browser admin HTTP handler (new 503 except branch)"},
+    {"where": "nextcloud_mcp_server/api/webhooks.py:220", "entry_point": "POST /api/v1/webhooks", "module_kind": "management API HTTP handler (new 503 on missing secret)"},
+    {"where": "nextcloud_mcp_server/api/management.py:245", "entry_point": "GET /api/v1/status", "module_kind": "status handler (cosmetic: adds webhooks_enabled flag)"},
+    {"where": "nextcloud_mcp_server/config.py:725-730", "entry_point": "none (comment only)", "module_kind": "config dataclass comment"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "nextcloud_mcp_server/auth/webhook_routes.py:140-143 (webhook_auth_pair returns (\"none\", None) when secret unset; used by nextcloud_mcp_server/auth/webhook_routes.py:162 and nextcloud_mcp_server/api/webhooks.py:220)"
+  },
+  "O3_reason_to_dismiss": "Registration is an outbound, admin-authenticated call to Nextcloud, not the unauthenticated receiver; returning authMethod none is documented backward compatibility and does not itself let anyone reach the vector sink.",
+  "O4_distance": {"files": 5, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "With WEBHOOK_SECRET unset the server must still start and vector sync must keep working via the polling scanner (and /health, /api/v1/status, /app routes stay up); with the secret set, a correct `Bearer <secret>` delivery must still queue the task. An over-broad fix (fail startup when secret unset, or gate the whole vector-sync/producer on the secret) breaks default deployments.",
+    "where": "nextcloud_mcp_server/app.py:2317-2342; nextcloud_mcp_server/app.py:407-412; nextcloud_mcp_server/vector/webhook_receiver.py:98-111"
+  },
+  "O6_input_shapes": [
+    "WEBHOOK_SECRET unset (None, default from config.py:87)",
+    "WEBHOOK_SECRET empty string (falsy, same branch via `if secret:`)",
+    "Authorization header missing / wrong secret / wrong scheme when secret set (already rejected at pinned commit)",
+    "handler reached directly vs via mounted route (fix does both: unmount + 503 in handler)"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "nextcloud_mcp_server/config.py:87 (default None) and nextcloud_mcp_server/config.py:1430 (WEBHOOK_SECRET env mapping)",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "nextcloud_mcp_server/client/webhooks.py:37-46",
+      "sibling": "A second registration path (e.g. an MCP tool or CLI) calling WebhooksClient.create_webhook directly, inheriting the auth_method=\"none\" default instead of webhook_auth_pair.",
+      "why_realistic": "The low-level client already defaults to \"none\" and is public; a maintainer adding an MCP webhook tool would naturally call it without the helper."
+    },
+    {
+      "where": "nextcloud_mcp_server/app.py:2324-2327",
+      "sibling": "A second receiver route (e.g. a per-app or legacy alias like /webhooks/nextcloud/{app}) or a receiver in another transport wired to extract_document_task + task_producer with its own copy of the optional-secret check.",
+      "why_realistic": "The parser is a reusable module (nextcloud_mcp_server/vector/webhook_parser.py:50) and the docstring at webhook_parser.py:8-10 anticipates more event families; a split receiver per app is a plausible refactor."
+    },
+    {
+      "where": "nextcloud_mcp_server/vector/webhook_receiver.py:57-64",
+      "sibling": "A secret check that normalises the header (strip/lower-case scheme) or accepts the secret via query string for NC versions without authData.",
+      "why_realistic": "The code comments discuss NC delivery quirks at length (webhook_receiver.py:65-71); a compatibility fallback is believable."
+    }
+  ],
+  "O9_family": "CWE-306 missing authentication for critical function (fail-open optional shared-secret check on webhook receiver)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.11, pyproject.toml:10)",
+    "toolchain": "uv/pip install of pyproject; pytest with unit marker",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/unit/test_webhook_endpoint.py (Starlette TestClient against handle_nextcloud_webhook with an anyio memory stream), tests/unit/test_webhook_routes_register.py, tests/unit/test_webhook_uri.py, tests/unit/test_webhooks_api_auth.py, tests/unit/test_management_status_endpoint.py; no Qdrant/Nextcloud needed for these"
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "nextcloud_mcp_server/vector/webhook_receiver.py, nextcloud_mcp_server/app.py, nextcloud_mcp_server/auth/webhook_routes.py, nextcloud_mcp_server/api/webhooks.py, nextcloud_mcp_server/api/management.py, nextcloud_mcp_server/config.py (comment)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Flip the receiver's `else` branch to return 401/503 and stop, leaving the route mounted and registration still creating authMethod=none webhooks (or, over-broad, raise at startup when WEBHOOK_SECRET is unset)."
+  },
+  "out_of_scope_notes": [
+    "Even when authenticated, the receiver trusts payload user.uid without binding it to the node path owner (nextcloud_mcp_server/vector/webhook_parser.py:47,60); different property (authorization binding), not pursued.",
+    "Public unauthenticated GET /api/v1/vector-sync/status exposes queue/index stats (nextcloud_mcp_server/app.py:2333-2339); information exposure, not this advisory."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check performed); tiny_repo/giant_repo flags not assessed.",
+    "pattern_fit A is weak: the security-essential change is one branch in webhook_receiver.py; the registration-side changes (webhook_auth_pair raising, 503s in two handlers) are design choices a hidden test could only demand if the report states them, which risks fairness. How-type room in real code is low and O8 is empty.",
+    "Did not exhaustively search non-Python components (e.g. any bundled PHP app) for another receiver; Python tree search for task_producer / webhooks/nextcloud found only the one receiver.",
+    "Recall risk set low by project size; publication (2026-08-25) postdates nothing checked externally."
+  ]
+}

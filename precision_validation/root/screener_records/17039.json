@@ -1,0 +1,79 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "17039",
+  "advisory_ids": ["GHSA-C36X-H252-G9X2", "BIT-OPENBAO-2026-55774", "CVE-2026-55774", "GO-2026-5304"],
+  "repo": "openbao/openbao",
+  "pinned_commit": "37e1fee05231cea9a50139e5d200f964e5e0829e",
+  "fix_commits": ["b20b999dd4044d7b419a5472d8fe08407828be37"],
+  "trust_decision": {
+    "summary": "Which namespace a lease operation acts in: the request is ACL-checked in the caller's (or re-routed) namespace, but at the pinned commit loadEntry silently switches to the namespace embedded in the lease ID, and the request router only re-routes body-form lease IDs, so the ACL namespace and the storage namespace can differ.",
+    "evidence": ["vault/expiration.go:2105-2116", "vault/request_handling.go:930-952", "vault/expiration.go:2130-2147", "vault/logical_system.go:2044-2076"]
+  },
+  "landing_point": {
+    "where": "vault/logical_system.go:2044",
+    "why": "Summary names canonical sys/leases/{revoke,renew}; handleRevoke/handleRenew are the handlers, and the url_lease_id fallback at vault/logical_system.go:2046-2049 is the obvious path-segment variant. The router special-case at vault/request_handling.go:935 is the second obvious stop."
+  },
+  "fix_sites": [
+    {"where": "vault/request_handling.go:930-952", "entry_point": "POST sys/leases/revoke/<lease_id>, sys/leases/renew/<lease_id> (path-segment form now re-routed by embedded ns ID; body form kept)", "module_kind": "core request router (namespace re-routing)"},
+    {"where": "vault/request_handling.go:883-925", "entry_point": "auth/token/{lookup,renew,revoke,revoke-orphan} with non-string 'token' body (type assertion hardened)", "module_kind": "core request router (token re-routing)"},
+    {"where": "vault/expiration.go:2105-2116", "entry_point": "every ExpirationManager lease load: sys/leases/revoke[/id], sys/leases/renew[/id], sys/leases/revoke-prefix/<id>, sys/leases/revoke-force/<id> (removal of the lease-ID namespace override)", "module_kind": "lower-level shared loader (expiration manager)"},
+    {"where": "vault/expiration.go:1805-1816", "entry_point": "POST sys/leases/lookup (and auth/token lookup via FetchLeaseTimesByToken) served from the pending/irrevocable in-memory cache", "module_kind": "cache fast path in expiration manager"},
+    {"where": "vault/expiration.go:1337-1343", "entry_point": "sys/leases/renew[/id] (redundant cross-namespace check removed now that loadEntry no longer crosses)", "module_kind": "expiration manager API"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "vault/expiration.go:2105-2116 (loadEntry), reached by sys/leases/revoke-prefix/<id> and revoke-force/<id> via vault/expiration.go:1265-1274; plus the cache fast path vault/expiration.go:1808-1816 for sys/leases/lookup"
+  },
+  "O3_reason_to_dismiss": "revoke-prefix/revoke-force are sudo-only prefix endpoints (vault/logical_system.go:83-84) that 'take a mount prefix, not a lease ID', and lookup is read-only and already re-routed by body lease_id, so a solver fixing the router for revoke/renew path segments can argue those are a different feature.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate cross-namespace lease ops must keep working: a request sent to a parent namespace with a child-namespace token/lease is re-routed by the lease's embedded ns ID (fix test cases 'root->ns1 via ns1 token', 'ns2->ns1 via ns1 token'); internal revocation (RevokeByToken, expiry timers with nsCtx) still loads leases. A solver who hard-rejects any request-ns != lease-ns, or drops the router re-routing, breaks these.",
+    "where": "vault/request_handling.go:941-951; vault/expiration.go:1212-1225; vault/expiration.go:263; fix.diff:351-374"
+  },
+  "O6_input_shapes": [
+    "lease_id in request body (sys/leases/{lookup,renew,revoke})",
+    "lease_id as URL path segment (sys/leases/{renew,revoke}/<id>), body taking precedence",
+    "non-string lease_id in body (rejected as invalid lease ID instead of panicking type assertion)",
+    "non-string token in body for auth/token/* re-routing",
+    "lease ID with vs without embedded namespace suffix (root lease looked up from a child namespace via cache)"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "vault/expiration.go:1808-1816 (pending/irrevocable maps returning cachedLeaseInfo without consulting request namespace); the namespace is attached at load time in vault/expiration.go:2147",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "vault/expiration.go:1265-1274", "sibling": "revokePrefixCommon's single-lease shortcut could re-derive the namespace from the lease ID suffix itself (as loadEntry did) so revoke-prefix/<foreign id> keeps crossing after a router-only fix", "why_realistic": "Same 'helpful' convenience as the removed loadEntry block; a maintainer wanting revoke-prefix to accept a fully-qualified lease ID would write exactly this."},
+    {"where": "vault/expiration.go:1780-1800", "sibling": "FetchLeaseTimesByToken-style helper that reads lease info from the pending cache by token-derived ID without a namespace check", "why_realistic": "The cache fast path is an optimisation maintainers copy into new lookup helpers; it never sees the request namespace."},
+    {"where": "vault/logical_system.go:2000-2016", "sibling": "handleLeaseLookupList accepting a prefix with an embedded ns ID and listing that namespace's leaseView", "why_realistic": "Mirrors the router's embedded-ns re-routing that already exists for lookup/renew/revoke."}
+  ],
+  "O9_family": "authorization: cross-namespace confused deputy (ACL namespace differs from storage namespace), CWE-863", "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go (version per go.mod), go test",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "vault/request_handling_test.go (fix adds TestRequestHandling_CrossNamespaceRouting), vault/expiration_test.go, vault/logical_system_test.go:1476-1777 (renew/revoke path and body forms), vault/namespace_store_test.go:1576-1966; in-process TestCoreUnsealed + TestCoreCreateNamespaces"
+  },
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "vault/request_handling.go, vault/expiration.go",
+        "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Extend the router switch at vault/request_handling.go:935 to also re-route sys/leases/{revoke,renew}/<id> path segments, leaving loadEntry's lease-ID namespace override (revoke-prefix/revoke-force) and the lookup cache fast path open."},
+  "out_of_scope_notes": [
+    "Predecessor CVE-2026-45808 (changelog/3152.txt:2) removed legacy sys/revoke*, sys/renew endpoints; this advisory is its incomplete-fix sibling.",
+    "Pinned token re-routing does token.(string) on arbitrary body data (vault/request_handling.go:901); fix hardens it but it is a panic-shape issue, not the namespace protection.",
+    "sys/leases/revoke-force is listed as an exact path at vault/request_handling.go:935 but the route pattern requires a prefix (vault/logical_system_paths.go:2765), so that case was dead code."
+  ],
+  "unverified": [
+    "Whether cross-namespace renew via path segment actually succeeds at the pinned commit: vault/expiration.go:1341 compares request ns with le.namespace (set to the lease ns by loadEntry), which looks like it blocks renew; the summary still names renewal.",
+    "Exact reachability of revoke-prefix/<foreign lease id> across namespaces at pinned commit (reasoned from vault/expiration.go:1265-1274 + 2105-2116; ACL/sudo semantics for a child-ns token not traced).",
+    "Whether removing the loadEntry override changes internal RevokeByToken behaviour for leases in child namespaces (vault/expiration.go:1221 passes the outer ctx).",
+    "Repo size in MB; present_in_latest not checkable (no latest release given)."
+  ]
+}

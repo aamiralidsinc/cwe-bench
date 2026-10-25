@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "12733",
+  "advisory_ids": ["GHSA-MWWR-P57H-56PF", "CVE-2026-61788"],
+  "repo": "bytebase/dbhub",
+  "pinned_commit": "d65c6b424e9d10678fb6f7dda93fba180d7baff9",
+  "fix_commits": ["872bb338f7d31f6afe517a076ac3e3edafaaaf08"],
+  "trust_decision": {
+    "summary": "Whether SQL submitted to a read-only tool may run is decided only by a leading-keyword classifier over dialect-tokenized statements (execute-sql/custom tool handlers); the connectors then execute it on a writable connection with no engine-level read-only enforcement.",
+    "evidence": [
+      "src/tools/execute-sql.ts:26-29",
+      "src/tools/execute-sql.ts:57-71",
+      "src/tools/custom-tool-handler.ts:184-203",
+      "src/utils/allowed-keywords.ts:82-123",
+      "src/utils/sql-parser.ts:214-237"
+    ]
+  },
+  "landing_point": {
+    "where": "src/tools/execute-sql.ts:58-63",
+    "why": "The summary says read-only mode lets writes through; the READONLY_VIOLATION gate in the execute_sql handler (and the isReadOnlySQL classifier it calls) is the obvious first stop."
+  },
+  "fix_sites": [
+    {"where": "src/utils/sql-parser.ts:135-136", "entry_point": "MCP tool execute_sql (readonly=true) on mysql/mariadb source -> areAllStatementsReadOnly -> splitSQLStatements/stripCommentsAndStrings (fix.diff:691-723)", "module_kind": "shared tokenizer utility (lower layer than the handler)"},
+    {"where": "src/utils/allowed-keywords.ts:94-104", "entry_point": "MCP tool execute_sql (readonly=true) on sqlite source, and custom tools with readonly=true -> isReadOnlySQL; PRAGMA setter forms (fix.diff:663-678)", "module_kind": "classifier utility"},
+    {"where": "src/connectors/postgres/index.ts:608-627", "entry_point": "execute_sql / custom tool -> Connector.executeSQL single-statement path, wrapped in BEGIN READ ONLY (fix.diff:387-413)", "module_kind": "database connector (engine layer)"},
+    {"where": "src/connectors/postgres/index.ts:639", "entry_point": "execute_sql -> Connector.executeSQL multi-statement path, BEGIN -> BEGIN READ ONLY (fix.diff:424-443)", "module_kind": "database connector (engine layer)"},
+    {"where": "src/connectors/mysql/index.ts:613-654", "entry_point": "execute_sql / custom tool -> MySQLConnector.executeSQL, START TRANSACTION READ ONLY/COMMIT/ROLLBACK (fix.diff:351-375)", "module_kind": "database connector (engine layer)"},
+    {"where": "src/connectors/mariadb/index.ts:600-637", "entry_point": "execute_sql / custom tool -> MariaDBConnector.executeSQL, START TRANSACTION READ ONLY/COMMIT/ROLLBACK (fix.diff:307-331)", "module_kind": "database connector (second implementation of the MySQL connector)"},
+    {"where": "src/connectors/sqlite/index.ts:456", "entry_point": "execute_sql / custom tool -> SQLiteConnector.executeSQL, PRAGMA query_only ON + finally OFF (fix.diff:459-461, 493-505)", "module_kind": "database connector (engine layer)"},
+    {"where": "src/connectors/sqlite/index.ts:545-557", "entry_point": "execute_sql multi-statement batch -> per-statement re-assert of query_only (fix.diff:470-485)", "module_kind": "database connector (engine layer)"},
+    {"where": "src/connectors/manager.ts:245-248", "entry_point": "source connect (ConnectorManager) -> ConnectorConfig.readonly wiring removed (fix.diff:278-287); behaviourally a no-op since toml-loader rejects source-level readonly", "module_kind": "connection manager / config wiring"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "src/connectors/sqlite/index.ts:451-564 (and postgres/index.ts:598-666, mysql/index.ts:606-662, mariadb/index.ts:593-662): Connector.executeSQL, the engine layer below the handler's classifier, plus the dialect tokenizer src/utils/sql-parser.ts:135-142"
+  },
+  "O3_reason_to_dismiss": "The handler already rejects non-read-only SQL before calling the connector, and the docs call read-only mode 'a safety net ... not a security boundary' (docs/tools/execute-sql.mdx:129), so a solver can argue tightening the classifier is enough and the connectors (and SQL Server, which has no READ ONLY transaction) are out of scope.",
+  "O4_distance": {"files": 7, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "One source connection is shared by read-only and writable tools: a writable execute_sql/custom tool on the same source must still be able to INSERT after a read-only call (so connection-level read-only or a sticky query_only/READ ONLY session breaks it); SQLite introspection PRAGMAs (table_info(t), bare 'PRAGMA user_version') and MySQL '-- ' comments must keep working.",
+    "where": "src/connectors/sqlite/index.ts:464-472; src/connectors/sqlite/index.ts:192-194; src/connectors/postgres/index.ts:175-178; src/config/toml-loader.ts:628-634"
+  },
+  "O6_input_shapes": [
+    "mysql/mariadb '--' followed by non-whitespace (minus operators) vs '-- ' / control char / DEL 0x7F / EOL (comment) (fix.diff:700-711)",
+    "SQLite PRAGMA assignment form 'name = v' and 'name=v' (fix.diff:671-673)",
+    "SQLite PRAGMA parenthesized setter 'name(v)' incl. schema-qualified 'schema.name(v)', with allow-list for table_info/index_info/index_list/foreign_key_list (fix.diff:646-654, 674-677)",
+    "function-based writes passing the classifier, e.g. SELECT setval(...) (fix.diff:387-413)",
+    "single-statement vs multi-statement batch (postgres BEGIN READ ONLY on both paths; sqlite re-assert per statement) (fix.diff:427, 473-485)",
+    "parameterized vs unparameterized execution (custom tools pass parameters) (fix.diff:393-395)",
+    "in-batch backstop toggle 'PRAGMA query_only = OFF; INSERT ...' (fix.diff:470-475)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Closest analogue is the dialect tokenizer src/utils/sql-parser.ts:135-142 that produces statement boundaries; the check does call it (src/tools/execute-sql.ts:27), so it is not an uncalled producer.", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "SQL Server connector executeSQL ignores options.readonly entirely; classifier-passing writes such as SELECT NEXT VALUE FOR <sequence> (sequence advance, analogue of setval) reach the engine with no backstop.", "where": "src/connectors/sqlserver/index.ts:609-695", "reason_to_dismiss": "SQL Server has no START TRANSACTION READ ONLY equivalent and the advisory/fix only touch PG/MySQL/MariaDB/SQLite, so it looks like an unsupported combination.", "distance": "different connector file (src/connectors/sqlserver) from landing point src/tools/execute-sql.ts", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "MySQL/MariaDB tokenizer does not treat '#' as a line comment, so a quote after '#' makes the classifier see one SELECT while the engine sees a stacked statement; DDL then escapes the READ ONLY transaction (fix itself notes DDL implicit-commits).", "where": "src/utils/sql-parser.ts:135-142", "reason_to_dismiss": "The advisory names the '--' differential; '#' looks like a different comment style and the engine backstop seems to cover it (it does not for DDL).", "distance": "same file as the published tokenizer fix, different scanner rule", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "MySQL/MariaDB string scanner ignores backslash escapes (\\'), so the classifier's string boundary differs from the engine's and a stacked DDL statement can be hidden inside what the parser thinks is a literal.", "where": "src/utils/sql-parser.ts:56-65", "reason_to_dismiss": "Backslash escaping depends on sql_mode (NO_BACKSLASH_ESCAPES), so a solver can call it configuration-dependent; shared scanner is also used by other dialects.", "distance": "same file, shared string scanner used by all dialects", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "SQL Server tokenizer uses the non-nesting block-comment scanner although T-SQL nests /* */ comments; with no engine backstop on SQL Server, a stacked statement hidden after a nested comment is unprotected.", "where": "src/utils/sql-parser.ts:154-161", "reason_to_dismiss": "Advisory is about MySQL '--' and SQLite PRAGMA; SQL Server tokenizer was not mentioned and Postgres already uses a nesting scanner, so it looks deliberate.", "distance": "same file, different dialect scanner; pairs with sqlserver connector route", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/connectors/sqlserver/index.ts:618-623", "sibling": "EXPLAIN translation returns early from executeSQL before any readonly backstop added below it, so a backstop placed after this branch is skipped for the EXPLAIN route.", "why_realistic": "Early-return special-casing at the top of executeSQL already exists; a maintainer adding a backstop lower in the function would naturally miss it."},
+    {"where": "src/tools/custom-tool-handler.ts:179-186", "sibling": "Custom tool checks the whole statement with isReadOnlySQL without splitting into statements (execute_sql splits at src/tools/execute-sql.ts:26-29); a stacked statement in a readonly custom tool passes the classifier.", "why_realistic": "Custom statements are config-authored, so a maintainer could reasonably skip splitting; it is a real asymmetry at the pinned commit."},
+    {"where": "src/connectors/sqlite/index.ts:464-472", "sibling": "Connector's own read/write split uses substring includes('table_info') on the statement, a second, independent classifier that could disagree with allowed-keywords.ts.", "why_realistic": "Duplicate PRAGMA allow-lists in connector and classifier already drift; a sibling here is a natural maintenance slip."}
+  ],
+  "O9_family": "Incomplete deny-list / parser differential in read-only SQL enforcement (CWE-184, CWE-863), missing engine-level authorization backstop",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node >=22.5 (node:sqlite), pnpm 10.17.1, tsup, vitest 4",
+    "services": ["PostgreSQL, MySQL, MariaDB, SQL Server via testcontainers (Docker) for integration tests; SQLite is in-process"],
+    "offline_after_build": true,
+    "project_tests": "src/utils/__tests__/allowed-keywords.test.ts, src/utils/__tests__/sql-parser.test.ts (unit, offline); src/connectors/__tests__/{postgres,mysql,mariadb,sqlite,sqlserver}.integration.test.ts (sqlite offline, others need DB containers)"
+  },
+  "O11_fix_minutes": 75,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/utils/sql-parser.ts, src/utils/allowed-keywords.ts, src/connectors/postgres/index.ts, src/connectors/mysql/index.ts, src/connectors/mariadb/index.ts, src/connectors/sqlite/index.ts, src/connectors/manager.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Patch only the classifier (reject PRAGMA '=' / handle MySQL '--x') in allowed-keywords.ts/sql-parser.ts, or force the whole source connection read-only, which breaks writable tools sharing it."
+  },
+  "out_of_scope_notes": [
+    "Postgres E'' strings with backslash escapes also mis-split in the tokenizer, but after the fix the single-statement path runs under BEGIN READ ONLY, so it falls inside the published protection.",
+    "search_objects calls executeSQL without readonly (src/tools/search-objects.ts:108) on internally built SQL; not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); tiny_repo/giant_repo not assessed.",
+    "MySQL '#' and backslash-escape differentials and T-SQL nested comments are inferred from tokenizer code plus engine documentation knowledge, not executed.",
+    "Whether SELECT NEXT VALUE FOR is accepted in SQL Server under the classifier with maxRows rewriting was not traced through SQLRowLimiter.applyMaxRowsForSQLServer.",
+    "present_in_latest unknown for all O8 routes (no latest release provided).",
+    "docs/tools/execute-sql.mdx:129 calls read-only mode 'not a security boundary'; this weakens fairness of grading engine-level routes and should be reviewed."
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "19004",
+  "advisory_ids": ["GHSA-R2V3-8GWF-7GHM", "CVE-2026-54725", "GO-2026-6160"],
+  "repo": "bank-vaults/vault-secrets-webhook",
+  "pinned_commit": "71cfbb8907b2b7197e892570975428a447e615be",
+  "fix_commits": ["76db45976fee0f54cafd94dffa425e6b542f65a0"],
+  "trust_decision": {
+    "summary": "Whether a Vault address (and TLS skip-verify) taken from an untrusted object annotation may be used by the webhook's own Vault client, and before a ServiceAccount token is minted; decided in newVaultClient using a provenance flag set by parseVaultConfig.",
+    "evidence": ["pkg/webhook/config.go:107-111", "pkg/webhook/config.go:147-151", "pkg/webhook/webhook.go:204-206", "pkg/webhook/webhook.go:259-302", "fix.diff:79-85", "fix.diff:28-30"]
+  },
+  "landing_point": {"where": "pkg/webhook/webhook.go:204", "why": "newVaultClient is where the annotation address becomes clientConfig.Address and where the SA token is minted (webhook.go:285), so an engineer reading 'webhook makes outbound call to attacker URL ... TokenRequest' goes here first."},
+  "fix_sites": [
+    {"where": "pkg/webhook/config.go:107-108", "entry_point": "admission routes /pods /secrets /configmaps /objects (main.go:168-171) via VaultSecretsMutator -> parseVaultConfig (webhook.go:53)", "module_kind": "config_loader (annotation parser; records address provenance)"},
+    {"where": "pkg/webhook/config.go:147-148", "entry_point": "same four admission routes via parseVaultConfig; value also injected into pods as VAULT_SKIP_VERIFY (pod.go:93-94, pod.go:333-334)", "module_kind": "config_loader (skip-verify gate via common.ResolveObjectSkipVerify)"},
+    {"where": "pkg/webhook/config.go:474-475", "entry_point": "process start: main.go:44 init -> SetConfigDefaults", "module_kind": "defaults (new operator knobs vault_addr_allowlist, vault_allow_object_skip_verify, vault_allow_private_addr)"},
+    {"where": "pkg/webhook/webhook.go:196-204", "entry_point": "/secrets (secret.go:96), /configmaps (configmap.go:49), /objects (object.go:127) -> newVaultClient", "module_kind": "handler-level client constructor (validation via common.ValidateObjectAddr before connect/token mint)"},
+    {"where": "fix.diff:60-70", "entry_point": "called only from newVaultClient", "module_kind": "policy builder (allowlist + implicit operator default)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "pkg/webhook/config.go:107-111 (annotation-vs-operator-default merge must record provenance; operator default vault_addr implicitly allowlisted, fix.diff:62-64)"},
+  "O3_reason_to_dismiss": "The parser 'just reads annotations' and the address is legitimately injected into pods unchanged (pod.go:89-90), so a solver can argue the only place to touch is the client constructor and that skip-verify is a separate, documented user feature (deploy/charts/vault-secrets-webhook/README.md:18).",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "An object-supplied vault-addr must still be injected verbatim into mutated pods (pods connect themselves) and an allowlisted or operator-default address must still work from Secrets/ConfigMaps; in-cluster hostnames are not DNS-resolved. Rejecting the annotation in the parser or blocking all hostnames/private IPs breaks these.", "where": "pkg/webhook/pod.go:89-90"},
+  "O6_input_shapes": ["IMDS IP literal URL", "external non-allowlisted host", "userinfo-bearing URL matching allowlisted host", "allowlisted exact address (must pass)", "annotation equal to operator default (implicitly allowed)", "skip-verify annotation true without operator opt-in"],
+  "O7_producer": {"kind": "config_loader", "where": "pkg/webhook/config.go:94-111 (parseVaultConfig produces Addr and, after fix, AddrFromObject)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "registry-skip-verify annotation is honoured from the object without operator opt-in and disables TLS on the webhook's outbound registry fetch during admission", "where": "pkg/webhook/config.go:283-284", "reason_to_dismiss": "Different feature (image registry lookup, not Vault) and the advisory names only vault-addr/vault-skip-verify", "distance": "same package, other file: pkg/webhook/registry.go:185-188 via pod.go:279", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/webhook/config.go:107", "sibling": "a legacy/alias annotation key (e.g. old vault.security.banzaicloud.io vs new prefix) that also sets Addr but not the provenance flag", "why_realistic": "Projects that renamed annotation prefixes keep fallback lookups; the provenance flag must be set at every producer, a how-type miss."},
+    {"where": "pkg/webhook/configmap.go:49", "sibling": "a second Vault client constructor (e.g. a transit/agent-config helper) that builds vaultapi config from VaultConfig.Addr without calling the guard", "why_realistic": "Three mutators already construct clients; a maintainer adding a lightweight client for one mutator could bypass newVaultClient."},
+    {"where": "pkg/webhook/config.go:153-154", "sibling": "a vault-addr carried in the referenced TLS secret or a configmap and applied to the webhook client", "why_realistic": "Annotation values already pull data from Secrets in webhook.go:213-234, making a config-from-secret address a plausible extension."}
+  ],
+  "O9_family": "SSRF (CWE-918) with object-controlled TLS verification bypass and credential (SA token) exfiltration", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26.3 (go.mod:3)", "services": [], "offline_after_build": true,
+                "project_tests": "pkg/webhook/webhook_test.go (TestNewVaultClientMetrics uses fake clientset), pkg/common/addr_test.go, pkg/common/policy_test.go; e2e/ needs a cluster"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "pkg/webhook/config.go, pkg/webhook/webhook.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Call common.ValidateObjectAddr on every vaultConfig.Addr in newVaultClient (rejecting the operator default when no allowlist is set) or reject the annotation in parseVaultConfig, and leave vault-skip-verify untouched."},
+  "out_of_scope_notes": [
+    "Pod image references cause outbound registry fetches to arbitrary hosts with pod pull secrets (pkg/webhook/registry.go:191-196); separate design question, not pursued.",
+    "vault-tls-secret annotation lets an object choose any Secret in the webhook namespace as Vault CA (pkg/webhook/config.go:153-154, pkg/webhook/webhook.go:213-234); not pursued.",
+    "vault-serviceaccount annotation still lets an object mint a token for any SA in its own namespace toward the trusted Vault (pkg/webhook/webhook.go:259-296); fix does not change this."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); tiny_repo inferred from 23 Go source files in the tree.",
+    "The guard helpers (pkg/common/addr.go, pkg/common/policy.go) already exist at the pinned commit (parent commit 71cfbb8 added them), which makes the fix largely wiring and hands the solver the mechanism.",
+    "Fix-diff test sets VaultConfig.AddrFromObject directly (fix.diff:151-159); hidden tests must be rewritten to go through parseVaultConfig to avoid requiring that field name.",
+    "O8 registry-skip-verify is arguably outside the advisory's property (different sink); present_in_latest unknown (no latest release given).",
+    "Advisory text itself not available beyond the summary; reliance on fix diff."
+  ]
+}

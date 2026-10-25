@@ -1,0 +1,67 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "22583", "advisory_ids": ["GHSA-32HF-8JW3-V4QQ", "CVE-2026-48040"], "repo": "netty/netty-incubator-codec-ohttp",
+  "pinned_commit": "28f977f293591a4e837bd59ceb441f9f70349915", "fix_commits": ["7ad38d5cc2827af7e067e5c1e1ac37cd4566dad9"],
+  "trust_decision": {
+    "summary": "The Java side derives the raw native pointer (plus length) handed to BoringSSL seal/open; when a direct ByteBuf has no memoryAddress (no Unsafe) the fallback takes JNI GetDirectBufferAddress of internalNioBuffer(0, capacity), which returns the base of the pooled chunk and ignores the NIO buffer's position (the pool offset), so native code reads/writes at the wrong place.",
+    "evidence": [
+      "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:141-146",
+      "codec-ohttp-hpke-native-boringssl/src/main/c/netty_incubator_codec_ohttp_hpke_boringssl.c:342-343",
+      "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLCryptoOperation.java:51-59"
+    ]
+  },
+  "landing_point": {
+    "where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:141",
+    "why": "The summary names the pooled direct ByteBuf fallback for native pointer derivation; memory_address(ByteBuf) is the only such helper and its fallback branch is at line 145."
+  },
+  "fix_sites": [
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:141-146", "entry_point": "internal helper reached by all seal/open calls (AEADContext / HPKESenderContext / HPKERecipientContext from OHttpCryptoProvider)", "module_kind": "JNI binding helper (classes-boringssl)"},
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:119", "entry_point": "native memory_address(ByteBuffer) made private (no behaviour change)", "module_kind": "JNI declaration"},
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLCryptoOperation.java:51-55", "entry_point": "AEADContext.seal/open, HPKESenderContext.seal, HPKERecipientContext.open (aad/in/out buffers)", "module_kind": "shared crypto operation base"},
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLAEADContext.java:132-136", "entry_point": "AEADContext.seal/open via OHttpCryptoProvider.setupAEAD (nonce buffer from alloc.directBuffer)", "module_kind": "AEAD context (response encryption)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "none", "where": "Nonce pointer in codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLAEADContext.java:135 is a separate caller but in the same package two files from the landing point; the BouncyCastle provider is pure Java and unaffected."},
+  "O3_reason_to_dismiss": "The nonce buffer is created internally (not caller-supplied input) and is passed as an address with no readerIndex added, so a solver fixing only the '+ readerIndex' sites in BoringSSLCryptoOperation could argue the nonce is safe; fixing the shared helper closes it anyway.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Direct buffers without a memoryAddress (noUnsafe / JDK restrictions) must still seal/open correctly; an over-broad fix that rejects such buffers or requires hasMemoryAddress breaks those environments, and the Unsafe path must keep returning memoryAddress()+offset; non-direct inputs are copied into a direct temp and results copied back.",
+    "where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:141-146; codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLCryptoOperation.java:85-100"
+  },
+  "O6_input_shapes": [
+    "readable region at readerIndex (aad, in) - BoringSSLCryptoOperation.java:51,53",
+    "writable region at writerIndex (out) - BoringSSLCryptoOperation.java:55",
+    "internally allocated nonce buffer at index 0 - BoringSSLAEADContext.java:134-135",
+    "slices of the caller's message (OHttpCrypto.encrypt/decrypt pass message.slice(...)) - codec-ohttp/src/main/java/io/netty/incubator/codec/ohttp/OHttpCrypto.java:111,128"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSL.java:137-139", "sibling": "An HKDF_extract/expand or EVP_HPKE_CTX_export variant taking a ByteBuf address (instead of byte[]) that inlines its own 'nioBuffer + GetDirectBufferAddress' derivation rather than calling the shared helper.", "why_realistic": "The other native methods take byte[]; a perf-motivated maintainer moving them to zero-copy ByteBuf addresses would plausibly copy the old fallback pattern inline."},
+    {"where": "codec-ohttp-hpke-classes-boringssl/src/main/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLAEADContext.java:132-136", "sibling": "A cached-address pattern in another context (e.g. HPKE context caching an export/encapsulation buffer address) computed once with buf.nioBuffer() and reused.", "why_realistic": "Nonce already caches its address at creation; a parallel cache in another context class is a natural copy."}
+  ],
+  "O9_family": "memory-safety: incorrect native pointer arithmetic across JNI (out-of-bounds read/write, CWE-125/787)", "O9_dos": false,
+  "O10_build": {
+    "language": "Java + C (JNI)",
+    "toolchain": "Maven wrapper, JDK, cmake, C/C++ toolchain, Go/ninja for BoringSSL; native module clones BoringSSL with git during generate-sources (codec-ohttp-hpke-native-boringssl/pom.xml:266-282)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "codec-ohttp-hpke-native-boringssl/src/test/java/io/netty/incubator/codec/hpke/boringssl/BoringSSLOHttpCryptoProviderTest.java (one @Test), codec-ohttp/src/test/java/io/netty/incubator/codec/ohttp/OHttpCryptoTest.java, OHttpCodecsTest.java; the bug needs -Dio.netty.noUnsafe=true (docker build-no-unsafe profile, docker/docker-compose.centos-7.yaml:34-36) plus a pooled direct allocator"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "codec-ohttp-hpke-classes-boringssl/.../BoringSSL.java, BoringSSLCryptoOperation.java, BoringSSLAEADContext.java", "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Change the fallback to memory_address(buf.internalNioBuffer(0, capacity)) + position() in the helper; correct for all callers, so the main risk is instead double-adding readerIndex or using nioBuffer() (copy for composites) rather than any missed route."},
+  "out_of_scope_notes": [
+    "Native seal/open trust Java-supplied lengths with no bounds checks (netty_incubator_codec_ohttp_hpke_boringssl.c:212-231); not pursued.",
+    "The build fetches BoringSSL over the network at build time; the image must pre-clone it."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); ~90 Java files across 6 modules, so source is assumed well under 5 MB for tiny_repo.",
+    "Whether OHttpCrypto.aad(...) returns pooled direct buffers was not read.",
+    "Latest release is 'none', so present_in_latest is not applicable (O8 empty)."
+  ]
+}

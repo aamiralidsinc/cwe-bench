@@ -1,0 +1,64 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "19374", "advisory_ids": ["GHSA-VH4V-2XQ2-G5CG", "GO-2026-5884"], "repo": "oras-project/oras-go",
+  "pinned_commit": "cc323e564d90c6b5b4bdd71d3c8d2ee2713b37e5",
+  "fix_commits": ["3c2e884e12ea52b6bff60c97f1edb7df7d0e0909"],
+  "trust_decision": {
+    "summary": "Whether registry credentials (Authorization header, or credentials resolved for the original host) may go to an HTTP origin other than the one the caller targeted; decided in auth.Client.send (redirect following delegated to net/http, which strips Authorization only on hostname change) and in auth.Client.Do after a 401 (credentials resolved for originalReq.Host and replayed regardless of which origin issued the challenge).",
+    "evidence": ["registry/remote/auth/client.go:136-141", "registry/remote/auth/client.go:247-270", "fix.diff:20-32", "fix.diff:79-81"]
+  },
+  "landing_point": {"where": "registry/remote/auth/client.go:136-141", "why": "The summary says 'forwards credentials across redirects'; the only place redirects are followed is c.client().Do in send, so an engineer adds a CheckRedirect there first."},
+  "fix_sites": [
+    {"where": "registry/remote/auth/client.go:140", "entry_point": "auth.Client.Do (and every remote.Repository/remote.Registry operation through Repository.do / Registry.do; also token fetches via fetchDistributionToken / fetchOAuth2Token)", "module_kind": "auth-decorated HTTP client, send helper (redirect policy)"},
+    {"where": "registry/remote/auth/client.go:228", "entry_point": "auth.Client.Do with a hand-built *http.Request whose Host field is empty", "module_kind": "auth client, cache/credential host-key derivation"},
+    {"where": "registry/remote/auth/client.go:251-255", "entry_point": "auth.Client.Do when the 401 challenge is returned by a redirected-to origin (pre-auth redirect)", "module_kind": "auth client, challenge handling"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All three fix sites are in registry/remote/auth/client.go; the pre-auth challenge-origin check (fix.diff:79-81) is the least obvious but it is in the same function the landing point leads to."},
+  "O3_reason_to_dismiss": "For the OAuth2 password-grant body (registry/remote/auth/client.go:412-441): 'the advisory is about the Authorization header and registry redirects; this is the token service, the secret sits in a form body, and replaying a 307 body is standard net/http behaviour'.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Credentials must still be forwarded across same-origin redirects (path-only redirect, default-port normalisation example.com == example.com:443, case-insensitive host), and a caller-supplied http.Client.CheckRedirect must still be invoked; cross-host bearer realms (auth.docker.io) and docker.io -> registry-1.docker.io must keep working.", "where": "fix.diff:209-307; registry/remote/auth/client.go:70-76; registry/remote/auth/client.go:169-173"},
+  "O6_input_shapes": [
+    "redirect to different port on same host",
+    "redirect to different host",
+    "redirect with scheme change (https -> http)",
+    "default port explicit vs implicit (normalised equal)",
+    "host case differences (normalised equal)",
+    "redirect after auth (Authorization already set) vs redirect before auth (401 issued by redirect target)",
+    "request with empty req.Host (falls back to URL.Host)",
+    "caller-supplied CheckRedirect preserved"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "OAuth2 password/refresh-token grant POSTs credentials in a form body; on a 307/308 from the token endpoint net/http replays the body to the new origin, and the fix's CheckRedirect only deletes the Authorization header.",
+     "where": "registry/remote/auth/client.go:413-441",
+     "reason_to_dismiss": "Token service rather than registry; credential is in the body, not a header; advisory and tests talk only about the Authorization header.",
+     "distance": "same file, different function (fetchOAuth2Token), reached only when Credential has RefreshToken or ForceAttemptOAuth2 is set",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "registry/remote/repository.go:942-946", "sibling": "Blob upload PUT copies Authorization from resp.Request (the post-redirect POST); a variant that copies it from the original req, or skips the sameUploadHost check for a redirected POST, re-forwards credentials cross-origin.", "why_realistic": "The 'reuse credential from previous POST request' comment already shows the maintainers manually propagating auth outside auth.Client."},
+    {"where": "internal/httputil/seek.go:92-94", "sibling": "Range re-request clones the stored request; a variant storing resp.Request (post-redirect URL with copied Authorization) would bypass auth.Client's origin logic.", "why_realistic": "Seek-by-new-connection lives in an internal package far from auth; a maintainer optimising to skip the redirect hop would plausibly store the final request."},
+    {"where": "registry/remote/utils.go:54", "sibling": "Pagination Link resolved against resp.Request.URL; a variant that attaches the previous page's Authorization to the next-page request would leak across origins.", "why_realistic": "Pagination code already reads the redirected request; carrying auth along to save a 401 round-trip is a plausible optimisation."}
+  ],
+  "O9_family": "credential forwarding to an unintended origin across HTTP redirects (CWE-200/CWE-522)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.25.0 (go.mod); deps go-digest, image-spec, x/sync", "services": [], "offline_after_build": true,
+                "project_tests": "registry/remote/auth/client_test.go (httptest servers, offline); registry/remote/repository_test.go for upload Location checks"},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "registry/remote/auth/client.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a CheckRedirect in send that strips Authorization on host change only (or on any redirect), missing the port/scheme case, the pre-auth 401-from-redirect-target path in Do, and breaking same-origin redirects or a caller's CheckRedirect."},
+  "out_of_scope_notes": [
+    "registry/remote/repository.go:880 sameUploadHost compares Hostname() case-sensitively (fails closed, not a leak).",
+    "Headers from auth.Client.Header (registry/remote/auth/client.go:137-139) are forwarded across redirects; only matters if a caller puts secrets there."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); tiny_repo flag is an estimate from the small Go-only tree with three direct deps.",
+    "Whether net/http replays the fetchOAuth2Token body on 307/308 to a cross-origin target was reasoned from stdlib semantics (strings.Reader sets GetBody), not executed.",
+    "present_in_latest unknown: no latest release supplied.",
+    "j_defence_ineffective=1 refers to net/http's built-in hostname-only header stripping, which the fix comment says did not cover port changes (fix.diff:14-18)."
+  ]
+}

@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "stacking", "out")
 RECS = os.path.join(ROOT, "sourcer", "review", "screener-v2")
 DOS = {"CWE-400", "CWE-770", "CWE-1333", "CWE-674", "CWE-834", "CWE-407", "CWE-606"}
-SZZ_ORDER = {"H3a-regression": 0, "H3b-touching": 1, "H3b-elsewhere": 2, "add-only": 3}
+SZZ_ORDER = {"H3a": 0, "H3b1": 1, "H3b2": 2, "H3u": 3}   # renamed 2026-10-22 (was H3a-regression / H3b-touching / H3b-elsewhere / add-only)
 
 
 def tsv(name):
@@ -46,14 +46,27 @@ def main():
     pairs.sort(key=lambda r: SZZ_ORDER.get(szz.get((r["b"], r["a"])), 4))
     for r in pairs[: a.h3]:
         st = szz.get((r["b"], r["a"]), "not-mined")
-        pattern = "H3a" if st == "H3a-regression" else "H3b"
+        pattern = st if st in SZZ_ORDER else "H3u"
         jobs.append(dict(id=f"h3-{r['b'].lower()}", pattern=pattern, repo=r["repo"].split(";")[0],
                          pin_from=[c for c in r["a_fix"].split(";") if c], candidate=dict(r, szz_status=st),
                          screener_record=None))
     os.makedirs(OUT, exist_ok=True)
-    with open(os.path.join(OUT, "reader_jobs.jsonl"), "w") as o:
-        for j in jobs:
+    # MERGE with the existing job list: keep earlier jobs (build_prepare_stack.py looks them up by id),
+    # add new ones; for an id already present, the new definition replaces the old.
+    path = os.path.join(OUT, "reader_jobs.jsonl")
+    merged = {}
+    if os.path.isfile(path):
+        for l in open(path):
+            if l.strip():
+                j = json.loads(l)
+                merged[j["id"]] = j
+    new_ids = [j["id"] for j in jobs if j["id"] not in merged]
+    for j in jobs:
+        merged[j["id"]] = j
+    with open(path, "w") as o:
+        for j in merged.values():
             o.write(json.dumps(j) + "\n")
+    print(f"merged: {len(merged)} jobs in file, {len(new_ids)} new")
     print(f"{len(jobs)} jobs -> stacking/out/reader_jobs.jsonl "
           f"(H4 {sum(j['pattern']=='H4' for j in jobs)}, H3 {sum(j['pattern']!='H4' for j in jobs)})")
     for j in jobs:

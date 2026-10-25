@@ -1,0 +1,52 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "9675", "advisory_ids": ["GHSA-8238-W5PM-2374"], "repo": "cthackers/adm-zip",
+  "pinned_commit": "747060a7b6a20c677a8ef6c66c45f262de1f8e69",
+  "fix_commits": ["5e70d3a26097d68fa981c41f022c053117174e49"],
+  "trust_decision": {
+    "summary": "Archive bytes from an untrusted zip are fed to an async zlib inflate stream; the library decides whether a decompression failure is reported to the caller's callback or escapes as an unhandled 'error' event (process crash). Decided in methods/inflater.js inflateAsync (no 'error' listener) and in zipEntry.js decompress async branch (callback ignores err).",
+    "evidence": ["methods/inflater.js:12-31", "zipEntry.js:110-118", "fix.diff:20-24", "fix.diff:50-60"]
+  },
+  "landing_point": {"where": "methods/inflater.js:12", "why": "Summary says 'unhandled error event in async DEFLATE decompression'; inflateAsync creates the zlib stream with only 'data'/'end' listeners."},
+  "fix_sites": [
+    {"where": "methods/inflater.js:12-31", "entry_point": "ZipEntry.getDataAsync / AdmZip.readFileAsync / readAsTextAsync / extractAllToAsync (via zipEntry.js:102,110)", "module_kind": "internal low-level compression method module (methods/)"},
+    {"where": "zipEntry.js:110-118", "entry_point": "ZipEntry.getDataAsync (zipEntry.js:309-314) and AdmZip async readers (adm-zip.js:157-160, adm-zip.js:192-195, adm-zip.js:893)", "module_kind": "core entry model (consumer/wrapper of inflater)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "zipEntry.js:110-118 (decompress callback must propagate the new err instead of CRC-checking the empty placeholder buffer)"},
+  "O3_reason_to_dismiss": "The sync-throw routes in async decompress (bad password, unknown method, bad local header, STORED bad CRC) are 'synchronous exceptions documented as throws', not zlib error events, so a solver can argue they are outside an advisory about the DEFLATE stream.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "The maxOutputLength cap (fix for CVE-2026-39244) must stay: it is itself a source of stream errors, so a fix that drops the cap to avoid errors reopens the decompression bomb; also valid DEFLATE entries must still decode and bad-CRC entries must still deliver data plus BAD_CRC exactly once.", "where": "methods/inflater.js:5"},
+  "O6_input_shapes": ["malformed DEFLATE stream (Z_DATA_ERROR)", "real output exceeding declared size (maxOutputLength RangeError)", "error after partial data / end-after-error (single callback guard)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "Encrypted entry with wrong password: ZipCrypto.decrypt throws synchronously inside async decompress; from extractAllToAsync the 2nd+ entry is decompressed inside an fs.utimes callback, so the throw is uncaught.", "where": "zipEntry.js:71-76", "reason_to_dismiss": "Password errors are a sync API contract and belong to a neighbouring (encryption) feature.", "distance": "zipEntry.js -> methods/zipcrypto.js:128, reached from adm-zip.js:893/905-909", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "STORED entry with bad CRC calls the callback with BAD_CRC and then also throws in async mode (double signal + uncaught throw from async extraction chain).", "where": "zipEntry.js:89-91", "reason_to_dismiss": "STORED is not DEFLATE; the advisory names DEFLATE only.", "distance": "same file as fix site 2", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Unknown compression method calls callback then throws in async mode.", "where": "zipEntry.js:121-123", "reason_to_dismiss": "Unsupported method is a legacy/unsupported-combination path.", "distance": "same file as fix site 2", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Malformed local header: getCompressedDataFromZip -> loadLocalHeaderFromBinary throws INVALID_LOC before any async work, uncaught when reached from the extractAllToAsync chain.", "where": "zipEntry.js:63", "reason_to_dismiss": "Header parsing is a different layer from decompression.", "distance": "zipEntry.js:27 -> headers/entryHeader.js:218", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "methods/deflater.js:11-31", "sibling": "deflateAsync has the same stream pattern with no 'error' listener (second implementation of the same stream wrapper, used by toBuffer/toBufferPromise via zipFile.js:391).", "why_realistic": "It is a copy-paste twin of inflateAsync; a maintainer fixing inflate would plausibly forget it, though input is in-memory data so a real error is hard to trigger."},
+    {"where": "adm-zip.js:886-915", "sibling": "An async extract/readFile variant that wraps getDataAsync without try/catch around sync throws.", "why_realistic": "extractAllToAsync already chains getDataAsync inside fs callbacks; a per-entry async extractEntryTo would be a natural addition."}
+  ],
+  "O9_family": "CWE-248 uncaught exception in async error path (unhandled stream 'error' event) leading to process crash",
+  "O9_dos": true,
+  "O10_build": {"language": "JavaScript", "toolchain": "Node.js >= 14 (maxOutputLength needs >= 15), npm, mocha", "services": [], "offline_after_build": true,
+                "project_tests": "test/crc/index.js (async bad-CRC callback), test/decompress_bomb.test.js (sync only), test/methods/methods.test.js (extractAllToAsync)"},
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "methods/inflater.js, zipEntry.js", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add tmp.on('error') in inflateAsync that calls callback(buf, err), leaving zipEntry's callback to ignore err and the sync throws in async decompress untouched."},
+  "out_of_scope_notes": [
+    "Crash/DoS class in a small library: lessons-v2 records resource-exhaustion and small-library hosts as never hard; how-type room is limited to the maxOutputLength coupling."
+  ],
+  "unverified": [
+    "repo_mb not measured (source is a handful of JS files, clearly < 5 MB).",
+    "Whether the advisory text counts sync throws in async decompress (O8) as within its property is inferred from the summary, not the full advisory body.",
+    "present_in_latest unknown for all O8 routes (no latest release provided).",
+    "Exact crash behaviour of O8 routes was reasoned from code (getDataAsync called from fs.utimes callback at adm-zip.js:905-909), not executed."
+  ]
+}

@@ -3,10 +3,10 @@
 
 For each H3b pair (earlier fix A, later fix B, same repo): take the lines B's fix deletes or changes,
 blame them in B's parent, and count how many were written by A's fix commits.
-  H3a-regression  : at least half of B's changed lines come from A's fix (B corrects code A wrote)
-  H3b-touching    : some, but under half
-  H3b-elsewhere   : none (A was incomplete; B adds protection elsewhere)
-  add-only        : B only adds lines, so SZZ cannot attribute (read by hand)
+  H3a   (regression)      : at least half of B's changed lines come from A's fix (B corrects code A wrote)
+  H3b1  (incomplete, touches A's code): some, but under half
+  H3b2  (incomplete, elsewhere): none (A was incomplete; B adds protection elsewhere)
+  H3u   (unclassified)    : B only adds lines, so SZZ cannot attribute (read by hand)
 Clones are blobless and cached in ~/.tb-graders/cwe/stacking/clones/ (network: github.com only).
 
   python3 -I stacking/szz_pairs.py [--limit N] [--only owner/repo ...] [--max-repo-mb 1500]
@@ -144,8 +144,8 @@ def main():
                             if c in a_fix:
                                 to_a += n
                 share = to_a / total if total else 0
-                status = ("add-only" if total == 0 else "H3a-regression" if share >= 0.5 else
-                          "H3b-touching" if to_a else "H3b-elsewhere")
+                status = ("H3u" if total == 0 else "H3a" if share >= 0.5 else
+                          "H3b1" if to_a else "H3b2")
                 row.update(status=status, b_changed_lines=total, blamed_to_a=to_a, share_a=f"{share:.2f}",
                            blamed_commits=len(commits), files=files)
               except Exception as e:      # one bad pair must not stop the run

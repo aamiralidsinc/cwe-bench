@@ -1,0 +1,85 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "25854",
+  "advisory_ids": ["GHSA-G9JJ-CGMH-9F38", "CVE-2026-55856"],
+  "repo": "mariadb-corporation/mariadb-connector-j",
+  "pinned_commit": "f4a727c764d1cf48fd0c3d5e301dfa92503e0a58",
+  "fix_commits": ["149ec6a626376214966c01f42d48be1b80d06056", "d90b9872322c76b05a48219be66bff1d33102f8a"],
+  "trust_decision": {
+    "summary": "Whether the driver may put the authentication answer for the server-named initial plugin (the clear-text password for mysql_clear_password) on the wire in the initial HandshakeResponse. That needs a secure transport whose server identity is already verified, not just deferred to a later fingerprint check. At the pinned commit the only gate is an SSL-capability check inside the encoder; the fix moves the decision to StandardClient.handleAuthentication before the response is built.",
+    "evidence": [
+      "src/main/java/org/mariadb/jdbc/message/client/HandshakeResponse.java:141-146",
+      "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:384-395",
+      "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:295-299",
+      "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:526-549",
+      "fix.diff:376-406"
+    ]
+  },
+  "landing_point": {
+    "where": "src/main/java/org/mariadb/jdbc/message/client/HandshakeResponse.java:141",
+    "why": "This is the only place that writes the clear-text password into the initial-handshake response, and it already holds a 'Cannot send password in clear if SSL is not enabled' guard. Grepping for mysql_clear_password or 'clear' leads straight here."
+  },
+  "fix_sites": [
+    {"where": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:384-395", "entry_point": "java.sql.DriverManager.getConnection / Driver.connect / MariaDbDataSource.getConnection -> StandardClient constructor (StandardClient.java:144-156) -> setupConnection -> handleAuthentication", "module_kind": "core connection/protocol client (client.impl)"},
+    {"where": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:442-448", "entry_point": "same as above (createAuthPlugin removed; plugin now built via AuthenticationPluginLoader before the response is sent, fix.diff:376-392)", "module_kind": "core connection/protocol client (client.impl)"},
+    {"where": "src/main/java/org/mariadb/jdbc/message/client/HandshakeResponse.java:141-144", "entry_point": "same connection path; HandshakeResponse.encode is a public class in message.client, invoked from StandardClient.sendHandshakeResponse (StandardClient.java:425-440)", "module_kind": "lower-level wire message encoder (message.client); the old guard is removed and replaced upstream"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "src/main/java/org/mariadb/jdbc/message/client/HandshakeResponse.java:141-144 (the existing SSL-capability guard in the encoder, in another package; the fix removes it and replaces it in StandardClient, fix.diff:439-447)"},
+  "O3_reason_to_dismiss": "HandshakeResponse already refuses clear text without SSL, and the self-signed case is 'already handled' by the fingerprint check at the OK packet (StandardClient.java:526-549) and by the auth-switch gate (StandardClient.java:490-502). A solver can argue the initial path is covered and not see that the password has already left before either of those checks runs.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Self-signed TLS without a CA ('MitM-proof without CA') must keep working for MitM-proof plugins (native, ed25519, parsec) with a non-empty password, validated by fingerprint at the OK packet. mysql_clear_password must keep working over CA-verified TLS, over sslMode=trust and over a local unix socket. An over-broad fix (refuse every self-signed cert, or refuse clear password whenever SSL is used) breaks these.",
+    "where": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:526-549; src/main/java/org/mariadb/jdbc/plugin/authentication/standard/NativePasswordPlugin.java:106; src/main/java/org/mariadb/jdbc/plugin/tls/main/DefaultTlsSocketPlugin.java:155-168; src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:474-476"
+  },
+  "O6_input_shapes": [
+    "initial plugin named by the server handshake (StandardClient.java:398)",
+    "initial plugin forced client-side by a CredentialPlugin.defaultAuthenticationPluginType (StandardClient.java:399-402)",
+    "plain TCP without SSL vs local unix socket (exempt) (fix.diff:377-379)",
+    "TLS with deferred identity (certFingerprint != null) vs verified/trust TLS (fix.diff:394-397)",
+    "null/empty password with a self-signed cert (fix.diff:395-397)",
+    "any requireSecure() plugin as initial type, e.g. dialog, not just mysql_clear_password (fix.diff:376-378; src/main/java/org/mariadb/jdbc/plugin/authentication/standard/SendPamAuthPacketFactory.java:23)"
+  ],
+  "O7_producer": {"kind": "handler", "where": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:295-299 (TLS handshake handler sets certFingerprint from MariaDbX509DeferredIdentityTrustManager, chosen in src/main/java/org/mariadb/jdbc/plugin/tls/main/DefaultTlsSocketPlugin.java:155-160)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/main/java/org/mariadb/jdbc/plugin/authentication/standard/CachingSha2PasswordPlugin.java:212-229", "sibling": "full-auth (0x04) branch sends the clear password gated on configured sslMode; a copy that drops the sslFingerPrintValidation term, or gates on SSL capability only, would leak under deferred identity", "why_realistic": "This branch already makes its own local clear-text decision from sslMode instead of verified identity, so a maintainer could easily write the weaker variant."},
+    {"where": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:599-643", "sibling": "a re-authentication path (redirect or a planted COM_CHANGE_USER / pool re-auth packet) that builds its own auth response with the initial-plugin shortcut instead of going through handleAuthentication", "why_realistic": "The redirect code already re-runs connection setup with a rebuilt Configuration; a change-user packet in message.client next to HandshakeResponse is a natural feature that would copy the encoder's clear-text branch."},
+    {"where": "src/main/java/org/mariadb/jdbc/plugin/authentication/addon/ClearPasswordPlugin.java:51-57", "sibling": "plugin-level guard that checks sslMode != DISABLE/TRUST and the fingerprint flag but not unix-socket/plain-TCP; a second clear-text plugin (e.g. a token/IAM plugin) with only this guard", "why_realistic": "Plugins are loaded through ServiceLoader and each one carries its own guard, so adding a token plugin with a copied guard is plausible."}
+  ],
+  "O9_family": "CWE-522 insufficiently protected credentials: clear-text secret sent before the TLS peer identity is verified (check-before-send ordering)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Java",
+    "toolchain": "Maven (pom.xml), JUnit 5",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "The fix adds src/test/java/org/mariadb/jdbc/unit/client/RogueServerCredentialLeakTest.java, which uses an in-process loopback rogue server plus a test keystore src/test/resources/loopback-server.p12 (fix.diff:79-353), so no DB is needed. Existing related tests are src/test/java/org/mariadb/jdbc/unit/client/MariaDbX509DeferredIdentityTrustManagerTest.java (unit) and integration/SslTest.java and integration/ConnectionTest.java, which need a live MariaDB."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java, src/main/java/org/mariadb/jdbc/message/client/HandshakeResponse.java",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "In HandshakeResponse.encode, tighten the mysql_clear_password guard (or copy the auth-switch fingerprint check) for that one plugin name only, leaving the decision in the encoder, which cannot see certFingerprint or the socket type."
+  },
+  "out_of_scope_notes": [
+    "AuthenticationPluginLoader restrictedAuth match uses type::contains (substring), src/main/java/org/mariadb/jdbc/plugin/authentication/AuthenticationPluginLoader.java:36; not pursued.",
+    "Server-supplied redirect after OK reuses/overrides credentials toward a new host, src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:552-554,599-643; separate concern, not pursued."
+  ],
+  "unverified": [
+    "repo_mb unknown (no du allowed in budget); tiny_repo/giant_repo not assessed. About 260 main Java files, so probably not tiny.",
+    "Commit 149ec6a6 (fix.diff:1-62) is a backport against an older branch layout (StandardClient ~line 210, no-arg ClearPasswordPlugin) and does not apply to this pinned tree; only d90b9872 (fix.diff:355-447) applies.",
+    "The PAM auth-switch case in the new regression test (fix.diff:557-599) is already guarded at the pinned commit (src/main/java/org/mariadb/jdbc/client/impl/StandardClient.java:474-485, from parent commit CONJ-1320), so that test case should already pass at the pin. Not run.",
+    "O1 counted as 1: Driver.connect, DataSource/pool getConnection and redirect all funnel into the single StandardClient constructor path.",
+    "The fix incidentally enforces restrictedAuth and requireSecure() on the initial plugin type (fix.diff:376-388), which the pinned code never consults on that path. Hidden tests asserting these would be behaviour beyond the advisory's clear-text property.",
+    "single_site not flagged: the fix touches one function plus a guard removal in a second file (O2). In practice it is close to single-location.",
+    "JDK version requirement not checked in pom.xml."
+  ]
+}

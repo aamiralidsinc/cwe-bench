@@ -1,0 +1,61 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "7885", "advisory_ids": ["GHSA-3F6P-5WW8-9RCR"], "repo": "sidorares/node-mysql2",
+  "pinned_commit": "79a4fdaee1d8ef48f45eeaa5eb577805ea8f22a0",
+  "fix_commits": ["884bec56288d827939d0dd3f1f4ae476fbc8dbeb"],
+  "trust_decision": {
+    "summary": "The client decides whether to send the password in plaintext when the server names the auth plugin mysql_clear_password. At the pinned commit it does so with no client opt-in, both in the auth-switch handler and in the initial-handshake direct-auth shortcut. The fix gates both on config.enableCleartextPlugin or on a custom authPlugins.mysql_clear_password entry.",
+    "evidence": ["lib/commands/auth_switch.js:75-82", "lib/commands/client_handshake.js:105-119", "lib/commands/client_handshake.js:189-194", "lib/auth_plugins/mysql_clear_password.js:7-15", "fix.diff:13-33", "fix.diff:47-49"]
+  },
+  "landing_point": {"where": "lib/commands/auth_switch.js:75", "why": "The summary says 'auth plugin downgrade'. A server-sent AuthSwitchRequest naming mysql_clear_password is resolved here through getAuthPlugin into the built-in cleartext plugin, so this is where an engineer would look first."},
+  "fix_sites": [
+    {"where": "lib/commands/auth_switch.js:75", "entry_point": "mysql.createConnection()/createPool()/promise wrappers -> ClientHandshake.handshakeResult (lib/commands/client_handshake.js:338); also connection.changeUser() via lib/commands/change_user.js:63-64 and MFA AuthNextFactor (marker 0x02, lib/commands/client_handshake.js:319-338)", "module_kind": "protocol command handler (auth switch)"},
+    {"where": "lib/commands/client_handshake.js:105-108", "entry_point": "mysql.createConnection() with ssl or socketPath set: the initial HandshakeResponse direct-auth optimization (sendCredentials)", "module_kind": "second code path in another file (handshake optimization that bypasses auth switch)"},
+    {"where": "lib/commands/client_handshake.js:343", "entry_point": "same as auth_switch: keeps the new error code instead of overwriting it with AUTH_SWITCH_PLUGIN_ERROR", "module_kind": "error mapping"},
+    {"where": "lib/connection_config.js:62", "entry_point": "createConnection/createPool options (validOptions whitelist)", "module_kind": "config_loader"},
+    {"where": "lib/connection_config.js:154", "entry_point": "ConnectionConfig constructor, used by createConnection, PoolConfig (lib/pool_config.js:8-10) and URI strings (lib/connection_config.js:272-293)", "module_kind": "config_loader"},
+    {"where": "typings/mysql/lib/Connection.d.ts:327", "entry_point": "TypeScript ConnectionOptions", "module_kind": "typings (non-runtime)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "lib/commands/client_handshake.js:105-119 (direct-auth shortcut: canUseAuthMethodDirectly at :203-219 returns true for mysql_clear_password when ssl/socketPath is set, and calculateAuthToken at :189-194 builds the plaintext token without any plugin)"},
+  "O3_reason_to_dismiss": "The direct-auth shortcut only fires when ssl or socketPath is configured (client_handshake.js:78-79, :210-213), so a solver can argue the channel is already secure and the report's 'downgrade' is only the AuthSwitchRequest path. The fix still requires opt-in there, because a malicious or impersonated server receives the plaintext password.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Cleartext auth must keep working when the user opts in (enableCleartextPlugin:true, or a custom authPlugins.mysql_clear_password, which the fix treats as implicit opt-in), including direct use over TLS/socket. Other plaintext-over-TLS plugins (sha256_password, caching_sha2 full auth) must keep working, and existing unit tests expect canUseAuthMethodDirectly('mysql_clear_password', true) === true. An over-broad fix that rejects the plugin outright, ignores custom authPlugins, or edits canUseAuthMethodDirectly breaks these.", "where": "lib/commands/client_handshake.js:203-219; test/unit/commands/test-client-handshake-auth.test.mts:186-200; lib/auth_plugins/sha256_password.js:42-48; lib/auth_plugins/caching_sha2_password.js:73-81; fix.diff:231-260"},
+  "O6_input_shapes": [
+    "server AuthSwitchRequest (0xfe) naming mysql_clear_password",
+    "server AuthNextFactor (0x02, MFA) naming mysql_clear_password, through the same authSwitchRequest",
+    "server initial Handshake advertising mysql_clear_password as the default plugin, with ssl/socketPath configured (direct-auth path)",
+    "changeUser re-auth, which reuses handshakeResult",
+    "opt-in through enableCleartextPlugin:true",
+    "opt-in through an authPlugins own-property 'mysql_clear_password' (hasOwnProperty check)",
+    "option given through a URI query string or pool config (ConnectionConfig.parseUrl JSON-parses values)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "lib/connection_config.js:74-194 (ConnectionConfig constructor; the option must be copied to this.enableCleartextPlugin at fix.diff:81, and the whitelist entry at fix.diff:73 only silences a warning)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "A legacy authSwitchHandler is invoked for a server-requested mysql_clear_password before the new gate. The fix leaves it ungated (the handler receives the pluginName and decides itself).", "where": "lib/commands/auth_switch.js:60-73", "reason_to_dismiss": "The handler is deprecated user-supplied code, and client_handshake already treats it as an explicit opt-out of built-in auth (client_handshake.js:100-101). This is a weak route that is probably intentional.", "distance": "same file as the landing point, 15 lines above", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/commands/change_user.js:63-64", "sibling": "Give ChangeUser its own auth-switch handling (a copy of handshakeResult/authSwitchRequest) that resolves plugins through standardAuthPlugins without the gate.", "why_realistic": "ChangeUser already borrows ClientHandshake methods piecemeal. A maintainer handling re-auth separately (it resets currentConfig.password at :43) could plausibly have forked the logic."},
+    {"where": "lib/auth_plugins/caching_sha2_password.js:73-81", "sibling": "Server-driven PERFORM_FULL_AUTHENTICATION sends the plaintext password whenever config.ssl/socketPath is truthy or overrideIsSecure is set, not when the stream is actually encrypted. Unlike sha256_password.js:42-48 it does not check the TLS socket.", "why_realistic": "This is a real asymmetry between two plugins that do the same job. A planted variant without the isSecureConnection check would be a how-type sibling in a plugin module the report does not name."},
+    {"where": "lib/connection_config.js:78-84", "sibling": "The uri merge skips only truthy explicit options, so enableCleartextPlugin:false plus uri '?enableCleartextPlugin=true' ends up enabled. A defaults/merge route for the opt-in flag.", "why_realistic": "This is the existing merge idiom for every option, so a maintainer would not have special-cased a security flag."}
+  ],
+  "O9_family": "CWE-522 insufficiently protected credentials (client auth-plugin downgrade to cleartext, missing opt-in gate)", "O9_dos": false,
+  "O10_build": {"language": "JavaScript (Node.js, tests in .mts)", "toolchain": "npm install; poku test runner (package.json:11); node >= 8 per package.json:51", "services": [], "offline_after_build": true,
+                "project_tests": "The fix's test (test/integration/test-cleartext-plugin-gate.test.mts) uses an in-process mysql.createServer mock, so it needs no MySQL server. Existing unit tests are in test/unit/commands/test-client-handshake-auth.test.mts:186-200. Most other integration tests need a MySQL server (docker-compose), but hidden tests for this area can use the mock-server pattern."},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "lib/commands/auth_switch.js, lib/commands/client_handshake.js, lib/connection_config.js, typings/mysql/lib/Connection.d.ts", "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add an opt-in check only in authSwitchRequest (or in the mysql_clear_password plugin) and leave the client_handshake direct-auth shortcut sending plaintext whenever ssl/socketPath is set."},
+  "out_of_scope_notes": [
+    "The server-side ConnectionConfig use in lib/server.js:18 is not part of the client auth decision and was not examined."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check); probably above 5 MB because of the website/ docs tree, but not confirmed.",
+    "present_in_latest for the O8 route: no latest release was provided.",
+    "O8 has only a weak route (the legacy handler); other paths to the cleartext sink (changeUser, MFA AuthNextFactor) go through authSwitchRequest and are covered by the fix.",
+    "Recall risk is a judgement: the option name mirrors libmysqlclient's well-known --enable-cleartext-plugin / ENABLE_CLEARTEXT_PLUGIN, which makes the fix shape guessable."
+  ]
+}

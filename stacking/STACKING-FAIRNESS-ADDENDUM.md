@@ -1,4 +1,8 @@
-# Stacking fairness addendum, v1, 2026-10-22
+# Stacking fairness addendum, v2, 2026-10-24
+
+**v2 (2026-10-24):** S1 no longer asks for a clause that states each coupled value; the general
+keep-working sentence covers it (batch 1 instructions listed their traps through such clauses). The
+fairfix rule now forbids adding any sentence that fails build rule 7's one-bug test.
 
 **How it is used:**
 - **Fairness review:** appended to `builder/FAIRNESS-REVIEW-BRIEF.md` when the task's
@@ -17,11 +21,14 @@ This task stacks several independent concepts; `manifest.stacking` lists them. A
 
 **S1. Coupled traps (gate a when it fails).** For every functional test holding a must-keep-working
 value next to a hidden one:
-- quote the instruction clause that states that value;
-- check that the clause does not contradict any security rule in the instruction.
+- quote the instruction clause that covers that value. The general keep-working sentence ("everything
+  that works today keeps working", "keep every legitimate use working") counts; a clause naming the
+  value is NOT required, and its absence is never a finding;
+- check that no security rule in the instruction, read literally, forbids that value.
 
-A keep-working demand that a security rule forbids, read literally, is a contradiction: a correct fix
-cannot pass both.
+Gate a fails only on that contradiction: a correct fix cannot pass both. The remedy is to reword the
+security rule over its protected outcome, never to add a clause that names the value (that lists the
+trap; see build rule 7).
 
 **S2. Shape traps (gate a when it fails).** For every input shape a security test refuses, check that
 it lies outside the legitimate set that every keep-working clause, example and fixture describes.
@@ -60,6 +67,8 @@ refused leading slash, where another route must accept it.
 
 **Fairfix rules for stacked tasks:**
 - Resolve a contradiction by keeping the instruction and changing the test and the reference
-  (decision of 2026-10-20). Never add a sentence that points at a route.
+  (decision of 2026-10-20). Never add a sentence that points at a route, and never one that names
+  or describes a coupled value, a form, a source or an alias: apply build rule 7's one-bug test to
+  every sentence you add. Re-run `stacking/run_listing_check.sh` after any instruction change.
 - Drop a concept only when the concept itself cannot be made fair. If fewer than 3 independent
   concepts remain, the task is no longer a stacked task: report that, rather than shipping it.

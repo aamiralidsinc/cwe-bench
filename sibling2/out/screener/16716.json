@@ -1,0 +1,64 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "16716",
+  "advisory_ids": ["GHSA-8Q3C-RJR9-XXRP", "CVE-2026-61625", "GO-2026-6366"],
+  "repo": "victoriametrics/victoriametrics",
+  "pinned_commit": "0ceeb140763f1a3dbdd00476b6b9336e75038526",
+  "fix_commits": ["710c920d6083327042a309e449fae4383617d817"],
+  "trust_decision": {
+    "summary": "Part.Path comes from object/file names in an untrusted remote backup; the code must decide that the local path built from it (filepath.Join(dir, Path)) stays inside the local root dir before creating, preallocating, writing or renaming the file. At the pinned commit nothing decides this.",
+    "evidence": ["lib/backup/common/part.go:95-121", "lib/backup/common/part.go:71-78", "lib/backup/s3remote/s3.go:313-322", "lib/backup/fslocal/fslocal.go:131-136", "lib/backup/fslocal/fslocal.go:157-162", "fix.diff:28-32", "fix.diff:44-53", "fix.diff:126-128"]
+  },
+  "landing_point": {"where": "lib/backup/actions/restore.go:90", "why": "The summary names vmrestore and the restore root. app/vmrestore/main.go:62-70 hands off directly to actions.Restore.Run, which lists the src parts at :90 and writes them via pipelinedDownload (:242)."},
+  "fix_sites": [
+    {"where": "lib/backup/actions/restore.go:90", "entry_point": "vmrestore CLI (-src, -storageDataPath) -> actions.Restore.Run (public Go API); upfront loop over srcParts added after ListParts (fix.diff:28-32)", "module_kind": "orchestration action (lib/backup/actions)"},
+    {"where": "lib/backup/common/part.go:122", "entry_point": "new shared helper Part.IsLocalPathInsideDir (fix.diff:44-53), placed after ParseFromRemotePath and called from both other sites", "module_kind": "shared model/helper (lib/backup/common)"},
+    {"where": "lib/backup/fslocal/fslocal.go:131", "entry_point": "fslocal.FS.NewDirectWriteCloser (public lower-level Go API); fatal BUG assertion added (fix.diff:126-128)", "module_kind": "lower-level filesystem backend (lib/backup/fslocal)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "lib/backup/fslocal/fslocal.go:131 (NewDirectWriteCloser guard, fix.diff:126-128). The landing point is lib/backup/actions/restore.go; the backend package is a separate layer."},
+  "O3_reason_to_dismiss": "For the O8 vmbackup route: the advisory is about vmrestore and -storageDataPath. vmbackup -origin -> fs:// -dst writes to a backup destination, which is a 'remote' and not the storage dir, and cross-type copy looks like a neighbouring optimisation feature. For fslocal PreallocateFile/FinalizeFile: they are only called from Restore.Run, which already validates.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Legitimate names must still restore: '..' segments that resolve inside the dir ('foo/../bar/file.dat'), file names that merely start with '..' (the fix commit itself adds 'cve/..foo.txt'), a leading '/' treated as relative, and a root dir of '/', which allows everything. A strings.Contains(path, \"..\") or reject-leading-slash fix breaks these. The rsync --delete sync of the existing storageDataPath contents must also keep working.", "where": "fix.diff:5; fix.diff:89; fix.diff:92-98; lib/backup/actions/restore.go:134-160; app/vmrestore/main.go:27-29"},
+  "O6_input_shapes": ["leading ../ (../outside/marker.txt)", "mid-path traversal (a/../../outside)", "prefix-sharing sibling dir (../storagefoo/evil.txt vs /data/storage)", "dir with trailing slash", "dir containing .. components", "absolute-looking path (/outside/marker.txt), stays inside", "root dir '/'", "Windows backslash separators: regex accepts [/\\\\] (lib/backup/common/part.go:88) and LocalPath converts '/' (lib/backup/common/part.go:74-76)"],
+  "O7_producer": {"kind": "mapper", "where": "lib/backup/common/part.go:95-121 (ParseFromRemotePath builds Part.Path from remote keys; called from lib/backup/s3remote/s3.go:322, lib/backup/gcsremote/gcs.go:136, lib/backup/azremote/azblob.go:183, lib/backup/fsremote/fsremote.go:61)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "vmbackup server-side copy with -origin on s3/gcs/azblob and -dst=fs://: copySrcParts takes the cross-type branch, and crossTypeCopy calls fsremote.UploadPart, which joins the remote-supplied Part.Path onto fs.Dir with no inside-dir check",
+     "where": "lib/backup/actions/backup.go:244-250; lib/backup/actions/backup.go:297; lib/backup/fsremote/fsremote.go:161-166; lib/backup/fsremote/fsremote.go:196-198; app/vmbackup/main.go:134-145",
+     "reason_to_dismiss": "Advisory says vmrestore/-storageDataPath; fs:// is a backup 'remote' destination, and cross-type origin copy looks like a separate optimisation feature",
+     "distance": "different app (app/vmbackup) and package (lib/backup/fsremote) from the landing point lib/backup/actions/restore.go",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "fslocal.FS.PreallocateFile and FinalizeFile (public lower-level API) build the path from Part.Path and create, preallocate or rename files without the guard the fix put only on NewDirectWriteCloser; Restore.Run calls PreallocateFile before the writer",
+     "where": "lib/backup/fslocal/fslocal.go:157-162; lib/backup/fslocal/fslocal.go:167-174; lib/backup/actions/restore.go:184; lib/backup/actions/restore.go:242",
+     "reason_to_dismiss": "Only reached via Restore.Run, which validates all srcParts upfront after the fix",
+     "distance": "same package as fix site lib/backup/fslocal/fslocal.go:131",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/backup/fsremote/fsremote.go:93-100", "sibling": "fsremote.CopyPart joins p.Path onto the dst dir; a planted fs->fs copy route taking parts from a non-disk listing", "why_realistic": "same Join-on-Dir path helper as UploadPart; a maintainer adding a new copy mode would reuse fs.path(p)"},
+    {"where": "lib/backup/fslocal/fslocal.go:213-217", "sibling": "fslocal.DeletePath builds the path from a caller-supplied canonical path; a planted deletion route driven by remote-listed names (e.g. a remote 'parts to remove' manifest)", "why_realistic": "the rsync --delete logic already deletes by path; feeding it from remote metadata is a plausible feature"},
+    {"where": "lib/backup/fsremote/fsremote.go:215-221", "sibling": "fsremote.CreateFile/ReadFile join a filePath onto fs.Dir; a planted metadata file whose name comes from backup metadata", "why_realistic": "copyMetadata (lib/backup/actions/copy.go:51-60) already moves named files between remotes"}
+  ],
+  "O9_family": "CWE-22 path traversal leading to arbitrary file write (untrusted remote object names mapped to local paths)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26.4 (go.mod:3), vendored modules (vendor/modules.txt)", "services": [], "offline_after_build": true,
+                "project_tests": "lib/backup/fslocal/fslocal_test.go:9 (ListParts only), lib/backup/azremote/azblob_test.go:9-83; no tests for actions.Restore or fsremote. Restore and copy can be driven offline with fs:// sources or a fake common.RemoteFS."},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "lib/backup/actions/restore.go, lib/backup/common/part.go, lib/backup/fslocal/fslocal.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Reject any Path containing \"..\" in NewDirectWriteCloser (or in ParseFromRemotePath only). This breaks '..foo' names and in-dir '..'; the writer-only version misses PreallocateFile (restore.go:184), which runs first, and the vmbackup fsremote.UploadPart route."},
+  "out_of_scope_notes": [
+    "The lexical check ignores symlinks already inside storageDataPath; fscommon follows symlinks (lib/backup/fscommon/fscommon.go:60-102). Not pursued.",
+    "s3/gcs/azblob CopyPart/UploadPart put '../' into object keys on the remote; not a local filesystem write. Not pursued.",
+    "The fix commit adds an empty file cve/..foo.txt (fix.diff:5) with no explanation."
+  ],
+  "unverified": [
+    "repo_mb not measured (vendor/ present; likely large but under 1.5 GB)",
+    "Whether real S3/GCS/Azure keys containing '../' survive listing unnormalised was not checked against provider behaviour; it does not matter for tests that use a fake common.RemoteFS",
+    "A ParseFromRemotePath-only fix covers all real listers. Hidden tests for O8 need a fake RemoteFS (or fsremote-level calls) to tell it apart; whether that is fair needs a decision",
+    "present_in_latest unknown for all O8 routes (no latest release given)",
+    "The NewDirectWriteCloser guard uses logger.Fatalf (process exit), so a behavioural test of that site needs a subprocess"
+  ]
+}

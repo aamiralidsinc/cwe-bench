@@ -1,0 +1,59 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "15196",
+  "advisory_ids": ["GHSA-2FQW-7C6R-2CQ6", "CVE-2026-53471", "GO-2026-6228"],
+  "repo": "kubev2v/migration-planner",
+  "pinned_commit": "d7ba2e1920104552cbf91f6f640b97edd10ba130",
+  "fix_commits": ["fd21a239216f5eeec635d16c72be9c033bd5d1aa"],
+  "trust_decision": {
+    "summary": "Whether an authenticated agent (JWT source_id claim) may write to a given source/agent record; the JWT is verified in the agent-server middleware but the agent handlers never compare its source_id to the source being written.",
+    "evidence": ["internal/auth/agent_authenticator.go:112-129", "internal/auth/agent_authenticator.go:137-143", "internal/handlers/v1alpha1/agent.go:29-44", "internal/handlers/v1alpha1/agent.go:68-84", "internal/service/agent.go:59-62"]
+  },
+  "landing_point": {"where": "internal/handlers/v1alpha1/agent.go:29", "why": "The summary names the agent-API and the JWT source_id claim; the two agent handlers are the only agent-API operations, and UpdateSourceInventory is the one that writes source data."},
+  "fix_sites": [
+    {"where": "internal/handlers/v1alpha1/agent.go:29", "entry_point": "PUT /api/v1/sources/{id}/status (UpdateSourceInventory)", "module_kind": "HTTP handler"},
+    {"where": "internal/handlers/v1alpha1/agent.go:68", "entry_point": "PUT /api/v1/agents/{id}/status (UpdateAgentStatus)", "module_kind": "HTTP handler"},
+    {"where": "internal/api_server/agentserver/server.go:77-82", "entry_point": "agent server router middleware chain (all agent routes)", "module_kind": "server wiring / middleware composition"},
+    {"where": "internal/auth/agent_authenticator.go:79", "entry_point": "auth.NewAgentAuthenticator constructor, used by the agent server", "module_kind": "auth library constructor"},
+    {"where": "fix.diff:138-191", "entry_point": "new NoneAgentAuthenticator middleware used when MIGRATION_PLANNER_AGENT_AUTH_ENABLED=false", "module_kind": "auth middleware (new file internal/auth/none_agent_authenticator.go)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "internal/api_server/agentserver/server.go:77-82 with internal/config/config.go:43 — the auth-disabled config mode installs no agent context, so the new MustHaveAgent check would panic; the fix adds a none authenticator (fix.diff:13-21, fix.diff:34-43, fix.diff:138-191)"},
+  "O3_reason_to_dismiss": "Auth-disabled mode is a dev/test configuration where there is no JWT, so a solver can say it has no tenant boundary and leave it alone, or just skip the check when no agent is in context.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "With agent auth disabled (config default true, but switchable), the agent routes must keep working. A check that calls MustHaveAgent panics there (Recoverer turns it into a 500). The legitimate same-source update by a valid agent must also keep returning 200/201.", "where": "internal/config/config.go:43; internal/auth/model.go:41-47; internal/api_server/agentserver/server.go:78-86"},
+  "O6_input_shapes": ["source id in the URL path (UpdateSourceInventory request.Id)", "source id in the JSON body (UpdateAgentStatus request.Body.SourceId)", "auth-enabled (signed JWT in X-Agent-Token) vs auth-disabled (source id taken from the request body)"],
+  "O7_producer": {"kind": "handler", "where": "internal/auth/agent_authenticator.go:112-129 (puts AgentJWT into context); internal/auth/agent_authenticator.go:137-143 (maps the source_id claim)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "UpdateAgentStatus checks only the body sourceId against the JWT; the agent id in the path is never bound to that source, so an existing agent row belonging to another source can be overwritten and reassigned (Updates writes SourceID).",
+     "where": "internal/service/agent.go:89-103",
+     "reason_to_dismiss": "The report talks about source_id; the agent id is a separate, random UUID, and the body source id now matches the token, so the request looks 'authorised'.",
+     "distance": "same handler file as the landing point, sink in internal/service/agent.go and internal/store/agent.go:71-81 (2 packages away)",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "internal/handlers/v1alpha1/agent.go:68", "sibling": "a third agent-API route (e.g. agent heartbeat / delete agent / upload credentials-status) that takes a source id from path or body", "why_realistic": "The agent API has only two generated operations (internal/api/server/agent/server.gen.go:365-368); adding a third strict-handler operation follows the existing generated pattern."},
+    {"where": "internal/service/agent.go:80-103", "sibling": "service-level check comparing the existing agent.SourceID with the form SourceID, which is missing in UpdateAgentStatus while UpdateSourceInventory has it (internal/service/agent.go:59-62)", "why_realistic": "It mirrors the existing check in the sibling service method, so its absence in one method reads as a plain oversight."}
+  ],
+  "O9_family": "broken access control / IDOR (CWE-639, authorization bypass through user-controlled key)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.25.0 (go.mod:3), ginkgo/gomega tests", "services": ["PostgreSQL (DB_TYPE default pgsql, internal/config/config.go:15; handler tests call store.InitDB, internal/handlers/v1alpha1/agent_test.go:29-33)"], "offline_after_build": true,
+                "project_tests": "internal/handlers/v1alpha1/agent_test.go (handler tests with a DB), internal/auth/agent_authenticator_test.go (JWT middleware), internal/service/agent_test.go"},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "internal/handlers/v1alpha1/agent.go, internal/api_server/agentserver/server.go, internal/auth/agent_authenticator.go, internal/auth/none_agent_authenticator.go (new)", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a MustHaveAgent source_id comparison only in UpdateSourceInventory (path id), missing the body-sourced id in UpdateAgentStatus and panicking in auth-disabled mode."},
+  "out_of_scope_notes": [
+    "Image server (internal/api_server/imageserver/server.go:71-78) uses image tokens, not agent JWTs; not followed.",
+    "The published none authenticator reads sourceId from the body, but SourceStatusUpdate has no sourceId field (api/v1alpha1/agent/types.gen.go:21-24), so in auth-disabled mode the published UpdateSourceInventory check would compare against an empty string and return 403. Worth knowing for the hidden tests."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell use).",
+    "present_in_latest unknown: no latest release given.",
+    "The O8 agent-reassignment route is inferred from code reading (service/agent.go:89-103 plus store/agent.go:71-81 Updates with SourceID from the form); not executed.",
+    "The 403 in auth-disabled mode under the published fix (out_of_scope_notes) is inferred from fix.diff:170-186 and types.gen.go:21-24; not executed.",
+    "Recall risk is estimated; I did not search for write-ups."
+  ]
+}

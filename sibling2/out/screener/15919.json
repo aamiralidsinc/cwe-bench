@@ -1,0 +1,79 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "15919",
+  "advisory_ids": ["GHSA-5GM3-9CRP-6G3V", "CVE-2026-77339", "GO-2026-6515"],
+  "repo": "f1bonacc1/process-compose",
+  "pinned_commit": "e429fa3ac3b0f31b7dab22987f47aef363251e8e",
+  "fix_commits": ["6ffa74f462cd2fa4f8dc1ee63c70b793b298c858"],
+  "trust_decision": {
+    "summary": "Whether an HTTP request that reaches the MCP SSE listener comes from a trusted local client. At the pinned commit nothing decides it: mcp-go's SSEServer.Start serves every Host/Origin with no auth. The fix adds a Host allowlist, an Origin allowlist and an optional token gate in front of the SSE handler.",
+    "evidence": ["src/mcp/server.go:202-219", "fix.diff:141-170", "fix.diff:74-79"]
+  },
+  "landing_point": {"where": "src/mcp/server.go:209", "why": "The summary names the MCP SSE transport. startSSE is the only place that builds and starts the SSE HTTP listener (server.NewSSEServer + sseServer.Start(addr))."},
+  "fix_sites": [
+    {"where": "src/mcp/server.go:208-216", "entry_point": "MCP SSE listener (mcp-go SSEServer routes GET /sse and POST /message), started via `process-compose up` with mcp_server config (src/cmd/root.go:239-245)", "module_kind": "transport/server bootstrap"},
+    {"where": "src/mcp/server.go:222-226", "entry_point": "MCPManager.Stop on shutdown (src/mcp/mcp_manager.go:66-71); lifecycle change needed because the listener is now an owned http.Server", "module_kind": "lifecycle (incidental)"},
+    {"where": "fix.diff:141-170", "entry_point": "every request to the SSE listener (new sseSecurityMiddleware in src/mcp/sse_security.go)", "module_kind": "new security middleware"},
+    {"where": "fix.diff:177-184", "entry_point": "mcp_server.host / mcp_server.trusted_hosts config feeding the allowlist (trustedHosts; wildcard bind excluded)", "module_kind": "config-derived allowlist"},
+    {"where": "src/types/mcp.go:11-17", "entry_point": "project YAML mcp_server block (src/types/project.go:34); fix adds TrustedHosts field (fix.diff:483)", "module_kind": "config type (other package)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": "The published fix stays inside src/mcp plus one config field in src/types/mcp.go:11-17. No second implementation, lower-level API or wrapper was changed."},
+  "O3_reason_to_dismiss": "For the REST API route (O8): the advisory is about 'MCP tools' over the SSE transport, and the REST API is a separate, older feature with its own documented PC_API_TOKEN mechanism (src/api/routes.go:40-46), so a solver can say it is out of scope.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Loopback MCP clients (Host 127.0.0.1 / localhost / [::1], usually with no Origin) must keep working without config. A host named in mcp_server.host or trusted_hosts must be accepted. The ResponseWriter must stay an http.Flusher, or SSE streaming breaks. stdio transport is unaffected. On the REST route, the process-compose CLI/TUI client (src/client/client.go:66-83) and the WS log/state streams must keep working.",
+    "where": "fix.diff:139-140, fix.diff:177-184, src/mcp/server.go:176-199, src/client/client.go:66-83"
+  },
+  "O6_input_shapes": [
+    "Host as host:port, bare host, bracketed IPv6 with/without port, trailing-dot name (fix.diff:202-210)",
+    "Loopback as any 127.0.0.0/8 IP, ::1, or case-insensitive 'localhost' (fix.diff:221-227)",
+    "Origin absent vs present vs unparsable/'null' (fix.diff:153-159)",
+    "Token via X-PC-Token-Key or Authorization: Bearer with case-insensitive scheme (fix.diff:252-265)",
+    "Wildcard bind 0.0.0.0/:: is not treated as trust-all; trusted_hosts ['*'] opt-out (fix.diff:177-184, fix.diff:214-217)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "src/types/mcp.go:11-17 (MCPServerConfig decoded from project YAML via src/types/project.go:34; validated at src/loader/validators.go:204-205)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "The main REST API TCP listener (default localhost:8080) exposes process start/stop/restart/scale/update/project reload to the same ProjectRunner, with no Host/Origin validation. The token is optional and off by default, so DNS rebinding reaches the same process-control sink.",
+     "where": "src/api/server.go:49-66",
+     "reason_to_dismiss": "Advisory and fix are scoped to MCP SSE; the REST API is a separate, long-standing feature with its own token middleware.",
+     "distance": "different package (src/api vs src/mcp), wired separately in src/cmd/root.go:226-235",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "REST routes that control processes (POST /process updates a process config, POST /process/start, /project/configuration, etc.) are gated only by the optional TokenAuthMiddleware, which uses a non-constant-time compare and has no Host check.",
+     "where": "src/api/routes.go:15-46",
+     "reason_to_dismiss": "Token auth exists, so a solver may count the route as already protected, but with no token configured nothing is checked.",
+     "distance": "src/api/routes.go, another package from the landing point",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "WebSocket log/state streams use a zero-value gorilla Upgrader. Its default Origin==Host check passes under DNS rebinding because the attacker origin and Host match.",
+     "where": "src/api/ws_api.go:20",
+     "reason_to_dismiss": "Gorilla's default CheckOrigin looks like a same-origin defence already; read-only streams.",
+     "distance": "src/api/ws_api.go and src/api/state_ws_api.go:82",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/api/server.go:49-66", "sibling": "Wrap the gin router's TCP listener in the same Host/Origin gate, or plant a second MCP-over-HTTP (streamable HTTP) listener started outside the middleware.", "why_realistic": "mcp-go also ships a streamable-HTTP server; a maintainer adding a 'streamable' transport next to SSE in startSSE's sibling would reasonably reuse server.NewStreamableHTTPServer(...).Start(addr) directly."},
+    {"where": "src/mcp/server.go:164-172", "sibling": "A transport-selection branch, e.g. an 'http' alias, that calls the library's own Start instead of s.httpServer.", "why_realistic": "Transport names are normalised in two different ways (IsSSE uses raw Transport at src/types/mcp.go:30, getTransport lowercases at src/types/mcp.go:42-47). An alias or case variant could skip the guarded path."}
+  ],
+  "O9_family": "Missing authentication / origin validation on a local HTTP control listener (DNS rebinding; CWE-306, CWE-346)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26 (go.mod:3); deps incl. mark3labs/mcp-go v0.55.0, gin v1.12.0, gorilla/websocket v1.5.3; no vendor dir", "services": [], "offline_after_build": true,
+                "project_tests": "src/mcp/control_tools_test.go, utils_test.go, argshandler_test.go exist; no SSE listener/security tests at the pinned commit (fix adds src/mcp/sse_security_test.go). Middleware is testable with httptest without network."},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/mcp/server.go, src/mcp/sse_security.go (new), src/types/mcp.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add an Origin check or CORS restriction (WithSSECORS) only. This misses same-origin rebinding requests that carry no Origin. Or require the token only when one is set, which leaves the default unauthenticated."},
+  "out_of_scope_notes": [
+    "REST TokenAuthMiddleware compares tokens with != rather than constant-time (src/api/routes.go:19); timing side-channel, separate concern.",
+    "MCP tool processes substitute user arguments into commands (src/mcp/argshandler.go); command-injection surface not examined."
+  ],
+  "unverified": [
+    "Repo size in MB not measured, so tiny_repo / giant_repo not assessed.",
+    "Whether the REST API (O8) is in the advisory's intended scope; the GHSA text beyond the summary was not available. Upstream may treat it as a separate issue.",
+    "mcp-go v0.55.0 SSE route paths (/sse, /message) and its default CORS header taken from the fix comment (fix.diff:72-73), not read in the module cache.",
+    "present_in_latest for all O8 routes: no latest release provided.",
+    "Recall risk judged from publication date (2026-09-18) only."
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "17107",
+  "advisory_ids": ["GHSA-C8W2-FGVX-VHV4", "CVE-2026-61682", "GO-2026-6517"],
+  "repo": "kcp-dev/kcp",
+  "pinned_commit": "0d66d9bc2942024a53a7e90ec59b343e927fa2b8",
+  "fix_commits": ["7437cdcfec8f927d1a9bf1b2dd1e075d038e27ca"],
+  "trust_decision": {
+    "summary": "The proxy decides which identity (X-Remote-User/Group/Extra-*) the backend shard trusts over the proxy's mTLS connection. Inbound copies are stripped only when the proxy itself authenticated the user. A request the proxy passes through unauthenticated (no client cert, no additional auth) keeps client-supplied identity headers, and the shard trusts them.",
+    "evidence": ["pkg/proxy/proxy.go:59-67", "pkg/proxy/filters/filters.go:61-68", "pkg/proxy/authheaders/authheaders.go:17-22", "pkg/proxy/authheaders/authheaders.go:38-45", "pkg/server/localproxy.go:324-332"]
+  },
+  "landing_point": {"where": "pkg/proxy/authheaders/authheaders.go:38", "why": "The summary says 'does not strip inbound X-Remote-* headers', and SetAuthHeaders is the only stripping helper; its package doc names exactly those headers. It already strips, so the engineer must then work out which caller skips it."},
+  "fix_sites": [
+    {"where": "pkg/proxy/authheaders/authheaders.go:38-45", "entry_point": "internal helper; new ClearAuthHeaders split out of SetAuthHeaders (fix.diff:19-40), used by both proxies", "module_kind": "shared helper package (pkg/proxy/authheaders)"},
+    {"where": "pkg/proxy/proxy.go:61-63", "entry_point": "kcp-front-proxy HTTPS: every path mapping in the mapping file (/clusters/, /services/..., default '/') wired at pkg/proxy/mapping.go:104, reached unauthenticated via pkg/proxy/filters/filters.go:61-68", "module_kind": "front-proxy (primary)"},
+    {"where": "pkg/server/localproxy.go:326-328", "entry_point": "kcp server (shard/standalone) --additional-mappings-file path mappings wired at pkg/server/localproxy.go:300; WithLocalProxy runs before authentication (pkg/server/config.go:568,599), so no user is ever in context", "module_kind": "second implementation in kcp server package (pkg/server)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "pkg/server/localproxy.go:324-332 (near-copy of pkg/proxy/proxy.go:59-67 in another package; comment at pkg/server/localproxy.go:242-245 says it mirrors proxy/mapping.go)"},
+  "O3_reason_to_dismiss": "The pinned tree's own test comment states the unauthenticated pass-through is a deliberate contract and that such requests 'never reach a shard mapping' (pkg/proxy/proxy_test.go:215-221). For the local proxy, a solver can argue it is 'mainly for standalone mode without a real front-proxy' (pkg/server/localproxy.go:101-103) and that it forwards over an insecure transport with no client cert (pkg/server/localproxy.go:276-277,314-320), so no backend would trust the headers.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Unauthenticated pass-through must keep working: bearer-token clients with no client cert are forwarded so the shard can authenticate them itself. Rejecting no-user requests at the proxy, or stripping more than the identity headers, breaks that. Authenticated requests must still be stamped with the real identity, including URL-escaped extra keys.", "where": "pkg/proxy/filters/filters.go:61-68; pkg/proxy/authheaders/authheaders.go:47-60"},
+  "O6_input_shapes": ["single X-Remote-User value", "multiple X-Remote-Group values (Header.Del removes all)", "X-Remote-Extra-* keys of any case, matched by case-insensitive prefix (warrant, scopes)", "custom header names and prefix per mapping entry (pkg/proxy/mapping.go:94-102, pkg/server/proxy/types/mapping.go:30-32)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "UID identity header (--requestheader-uid-headers, e.g. X-Remote-Uid) is never stripped or stamped by either proxy, so a client-supplied UID reaches a shard configured to trust it, on both the authenticated and unauthenticated branches", "where": "pkg/proxy/authheaders/authheaders.go:38-45", "reason_to_dismiss": "UID headers are feature-gated (RemoteRequestHeaderUID) and the kcp topologies only configure user/group/extra headers (cmd/sharded-test-server/shard.go:90-92), so a solver can call UID unsupported. The flag is still exposed to shards at pkg/server/options/flags.go:82.", "distance": "same file as the landing point; the trust config is in pkg/server/options", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/server/localproxy.go:169-186", "sibling": "the mounted-workspace reverse proxy forwards client headers to the mount URL with no identity handling; a variant that sends to a trusted backend over the shard's client cert would be a third copy", "why_realistic": "it already hand-builds a reverse proxy with a TODO to wire a real cert (pkg/server/localproxy.go:178); adding a client cert there without stamping is a plausible maintainer change"},
+    {"where": "pkg/proxy/lookup/lookup.go:134-137", "sibling": "a wildcard or no-cluster mapping path that skips the resolver could be given its own short-circuit proxy handler that bypasses WithProxyAuthHeaders", "why_realistic": "the mapping handler already special-cases empty and '*' cluster names and delegates directly"},
+    {"where": "pkg/proxy/authheaders/authheaders.go:41-45", "sibling": "case-sensitive or canonicalised prefix match on extra headers (a how-type parser differential against the shard's prefix matching)", "why_realistic": "the matching logic is hand-written; upstream requestheader matching is case-insensitive"}
+  ],
+  "O9_family": "authentication bypass via trusted identity headers forwarded by a proxy (spoofable request-header identity)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.25 (go.mod:10); Makefile", "services": [], "offline_after_build": true,
+                "project_tests": "unit tests: pkg/proxy/proxy_test.go, pkg/proxy/authheaders/authheaders_test.go, pkg/server/localproxy_test.go (httptest, offline). e2e test/e2e/proxy/header_injection_test.go needs a multi-shard kcp plus etcd and is not suitable for offline use."},
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "pkg/proxy/authheaders/authheaders.go, pkg/proxy/proxy.go, pkg/server/localproxy.go",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add an else-branch strip only in pkg/proxy/proxy.go (or reject no-user requests in WithOptionalAuthentication), missing the pkg/server/localproxy.go copy and breaking bearer-token pass-through."},
+  "out_of_scope_notes": [
+    "httputil.ReverseProxy drops hop-by-hop headers named in a client 'Connection' header after the identity is stamped; whether that can remove stamped X-Remote-* headers so the shard falls back to the proxy cert identity was not checked.",
+    "pkg/virtual/initializingworkspaces/builder/build.go:281-298 strips Impersonate-* headers. That is a different protection (impersonation), not request-header identity.",
+    "pkg/server/handler.go:68-108 forwards to the virtual workspace server via an impersonating transport, not request-header identity."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "O8 UID route: assumes the upstream k8s requestheader authenticator honours --requestheader-uid-headers when the RemoteRequestHeaderUID gate is on; vendored k8s code was not read.",
+    "Whether local-proxy mapping backends trust request headers: the transport there presents no client cert (pkg/server/localproxy.go:314-320), so the local-proxy site may be low impact in practice.",
+    "The advisory summary says 'any authenticated client'; the code shows the gap is the front-proxy pass-through for clients the proxy did not authenticate (e.g. bearer tokens the shard authenticates). This reading is taken from the code and diff only; the advisory text was not available.",
+    "present_in_latest unknown: no latest release given."
+  ]
+}

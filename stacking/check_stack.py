@@ -50,7 +50,7 @@ def main():
     checks = m.get("patch_checks") or []
     names = {os.path.basename(str(c.get("patch", ""))): c for c in checks if isinstance(c, dict)}
     for g in concepts:
-        covered = any(c.get("expect") == "fail" and c.get("kind") == "security_fail" and
+        covered = any(c.get("expect") == "security_fail" and c.get("kind") == "security_fail" and
                       set(c.get("misses") or []) and set(c.get("misses") or []) <= set(g) for c in checks)
         if not covered:
             problems.append(f"no security_fail check that misses only concept {g} (set its `misses` to the concept's trap ids)")
@@ -59,7 +59,7 @@ def main():
         c = names.get(n)
         if not c:
             problems.append(f"recall check {n} missing from patch_checks")
-        elif c.get("expect") != "fail":
+        elif c.get("expect") != "security_fail":
             problems.append(f"recall check {n} must expect fail")
         elif not os.path.isfile(os.path.join(b, "checks", n)):
             problems.append(f"recall check file checks/{n} missing")

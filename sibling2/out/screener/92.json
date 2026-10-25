@@ -1,0 +1,100 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "92",
+  "advisory_ids": ["GHSA-27VJ-QCQG-25RC", "CVE-2026-104851"],
+  "repo": "fsspec/filesystem_spec",
+  "pinned_commit": "85facaaf2659c8bbd031df24ead9aca36668c635",
+  "fix_commits": ["86438783f93b1398ef245b92f0e6063b445b611c", "a1c16ab3f07f354aa371c38f7b1b07ea7fd4c5c8"],
+  "trust_decision": {
+    "summary": "Strings in a reference manifest (refs URLs, templates, gen key/url/offset/length) are untrusted. ReferenceFileSystem decides whether they get evaluated as Jinja (unsandboxed jinja2.Template) or substituted as plain text. That choice is made in _process_references1/_process_templates/_process_gen, gated only partly by simple_templates.",
+    "evidence": [
+      "fsspec/implementations/reference.py:1010-1041",
+      "fsspec/implementations/reference.py:1043-1055",
+      "fsspec/implementations/reference.py:1057-1092",
+      "fsspec/implementations/reference.py:722-728"
+    ]
+  },
+  "landing_point": {
+    "where": "fsspec/implementations/reference.py:1016-1018",
+    "why": "Someone who reads only 'SSTI in ReferenceFileSystem' would grep for jinja2.Template. The first hit is the _render_jinja helper used for refs URLs when simple_templates=False."
+  },
+  "fix_sites": [
+    {"where": "fsspec/implementations/reference.py:1012-1018", "entry_point": "fsspec.filesystem('reference', fo=<dict or JSON URL>, simple_templates=False): refs entries whose URL contains '{{'", "module_kind": "filesystem implementation (core reference-manifest processing)"},
+    {"where": "fsspec/implementations/reference.py:1049-1053", "entry_point": "fsspec.filesystem('reference', fo=...) with any simple_templates value: a 'templates' value (or template_overrides value) containing '{{' becomes a jinja lambda. __init__ calls it during remote-protocol inference (reference.py:748-752)", "module_kind": "filesystem implementation (template table builder; called from __init__ defaults route)"},
+    {"where": "fsspec/implementations/reference.py:1073-1082", "entry_point": "fsspec.filesystem('reference', fo=...): 'gen' entries' key/url/offset/length. Before the fix this ran even with simple_templates=True (default)", "module_kind": "filesystem implementation (generator expansion)"},
+    {"where": "fix.diff:561-562", "entry_point": "same as gen route; the a1c16 gate inserted at the top of _process_gen (reference.py:1057-1058)", "module_kind": "filesystem implementation (mode gate)"},
+    {"where": "fsspec/implementations/cache_metadata.py:55-62", "entry_point": "fsspec.filesystem('filecache'/'blockcache', cache_storage=...): loads the cache metadata file and falls back to pickle.load when it is not JSON", "module_kind": "caching layer (save/reload of metadata). Different weakness (CWE-502), bundled in the 'Small safety improvements' commit"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "fsspec/implementations/reference.py:1043-1055 executed via fsspec/implementations/reference.py:748-752 (remote_protocol default inference calls each callable template); template_overrides merged at fsspec/implementations/reference.py:1045-1046"
+  },
+  "O3_reason_to_dismiss": "Templates look like plain substitution values, and the docstring says simple_templates=True means simple replace (reference.py:678-681). A solver who 'honours simple_templates' (as commit a1c16 does for gen) can argue the templates table is just data, and miss that __init__'s protocol inference renders it with jinja in every mode. The simple-mode str.format route (O8) can be dismissed as 'documented safe mode, format cannot call code'.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate Jinja manifests must keep rendering when simple_templates=False: callable templates with kwargs ('{{f(c=\"text\")}}'), arithmetic in gen offset ('{{(i + 1) * 1000}}'), and simple {{u}} replacement plus template_overrides in default mode. Removing jinja, or refusing callables or expressions, breaks these.",
+    "where": "fsspec/implementations/tests/test_reference.py:276-350"
+  },
+  "O6_input_shapes": [
+    "refs entry as a 1-element list [url] or a 3-element list [url, offset, length] with '{{' in url (reference.py:1027-1038)",
+    "templates value string containing '{{' (becomes a callable) vs plain string (reference.py:1047-1055)",
+    "template_overrides dict merged into templates (reference.py:1045-1046)",
+    "gen entry fields key, url, offset, length rendered separately; dimensions as list or range dict (reference.py:1059-1083)",
+    "manifest passed as an in-memory dict vs a JSON file URL loaded via fsspec.open (reference.py:705-728)"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "fsspec/implementations/reference.py:1043-1055 (_process_templates turns manifest template strings into jinja-rendering lambdas, consumed at reference.py:750-752, 1018, 1075-1082)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Default 'safe' simple_templates mode substitutes refs URLs with str.format(**self.templates). An attacker-controlled format string gets attribute/index traversal on template values (e.g. a jinja lambda's __globals__, which holds module 'os'), so data leaks into the URL that is then fetched. The fix leaves this path untouched.",
+      "where": "fsspec/implementations/reference.py:1029-1035",
+      "reason_to_dismiss": "The fix's docstring calls simple mode 'the safe option' (fix.diff:552-553), and str.format cannot call functions, so it is information disclosure rather than RCE.",
+      "distance": "same file, about 20 lines above the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "fsspec/implementations/reference.py:300-338", "sibling": "LazyReferenceMapper._load_one_key expands '{{...}}' in parquet 'path' values against stored templates using jinja2.Template", "why_realistic": "Parquet refs are the lazy counterpart of JSON refs. A maintainer adding template support to the parquet backend would naturally copy the jinja call from _render_jinja. It sits at distance in a separate class that a solver focused on _process_references1 would not reopen."},
+    {"where": "fsspec/implementations/reference.py:748-767", "sibling": "remote-protocol inference renders callable references (callable(ref) -> ref()) through a fresh unsandboxed jinja2.Template", "why_realistic": "The loop already calls callable references (reference.py:760-762); a lazily rendered ref helper would be a plausible optimisation."}
+  ],
+  "O9_family": "template injection / code injection (CWE-1336, CWE-94): untrusted manifest strings evaluated by an unsandboxed template engine",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python",
+    "toolchain": "pip install -e . plus pytest; jinja2 optional dependency (imported lazily at reference.py:1012, 1049, 1073)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "fsspec/implementations/tests/test_reference.py (test_spec1_expand :276, test_spec1_expand_simple :326, test_spec1_gen_variants :353); fsspec/implementations/tests/test_cached.py for the cache-metadata pickle site"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "fsspec/implementations/reference.py, fsspec/implementations/cache_metadata.py (plus non-security assert changes in fsspec/asyn.py, fsspec/implementations/dbfs.py)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Swap jinja2.Template for SandboxedEnvironment only in _render_jinja (refs, the report's example), or only gate _process_gen on simple_templates, leaving the templates lambdas that __init__ renders in every mode."
+  },
+  "out_of_scope_notes": [
+    "fsspec/implementations/cache_metadata.py:55-62 pickle.load fallback on cache metadata (CWE-502) was removed in the same fix commit, but it is a different protection. A fair task would need its own report line.",
+    "fsspec/implementations/reference.py:1022-1024 base64-decoded value is overwritten by the raw string (functional bug, not security).",
+    "fsspec/implementations/reference.py:1045-1046 template_overrides.update mutates the caller's manifest dict in place (not security)."
+  ],
+  "unverified": [
+    "Repo size not measured (no shell). fsspec is a small library and may meet tiny_repo (<5 MB source); not flagged because unmeasured. Lessons say small libraries never made a task hard.",
+    "O8 str.format leak is from reading only: format-spec traversal on a lambda's __globals__['os'] was not run. Whether it falls within the advisory's protection (RCE vs disclosure) is a judgement call.",
+    "O2/O7 classification (defaults route / 'mapper') is the closest enum fit for the templates table rendered by __init__ protocol inference.",
+    "All in-scope sites are in one file within about 350 lines, so distance is low; pattern A is weak and relies on the init-time templates route.",
+    "Advisory text itself was not available beyond the summary; latest release is 'none', so present_in_latest is unknown.",
+    "Whether SandboxedEnvironment still allows harmful calls on template lambdas exposed in the render context was not assessed."
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "10356", "advisory_ids": ["GHSA-9MQV-5HH9-4CGG", "CVE-2026-73565"], "repo": "honojs/node-server",
+  "pinned_commit": "98420217e53a17a238ef1aa1a6bef0b2b70136c5",
+  "fix_commits": ["3a21938c418340e980cb7ffa88e78369f78392d1"],
+  "trust_decision": {"summary": "The upgrade listener decides whether a per-request waiter (holding the IncomingMessage and a never-settling Promise) is removed from the shared waiterMap; at the pinned commit it is only removed on a successful 'connection' or on the reject branch, so a handshake that ws aborts after the waiter was set keeps it forever.",
+    "evidence": ["src/websocket.ts:172-189", "src/websocket.ts:221-229", "src/websocket.ts:237-244", "src/websocket.ts:265-268"]},
+  "landing_point": {"where": "src/websocket.ts:239", "why": "The summary says 'aborted WebSocket handshake'; the only handshake call is wss.handleUpgrade inside setupWebSocket, next to the waiterMap."},
+  "fix_sites": [
+    {"where": "src/websocket.ts:172-175", "entry_point": "HTTP Upgrade: websocket request to any route using upgradeWebSocket (server 'upgrade' listener installed by createAdaptorServer/serve with websocket.server)", "module_kind": "adapter internal state (waiter map type gains reject)"},
+    {"where": "src/websocket.ts:185-189", "entry_point": "same; waitForWebSocket called from upgradeWebSocket middleware", "module_kind": "adapter internal helper (promise now rejectable; new rejectWaiter, fix.diff:26-32)"},
+    {"where": "src/websocket.ts:224", "entry_point": "same; upgrade rejected because waiter missing or connection symbol mismatched", "module_kind": "upgrade listener reject branch (delete -> rejectWaiter)"},
+    {"where": "src/websocket.ts:235-241", "entry_point": "same; ws aborts handshake (e.g. invalid Sec-WebSocket-Key) and destroys socket", "module_kind": "upgrade listener handshake path (socket 'close' reclaims waiter, fix.diff:57-63)"},
+    {"where": "src/websocket.ts:268", "entry_point": "public API upgradeWebSocket helper (exported src/index.ts:2)", "module_kind": "public middleware (catch rejection and return, fix.diff:72-77)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All five sites are in src/websocket.ts; the upgradeWebSocket consumer (src/websocket.ts:252-268) is the same file and module as the landing point."},
+  "O3_reason_to_dismiss": "For the uncovered routes: the fetchCallback-throws branch (src/websocket.ts:214-218) looks like an app error path already answered with 500, and the client-disconnect-during-fetch race looks like a ws/Node lifecycle concern rather than the 'aborted handshake' the report names.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A successful upgrade must still resolve the waiter and fire onOpen/messages; also other server 'upgrade' listeners (listenerCount > 1) must not have their sockets ended, and messages buffered during onOpen must still be delivered. An over-broad fix (e.g. deleting the waiter before handleUpgrade, or rejecting on any socket close including after upgrade) breaks open or close semantics.", "where": "src/websocket.ts:177-183, src/websocket.ts:215, src/websocket.ts:225, src/websocket.ts:239-241, src/websocket.ts:270-274"},
+  "O6_input_shapes": ["upgrade rejected by app (non-matching or missing waiter symbol) -> waiter rejected (fix.diff:47)", "handshake aborted by ws after waiter matched (invalid Sec-WebSocket-Key in the test; any ws abortHandshake that destroys the socket) -> reclaimed on socket 'close' (fix.diff:57-58)"],
+  "O7_producer": {"kind": "none", "where": "The leaked state is produced by waitForWebSocket (src/websocket.ts:185-189) via upgradeWebSocket (src/websocket.ts:268), in the same file as the check; no schema/serializer/cache.", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "fetchCallback throws after upgradeWebSocket already registered a waiter (e.g. a later middleware or user fetch wrapper throws); catch branch returns without deleting/rejecting the waiter, and the fix did not touch it.", "where": "src/websocket.ts:214-218", "reason_to_dismiss": "Looks like a generic app-error path that already sends 500; Hono's app.fetch usually converts errors via onError, so only custom fetch wrappers or a rethrowing onError reach it.", "distance": "same file, ~10 lines above the fix site", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "client socket closes while fetchCallback is still awaiting (slow auth middleware); the fix's socket.once('close') is registered only after the await, so a close that already fired never reclaims the waiter if ws then silently destroys the non-readable socket.", "where": "src/websocket.ts:206-209", "reason_to_dismiss": "Race on client disconnect looks like a ws/Node lifecycle concern, not the 'aborted handshake' the report describes; reproducing it needs a timed disconnect.", "distance": "same file; depends on ws completeUpgrade behaviour outside the repo", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/websocket.ts:214-218", "sibling": "Already a natural sibling: the error branch returning early without reclaiming the waiter.", "why_realistic": "A maintainer writing the error branch thinks only of answering 500, not of state registered by the middleware that ran before the throw."},
+    {"where": "src/websocket.ts:191-194", "sibling": "A second upgrade path (e.g. an h2/secure server or a manual handleUpgrade helper for users with listenerCount > 1) that reuses waitForWebSocket but not rejectWaiter.", "why_realistic": "The adapter already supports a custom createServer (src/server.ts:16) and co-existing upgrade listeners (src/websocket.ts:215,225); a second helper sharing the waiter map is a plausible addition."}
+  ],
+  "O9_family": "CWE-401/CWE-770 missing release of per-request state (memory leak) on aborted WebSocket handshake", "O9_dos": true,
+  "O10_build": {"language": "TypeScript", "toolchain": "Node >=20, pnpm 11, vitest 4, tsdown; dev dep ws ^8.19 and hono ^4.12 (package.json:93-116)", "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/websocket.test.ts (connect, reject, header forwarding, other upgrade listeners); the fix test uses FinalizationRegistry plus global.gc, so it needs node --expose-gc for a reliable signal (fix.diff:97-149)"},
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/websocket.ts", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Delete the waiter in a finally after wss.handleUpgrade, or add a socket 'close' listener only around handleUpgrade, leaving the fetchCallback-throw branch and the pre-await disconnect open and the pending promise in upgradeWebSocket unsettled."},
+  "out_of_scope_notes": [
+    "When a waiter matches, the listener calls handleUpgrade regardless of the app's response status (src/websocket.ts:221-241), so a later middleware returning 401 does not block the upgrade; this is an access-control question, not this leak."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); src/ has 16 .ts files, so tiny_repo is inferred, not measured.",
+    "Route 2 (disconnect during await) depends on ws completeUpgrade destroying a non-readable socket without re-emitting 'close'; node_modules is absent at the pinned tree, so ws source was not checked.",
+    "present_in_latest is unknown for both O8 routes: no latest release was provided.",
+    "Recall risk is estimated; advisory text was not available beyond the summary.",
+    "O4 distance is 0 because every site is in src/websocket.ts; the Pattern A distance lever is absent."
+  ]
+}

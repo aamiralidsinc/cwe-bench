@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "15701",
+  "advisory_ids": ["GHSA-4HQ8-GPF5-8P68", "CVE-2026-57231", "GO-2026-6594"],
+  "repo": "podman-container-tools/podman",
+  "pinned_commit": "1fecb62b349e1c531ec2429da9d612ca4492962b",
+  "fix_commits": ["6c431b73dbf8e4b20b778644d7a80caebdb75050"],
+  "trust_decision": {
+    "summary": "Image-config Env entries (attacker-controlled image metadata) are run through the user-facing env parser, which treats key-only entries ('NAME' / 'PREFIX*') as host-environment passthrough; the decision 'image env must be literal KEY=VALUE, never host lookup' belongs in CompleteSpec's image-env defaults step.",
+    "evidence": ["pkg/specgen/generate/container.go:174-182", "pkg/env/env.go:91-119", "pkg/env/env_unix.go:7-15"]
+  },
+  "landing_point": {
+    "where": "pkg/specgen/generate/container.go:177",
+    "why": "Summary says 'podman run' + image env leaking host env; CompleteSpec is where image Config.Env is merged and the only image-env call into envLib.ParseSlice."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:13-23", "entry_point": "new helper generate.ParseImageEnvs (public func in pkg/specgen/generate)", "module_kind": "spec generation helper"},
+    {"where": "pkg/specgen/generate/container.go:177", "entry_point": "podman run / podman create / podman container clone / pod create infra / libpod REST containers/create / kube play, all via generate.CompleteSpec", "module_kind": "core spec generator (server side)"},
+    {"where": "pkg/specgen/generate/kube/kube.go:477-481", "entry_point": "podman kube play (kube.ToSpecGen)", "module_kind": "kube YAML -> specgen translator (separate package)"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "pkg/specgen/generate/kube/kube.go:477-481"},
+  "O3_reason_to_dismiss": "kube.ToSpecGen's own loop uses strings.Cut and never consults the host env, and kube play still goes through CompleteSpec (pkg/domain/infra/abi/play.go:1010,1106), so a solver can rightly argue the kube site is not a leak and the CompleteSpec fix alone already covers kube play.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Key-only and 'PREFIX*' host passthrough is a legitimate feature for user-supplied --env, --env-file, podman exec --env and containers.conf env; changing the shared parseEnv/ParseSlice to reject or ignore key-only entries breaks all of them.",
+    "where": "pkg/env/env.go:100-117; pkg/specgenutil/specgen.go:473,481; cmd/podman/containers/exec.go:153; pkg/specgen/generate/container.go:167"
+  },
+  "O6_input_shapes": [
+    "exact key-only name 'HOST' (os.LookupEnv passthrough)",
+    "prefix glob 'HOST*' (all host vars with that prefix)",
+    "bare '*' (entire host environment)",
+    "empty key '=123'"
+  ],
+  "O7_producer": {"kind": "none", "where": "image Config.Env comes from libimage Inspect (vendored c/common), consumed directly at pkg/specgen/generate/container.go:59,177", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/specgen/generate/container.go:190-205", "sibling": "--env-merge expansion seeded from image env parsed with the passthrough-capable parser instead of the strict one", "why_realistic": "env-merge already reuses defaultEnvs built from image env; a maintainer could plausibly re-parse inspectData.Config.Env there with envLib.ParseSlice for 'image-only' substitution."},
+    {"where": "pkg/specgen/generate/pod_create.go:333", "sibling": "infra-container spec path that merges infra image Env via envLib.ParseSlice before calling CompleteSpec", "why_realistic": "infra spec is assembled separately from user container specs; duplicating the env-defaults block there is a natural copy."},
+    {"where": "cmd/podman/containers/exec.go:153", "sibling": "podman exec defaulting to the image's Config.Env and feeding it through envLib.ParseSlice alongside --env", "why_realistic": "exec already parses CLI env with ParseSlice; adding image env defaults with the same call looks like a harmless convenience."},
+    {"where": "pkg/env/env.go:91-99", "sibling": "HOW-type: a strict image-env parser that checks hasValue/empty key on the raw key while the consumer uses a trimmed key (or vice versa), creating a parser differential on the key's identity", "why_realistic": "parseEnv already checks key == \"\" before TrimLeft'ing it (pkg/env/env.go:95-99), so check-then-normalise ordering bugs of this kind are natural."}
+  ],
+  "O9_family": "CWE-200 information exposure: untrusted metadata interpreted with a trusted-input parser (host environment passthrough)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go toolchain per go.mod; cgo build of pkg/specgen/generate needs Linux headers/libs (libseccomp, gpgme, btrfs or exclude tags) due to '!remote && (linux || freebsd)' build tags",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Fix adds unit test pkg/specgen/generate/container_test.go (TestParseImageEnvs) and bats test/system/030-run.bats 'podman run host env leak' (needs skopeo, jq, a container runtime); neither exists at the pinned commit, and pkg/env/env.go:4 notes 'TODO: we need to add tests for this package'."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/specgen/generate/container.go, pkg/specgen/generate/kube/kube.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Make pkg/env parseEnv reject or drop key-only / '*' entries globally, which closes the leak but breaks --env NAME, --env 'PREFIX*', --env-file and containers.conf passthrough."
+  },
+  "out_of_scope_notes": [
+    "Vendored buildah/c-common also process image Env during podman build; not checked, outside this repo's own code.",
+    "--env-host / --http-proxy deliberately copy host env (pkg/specgen/generate/container.go:216-227); by design, not part of this advisory."
+  ],
+  "unverified": [
+    "Kube play specgen sets s.Image so CompleteSpec reparses image env (likely via specgen.NewSpecGenerator in ToSpecGen); not traced line by line, so the kube.go site may be defence-in-depth only.",
+    "Docker-compat create handler route into CompleteSpec not traced; not counted in O1.",
+    "Repo size in MB not measured; giant_repo/tiny_repo not evaluated.",
+    "No independent O8 route found among in-repo callers of envLib.ParseSlice (cmd/podman/generate/systemd.go:160, cmd/podman/containers/exec.go:153, pkg/specgenutil/specgen.go:481, pkg/domain/infra/abi/containers_runlabel.go:157 all take user/CLI input, not image metadata); single_site not flagged only because the fix touches two functions in two files, though in practice it is one decision point.",
+    "Latest release not provided; present_in_latest not applicable (no O8 routes)."
+  ]
+}

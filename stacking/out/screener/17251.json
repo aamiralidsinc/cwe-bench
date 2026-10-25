@@ -1,0 +1,56 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "17251",
+  "advisory_ids": ["GHSA-CXVF-GVFQ-36W2", "CVE-2026-73293", "GO-2026-6371"],
+  "repo": "semaphoreui/semaphore",
+  "pinned_commit": "419c655d6168290065cb11f9ee76c367d1a92ec8",
+  "fix_commits": ["1c4bb65df114962134f8829d4a03667106a01a68", "bb2a4e1f08c8023e618f8dd6eaca73554f2c33bb"],
+  "trust_decision": {
+    "summary": "A project member's effective permissions are resolved from the stored role slug. A DB role row with that slug, looked up across all projects, overrides the built-in permission table. The decision is made in ProjectMiddleware and in SqlDb.GetTemplatePermission; custom-role slugs are never checked against the built-in slugs.",
+    "evidence": ["api/projects/project.go:45-57", "db/sql/template.go:495-512", "db/sql/role.go:59-63", "db/Role.go:10-15", "db/ProjectUser.go:22-32"]
+  },
+  "landing_point": {"where": "db/Role.go:10", "why": "The summary says 'custom-role slug collision', so an engineer goes to role creation validation (ValidateRole) first. The OSS create handler is a 404 stub (pro/api/roles.go:49-51), which points them at the model validator."},
+  "fix_sites": [
+    {"where": "api/projects/project.go:49", "entry_point": "every /api/project/{project_id}/... route via ProjectMiddleware (api/router.go:276,282,294,364,380)", "module_kind": "HTTP middleware (authorization)"},
+    {"where": "db/sql/template.go:497", "entry_point": "routes with {template_id} via ProjectMiddleware -> GetTemplatePermission (api/projects/project.go:67)", "module_kind": "SQL store implementation (lower-level data layer)"},
+    {"where": "db/sql/role.go:61", "entry_point": "Store.GetProjectOrGlobalRoleBySlug, called by ProjectMiddleware, GetTemplatePermission, AddUser/UpdateUser (api/projects/users.go:90,180)", "module_kind": "SQL store query (scoping)"},
+    {"where": "db/Role.go:10", "entry_point": "POST /api/project/{project_id}/roles and /api/admin/roles (api/router.go:354,227); handlers are closed-source pro stubs in this tree (pro/api/roles.go:28-30,49-51)", "module_kind": "model validator"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "db/sql/template.go:485-512 (GetTemplatePermission resolves the role inside the store, apart from the middleware) and db/sql/role.go:59-63 (unscoped query)"},
+  "O3_reason_to_dismiss": "Once custom roles can no longer reuse built-in slugs and the middleware gates the lookup on IsValid, a solver can argue that the store-level template-permission lookup and the cross-project query scope are a separate data-layer concern. The Bolt copy can be dismissed as a deprecated backend.",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Real custom roles (non-built-in slugs, project-scoped or global with project_id NULL) must still resolve to their DB permissions, both in ProjectMiddleware and for template permissions. Built-in users must still get template_role extras. An over-broad fix that drops the DB lookup or demands project_id=? (rejecting global roles) breaks these.", "where": "api/projects/project.go:51-53; db/sql/template.go:508-512; db/sql/role.go:5-8"},
+  "O6_input_shapes": ["built-in slug reused by a project custom role (owner/manager/task_runner/guest)", "empty slug", "custom role from another project resolved by an unscoped slug lookup", "global role (project_id NULL)"],
+  "O7_producer": {"kind": "mapper", "where": "db/sql/role.go:59-63 (slug -> Role row lookup feeding permissions); db/ProjectUser.go:22-27 (built-in table)", "check_calls_producer": true},
+  "O8_uncovered_routes": [
+    {"route": "BoltDB GetProjectOrGlobalRoleBySlug still matches any project's role by slug; the SQL project scoping was not mirrored, so AddUser/UpdateUser validation and middleware custom-role resolution stay cross-project on Bolt", "where": "db/bolt/role.go:79-96", "reason_to_dismiss": "BoltDB is marked deprecated (util/config.go:39, cli/setup/setup.go:114), and the built-in-shadowing part is already closed by the store-agnostic IsValid gate in the middleware", "distance": "db/bolt package, 2 packages from the landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Project-scoped role mutation by slug only: UpdateRole/DeleteRole match on slug with no project_id, in both SQL and Bolt", "where": "db/sql/role.go:23-30", "reason_to_dismiss": "the handlers that call them are closed-source pro stubs here (pro/api/roles.go:57-63), and this is cross-project role tampering rather than slug collision", "distance": "same file as the scoped-query fix site", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "api/projects/templates.go:360-371", "sibling": "AddTemplatePerm stores the client-supplied role_slug and permission bitmask without checking that the slug is a custom role of this project; a planted copy without the FK (or on Bolt) would let a manager grant a built-in slug extra template permissions", "why_realistic": "the handler binds the struct and inserts it directly; only the FK at db/sql/migrations/v2.17.1.sql:19 limits it today"},
+    {"where": "services/export/Role.go:43-57", "sibling": "the migrate/import restore path calls CreateRole with the original slug and skips ValidateRole", "why_realistic": "a save/reload path that never calls the validator; a maintainer would reasonably treat migration data as trusted"},
+    {"where": "db/bolt/role.go:79-96", "sibling": "a second store implementation of the same lookup, left unscoped", "why_realistic": "the Bolt and SQL stores are maintained in parallel, and the fix touched only SQL"}
+  ],
+  "O9_family": "authorization / privilege escalation via identifier collision (role-slug shadowing of built-in roles, plus unscoped cross-project lookup)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.24.6 (go.mod:3); the web UI (Vue) is not needed for API tests", "services": ["none required with SQLite or Bolt; MySQL/Postgres optional"], "offline_after_build": true, "project_tests": "db/ProjectUser_test.go (built-in role permission table); no existing tests for role resolution or middleware; the fix adds db/Role_test.go (unit tests for ValidateRole)"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "api/projects/project.go, db/Role.go, db/sql/role.go, db/sql/template.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Reject built-in slugs in ValidateRole only, leaving ProjectMiddleware and GetTemplatePermission still preferring a DB row over the built-in table, and the slug query still unscoped by project"},
+  "out_of_scope_notes": [
+    "The OSS role-create/update/delete handlers are 404 stubs (pro/api/roles.go:28-63) and ValidateRole has no caller in this tree. Hidden tests must seed role rows directly or unit-test ValidateRole; the HTTP creation path cannot be exercised.",
+    "UpdateUser reads 'projectUserRole' from context, which ProjectMiddleware sets for the requesting user (api/projects/users.go:164; api/projects/project.go:76); not pursued."
+  ],
+  "unverified": [
+    "repo_mb: not measured (no shell size check)",
+    "present_in_latest for the O8 routes: no latest release provided",
+    "whether SQLite FK enforcement is enabled at runtime, which decides if AddTemplatePerm can reference a nonexistent or built-in slug",
+    "recall_risk: based only on a 2026-09 publication with no widely known write-up",
+    "fix diff duplication: the two commits carry the same hunks (fix.diff:1-195 vs fix.diff:197-391), differing only in template.go line offsets"
+  ]
+}

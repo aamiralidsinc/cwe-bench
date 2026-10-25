@@ -1,0 +1,66 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "19854",
+  "advisory_ids": ["GHSA-XGX4-4H9W-53PV", "CVE-2026-47703", "GO-2026-5756"],
+  "repo": "adguardteam/dnsproxy",
+  "pinned_commit": "05f86f08e51351db253aa692c6ebb4a77a561e82",
+  "fix_commits": ["f00d992ce9567a50f596853978ad6500acfdcf1d"],
+  "trust_decision": {
+    "summary": "The plain UDP upstream client sends the client's DNS message ID unchanged, so a DoQ (RFC 9250) or DoH (RFC 8484) query with ID 0 reaches the UDP upstream with a fixed, known ID. Only the source port is left to stop an off-path spoofed response, and that response is then cached and served to all clients. The fix decides in upstream/plain.go dialExchange: if the network is UDP and the ID is 0, it copies the request with a fresh dns.Id() and restores the ID on the response.",
+    "evidence": ["upstream/plain.go:95-127", "proxy/serverquic.go:253-287", "proxy/serverquic.go:342-345", "upstream/doq.go:176-184", "fix.diff:219-224", "fix.diff:261-275"]
+  },
+  "landing_point": {
+    "where": "proxy/serverquic.go:253",
+    "why": "The summary says 'DoQ-to-UDP', so an engineer first looks at the DoQ server handler that unpacks the ID-0 query and passes it on (or at upstream/doq.go:176, which sets ID 0 itself). The flaw is actually in the plain UDP upstream client in a different package."
+  },
+  "fix_sites": [
+    {"where": "upstream/plain.go:95-100", "entry_point": "proxy listeners (DoQ/DoH/UDP/TCP/DoT/DNSCrypt) -> Proxy.Resolve -> exchangeUpstreams -> plainDNS.Exchange; public API upstream.AddressToUpstream(\"udp://...\"|sdns plain stamp).Exchange", "module_kind": "lower-level upstream client package (upstream/), dialExchange conn setup replaced by setRequestForNetwork (fix.diff:216-219)"},
+    {"where": "upstream/plain.go:112", "entry_point": "same as above (first ExchangeWithConn)", "module_kind": "upstream client"},
+    {"where": "upstream/plain.go:120", "entry_point": "same as above (redial retry ExchangeWithConn)", "module_kind": "upstream client"},
+    {"where": "upstream/plain.go:127", "entry_point": "same as above (validatePlainResponse against the rewritten request)", "module_kind": "upstream client"},
+    {"where": "upstream/upstream.go:340", "entry_point": "logBegin, called from every upstream Exchange; adds the ID to the debug log (fix.diff:286-295), not a security change", "module_kind": "logging helper"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "upstream/plain.go:89-128 (upstream package plainDNS.dialExchange, public via upstream.AddressToUpstream / ExchangeParallel / ExchangeAll), at a distance from the DoQ server at proxy/serverquic.go:253"},
+  "O3_reason_to_dismiss": "DoQ and DoH require ID 0 by RFC and the server consciously accepts any ID (proxy/serverquic.go:342-345); a solver can argue that keeping the client's ID is a transparent-forwarder contract (doh.go/doq.go restore it 'to not break compatibility with proxies', upstream/doh.go:162), so the client-chosen non-zero ID case is out of scope.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The response ID must match the client's original ID (0 for DoQ/DoH, the client's own ID for UDP/TCP). Randomizing in place without restoring it, or randomizing on TCP or on every ID, breaks client matching, the miekg ID check and validatePlainResponse. The upstream DoH/DoQ clients must still send ID 0.",
+    "where": "upstream/plain.go:112-127; upstream/doq.go:176-184; upstream/doh.go:159-167; fix.diff:220-224"
+  },
+  "O6_input_shapes": ["request ID == 0 over UDP (rewritten)", "request ID != 0 over UDP (left unchanged)", "TCP network, including the truncated/malformed TCP fallback at upstream/plain.go:167,176 (left unchanged)", "redial retry path upstream/plain.go:120"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "Client-chosen constant non-zero IDs (DoQ accepts non-zero IDs, and DoH/UDP/TCP/DoT pass the ID through) still reach the UDP upstream with an ID the querying client knows. The published fix only rewrites ID 0.",
+     "where": "fix.diff:269-272",
+     "reason_to_dismiss": "Advisory names ID 0 / DoQ; non-zero IDs are the client's own entropy and transparent ID passthrough is normal forwarder behaviour",
+     "distance": "same function as the fix; how-type (input-shape/identity), not a separate file",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "proxy/dns64.go:106-107", "sibling": "A DNS64 or similar synthesized follow-up query that copies the client request but keeps its ID instead of calling dns.Id()", "why_realistic": "The code already copies the request and re-IDs it here, so a maintainer could easily write a parallel helper (e.g. a PTR/private-rDNS or CNAME-chase re-query) that forgets the dns.Id() line"},
+    {"where": "upstream/plain.go:167", "sibling": "A truncation or bad-question fallback that retries over UDP to a second address and reuses the original req instead of the re-IDed copy", "why_realistic": "Exchange already has retry/fallback branches that pass the original req, not the rewritten one"},
+    {"where": "upstream/doh.go:159-167", "sibling": "A UDP-fallback branch in the DoH/DoQ upstream (which already zeroes req.Id in place) that hands the zeroed request to a plain UDP exchange", "why_realistic": "Both clients mutate req.Id to 0 in place, and a 'fall back to plain DNS when QUIC is blocked' branch is a plausible addition"}
+  ],
+  "O9_family": "insufficient entropy / predictable DNS transaction ID enabling off-path response spoofing and cache poisoning (CWE-330)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26.1 (go.mod; fix bumps to 1.26.2)", "services": [], "offline_after_build": true,
+                "project_tests": "upstream/plain_internal_test.go, upstream/upstream_internal_test.go, proxy/serverquic_internal_test.go (local loopback servers)"},
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "upstream/plain.go, upstream/upstream.go (logging only); other diff files are cleanup", "j_sibling_sites": "unknown",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Assign a random ID in the DoQ server handler (proxy/serverquic.go) only. This leaves DoH ID-0 queries and library users exposed and returns a non-zero ID to DoQ clients unless restored."},
+  "out_of_scope_notes": [
+    "proxy/recursiondetector.go:91 keys recursion signatures on msg.Id; constant ID 0 from DoQ/DoH makes signatures collide across clients (separate concern).",
+    "upstream/doh.go:160 and upstream/doq.go:177 mutate the shared req.Id in place; callers in parallel mode copy first (upstream/parallel.go:41,124), so this is not pursued as the CWE-362 aspect."
+  ],
+  "unverified": [
+    "Repo size not measured (no shell); dnsproxy may be under 5 MB of source, so tiny_repo may apply.",
+    "Advisory text not available locally; the 'source-port oracle' and CWE-362/662 aspects were inferred from the diff only.",
+    "Whether the advisory's property covers client-chosen non-zero IDs (the O8 route) is a judgement call; the published fix does not cover them.",
+    "present_in_latest unknown: no latest release was provided."
+  ]
+}

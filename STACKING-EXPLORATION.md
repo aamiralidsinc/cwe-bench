@@ -145,7 +145,7 @@ against known outcomes (§6).
 
 ---
 
-## 5. Weights file: `sourcer/stacking_weights.json` (not created yet)
+## 5. Weights file: `stacking/stacking_weights.json` (created 2026-10-22, v1)
 
 - **Kept separate from `sourcer/weights.json`.** That file scores hosts and advisories for the other
   task types, and must not change for this.

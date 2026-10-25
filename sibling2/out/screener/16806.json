@@ -1,0 +1,61 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "16806",
+  "advisory_ids": ["GHSA-9493-H4F5-633X", "BIT-GRAFANA-2026-10601", "CVE-2026-10601", "GO-2026-6545"],
+  "repo": "grafana/grafana",
+  "pinned_commit": "eaffa37988a5d6f901e783491ddefa6f59a40713",
+  "fix_commits": ["3fcdbc5a6e5c955bd42bd3715dd03cbad2b078c1", "42cdc39124912a8506a0c613c319c345aa950b29", "82ef13993059351bf21de35b8488bbd9b42df4f4", "d27d2eba9c509d16f214d290436a6ad0bd9c6c01", "dd5dc51681ff0133ddb2e206c2ea318713aeca16", "f70d3e480274a5dbd12006338c393f4b05d441ca"],
+  "trust_decision": {
+    "summary": "Grafana's Tempo and Loki backends decide that user-controlled path pieces (Loki resource URL, Tempo tag name, Tempo trace ID) must stay under the fixed upstream API prefix before being path-joined onto the datasource URL; at the pinned commit nothing enforces this, and path.Join resolves '..' segments.",
+    "evidence": ["pkg/tsdb/loki/loki.go:126-136", "pkg/tsdb/loki/api.go:244-259", "pkg/tsdb/tempo/tempo.go:275-292", "pkg/tsdb/tempo/tempo.go:323-324", "pkg/tsdb/tempo/trace.go:189-198"]
+  },
+  "landing_point": {"where": "pkg/tsdb/loki/loki.go:129", "why": "The Loki resource handler builds '/loki/api/v1/%s' straight from req.URL; it is the obvious 'path traversal in Loki data source' spot. For Tempo the equivalent is pkg/tsdb/tempo/tempo.go:291."},
+  "fix_sites": [
+    {"where": "pkg/tsdb/loki/loki.go:129", "entry_point": "GET /api/datasources/uid/:uid/resources/* (Loki CallResource, non-suggestions branch)", "module_kind": "datasource plugin resource handler (core backend plugin)"},
+    {"where": "pkg/tsdb/tempo/tempo.go:291", "entry_point": "GET /api/datasources/uid/:uid/resources/tag-values?tag=... (Tempo resource mux, pkg/tsdb/tempo/tempo.go:58)", "module_kind": "datasource plugin resource handler (core backend plugin)"},
+    {"where": "pkg/tsdb/tempo/trace.go:189-198", "entry_point": "POST /api/ds/query with a Tempo queryType=traceId query (QueryData -> getTrace -> performTraceRequest -> createRequest, pkg/tsdb/tempo/tempo.go:111-112)", "module_kind": "datasource query path (lower-level request builder, separate file from the resource handler)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "pkg/tsdb/tempo/trace.go:189-198 (createRequest on the QueryData trace-by-ID path, not a resource endpoint; fix.diff:230-261)"},
+  "O3_reason_to_dismiss": "The report talks about resource/path endpoints; the trace-ID route is the query (QueryData) path that sends a fixed GET with Accept: protobuf, so a solver can argue the trace ID is 'just a query value' rather than a path. The Loki suggestions route (O8) already applies url.QueryEscape to the label name, so it looks escaped.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Loki resource URLs carry LogQL in the query string (regexes like '.+', '..', '/'), and Tempo tag names are dotted ('span.http.url', 'resource.service.name'). A fix that rejects '.' or '..' anywhere in the raw string, instead of only whole path segments after decoding, breaks label/series lookups and dotted tag-values. The fix also deliberately allows paths that clean to exactly '/loki/api/v1'.", "where": "pkg/tsdb/loki/api.go:255-257; pkg/tsdb/tempo/tempo.go:283-291; fix.diff:204"},
+  "O6_input_shapes": [
+    "raw '../' segments in the Loki resource path (fix.diff:198-206)",
+    "percent-encoded '%2e%2e%2f' in the Loki resource path, decoded by net/url.Parse before path.Clean (fix.diff:198-199)",
+    "Tempo tag that url.PathUnescape decodes after the query parameter was already decoded once (a double-encoding layer), checked per '/'-separated segment for '.' and '..' (pkg/tsdb/tempo/tempo.go:277-284; fix.diff:219-225)",
+    "Tempo trace ID with any non-hex character, rejected by an allow-list regex (fix.diff:246,255-257)"
+  ],
+  "O7_producer": {"kind": "handler", "where": "pkg/tsdb/loki/scopes.go:72-79 (GetSuggestions builds its own '/loki/api/v1/label/<name>/values' path from the JSON body and passes it to RawQuery)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Loki POST resources/suggestions: labelName from the JSON body goes through url.QueryEscape (which keeps '.' and turns '/' into %2F), then makeRawRequest's url.Parse decodes %2F and path.Join resolves the '..' segments; the published check only inspects the fixed outer '/loki/api/v1/suggestions' URL", "where": "pkg/tsdb/loki/scopes.go:73-74", "reason_to_dismiss": "The label name is already escaped with url.QueryEscape, and the scopes/suggestions feature looks like a neighbouring feature reached only through POST, separate from the GET resource proxy in the report", "distance": "different file (scopes.go) from the landing point loki.go; same package; sink in api.go:257", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/tsdb/tempo/tempo.go:57", "sibling": "a second Tempo resource route (e.g. /tag-values-v1 or a per-scope tags route) that formats a user tag into an 'api/search/tag/%s/values' path through proxyToTempo", "why_realistic": "Tempo has v1 and v2 tag APIs and the mux already pairs /tags with /tag-values; a maintainer adding v1 fallback would copy handleTagValues."},
+    {"where": "pkg/tsdb/loki/scopes.go:73-74", "sibling": "another body-supplied identifier (e.g. a detected_field name) formatted into a '/loki/api/v1/detected_field/<name>/values' path with url.QueryEscape", "why_realistic": "Loki has detected_field/<name>/values endpoints, and the suggestions code already builds paths from body fields this way."},
+    {"where": "pkg/tsdb/tempo/trace.go:194-198", "sibling": "a trace-ID path built in a second place, e.g. a v1 fallback or a streaming/gRPC trace lookup that skips the hex check", "why_realistic": "getTrace already retries v1 after v2 (pkg/tsdb/tempo/trace.go:60-68), so a separate fallback builder is plausible."}
+  ],
+  "O9_family": "CWE-22 path traversal in an outbound URL path (upstream API prefix escape / SSRF-adjacent request-path confusion)",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "Go toolchain per repo go.mod/go.work (Grafana monorepo); pure Go unit tests in pkg/tsdb/loki and pkg/tsdb/tempo", "services": [], "offline_after_build": true,
+                "project_tests": "pkg/tsdb/loki/api_test.go, pkg/tsdb/loki/scopes_test.go, pkg/tsdb/tempo/tempo_test.go, pkg/tsdb/tempo/trace_test.go (use httptest/fake clients; no live Loki or Tempo needed)"},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["many_fix_commits"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "pkg/tsdb/loki/loki.go, pkg/tsdb/tempo/tempo.go, pkg/tsdb/tempo/trace.go (advisory-relevant; the bundled patch commits also touch unrelated files)",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Reject '..' in the Loki req.URL string (and maybe the Tempo tag), missing the encoded form, the Tempo trace-ID query path and the suggestions labelName built in scopes.go."},
+  "out_of_scope_notes": [
+    "The six fix commits are bundled monthly security patches for several release branches; they also include unrelated fixes (MaxBytesReader on pre-auth forms and web.Bind, public dashboard token check, TableNG code-gen injection, geomap URL sanitising, authn metric label). Only the loki.go/tempo.go/trace.go hunks belong to this advisory.",
+    "pkg/tsdb/zipkin/client.go:124 builds the trace URL with url.QueryEscape(traceId) + url.JoinPath, a similar '..' pattern in a different datasource; not pursued.",
+    "pkg/tsdb/graphite/graphite.go:106-107 path-joins params.SubPath; not checked whether the value is user-controlled."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "The suggestions-route traversal (O8) is inferred from reading net/url QueryEscape/Parse and path.Join semantics, not executed.",
+    "present_in_latest unknown: no latest release was provided.",
+    "Recall risk estimate: Grafana advisories get wide coverage, but this one is bundled in a multi-fix patch release."
+  ]
+}

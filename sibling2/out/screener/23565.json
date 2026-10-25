@@ -1,0 +1,105 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "23565",
+  "advisory_ids": ["GHSA-5RQC-86VF-G8R2", "CVE-2026-55859"],
+  "repo": "mariadb-corporation/mariadb-connector-r2dbc",
+  "pinned_commit": "e92e05cd3983aa749012b324d6435908a487d2d5",
+  "fix_commits": ["38bad9afebc6c581a853656a42f9ebf403b1b1b7"],
+  "trust_decision": {
+    "summary": "The driver escapes text-protocol parameters client-side on the assumption that the session's character_set_client is UTF-8. A server-reported switch of character_set_client to a non-utf8 charset after connection init is never checked: the session-tracking parser in OkPacket.decode drops it, so escaping goes on in a charset the server no longer uses.",
+    "evidence": [
+      "src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java:55-90",
+      "src/main/java/org/mariadb/r2dbc/util/BufferUtils.java:109-149",
+      "src/main/java/org/mariadb/r2dbc/util/BufferUtils.java:161-184",
+      "src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:131-132",
+      "src/main/java/org/mariadb/r2dbc/message/client/HandshakeResponse.java:60-68"
+    ]
+  },
+  "landing_point": {
+    "where": "src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java:63-88",
+    "why": "The session-variable tracking switch is the only place server-side variable changes (isolation, redirect_url) reach the Context, so an engineer looking for 'charset change not detected' adds a character_set_client case here."
+  },
+  "fix_sites": [
+    {"where": "src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java:85-88", "entry_point": "any statement execution: MariadbConnection.createStatement(sql).execute() whose OK packet carries session-track data", "module_kind": "protocol decoder (server message parser)"},
+    {"where": "src/main/java/org/mariadb/r2dbc/client/SimpleContext.java:88-95", "entry_point": "Context.setCharset/setInitialized reached through OkPacket.decode and the connect paths", "module_kind": "connection state object"},
+    {"where": "src/main/java/org/mariadb/r2dbc/message/Context.java:37-39", "entry_point": "interface (new setCharset/setInitialized methods)", "module_kind": "internal API interface"},
+    {"where": "src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:54", "entry_point": "MariadbConnectionFactory.create() with a unix socket configured (connectToSocket)", "module_kind": "connection factory"},
+    {"where": "src/main/java/org/mariadb/r2dbc/HaMode.java:121-123", "entry_point": "MariadbConnectionFactory.create() over TCP, any HaMode incl. NONE, and FailoverClient reconnect", "module_kind": "HA / host-selection connect path"},
+    {"where": "src/main/java/org/mariadb/r2dbc/client/SimpleClient.java:199-202", "entry_point": "server-sent redirect_url after a statement (redirection reconnect inside SimpleClient)", "module_kind": "client transport (redirect reconnect)"},
+    {"where": "src/main/java/org/mariadb/r2dbc/client/SimpleClient.java:278-293", "entry_point": "any decoder exception -> handleConnectionError; the fix unwraps the R2dbcNonTransientResourceException thrown by setCharset so its message survives", "module_kind": "client transport error mapping"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "src/main/java/org/mariadb/r2dbc/client/SimpleClient.java:199-202 (redirect reconnect builds a fresh SimpleClient/context that must also be marked initialized); also src/main/java/org/mariadb/r2dbc/HaMode.java:121-123 vs src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:54 (three separate connect pipelines)"
+  },
+  "O3_reason_to_dismiss": "Redirection is a separate MariaDB 11.x feature triggered only by a server redirect_url, and the unix-socket path is a niche transport, so a solver who wires the 'initialized' flag into the main TCP connect can argue the other two connect pipelines are unrelated features.",
+  "O4_distance": {"files": 6, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The driver's own init 'SET names UTF8MB4 [COLLATE x]' plus user sessionVariables, and any later SET NAMES utf8/utf8mb3/utf8mb4 (any collation), must keep working. Rejecting every character_set_client change, or checking before init, breaks connection setup. Also, a check thrown from inside the decoder is rewrapped as a generic 'Connection error' unless handleConnectionError is changed.",
+    "where": "src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:131-134; src/main/java/org/mariadb/r2dbc/client/SimpleClient.java:284-290"
+  },
+  "O6_input_shapes": [
+    "character_set_client value not starting with 'utf8' (e.g. big5, gbk, sjis, latin1) -> rejected",
+    "utf8 / utf8mb3 / utf8mb4 values -> accepted",
+    "null value -> ignored",
+    "change reported before initialization (during handshake/auth) -> ignored; after the connect pipeline marks initialized -> enforced"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:158-179 (setSessionVariables builds session_track_system_variables, which decides whether the server ever reports character_set_client)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "If the server's session_track_system_variables is '' (or a custom list without character_set_client), the driver sets it to only 'autocommit,<tx_isolation>' (MariaDB) or only '<tx_isolation>' (MySQL). character_set_client changes are then never reported and the new OkPacket check never fires.",
+      "where": "src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:164-178",
+      "reason_to_dismiss": "Server default tracking lists include character_set_client, so a solver can call an empty or custom tracking list a server misconfiguration outside the driver's responsibility.",
+      "distance": "same file as the factory fix site, different method (setSessionVariables); far from the OkPacket landing point (other package)",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Server without CLIENT_SESSION_TRACK capability: OkPacket skips all session-state parsing, so no charset change is ever detected.",
+      "where": "src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java:48-49",
+      "reason_to_dismiss": "Legacy servers (pre-MariaDB 10.2 / MySQL 5.7) without session tracking can be argued unsupported for this protection.",
+      "distance": "same file as landing point",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java:63-88", "sibling": "also track character_set_connection / character_set_results changes, which desync result decoding (results are decoded as UTF-8)", "why_realistic": "The switch already handles several tracked variables; a maintainer would plausibly add these next to character_set_client."},
+    {"where": "src/main/java/org/mariadb/r2dbc/client/FailoverClient.java:120-150", "sibling": "failover state replay copies the old context state (isolation, database) to the new client; a planted charset field copied without re-validation would be a save/reload sibling", "why_realistic": "FailoverClient already transfers per-session state from oldCtx to the new connection."}
+  ],
+  "O9_family": "encoding/escaping context desync (charset-dependent client-side escaping -> SQL injection risk), CWE-116/CWE-838",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Java",
+    "toolchain": "Maven (pom.xml), JDK 8+ target",
+    "services": ["MariaDB or MySQL server (integration tests in src/test/java/org/mariadb/r2dbc/integration)"],
+    "offline_after_build": true,
+    "project_tests": "The fix adds src/test/java/org/mariadb/r2dbc/integration/ConnectionTest.java test setNamesBig5IsRejectedAndConnectionDropped, which needs a live DB. Unit-level OkPacket decode tests with a crafted ByteBuf and SimpleContext are feasible (cf. src/test/java/org/mariadb/r2dbc/unit/util/BufferUtilsTest.java:195-206)."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/main/java/org/mariadb/r2dbc/HaMode.java, src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java, src/main/java/org/mariadb/r2dbc/client/SimpleClient.java, src/main/java/org/mariadb/r2dbc/client/SimpleContext.java, src/main/java/org/mariadb/r2dbc/message/Context.java, src/main/java/org/mariadb/r2dbc/message/server/OkPacket.java",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a character_set_client case in OkPacket that throws on non-utf8 with no init gating (breaks or races with the driver's own SET NAMES) or gated in only one connect path, and leave the error unwrapped so it surfaces as 'Connection error'."
+  },
+  "out_of_scope_notes": [
+    "setSessionVariables concatenates String session-variable values from configuration into SQL with quotes and no escaping (src/main/java/org/mariadb/r2dbc/MariadbConnectionFactory.java:205-207); this is config-sourced and not part of this advisory."
+  ],
+  "unverified": [
+    "repo_mb not measured. This is a small single-module library, likely under 5 MB of source, so tiny_repo may apply but was not confirmed and is not flagged.",
+    "Server default session_track_system_variables contents (whether character_set_client is included by default on MariaDB/MySQL) are from server documentation recall, not from this repo.",
+    "present_in_latest unknown: no latest release provided.",
+    "Advisory text itself was not available; the trust decision is inferred from the fix diff (fix.diff:1-2, fix.diff:115-130) and the escaping code.",
+    "O13 recall risk rated low because the advisory is recent (2026-08-28) and the fix commit message is generic; not checked against write-ups."
+  ]
+}

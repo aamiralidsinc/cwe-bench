@@ -17,7 +17,7 @@ Outputs: stacking/out/stack_scores.tsv and stack_scores.md
 import argparse, glob, json, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-W = json.load(open(os.path.join(ROOT, "sourcer", "stacking_weights.json")))
+W = json.load(open(os.path.join(ROOT, "stacking", "stacking_weights.json")))
 MODELS = ("deepseek", "mimo")
 
 

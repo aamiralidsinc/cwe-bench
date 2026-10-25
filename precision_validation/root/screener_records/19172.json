@@ -1,0 +1,85 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v1", "model": "claude-opus-5-5",
+  "entry_id": "19172",
+  "advisory_ids": ["GHSA-RP4V-QC77-PHM4", "CVE-2026-3433", "GO-2026-6286"],
+  "repo": "mattermost/mattermost",
+  "pinned_commit": "073bd3a6b77cfc03851be995b6be14d51618647a",
+  "fix_commits": ["0a0ab0d54d899d308bd1352cc577036917500318", "7425c6817bf244f976c729f8a73cecac8039a1e1", "9408b98025d7364d7dfe7cdb28fcd109b1b595a6", "a30a331a29b9766d46716d4252056d7b74e66da0"],
+  "trust_decision": {
+    "summary": "Which websocket clients receive a role_updated event (carrying the role's full permission JSON) is decided in App.sendUpdatedRoleEvent, which at the pinned commit publishes with empty team/channel/user, i.e. to every connected user, even for team- or channel-scheme roles.",
+    "evidence": ["server/channels/app/role.go:277-286", "fix.diff:32-113"]
+  },
+  "landing_point": {
+    "where": "server/channels/app/role.go:277",
+    "why": "The summary names the role_updated websocket event; grepping WebsocketEventRoleUpdated leads straight to sendUpdatedRoleEvent, its only publisher."
+  },
+  "fix_sites": [
+    {"where": "server/channels/app/role.go:277", "entry_point": "PUT /api/v4/roles/{role_id}/patch (server/channels/api4/role.go:28,224) -> App.PatchRole; PUT /api/v4/channels/{channel_id}/moderations/patch (server/channels/api4/channel.go:84,2359); bulk import role/scheme lines (server/channels/app/import.go:356 -> import_functions.go:169 UpdateRole cascade); shared-channel readonly moderation (server/platform/services/sharedchannel/service.go:263)", "module_kind": "app service (event broadcaster)"},
+    {"where": "server/channels/store/sqlstore/scheme_store.go:102", "entry_point": "POST /api/v4/schemes and channel moderation patch creating a channel scheme (server/channels/app/channel.go:751) -> store createScheme; now records SchemeId on every scheme role (fix.diff:680-777)", "module_kind": "SQL store (persistence producer)"},
+    {"where": "server/channels/store/sqlstore/role_store.go:384", "entry_point": "internal: role Save/Get/GetByNames/AllChannelSchemeRoles/ChannelRolesUnderTeamRole mapping the new SchemeId column (fix.diff:576-672)", "module_kind": "SQL store (schema/row mapping)"},
+    {"where": "server/public/model/role.go:414", "entry_point": "public model: Role struct JSON/YAML/Auditable gain scheme_id (fix.diff:1031-1076)", "module_kind": "public model / serializer"},
+    {"where": "fix.diff:394-571", "entry_point": "DB migrations 000142-000144 (add Roles.SchemeId, backfill from Schemes.Default*Role, index), run at server start", "module_kind": "schema migration"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "server/channels/store/sqlstore/scheme_store.go:102 (createScheme assigns scheme.Id only at :283, after roles are created; fix moves it up and stamps SchemeId on each role, fix.diff:680-777) plus migrations fix.diff:394-571"
+  },
+  "O3_reason_to_dismiss": "The cascade at server/channels/app/role.go:243-250 re-emits events for other roles after a system/team role change, which a solver can call 'propagation of an admin-wide change' and leave global, while scoping only the channel-moderation caller that already has channel.Id at server/channels/app/channel.go:1111.",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Built-in and scheme-less custom roles must still broadcast globally, and channel/team scheme role updates must still reach that channel's/team's members, so clients refresh permissions live; dropping or user-scoping the event breaks this.",
+    "where": "server/channels/app/role.go:198-208 (built-in roles), server/channels/app/channel.go:1105-1116 (new channel-scheme role must be emitted), fix.diff:38-49"
+  },
+  "O6_input_shapes": [
+    "built-in role (BuiltIn=true) -> global",
+    "custom role with no owning scheme -> global",
+    "team-scope scheme role -> one event per team using the scheme (paged)",
+    "channel-scope scheme role -> one event per channel using the scheme (paged)",
+    "playbook/run-scope scheme role -> global",
+    "scheme lookup error -> no broadcast"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "Roles table/row mapping server/channels/store/sqlstore/role_store.go:384-423 and server/public/model/role.go:414-425 have no owning-scheme field at the pinned commit; SchemeStore has no reverse lookup by role name (server/channels/store/store.go:854-863)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "server/channels/app/scheme.go:110", "sibling": "PatchScheme emitting role_updated/scheme event for the scheme's default roles via a direct Publish with empty broadcast", "why_realistic": "A maintainer refreshing admin-console or client permission caches after a scheme rename/patch would plausibly copy the existing global role_updated publish pattern."},
+    {"where": "server/channels/app/channel.go:1169-1174", "sibling": "DeleteChannelScheme revert path publishing the reverted higher-scoped member/guest roles as role_updated with no channel scope", "why_realistic": "The branch already reassigns memberRole/guestRole to higher-scoped roles that clients must re-fetch; emitting them directly beside the existing channel_scheme_updated publish is a natural addition."}
+  ],
+  "O9_family": "CWE-200 information exposure via over-broad websocket broadcast (missing audience scoping)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go (server); TypeScript webapp not needed",
+    "toolchain": "Go per server/go.mod, make/go test",
+    "services": ["PostgreSQL (for app/api4 integration tests and migrations); fix's own unit tests use store mocks"],
+    "offline_after_build": true,
+    "project_tests": "server/channels/app/role_test.go (TestSendUpdatedRoleEvent added by fix), server/channels/api4/role_test.go:221 TestPatchRole, server/channels/api4/channel_test.go:5763 TestPatchChannelModerations, server/channels/app/channel_test.go:2022, server/channels/store/storetest/role_store.go and scheme_store.go"
+  },
+  "O11_fix_minutes": 75,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "server/channels/app/role.go, server/channels/store/sqlstore/role_store.go, server/channels/store/sqlstore/scheme_store.go, server/public/model/role.go, server/channels/db/migrations/{mysql,postgres}/000142-000144, server/channels/db/migrations/migrations.list, server/i18n/en.json",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add teamID/channelID parameters to sendUpdatedRoleEvent and fill channel.Id only at the moderation caller (server/channels/app/channel.go:1111), leaving the role-patch API and the UpdateRole cascade (role.go:156, 245) broadcasting globally."
+  },
+  "out_of_scope_notes": [
+    "Playbook/run-scope scheme roles still broadcast globally after the fix (fix.diff:108-110); by design, not pursued.",
+    "Post-fix, any scheme role whose SchemeId is NULL (e.g. not backfilled) falls back to global broadcast (fix.diff:45-48); not pursued."
+  ],
+  "unverified": [
+    "repo_mb and giant_repo: size not measured (no shell); the tree has >12,000 files including webapp and e2e-tests.",
+    "Whether the four fix commits split the change differently (only the combined fix.diff was read).",
+    "Exact Go version from server/go.mod not read.",
+    "O8 is empty because every role_updated publish goes through sendUpdatedRoleEvent (only publisher found by grep); plugin-API or enterprise routes outside server/ were not searched.",
+    "single_site was not flagged: the security logic sits in one function, but the fix also changes store/model/migration functions and an O2 site exists. Graders should note that the actual check lives in one location."
+  ]
+}

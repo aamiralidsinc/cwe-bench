@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "4499",
+  "advisory_ids": ["GHSA-MFX4-HV73-Q22V", "CVE-2026-69243", "PYSEC-2026-3546"],
+  "repo": "aio-libs/aiohttp",
+  "pinned_commit": "c852173947406e2eca65957535ff17d3a4035a03",
+  "fix_commits": ["6ae358f0983c3f4d6f67692b2f8e65dc8e091c98"],
+  "trust_decision": {
+    "summary": "The HTTP/1 parser decides when a connection has switched protocols. At the pinned commit it switches as soon as a supported Upgrade request's headers end and skips the declared Content-Length/chunked body, so the body bytes become the 'upgraded tail'. When the handler declines the upgrade, finish_response feeds that tail back into the HTTP parser as new pipelined requests. The fix defers the switch until the full body has been read.",
+    "evidence": [
+      "aiohttp/http_parser.py:427-443",
+      "aiohttp/http_parser.py:529-531",
+      "aiohttp/_http_parser.pyx:481-486",
+      "aiohttp/_http_parser.pyx:863-864",
+      "aiohttp/web_protocol.py:458-460",
+      "aiohttp/web_protocol.py:768-776"
+    ]
+  },
+  "landing_point": {
+    "where": "aiohttp/web_protocol.py:768-776",
+    "why": "The summary says 'smuggling via WebSocket upgrade'. The declined-upgrade path in finish_response is where the stored tail is re-parsed as HTTP, so this is the obvious first stop (along with the web_ws.py:290 upgrade check)."
+  },
+  "fix_sites": [
+    {"where": "aiohttp/http_parser.py:427-429", "entry_point": "aiohttp.web server (RequestHandler.data_received) when using the pure-Python parser (AIOHTTP_NO_EXTENSIONS / no C extension); also the public aiohttp.http_parser.HttpRequestParser.feed_data", "module_kind": "pure-Python fallback parser (second implementation)"},
+    {"where": "aiohttp/http_parser.py:440-443", "entry_point": "same as above: body framing is skipped for upgrade requests", "module_kind": "pure-Python fallback parser"},
+    {"where": "aiohttp/http_parser.py:466-467", "entry_point": "same as above: the deferred upgrade is recorded when a body parser is pending", "module_kind": "pure-Python fallback parser"},
+    {"where": "aiohttp/http_parser.py:514-515", "entry_point": "same as above: no-body upgrade switches immediately", "module_kind": "pure-Python fallback parser"},
+    {"where": "aiohttp/http_parser.py:568-570", "entry_point": "same as above: the upgrade takes effect once the body completes", "module_kind": "pure-Python fallback parser"},
+    {"where": "aiohttp/_http_parser.pyx:481-486", "entry_point": "aiohttp.web server with the default C (llhttp) parser; the client ClientSession response parser for the 101 branch", "module_kind": "Cython/llhttp parser (primary implementation)"},
+    {"where": "aiohttp/_http_parser.pyx:642-644", "entry_point": "same as above: feed_data sets upgraded on HPE_PAUSED_UPGRADE", "module_kind": "Cython/llhttp parser"},
+    {"where": "aiohttp/_http_parser.pyx:863-864", "entry_point": "same as above: llhttp callback return code 2 = skip body", "module_kind": "Cython/llhttp callback"},
+    {"where": "aiohttp/_http_parser.pyx:322", "entry_point": "state field declaration (_pending_upgrade added), with init at aiohttp/_http_parser.pyx:398", "module_kind": "Cython/llhttp parser"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "aiohttp/http_parser.py:427-443 (pure-Python parser) vs aiohttp/_http_parser.pyx:481-486 + aiohttp/_http_parser.pyx:863-864 (C parser); the default install uses the C parser, so a solver who reproduces on one parser may fix only that one"},
+  "O3_reason_to_dismiss": "Either one parser is 'the real one': the C parser is the default and the Python parser is a debugging fallback, or the solver reproduces on the Python parser and treats the .pyx as generated or vendored glue they can't build because the llhttp submodule needs npm. For CONNECT, a solver can argue that the aiohttp server is not a proxy and that a CONNECT body has no defined semantics.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Three behaviours must keep working. (1) A real WebSocket upgrade with no body (or Content-Length: 0) must switch immediately, and any frame bytes that arrive in the same packet must be passed on as the tail. (2) A declined upgrade with a body must have its body readable by the handler, and the pipelined request after it must still be served. (3) CONNECT must still return upgraded with a StreamReader payload. Fixes that are too broad (closing the connection or dropping message_tail on a declined upgrade, or refusing upgrades that carry a body) break (1) or (2).",
+    "where": "tests/test_http_parser.py:1476-1489; tests/test_http_parser.py:974-979; aiohttp/web_protocol.py:418-420; fix.diff:178-191; fix.diff:205-253"
+  },
+  "O6_input_shapes": [
+    "Upgrade request with a Content-Length body",
+    "Upgrade request with a Transfer-Encoding: chunked body",
+    "Upgrade request with Content-Length: 0 or no body (immediate switch)",
+    "body split across several feed_data calls (deferred switch at payload completion)",
+    "Upgrade: websocket (both parsers) vs Upgrade: tcp (pure-Python parser only, aiohttp/http_parser.py:257)",
+    "response-side 101 Switching Protocols (C parser branch aiohttp/_http_parser.pyx:485-486)"
+  ],
+  "O7_producer": {"kind": "none", "where": "The upgraded flag/tail is produced by the parser (aiohttp/http_parser.py:577, aiohttp/_http_parser.pyx:674-675) and consumed by aiohttp/web_protocol.py:458-460; no schema/serializer/cache/config producer is involved", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "A CONNECT request with Content-Length > 0. The C parser treats CONNECT as upgraded and skips the body. After the fix, llhttp itself may still treat CONNECT as an immediate upgrade, so the body would become a tail that finish_response re-parses if the handler declines. The Python parser reads the same body as a normal body. This is a differential across the two implementations.",
+      "where": "aiohttp/_http_parser.pyx:482; aiohttp/_http_parser.pyx:863-864; aiohttp/http_parser.py:440-488",
+      "reason_to_dismiss": "CONNECT is a proxy/tunnel feature that aiohttp.web does not serve, and RFC 9110 gives a CONNECT body no defined semantics.",
+      "distance": "same files as the fix; the behaviour lives in the vendored llhttp submodule (not checked out)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "aiohttp/web_protocol.py:768-776", "sibling": "a second declined-upgrade re-parse of message_tail on the handler-exception/error-response path", "why_realistic": "finish_response already re-feeds the tail inline; a maintainer adding a separate error path could copy the re-feed without the parser having consumed the body"},
+    {"where": "aiohttp/http_parser.py:468-488", "sibling": "a CONNECT branch that sets _upgraded immediately even when a Content-Length body is declared", "why_realistic": "the existing CONNECT branch already sets _upgraded = True at aiohttp/http_parser.py:476 for tunnel data; extending it to the length>0 case mirrors the C parser"},
+    {"where": "aiohttp/client_proto.py:371-372", "sibling": "the client response parser upgrading on Upgrade headers without enforcing status 101 before skipping the body", "why_realistic": "the pure-Python parser's _is_supported_upgrade check at aiohttp/http_parser.py:427 is shared by request and response parsers and does not look at the status code"}
+  ],
+  "O9_family": "HTTP request smuggling / message-framing desync (CWE-444): premature protocol switch skips body framing",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python + Cython (C extension over vendored llhttp)",
+    "toolchain": "Python 3.10+, pip, Cython, C compiler; regenerating llhttp needs Node/npm (Makefile:73-78) and the vendor/llhttp git submodule (.gitmodules:1-4), which is not checked out in the screen tree",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/test_http_parser.py (parametrized over C and Python parsers, e.g. tests/test_http_parser.py:1476-1510), tests/test_web_functional.py (raw pipelined socket tests), tests/test_web_websocket_functional.py"
+  },
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "aiohttp/http_parser.py, aiohttp/_http_parser.pyx",
+    "j_sibling_sites": "unknown",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "In web_protocol.finish_response, drop message_tail or force-close when the upgrade is declined (or reject upgrade requests that carry a body), instead of deferring the protocol switch until the body is consumed in both parsers"
+  },
+  "out_of_scope_notes": [
+    "The two parsers allow different Upgrade tokens: C allows only {'websocket'} (aiohttp/_http_parser.pyx:50), Python allows {'tcp','websocket'} (aiohttp/http_parser.py:257).",
+    "The pure-Python response parser marks a response as upgraded without checking for status 101 (aiohttp/http_parser.py:427); the C parser requires 101 (aiohttp/_http_parser.pyx:485). This is client-side, so a different sink."
+  ],
+  "unverified": [
+    "The O8 CONNECT route depends on llhttp's behaviour (it treats CONNECT as an upgrade and ignores the body). vendor/llhttp is an uncheckedout submodule, so this could not be confirmed, and the route's state after the fix is unknown.",
+    "Repo size was not measured (no shell); repo_mb is null.",
+    "present_in_latest is unknown because no latest release was provided.",
+    "Regression tests: the names added by the fix (test_http_request_upgrade_with_body_read, test_http_request_upgrade_empty_body_allowed, test_declined_websocket_upgrade_reads_body) were confirmed absent from the pinned tests/ by search, so regression_tests_in_pinned_commit does not apply."
+  ]
+}

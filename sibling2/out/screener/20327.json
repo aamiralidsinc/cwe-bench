@@ -1,0 +1,55 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "20327", "advisory_ids": ["GHSA-2JX3-FF3V-J7JJ"], "repo": "virustotal/yara-x",
+  "pinned_commit": "4fbaf55606e06af6e109d02b764a9190edf8c4ed",
+  "fix_commits": ["25efa375572efcfbe880a263ee3b0932d4b61a24"],
+  "trust_decision": {
+    "summary": "Bytes passed to safe Rules::deserialize are decoded by bincode and trusted as-is: index/ID fields (SubPatternId, code locations) and literal-pool UTF-8 are later used in unchecked/unsafe operations during scanning and metadata access, with no post-decode validation.",
+    "evidence": ["lib/src/compiler/rules.rs:248-252", "lib/src/compiler/rules.rs:285-287", "lib/src/compiler/rules.rs:418", "lib/src/models.rs:208"]
+  },
+  "landing_point": {"where": "lib/src/compiler/rules.rs:221", "why": "Summary names `Rules::deserialize`; an engineer reads this function first and sees it returns bincode output with no validation."},
+  "fix_sites": [
+    {"where": "lib/src/compiler/rules.rs:285", "entry_point": "Rules::deserialize / Rules::deserialize_from (Rust API), yrx_rules_deserialize (C API, capi/src/rules.rs:118), Python Rules.deserialize_from (py/src/lib.rs:1295), CLI `yr scan --compiled-rules` (cli/src/commands/scan.rs:242)", "module_kind": "deserializer / public library API"},
+    {"where": "lib/src/compiler/mod.rs:2935", "entry_point": "none directly; derive Ord on SubPatternId to support .max() in the rules.rs check", "module_kind": "type definition (supporting change)"},
+    {"where": "lib/src/models.rs:208", "entry_point": "Rule::metadata() iterator (public Rust API, reached by CLI/C/Python metadata output)", "module_kind": "public model/accessor layer, separate from deserializer"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "lib/src/models.rs:208 (Metadata iterator: unsafe to_str_unchecked on lit_pool bytes; the UTF-8 invariant is only established at compile time, not by the deserializer at lib/src/string_pool.rs:255-259)"},
+  "O3_reason_to_dismiss": "The report points at deserialize/scanning; the metadata accessor is a read-only model API in another module whose comment asserts the string is 'sure' to be valid UTF-8, so a solver can argue it is not reachable by the deserialization bug.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Round-trip of legitimately compiled rules (serialize -> deserialize -> scan) must keep working, including rules with no atoms (empty atoms vector) and rules whose sub-patterns are anchored-only or chained; an over-strict check (e.g. requiring atoms non-empty, or rejecting the native compiled_wasm_mod path) breaks them. Metadata strings that are valid UTF-8 must still be returned as MetaValue::String, not Bytes/error.", "where": "lib/src/compiler/rules.rs:269-287; lib/src/compiler/tests/mod.rs:56; lib/src/models.rs:204-213"},
+  "O6_input_shapes": ["atom.sub_pattern_id beyond sub_patterns length (atoms vector)", "MetaValue::String literal id pointing at non-UTF-8 bytes in lit_pool"],
+  "O7_producer": {"kind": "serializer", "where": "lib/src/compiler/rules.rs:51 (#[derive(Deserialize)] on Rules) plus custom pool deserializers lib/src/string_pool.rs:220-259; the invariants are produced by the compiler (Compiler::build), which deserialize never calls", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "anchored_sub_patterns: deserialized SubPatternIds fed to unchecked get_sub_pattern; the fix only scans atoms", "where": "lib/src/scanner/context.rs:1147-1151", "reason_to_dismiss": "Anchored patterns are a separate optimisation path not using the Aho-Corasick atoms the fix reasons about.", "distance": "other file/package area (scanner) from landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "chained_to SubPatternId inside SubPattern::*ChainTail values, followed in chain verification via unchecked get_sub_pattern", "where": "lib/src/scanner/context.rs:1290-1318", "reason_to_dismiss": "IDs nested inside SubPattern enum values (chain heads/tails) rather than top-level index vectors; chains look like a neighbouring feature.", "distance": "scanner module; field defined in lib/src/compiler/mod.rs:2998-3012", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Published check is off-by-one: `sub_patterns.len() < max_id` accepts max_id == len, still out of bounds for get_unchecked", "where": "fix.diff:63", "reason_to_dismiss": "Looks like the upstream fix; a solver copying its shape inherits the bug.", "distance": "same function as landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Regex code locations (FwdCodeLoc/BckCodeLoc in SubPattern) index deserialized re_code, decoded with get_unchecked in PikeVM/InstrParser", "where": "lib/src/re/thompson/pikevm.rs:199", "reason_to_dismiss": "Regex VM is a separate engine package (re/thompson); bytecode validity reads as a compiler invariant, not deserializer scope.", "distance": "lib/src/re/thompson/ (different module tree), also lib/src/re/thompson/instr.rs:429-431", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "compiled_wasm_mod bytes from the blob are passed to unsafe wasmtime::Module::deserialize (native code load) whenever present, regardless of feature flag", "where": "lib/src/compiler/rules.rs:644-646", "reason_to_dismiss": "native-code-serialization is an opt-in feature and the fix's own new doc says untrusted blobs are unsupported.", "distance": "lib/src/wasm/runtime/native.rs:55 (wasm runtime package)", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/src/compiler/rules.rs:603-605", "sibling": "is_fast_scan indexes fast_scan_patterns BitVec by PatternId; a get_unchecked variant here would be a realistic perf micro-optimisation", "why_realistic": "Same file already uses get_unchecked for sub_patterns on the hot path for performance (rules.rs:418)."},
+    {"where": "lib/src/scanner/context.rs:846", "sibling": "atoms.get_unchecked(atom_idx) already exists; a parallel unchecked lookup of rules by RuleId from SubPattern/PatternId in tracking code", "why_realistic": "Scanner hot loop routinely trades bounds checks for speed."}
+  ],
+  "O9_family": "CWE-502 unvalidated deserialization leading to out-of-bounds read / invalid UTF-8 UB (memory safety)", "O9_dos": false,
+  "O10_build": {"language": "Rust", "toolchain": "cargo (stable Rust), workspace with lib, cli, capi, py, go bindings; wasmtime dependency", "services": [], "offline_after_build": true,
+                "project_tests": "lib/src/compiler/tests/mod.rs:15-60 (deserialize header/version/roundtrip tests); scanner tests under lib/src/tests"},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "lib/src/compiler/rules.rs, lib/src/compiler/mod.rs, lib/src/models.rs", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a bounds check on atom sub_pattern_ids (or replace get_unchecked with get().unwrap()) only, leaving anchored/chained IDs, regex code offsets and metadata UTF-8 unvalidated."},
+  "out_of_scope_notes": [
+    "Parser uses to_str_unchecked on source tokens (parser/src/ast/cst2ast.rs:641); unrelated to deserialization."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell).",
+    "Fairness risk (no listed red flag fits): the fix adds a '# Safety' doc telling users never to deserialize third-party blobs (fix.diff:38-44), so the task's hidden tests must define how much validation counts as the fix; this is a strong dismissal argument against every O8 route.",
+    "Whether replacing get_unchecked with checked get is the intended hidden-test behaviour (panic vs Err) is unknown; the fix returns SerializationError::InvalidFormat.",
+    "Whether the Teddy searcher (lib/src/teddy/generic.rs:1018-1023) can be driven out of bounds by deserialized atoms was not checked; it is rebuilt from atoms at load so likely self-consistent.",
+    "Exploitability of wasm_mod (raw) host-function arguments with crafted IDs not checked.",
+    "No latest release supplied; all present_in_latest are unknown."
+  ]
+}

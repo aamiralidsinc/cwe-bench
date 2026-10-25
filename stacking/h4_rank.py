@@ -100,12 +100,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--built", nargs="*", default=[])
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--recs", nargs="*", default=[RECS, os.path.join(ROOT, "stacking", "out", "screener")],
+                    help="folders of screener-v2 records (default: the sibling records and stacking/out/screener)")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     done = built_repos(a.built)
     rows = []
-    for f in sorted(glob.glob(os.path.join(RECS, "*.json"))):
-        if os.path.basename(f).startswith("._"):
+    files = sorted(f for d in a.recs for f in glob.glob(os.path.join(d, "*.json")))
+    for f in files:
+        if os.path.basename(f).startswith(("._", "_")) or f.endswith(".run.json"):
             continue
         try:
             rec = json.load(open(f))
