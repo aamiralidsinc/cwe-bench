@@ -32,11 +32,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--h4", type=int, default=9)
     ap.add_argument("--h3", type=int, default=12)
+    ap.add_argument("--recs", default=RECS, help="screener records folder for the H4 jobs")
+    ap.add_argument("--jobs-out", default="", help="write this job list instead of out/reader_jobs.jsonl")
+    ap.add_argument("--built", nargs="*", default=[], help="task dirs: skip H3 pairs whose repo is already built")
     a = ap.parse_args()
     jobs = []
     h4 = [r for r in tsv("h4_candidates.tsv") if r["both"] == "True" and r["built"] == "False"]
-    for r in h4[: a.h4]:
-        rec_path = os.path.join(RECS, f"{r['entry']}.json")
+    for r in (h4 if a.h4 <= 0 else h4[: a.h4]):
+        rec_path = os.path.join(a.recs, f"{r['entry']}.json")
         rec = json.load(open(rec_path)) if os.path.isfile(rec_path) else {}
         fixes = rec.get("fix_commits") or []
         if isinstance(fixes, str):
@@ -47,8 +50,15 @@ def main():
     pairs = [r for r in tsv("h3b_pairs.tsv") if r["status"] == "ready"
              and not (set(filter(None, r["cwes"].replace(";", ",").split(","))) and
                       set(filter(None, r["cwes"].replace(";", ",").split(","))) <= DOS)]
+    built = set()
+    for d in a.built:
+        for t in Path(d).glob("*/task.toml"):
+            m = __import__("re").search(r'^\s*repo\s*=\s*"([^"]+)"', t.read_text(errors="replace"), __import__("re").M)
+            if m:
+                built.add(m.group(1).lower().rstrip("/").replace("https://github.com/", ""))
+    pairs = [r for r in pairs if r["repo"].split(";")[0].lower() not in built]
     pairs.sort(key=lambda r: SZZ_ORDER.get(szz.get((r["b"], r["a"])), 4))
-    for r in pairs[: a.h3]:
+    for r in (pairs if a.h3 <= 0 else pairs[: a.h3]):
         st = szz.get((r["b"], r["a"]), "not-mined")
         pattern = st if st in SZZ_ORDER else "H3u"
         jobs.append(dict(id=f"h3-{r['b'].lower()}", pattern=pattern, repo=r["repo"].split(";")[0],
@@ -57,7 +67,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     # MERGE with the existing job list: keep earlier jobs (build_prepare_stack.py looks them up by id),
     # add new ones; for an id already present, the new definition replaces the old.
-    path = os.path.join(OUT, "reader_jobs.jsonl")
+    path = a.jobs_out or os.path.join(OUT, "reader_jobs.jsonl")
     merged = {}
     if os.path.isfile(path):
         for l in open(path):

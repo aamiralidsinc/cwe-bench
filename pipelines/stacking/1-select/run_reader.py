@@ -142,20 +142,30 @@ def main():
     ap.add_argument("--only", nargs="*", default=[])
     ap.add_argument("--timeout-min", type=int, default=40)
     ap.add_argument("--dry-run", action="store_true", help="prepare clone, pin, worktree and prompt; do not call the model")
+    ap.add_argument("--outdir", default="", help="write reader records here instead of pipelines/stacking/out/reader")
+    ap.add_argument("--jobs-file", default="", help="read this job list instead of pipelines/stacking/out/reader_jobs.jsonl")
+    ap.add_argument("--stagger-sec", type=float, default=3.0, help="delay between the first --parallel starts")
     a = ap.parse_args()
-    global DRY_RUN
+    global DRY_RUN, OUTDIR
+    if a.outdir:
+        OUTDIR = os.path.abspath(a.outdir)
     DRY_RUN = a.dry_run
     claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     if not claude:
         sys.exit("claude not found: set CLAUDE_BIN")
     os.makedirs(OUTDIR, exist_ok=True)
-    jobs = [json.loads(l) for l in open(os.path.join(ST, "out", "reader_jobs.jsonl")) if l.strip()]
+    jobs = [json.loads(l) for l in open(a.jobs_file or os.path.join(ST, "out", "reader_jobs.jsonl")) if l.strip()]
     if a.only:
         jobs = [j for j in jobs if j["id"] in a.only]
     log(f"reader: {len(jobs)} jobs, parallel {a.parallel}, model {a.model or '(CLI default)'}")
+    # Pool of --parallel workers: a slot takes the next job as soon as it frees; only the first fill is staggered.
+    def staggered(i, j):
+        if i < a.parallel and a.stagger_sec > 0:
+            time.sleep(i * a.stagger_sec)
+        run(j, a.model, a.timeout_min, claude)
     with ThreadPoolExecutor(max_workers=a.parallel) as ex:
-        for j in jobs:
-            ex.submit(run, j, a.model, a.timeout_min, claude)
+        for i, j in enumerate(jobs):
+            ex.submit(staggered, i, j)
     log("reader: all jobs finished")
 
 
