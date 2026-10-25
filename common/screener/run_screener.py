@@ -49,7 +49,9 @@ def norm(repo):
 
 def screened_repos():
     repos = set()
-    for d in (str(paths.SCREENER_RECORDS), OUTDIR):
+    # The sibling batch screens with the same prompt (pipelines/sibling/2-screen): its records count too, so a
+    # repo it already screened is not screened again (2026-10-25, full-pool stacking screen).
+    for d in (str(paths.SCREENER_RECORDS), OUTDIR, os.path.join(str(paths.SIBLING_OUT), "screener")):
         for f in glob.glob(os.path.join(d, "*.json")):
             if os.path.basename(f).startswith(("._", "_")) or f.endswith(".run.json"):
                 continue
@@ -216,6 +218,9 @@ def main():
     ap.add_argument("--timeout-min", type=int, default=30)
     ap.add_argument("--only", nargs="*", default=[])
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--stagger-sec", type=float, default=3.0,
+                    help="delay between the starts of the first --parallel jobs (clone storm guard); later jobs "
+                         "start the moment a slot frees")
     a = ap.parse_args()
     os.makedirs(OUTDIR, exist_ok=True)
     if a.pick:
@@ -229,9 +234,15 @@ def main():
         if a.only:
             jobs = [j for j in jobs if j["id"] in a.only]
         log(f"screener: {len(jobs)} jobs, parallel {a.parallel}, model {a.model or '(CLI default)'}")
+        # A pool of --parallel workers: each slot takes the next job as soon as its job ends (no waves).
+        # Only the first fill is staggered, so --parallel clones do not hit GitHub in the same second.
+        def staggered(i, j):
+            if i < a.parallel and a.stagger_sec > 0:
+                time.sleep(i * a.stagger_sec)
+            run_one(j, a.model, claude, a.timeout_min)
         with ThreadPoolExecutor(max_workers=a.parallel) as ex:
-            for j in jobs:
-                ex.submit(run_one, j, a.model, claude, a.timeout_min)
+            for i, j in enumerate(jobs):
+                ex.submit(staggered, i, j)
         log("screener: all jobs finished")
 
 
