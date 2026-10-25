@@ -7,14 +7,14 @@
 # back to the capped Claude account:
 #     common/launch/drive.sh deepseek bash common/blindfix/run_blindfix.sh <slug>
 #
-# The blind agent must see the SAME tree a trial agent sees: /app of the task's own image
+# The blind agent must see the SAME tree a trial agent sees: the product tree of the task's own image
 # (upstream + injection + build steps). Until 2026-10-20 it got a fresh upstream clone, so the
 # injected sites were missing and blind.patch could never cover them (astro-ds, flyto-core-ds,
 # prompty-path-read-inj). The tree now comes from the image, and every patch in environment/ must
 # be present in it before the agent starts.
 #
 # Exit codes (also written to build/<slug>/blind_status.txt):
-#   0 blind.patch wired   2 bad input/setup      3 image build or /app extract failed
+#   0 blind.patch wired   2 bad input/setup      3 image build or tree extract failed
 #   4 injection missing   5 agent failed/no patch 6 blind.patch does not apply to the tree
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
@@ -40,11 +40,24 @@ docker build -t "$IMG" "$ENV" > "$B/blind-image-build.log" 2>&1 \
 rm -rf "$WORK"; mkdir -p "$WORK/pristine"
 cid=$(docker create "$IMG" 2>>"$LOG") || die 3 "docker create $IMG failed"
 trap 'docker rm -f "$cid" >/dev/null 2>&1' EXIT
+# The product tree is the image's working directory (where a trial agent starts): /workspace for the
+# stacking and precision-validation builds, /app for older ones. Until 2026-10-25 this was hard-coded to
+# /app, so every /workspace task ended in "error 3: could not extract /app".
+SRC=""
+for d in "$(docker image inspect -f '{{.Config.WorkingDir}}' "$IMG" 2>/dev/null)" /workspace /app; do
+  [ -n "$d" ] && [ "$d" != / ] || continue
+  # Count entries with wc (reads the whole stream): head/grep -q would close the pipe early, and under
+  # pipefail the SIGPIPE makes an existing tree look empty.
+  n_ent=$(docker cp "$cid:$d/." - 2>/dev/null | tar -t 2>/dev/null | wc -l)
+  if [ "${n_ent:-0}" -gt 1 ]; then SRC=$d; break; fi
+done
+[ -n "$SRC" ] || die 3 "no product tree in $IMG (tried the image WORKDIR, /workspace, /app)"
+log "product tree: $SRC"
 # Dependency and cache dirs stay out: the agent reads source, and diff -ruN must stay fast.
-docker cp "$cid:/app" - 2>>"$LOG" | tar -x -C "$WORK/pristine" --strip-components=1 \
+docker cp "$cid:$SRC" - 2>>"$LOG" | tar -x -C "$WORK/pristine" --strip-components=1 \
   --exclude=.git --exclude=node_modules --exclude=.venv --exclude=__pycache__ --exclude='*.pyc' \
-  2>>"$LOG" || die 3 "could not extract /app from $IMG"
-[ -n "$(ls -A "$WORK/pristine")" ] || die 3 "/app in $IMG is empty"
+  2>>"$LOG" || die 3 "could not extract $SRC from $IMG"
+[ -n "$(ls -A "$WORK/pristine")" ] || die 3 "$SRC in $IMG is empty"
 
 # Every patch the environment ships must already be applied in the extracted tree.
 n=0
@@ -52,7 +65,7 @@ for p in "$ENV"/*.patch "$ENV"/*.diff; do
   [ -f "$p" ] || continue
   if ! patch -p1 -R --dry-run -s -f -d "$WORK/pristine" < "$p" >/dev/null 2>&1 \
      && ! patch -p0 -R --dry-run -s -f -d "$WORK/pristine" < "$p" >/dev/null 2>&1; then
-    die 4 "$(basename "$p") is not applied in the image's /app; the blind tree would miss it"
+    die 4 "$(basename "$p") is not applied in the image's $SRC; the blind tree would miss it"
   fi
   n=$((n+1))
 done
@@ -80,7 +93,7 @@ log "agent exit $rc: $st"
 [ "$st" = ok ] || die 5 "agent did not finish cleanly: $st; its patch is not used"
 [ -s "$WORK/blind.patch" ] || die 5 "agent finished but wrote no blind.patch; see build/$SLUG/blind_status.json (agent_result)"
 
-# The gate applies it with patch -p1 inside /app: prove that works on a fresh copy of the tree.
+# The gate applies it with patch -p1 inside the product tree: prove that works on a fresh copy of it.
 chk=$(mktemp -d); trap 'docker rm -f "$cid" >/dev/null 2>&1; rm -rf "$chk"' EXIT
 cp -a "$WORK/pristine" "$chk/t"
 patch -p1 --dry-run -f -d "$chk/t" < "$WORK/blind.patch" > "$B/blind-apply-check.log" 2>&1 \
@@ -93,7 +106,7 @@ import json, sys
 p, model = sys.argv[1], sys.argv[2]
 m = json.load(open(p)); pc = m.setdefault("patch_checks", [])
 entry = {"patch": "blind.patch", "expect": "pass", "kind": "blind",
-         "why": f"fresh agent ({model}), instruction + the task image's /app only"}
+         "why": f"fresh agent ({model}), instruction + the task image's product tree only"}
 for i, c in enumerate(pc):
     if c.get("patch") == "blind.patch":
         pc[i] = entry

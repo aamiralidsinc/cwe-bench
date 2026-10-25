@@ -46,6 +46,11 @@ def main():
     res = json.loads((trial / "result.json").read_text())
     task = Path(res["config"]["task"]["path"]).name
     tests = ROOT / "tasks" / task / "tests"
+    # Regrading with changed tests is only meaningful once the changed task passed its gate again
+    # (common/gate/fingerprint.py; exit 1 = stale). Tasks gated before 2026-10-25 only warn (exit 2).
+    fp = subprocess.run([sys.executable, "-I", str(ROOT / "common/gate/fingerprint.py"), "check", task])
+    if fp.returncode == 1:
+        sys.exit(f"refused: {task} changed since its gate passed; run bash common/gate/gate_one_ds.sh {task} first")
     container = f"{trial.name.lower()}__env-main-1"
     if sh("docker", "inspect", container).returncode != 0:
         sys.exit(f"container {container} not found (was it kept?)")

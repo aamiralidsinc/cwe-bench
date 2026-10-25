@@ -91,6 +91,9 @@ json.dump({"slug": slug, "verdict": verdict, "stage": stage or None, "summary": 
            "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, open(p, "w"), indent=1)
 PY
 rm -f "$B/.sound" "$B/.unsound" "$B/.gate_error"; touch "$B/$mark"
+# A SOUND is valid only for the files it gated (common/gate/fingerprint.py): record them, so a later
+# change to tests/solution/environment/checks makes run_trial.sh and regrade.py refuse until re-gated.
+if [ "$mark" = .sound ]; then python3 -I "$CWE_ROOT/common/gate/fingerprint.py" write "$s" >> "$LOG" 2>&1; else rm -f "$B/gate_fingerprint.json"; fi
 echo "  $s RESULT $word $(date -u +%FT%TZ)" >> "$LOG"
 echo "$s $word${verror:+ :: ${verror:0:400}}"
 exit $code

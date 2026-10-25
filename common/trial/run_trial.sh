@@ -26,6 +26,10 @@ done
 # going, e.g. after the same runs were started in parallel by hand).
 hold="$CWE_BUILD/$(basename "$task")/hold_$model"
 if [ -f "$hold" ]; then echo "held: $hold exists; not starting a run" >&2; exit 3; fi
+# A task whose tests/solution/environment/checks changed after its gate pass must be re-gated first
+# (common/gate/fingerprint.py; rule in pipelines/*/GUIDE.md). Tasks gated before 2026-10-25: warning only.
+python3 -I "$CWE_ROOT/common/gate/fingerprint.py" check "$(basename "$task")" >&2; fp=$?
+if [ "$fp" = 1 ]; then echo "refused: stale gate; re-gate before any new run" >&2; exit 3; fi
 
 extra=()
 case "$model" in

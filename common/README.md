@@ -24,6 +24,14 @@ instead of building paths from their own location. The repo root is the folder h
 
 ## Contracts other code relies on
 
+- **Gate fingerprint** (2026-10-25): `common/gate/fingerprint.py` records what a SOUND gate covered; trials and
+  regrades refuse a task whose tests/solution/environment/checks changed since. See the re-gate rule in
+  `pipelines/*/GUIDE.md`.
+- **Blind fix tree** (2026-10-25): `common/blindfix/run_blindfix.sh` copies the image's working directory
+  (`/workspace` or `/app`), not a fixed `/app`.
+- **Delivery export** (2026-10-25): `common/util/export_delivery.py <out> <slug>...` writes the client layout
+  `tasks/<task>/` + `trajectory/<task>/<model>/rollout<N>/{reward.json,trajectory.json,verifier/}`.
+
 **Exit codes:**
 
 | Script | Exit codes |

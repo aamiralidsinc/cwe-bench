@@ -21,7 +21,8 @@ overlap (a task can be both). Precision validation (sibling builder, 5 breakers)
 
 ## Summary
 
-1. **Strong breakers (all of E): 1 of 25.** Only stk-filebrowser passes every check, and it is weak: 5 of its 6 runs
+1. **Strong breakers (all of E): 1 of 25 as first measured.** (Many e3 failures are decisions recorded where the
+   fairness reader does not look; see the gaps table.) Only stk-filebrowser passes every check, and it is weak: 5 of its 6 runs
    fail on a status code (500 instead of 4xx). The main reason almost nothing passes is **e3, fairness READY with no
    open human question, which fails on 24 of 25**. That is a process gap (questions and required rewordings left
    open), not proof the tasks are bad.
@@ -56,13 +57,15 @@ first version (≈40 vs ≈49 hours) disappears.
 
 ## Shared process gaps (fix before scaling)
 
+Updated 2026-10-25 after review with the project owner: re-running fairness after test fixes and gating the missing
+stacking controls are **not** pursued (fairness runs once, after the trial; no time for controls). Human decisions
+were made batch by batch; the gap is where they are recorded, not whether they were made.
+
 | Gap | Seen in | Effect |
 |---|---|---|
-| Fairness `NEEDS_HUMAN_REVIEW` left open; "Required: generalize" rewordings never applied to the instruction | 24 of 25 | e3 fails; hints stay in instructions (B7 "leaky" in 6) |
-| Fairness not re-run after a test fix | dagu, siyuan, senaite, svgo | the official verdict is stale (siyuan also has a live fixture defect: snippet fixtures leave `Enabled` false) |
-| Blind fix never ran or broke: the script expects `/app`, tasks use `/workspace` | all stacking; most sibling | solvability (B8) rests on the gate alone |
-| Gate marker predates the upgrade that added the decisive test | electron-builder, hubuum, mockoon | the decisive tests were only checked by targeted runs |
-| Stacking control never gated or trialled | 6 of 8 stacking breakers (dagu, gitpython, lemur, mistral-rs, vikunja; langflow sound but untrialled) | stacking lift (D1) unmeasured for them |
+| Human decisions on fairness questions are recorded in `build/<slug>/HUMAN-REVIEW.md` / `NEEDS_HUMAN_REVIEW.md` ("User decision") or `build/audit/UNCOVERED-UPSTREAM-CLASS.md`, which neither the fairness reader nor this audit read | decisions found for 11 of 25 (electron-builder, protobuf.js, seaweedfs, lemur, mistral-rs, senaite, tensorflow, vikunja, dagu, filebrowser, gitpython); none found for grav, jetty, hubuum, litellm, mockoon, openbao, siyuan, theia, tinacms, or the new pv- flags | e3 was marked failed for tasks that were decided; fix: one decision file the fairness reader reads |
+| Blind fix never ran or broke: the script expects `/app`, tasks use `/workspace` | all stacking; most sibling | solvability (B8) rests on the gate alone — **fixed 2026-10-25** (uses the image's working directory) |
+| Gate marker predates the upgrade that added the decisive test | electron-builder, hubuum, mockoon | the decisive tests were only checked by targeted runs — **re-gate rule now enforced** (gate fingerprint; see pipeline GUIDEs); these 3 still need their re-gate |
 | Trap origin labels wrong in the manifest | vikunja | trap-origin counts must be checked against upstream commits |
 | Short trial clock | litellm (MiMo timeouts at 2 h) | MiMo's 0/3 depends partly on the clock |
 

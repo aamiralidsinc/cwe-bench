@@ -102,6 +102,27 @@ Steps 7 (trial) and 8 (audit) use shared tools only (`common/trial/`, `common/au
 It snapshots, runs the agent, then a gate (static only, or the full `gate_one_ds.sh`), and bumps `VERSION`.
 Exit codes 0/1/3/4.
 
+## Re-gate rule: any change to what the gate tests invalidates the gate (enforced)
+
+A `.sound` proves the task only for the exact files it gated. **Whenever a task's `tests/`, `solution/`,
+`environment/` or `build/<slug>/checks/` change after its gate pass** (fairfix, testfix, upgrade, a hand repair,
+a test removed as unfair), do all of this, in order:
+
+1. **Re-gate the whole task**: `bash common/gate/gate_one_ds.sh <slug>` (nop, oracle and every patch check, not
+   only the changed tests). A changed test can make a wrong-fix patch pass or the reference fail.
+2. **Re-grade the saved runs** on the new tests: `common/audit/regrade.py` (needs the run's container or final
+   code), or `common/audit/rescore_from_results.py` when the repair only **removes** tests. A repair that changes
+   what a test accepts cannot be rescored from results: it needs the code, or new runs.
+3. **Re-audit** every failing run whose reward changed (a same-reward regrade keeps its audit).
+4. An **instruction** change is different: the gate does not read `instruction.md`, so it needs no re-gate, but
+   it needs a **re-trial** (the runs saw the old text).
+
+Enforcement: `gate_one_ds.sh` writes `build/<slug>/gate_fingerprint.json` when a task is SOUND
+(`common/gate/fingerprint.py`). `common/trial/run_trial.sh` and `common/audit/regrade.py` refuse to start when the
+files no longer match (exit 3 / refusal), and say to re-gate. Tasks gated before 2026-10-25 have no fingerprint
+and only get a warning; electron-builder-ds, hubuum-client-rust-ds and mockoon-ds are known to need a re-gate
+(their deciding tests came with the 2026-10-20 upgrade, after their `.sound`).
+
 ## Marker and state files (in `build/<slug>/` unless noted)
 
 | File | Meaning |
