@@ -6,6 +6,19 @@ separately). Each breaker was reviewed by an Opus 5.5 (high) reviewer against on
 read on GitHub for the open-internet check. Evidence: `reports/quality-audit-20261025/` (brief, data pack, one review
 file per breaker).
 
+## Headline comparison
+
+| | Sibling injection (48 trialled) | Stacking (30 trialled) |
+|---|---|---|
+| Total both-model breakers (% of trialled) | 12 (25%) | 8 (27%) |
+| Single-test breakers: one test decides the result (% of breakers) | 6 (50%) | 6 (75%) |
+| Functionality breakers: failed only by breaking legitimate use (% of breakers) | 3 (25%) | 2 (25%) |
+| Core-strong: security miss not covered upstream (% of trialled) | 7 (15%); 5 (10%) first-build | 5 (17%) |
+
+Single-test: sibling hubuum, jetty, litellm, mockoon, openbao, tinacms; stacking dagu, filebrowser, mistral-rs,
+senaite, tensorflow, vikunja. Functionality: sibling hubuum, litellm, openbao; stacking lemur, mistral-rs. The rows
+overlap (a task can be both). Precision validation (sibling builder, 5 breakers): 4 single-test (80%), 0 functionality.
+
 ## Summary
 
 1. **Strong breakers (all of E): 1 of 25.** Only stk-filebrowser passes every check, and it is weak: 5 of its 6 runs
@@ -13,12 +26,11 @@ file per breaker).
    open human question, which fails on 24 of 25**. That is a process gap (questions and required rewordings left
    open), not proof the tasks are bad.
 2. **Core-strong breakers** (a security miss decides it, and the public upstream fix does not cover it; e4 + e5):
-   - **stacking 5 of 29 stacked tasks trialled, 17% (95% range 8–35%)**: dagu, filebrowser, senaite, tensorflow, vikunja;
-   - **sibling injection 7 of 60, 12% (6–22%)**: electron-builder, grav, jetty, mockoon, seaweedfs, siyuan, theia;
-     only **5 of 60 (8%)** without the dropped hardening step (grav and jetty were hardened after a solve);
+   - **stacking 5 of 30 stacked tasks trialled, 17% (95% range 7–34%)**: dagu, filebrowser, senaite, tensorflow, vikunja;
+   - **sibling injection 7 of 48, 15% (7–27%)**: electron-builder, grav, jetty, mockoon, seaweedfs, siyuan, theia;
+     only **5 of 48 (10%)** without the dropped hardening step (grav and jetty were hardened after a solve);
    - **precision validation 1 of 61 built (pv-device-builder)**.
-   The ranges overlap: the samples are too small to call stacking better with confidence. The direction favours
-   stacking.
+   The two pipelines are **level** on this measure; the samples are far too small to separate them.
 3. **Injected sites rarely decide a breaker.** In 10 of the 12 sibling breakers the injected siblings were fixed in
    every finished run (or decided almost nothing); the failures came from real upstream code (routes the upstream fix
    also misses, or coupled keep-working rules). theia's injected T10/T11 are the clear exception, protobuf.js partly. In precision validation
@@ -30,11 +42,17 @@ file per breaker).
 5. **Fragile breakers are common**: one test decides the result in 6 of 8 stacking, 6 of 12 sibling and 4 of 5
    precision-validation breakers.
 
-**Recommendation:** scale **stacking**, and treat sibling injection as optional rather than the main lever. Stacking
-is slightly ahead on core-strong yield (17% vs 12%) and cost (≈40 vs ≈49 agent-hours per core-strong breaker), its
-breakers are first-build (no hardening or upgrade rounds), and it targets the thing that actually produces breakers:
-several real flaws, some the upstream fix misses. Before scaling either pipeline, fix the shared process gaps below,
+**Recommendation:** the two pipelines are close to a tie on yield (25% vs 27% both-model; 15% vs 17% core-strong)
+and cost (≈40 agent-hours per core-strong breaker each). The lean is toward **stacking**, for two smaller reasons: its
+breakers are all first-build (two of sibling's seven core-strong ones came from the dropped hardening step, leaving
+10% vs 17%), and sibling's distinctive step, injection, rarely decides a breaker. Against stacking: more of its
+breakers rest on one test (75% vs 50%). Treat injection as optional rather than the main lever. Before scaling either pipeline, fix the shared process gaps below,
 because they cap the strong-breaker count of both.
+
+**Correction (2026-10-25, same day):** the first version counted 60 sibling tasks; that mixed the sibling batch (48
+`-ds` tasks, all 12 breakers) with the older `-inj` round (11 tasks, earlier builder, 0 breakers) and one stacking
+task (stk-nova) whose task file says "injected". Sibling now uses 48 and stacking 30. The stacking cost lead in the
+first version (≈40 vs ≈49 hours) disappears.
 
 ## Shared process gaps (fix before scaling)
 
@@ -52,10 +70,10 @@ because they cap the strong-breaker count of both.
 
 | Metric | Sibling injection | Stacking | Precision validation |
 |---|---|---|---|
-| A1 funnel | 116 built → 93 gated sound → 60 trialled → 12 both-model | 65 built (incl. controls) → 54 sound → 29 stacked + 23 controls trialled → 8 both-model | 61 built → 7 imported (both-fail on Actions) → 5 hold after audit and fairness |
-| A2 both-model yield per trialled | 20% (12–32%) | 28% (15–46%) | 8% of built (4–18%) |
-| A3 agent-hours per both-model breaker (builder + trials) | ≈28 | ≈25 | n/a (only survivors imported) |
-| A3 per core-strong breaker | ≈49 | ≈40 | — |
+| A1 funnel | sibling batch (`-ds`): 48 trialled → 12 both-model (116 injected builds of all eras, 93 gated sound) | 65 built (incl. controls) → 54 sound → 30 stacked + 23 controls trialled → 8 both-model | 61 built → 7 imported (both-fail on Actions) → 5 hold after audit and fairness |
+| A2 both-model yield per trialled | 25% (15–39%) | 27% (14–44%) | 8% of built (4–18%) |
+| A3 agent-hours per both-model breaker (builder + trials) | ≈24 | ≈25 | n/a (only survivors imported) |
+| A3 per core-strong breaker | ≈40 | ≈41 | — |
 | A5 repair burden on breakers | 9 upgraded, 5 fairfixed, 2 hardened | 2 test fixes, 1 fairfix | 1 test repair (svgo) |
 | B1 decisive type: security miss / regression only | 9 / 3 | 6 / 2 (filebrowser mostly contract) | 5 / 0 |
 | B2 one test decides | 6 of 12 | 6 of 8 | 4 of 5 |
@@ -81,9 +99,9 @@ because they cap the strong-breaker count of both.
 ### Single-model breakers (F)
 | | Sibling injection | Stacking | Precision validation |
 |---|---|---|---|
-| F1 DeepSeek-only / MiMo-only | 7 / 4 | 3 / 4 (+2 controls DeepSeek-only) | 1 / 0 |
-| F2 both-model + single-model per trialled | 23 of 60 (38%) | 15 of 29 (52%) | — |
-| F4 near-miss (the solving model failed first, solved on run 2+) | 5 of 11 (airflow, flyto, keras, knowns, pimcore) | 2 of 7 (mlflow, uri-js) | 1 (spring-ws, run 4) |
+| F1 DeepSeek-only / MiMo-only | 7 / 3 | 3 / 4 (+2 controls DeepSeek-only) | 1 / 0 |
+| F2 both-model + single-model per trialled | 22 of 48 (46%) | 15 of 30 (50%) | — |
+| F4 near-miss (the solving model failed first, solved on run 2+) | 5 of 10 (airflow, flyto, keras, knowns, pimcore) | 2 of 7 (mlflow, uri-js) | 1 (spring-ws, run 4) |
 Single-model failures are audited; their fairness has not been reviewed, so F3 is not assessed.
 
 ## What would change the recommendation
