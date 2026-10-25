@@ -218,10 +218,17 @@ def main():
     ap.add_argument("--timeout-min", type=int, default=30)
     ap.add_argument("--only", nargs="*", default=[])
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--outdir", default="", help="write records here instead of pipelines/stacking/out/screener")
+    ap.add_argument("--jobs-file", default="", help="read (and with --pick, write) this job list instead")
     ap.add_argument("--stagger-sec", type=float, default=3.0,
                     help="delay between the starts of the first --parallel jobs (clone storm guard); later jobs "
                          "start the moment a slot frees")
     a = ap.parse_args()
+    global OUTDIR, JOBS
+    if a.outdir:
+        OUTDIR = os.path.abspath(a.outdir)
+    if a.jobs_file:
+        JOBS = os.path.abspath(a.jobs_file)
     os.makedirs(OUTDIR, exist_ok=True)
     if a.pick:
         pick(a.pick, a.built)
