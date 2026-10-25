@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Persistent host ledger over the 150 screened hosts + any built task, merged with VM trial
 outcomes. Writes build/audit/host-ledger.tsv. Status decides what NOT to rebuild and what to
-replace. Run: python3 -I build_ledger.py VM_OUTCOMES.tsv
+replace. Run: python3 -I pipelines/sibling/3-rank/build_ledger.py VM_OUTCOMES.tsv
 
 Status per repo:
   breaker        both models 0/N (no solve either) - KEEP, the goal
@@ -12,10 +12,13 @@ Status per repo:
   screened       scored, not built - candidate pool for new batches
 """
 import csv, glob, json, os, re, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REC = os.path.join(HERE, "..", "review", "screener-v2")
-OUT = os.path.join(HERE, "..", "..", "build", "audit", "host-ledger.tsv")
+REC = str(paths.SCREENER_RECORDS)
+OUT = os.path.join(str(paths.AUDIT_DIR), "host-ledger.tsv")
 
 
 def classify(ds, mm, parked, built):

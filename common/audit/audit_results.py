@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Rebuild the results ledger from the RAW trial folders only.
 
-    python3 build/audit_results.py
+    python3 common/audit/audit_results.py
 
 Reads every trial folder under ~/.tb-graders/cwe/jobs (every trial in every job — early
 jobs ran 3 trials in one job), and nothing else: not queue.json, not runs_<model>.log,
 not trial_detail_*.json. Those derived files were written by a reader with two bugs (see
-build/RESULTS-AUDIT.md) and are superseded by this script.
+docs/history/RESULTS-AUDIT.md) and are superseded by this script.
 
 Writes:
     build/audit/trials.tsv   one row per trial, ordered task / model / start time
@@ -17,7 +17,7 @@ Rules:
                    limit (grade-at-timeout, as CWE-bench does)
     leaked run   = the agent read or ran hidden tests baked into the image (listed in
                    build/audit/contaminated.tsv); excluded from verdicts
-    needs review = a non-solve whose grading setup broke (build/review_flags.py); not a
+    needs review = a non-solve whose grading setup broke (common/audit/review_flags.py); not a
                    model failure until build/audit/reviews.tsv decides model / harness
     cut run      = graded run cut by a SHORTER limit than the task's current one
                    (e.g. 60 min before the switch to 120 min) that did not solve; it is
@@ -32,11 +32,15 @@ import json
 import re
 import time
 from datetime import datetime
+import sys
 from pathlib import Path
 
 from review_flags import setup_flags
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 OUT = ROOT / "build" / "audit"
 TRACK_ORDER = {"mined": 0, "stacking": 1, "injection": 2}
@@ -69,7 +73,7 @@ def read_trial(trial):
     if reward is None:
         reward = (jload(trial / "verifier" / "reward.json") or {}).get("reward")
     verifier = trial / "verifier"
-    # A re-grade of the final output (build/regrade.py) replaces a grading that broke.
+    # A re-grade of the final output (common/audit/regrade.py) replaces a grading that broke.
     # Only finished regrades (REGRADE.json is written last); one still running is ignored.
     regrades = sorted(r.parent / "verifier" / "reward.json" for r in trial.glob("regrade-*/REGRADE.json")
                       if (r.parent / "verifier" / "reward.json").is_file())
@@ -154,7 +158,7 @@ def task_defects():
 def excluded_runs():
     """(job, trial) -> kind, from excluded_runs.tsv: runs whose grading can no longer be trusted
     and cannot be regraded (no saved final code). Kinds: 'test-fault' (the run failed a test
-    since found faulty and repaired; see research/own-runs/FINDINGS.md) and 'provider-stop'
+    since found faulty and repaired; see docs/research/own-runs/FINDINGS.md) and 'provider-stop'
     (the model provider refused the request mid-run: an infrastructure stop, not a result)."""
     f = OUT / "excluded_runs.tsv"
     if not f.is_file():
@@ -165,7 +169,7 @@ def excluded_runs():
 
 def postmortem_state(job, trial, grading):
     """'trusted' / 'untrusted' / 'awaiting' from the newest <trial>/postmortem-*/POSTMORTEM.json
-    (build/postmortem.py). A postmortem only counts if it audited the grading now in use."""
+    (common/audit/postmortem.py). A postmortem only counts if it audited the grading now in use."""
     d = JOBS / job / trial
     pms = sorted(d.glob("postmortem-*/POSTMORTEM.json"))
     if not pms:
@@ -255,7 +259,7 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     harness = [r for r in review if dec(r) == "harness"]
     pending = [r for r in review if r not in harness]
     runs = [r for r in runs if r not in review]
-    # Every graded run needs an independent post-run audit (build/postmortem.py) before it can
+    # Every graded run needs an independent post-run audit (common/audit/postmortem.py) before it can
     # count: awaiting -> not yet final; untrusted -> excluded until a human decides.
     audit = {id(r): postmortem_state(r["job"], r["trial"], r["grading"]) for r in runs if r["reward"] is not None}
     awaiting = [r for r in runs if audit.get(id(r)) == "awaiting"]
@@ -264,7 +268,7 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     AWAITING.extend(awaiting)
     # CWE-bench runs agents OFFLINE (only the model API; arXiv 2610.17020). Before a task's switch
     # (build/audit/offline_since.tsv) its trials had open internet: a SOLVE counts only if the run
-    # did no internet lookup (build/internet_use.py). Failures with more access still count.
+    # did no internet lookup (common/audit/internet_use.py). Failures with more access still count.
     from internet_use import cached_hits, offline_since
     since = offline_since()
     # Offline network but web tools still on (until WEB_TOOLS_OFF_UTC): WebSearch ran on the
@@ -352,7 +356,7 @@ def main():
             onefail.append(f"| {track_of(t)} | {t} | {cells['deepseek'][0]} | {cells['mimo'][0]} | {failed[0]} |")
 
     hdr = "| Track | Task | DeepSeek | MiMo | {} |\n|---|---|---|---|---|"
-    md = [f"_Generated {datetime.now():%Y-%m-%d %H:%M} from {len(rows)} raw trials by build/audit_results.py_", "",
+    md = [f"_Generated {datetime.now():%Y-%m-%d %H:%M} from {len(rows)} raw trials by common/audit/audit_results.py_", "",
           "## Tasks where one model failed (the other solved)", "", hdr.format("Who failed"), *onefail, "",
           "## All tasks", "", hdr.format("Verdict"), *full, ""]
     (OUT / "ledger.md").write_text("\n".join(md))
@@ -364,7 +368,7 @@ def main():
         f.write("job\ttrial\taudited_grading\tcurrent_grading\treward\n")
         for row in sorted(set(CARRYOVER)):
             f.write("\t".join(str(x) for x in row) + "\n")
-    with open(OUT / "awaiting_audit.tsv", "w") as f:    # input for build/postmortem.py pending
+    with open(OUT / "awaiting_audit.tsv", "w") as f:    # input for common/audit/postmortem.py pending
         f.write("task\tmodel\treward\tjob\ttrial\tgrading\n")
         for r in AWAITING:
             f.write(f"{r['task']}\t{r['model']}\t{r['reward']}\t{r['job']}\t{r['trial']}\t{r['grading']}\n")

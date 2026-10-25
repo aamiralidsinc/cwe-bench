@@ -7,14 +7,17 @@ model's own prior score and any pick/verdict are NOT included -- the lane must
 score and choose for itself. Confirmed both-models breakers are excluded
 (EXCLUDE_REPOS); solved and blocked hosts stay in as controls.
 
-  python3 -I make_pool.py            # writes build/pipeline/pool.jsonl
+  python3 -I pipelines/sibling/4-select/make_pool.py            # writes build/pipeline/pool.jsonl
 """
 import glob, json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-RECS = os.path.join(ROOT, "sourcer", "review", "screener-v2")
-OUT = os.path.join(ROOT, "build", "pipeline", "pool.jsonl")
+ROOT = str(paths.ROOT)
+RECS = str(paths.SCREENER_RECORDS)
+OUT = os.path.join(str(paths.BUILD_PIPELINE), "pool.jsonl")
 
 # Confirmed both-models breakers: keep out so the model must find new ones.
 EXCLUDE_REPOS = {"fasterxml/jackson-databind"}

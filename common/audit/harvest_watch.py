@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Save the final code of runs whose containers Harbor deletes right after grading.
 
-    python3 build/harvest_watch.py
+    python3 common/audit/harvest_watch.py
 
 For every recent trial with no result.json yet: as soon as grading starts
 (verifier/test-stdout.txt appears) the agent is done, so its code is saved with
@@ -57,7 +57,7 @@ def main():
                     f"{sorted(p.name for p in (t / 'final-code' / 'tmp-logs').glob('*'))}"
                     if (t / "final-code" / "tmp-logs").exists() else f"grading over for {t.name}; no tmp logs")
                 del grading[t]
-        busy = subprocess.run(["pgrep", "-f", "build/trial.py "], capture_output=True).returncode == 0
+        busy = subprocess.run(["pgrep", "-f", "common/trial/trial.py "], capture_output=True).returncode == 0
         if not busy and not grading:
             log("no trials left; exiting")
             return

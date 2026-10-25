@@ -6,14 +6,18 @@ task pins the code BEFORE A's fix, and the reference is the complete fix (A + B)
 fix (A) is a wrong fix. This script resolves each pair to its repo and fix commits from the OSV dumps.
 
 Inputs (read-only): ~/.tb-graders/cwe/sourcer-data/dumps/*.zip
-Outputs: stacking/out/h3b_pairs.tsv (one row per pair), stacking/out/h3b_summary.md
+Outputs: pipelines/stacking/out/h3b_pairs.tsv (one row per pair), pipelines/stacking/out/h3b_summary.md
 
-  python3 -I stacking/h3b_pairs.py
+  python3 -I pipelines/stacking/1-select/h3b_pairs.py
 """
 import collections, glob, json, os, re, zipfile
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "stacking", "out")
+ROOT = str(paths.ROOT)
+OUT = str(paths.STACKING_OUT)
 DUMPS = glob.glob(os.path.expanduser("~/.tb-graders/cwe/sourcer-data/dumps/*.zip"))
 LINK = re.compile(r"(incomplete fix|bypass(?:es|ed)?(?: of)?(?: the)? (?:fix|patch)|regression|not (?:fully|completely) "
                   r"(?:fixed|patched)|previous(?:ly)? (?:fix|patch)|fix for)[^.]{0,120}?((?:CVE-\d{4}-\d+)|(?:GHSA(?:-[a-z0-9]{4}){3}))", re.I)

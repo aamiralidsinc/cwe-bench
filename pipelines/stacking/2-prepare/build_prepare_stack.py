@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Stacking copy of sourcer/rerank-v4-draft/build_prepare.py (the original is untouched).
+"""Stacking copy of common/builder/build_prepare.py (the original is untouched).
 
-Fills builder/TASK-BUILD-PROMPT-v1.md (read as is) for ONE stacked candidate, from the stacking
-reader's record instead of a screener record, then appends stacking/STACKING-BUILD-ADDENDUM.md with
+Fills common/builder/TASK-BUILD-PROMPT-v1.md (read as is) for ONE stacked candidate, from the stacking
+reader's record instead of a screener record, then appends pipelines/stacking/2-prepare/STACKING-BUILD-ADDENDUM.md with
 the reader record filled in. Writes <out-root>/build/<slug>/BUILD-PROMPT.md, which the unchanged
-run_build.sh / drive.sh then run.
+common/launch/run_build.sh / common/launch/drive.sh then run.
 
-  python3 -I stacking/build_prepare_stack.py JOB_ID --project-root /home/<user>/cwe-bench [--out-root DIR]
-JOB_ID: an id from stacking/out/reader_jobs.jsonl that has stacking/out/reader/<JOB_ID>.json.
+  python3 -I pipelines/stacking/2-prepare/build_prepare_stack.py JOB_ID --project-root /home/<user>/cwe-bench [--out-root DIR]
+JOB_ID: an id from pipelines/stacking/out/reader_jobs.jsonl that has pipelines/stacking/out/reader/<JOB_ID>.json.
 Slug: stk-<repo-name>-<short-id>; its one-bug control is <slug>-control (built by the same builder).
 """
 import argparse, json, os, re
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TEMPLATE = os.path.join(ROOT, "builder", "TASK-BUILD-PROMPT-v1.md")
-ADDENDUM = os.path.join(ROOT, "stacking", "STACKING-BUILD-ADDENDUM.md")
+ROOT = str(paths.ROOT)
+TEMPLATE = str(paths.BUILD_TEMPLATE)
+ADDENDUM = os.path.join(str(paths.STACKING), "2-prepare", "STACKING-BUILD-ADDENDUM.md")
 MARK = "---8<---"
 
 
@@ -40,9 +44,9 @@ def main():
     ap.add_argument("--project-root", required=True, help="cwe-bench path ON THE BUILD MACHINE")
     ap.add_argument("--out-root", default=ROOT, help="where build/<slug>/BUILD-PROMPT.md is written")
     a = ap.parse_args()
-    jobs = {j["id"]: j for j in (json.loads(l) for l in open(os.path.join(ROOT, "stacking", "out", "reader_jobs.jsonl")) if l.strip())}
+    jobs = {j["id"]: j for j in (json.loads(l) for l in open(os.path.join(str(paths.STACKING_OUT), "reader_jobs.jsonl")) if l.strip())}
     job = jobs[a.job_id]
-    rec = json.load(open(os.path.join(ROOT, "stacking", "out", "reader", f"{a.job_id}.json")))
+    rec = json.load(open(os.path.join(str(paths.STACKING_OUT), "reader", f"{a.job_id}.json")))
     if not rec.get("usable"):
         raise SystemExit(f"{a.job_id}: the reader marked this candidate not usable; not preparing a build")
     slug = slug_for(job)
@@ -68,9 +72,9 @@ def main():
                .replace("{{UNCOVERED_ROUTES}}", uncovered).replace("{{DESIGN_PLAN}}", plan)
                .replace("{{HOST_NOTES}}", notes).replace("{{PROJECT_ROOT}}", a.project_root))
     add = open(ADDENDUM, encoding="utf-8").read().split(MARK, 1)[1].strip("\n")
-    out += "\n\n" + add.replace("{{READER_RECORD}}", f"`{a.project_root}/stacking/out/reader/{a.job_id}.json`") + "\n"
+    out += "\n\n" + add.replace("{{READER_RECORD}}", f"`{a.project_root}/pipelines/stacking/out/reader/{a.job_id}.json`") + "\n"
     out += (f"\nStacked task slug: `{slug}`. Control task slug: `{slug}-control`. "
-            f"Manifest `stacking.reader_record`: `stacking/out/reader/{a.job_id}.json`.\n")
+            f"Manifest `stacking.reader_record`: `pipelines/stacking/out/reader/{a.job_id}.json`.\n")
     # only the template's own slots: record text may hold literal {{...}} (nuclei templates use {{ENV}})
     slots = set(re.findall(r"\{\{[A-Z_]+\}\}", body + add))
     left = [x for x in slots if x in out]

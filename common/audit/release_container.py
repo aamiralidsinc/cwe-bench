@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Remove kept trial containers once they are no longer needed for review.
 
-    python3 build/release_container.py list
-    python3 build/release_container.py <trial_dir> "<why it can go>"
+    python3 common/audit/release_container.py list
+    python3 common/audit/release_container.py <trial_dir> "<why it can go>"
 
 Before removing, the agent's final code is saved (harvest_code.py) if it was not
 already, so only the container and its image are lost, never the evidence. Every
@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+sys.path.insert(0, str(paths.TRIAL_DIR))
 from harvest_code import harvest  # noqa: E402
 from trial import KEPT, remove_container  # noqa: E402
 

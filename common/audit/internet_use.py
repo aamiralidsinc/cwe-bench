@@ -2,7 +2,7 @@
 """Did a run use the internet to look things up? (CWE-bench runs agents OFFLINE: "Each attempt runs
 in an isolated container whose only network access is the model provider's API", arXiv 2610.17020.)
 
-    python3 build/internet_use.py <trial_dir>     # prints the hits
+    python3 common/audit/internet_use.py <trial_dir>     # prints the hits
 
 Our tasks switched to that setting per task at the time in build/audit/offline_since.tsv. A run that
 started before its task's switch had open internet; audit_results.py counts its SOLVE only if this
@@ -21,7 +21,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 CACHE = ROOT / "build/audit/internet_use_cache.json"
 SINCE = ROOT / "build/audit/offline_since.tsv"
 LOCAL = r"(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[::1\]|host\.docker\.internal)"

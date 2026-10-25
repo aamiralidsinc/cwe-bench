@@ -14,13 +14,16 @@ as READY. Three review formats exist; the newest one present wins:
             heading followed by a paragraph opening with the token. Such a NOT READY may be
             leniency, not unfairness (the 2026-10-19 audit); the source label says so.
 A missing file, no verdict in any format, or a fairness run that did not finish
-(build/<slug>/fairness_status.txt, written by run_fairness.sh) is ERROR: a person decides.
+(build/<slug>/fairness_status.txt, written by pipelines/sibling/9-fairness/run_fairness.sh) is ERROR: a person decides.
 """
 import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 TOKEN = r"(NOT[ _-]?READY|READY)\b"
 GATE_A = re.compile(r"(?mi)^[\s>*`_|-]*GATE_A[*`_]*\s*[:=]\s*[*`_]*\s*" + TOKEN)
 # A labelled line: optional heading marks / list marks / a section number like "5." or "5a.".

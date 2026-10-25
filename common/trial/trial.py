@@ -24,11 +24,14 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-RUN = ROOT / "harness" / "run_trial.sh"
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
+RUN = paths.RUN_TRIAL
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
-sys.path.insert(0, str(ROOT / "pipeline"))
-import evidence as ev  # noqa: E402  (full error evidence: pipeline/evidence.py)
+sys.path.insert(0, str(paths.UTIL))
+import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
 
 
 def run_evidence(task, name, cause, trial=None, proc=None, extra=None):
@@ -97,7 +100,7 @@ def keep_or_release(trial, task, model, job, reward):
     container = f"{trial.name.lower()}__env-main-1"
     print(f"[trial] {save_netguard_log(trial, container)}", flush=True)
     code = harvest(trial, "after-run", container)
-    # Evidence for the independent post-run audit (build/postmortem.py). The run counts toward
+    # Evidence for the independent post-run audit (common/audit/postmortem.py). The run counts toward
     # no verdict until an auditor sub-agent has judged it and `postmortem.py record` was run.
     if reward is not None:
         try:

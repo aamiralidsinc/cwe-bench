@@ -3,10 +3,10 @@
 | | |
 |---|---|
 | Version | `screener-v2`, 2026-10-16 (copied from v1, then edited; see the change log) |
-| Spec | `builder/PROMPT-TEMPLATES-SPEC.md` §1.2, §1.5, §3.1 |
+| Spec | `common/builder/PROMPT-TEMPLATES-SPEC.md` §1.2, §1.5, §3.1 |
 | Lessons digest | `lessons-v1` (below; paste it into `{{LESSONS_DIGEST}}`) |
 | Scored by | the weights version named at run time (`sourcer/weights.json` v3; `rerank-v4-draft`). The prompt never scores |
-| Replaces | `builder/SCREENER-PROMPT-v1.md` (kept, with its calibration results) |
+| Replaces | `common/archive/old-prompts/SCREENER-PROMPT-v1.md` (kept, with its calibration results) |
 
 ## Operator part (never sent)
 
@@ -17,7 +17,7 @@
 | `{{CANDIDATE}}` | the index row as JSON: `entry_id`, advisory ids, `repo`, `cwe_ids`, `summary`, `parent_commit`, `fix_commits`, and the computed `c_*` signals |
 | `{{CODE_LOCATION}}` | where the agent finds the code at `parent_commit` and the fix diff. Claude Code run: a scratch clone path under `~/.tb-graders/cwe/work/screen/<entry_id>/`. Harbor run: `/work/repo` and `/work/fix.diff`, pre-fetched into the image, offline |
 | `{{LATEST_LOCATION}}` | where the latest release's code is, for O8's `present_in_latest`; or `none` (the answer is then `unknown`) |
-| `{{OUTPUT_PATH}}` | `sourcer/review/screener-v2/<entry_id>.json` locally; `/output/host.json` in Harbor |
+| `{{OUTPUT_PATH}}` | `common/screener/records/<entry_id>.json` locally; `/output/host.json` in Harbor |
 | `{{TIME_BOX_MIN}}` | 20 by default |
 
 ### Launch modes
@@ -135,20 +135,20 @@ near tie and has the lower false-hard rate; either is defensible. Neither is a t
 Caveats: 18-34 claims per model; the checkers are Opus 5.5, itself a candidate (it scored third).
 Run set: `~/.tb-graders/cwe/work/screen/calib-v2-20261017T0001Z/` (`choice.md`, `fact-check/`).
 
-v1 results: `builder/SCREENER-PROMPT-v1.md`.
+v1 results: `common/archive/old-prompts/SCREENER-PROMPT-v1.md`.
 
 ### After screening
 - **Validate.** The schema validator checks enums, required fields and every file:line.
 - **Score.** The scoring script combines the observations with the named weights version into
-  `score_read`, then a shortlist. It extends `sourcer/rerank-v4-draft/rerank.py` and is not written
+  `score_read`, then a shortlist. It extends `pipelines/sibling/3-rank/rerank.py` and is not written
   yet.
 - **Store.** Outputs merge into the index's `j_*` columns.
-- **Learning loop:** after each trial batch, add the outcomes to `research/trap_tally.tsv`, refit
+- **Learning loop:** after each trial batch, add the outcomes to `docs/research/trap_tally.tsv`, refit
   the weights, regenerate the digest, bump the versions, and re-screen.
 
 ### Change log
 - screener-v1 (2026-10-16): first version, written from the spec.
-- screener-v2 (2026-10-16), from the v1 calibration (`builder/SCREENER-PROMPT-v1.md`):
+- screener-v2 (2026-10-16), from the v1 calibration (`common/archive/old-prompts/SCREENER-PROMPT-v1.md`):
   - O12 red flags defined one by one (Opus raised `regression_tests_in_pinned_commit` on 3 hosts
     where only older tests for the area existed);
   - enum fields hold exactly one listed value, no added text (prose in `present_in_latest`
@@ -157,14 +157,14 @@ v1 results: `builder/SCREENER-PROMPT-v1.md`.
     a file the screener wrote (self-citation was 16% of one model's evidence);
   - calibration set grown from 9 to 37 hosts; choice rule replaced (see "Choice").
 - lessons-v2 (2026-10-19): digest only, prompt unchanged; adds the where-vs-how lessons from the
-  93-task sibling analysis (`BETTER-PATTERNS.md` §5).
+  93-task sibling analysis (`docs/BETTER-PATTERNS.md` §5).
 
 ---
 
 ## lessons-v1 (paste into `{{LESSONS_DIGEST}}`)
 
-Sources: `research/round1-analysis/B-failure-modes.md`, `builder/BRIEF-trap-stack.md`,
-`research/peer-analysis-2026-10-16.md`, `RESULTS.md` round 2, `research/trap_tally.tsv`.
+Sources: `docs/research/round1-analysis/B-failure-modes.md`, `common/builder/BRIEF-trap-stack.md`,
+`docs/research/peer-analysis-2026-10-16.md`, `docs/RESULTS.md` round 2, `docs/research/trap_tally.tsv`.
 
 ```
 How the target models fail (audited runs, ours and a peer team's):
@@ -199,7 +199,7 @@ Both patterns that produced failures:
 ## lessons-v2 (2026-10-19; paste into `{{LESSONS_DIGEST}}` instead of lessons-v1)
 
 Sources: everything in lessons-v1, plus `reports/SIBLING-INJECTION-PATTERNS.md` (93 tasks, 609
-traps) and `BETTER-PATTERNS.md` §5-§8. It is lessons-v1 with the last block added.
+traps) and `docs/BETTER-PATTERNS.md` §5-§8. It is lessons-v1 with the last block added.
 
 ```
 How the target models fail (audited runs, ours and a peer team's):

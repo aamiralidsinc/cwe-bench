@@ -7,14 +7,18 @@ checkout can hold them all. Each co-present group is split by how upstream fixed
 Fix commits come from the advisories' commit references. DoS-only advisories are left out (not built).
 
 Inputs (read-only): ~/.tb-graders/cwe/sourcer-data/dumps/*.zip
-Outputs: stacking/out/h12_groups.tsv, stacking/out/h12_summary.md
+Outputs: pipelines/stacking/out/h12_groups.tsv, pipelines/stacking/out/h12_summary.md
 
-  python3 -I stacking/h12_groups.py
+  python3 -I pipelines/stacking/1-select/h12_groups.py
 """
 import collections, glob, json, os, re, zipfile
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "stacking", "out")
+ROOT = str(paths.ROOT)
+OUT = str(paths.STACKING_OUT)
 DUMPS = glob.glob(os.path.expanduser("~/.tb-graders/cwe/sourcer-data/dumps/*.zip"))
 COMMIT = re.compile(r"https?://(?:www\.)?github\.com/([^/\s]+/[^/\s]+?)(?:\.git)?/commit/([0-9a-f]{7,40})", re.I)
 DOS = {"CWE-400", "CWE-770", "CWE-1333", "CWE-674", "CWE-834", "CWE-407", "CWE-606"}

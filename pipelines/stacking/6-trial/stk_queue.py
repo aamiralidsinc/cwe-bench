@@ -2,26 +2,29 @@
 """Stacking queue (new; the sibling pipeline's queue, lanes and queue.json are not used or touched).
 
 A pool of N slots (default 16): whenever a job finishes, the next one starts. Two phases, never mixed:
-  build  : per stk- slug, `bash stacking/run_stack_pipeline.sh SLUG` (build, check, gates, blind fix,
+  build  : per stk- slug, `bash pipelines/stacking/3-build-gate/run_stack_pipeline.sh SLUG` (build, check, gates, blind fix,
            .sound markers). Slugs come from --slugs-file (one per line, in priority order).
-  trial  : per (slug, model), `python3 build/trial.py SLUG --models MODEL --no-verdict` (stop at the first
+  trial  : per (slug, model), `python3 common/trial/trial.py SLUG --models MODEL --no-verdict` (stop at the first
            solve; 3 runs only while the model keeps failing). Only slugs with build/<slug>/.sound.
            Stacked slugs first, their -control tasks last (lowest priority). Pairs already decided
-           (pipeline/trial_state.py: solved, failed, stuck) are skipped; incomplete ones resume.
+           (common/trial/trial_state.py: solved, failed, stuck) are skipped; incomplete ones resume.
 The trial phase refuses to start while any stacking build is running: builds take the CPU, and
 CPU-starved trials hit the timeout (user rule, 2026-10-22). `all` runs build, then trial.
 
 Starts are staggered (random 15-40 s apart while the pool fills) so a burst of container starts does
-not starve sshd. Progress: stacking/out/queue/<phase>.log (one line per start/finish) and
-stacking/out/queue/state.json (rewritten every 30 s: running jobs with elapsed time, waiting, done).
+not starve sshd. Progress: pipelines/stacking/out/queue/<phase>.log (one line per start/finish) and
+pipelines/stacking/out/queue/state.json (rewritten every 30 s: running jobs with elapsed time, waiting, done).
 
-  nohup python3 -I stacking/stk_queue.py all --slugs-file stacking/out/batch1.txt > stacking/out/queue/nohup.log 2>&1 &
-  python3 -I stacking/stk_queue.py status
+  nohup python3 -I pipelines/stacking/6-trial/stk_queue.py all --slugs-file pipelines/stacking/out/batch1.txt > pipelines/stacking/out/queue/nohup.log 2>&1 &
+  python3 -I pipelines/stacking/6-trial/stk_queue.py status
 """
 import argparse, json, os, random, subprocess, sys, threading, time
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-QDIR = os.path.join(ROOT, "stacking", "out", "queue")
+ROOT = str(paths.ROOT)
+QDIR = os.path.join(str(paths.STACKING_OUT), "queue")
 STATE = os.path.join(QDIR, "state.json")
 MODELS = ("deepseek", "mimo")
 LOCK = threading.Lock()
@@ -36,7 +39,7 @@ def log(phase, msg):
 
 
 def builds_running():
-    r = subprocess.run(["pgrep", "-f", "stacking/run_stack_pipeline.sh"], capture_output=True, text=True)
+    r = subprocess.run(["pgrep", "-f", "pipelines/stacking/3-build-gate/run_stack_pipeline.sh"], capture_output=True, text=True)
     return [p for p in r.stdout.split() if p and int(p) != os.getpid()]
 
 
@@ -52,7 +55,7 @@ def build_jobs(slugs, retry):
         if not os.path.isfile(os.path.join(b, "BUILD-PROMPT.md")):
             print(f"[skip] {s}: no build/{s}/BUILD-PROMPT.md (run build_prepare_stack.py first)")
             continue
-        jobs.append(dict(name=s, cmd=["bash", "stacking/run_stack_pipeline.sh", s]))
+        jobs.append(dict(name=s, cmd=["bash", "pipelines/stacking/3-build-gate/run_stack_pipeline.sh", s]))
     return jobs
 
 
@@ -63,7 +66,7 @@ def trial_jobs():
     jobs = []
     for s in order:
         for m in MODELS:
-            r = subprocess.run([sys.executable, "-I", "pipeline/trial_state.py", s, m], cwd=ROOT,
+            r = subprocess.run([sys.executable, "-I", str(paths.TRIAL_STATE), s, m], cwd=ROOT,
                                capture_output=True, text=True)
             state = (r.stdout.split() or ["none"])[0]
             if state in ("solved", "failed", "stuck"):
@@ -71,7 +74,7 @@ def trial_jobs():
             kv = dict(x.split("=", 1) for x in r.stdout.split()[1:] if "=" in x)
             graded = int(kv.get("graded", 0) or 0)
             tried = graded + int(kv.get("ungraded", 0) or 0)
-            jobs.append(dict(name=f"{s}:{m}", cmd=[sys.executable, "build/trial.py", s, "--models", m, "--no-verdict",
+            jobs.append(dict(name=f"{s}:{m}", cmd=[sys.executable, str(paths.TRIAL), s, "--models", m, "--no-verdict",
                                                    "--first-run", str(tried + 1), "--max-runs", str(max(1, 3 - graded))]))
     return jobs
 

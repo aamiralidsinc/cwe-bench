@@ -2,21 +2,25 @@
 """Pick a fresh batch for the sibling-injection lane: the next N candidates by index score that no
 earlier experiment has touched, one per repo, excluded by entry_id AND by repo.
 
-Used sets: sourcer/review/screener-v2 (the screened 150), precision_validation (all arms and inputs),
+Used sets: common/screener/records (the screened 150), experiments/precision_validation (all arms and inputs),
 the shortlists and annotations, the screener calibration hosts, local tasks/*/task.toml, and the VM
-side collected into sibling2/out/vm_used.json (selections, stacking screener/reader jobs, batch1, VM
-tasks and build prompts). Filters are the ones stacking/run_screener.py applies (imported from it).
+side collected into pipelines/sibling/out/vm_used.json (selections, stacking screener/reader jobs, batch1, VM
+tasks and build prompts). Filters are the ones common/screener/run_screener.py applies (imported from it).
 
-  python3 -I sibling2/pick.py --n 300
-Writes sibling2/out/screener_jobs.jsonl (run_screener.py job format) and sibling2/out/exclusion.json.
+  python3 -I pipelines/sibling/1-pick/pick.py --n 300
+Writes pipelines/sibling/out/screener_jobs.jsonl (run_screener.py job format) and pipelines/sibling/out/exclusion.json.
 """
 import argparse, csv, glob, importlib.util, json, os, re, sqlite3
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "sibling2", "out")
-DB = os.path.join(ROOT, "sourcer", "index", "candidates.sqlite")
+ROOT = str(paths.ROOT)
+OUT = str(paths.SIBLING_OUT)
+DB = str(paths.CANDIDATES_DB)
 
-spec = importlib.util.spec_from_file_location("run_screener", os.path.join(ROOT, "stacking", "run_screener.py"))
+spec = importlib.util.spec_from_file_location("run_screener", str(paths.SCREENER_RUNNER))
 rs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rs)
 norm = rs.norm
@@ -47,8 +51,8 @@ def collect():
     repos.update(vm["repos"])
     by["vm_used"] = len(vm["ids"]) + len(vm["repos"])
 
-    for f in glob.glob(os.path.join(ROOT, "sourcer", "review", "screener-v2", "*.json")) + \
-             glob.glob(os.path.join(ROOT, "precision_validation", "results", "screener_v2", "*.json")):
+    for f in glob.glob(os.path.join(str(paths.SCREENER_RECORDS), "*.json")) + \
+             glob.glob(os.path.join(str(paths.PRECISION_VALIDATION), "results", "screener_v2", "*.json")):
         if os.path.basename(f).startswith(("_", "._")) or f.endswith(".run.json"):
             continue
         try:
@@ -56,16 +60,16 @@ def collect():
         except Exception:
             pass
 
-    tables = glob.glob(os.path.join(ROOT, "precision_validation", "results", "*.csv")) + [
+    tables = glob.glob(os.path.join(str(paths.PRECISION_VALIDATION), "results", "*.csv")) + [
         os.path.join(ROOT, "sourcer", "shortlist-20.tsv"),
         os.path.join(ROOT, "sourcer", "stacking-shortlist.tsv"),
         os.path.join(ROOT, "sourcer", "review", "annotations.tsv"),
-        os.path.join(ROOT, "sourcer", "rerank-v4-draft", "host-rank-screened.tsv")]
+        os.path.join(str(paths.SIBLING_OUT), "rerank-batch1-20261017", "host-rank-screened.tsv")]
     for f in tables:
         for r in table_rows(f):
             add(os.path.basename(f), r.get("entry_id"), r.get("repo"))
 
-    for f in glob.glob(os.path.join(ROOT, "precision_validation", "inputs", "*.jsonl")):
+    for f in glob.glob(os.path.join(str(paths.PRECISION_VALIDATION), "inputs", "*.jsonl")):
         for l in open(f):
             if l.strip():
                 j = json.loads(l)
@@ -77,7 +81,7 @@ def collect():
             add("local_task_toml", repo=m.group(1))
 
     # calibration hosts are listed by advisory (GHSA), resolved to entries/repos through the index in main()
-    prompt = open(os.path.join(ROOT, "builder", "SCREENER-PROMPT-v2.md"), errors="replace").read()
+    prompt = open(str(paths.SCREENER_PROMPT), errors="replace").read()
     table = prompt[prompt.find("### Calibration set"):prompt.find("Added in v2")]
     ghsas = {g.upper() for g in GHSA_RE.findall(table)}
     by["calibration_ghsas"] = len(ghsas)
@@ -128,7 +132,7 @@ def main():
     json.dump({"ids": sorted(ids), "repos": sorted(repos), "by_source": by}, open(os.path.join(OUT, "exclusion.json"), "w"), indent=1)
     print(f"excluded: {len(ids)} entry ids, {len(repos)} repos  (sources: {by})")
     print(f"skipped while picking: {why}")
-    print(f"picked {len(out)} -> sibling2/out/screener_jobs.jsonl")
+    print(f"picked {len(out)} -> pipelines/sibling/out/screener_jobs.jsonl")
     if out:
         print(f"score range: {out[0]['row']['score']} .. {out[-1]['row']['score']}")
         for j in out[:10]:

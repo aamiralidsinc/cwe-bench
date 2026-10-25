@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""The sibling-injection lane for the sibling2 batch: pipeline/make_pool.py and pipeline/prepare_lane.py
-logic, unchanged, with every input and output redirected into sibling2/ so batch-1's files
+"""The sibling-injection lane for the sibling2 batch: pipelines/sibling/4-select/make_pool.py and pipelines/sibling/5-prepare/prepare_lane.py
+logic, unchanged, with every input and output redirected into pipelines/sibling/out/ so batch-1's files
 (build/pipeline/pool.jsonl, selection_*.json, specs_*, slugs_*.txt) are never touched.
 
-  python3 -I sibling2/lane.py pool                 # sibling2/out/screener -> sibling2/out/pipeline/pool.jsonl
-  bash sibling2/select.sh deepseek                 # driver picks -> sibling2/out/pipeline/selection_deepseek.json
-  python3 -I sibling2/lane.py prepare deepseek     # -> build/<slug>/BUILD-PROMPT.md + sibling2/out/pipeline/slugs_deepseek.txt
+  python3 -I pipelines/sibling/4-select/lane.py pool                 # pipelines/sibling/out/screener -> pipelines/sibling/out/pipeline/pool.jsonl
+  bash pipelines/sibling/4-select/select.sh deepseek                 # driver picks -> pipelines/sibling/out/pipeline/selection_deepseek.json
+  python3 -I pipelines/sibling/4-select/lane.py prepare deepseek     # -> build/<slug>/BUILD-PROMPT.md + pipelines/sibling/out/pipeline/slugs_deepseek.txt
 """
 import importlib.util, json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RECS = os.path.join(ROOT, "sibling2", "out", "screener")
-PIPE = os.path.join(ROOT, "sibling2", "out", "pipeline")
+ROOT = str(paths.ROOT)
+RECS = os.path.join(str(paths.SIBLING_OUT), "screener")
+PIPE = str(paths.SIBLING_OUT / "pipeline")
 
 
 def load(name, rel):
@@ -22,14 +25,14 @@ def load(name, rel):
 
 
 def pool():
-    mp = load("make_pool", "pipeline/make_pool.py")
+    mp = load("make_pool", "pipelines/sibling/4-select/make_pool.py")
     mp.RECS, mp.OUT = RECS, os.path.join(PIPE, "pool.jsonl")
     mp.main()
 
 
 def prepare(driver):
-    pl = load("prepare_lane", "pipeline/prepare_lane.py")      # for PLAN and VM_ROOT, read as is
-    bp = load("build_prepare", "sourcer/rerank-v4-draft/build_prepare.py")
+    pl = load("prepare_lane", "pipelines/sibling/5-prepare/prepare_lane.py")      # for PLAN and VM_ROOT, read as is
+    bp = load("build_prepare", str(paths.BUILD_PREPARE))
     bp.RECORDS = RECS
     suffix = "ds" if driver == "deepseek" else "mm"
     sel = json.load(open(os.path.join(PIPE, f"selection_{driver}.json")))

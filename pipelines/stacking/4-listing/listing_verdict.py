@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """listing_verdict.py <slug> : verdict of the stacking listing check (build rule 7).
 
-Reads build/<slug>/listing.json (from stacking/run_listing_check.sh) and the trap origins from
+Reads build/<slug>/listing.json (from pipelines/stacking/4-listing/run_listing_check.sh) and the trap origins from
 build/<slug>/manifest.json (never from the reviewer). Traps with origin `advisory_route` (the reported
 bug, which the impact example may show) are exempt; every other trap is hidden.
 
@@ -12,8 +12,11 @@ ERROR: no finished review, unreadable JSON, a hidden trap the review does not cl
 outside NAMED/DESCRIBED/GENERAL/ABSENT (2026-10-24: such a label used to count as neither and could pass).
 """
 import json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = str(paths.ROOT)
 EXEMPT = {"advisory_route"}
 MAX_DESCRIBED = 1
 LABELS = ("NAMED", "DESCRIBED", "GENERAL", "ABSENT")

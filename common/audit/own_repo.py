@@ -2,10 +2,10 @@
 """Did a run reach the task's OWN repository (or a fixed release of its own package)?
 
 The client's trial rule (2026-10-14): trials have internet but no access to the task's own
-repository. Our runs before the netguard sidecar (harness/netguard, 2026-10-16) had open
+repository. Our runs before the netguard sidecar (common/trial/netguard, 2026-10-16) had open
 internet, so a solve that fetched the task's repo does not count; audit_results.py excludes it.
 
-    python3 build/own_repo.py <trial_dir>      # prints the hits
+    python3 common/audit/own_repo.py <trial_dir>      # prints the hits
 
 Detection (transcript, agent/claude-code.txt): a WebFetch/WebSearch/Bash tool call naming
   - <host>/<owner>/<repo> on github.com, raw.githubusercontent.com, api.github.com/repos,
@@ -24,7 +24,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 CACHE = ROOT / "build/audit/own_repo_cache.json"
 REGISTRIES = (r"pypi\.org|files\.pythonhosted\.org|registry\.npmjs\.org|npmjs\.com|repo1\.maven\.org|"
               r"repo\.maven\.apache\.org|central\.sonatype\.com|crates\.io|static\.crates\.io|docs\.rs|"

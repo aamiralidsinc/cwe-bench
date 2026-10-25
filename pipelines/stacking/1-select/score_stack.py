@@ -11,13 +11,17 @@ It scores the reader's chosen design (falls back to all traps), and flags design
 DeepSeek-type or MiMo-type trap, or that rest on a single concept.
 Assumes independent misses, so scores are upper bounds until calibrated (§6).
 
-  python3 -I stacking/score_stack.py [--reader-dir stacking/out/reader]
-Outputs: stacking/out/stack_scores.tsv and stack_scores.md
+  python3 -I pipelines/stacking/1-select/score_stack.py [--reader-dir pipelines/stacking/out/reader]
+Outputs: pipelines/stacking/out/stack_scores.tsv and stack_scores.md
 """
 import argparse, glob, json, os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-W = json.load(open(os.path.join(ROOT, "stacking", "stacking_weights.json")))
+ROOT = str(paths.ROOT)
+W = json.load(open(os.path.join(str(paths.STACKING), "1-select", "stacking_weights.json")))
 MODELS = ("deepseek", "mimo")
 
 
@@ -85,7 +89,7 @@ def score_design(rec):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reader-dir", default=os.path.join(ROOT, "stacking", "out", "reader"))
+    ap.add_argument("--reader-dir", default=os.path.join(str(paths.STACKING_OUT), "reader"))
     a = ap.parse_args()
     rows = []
     for f in sorted(glob.glob(os.path.join(a.reader_dir, "*.json"))):
@@ -100,7 +104,7 @@ def main():
         return
     rows.sort(key=lambda r: -r["score"])
     cols = list(rows[0].keys())
-    out = os.path.join(ROOT, "stacking", "out")
+    out = str(paths.STACKING_OUT)
     with open(os.path.join(out, "stack_scores.tsv"), "w") as o:
         o.write("\t".join(cols) + "\n")
         for r in rows:

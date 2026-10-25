@@ -6,14 +6,18 @@ open. Reads the runs in ~/.tb-graders/cwe/jobs/<slug>-<model>-r*/ (the current v
 are there (already moved by snapshot_experiment.sh), it reads the latest experiment version's runs.
 Never fails the caller: on any problem it writes what it can and exits 0.
 
-  python3 -I pipeline/trial_summary.py SLUG
+  python3 -I common/trial/trial_summary.py SLUG
 """
 import glob, json, os, re, sys
+from pathlib import Path
+
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HOME = os.path.expanduser("~")
 JOBS = os.path.join(HOME, ".tb-graders/cwe/jobs")
 EXP = os.path.join(HOME, ".tb-graders/cwe/experiments")
-ROOT = os.path.join(HOME, "cwe-bench")
+ROOT = str(paths.ROOT)
 
 
 def key(name):

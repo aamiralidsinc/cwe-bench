@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-. "$HOME/cwe-bench/pipeline/docker-tuning.env" 2>/dev/null || true
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_DOCKER_TUNING" 2>/dev/null || true
 # Run a Harbor task with Claude Code driving DeepSeek V4.1 Flash or MiMo-V2.6-Pro.
 #
 #   run_trial.sh <deepseek|mimo> <task-dir> [attempts] [extra harbor args...]
@@ -16,15 +17,14 @@ shift $(( $# < 3 ? $# : 3 ))
 
 # First file found wins: $CWE_MODELS_ENV, ~/.tb-graders/cwe/models.env, then the
 # repo's git-ignored .env.
-here=$(cd "$(dirname "$0")" && pwd)
-for env_file in "${CWE_MODELS_ENV:-}" "$HOME/.tb-graders/cwe/models.env" "$here/../../.env"; do
+for env_file in "${CWE_MODELS_ENV:-}" "$HOME/.tb-graders/cwe/models.env" "$CWE_ROOT/../.env"; do
   if [ -n "$env_file" ] && [ -f "$env_file" ]; then set -a; . "$env_file"; set +a; break; fi
 done
 
 # Per-run hold: build/<task>/hold_<model> stops any NEW run of that task/model from
 # starting (checked on every run, so it also stops a trial.py loop that is already
 # going, e.g. after the same runs were started in parallel by hand).
-hold="$here/../build/$(basename "$task")/hold_$model"
+hold="$CWE_BUILD/$(basename "$task")/hold_$model"
 if [ -f "$hold" ]; then echo "held: $hold exists; not starting a run" >&2; exit 3; fi
 
 extra=()
@@ -60,11 +60,11 @@ extra+=(--ae API_TIMEOUT_MS=1200000)
 
 # Harbor does not record the task's agent time limit in a trial; pass it as an env
 # var so each trial's config.json carries the limit it ran under (read by
-# build/audit_results.py). Runs before 2026-10-15 have no such var: they ran at 3600 s.
+# common/audit/audit_results.py). Runs before 2026-10-15 have no such var: they ran at 3600 s.
 limit=$(awk '/^\[/{s=$0} s=="[agent]" && /^timeout_sec/{print int($3)}' "$task/task.toml")
 # Optional longer limit for a re-run after a timeout (user, 2026-10-16: a run that fails by hitting
 # the 2 h limit is re-run with 3 h). CWE_AGENT_TIMEOUT_MULT=1.5 -> Harbor's agent timeout x1.5,
-# and the recorded limit (CWE_AGENT_LIMIT_SEC, read by build/audit_results.py) matches it.
+# and the recorded limit (CWE_AGENT_LIMIT_SEC, read by common/audit/audit_results.py) matches it.
 mult_args=()
 if [ -n "${CWE_AGENT_TIMEOUT_MULT:-}" ]; then
   limit=$(python3 -c "print(int($limit * $CWE_AGENT_TIMEOUT_MULT))")
@@ -73,7 +73,7 @@ fi
 [ -n "$limit" ] && extra+=(--ae "CWE_AGENT_LIMIT_SEC=$limit")
 
 # Keep the container (stopped) after the run instead of deleting it, so the agent's
-# final code can be saved and, if grading broke, re-graded. build/trial.py saves the
+# final code can be saved and, if grading broke, re-graded. common/trial/trial.py saves the
 # code, then removes containers of clean solves and lists the rest for review.
 extra+=(--ek keep_containers=true)
 

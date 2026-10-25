@@ -1,16 +1,16 @@
 # Stacking build addendum (step 4 of the stacking pipeline), v2, 2026-10-24
 
 **v2 (2026-10-24):** rules 5, 7 and 10 rewritten. In batch 1 (30 tasks), 137 of 155 traps had a
-sentence of their own in instruction.md (`stacking/out/listing_audit.json`), so each task read as a
+sentence of their own in instruction.md (`pipelines/stacking/out/listing_audit.json`), so each task read as a
 checklist. Rules 5 and 10 (and fairness S1) asked for a stated value per hidden route; rule 7 alone
-did not hold against them. A post-build listing check (`stacking/run_listing_check.sh`) now enforces
+did not hold against them. A post-build listing check (`pipelines/stacking/4-listing/run_listing_check.sh`) now enforces
 rule 7.
 
 **What it is:** an add-on to the build prompt, not a replacement.
-- The builder follows every rule in `builder/TASK-BUILD-PROMPT-v1.md` (the Design, Report, Tests and
+- The builder follows every rule in `common/builder/TASK-BUILD-PROMPT-v1.md` (the Design, Report, Tests and
   Proof sections; the rule to state one general property and never describe surfaces).
 - This addendum is appended after the per-task section.
-- Its input is the stacking reader's record (`stacking/out/reader/<id>.json`) and its chosen
+- Its input is the stacking reader's record (`pipelines/stacking/out/reader/<id>.json`) and its chosen
   design.
 
 ---8<---
@@ -51,9 +51,9 @@ pinned code before you rely on it. The record is a lead.
    - General contracts that hold for every route stay: the refusal form (for example "a client
      error, with no effect"), an operator opt-in, "keep every legitimate use working".
    - Keep the report short: the goal in a few lines, the property, the general contracts.
-   - After the build, `stacking/run_listing_check.sh` classifies every hidden trap against the
+   - After the build, `pipelines/stacking/4-listing/run_listing_check.sh` classifies every hidden trap against the
      report. One NAMED hidden trap, or more than one DESCRIBED hidden trap, is a FAIL. Once the
-     reviewer is calibrated (`stacking/LISTING_ENFORCE`), a FAIL means the task is not marked sound.
+     reviewer is calibrated (`pipelines/stacking/4-listing/LISTING_ENFORCE`), a FAIL means the task is not marked sound.
 
 **History rules** (by the record's `pattern`)
 8. **H3a / H3b (fix of a fix):**
@@ -85,10 +85,10 @@ pinned code before you rely on it. The record is a lead.
 - `reader_record`;
 - `concepts` (groups of trap ids);
 - `history`: advisories A and B with their fix commits, `pinned_commit` and its rule;
-- `score_at_build`: from `stacking/score_stack.py`;
+- `score_at_build`: from `pipelines/stacking/1-select/score_stack.py`;
 - `control_slug`.
 
-**Exact manifest fields the static conformance check reads (step 5, `stacking/check_stack.py`). Emit these literally — the field NAMES and VALUES below must match, or the build is rejected before the container gate:**
+**Exact manifest fields the static conformance check reads (step 5, `pipelines/stacking/3-build-gate/check_stack.py`). Emit these literally — the field NAMES and VALUES below must match, or the build is rejected before the container gate:**
 
 `manifest.traps[]` — one object per trap:
 - `id` (string) — referenced by `stacking.concepts`.

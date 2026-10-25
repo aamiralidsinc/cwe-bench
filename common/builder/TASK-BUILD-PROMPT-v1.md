@@ -1,14 +1,14 @@
 # Task-build prompt, v1
 
-> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `builder/templates/` and follow `builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
+> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `common/builder/templates/` and follow `common/builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `common/builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
 
 
 | | |
 |---|---|
 | Version | `build-v1`, 2026-10-16 |
-| Spec | `builder/PROMPT-TEMPLATES-SPEC.md` §1.3, §1.5, §3.2 |
-| Rules digest made from | `builder/BUILDER.md` (§3a–3j as of 2026-10-16), `builder/BRIEF-trap-stack.md`, `research/round1-analysis/B-failure-modes.md` §3b/§4, `research/peer-analysis-2026-10-16.md` |
-| Replaces | `builder/PROMPT-task-build.md` (first draft, kept for reference) |
+| Spec | `common/builder/PROMPT-TEMPLATES-SPEC.md` §1.3, §1.5, §3.2 |
+| Rules digest made from | `common/builder/BUILDER.md` (§3a–3j as of 2026-10-16), `common/builder/BRIEF-trap-stack.md`, `docs/research/round1-analysis/B-failure-modes.md` §3b/§4, `docs/research/peer-analysis-2026-10-16.md` |
+| Replaces | `common/archive/old-prompts/PROMPT-task-build.md` (first draft, kept for reference) |
 
 `BUILDER.md` stays the authority. When it changes, regenerate the shared core and bump the version.
 
@@ -36,10 +36,10 @@
   build. Log the change. Never re-run a stopped prompt on another model.
 
 ### After the builder reports (separate briefs, in order)
-1. Blind fix: `builder/BLIND-FIX-BRIEF.md`, a fresh agent. A target model never writes the blind fix
+1. Blind fix: `common/blindfix/BLIND-FIX-BRIEF.md`, a fresh agent. A target model never writes the blind fix
    for its own task.
-2. Fairness review: `builder/FAIRNESS-REVIEW-BRIEF.md`, another fresh agent.
-3. Full strict gate: `python3 -I builder/gate.py <slug>`.
+2. Fairness review: `common/fairness/FAIRNESS-REVIEW-BRIEF.md`, another fresh agent.
+3. Full strict gate: `python3 -I common/gate/gate.py <slug>`.
 4. Trials: both models, up to 3 runs each, offline, 2 h limit.
 5. Post-run audit of every graded run.
 6. Pattern B: check that every route has its row in `build/audit/uncovered-routes.tsv`, with
@@ -222,7 +222,7 @@ fix cannot find is unfair: remove it.
 - **Offline.** Install every dependency, tool and service the project and tests need; nothing may
   be downloaded at test time. Services start from `test.sh`.
 - **Packages:** `patch`, `curl`, `ca-certificates`, `bash`, `git`.
-- **Agent layer.** Append `harness/claude-code.Dockerfile.snippet` unchanged at the end.
+- **Agent layer.** Append `common/trial/claude-code.Dockerfile.snippet` unchanged at the end.
 - **No test code in the image.** The agent shares the container. Pre-build against stubs; `test.sh`
   copies the real tests in at grading time.
 - **Project tests.** The project's own tests for the affected area must pass in the image at the
@@ -307,7 +307,7 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 ## Deliverables
 **`tasks/{{SLUG}}/`:**
 - `instruction.md`;
-- `task.toml`, from `builder/templates/`, with `[metadata]` (incl. the delivery fields) filled in and
+- `task.toml`, from `common/builder/templates/`, with `[metadata]` (incl. the delivery fields) filled in and
   `network_mode = "no-network"` (no allowlist);
 - `environment/Dockerfile`;
 - `solution/solve.sh` and `solution/fix.patch`;
@@ -331,15 +331,15 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 
 Pattern B: the register rows (see Design).
 
-Use `builder/templates/` and `harness/smoke-task/` for the layout.
+Use `common/builder/templates/` and `common/trial/smoke-task/` for the layout.
 
 ## Run the gate
 Run the stages in order, one at a time:
 ```
-python3 -I builder/gate.py {{SLUG}} --only static
-python3 -I builder/gate.py {{SLUG}} --only nop
-python3 -I builder/gate.py {{SLUG}} --only oracle
-python3 -I builder/gate.py {{SLUG}} --only patches
+python3 -I common/gate/gate.py {{SLUG}} --only static
+python3 -I common/gate/gate.py {{SLUG}} --only nop
+python3 -I common/gate/gate.py {{SLUG}} --only oracle
+python3 -I common/gate/gate.py {{SLUG}} --only patches
 ```
 In static, only the missing `blind` patch and the missing `FAIRNESS.md` may remain; others write
 those after you. Do NOT write them yourself, and do NOT run trials or any target model.

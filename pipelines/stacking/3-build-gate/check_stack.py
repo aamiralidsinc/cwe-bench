@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Step 5 of the stacking pipeline: static check that a built stacked task meets STACKING-BUILD-ADDENDUM.md.
 
-Runs before the container gate (builder/gate.py, which then executes every patch check with its
+Runs before the container gate (common/gate/gate.py, which then executes every patch check with its
 expected outcome). No Docker, no model. Exit 0 = conforming, 1 = problems (listed).
 
 Checks:
@@ -14,15 +14,18 @@ Checks:
   - the control task directory exists, and its instruction.md is identical to the stacked task's
     (rule 13; added 2026-10-24).
 
-  python3 -I stacking/check_stack.py SLUG [--root <cwe-bench dir>]
+  python3 -I pipelines/stacking/3-build-gate/check_stack.py SLUG [--root <cwe-bench dir>]
 """
 import argparse, json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug")
-    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--root", default=str(paths.ROOT))
     a = ap.parse_args()
     b = os.path.join(a.root, "build", a.slug)
     problems = []

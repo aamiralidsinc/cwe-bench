@@ -1,12 +1,12 @@
 #!/bin/bash
-# drive.sh <deepseek|mimo> <command...>
+# common/launch/drive.sh <deepseek|mimo> <command...>
 #
 # Runs the given command with Claude Code pointed at DeepSeek V4.1 Flash or
 # MiMo-V2.6-Pro instead of the (capped) Claude account -- the same base-URL
-# override that harness/run_trial.sh uses for trials. This lets the EXISTING
-# generation launchers (run_build.sh / run_blindfix.sh / run_fairness.sh /
-# run_fairfix.sh) be "model driven" without editing them or any per-candidate
-# prompt: only the model that answers changes.
+# override that common/trial/run_trial.sh uses for trials. This lets the EXISTING
+# generation launchers (common/launch/run_build.sh / common/blindfix/run_blindfix.sh /
+# pipelines/sibling/9-fairness/run_fairness.sh / pipelines/sibling/10-fairfix/run_fairfix.sh)
+# be "model driven" without editing them or any per-candidate prompt: only the model that answers changes.
 #
 # The driver model is used ONLY to generate and review tasks. Trials still
 # evaluate every task on BOTH targets via run_trial.sh -- that is unchanged and
@@ -15,13 +15,14 @@
 #   MODEL is exported so run_*.sh's `--model "${MODEL:-...}"` uses the driver.
 #
 # Usage examples:
-#   drive.sh deepseek bash run_build.sh my-task-ds
-#   drive.sh mimo     bash run_fairness.sh my-task-mm
+#   common/launch/drive.sh deepseek bash common/launch/run_build.sh my-task-ds
+#   common/launch/drive.sh mimo     bash pipelines/sibling/9-fairness/run_fairness.sh my-task-mm
 set -uo pipefail
-DRIVER=${1:?usage: drive.sh <deepseek|mimo> <command...>}; shift || true
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+DRIVER=${1:?usage: common/launch/drive.sh <deepseek|mimo> <command...>}; shift || true
 
-# First env file found wins (same search order as harness/run_trial.sh).
-for env_file in "${CWE_MODELS_ENV:-}" "$HOME/.tb-graders/cwe/models.env" "$HOME/cwe-bench/.env" "$HOME/.env"; do
+# First env file found wins (same search order as common/trial/run_trial.sh).
+for env_file in "${CWE_MODELS_ENV:-}" "$HOME/.tb-graders/cwe/models.env" "$CWE_ROOT/.env" "$HOME/.env"; do
   if [ -n "$env_file" ] && [ -f "$env_file" ]; then set -a; . "$env_file"; set +a; break; fi
 done
 

@@ -2,10 +2,10 @@
 
 **v2:** rule 3 added (keep behaviour the fix itself must add; comfyui lost its carry-over contract in v1).
 
-**What it is:** the prompt `stacking/run_upgrade_stack.sh` gives the upgrade agent. It rewrites ONE
+**What it is:** the prompt `pipelines/stacking/5-upgrade/run_upgrade_stack.sh` gives the upgrade agent. It rewrites ONE
 built stacked task's `instruction.md` so it passes build rule 7 (the one-bug test) of
 `STACKING-BUILD-ADDENDUM.md` v2. Nothing else changes: no tests, no reference fix, no manifest, no
-image, so no rebuild and no container gate. It is the stacking form of `builder/UPGRADE-PROMPT.md`
+image, so no rebuild and no container gate. It is the stacking form of `pipelines/sibling/upgrade/UPGRADE-PROMPT.md`
 (the sibling upgrade), cut down to its instruction step, because stacked tasks already have their
 traps and tests. `run_stack_pipeline.sh` is not involved.
 

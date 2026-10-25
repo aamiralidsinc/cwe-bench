@@ -1,54 +1,70 @@
-# cwe-bench task pipeline
+# cwe-bench
 
-A pipeline that generates Harbor-format **security-fix** benchmark tasks: a real
-open-source repo checked out at a vulnerable commit plus a realistic
-vulnerability report; an AI coding agent must fix it; hidden tests exploit the
-hole through a real entry point and confirm the feature still works. A task is
-accepted only when it is failed on 3/3 runs by both target models
-(DeepSeek V4.1 Flash and Xiaomi MiMo-V2.6-Pro).
+A factory for **security-fix benchmark tasks** in the Harbor format. Each task is a real open-source repository at a
+vulnerable commit, plus a realistic vulnerability report. An AI coding agent must fix the flaw without breaking the
+product. Hidden behavioural tests attack the flaw through real entry points, and check that legitimate use still
+works.
 
-See **[ALGORITHM.md](ALGORITHM.md)** for the full design, the three task-shape
-branches, the scoring model, and the learning loop.
+A task is a **breaker** when both target models, DeepSeek V4.1 Flash and Xiaomi MiMo-V2.6-Pro, fail it on 3 of 3
+runs, every failing run passes an independent audit, and a fairness review finds the task fair.
 
-## Pipeline
+## Where to start
 
-```
-sourcer ──► screener/scoring ──► builder ──► gate ──► trial (early-abort) ──► verdict
-```
-
-Driver (mode-selectable, resumable from filesystem state):
-
-```
-python3 build/run.py simple   <slug>     # mined-only (Branch A, baseline)
-python3 build/run.py sibling  <slug>     # mined + injected sibling (Branch B)
-python3 build/run.py stacking <slug>     # several real co-present vulns (Branch C)
-python3 build/run.py screen   <mined|stacking>
-python3 build/run.py status   <slug>
-```
+| You want to… | Read |
+|---|---|
+| run or extend the **sibling-injection** pipeline | `pipelines/sibling/GUIDE.md`, then `COMPONENTS.md` |
+| run or extend the **stacking** pipeline | `pipelines/stacking/GUIDE.md`, then `COMPONENTS.md` |
+| understand the shared gate, trial, audit and launch tools | `common/README.md` |
+| find new candidate advisories | `sourcer/README.md` |
+| see results | `reports/BREAKERS.md`, `reports/SINGLE-MODEL-BREAKERS.md`, `reports/stacking-night-20261025.md` |
+| understand the design | `docs/ALGORITHM.md`, `docs/BETTER-PATTERNS.md`, `docs/STACKING-EXPLORATION.md` |
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `ALGORITHM.md` | design: pipeline, branches, scoring, learning loop |
-| `sourcer/` | OSV sourcer, candidate index, `weights.json` scoring config, screeners |
-| `sourcer/stacking_screener.py` | Branch C: rank small repos with co-present real vulns |
-| `builder/BUILDER.md`, `BUILDER-stacking.md` | briefs a builder agent follows |
-| `builder/gate.py` | scripted acceptance gate (static → nop → oracle → patches) |
-| `builder/templates/` | task skeleton: `task.toml`, `test.sh`, `score.py` |
-| `build/run.py`, `trial.py`, `status.py` | driver, sequential early-abort trial runner, status |
-| `build/<slug>/` | per-task build artifacts: manifest, checks, gate report |
-| `tasks/<slug>/` | the Harbor tasks (instruction, env, solution, tests) |
-| `harness/run_trial.sh` | run a task with Claude Code driving DeepSeek/MiMo |
+```
+README.md            this file
+.cwe-bench-root      marks the repo root (common/paths.* look for it; do not move it)
+common/              shared infrastructure: launch, builder, screener, gate, blindfix, trial, audit, fairness,
+                     versioning, util. One copy of each file. paths.py / paths.sh define every location.
+pipelines/
+  sibling/           sibling-injection: 1-pick 2-screen 3-rank 4-select 5-prepare 6-build 9-fairness 10-fairfix
+                     upgrade; out/ (batch records); archive/ (old versions, one-offs)
+  stacking/          stacking: 1-select 2-prepare 3-build-gate 4-listing 5-upgrade 6-trial 7-fairness 8-fairfix;
+                     out/; archive/
+sourcer/             advisory sourcing (OSV index, scoring); reserve/ holds the reserve sources (R1-R5)
+experiments/         precision_validation/: a FAILED experiment, kept for the record. Do not use (see its README)
+reports/             breaker registers and run reports
+docs/                design notes, research, history, peer material
+attic/               the round 1/2 driver from before the sibling pipeline (not runnable)
+build/               run data: build/<slug>/ (build records, gate markers, manifests), build/pipeline/, build/audit/
+tasks/               run data: tasks/<slug>/, the Harbor task packages
+```
 
-## Not in the repo (reproducible / secret)
+## The two pipelines
 
-- `sourcer/index/` (the candidate SQLite/TSV) — regenerate by running the sourcer.
-- OSV dumps, Docker images, clones, build caches — live outside the tree.
-- API keys (`.env`) — see `harness/models.env.example` for the variables.
+Both pipelines produce the same kind of task and share the build prompt, gate, trial, audit and fairness tools.
+They differ in **how the hidden difficulty is made**:
 
-## Status (pilot)
+- **Sibling injection:** the reported flaw, plus injected sibling variants of it at other sites in the same repo.
+- **Stacking:** several independent real flaws behind one report. Each stacked task has a one-bug `-control` twin
+  with a byte-identical instruction, which measures what stacking adds.
 
-6 mined-only tasks built: all solved by both models (mined difficulty alone does
-not clear the bar — the fix is derivable). The injected-sibling and stacking
-branches are the path to breakers; see ALGORITHM.md and `build/queue.json`.
+## How the code is kept unambiguous
+
+- **One live copy of each component.** Its path is the CURRENT version. Each pipeline's `COMPONENTS.md` names the
+  last version proven in real runs, and where every older version is archived.
+- **Old versions are never deleted.** They live in the owning `archive/` folder, unchanged, indexed in
+  `archive/README.md` (original path, date, sha256). Archived files use the old layout and are not runnable as-is.
+- **Every script finds the repo through `common/paths.py` / `common/paths.sh`.** No script builds paths from its own
+  location.
+
+## Machines
+
+The pipelines run on the VM (`~/cwe-bench`, a git checkout of this repo). The Mac checkout holds the sourcer's
+candidate index (`sourcer/index/`, git-ignored) and runs the Mac-side steps (picking, ranking, selection reading).
+
+Not in git, because the data is large or secret:
+- the candidate indexes;
+- trial runs and task versions (`~/.tb-graders/cwe/` on the VM);
+- precision_validation's Actions output;
+- API keys (see `common/launch/models.env.example`).

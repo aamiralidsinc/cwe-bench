@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Where did each trial's agent time go? Build vs test vs deps vs other commands vs model.
 
-    python3 build/time_breakdown.py            -> build/audit/time_breakdown.tsv + summary
+    python3 common/audit/time_breakdown.py            -> build/audit/time_breakdown.tsv + summary
 
 Source: the Claude Code session transcript saved in each trial
 (agent/sessions/**/*.jsonl). Every tool_use and its tool_result carry timestamps, so a
@@ -12,9 +12,13 @@ import json
 import re
 import statistics
 from datetime import datetime
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 OUT = ROOT / "build" / "audit"
 

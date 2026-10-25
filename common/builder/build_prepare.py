@@ -1,4 +1,4 @@
-"""Fill builder/TASK-BUILD-PROMPT-v1.md for one host into build/<slug>/BUILD-PROMPT.md.
+"""Fill common/builder/TASK-BUILD-PROMPT-v1.md for one host into build/<slug>/BUILD-PROMPT.md.
 
 The prompt body is cut verbatim between the ---8<--- markers; FIX_SITES / UNCOVERED_ROUTES /
 SCREEN_RECORD come from the screener record; DESIGN_PLAN and HOST_NOTES from a small spec file.
@@ -9,10 +9,14 @@ SPEC.json: {slug, entry_id, pattern, track, advisory, vuln_commit, fix_commits:[
 Writes <project_root-on-this-machine>/build/<slug>/BUILD-PROMPT.md (locally, to ship to the VM).
 """
 import json, os, re, sys
+from pathlib import Path
+
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE = os.path.join(HERE, "..", "..", "builder", "TASK-BUILD-PROMPT-v1.md")
-RECORDS = os.path.join(HERE, "..", "review", "screener-v2")
+TEMPLATE = str(paths.BUILD_TEMPLATE)
+RECORDS = str(paths.SCREENER_RECORDS)
 MARK = "---8<---"
 
 
@@ -50,7 +54,7 @@ def main(spec_path):
     left = re.findall(r"\{\{[A-Z_]+\}\}", out)
     if left:
         raise SystemExit(f"unfilled slots: {left}")
-    d = os.path.join(HERE, "..", "..", "build", spec["slug"])
+    d = os.path.join(str(paths.BUILD), spec["slug"])
     os.makedirs(d, exist_ok=True)
     p = os.path.join(d, "BUILD-PROMPT.md")
     open(p, "w").write(out)

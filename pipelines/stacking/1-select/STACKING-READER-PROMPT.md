@@ -2,12 +2,12 @@
 
 Operator notes (not sent):
 - One run per candidate. Slots:
-  - `{{CANDIDATE}}`: one row from `stacking/out/h4_candidates.tsv`, `h3b_pairs.tsv` (with its
+  - `{{CANDIDATE}}`: one row from `pipelines/stacking/out/h4_candidates.tsv`, `h3b_pairs.tsv` (with its
     `szz_pairs.tsv` row) or `h12_groups.tsv`;
   - `{{SCREENER_RECORD}}`: the screener-v2 JSON when one exists, else `none`;
   - `{{REPO_DIR}}`: a checkout at the pinned commit;
   - `{{PRIORS}}`: the tier table, STACKING-EXPLORATION.md §2.2-2.3.
-- Output: `stacking/out/reader/<candidate_id>.json`, which the scorer (step 3) reads.
+- Output: `pipelines/stacking/out/reader/<candidate_id>.json`, which the scorer (step 3) reads.
 - The reader reads code and writes one JSON file. It builds nothing and runs nothing against the
   project.
 

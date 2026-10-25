@@ -5,7 +5,7 @@
 #
 # Launch through the model driver; there is deliberately no default model, so this can never fall
 # back to the capped Claude account:
-#     ./drive.sh deepseek bash run_blindfix.sh <slug>
+#     common/launch/drive.sh deepseek bash common/blindfix/run_blindfix.sh <slug>
 #
 # The blind agent must see the SAME tree a trial agent sees: /app of the task's own image
 # (upstream + injection + build steps). Until 2026-10-20 it got a fresh upstream clone, so the
@@ -17,15 +17,16 @@
 #   0 blind.patch wired   2 bad input/setup      3 image build or /app extract failed
 #   4 injection missing   5 agent failed/no patch 6 blind.patch does not apply to the tree
 set -uo pipefail
-SLUG=${1:?usage: run_blindfix.sh <slug>}
-R="$HOME/cwe-bench"; ENV="$R/tasks/$SLUG/environment"; B="$R/build/$SLUG"
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+SLUG=${1:?usage: common/blindfix/run_blindfix.sh <slug>}
+R="$CWE_ROOT"; ENV="$R/tasks/$SLUG/environment"; B="$R/build/$SLUG"
 WORK="$HOME/.tb-graders/cwe/blind/$SLUG"; LOG="$B/blindfix.log"; IMG="cwe-blind-src:$SLUG"
 mkdir -p "$B"; : > "$LOG"
 log() { echo "[$(date -u +%T)] $SLUG blind: $*" | tee -a "$LOG"; }
 die() { log "ERROR($1): $2"; echo "error $1: $2" > "$B/blind_status.txt"; exit "$1"; }
 echo "running" > "$B/blind_status.txt"
 
-[ -n "${MODEL:-}" ] || die 2 "MODEL not set; launch via ./drive.sh deepseek bash run_blindfix.sh $SLUG"
+[ -n "${MODEL:-}" ] || die 2 "MODEL not set; launch via common/launch/drive.sh deepseek bash common/blindfix/run_blindfix.sh $SLUG"
 [ -f "$ENV/Dockerfile" ] || die 2 "no $ENV/Dockerfile"
 [ -f "$R/tasks/$SLUG/instruction.md" ] || die 2 "no instruction.md"
 # The VM builds with DOCKER_BUILDKIT=0, which silently drops heredoc bodies (fission-ds, 2026-10-20).
@@ -61,7 +62,7 @@ if [ "${BLIND_PREPARE_ONLY:-0}" = 1 ]; then echo "prepared" > "$B/blind_status.t
 cp -a "$WORK/pristine" "$WORK/app"
 cp "$R/tasks/$SLUG/instruction.md" "$WORK/instruction.md"
 [ -d "$B/libs" ] && cp -r "$B/libs" "$WORK/libs"
-BRIEF=$(cat "$R/builder/BLIND-FIX-BRIEF.md") || die 2 "no builder/BLIND-FIX-BRIEF.md"
+BRIEF=$(cat "$CWE_BLIND_BRIEF") || die 2 "no common/blindfix/BLIND-FIX-BRIEF.md"
 P="$BRIEF
 
 WORK=$WORK . Read ONLY \$WORK/instruction.md and \$WORK/app (and \$WORK/libs if present). Do NOT open anything under /home/mara/cwe-bench or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
@@ -72,7 +73,7 @@ timeout 5400 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --output-format json > "$B/blind-run.json" 2> "$B/blind-run.err"
 rc=$?
 # Full agent details (result text, errors, stderr tail) -> build/<slug>/blind_status.json.
-st=$(python3 "$R/pipeline/agent_status.py" "$B/blind-run.json" "$rc" --details "$B/blind_status.json")
+st=$(python3 "$CWE_AGENT_STATUS" "$B/blind-run.json" "$rc" --details "$B/blind_status.json")
 log "agent exit $rc: $st"
 # An agent cut off by an API error, quota or crash may leave a half-finished patch; wiring that in
 # as an expected-pass fix would mark a fair task unsound (backstage-ds, 2026-10-20).

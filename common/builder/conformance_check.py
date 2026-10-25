@@ -3,7 +3,7 @@
 
 The machinery (not a prompt) enforces the delivery format: this returns the list of ways a task
 deviates from the frontier-swe template as adopted for cwe-bench (reports/FRONTIER-SWE-FORMAT-
-COMPARISON.md + builder/FRONTIER-CONFORMANCE-SPEC.md). gate.py calls problems() in its static stage,
+COMPARISON.md + common/builder/FRONTIER-CONFORMANCE-SPEC.md). gate.py calls problems() in its static stage,
 so a non-conforming task fails the gate regardless of what any build prompt said.
 
 User-chosen deviations from a literal template copy (2026-10-21): name stays cwe-bench/<slug> and

@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""Grow the H4 pool: run the UNCHANGED sibling screener prompt (builder/SCREENER-PROMPT-v2.md, read as is)
-on more candidate advisories, writing records into stacking/out/screener/ (never into sourcer/review/).
+"""Grow the H4 pool: run the UNCHANGED sibling screener prompt (common/screener/SCREENER-PROMPT-v2.md, read as is)
+on more candidate advisories, writing records into pipelines/stacking/out/screener/ (never into sourcer/review/).
 
 Selection (--pick N): the next N candidates by index score (sourcer/index/candidates.sqlite, read-only),
-one per repo, skipping repos already screened (sourcer/review/screener-v2 and stacking/out/screener)
+one per repo, skipping repos already screened (common/screener/records and pipelines/stacking/out/screener)
 or already built (--built dirs), DoS-only CWEs, repos over 1.5 GB, and entries without a fix commit.
-Writes the list to stacking/out/screener_jobs.jsonl (merged, like make_reader_jobs.py).
+Writes the list to pipelines/stacking/out/screener_jobs.jsonl (merged, like make_reader_jobs.py).
 
 Run (--run): per job, blobless clone, worktree at the parent commit, fix diff saved beside it, slots
 filled (lessons-v2, candidate row, code location, LATEST=none, output path, 20-minute time box), then
 headless Claude Code with only Read/Grep/Glob/Write. Jobs with an existing output are skipped.
 
-  python3 -I stacking/run_screener.py --pick 100 --built <tasks dirs...>
-  CLAUDE_BIN=... python3 -I stacking/run_screener.py --run [--parallel 3] [--model claude-opus-5-5] [--dry-run]
-Then: python3 -I stacking/h4_rank.py --recs sourcer/review/screener-v2 stacking/out/screener --built ...
+  python3 -I common/screener/run_screener.py --pick 100 --built <tasks dirs...>
+  CLAUDE_BIN=... python3 -I common/screener/run_screener.py --run [--parallel 3] [--model claude-opus-5-5] [--dry-run]
+Then: python3 -I pipelines/stacking/1-select/h4_rank.py --recs common/screener/records pipelines/stacking/out/screener --built ...
 """
 import argparse, glob, json, os, re, shutil, sqlite3, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ST = os.path.join(ROOT, "stacking")
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = str(paths.ROOT)
+ST = str(paths.STACKING)
 OUTDIR = os.path.join(ST, "out", "screener")
 JOBS = os.path.join(ST, "out", "screener_jobs.jsonl")
-DB = os.path.join(ROOT, "sourcer", "index", "candidates.sqlite")
-PROMPT = os.path.join(ROOT, "builder", "SCREENER-PROMPT-v2.md")
+DB = str(paths.CANDIDATES_DB)
+PROMPT = str(paths.SCREENER_PROMPT)
 CLONES = os.path.expanduser("~/.tb-graders/cwe/stacking/clones")
 TREES = os.path.expanduser("~/.tb-graders/cwe/stacking/screen-trees")
 DOS = {"CWE-400", "CWE-770", "CWE-1333", "CWE-674", "CWE-834", "CWE-407", "CWE-606"}
@@ -45,7 +49,7 @@ def norm(repo):
 
 def screened_repos():
     repos = set()
-    for d in (os.path.join(ROOT, "sourcer", "review", "screener-v2"), OUTDIR):
+    for d in (str(paths.SCREENER_RECORDS), OUTDIR):
         for f in glob.glob(os.path.join(d, "*.json")):
             if os.path.basename(f).startswith(("._", "_")) or f.endswith(".run.json"):
                 continue

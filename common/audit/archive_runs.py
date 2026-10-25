@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lock every finished trial, every task version and the harness into a write-once archive.
 
-    ~/.local/share/uv/tools/harbor/bin/python build/archive_runs.py
+    ~/.local/share/uv/tools/harbor/bin/python common/audit/archive_runs.py
 
 (Harbor's Python, because task fingerprints use Harbor's own `dirhash`.)
 
@@ -43,7 +43,10 @@ from pathlib import Path
 
 from dirhash import dirhash
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 CWE = Path.home() / ".tb-graders" / "cwe"
 JOBS, GATE = CWE / "jobs", CWE / "gate-jobs"
 ARCH = Path(os.environ.get("CWE_ARCHIVE", CWE / "archive"))   # override only for test runs
@@ -56,9 +59,9 @@ EXCLUDE_DIR = re.compile(r"(^|[-_])target$|^node_modules$|^\.gradle$|^\.m2$")
 # Used to recover the exact older version a run used, verified by Harbor's fingerprint.
 KNOWN_EDITS = [("timeout_sec = 7200.0", "timeout_sec = 3600.0",
                 "agent limit was 3600 s; changed to 7200 s on 2026-10-15 ~14:20 UTC")]
-HARNESS_FILES = ["harness/run_trial.sh", "build/trial.py", "build/trial_fleet.py",
-                 "build/audit_results.py", "build/time_breakdown.py", "build/archive_runs.py",
-                 "build/TRIAL-PROCEDURE.md", "builder/gate.py", "builder/templates"]
+HARNESS_FILES = ["common/trial/run_trial.sh", "common/trial/trial.py", "attic/round1-2-driver/trial_fleet.py",
+                 "common/audit/audit_results.py", "common/audit/time_breakdown.py", "common/audit/archive_runs.py",
+                 "docs/history/TRIAL-PROCEDURE.md", "common/gate/gate.py", "common/builder/templates"]
 DERIVED_UNTRUSTED = {"runs_deepseek.log", "runs_mimo.log", "trial_detail.json",
                      "trial_detail_deepseek.json", "trial_detail_mimo.json"}
 
@@ -149,7 +152,7 @@ def archive_task_metadata(task):
     dst.mkdir(parents=True)
     for p in src.iterdir():
         if p.name in DERIVED_UNTRUSTED:
-            continue                     # written by the buggy reader; see build/RESULTS-AUDIT.md
+            continue                     # written by the buggy reader; see docs/history/RESULTS-AUDIT.md
         (shutil.copytree if p.is_dir() else shutil.copy2)(p, dst / p.name)
     lock(dst)
 
@@ -376,7 +379,7 @@ def main():
     cols = ["start_utc", "task", "model", "agent_limit_min", "outcome", "reward", "security", "functional",
             "exception", "agent_minutes", "task_fingerprint", "path"]
     with open(ARCH / "INDEX.tsv", "w") as f:
-        f.write(f"# generated {NOW.isoformat(timespec='seconds')} by build/archive_runs.py; "
+        f.write(f"# generated {NOW.isoformat(timespec='seconds')} by common/audit/archive_runs.py; "
                 f"{len(rows)} runs; times are UTC\n" + "\t".join(cols) + "\n")
         for r in rows:
             f.write("\t".join("" if r[c] is None else str(r[c])[:12] if c == "task_fingerprint" else str(r[c])
@@ -402,7 +405,7 @@ def main():
 
 README = """# CWE-bench run archive
 
-Generated {now} UTC by `build/archive_runs.py`. **{n} runs archived.** Everything under
+Generated {now} UTC by `common/audit/archive_runs.py`. **{n} runs archived.** Everything under
 `runs/`, `tasks/*/versions/`, `tasks/*/gate-runs/`, `tasks/*/build-metadata/` and `harness/`
 is write-once and read-only. Unlock deliberately with `chmod -R u+w <folder>`.
 
@@ -411,7 +414,7 @@ is write-once and read-only. Unlock deliberately with `chmod -R u+w <folder>`.
   job and trial: `runs/<task>/<model>/<START-UTC>__<limit>m__<outcome>__<job>__<trial>/`.
   Sort by name to get chronological order. The 60-minute era and the 120-minute era are
   told apart by the `60m` / `120m` field; never pool them without saying so.
-- `outcome` uses the rules in `cwe-bench/build/audit_results.py`: `solved` = reward 1.0;
+- `outcome` uses the rules in `cwe-bench/common/audit/audit_results.py`: `solved` = reward 1.0;
   `failed-<reward>` = graded below 1.0; `-at-timeout` = graded when the agent limit cut it;
   `ungraded-<reason>` = never graded (not a model failure).
 - `RUN.json` holds the facts; `trial/` holds the raw evidence: `agent/claude-code.txt`

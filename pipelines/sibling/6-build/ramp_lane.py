@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Stepped-concurrency build lane for the spike diagnosis: keeps <target> sibling2 builds in flight,
 raising the target on a schedule (default 16 for 45 min, 24 for 45, 30 for 45, then 40 to the end),
-starting one build at a time with jitter. Each build is sibling2/run_pipeline.sh (build -> gate).
+starting one build at a time with jitter. Each build is pipelines/sibling/6-build/run_pipeline.sh (build -> gate).
 
 Safety: if the monitor (/home/mara/spike/monitor.csv) shows docker ps or sshd stuck (> 10 s) for three
 checks in a row, the ramp HOLDS: no new builds start, none are killed, and the level is logged as the
 knee. A manual hold: touch /home/mara/spike/HOLD. The current target is written to
 /home/mara/spike/target_c so the monitor records it.
 
-  python3 -I sibling2/ramp_lane.py [--schedule 16:45,24:45,30:45,40:0]
+  python3 -I pipelines/sibling/6-build/ramp_lane.py [--schedule 16:45,24:45,30:45,40:0]
 """
 import argparse, os, random, subprocess, time
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = str(paths.ROOT)
 SPIKE = "/home/mara/spike"
-LOG = os.path.join(ROOT, "sibling2", "out", "pipeline", "ramp_lane.log")
+LOG = os.path.join(str(paths.SIBLING_OUT / "pipeline"), "ramp_lane.log")
 STUCK_MS = 10000
 
 
@@ -55,7 +59,7 @@ def running_slugs():
             a = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
         except OSError:
             continue
-        if len(a) >= 4 and a[0] == b"bash" and a[1] == b"sibling2/run_pipeline.sh" and a[2] == b"deepseek":
+        if len(a) >= 4 and a[0] == b"bash" and a[1] == b"pipelines/sibling/6-build/run_pipeline.sh" and a[2] == b"deepseek":
             out.add(a[3].decode())
     return out
 
@@ -65,8 +69,8 @@ def main():
     ap.add_argument("--schedule", default="16:45,24:45,30:45,40:0")
     a = ap.parse_args()
     steps = [(int(c), int(m)) for c, m in (s.split(":") for s in a.schedule.split(","))]
-    slugs = [s for s in open(os.path.join(ROOT, "sibling2", "out", "pipeline", "slugs_deepseek.txt")).read().split()
-             if not os.path.exists(os.path.join(ROOT, "build", s, "pipeline.log"))]
+    slugs = [s for s in open(os.path.join(str(paths.SIBLING_OUT / "pipeline"), "slugs_deepseek.txt")).read().split()
+             if not os.path.exists(os.path.join(str(paths.BUILD), s, "pipeline.log"))]
     log(f"ramp lane start: {len(slugs)} slugs, schedule {steps}")
     t0, procs, held, bad, step_logged = time.time(), {}, None, 0, None
     while slugs or procs or running_slugs():
@@ -99,7 +103,7 @@ def main():
             continue
         if slugs and len(running) < target:
             s = slugs.pop(0)
-            procs[s] = subprocess.Popen(["bash", "sibling2/run_pipeline.sh", "deepseek", s], cwd=ROOT,
+            procs[s] = subprocess.Popen(["bash", "pipelines/sibling/6-build/run_pipeline.sh", "deepseek", s], cwd=ROOT,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             log(f"[start] {s} ({len(running) + 1} in flight on box, target {target}, {len(slugs)} left)")
             time.sleep(random.uniform(8, 20))

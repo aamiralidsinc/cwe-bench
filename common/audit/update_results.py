@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Refresh RESULTS.md's task table from the audited ledger (run after every recorded verdict).
+"""Refresh docs/RESULTS.md's task table from the audited ledger (run after every recorded verdict).
 
-    python3 build/postmortem.py record-ready && python3 build/audit_results.py && python3 build/update_results.py
+    python3 common/audit/postmortem.py record-ready && python3 common/audit/audit_results.py && python3 common/audit/update_results.py
 
 Rewrites only the DeepSeek / MiMo / Verdict cells of the "All trialed tasks" table and the
 "Audited verdicts as of" stamp; prose (executive summary, open pairs, corrections) is edited by
@@ -10,9 +10,13 @@ Cells of decided pairs drop "(+N awaiting audit)" (extra solves of an already-SO
 all audited); undecided pairs keep it.
 """
 import re
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 TRACKS = ("mined", "stacking", "injection")
 
 
@@ -25,7 +29,7 @@ def main():
         if len(c) == 5 and c[0] in TRACKS:
             fix = lambda s: re.sub(r" \(\+\d+ awaiting audit\)", "", s) if s.startswith(("SOLVED", "**failed")) else s
             cells[c[1]] = (fix(c[2]), fix(c[3]), c[4])
-    p = ROOT / "RESULTS.md"
+    p = ROOT / "docs" / "RESULTS.md"
     out, changed = [], []
     in_table = False
     for line in p.read_text().splitlines():

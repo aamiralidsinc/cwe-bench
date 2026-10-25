@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Post-build, pre-check normalizer: force expect='security_fail' on every security_fail-kind
 patch check and on the recall checks, so the manifest matches the pipeline's expect vocabulary
-(builder/gate.py accepts security_fail|functional_fail|pass; check_stack.py reads security_fail).
+(common/gate/gate.py accepts security_fail|functional_fail|pass; check_stack.py reads security_fail).
 Leaves functional_fail and pass checks untouched. Safe by definition."""
 import json, os, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 slug = sys.argv[1]
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+root = str(paths.ROOT)
 p = os.path.join(root, "build", slug, "manifest.json")
 try:
     m = json.load(open(p))

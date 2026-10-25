@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Build the reader job list (step 2 input) from the Phase 1 shortlists.
 
-Jobs (one JSON object per line in stacking/out/reader_jobs.jsonl):
+Jobs (one JSON object per line in pipelines/stacking/out/reader_jobs.jsonl):
   H4 : unbuilt hosts offering both a DeepSeek-type and a MiMo-type trap (h4_candidates.tsv)
   H3 : ready fix-of-fix pairs (h3b_pairs.tsv), ordered by the SZZ result:
        H3a-regression, H3b-touching, H3b-elsewhere, add-only, then pairs not yet mined
 Each job carries `pin_from`: commits whose EARLIEST one's parent is the pinned commit (the launcher
 resolves it in the clone), so the code is checked out before any of the fixes.
 
-  python3 -I stacking/make_reader_jobs.py [--h4 9] [--h3 12]
+  python3 -I pipelines/stacking/1-select/make_reader_jobs.py [--h4 9] [--h3 12]
 """
 import argparse, csv, json, os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "stacking", "out")
-RECS = os.path.join(ROOT, "sourcer", "review", "screener-v2")
+ROOT = str(paths.ROOT)
+OUT = str(paths.STACKING_OUT)
+RECS = str(paths.SCREENER_RECORDS)
 DOS = {"CWE-400", "CWE-770", "CWE-1333", "CWE-674", "CWE-834", "CWE-407", "CWE-606"}
 SZZ_ORDER = {"H3a": 0, "H3b1": 1, "H3b2": 2, "H3u": 3}   # renamed 2026-10-22 (was H3a-regression / H3b-touching / H3b-elsewhere / add-only)
 
@@ -67,7 +71,7 @@ def main():
         for j in merged.values():
             o.write(json.dumps(j) + "\n")
     print(f"merged: {len(merged)} jobs in file, {len(new_ids)} new")
-    print(f"{len(jobs)} jobs -> stacking/out/reader_jobs.jsonl "
+    print(f"{len(jobs)} jobs -> pipelines/stacking/out/reader_jobs.jsonl "
           f"(H4 {sum(j['pattern']=='H4' for j in jobs)}, H3 {sum(j['pattern']!='H4' for j in jobs)})")
     for j in jobs:
         print(f"  {j['id']:28} {j['pattern']:4} {j['repo']}")

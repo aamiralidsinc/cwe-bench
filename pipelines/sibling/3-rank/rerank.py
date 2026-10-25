@@ -7,12 +7,15 @@ Every component is tied to a round-1 lesson (see LESSON comments). No network.
   python3 -I rerank.py DB OUT --screened DIR [...]     # also host-rank-screened.tsv
 
 --screened scores screener-v1 records (any *.json under DIR, validated first with
-validate_screen.py; records with errors are skipped and listed) with screen-weights.json:
+pipelines/sibling/3-rank/validate_screen.py; records with errors are skipped and listed) with screen-weights.json:
 score_read = screener observation terms + this script's weakness terms (H5). See
 screen-weights.json "about" for why the computed proxies are left out of score_read.
 """
 import argparse, glob, json, re, sqlite3, sys, csv, os
 from collections import Counter
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -239,7 +242,7 @@ def screen_terms(rec, W):
 
 
 def score_screened(con, llm_rx, screened_dir, weights_path, out_dir):
-    sys.path.insert(0, HERE)
+    sys.path.insert(0, HERE)  # validate_screen.py sits next to this file
     import validate_screen
     W = json.load(open(weights_path))
     rows, skipped = [], []

@@ -49,7 +49,7 @@ HARD RULES:
   potential), STOP and report why — do not ship a weak task.
 
 After your edits, run ONLY the static leak-scan to confirm instruction.md carries no leaked term:
-  python3 -I builder/gate.py {{SLUG}} --only static
+  python3 -I common/gate/gate.py {{SLUG}} --only static
 (A missing blind.patch in static is allowed — it is wired separately.) Do NOT run nop/oracle/patches
 yourself: the launcher re-gates after you, and ONLY when a container gate is actually needed. But you
 MUST keep the task valid by your own reasoning — the pinned code must still FAIL every security test,

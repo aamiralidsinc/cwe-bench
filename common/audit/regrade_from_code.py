@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-grade a trial's SAVED FINAL CODE with the task's current tests (no new model run).
 
-    python3 build/regrade_from_code.py <trial_dir> "<why>"
+    python3 common/audit/regrade_from_code.py <trial_dir> "<why>"
 
 For runs whose container is gone (released after review) but whose final code was harvested
 (<trial>/final-code/, by harvest_code.py): build the task image from tasks/<task>/environment,
@@ -29,7 +29,10 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harvest_code import save_tmp_logs  # noqa: E402
 

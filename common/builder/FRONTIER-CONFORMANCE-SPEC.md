@@ -30,7 +30,7 @@ deliberate deviations the user chose (2026-10-21). Reference: `reports/frontier-
   root-only and verified unreachable before any submission code runs; reap leftover agent procs.
 - **B4 no-network both phases:** `[agent] network_mode = "no-network"`, `[verifier] network_mode =
   "no-network"`, `[verifier.environment] network_mode = "no-network"`; NO allowlist in task.toml;
-  model host allowed at run time via `--allow-agent-host` in `harness/run_trial.sh`.
+  model host allowed at run time via `--allow-agent-host` in `common/trial/run_trial.sh`.
 - **B5 instruction says nothing about tests/grading:** drop "Do not modify or add tests"; keep "do not
   look up the upstream fix / existing implementations"; add "There is no network access."
 - **B6 schema 1.4** + full `[verifier]`, `[verifier.environment]`, `[environment]` blocks with
@@ -56,15 +56,15 @@ deliberate deviations the user chose (2026-10-21). Reference: `reports/frontier-
 - Native runners per language (Java/Go/Rust/TS/Python), each emitting JUnit XML (C).
 
 ## Files to change (pipeline)
-- `builder/templates/task.toml` — the 1.4 skeleton (decisions 1–4, B4/B6/B7/B8, artifacts).
-- `builder/templates/environment.Dockerfile` (NEW) — agent image skeleton (B2/B8/B11/A6 + node + agent snippet).
-- `builder/templates/tests.Dockerfile` (NEW) — verifier image skeleton (B1/B2/B8/B11).
-- `builder/templates/test.sh` — non-root separate-mode scaffold (B3/B9/B10) + our two-group native JUnit runner placeholder; calls score.py.
-- `builder/templates/score.py` — dual scoring: primary threshold reward (unchanged), + metrics.json with passed/total + counts + status (B9, decision 2).
-- `harness/claude-code.Dockerfile.snippet` — install Claude Code for the uid-1000 `agent` user (B2).
-- `harness/run_trial.sh` — pass `--allow-agent-host=api.deepseek.com --allow-agent-host=api.xiaomimimo.com` (B4).
-- `builder/gate.py` — build/grade via the restored /workspace as `agent` (B1/B3/B11); keep nop/oracle/wrong-fix/blind/fairness semantics.
-- `build/harvest_code.py` — collect the final /workspace state as the artifact diff for the record (B1/B11).
+- `common/builder/templates/task.toml` — the 1.4 skeleton (decisions 1–4, B4/B6/B7/B8, artifacts).
+- `common/builder/templates/environment.Dockerfile` (NEW) — agent image skeleton (B2/B8/B11/A6 + node + agent snippet).
+- `common/builder/templates/tests.Dockerfile` (NEW) — verifier image skeleton (B1/B2/B8/B11).
+- `common/builder/templates/test.sh` — non-root separate-mode scaffold (B3/B9/B10) + our two-group native JUnit runner placeholder; calls score.py.
+- `common/builder/templates/score.py` — dual scoring: primary threshold reward (unchanged), + metrics.json with passed/total + counts + status (B9, decision 2).
+- `common/trial/claude-code.Dockerfile.snippet` — install Claude Code for the uid-1000 `agent` user (B2).
+- `common/trial/run_trial.sh` — pass `--allow-agent-host=api.deepseek.com --allow-agent-host=api.xiaomimimo.com` (B4).
+- `common/gate/gate.py` — build/grade via the restored /workspace as `agent` (B1/B3/B11); keep nop/oracle/wrong-fix/blind/fairness semantics.
+- `common/audit/harvest_code.py` — collect the final /workspace state as the artifact diff for the record (B1/B11).
 - Build briefs (`BUILDER.md`, `TASK-BUILD-PROMPT-v1.md`, `PROMPT-task-build.md`): instruct the new structure
   (/workspace, both Dockerfiles with the agent user, tests/Dockerfile, artifacts block, canary GUID, the
   new metadata + the three explanations, the instruction wording, per-group JUnit + time limits).
@@ -75,12 +75,12 @@ deliberate deviations the user chose (2026-10-21). Reference: `reports/frontier-
   clean gate on the sample.
 
 ## STATUS — implemented 2026-10-21
-DONE (machinery-first): builder/templates/ rewritten (task.toml, environment.Dockerfile, tests.Dockerfile,
-test.sh, score.py); harness/claude-code.Dockerfile.snippet (uid-1000); builder/conformance_check.py added
+DONE (machinery-first): common/builder/templates/ rewritten (task.toml, environment.Dockerfile, tests.Dockerfile,
+test.sh, score.py); common/trial/claude-code.Dockerfile.snippet (uid-1000); common/builder/conformance_check.py added
 and WIRED into gate.py check_static (machinery enforces the format); gate.py product-import regexes +
-REQUIRED (tests/Dockerfile) updated; build/harvest_code.py ROOTS=/workspace; harness/run_trial.sh passes
+REQUIRED (tests/Dockerfile) updated; common/audit/harvest_code.py ROOTS=/workspace; common/trial/run_trial.sh passes
 --allow-agent-host per model; briefs (BUILDER.md, TASK-BUILD-PROMPT-v1.md, PROMPT-task-build.md) carry a
-SUPERSEDE note + the 3 contradiction fixes. Old templates backed up (builder/templates.bak-*). A filled
+SUPERSEDE note + the 3 contradiction fixes. Old templates backed up (common/archive/versions/builder/). A filled
 template passes conformance_check; old-format tasks fail it.
 REMAINING confidence step before the full batch: render ONE real task through the builder in this format
 and run gate.py on it (separate + non-root + artifacts restore) — a real Harbor build; do that, confirm a
@@ -90,12 +90,12 @@ clean gate, then launch the batch.
 gate.py PASSED all stages (static/nop/oracle x2 = 1.0/patches) on a synthetic probe task built from the
 promoted templates, in the new mode: separate verifier + artifacts /workspace restore + uid-1000 non-root
 grading + dual scoring + conformance_check. Four template bugs found and fixed during the step (all in
-builder/templates/test.sh unless noted):
+common/builder/templates/test.sh unless noted):
   1. gate.py hidden_test_leaks: ignore two-Dockerfile boilerplate in separate mode (fixed in gate.py).
   2. non-root grading: the agent-run suite writes JUnit to an agent-writable path; root copies it into the
      root-locked /logs/verifier/<group>/.
   3. run_group: @OUT@ token substitution for the JUnit path (immune to set -u / caller quoting).
   4. scoring tail: score.py's exit code encodes solved(0)/unsolved(1), NOT success -> do not treat a
      non-zero exit as a verifier error (it was deleting the reward on nop).
-Probe is reproducible via builder/fmt_probe_gen.py (regression fixture); the throwaway task dir was removed.
+Probe is reproducible via common/builder/fmt_probe_gen.py (regression fixture); the throwaway task dir was removed.
 PIPELINE IS READY for the next batch in the Frontier format.

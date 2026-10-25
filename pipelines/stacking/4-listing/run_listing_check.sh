@@ -1,21 +1,22 @@
 #!/bin/bash
-# Stacking listing check for one built stk- task (new; modelled on stacking/run_fairness_stack.sh).
+# Stacking listing check for one built stk- task (new; modelled on pipelines/stacking/7-fairness/run_fairness_stack.sh).
 # Read-only + Write, NO Docker/Bash in the agent. Classifies how instruction.md covers each hidden
-# trap in manifest.traps (stacking/STACKING-LISTING-CHECK.md) and writes build/<slug>/listing.json.
+# trap in manifest.traps (pipelines/stacking/4-listing/STACKING-LISTING-CHECK.md) and writes build/<slug>/listing.json.
 # Launch through the driver (there is no default model):
-#     ./drive.sh deepseek bash stacking/run_listing_check.sh SLUG
-# Read the verdict ONLY with: python3 -I stacking/listing_verdict.py SLUG  (0 PASS, 1 FAIL, 2 ERROR)
+#     common/launch/drive.sh deepseek bash pipelines/stacking/4-listing/run_listing_check.sh SLUG
+# Read the verdict ONLY with: python3 -I pipelines/stacking/4-listing/listing_verdict.py SLUG  (0 PASS, 1 FAIL, 2 ERROR)
 # Exit 0 = a finished review; 1 = the agent did not finish (listing_status.txt says why; a previous
 # listing.json is kept as listing.json.prev-<UTC>, never left looking current).
 # A review that changed tasks/SLUG, build/SLUG/manifest.json or build/SLUG/checks/ is restored from a
 # snapshot taken just before it and counts as not finished (2026-10-24).
 set -uo pipefail
-SLUG=${1:?usage: stacking/run_listing_check.sh SLUG}
-R="$HOME/cwe-bench"; cd "$R" || exit 1
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+SLUG=${1:?usage: pipelines/stacking/4-listing/run_listing_check.sh SLUG}
+R="$CWE_ROOT"; cd "$R" || exit 1
 B=build/$SLUG
-[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash stacking/run_listing_check.sh $SLUG" | tee "$B/listing_status.txt"; exit 1; }
+[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via common/launch/drive.sh deepseek bash pipelines/stacking/4-listing/run_listing_check.sh $SLUG" | tee "$B/listing_status.txt"; exit 1; }
 [ -f "tasks/$SLUG/instruction.md" ] && [ -f "$B/manifest.json" ] || { echo "error: no instruction.md or manifest.json" | tee "$B/listing_status.txt"; exit 1; }
-P="$(sed -n "/^---8<---$/,\$p" stacking/STACKING-LISTING-CHECK.md | tail -n +2 | sed "s#{{ROOT}}#$R#g; s#{{SLUG}}#$SLUG#g")"
+P="$(sed -n "/^---8<---$/,\$p" pipelines/stacking/4-listing/STACKING-LISTING-CHECK.md | tail -n +2 | sed "s#{{ROOT}}#$R#g; s#{{SLUG}}#$SLUG#g")"
 [ -f "$B/listing.json" ] && mv "$B/listing.json" "$B/listing.json.prev-$(date -u +%Y%m%dT%H%M%SZ)"
 echo "running" > "$B/listing_status.txt"
 # Integrity guard (2026-10-24): the reviewer has the Write tool over the whole project, so snapshot
@@ -29,7 +30,7 @@ timeout 1200 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$R" \
   --output-format json > "$B/listing-run.json" 2> "$B/listing-run.err"
 rc=$?
-st=$(python3 pipeline/agent_status.py "$B/listing-run.json" "$rc")
+st=$(python3 "$CWE_AGENT_STATUS" "$B/listing-run.json" "$rc")
 if [ "$(fp)" != "$before" ]; then
   rm -rf "tasks/$SLUG" "$B/checks"; tar -xf "$SNAP/before.tar"
   st="error: reviewer modified the task files (instruction, tests, manifest or checks); restored from the pre-review snapshot"
@@ -38,5 +39,5 @@ fi
 if [ "$st" = ok ] && [ ! -s "$B/listing.json" ]; then st="error: agent finished but wrote no listing.json"; fi
 if [ "$st" != ok ] && [ -f "$B/listing.json" ]; then mv "$B/listing.json" "$B/listing.json.unfinished-$(date -u +%Y%m%dT%H%M%SZ)"; fi
 echo "$st" > "$B/listing_status.txt"
-echo "$SLUG listing: $st; verdict: $(python3 -I stacking/listing_verdict.py "$SLUG" | head -1)"
+echo "$SLUG listing: $st; verdict: $(python3 -I pipelines/stacking/4-listing/listing_verdict.py "$SLUG" | head -1)"
 [ "$st" = ok ]

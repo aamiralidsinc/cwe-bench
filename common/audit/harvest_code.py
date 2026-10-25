@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Save a trial's final code: what the agent changed in /app, as proof of its fix.
 
-    python3 build/harvest_code.py <trial_dir> [--stage during-grading|after-run]
+    python3 common/audit/harvest_code.py <trial_dir> [--stage during-grading|after-run]
 
 Uses Docker's own record of the container's changes (`docker diff`, i.e. against the
 task image: the exact starting point the agent got), so no git history is needed.

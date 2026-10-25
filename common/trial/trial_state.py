@@ -11,7 +11,7 @@ Prints one line: `<state> graded=<n> ungraded=<n> rewards=<r,...>` where state i
     solved      at least one graded run at reward 1.0                       exit 0
     failed      N or more graded runs, none at 1.0                          exit 0
 For LAUNCH decisions only (trial it again or not). Per-model verdicts come from
-build/audit_results.py, which also applies the post-run audit.
+common/audit/audit_results.py, which also applies the post-run audit.
 
 Until 2026-10-20 launchers grepped `reward=[0-9.]+` (hiding every reward=None), tested `-s` on the
 log (one infra row meant "trialed"), and matched "1.0" as a regex ("0.9231,0.5" contains "1,0").
@@ -21,7 +21,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 STUCK_AFTER = 6   # ungraded runs: trial.py makes at most 2 per run slot, so 3 slots' worth
 
 

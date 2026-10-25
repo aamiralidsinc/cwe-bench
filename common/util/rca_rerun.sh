@@ -4,15 +4,16 @@
 #   PATCH = nop (untouched code) | oracle (solution/fix.patch) | a checks/ patch name (blind.patch)
 #           | a path to any patch file
 # Output: build/SLUG/rca/<UTC>-<patch>/
-#   report.txt   failing tests with their complete output (pipeline/evidence.py), then the
+#   report.txt   failing tests with their complete output (common/util/evidence.py), then the
 #                full test stdout
 #   stdout.txt   everything test.sh printed;  verifier/  JUnit XML, results.json, reward
-# For JS/TS tests, the hidden test COPIES used here get pipeline/rca/jest-explain-errors.cjs
+# For JS/TS tests, the hidden test COPIES used here get common/util/rca/jest-explain-errors.cjs
 # prepended, so an assertion like expect(error).toBeInstanceOf(InputError) prints the received
 # error's message and stack instead of only its class (stack line numbers shift by one).
 set -uo pipefail
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 SLUG=${1:?usage: rca_rerun.sh SLUG nop|oracle|<checks patch>|<patch path>}; PATCH=${2:?patch}
-R="$HOME/cwe-bench"; T="$R/tasks/$SLUG"; B="$R/build/$SLUG"; IMG="cwe-blind-src:$SLUG"
+R="$CWE_ROOT"; T="$R/tasks/$SLUG"; B="$R/build/$SLUG"; IMG="cwe-blind-src:$SLUG"
 cd "$R" || exit 2
 case "$PATCH" in
   nop) PF="" ;;
@@ -32,7 +33,7 @@ if [ -n "${TEST_PATCH:-}" ]; then
     || { echo "[rca] TEST_PATCH did not apply: $OUT/test-patch.log" >&2; exit 2; }
   cp "$TEST_PATCH" "$OUT/what-if-test.patch"; echo "[rca] WHAT-IF: test copies patched with $TEST_PATCH"
 fi
-cp "$R/pipeline/rca/jest-explain-errors.cjs" "$OUT/rca/"
+cp "$R/common/util/rca/jest-explain-errors.cjs" "$OUT/rca/"
 n=0
 while IFS= read -r f; do
   { printf 'require("/rca/jest-explain-errors.cjs");\n'; cat "$f"; } > "$f.rca" && mv "$f.rca" "$f"; n=$((n+1))
@@ -50,7 +51,7 @@ echo "[rca] test.sh exit $rc (90 = no /app, 91 = patch did not apply, 124 = time
 python3 - "$OUT" "$SLUG" "$PATCH" "$rc" <<'PY'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.home() / "cwe-bench" / "pipeline"))
+sys.path.insert(0, str(Path.home() / "cwe-bench" / "common" / "util"))
 import evidence as ev
 out, slug, patch, rc = sys.argv[1:5]
 d = {"failing_tests": ev.junit_failures(out), "verifier_stdout_tail": ev.read(Path(out, "stdout.txt"), 400_000),

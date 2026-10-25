@@ -1,8 +1,8 @@
 # Spec: the shared screener prompt and the shared task-build prompt
 
 Status: specification, 2026-10-16. The prompt files written from it are
-`builder/SCREENER-PROMPT-v1.md` and `builder/TASK-BUILD-PROMPT-v1.md`. The first drafts
-(`builder/PROMPT-screener.md`, `builder/PROMPT-task-build.md`) are kept for reference only. They do
+`common/archive/old-prompts/SCREENER-PROMPT-v1.md` and `common/builder/TASK-BUILD-PROMPT-v1.md`. The first drafts
+(`common/archive/old-prompts/PROMPT-screener.md`, `common/archive/old-prompts/PROMPT-task-build.md`) are kept for reference only. They do
 not meet this spec (see "Why the first drafts miss" at the end of part 1).
 
 **Two patterns, both in scope (user decision, 2026-10-16).** Both go through the screener and the
@@ -94,7 +94,7 @@ shared core plus a short per-task section.
   - the chosen task design;
   - host notes.
 - **It covers design and build only.** Blind fix, fairness review, strict gate, trials and per-run
-  audits stay separate stages with their own briefs (`builder/NEXT-STEPS.md`, "Process").
+  audits stay separate stages with their own briefs (`docs/history/NEXT-STEPS-builder.md`, "Process").
 - **The same comparison method applies.** Builder models are compared on:
   - whether the gate passes;
   - the fairness verdict;
@@ -106,7 +106,7 @@ shared core plus a short per-task section.
   - siblings we add to our own copy of the code.
 
 ### 1.4 Why the first drafts miss
-- **Not portable.** They tell the agent to read files on this machine (`builder/*.md`, `research/*`),
+- **Not portable.** They tell the agent to read files on this machine (`common/builder/*.md`, `docs/research/*`),
   so they cannot run on DeepSeek or MiMo in Harbor or in a fresh chat without the repo.
 - **The screener is a one-off.** It is a per-candidate reader for one top-30 pass. It has no slots
   for the weights or lessons version, no comparison across models, no known-outcome calibration set,
@@ -115,7 +115,7 @@ shared core plus a short per-task section.
   limit, no disclosure register and no summary-level rule, and they do not separate it from
   pattern A.
 - **They ignore the strongest outside evidence.** The peer pipeline's accepted hono task
-  (`Sheraz/C_RESULTS.md`) was built only from
+  (`docs/peers/Sheraz/C_RESULTS.md`) was built only from
   the published fix's own sites: a second renderer, an array input shape and a must-keep-working
   clause.
 
@@ -153,38 +153,38 @@ from when a source changes.
 ### 2.1 Shared by both files
 | Source | What it gives the templates |
 |---|---|
-| `plan.md` §1, §3 | The goal (100–200 tasks; both models pass@3 = 0; the failure is the model's), the acceptance rule, and what round 1 taught |
-| `builder/NEXT-STEPS.md` | Process order, working rules (timeouts and API cuts are never failures; no tests after a solve without approval), and next step 3, which defines these two files |
+| `docs/history/plan.md` §1, §3 | The goal (100–200 tasks; both models pass@3 = 0; the failure is the model's), the acceptance rule, and what round 1 taught |
+| `docs/history/NEXT-STEPS-builder.md` | Process order, working rules (timeouts and API cuts are never failures; no tests after a solve without approval), and next step 3, which defines these two files |
 | Handoff conversation, 2026-10-16 (messages 297, 308, 312, 350–355) | The request itself, the safe framing (published, already-fixed advisories; building the benchmark), what was stopped, "screen hosts not advisories", and the "compare models, never reroute" rule |
-| `RESULTS.md` "Round 2" and `build/audit/ledger.md` (regenerated with `build/audit_results.py`, the only source of truth for verdicts) | Known outcomes per host and model: the labels for calibrating and comparing models |
+| `docs/RESULTS.md` "Round 2" and `build/audit/ledger.md` (regenerated with `common/audit/audit_results.py`, the only source of truth for verdicts) | Known outcomes per host and model: the labels for calibrating and comparing models |
 | `build/audit/trials.tsv`; per task `build/<task>/notes.md`, `FAIRNESS.md` and each run's `postmortem-*/verdict.json` | Per-attempt scores, and *why* each run failed or solved, so the digest's lessons cite audited evidence |
-| `research/round1-analysis/B-failure-modes.md` §2.2–2.3, §3a, §4 | Why models fail (they judge wrongly about sites the report does not name), what they always catch, the 8 shapes |
-| `builder/BRIEF-trap-stack.md` | Pattern B's evidence (the any-setter base that beat DeepSeek 6/6; sib2's real gaps), and the round-2 lessons: distance (marshmallow), a reason to dismiss (jackson-databind-readonly), a producer that is infrastructure and not a handler (better-auth), and Hadi's shape with its controls |
-| `research/trap_tally.tsv` | Measured miss counts per shape and model |
-| `Sheraz/C_RESULTS.md` and `Sheraz/cwe-bench_findings_2026-10-16.zip`, plus `research/peer-analysis-2026-10-16.md` (saved 2026-10-16) | Pattern A's evidence, on published advisories: hono accepted; nltk, the MCP SDK and undici broke a model; patterns P1–P10; DoS 0 of 7; break rate by family |
+| `docs/research/round1-analysis/B-failure-modes.md` §2.2–2.3, §3a, §4 | Why models fail (they judge wrongly about sites the report does not name), what they always catch, the 8 shapes |
+| `common/builder/BRIEF-trap-stack.md` | Pattern B's evidence (the any-setter base that beat DeepSeek 6/6; sib2's real gaps), and the round-2 lessons: distance (marshmallow), a reason to dismiss (jackson-databind-readonly), a producer that is infrastructure and not a handler (better-auth), and Hadi's shape with its controls |
+| `docs/research/trap_tally.tsv` | Measured miss counts per shape and model |
+| `docs/peers/Sheraz/C_RESULTS.md` and `docs/peers/Sheraz/cwe-bench_findings_2026-10-16.zip`, plus `docs/research/peer-analysis-2026-10-16.md` (saved 2026-10-16) | Pattern A's evidence, on published advisories: hono accepted; nltk, the MCP SDK and undici broke a model; patterns P1–P10; DoS 0 of 7; break rate by family |
 
 ### 2.2 Screener prompt only
 | Source | What it gives |
 |---|---|
 | `sourcer/index/candidates.sqlite` and `sourcer/README.md` (column list, `c_*` computed and `j_*` judgement columns, `score_read`) | The candidate pool (1,462 published, fixed advisories) and the judgement fields the screener's output must fill |
-| `sourcer/rerank-v4-draft/` (`README.md`, `rerank.py`, `host-rank-all.tsv`, `host-shortlist-40.tsv`) | The computed pre-rank that picks which candidates are screened, and its known limits (repo size known for only a third; trap proxies fire broadly) |
+| `pipelines/sibling/3-rank/` (`README-rerank-v4.md`, `rerank.py`) and `pipelines/sibling/out/rerank-batch1-20261017/` (`host-rank-all.tsv`, `host-shortlist-40.tsv`) | The computed pre-rank that picks which candidates are screened, and its known limits (repo size known for only a third; trap proxies fire broadly) |
 | `sourcer/weights.json` (v3) and `rerank.py` (v4-draft) | The weights. A slot: the scoring script applies them, not the prompt |
-| `research/round1-analysis/A-screener-validity.md` | Which signals failed to predict difficulty (so the prompt does not ask for them) and proposed new features |
-| `research/round1-analysis/B-failure-modes.md` §3c | Code signals a reader can check near the fix, one per shape |
-| `research/round1-analysis/D-computed-s2.md` | S2a and S2b (check plus producer in another file): what is computable and what needs a reader |
-| `ALGORITHM.md` "Trap calibration" and "Learning loop" | How screener output feeds calibration and the refit of the weights |
+| `docs/research/round1-analysis/A-screener-validity.md` | Which signals failed to predict difficulty (so the prompt does not ask for them) and proposed new features |
+| `docs/research/round1-analysis/B-failure-modes.md` §3c | Code signals a reader can check near the fix, one per shape |
+| `docs/research/round1-analysis/D-computed-s2.md` | S2a and S2b (check plus producer in another file): what is computable and what needs a reader |
+| `docs/ALGORITHM.md` "Trap calibration" and "Learning loop" | How screener output feeds calibration and the refit of the weights |
 
 ### 2.3 Task-build prompt only
 | Source | What it gives |
 |---|---|
-| `builder/BUILDER.md` §3a–3j, "Manifest", "instruction.md", "Run the gate", "Report back", gotchas | The authority for every build rule. The template's core is a digest of it |
-| `builder/BUILDER-stacking.md` | The variant for a task that stacks several published advisories |
-| `builder/templates/`, `harness/claude-code.Dockerfile.snippet`, `harness/smoke-task/` | The files and layout the builder fills |
-| `builder/gate.py` (`WRONG_FIX_CLASSES`, static checks) | What the gate enforces, so the template never contradicts it |
-| `builder/BLIND-FIX-BRIEF.md`, `builder/FAIRNESS-REVIEW-BRIEF.md` | The next stages' needs: what the builder must leave for them |
-| `research/round1-analysis/B-failure-modes.md` §3b, §4 | Test shapes that caught each defect; instruction-wording rules |
-| `research/own-runs/FINDINGS.md`, `research/round1-analysis/C-pipeline-lessons.md` | Test faults and pipeline faults to prevent (the §3g origin; about half of round-1 time lost) |
-| `research/instruction-experiment.md` | Wording is hygiene, not the difficulty lever |
+| `common/builder/BUILDER.md` §3a–3j, "Manifest", "instruction.md", "Run the gate", "Report back", gotchas | The authority for every build rule. The template's core is a digest of it |
+| `common/archive/old-prompts/BUILDER-stacking.md` | The variant for a task that stacks several published advisories |
+| `common/builder/templates/`, `common/trial/claude-code.Dockerfile.snippet`, `common/trial/smoke-task/` | The files and layout the builder fills |
+| `common/gate/gate.py` (`WRONG_FIX_CLASSES`, static checks) | What the gate enforces, so the template never contradicts it |
+| `common/blindfix/BLIND-FIX-BRIEF.md`, `common/fairness/FAIRNESS-REVIEW-BRIEF.md` | The next stages' needs: what the builder must leave for them |
+| `docs/research/round1-analysis/B-failure-modes.md` §3b, §4 | Test shapes that caught each defect; instruction-wording rules |
+| `docs/research/own-runs/FINDINGS.md`, `docs/research/round1-analysis/C-pipeline-lessons.md` | Test faults and pipeline faults to prevent (the §3g origin; about half of round-1 time lost) |
+| `docs/research/instruction-experiment.md` | Wording is hygiene, not the difficulty lever |
 | Worked examples: `tasks/` and `build/` for `jackson-databind-sib2` (passed, both models 0/3), `better-auth-sso-endpoints` (3 fairness rounds, then solved), `marshmallow-readonly-sib`, `jackson-databind-readonly`; the hono dossier (peer, accepted) | One pass and three instructive misses, as examples of manifest, traps, notes and FAIRNESS.md |
 | The asyncssh session prompt (2026-10-15, "Written for: a fresh Claude Code session ... Paste this:") | A pasteable build prompt that ran without being stopped: a format reference |
 
@@ -195,7 +195,7 @@ from when a source changes.
   difficulty.
 - **`sourcer/host_screener.py`.** Untracked, written by a stopped agent with a cut-off brief; not
   reviewed. Do not use it.
-- **`research/partial-progress-60min.md`.** For the client conversation, not for either template:
+- **`docs/research/partial-progress-60min.md`.** For the client conversation, not for either template:
   timeouts never count as failures.
 - **Round-1 instructions.** They are examples of what not to write (409–687 words, names, counts).
 - **`cwe-bench-sheraz-wt/skills/`.** Outside `cwe-bench/`, so not read for this spec. It may hold
@@ -228,7 +228,7 @@ from when a source changes.
 - **Stops are handled by narrowing.** If a run is stopped, the operator narrows the prompt. It is
   never re-run on another model to get past the stop.
 
-### 3.1 Screener prompt file (`builder/SCREENER-PROMPT-v1.md`, kept in `builder/` with the other briefs)
+### 3.1 Screener prompt file (`common/archive/old-prompts/SCREENER-PROMPT-v1.md`, kept in `common/archive/old-prompts/` with the other briefs)
 
 **Operator part**
 1. Version and date; the digest version it embeds; the weights version that scores its output.
@@ -336,10 +336,10 @@ from when a source changes.
 - **The schema validator:** checks every file:line and enum.
 - **Outputs:** in `sourcer/review/<screener version>/<entry_id>.json`, merged into the index's
   `j_*` columns by script.
-- **Learning loop:** after each trial batch, add the outcomes to `research/trap_tally.tsv`, refit
+- **Learning loop:** after each trial batch, add the outcomes to `docs/research/trap_tally.tsv`, refit
   the weights, regenerate the digest, bump the versions, and re-screen.
 
-### 3.2 Task-build prompt file (`builder/TASK-BUILD-PROMPT-v1.md`)
+### 3.2 Task-build prompt file (`common/builder/TASK-BUILD-PROMPT-v1.md`)
 
 **Operator part**
 1. Version and date; the digest versions it embeds; the BUILDER.md revision the digest was made from.

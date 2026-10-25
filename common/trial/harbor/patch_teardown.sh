@@ -3,6 +3,7 @@
 #     concurrency must not fail a run whose test already completed during 'up'). Backed up + ast-checked.
 # (B) gate_one_ds.sh: fix the stale-marker bug (remove the opposite marker when marking unsound).
 set -uo pipefail
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 D="$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker.py"
 cp "$D" "$D.bak-$(date -u +%Y%m%dT%H%M%SZ)"
 python3 - "$D" <<"PY"
@@ -24,9 +25,9 @@ PY
 echo "--- harbor patch verify ---"; grep -n -A3 "if check and result.return_code != 0:" "$D" | head -6
 echo "--- harbor still imports? ---"
 ( cd "$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages" && python3 -c "import ast; ast.parse(open('harbor/environments/docker/docker.py').read()); print('ast OK')" )
-cd "$HOME/cwe-bench"
-cp pipeline/gate_one_ds.sh "pipeline/gate_one_ds.sh.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-python3 - pipeline/gate_one_ds.sh <<"PY"
+cd "$CWE_ROOT"
+cp common/gate/gate_one_ds.sh "common/gate/gate_one_ds.sh.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 - common/gate/gate_one_ds.sh <<"PY"
 import sys
 p=sys.argv[1]; s=open(p).read()
 old='else touch "build/$s/.unsound"; echo "$s unsound"'
@@ -35,5 +36,5 @@ assert s.count(old)==1, f"gate_one_ds: expected 1 match, found {s.count(old)}"
 open(p,"w").write(s.replace(old,new))
 print("gate_one_ds.sh: stale-marker bug fixed")
 PY
-bash -n pipeline/gate_one_ds.sh && echo "gate_one_ds.sh: syntax OK"
-grep -n "\.sound\|\.unsound" pipeline/gate_one_ds.sh | tail -2
+bash -n common/gate/gate_one_ds.sh && echo "gate_one_ds.sh: syntax OK"
+grep -n "\.sound\|\.unsound" common/gate/gate_one_ds.sh | tail -2

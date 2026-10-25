@@ -1,21 +1,22 @@
 #!/bin/bash
 # Fairness-fix one built task: apply its pre-trial fairness review's REQUIRED changes, then re-gate.
 # Needs Bash+Docker (edits tests/oracle, runs gate) -> bypassPermissions -> a PERSON launches this.
-# Usage: ./drive.sh deepseek bash run_fairfix.sh SLUG   Env: MODEL (required, set by drive.sh),
+# Usage: common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh SLUG   Env: MODEL (required, set by common/launch/drive.sh),
 # FAIRFIX_TIMEOUT (default 10800). Exit 0 = the agent finished; 1 = it did not (fairfix_status.txt
 # says why: quota, API error, timeout, crash) and the task must not be treated as fixed.
 set -uo pipefail
-SLUG=${1:?usage: run_fairfix.sh SLUG}
-cd "$HOME/cwe-bench" || exit 1
-[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash run_fairfix.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+SLUG=${1:?usage: pipelines/sibling/10-fairfix/run_fairfix.sh SLUG}
+cd "$CWE_ROOT" || exit 1
+[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
 echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
-bash pipeline/snapshot_experiment.sh "$SLUG"  # preserve prior version before in-place edit (provenance)
+bash "$CWE_SNAPSHOT" "$SLUG"  # preserve prior version before in-place edit (provenance)
 P="You are revising ONE already-built security-fix benchmark task to address its pre-trial FAIRNESS
 review before model trials. Project root: /home/mara/cwe-bench. Task slug: ${SLUG}.
 
 Read, in order: build/${SLUG}/FAIRNESS.md (the review, with a numbered 'Required changes' list),
-builder/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
+common/fairness/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
 tasks/${SLUG}/tests/ (all files), tasks/${SLUG}/solution/fix.patch, build/${SLUG}/manifest.json,
 build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch.
 
@@ -45,22 +46,22 @@ Hard rules:
 - Edit only under tasks/${SLUG}/ and build/${SLUG}/. Scratch in ~/.tb-graders/cwe/work/${SLUG}/.
 
 Then run the gate yourself, one stage at a time, and iterate until all pass:
-  python3 -I builder/gate.py ${SLUG} --only static
-  python3 -I builder/gate.py ${SLUG} --only nop
-  python3 -I builder/gate.py ${SLUG} --only oracle
-  python3 -I builder/gate.py ${SLUG} --only patches
+  python3 -I common/gate/gate.py ${SLUG} --only static
+  python3 -I common/gate/gate.py ${SLUG} --only nop
+  python3 -I common/gate/gate.py ${SLUG} --only oracle
+  python3 -I common/gate/gate.py ${SLUG} --only patches
 A missing blind.patch in static is allowed (it is wired separately). Report, under 300 words: each
 FAIRNESS 'Required' item and how you addressed it, the final gate result per stage, and any item you
 could not fully satisfy and why."
 date -u +%FT%TZ > "build/$SLUG/fairfix_start.txt"
 timeout "${FAIRFIX_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
-  --permission-mode bypassPermissions --add-dir "$HOME/cwe-bench" --add-dir "$HOME/.tb-graders/cwe/work" \
+  --permission-mode bypassPermissions --add-dir "$CWE_ROOT" --add-dir "$HOME/.tb-graders/cwe/work" \
   --output-format json > "build/$SLUG/fairfix-run.json" 2> "build/$SLUG/fairfix-run.err"
 rc=$?
 echo $rc > "build/$SLUG/fairfix-exit.txt"
 date -u +%FT%TZ > "build/$SLUG/fairfix_end.txt"
-st=$(python3 pipeline/agent_status.py "build/$SLUG/fairfix-run.json" "$rc" --details "build/$SLUG/fairfix_status.json")
+st=$(python3 "$CWE_AGENT_STATUS" "build/$SLUG/fairfix-run.json" "$rc" --details "build/$SLUG/fairfix_status.json")
 echo "$st" > "build/$SLUG/fairfix_status.txt"
 echo "$SLUG fairfix: exit $rc; $st"
 # An unfinished fairfix may leave a half-edited task: put back the version that was trialed.
-[ "$st" = ok ] || { bash pipeline/restore_snapshot.sh "$SLUG" "fairfix: $st"; exit 1; }
+[ "$st" = ok ] || { bash "$CWE_RESTORE" "$SLUG" "fairfix: $st"; exit 1; }

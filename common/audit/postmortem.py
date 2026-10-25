@@ -3,14 +3,14 @@
 (a sub-agent on Claude Opus 5.5 at high effort, started from the main session each time a
 result comes back, or the main session itself) judges whether its result can be trusted.
 
-    python3 build/postmortem.py prepare <trial_dir>   # evidence folder + AUDITOR_BRIEF.md; prints its path
-    python3 build/postmortem.py record <postmortem_dir> [--auditor "..."]
+    python3 common/audit/postmortem.py prepare <trial_dir>   # evidence folder + AUDITOR_BRIEF.md; prints its path
+    python3 common/audit/postmortem.py record <postmortem_dir> [--auditor "..."]
                                                     # validates <dir>/verdict.json, writes POSTMORTEM.json/.md
-    python3 build/postmortem.py record-ready          # record every folder whose auditor has finished
-    python3 build/postmortem.py pending               # graded runs without a current audit
+    python3 common/audit/postmortem.py record-ready          # record every folder whose auditor has finished
+    python3 common/audit/postmortem.py pending               # graded runs without a current audit
 
 Why (2026-10-16): two of three reported per-model failures turned out to be faults in our own
-tests (research/own-runs/FINDINGS.md). No result is final until an independent auditor has
+tests (docs/research/own-runs/FINDINGS.md). No result is final until an independent auditor has
 read the instruction, the tests, the grading output, the model's final code and its transcript.
 
 What the auditor gets (copied into <trial>/postmortem-<UTC>/evidence/, read-only tools only):
@@ -36,7 +36,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 AUDITOR = "sub-agent, Claude Opus 5.5, effort high"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -221,7 +224,7 @@ def build_evidence(trial, out):
         (ev / "grading" / "test-stdout.tail.txt").write_text("\n".join(lines[-600:]))
     if (gdir / "REGRADE.json").exists():
         shutil.copy2(gdir / "REGRADE.json", ev / "grading" / "REGRADE.json")
-    if (trial / "netguard.log").exists():          # repository block decisions (harness/netguard)
+    if (trial / "netguard.log").exists():          # repository block decisions (common/trial/netguard)
         shutil.copy2(trial / "netguard.log", ev / "netguard.log")
     if (trial / "final-code").is_dir():
         shutil.copytree(trial / "final-code", ev / "final-code")
@@ -308,7 +311,7 @@ def record(out, auditor=AUDITOR):
 
 def pending():
     """Runs that would count toward a verdict but lack a current audit, as listed by
-    build/audit_results.py in build/audit/awaiting_audit.tsv (run that first)."""
+    common/audit/audit_results.py in build/audit/awaiting_audit.tsv (run that first)."""
     f = ROOT / "build/audit/awaiting_audit.tsv"
     return [JOBS / r["job"] / r["trial"] for r in csv.DictReader(open(f), delimiter="\t")] if f.exists() else []
 

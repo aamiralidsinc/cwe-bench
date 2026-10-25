@@ -8,7 +8,7 @@ missed: lists of operations or resources (DESCRIBED) and keep-working lines that
 tests item by item (NAMED). v3: scope-widening clauses over parts of the system that only
 hidden traps occupy are DESCRIBED.
 
-**Calibration (2026-10-24, `out/calibration-listing/`):** v1 matched the batch-1 audit on 4 of 5
+**Calibration (2026-10-24, `pipelines/stacking/out/calibration-listing/`):** v1 matched the batch-1 audit on 4 of 5
 verdicts (too strict on the general property); v2 on 10 of 11; v3 on 17 of 17 (11 seen + 6 held out),
 trap labels 59 of 63, more lenient than the audit on 2 of 63 (3%). Caveat: batch 1 has only one
 instruction the audit passes (lobe-chat), so the false-FAIL rate on clean instructions is measured on
@@ -20,21 +20,21 @@ task's instruction covers each hidden trap, and enforces build rule 7 of
 
 **Why:**
 - In batch 1 (30 tasks), 137 of 155 traps had a sentence of their own in instruction.md
-  (`stacking/out/listing_audit.json`), so the tasks read as checklists.
+  (`pipelines/stacking/out/listing_audit.json`), so the tasks read as checklists.
 - 9 of the 22 sound tasks were solved by both models, mostly on the first run.
 
 **How it runs:**
-- **Launcher:** `stacking/run_listing_check.sh`. It writes `build/<slug>/listing.json`.
-- **Verdict:** `stacking/listing_verdict.py <slug>`.
+- **Launcher:** `pipelines/stacking/4-listing/run_listing_check.sh`. It writes `build/<slug>/listing.json`.
+- **Verdict:** `pipelines/stacking/4-listing/listing_verdict.py <slug>`.
   - It reads the trap origins from `manifest.json`, not from the reviewer.
   - **Exempt:** traps with origin `advisory_route`, the reported bug, which the impact example may
     show.
   - **FAIL:** one NAMED hidden trap, or more than one DESCRIBED hidden trap.
   - **ERROR:** no finished review, a hidden trap without a label, or a label outside the four.
-- **Gating (2026-10-24):** advisory until the reviewer is calibrated. Without `stacking/LISTING_ENFORCE`
+- **Gating (2026-10-24):** advisory until the reviewer is calibrated. Without `pipelines/stacking/4-listing/LISTING_ENFORCE`
   a FAIL or ERROR writes `build/<slug>/.listing_warn` and the task is marked sound as before; with it,
   `.listing_fail` and no `.sound`. To calibrate: run the check on batch-1 tasks, then
-  `python3 -I stacking/listing_calibrate.py SLUG... [--enforce]` (every verdict must match the audit, and
+  `python3 -I pipelines/stacking/4-listing/listing_calibrate.py SLUG... [--enforce]` (every verdict must match the audit, and
   at most 10% of hidden traps may be labelled more leniently than the audit).
 - **Integrity:** the reviewer has the Write tool, so the launcher snapshots `tasks/<slug>/`,
   `manifest.json` and `checks/` first and restores them if the review changed anything (counts as not

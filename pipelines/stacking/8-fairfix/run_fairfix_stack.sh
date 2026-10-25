@@ -1,15 +1,16 @@
 #!/bin/bash
-# STACKING COPY of run_fairfix.sh (original untouched). Differences: appends
-# stacking/STACKING-FAIRNESS-ADDENDUM.md (incl. its fairfix rules) to the prompt; project root from $HOME.
+# STACKING COPY of pipelines/sibling/10-fairfix/run_fairfix.sh (original untouched). Differences: appends
+# pipelines/stacking/7-fairness/STACKING-FAIRNESS-ADDENDUM.md (incl. its fairfix rules) to the prompt; project root from $HOME.
 # Fairness-fix one built task: apply its pre-trial fairness review's REQUIRED changes, then re-gate.
 # Needs Bash+Docker (edits tests/oracle, runs gate) -> bypassPermissions -> a PERSON launches this.
-# Usage: ./drive.sh deepseek bash stacking/run_fairfix_stack.sh SLUG   Env: MODEL (required, set by drive.sh),
+# Usage: common/launch/drive.sh deepseek bash pipelines/stacking/8-fairfix/run_fairfix_stack.sh SLUG   Env: MODEL (required, set by common/launch/drive.sh),
 # FAIRFIX_TIMEOUT (default 10800). Exit 0 = the agent finished; 1 = it did not (fairfix_status.txt
 # says why: quota, API error, timeout, crash) and the task must not be treated as fixed.
 set -uo pipefail
-SLUG=${1:?usage: stacking/run_fairfix_stack.sh SLUG}
-cd "$HOME/cwe-bench" || exit 1
-[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via ./drive.sh deepseek bash stacking/run_fairfix_stack.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+SLUG=${1:?usage: pipelines/stacking/8-fairfix/run_fairfix_stack.sh SLUG}
+cd "$CWE_ROOT" || exit 1
+[ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via common/launch/drive.sh deepseek bash pipelines/stacking/8-fairfix/run_fairfix_stack.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
 # FAIRFIX_BRIEF (2026-10-24): a brief with a numbered 'Required changes' list to apply INSTEAD of the
 # pre-trial review, e.g. a post-trial audit's repair (build/SLUG/AUDIT-FIX-*.md). Unset = FAIRNESS.md.
 BRIEF=${FAIRFIX_BRIEF:-build/${SLUG}/FAIRNESS.md}
@@ -17,12 +18,12 @@ BRIEF=${FAIRFIX_BRIEF:-build/${SLUG}/FAIRNESS.md}
 BN=$(basename "$BRIEF")
 echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
-bash pipeline/snapshot_experiment.sh "$SLUG"  # preserve prior version before in-place edit (provenance)
+bash "$CWE_SNAPSHOT" "$SLUG"  # preserve prior version before in-place edit (provenance)
 P="You are revising ONE already-built security-fix benchmark task to address its FAIRNESS
-review before model trials. Project root: $HOME/cwe-bench. Task slug: ${SLUG}.
+review before model trials. Project root: $CWE_ROOT. Task slug: ${SLUG}.
 
 Read, in order: ${BRIEF} (the review or audit brief, with a numbered 'Required changes' list),
-builder/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
+common/fairness/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,
 tasks/${SLUG}/tests/ (all files), tasks/${SLUG}/solution/fix.patch, build/${SLUG}/manifest.json,
 build/${SLUG}/notes.md, build/${SLUG}/checks/*.patch.
 
@@ -52,38 +53,38 @@ Hard rules:
 - Edit only under tasks/${SLUG}/ and build/${SLUG}/. Scratch in ~/.tb-graders/cwe/work/${SLUG}/.
 
 Then run the gate yourself, one stage at a time, and iterate until all pass:
-  python3 -I builder/gate.py ${SLUG} --only static
-  python3 -I builder/gate.py ${SLUG} --only nop
-  python3 -I builder/gate.py ${SLUG} --only oracle
-  python3 -I builder/gate.py ${SLUG} --only patches
+  python3 -I common/gate/gate.py ${SLUG} --only static
+  python3 -I common/gate/gate.py ${SLUG} --only nop
+  python3 -I common/gate/gate.py ${SLUG} --only oracle
+  python3 -I common/gate/gate.py ${SLUG} --only patches
 A missing blind.patch in static is allowed (it is wired separately). Report, under 300 words: each
 ${BN} 'Required' item and how you addressed it, the final gate result per stage, and any item you
 could not fully satisfy and why."
 P="$P
 
 This is a STACKED task. Also apply these rules:
-$(sed -n "/^---8<---$/,\$p" stacking/STACKING-FAIRNESS-ADDENDUM.md | tail -n +2)"
+$(sed -n "/^---8<---$/,\$p" pipelines/stacking/7-fairness/STACKING-FAIRNESS-ADDENDUM.md | tail -n +2)"
 date -u +%FT%TZ > "build/$SLUG/fairfix_start.txt"
 timeout "${FAIRFIX_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
-  --permission-mode bypassPermissions --add-dir "$HOME/cwe-bench" --add-dir "$HOME/.tb-graders/cwe/work" \
+  --permission-mode bypassPermissions --add-dir "$CWE_ROOT" --add-dir "$HOME/.tb-graders/cwe/work" \
   --output-format json > "build/$SLUG/fairfix-run.json" 2> "build/$SLUG/fairfix-run.err"
 rc=$?
 echo $rc > "build/$SLUG/fairfix-exit.txt"
 date -u +%FT%TZ > "build/$SLUG/fairfix_end.txt"
-st=$(python3 pipeline/agent_status.py "build/$SLUG/fairfix-run.json" "$rc" --details "build/$SLUG/fairfix_status.json")
+st=$(python3 "$CWE_AGENT_STATUS" "build/$SLUG/fairfix-run.json" "$rc" --details "build/$SLUG/fairfix_status.json")
 echo "$st" > "build/$SLUG/fairfix_status.txt"
 echo "$SLUG fairfix: exit $rc; $st"
 # An unfinished fairfix may leave a half-edited task: put back the version that was trialed.
-[ "$st" = ok ] || { bash pipeline/restore_snapshot.sh "$SLUG" "fairfix: $st"; exit 1; }
+[ "$st" = ok ] || { bash "$CWE_RESTORE" "$SLUG" "fairfix: $st"; exit 1; }
 
 # Build rule 13 (2026-10-24): the control has the same report as the stacked task. A fairfix that changed
 # instruction.md is copied to the control (snapshotted first, for provenance), then the listing check is
 # re-run on the new wording (fairness addendum, fairfix rules). The control's tests are not touched.
 CTL=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('stacking') or {}).get('control_slug',''))" "build/$SLUG/manifest.json" 2>/dev/null)
 if [ -n "$CTL" ] && [ -f "tasks/$CTL/instruction.md" ] && ! cmp -s "tasks/$SLUG/instruction.md" "tasks/$CTL/instruction.md"; then
-  bash pipeline/snapshot_experiment.sh "$CTL"
+  bash "$CWE_SNAPSHOT" "$CTL"
   cp "tasks/$SLUG/instruction.md" "tasks/$CTL/instruction.md"
   echo "$(date -u +%FT%TZ) fairfix changed tasks/$SLUG/instruction.md; copied it to tasks/$CTL/instruction.md (rule 13)" | tee -a "build/$SLUG/control_sync.log"
 fi
-bash stacking/run_listing_check.sh "$SLUG" > /dev/null 2>&1   # MODEL is already set by drive.sh
-echo "$SLUG listing check after fairfix: $(python3 -I stacking/listing_verdict.py "$SLUG" | head -1)"
+bash pipelines/stacking/4-listing/run_listing_check.sh "$SLUG" > /dev/null 2>&1   # MODEL is already set by common/launch/drive.sh
+echo "$SLUG listing check after fairfix: $(python3 -I pipelines/stacking/4-listing/listing_verdict.py "$SLUG" | head -1)"

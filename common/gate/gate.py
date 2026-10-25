@@ -42,7 +42,7 @@ error messages from the tests' JUnit XML (a compile error reads very differently
 assertion).
 
 Every failure also writes a FULL evidence file, build/<slug>/evidence/<UTC>-gate-<stage>.txt
-(+ .json; pipeline/evidence.py): the exception's class, complete message and traceback (Harbor's
+(+ .json; common/util/evidence.py): the exception's class, complete message and traceback (Harbor's
 exception_traceback included), every failing test's complete output, the verifier stdout, Harbor's
 stdout/stderr and the raw artifact paths. The stage record names it in "evidence_file".
 """
@@ -90,12 +90,15 @@ except ModuleNotFoundError:  # 3.9/3.10 host without tomllib
                 cur[key] = val.strip('"').strip("'")
         return data
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "gate-jobs"
-sys.path.insert(0, str(ROOT / "pipeline"))
-sys.path.insert(0, str(ROOT / "builder"))  # so sibling imports resolve under `python3 -I`
-import evidence as ev  # noqa: E402  (full error evidence: pipeline/evidence.py)
-import conformance_check  # noqa: E402  (Frontier-SWE delivery-format enforcement; builder/ on path for -I)
+sys.path.insert(0, str(paths.UTIL))
+sys.path.insert(0, str(paths.BUILDER_DIR))  # so sibling imports resolve under `python3 -I`
+import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
+import conformance_check  # noqa: E402  (Frontier-SWE delivery-format enforcement; common/builder/ on path for -I)
 REQUIRED = [
     "instruction.md",
     "task.toml",
@@ -112,7 +115,7 @@ MODEL_HOSTS = {"api.deepseek.com", "api.xiaomimimo.com"}
 AGENT_KILL_MARK = "@anthropic-ai/claude-code"   # the kill block from templates/test.sh
 MIN_DOCKER_FREE_GB = 15   # the Colima disk (79 GB) filled twice on 2026-10-16 and broke 6+ gate runs
 # Wrong fixes the round-1 audits found passing (or correct fixes failing) only AFTER trials
-# (research/round1-analysis/B-failure-modes.md, C-pipeline-lessons.md). A strict task names, for each
+# (docs/research/round1-analysis/B-failure-modes.md, C-pipeline-lessons.md). A strict task names, for each
 # class, the checks/ patch that proves the tests catch it, or "n/a: <why the class cannot apply>".
 WRONG_FIX_CLASSES = {
     "refuse_all": "deny/refuse everything on the protected path (needs a positive control test)",
@@ -149,7 +152,7 @@ INFRA_SIGNATURES = [
 BUILD_ERROR = re.compile(r"\[build failed\]|build failed|cannot find|undefined|ImportError|"
                          r"ModuleNotFoundError|SyntaxError|error TS\d+|compil|cannot resolve symbol",
                          re.I)
-# The VM gates and trials with DOCKER_BUILDKIT=0 (pipeline/docker-tuning.env). The classic builder
+# The VM gates and trials with DOCKER_BUILDKIT=0 (common/gate/docker-tuning.env). The classic builder
 # does not feed a heredoc body to its command, so the build "succeeds" with an empty file: fission-ds
 # lost its whole injection this way on 2026-10-19/20 and every stage then failed to compile.
 HEREDOC = re.compile(r"""(?m)^[^#\n]*<<-?\s*['"]?[A-Za-z_]+""")
@@ -162,7 +165,7 @@ class GateFailure(Exception):
     def __init__(self, message: str, evidence=None, details=None):
         super().__init__(message)
         self.evidence = evidence or []    # short lines for the report and the log
-        self.details = details or {}      # everything, for the evidence file (pipeline/evidence.py)
+        self.details = details or {}      # everything, for the evidence file (common/util/evidence.py)
 
 
 class InfraError(GateFailure):
@@ -384,7 +387,7 @@ def hidden_test_leaks(task: Path) -> list:
 
 # A security test must assert that the attack is BLOCKED, not how: an exact refusal status
 # (only 405, only 403, ...) fails correct fixes that refuse differently (trigger-dev 405,
-# argo 403; analysis 2026-10-16, research/own-runs/FINDINGS.md). A line may keep an exact
+# argo 403; analysis 2026-10-16, docs/research/own-runs/FINDINGS.md). A line may keep an exact
 # status after review by carrying the marker below.
 EXACT_STATUS_OK = "gate: exact-status-ok"
 EXACT_STATUS_PATTERNS = [
@@ -519,7 +522,7 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
 
     docker = (task / "environment/Dockerfile").read_text()
     if "claude-code-releases/bootstrap.sh" not in docker:
-        problems.append("Dockerfile lacks the agent layer (harness/claude-code.Dockerfile.snippet)")
+        problems.append("Dockerfile lacks the agent layer (common/trial/claude-code.Dockerfile.snippet)")
     if ".git" not in docker:
         problems.append("Dockerfile does not remove the repository's .git history")
     # The agent and the verifier share one container: hidden tests baked into the image

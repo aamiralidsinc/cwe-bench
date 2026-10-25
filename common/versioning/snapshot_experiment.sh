@@ -9,8 +9,9 @@
 #    build/<slug>/ once their copies are verified, so launchers never mix versions either.
 #  - Writes PROVENANCE.json + appends to experiments/INDEX.tsv; bumps build/<slug>/VERSION.
 set -uo pipefail
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 SLUG=${1:?usage: snapshot_experiment.sh SLUG}
-R="$HOME/cwe-bench"; cd "$R" || exit 1
+R="$CWE_ROOT"; cd "$R" || exit 1
 EXPROOT="$HOME/.tb-graders/cwe/experiments"
 JOBS="$HOME/.tb-graders/cwe/jobs"
 Vf="build/$SLUG/VERSION"
@@ -56,6 +57,6 @@ mkdir -p "$EXPROOT"
 printf '%s\t%s\t%s\t%s\t%d\t%s\n' "$ts" "$SLUG" "$cur" "$ish" "$n" "$dest" >> "$EXPROOT/INDEX.tsv"
 next="v$(( ${cur#v} + 1 ))"
 echo "$next" > "$Vf"
-# Where this snapshot went, so a failed edit can be undone (pipeline/restore_snapshot.sh).
+# Where this snapshot went, so a failed edit can be undone (common/versioning/restore_snapshot.sh).
 printf '%s\n%s\n' "$dest" "$cur" > "build/$SLUG/.last_snapshot"
 echo "snapshot: $SLUG $cur -> $dest (task copied, $n run-folders archived); new version=$next"

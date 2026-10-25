@@ -3,8 +3,13 @@
 machinery (separate verifier + artifacts restore + uid-1000 non-root grading + dual scoring).
 Path-confinement vuln: confsvc.read(name) must stay inside /workspace/data."""
 import os, subprocess, uuid, json, pathlib, textwrap, shutil
+import sys
+from pathlib import Path
 
-ROOT = pathlib.Path.home() / "cwe-bench"
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 SLUG = "fmt-probe-ds"
 T = ROOT / "tasks" / SLUG
 B = ROOT / "build" / SLUG
@@ -133,10 +138,10 @@ os.chmod(T / "solution/solve.sh", 0o755)
 (B / "checks/wrongfix_refuse_all.patch").write_text(diff_for(REFUSE_ALL))
 
 # --- score.py (dual scoring) copied from the promoted template ---
-shutil.copy(ROOT / "builder/templates/score.py", T / "tests/score.py")
+shutil.copy(ROOT / "common/builder/templates/score.py", T / "tests/score.py")
 
 # --- task.toml (filled from the promoted template) ---
-toml = (ROOT / "builder/templates/task.toml").read_text()
+toml = (ROOT / "common/builder/templates/task.toml").read_text()
 toml = toml.replace("GENERATE-PER-TASK", GUID)
 toml = toml.replace('name = "cwe-bench/SLUG"', f'name = "cwe-bench/{SLUG}"')
 toml = toml.replace('description = ""', 'description = "A file-reading library serves files from a fixed directory but does not confine resolved paths to it, so a crafted name reads files outside the served area."')
@@ -198,7 +203,7 @@ WORKDIR /workspace
 """)
 
 # --- tests/test.sh (new non-root scaffold, filled run_group for pytest) ---
-ts = (ROOT / "builder/templates/test.sh").read_text()
+ts = (ROOT / "common/builder/templates/test.sh").read_text()
 ts = ts.replace("GENERATE-PER-TASK", GUID)
 ts = ts.replace("BUILD='<FILL-IN or leave empty>'", "BUILD=''")
 # fill the hidden-suite copy + the two run_group calls
@@ -228,4 +233,4 @@ os.chmod(T / "tests/test.sh", 0o755)
 
 print("generated", SLUG, "guid", GUID)
 print("conformance:")
-subprocess.run(["python3", str(ROOT / "builder/conformance_check.py"), str(T)])
+subprocess.run(["python3", str(ROOT / "common/builder/conformance_check.py"), str(T)])

@@ -1,6 +1,7 @@
 """Validate screener output records (screener-v1) against the prompt's own output schema.
 
-The schema skeleton is read from builder/SCREENER-PROMPT-v1.md (the ```json block under
+The schema skeleton is read from the screener prompt of the record's version (common/screener/SCREENER-PROMPT-v2.md, or
+common/archive/old-prompts/SCREENER-PROMPT-v1.md) (the ```json block under
 "## Output", between the ---8<--- markers), so it cannot drift from what the screener was asked
 to write. Enums come from the prompt's prose; load_schema() checks that each one is still there.
 
@@ -13,17 +14,25 @@ Usage:
 Exit status 1 when any record has errors. Standard library only; reads files, runs nothing.
 """
 import argparse, json, os, re, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-BUILDER = os.path.join(HERE, "..", "..", "builder")
-PROMPT = os.path.join(BUILDER, "SCREENER-PROMPT-v1.md")
+# Screener prompts by version: the live one (v2) and the archived ones (v1 and older drafts).
+PROMPT_DIRS = [str(paths.SCREENER_PROMPT.parent), str(paths.COMMON / "archive" / "old-prompts")]
+PROMPT = str(paths.COMMON / "archive" / "old-prompts" / "SCREENER-PROMPT-v1.md")
 
 
 def prompt_for(version):
-    """builder/SCREENER-PROMPT-vN.md for 'screener-vN' (v1 when the version is missing or odd)."""
+    """SCREENER-PROMPT-vN.md for 'screener-vN', from common/screener/ or common/archive/old-prompts/
+    (v1 when the version is missing or odd)."""
     m = re.fullmatch(r"screener-(v\d+)", str(version or ""))
-    p = os.path.join(BUILDER, f"SCREENER-PROMPT-{m.group(1)}.md") if m else PROMPT
-    return p if os.path.exists(p) else PROMPT
+    if m:
+        for d in PROMPT_DIRS:
+            p = os.path.join(d, f"SCREENER-PROMPT-{m.group(1)}.md")
+            if os.path.exists(p):
+                return p
+    return PROMPT
 
 
 _SCHEMAS = {}

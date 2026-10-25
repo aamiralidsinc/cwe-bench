@@ -1,5 +1,6 @@
 #!/bin/bash
-. "$HOME/cwe-bench/pipeline/docker-tuning.env" 2>/dev/null || true
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_DOCKER_TUNING" 2>/dev/null || true
 # gate_one_ds.sh <slug> : gate one built task through nop/oracle/patches and leave exactly ONE
 # marker in build/<slug>/:
 #   .sound       every stage passed                                         (exit 0)
@@ -15,7 +16,7 @@
 # a real task failure left no stage key, read as ok=None, and was retried as an "infra flake";
 # a missing or stale report now counts as an internal error, never as a pass or a fail.
 s=${1:?usage: gate_one_ds.sh <slug>}
-cd "$HOME/cwe-bench" || exit 2
+cd "$CWE_ROOT" || exit 2
 B="build/$s"; LOG="$B/recover.log"; P="$B/gate_report.partial.json"
 [ -d "$B" ] || { echo "$s: no $B"; exit 2; }
 # One gate per task at a time: two gates on one slug overwrite each other's reports and markers.
@@ -28,7 +29,7 @@ echo "=== gate $s start $(date -u +%FT%TZ) ===" >> "$LOG"
 for st in nop oracle patches; do
   for a in $(seq 1 $MAX_INFRA); do
     rm -f "$P"
-    python3 -I builder/gate.py "$s" --only "$st" >> "$LOG" 2>&1
+    python3 -I common/gate/gate.py "$s" --only "$st" >> "$LOG" 2>&1
     rc=$?
     # kind<TAB>one-line summary, validated against slug + stage; anything else is "internal".
     # The failing stage's FULL record (complete error, evidence lines, evidence_file) is kept in

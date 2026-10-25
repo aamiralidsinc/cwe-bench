@@ -7,19 +7,23 @@ mechanism (MiMo-type). This is a PRIOR from the screener records only; the stack
 confirms against the code.
 
 Inputs (read-only):
-  sourcer/review/screener-v2/<entry>.json     screener-v2 records
+  common/screener/records/<entry>.json     screener-v2 records
   --built DIR [DIR...]                         task dirs whose task.toml `repo` marks a host as already built
 Outputs:
-  stacking/out/h4_candidates.tsv               every record, with its score breakdown
-  stacking/out/h4_shortlist.md                 top N hosts offering both a DeepSeek- and a MiMo-type trap
+  pipelines/stacking/out/h4_candidates.tsv               every record, with its score breakdown
+  pipelines/stacking/out/h4_shortlist.md                 top N hosts offering both a DeepSeek- and a MiMo-type trap
 
-  python3 -I stacking/h4_rank.py --built <tasks dir> [<tasks dir> ...] [--top 20]
+  python3 -I pipelines/stacking/1-select/h4_rank.py --built <tasks dir> [<tasks dir> ...] [--top 20]
 """
 import argparse, glob, json, os, re
+import sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RECS = os.path.join(ROOT, "sourcer", "review", "screener-v2")
-OUT = os.path.join(ROOT, "stacking", "out")
+ROOT = str(paths.ROOT)
+RECS = str(paths.SCREENER_RECORDS)
+OUT = str(paths.STACKING_OUT)
 
 O2_KIND = {"second_implementation": "M2", "lower_level_api": "M3", "wrapper_or_composition": "M3",
            "save_reload_or_serialization": "M6", "defaults_or_merge_route": "M5", "legacy_path": "M4"}
@@ -100,8 +104,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--built", nargs="*", default=[])
     ap.add_argument("--top", type=int, default=20)
-    ap.add_argument("--recs", nargs="*", default=[RECS, os.path.join(ROOT, "stacking", "out", "screener")],
-                    help="folders of screener-v2 records (default: the sibling records and stacking/out/screener)")
+    ap.add_argument("--recs", nargs="*", default=[RECS, os.path.join(str(paths.STACKING_OUT), "screener")],
+                    help="folders of screener-v2 records (default: the sibling records and pipelines/stacking/out/screener)")
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     done = built_repos(a.built)

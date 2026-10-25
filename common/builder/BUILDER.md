@@ -1,6 +1,6 @@
 # Task builder brief
 
-> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `builder/templates/` and follow `builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
+> **FORMAT (2026-10-21): Frontier-SWE delivery format.** Fill the skeletons in `common/builder/templates/` and follow `common/builder/FRONTIER-CONFORMANCE-SPEC.md`. The gate enforces it via `common/builder/conformance_check.py`, so a non-conforming task fails. Where any guidance below predates this and says `/app`, "delete `.git`", a model-host **allowlist**, or "do not modify/add tests", it is SUPERSEDED: use `/workspace`; keep the fresh one-commit git baseline (do not delete it); `[agent]` and `[verifier]` are `network_mode = "no-network"` with NO allowlist (the model host is allowed at run time via `--allow-agent-host`); and `instruction.md` must not mention tests or grading.
 
 
 You turn ONE shortlisted candidate (a real security fix in a real open-source
@@ -19,9 +19,9 @@ blocks just the reported input, or that removes the feature) does not.
   "tempting wrong fix". Fields ending in `_GUESS` or `_JUDGEMENT` are another
   reader's opinion: verify them against the code, do not trust them.
 - `SLUG`: the task's directory name (given with this brief).
-- Templates: `cwe-bench/builder/templates/` (`task.toml`, `test.sh`, `score.py`).
-- Agent layer: `cwe-bench/harness/claude-code.Dockerfile.snippet`.
-- Working example of the Harbor layout: `cwe-bench/harness/smoke-task/`.
+- Templates: `cwe-bench/common/builder/templates/` (`task.toml`, `test.sh`, `score.py`).
+- Agent layer: `cwe-bench/common/trial/claude-code.Dockerfile.snippet`.
+- Working example of the Harbor layout: `cwe-bench/common/trial/smoke-task/`.
 
 ## Outputs
 
@@ -146,7 +146,7 @@ Put these under `build/SLUG/checks/` and list them in the manifest:
 
 ### 3g. Test rules learned from our own runs (2026-10-16)
 Two of our three "per-model failures" turned out to be test faults; the full
-analysis is in `research/own-runs/FINDINGS.md`. Correct fixes failed for these
+analysis is in `docs/research/own-runs/FINDINGS.md`. Correct fixes failed for these
 reasons:
 - **The test called product code to compute its expected value or to clean up.**
   actualbudget called `getPathForUserFile`, which MiMo had hardened, so the test
@@ -179,7 +179,7 @@ reasons:
 About half of round-1 agent time was voided by settings fixed only after trials had run. These are
 now defaults; do not change them per task.
 - **Offline.** `[agent]` and `[verifier]` are `network_mode = "no-network"`; NO allowlist in the task file (the model host is allowed at run time via `--allow-agent-host`). (template)
-  `harness/run_trial.sh` also removes WebSearch/WebFetch. The gate fails a task without the allowlist.
+  `common/trial/run_trial.sh` also removes WebSearch/WebFetch. The gate fails a task without the allowlist.
 - **Agent killed before grading.** Keep the kill block at the top of the template `test.sh`. The
   gate fails a `test.sh` without it.
 - **Strict gate by default.** New manifests must not set `"strict_gate": false` (only the 19 round-1
@@ -206,7 +206,7 @@ now defaults; do not change them per task.
 ### 3i. instruction.md style: system and invariant (2026-10-16)
 Round-1 instructions were 409–687 words and named parameters, folders, root causes, the fix
 approach, every tested variant, and (stacked tasks) one section per flaw, which reveals the count.
-Models fix exactly what a report points at (`research/round1-analysis/B-failure-modes.md`), so such
+Models fix exactly what a report points at (`docs/research/round1-analysis/B-failure-modes.md`), so such
 instructions turn a task into a checklist. Write instead:
 - what the system is (product level), one observed impact with ONE concrete trigger example at
   the level a user sees (HTTP request, CLI call, public API use);
@@ -214,7 +214,7 @@ instructions turn a task into a checklist. Write instead:
   must never achieve, stated once in general terms ("no value of X may ..., however it arrives").
   It is fair when, read literally, it covers every tested route; it must not point at any of them
   (2026-10-19: the earlier "word each to cover every tested variant / one natural list" rule was
-  read as "mention every route" and produced checklists, see `BETTER-PATTERNS.md` §3);
+  read as "mention every route" and produced checklists, see `docs/BETTER-PATTERNS.md` §3);
 - for several genuinely different protections: one short list of properties, not one section per
   flaw, never a count, never one property per route;
 - the contracts the tests need and an engineer could not infer, each stated once for the whole
@@ -230,16 +230,16 @@ instructions turn a task into a checklist. Write instead:
   terms (a route, operation, command, channel, object kind, stage or format). State each property
   once, over the protected data or outcome, so it covers every route without pointing at any. Avoid
   a general word that is also the name of one stage or entry point (2026-10-19,
-  `BETTER-PATTERNS.md` §2: instructions that described each sibling's surface were solved 30/30);
+  `docs/BETTER-PATTERNS.md` §2: instructions that described each sibling's surface were solved 30/30);
 - the standard constraints block (fix the attack and close variants; keep legitimate use; do not
   modify or add tests; do not look up the upstream fix; do not special-case the example).
-Experiment (2026-10-16, `research/instruction-experiment.md`): rewriting 7 round-1 instructions
+Experiment (2026-10-16, `docs/research/instruction-experiment.md`): rewriting 7 round-1 instructions
 this way did not make any of them fail (every finished run still solved). Keep this style as
 hygiene (no fix hints, closer to CWE-bench); difficulty must come from 3j.
 
 ### 3j. Trap stacking for injected tasks (round 2)
 Difficulty comes from what the task contains, not from the advisory. Plan traps from the ranked
-recipes in `research/round1-analysis/B-failure-modes.md` §3a and record each one in
+recipes in `docs/research/round1-analysis/B-failure-modes.md` §3a and record each one in
 `manifest.traps` (`shape`, file:line, the test that covers it, and why a real codebase would
 have it):
 - at least one shape that beat DeepSeek consistently (feature-absent sibling;
@@ -253,7 +253,7 @@ have it):
 - at least one HOW-type trap, whose fix needs the mechanism understood (a producer deep in internal
   machinery, a coupled legitimate value, a shape a plausible check mishandles, a route where the
   protection never existed). Where-type traps (another entry point, a planted copy) count only as
-  extras and only under a general report (2026-10-19, `BETTER-PATTERNS.md` §5);
+  extras and only under a general report (2026-10-19, `docs/BETTER-PATTERNS.md` §5);
 - every trap must be realistic code a maintainer could have written, reachable through the real
   entry point, and covered by a general rule the instruction states (read literally, the rule
   applies to the trap without pointing at it), with no test that contradicts the instruction.
@@ -294,7 +294,7 @@ Follow the style in 3i (system and invariant).
 
 ## Run the gate
 ```
-python3 -I cwe-bench/builder/gate.py SLUG
+python3 -I cwe-bench/common/gate/gate.py SLUG
 ```
 It runs static → nop → oracle → patches and writes
 `build/SLUG/gate_report.json`. The task is built only when it prints PASSED.

@@ -5,7 +5,7 @@ keep-working sentence covers it (batch 1 instructions listed their traps through
 fairfix rule now forbids adding any sentence that fails build rule 7's one-bug test.
 
 **How it is used:**
-- **Fairness review:** appended to `builder/FAIRNESS-REVIEW-BRIEF.md` when the task's
+- **Fairness review:** appended to `common/fairness/FAIRNESS-REVIEW-BRIEF.md` when the task's
   `build/<slug>/manifest.json` has a `stacking` block.
 - **Fairfix:** also appended to the fairfix prompt for such tasks.
 - **Origin:** these checks are the ones the 13-breaker audit found missing
@@ -69,7 +69,7 @@ refused leading slash, where another route must accept it.
 - Resolve a contradiction by keeping the instruction and changing the test and the reference
   (decision of 2026-10-20). Never add a sentence that points at a route, and never one that names
   or describes a coupled value, a form, a source or an alias: apply build rule 7's one-bug test to
-  every sentence you add. Re-run `stacking/run_listing_check.sh` after any instruction change.
+  every sentence you add. Re-run `pipelines/stacking/4-listing/run_listing_check.sh` after any instruction change.
 - Edit only the stacked task's `instruction.md`, never the control's: `run_fairfix_stack.sh` copies
   the new wording to the control afterwards (build rule 13, same report) and re-runs the listing check.
 - Drop a concept only when the concept itself cannot be made fair. If fewer than 3 independent

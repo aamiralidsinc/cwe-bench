@@ -8,7 +8,7 @@ carry a one-line summary plus that file's path. Until 2026-10-21 several paths k
 (trial.py: cause="exception:<Type>") or 160-600 characters, and Harbor's exception_traceback was
 dropped everywhere, which made root-cause analysis impossible.
 
-    python3 pipeline/evidence.py <trial_dir>      # print the full evidence of one trial
+    python3 common/util/evidence.py <trial_dir>      # print the full evidence of one trial
 """
 import json
 import sys

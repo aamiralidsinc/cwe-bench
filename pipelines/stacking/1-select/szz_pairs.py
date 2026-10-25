@@ -9,13 +9,16 @@ blame them in B's parent, and count how many were written by A's fix commits.
   H3u   (unclassified)    : B only adds lines, so SZZ cannot attribute (read by hand)
 Clones are blobless and cached in ~/.tb-graders/cwe/stacking/clones/ (network: github.com only).
 
-  python3 -I stacking/szz_pairs.py [--limit N] [--only owner/repo ...] [--max-repo-mb 1500]
-Output: stacking/out/szz_pairs.tsv (append-safe; already-done pairs are skipped), progress on stderr.
+  python3 -I pipelines/stacking/1-select/szz_pairs.py [--limit N] [--only owner/repo ...] [--max-repo-mb 1500]
+Output: pipelines/stacking/out/szz_pairs.tsv (append-safe; already-done pairs are skipped), progress on stderr.
 """
 import argparse, csv, os, re, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "stacking", "out")
+ROOT = str(paths.ROOT)
+OUT = str(paths.STACKING_OUT)
 CLONES = os.path.expanduser("~/.tb-graders/cwe/stacking/clones")
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 COLS = ["b", "a", "repo", "status", "b_changed_lines", "blamed_to_a", "share_a", "blamed_commits", "files", "note"]

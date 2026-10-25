@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-grade a trial's FINAL OUTPUT inside its kept container (no new model run).
 
-    python3 build/regrade.py <trial_dir> "<why>" [--memory 8g]
+    python3 common/audit/regrade.py <trial_dir> "<why>" [--memory 8g]
 
 For runs where the grader broke (not the model): restart the kept container, copy in the
 task's current tests/, run tests/test.sh, and store the result separately:
@@ -23,7 +23,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+
+ROOT = paths.ROOT
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from harvest_code import save_tmp_logs  # noqa: E402
 

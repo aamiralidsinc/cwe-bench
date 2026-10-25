@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Run the stacking reader (step 2) on every job in stacking/out/reader_jobs.jsonl.
+"""Run the stacking reader (step 2) on every job in pipelines/stacking/out/reader_jobs.jsonl.
 
 Per job:
   1. reuse or create a blobless clone (~/.tb-graders/cwe/stacking/clones/);
   2. pin = parent of the EARLIEST commit in the job's `pin_from` (before any fix);
   3. check the pin out into a separate worktree (~/.tb-graders/cwe/stacking/worktrees/<id>/);
   4. fill STACKING-READER-PROMPT.md and run headless Claude Code with only Read/Grep/Glob/Write;
-  5. the agent writes stacking/out/reader/<id>.json. Jobs whose output already exists are skipped.
-Progress: one line per job start/finish on stdout, and stacking/out/reader/_run.log.
+  5. the agent writes pipelines/stacking/out/reader/<id>.json. Jobs whose output already exists are skipped.
+Progress: one line per job start/finish on stdout, and pipelines/stacking/out/reader/_run.log.
 
-  python3 -I stacking/run_reader.py [--parallel 2] [--model claude-opus-5-5] [--only ID ...] [--timeout-min 40]
+  python3 -I pipelines/stacking/1-select/run_reader.py [--parallel 2] [--model claude-opus-5-5] [--only ID ...] [--timeout-min 40]
 Env: CLAUDE_BIN (default: the claude found on PATH).
 """
 import argparse, json, os, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ST = os.path.join(ROOT, "stacking")
+ROOT = str(paths.ROOT)
+ST = str(paths.STACKING)
 OUTDIR = os.path.join(ST, "out", "reader")
 CLONES = os.path.expanduser("~/.tb-graders/cwe/stacking/clones")
 TREES = os.path.expanduser("~/.tb-graders/cwe/stacking/worktrees")
@@ -79,13 +82,13 @@ def worktree(d, jid, pin):
 
 
 def priors():
-    t = open(os.path.join(ROOT, "STACKING-EXPLORATION.md")).read()
+    t = open(os.path.join(ROOT, "docs", "STACKING-EXPLORATION.md")).read()
     a, b = t.find("### 2.2"), t.find("### 2.4")
     return t[a:b].strip() if a >= 0 and b > a else "(see STACKING-EXPLORATION.md §2.2-2.3)"
 
 
 def prompt(job, wt, pin, out_path):
-    tpl = open(os.path.join(ST, "STACKING-READER-PROMPT.md")).read().split("---8<---", 1)[1]
+    tpl = open(os.path.join(ST, "1-select", "STACKING-READER-PROMPT.md")).read().split("---8<---", 1)[1]
     rec = open(job["screener_record"]).read() if job.get("screener_record") else "none"
     p = (tpl.replace("{{CANDIDATE}}", json.dumps(job["candidate"], indent=1))
             .replace("{{SCREENER_RECORD}}", rec).replace("{{REPO_DIR}}", wt).replace("{{PRIORS}}", priors()))

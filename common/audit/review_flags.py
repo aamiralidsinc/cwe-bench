@@ -6,7 +6,7 @@ failure: we cannot tell from the score whether the model's code or our environme
 broke the setup. Decide from the saved evidence (final-code/, tmp-logs/,
 verifier/test-stdout.txt) and record the decision in build/audit/reviews.tsv.
 
-    python3 build/review_flags.py <trial_dir>      # print the flags of one trial
+    python3 common/audit/review_flags.py <trial_dir>      # print the flags of one trial
 """
 import json
 import re
@@ -58,7 +58,7 @@ def setup_flags(trial: Path, verifier: Path = None) -> list:
     cut = agent_cut(trial)
     if cut:
         # The flag is one line (it lands in TSV ledgers); the full message and traceback stay in
-        # <trial>/result.json exception_info (python3 pipeline/evidence.py <trial> prints them).
+        # <trial>/result.json exception_info (python3 common/util/evidence.py <trial> prints them).
         short = " ".join(cut.split())
         flags.append(f"agent session cut short, not finished: {short[:300]}{'...' if len(short) > 300 else ''}"
                      f" (full: {trial}/result.json)")

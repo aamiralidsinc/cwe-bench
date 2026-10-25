@@ -1,6 +1,6 @@
 # Builder brief: stack MiMo-targeted traps onto a base that already beats DeepSeek (round 2)
 
-You build ONE Harbor security-fix task. Read and follow `builder/BUILDER.md` in full, especially
+You build ONE Harbor security-fix task. Read and follow `common/builder/BUILDER.md` in full, especially
 3a–3j. This brief adds the round-2 goal and limits.
 
 ## Why this task exists
@@ -12,9 +12,9 @@ traps of DIFFERENT kinds that MiMo missed in about half of its round-1 runs. The
 needs several independent judgements that a probe of the obvious path does not reveal.
 
 Read first:
-- `research/round1-analysis/B-failure-modes.md`: §2.2 (judgement, not search), §3a (ranked recipes),
+- `docs/research/round1-analysis/B-failure-modes.md`: §2.2 (judgement, not search), §3a (ranked recipes),
   §3b (test shapes that caught each defect), §4 (wording rules).
-- `ALGORITHM.md`: the "data producer off the check's path" paragraph.
+- `docs/ALGORITHM.md`: the "data producer off the check's path" paragraph.
 
 MiMo-relevant shapes (round 1, n small): coupled visible binding next to the hidden one (both models
 missed it ~30% of runs); a merged/defaults/inheritance route to the same sink (MiMo 1/2); a
@@ -39,9 +39,9 @@ verbs, other protocols, other role/direction, anything the instruction names. Do
 5. The reference fix (`solution/fix.patch`) closes the base flaw and every trap. Wrong-fix patches
    go in `checks/`: one `security_fail` per trap (the fix that misses only that trap), the
    catalogue classes (3h), and `functional_fail` for over-broad fixes.
-6. Do NOT run DeepSeek or MiMo, do NOT run `build/trial.py` or `harness/run_trial.sh`, and do NOT
+6. Do NOT run DeepSeek or MiMo, do NOT run `common/trial/trial.py` or `common/trial/run_trial.sh`, and do NOT
    write the `blind` patch or `FAIRNESS.md`: independent agents do those after you. Run the gate
-   stages yourself: `python3 -I builder/gate.py SLUG --only static`, then `--only nop`,
+   stages yourself: `python3 -I common/gate/gate.py SLUG --only static`, then `--only nop`,
    `--only oracle`, `--only patches`. Static will report the missing blind patch and FAIRNESS.md as
    problems; that is expected. All other static problems must be fixed.
 7. Machine limits: one shared 8-CPU / 12 GB Docker VM, already running trials. Never prune Docker
@@ -71,7 +71,7 @@ unsupported combination, a neighbouring feature, a legacy path), while the state
 covers it unambiguously. Distance helps; the reason to dismiss is the main lever.
 
 ## DeepSeek shape 2: data producer off the check's path (Hadi, 2026-10-15)
-Source: Hadi's DEEPSEEK_WEAKNESS_2026-10-15.md (in Hadi/mcp-ts-sdk-oauth-issuer-confusion_deepseek.zip;
+Source: Hadi's DEEPSEEK_WEAKNESS_2026-10-15.md (in docs/peers/Hadi/mcp-ts-sdk-oauth-issuer-confusion_deepseek.zip;
 credit him in notes). DeepSeek failed this 8/8 (3/3 on the real MCP TypeScript SDK, GHSA-6qxp-vccf-f47h),
 always missing the same tests and never breaking functionality.
 - **Shape:** the fix needs (1) the CHECK the report points at and (2) the DATA PRODUCER the check

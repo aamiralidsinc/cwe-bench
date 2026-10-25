@@ -3,16 +3,17 @@
 # gate_one_ds.sh sources docker-tuning.env, so the gate runs with DOCKER_BUILDKIT=0.
 # With buildkit off, trivy's compose opens no session -> should be immune to the
 # "only one connection allowed" collisions even while other buildkit-ON gates run.
-cd "$HOME/cwe-bench" || exit 1
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+cd "$CWE_ROOT" || exit 1
 LOG=build/pipeline/buildkit_test.log
 {
 echo "=== buildkit_test trivy-ds START $(date -u +%FT%TZ) ==="
-. pipeline/docker-tuning.env 2>/dev/null
+. common/gate/docker-tuning.env 2>/dev/null
 echo "env: DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-unset} COMPOSE_DOCKER_CLI_BUILD=${COMPOSE_DOCKER_CLI_BUILD:-unset}"
 rm -f build/trivy-ds/.sound build/trivy-ds/.unsound build/trivy-ds/.lockdir 2>/dev/null
 rm -rf build/trivy-ds/.lockdir 2>/dev/null
 : > build/trivy-ds/gate_test.log
-bash pipeline/gate_one_ds.sh trivy-ds > build/trivy-ds/gate_test.log 2>&1
+bash common/gate/gate_one_ds.sh trivy-ds > build/trivy-ds/gate_test.log 2>&1
 mk=$( [ -f build/trivy-ds/.sound ] && echo SOUND || ([ -f build/trivy-ds/.unsound ] && echo unsound || echo none) )
 echo "RESULT marker=$mk"
 echo "compose-command-failed lines this run: $(grep -c 'compose command failed' build/trivy-ds/gate_test.log)"

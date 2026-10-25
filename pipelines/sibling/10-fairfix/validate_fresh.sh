@@ -5,22 +5,23 @@
 # leak will, after fairfix strips the leak, flip to a DeepSeek fail).
 # Never trials a task that did not reach READY (until 2026-10-20 it trialed anyway and marked it
 # .sound with no gate); a fairness ERROR or an unfinished fairfix stops it for a person.
-cd "$HOME/cwe-bench" || exit 1
-. pipeline/validate_common.sh
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+cd "$CWE_ROOT" || exit 1
+. pipelines/sibling/10-fairfix/validate_common.sh
 S=$1; MAX=${2:-3}
 LOG=build/pipeline/vfresh_$S.log
 echo "=== validate_fresh $S $(date -u +%FT%TZ) ===" >> "$LOG"
 ready=no
 for r in $(seq 1 "$MAX"); do
-  ./drive.sh deepseek bash run_fairness.sh "$S" >> "build/$S/vfresh.nohup" 2>&1
-  v=$(python3 pipeline/fairness_verdict.py "$S")
+  "$CWE_DRIVE" deepseek bash pipelines/sibling/9-fairness/run_fairness.sh "$S" >> "build/$S/vfresh.nohup" 2>&1
+  v=$(python3 "$CWE_FAIRNESS_VERDICT" "$S")
   echo "[r$r] fairness=$v $(date -u +%T)" >> "$LOG"
   case "$v" in
     READY*) ready=yes; break ;;
     NOT_READY*) ;;
     *) echo "STOPPED (fairness $v)" > "build/$S/VFRESH_RESULT.txt"; exit 1 ;;
   esac
-  if ! ./drive.sh deepseek bash run_fairfix.sh "$S" >> "build/$S/vfresh.nohup" 2>&1; then
+  if ! "$CWE_DRIVE" deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh "$S" >> "build/$S/vfresh.nohup" 2>&1; then
     echo "[r$r] fairfix did not finish ($(cat build/$S/fairfix_status.txt 2>/dev/null)); task restored -> stop" >> "$LOG"
     echo "STOPPED (fairfix did not finish)" > "build/$S/VFRESH_RESULT.txt"; exit 1
   fi

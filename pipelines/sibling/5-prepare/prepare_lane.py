@@ -3,29 +3,32 @@
 
 For each chosen entry_id, build a build_prepare spec with:
   - a lane-namespaced slug (repo with '/'->'-', lowercased, + '-ds'/'-mm');
-  - the SAME constant self-design plan (builder/SELFDESIGN-PLAN.md) for every candidate,
+  - the SAME constant self-design plan (pipelines/sibling/5-prepare/SELFDESIGN-PLAN.md) for every candidate,
     so the DRIVER model designs the injection itself (no per-candidate human plan);
   - track=injected, pattern from the record (A/B/A+B, else A+B);
   - the VM project root.
-Then runs build_prepare.py to write build/<slug>/BUILD-PROMPT.md, and lists the slugs in
+Then runs common/builder/build_prepare.py to write build/<slug>/BUILD-PROMPT.md, and lists the slugs in
 build/pipeline/slugs_<driver>.txt.
 
-  python3 -I prepare_lane.py <deepseek|mimo>
+  python3 -I pipelines/sibling/5-prepare/prepare_lane.py <deepseek|mimo>
 """
 import json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, ".."))
-RECS = os.path.join(ROOT, "sourcer", "review", "screener-v2")
-PREPARE = os.path.join(ROOT, "sourcer", "rerank-v4-draft", "build_prepare.py")
-PLAN = open(os.path.join(ROOT, "builder", "SELFDESIGN-PLAN.md")).read().strip()
+ROOT = str(paths.ROOT)
+RECS = str(paths.SCREENER_RECORDS)
+PREPARE = str(paths.BUILD_PREPARE)
+PLAN = open(os.path.join(HERE, "SELFDESIGN-PLAN.md")).read().strip()
 VM_ROOT = "/home/mara/cwe-bench"
 
 
 def main(driver):
     suffix = "ds" if driver == "deepseek" else "mm"
-    sel = json.load(open(os.path.join(ROOT, "build", "pipeline", f"selection_{driver}.json")))
-    slugs, specdir = [], os.path.join(ROOT, "build", "pipeline", f"specs_{driver}")
+    sel = json.load(open(os.path.join(str(paths.BUILD_PIPELINE), f"selection_{driver}.json")))
+    slugs, specdir = [], os.path.join(str(paths.BUILD_PIPELINE), f"specs_{driver}")
     os.makedirs(specdir, exist_ok=True)
     for row in sel:
         eid = str(row["entry_id"])
@@ -52,7 +55,7 @@ def main(driver):
             slugs.append(slug)
         else:
             print("prepare failed:", slug)
-    listf = os.path.join(ROOT, "build", "pipeline", f"slugs_{driver}.txt")
+    listf = os.path.join(str(paths.BUILD_PIPELINE), f"slugs_{driver}.txt")
     open(listf, "w").write("\n".join(slugs) + "\n")
     print(f"{driver}: prepared {len(slugs)} BUILD-PROMPTs -> {listf}")
 
