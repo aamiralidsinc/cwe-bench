@@ -1,0 +1,118 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "15889",
+  "advisory_ids": ["GHSA-5C3F-6486-3G7G", "CVE-2026-52809", "GO-2026-5140"],
+  "repo": "gogs/gogs",
+  "pinned_commit": "6283462119bd8894f1599d70339b5e823f99954a",
+  "fix_commits": ["187e9c557930eb4a8b9b1502ee45cccf3255ee7f"],
+  "trust_decision": {
+    "summary": "Password-reset emails must carry a code minted with [auth] RESET_PASSWORD_CODE_LIVES, while account-activation and email-confirmation codes keep ACTIVATE_CODE_LIVES; at the pinned commit both flows share userx.GenerateActivateCode, and the token format signs its own lifetime into a 6-digit minutes field.",
+    "evidence": [
+      "internal/userx/userx.go:36-41",
+      "internal/email/email.go:228",
+      "internal/email/email.go:205",
+      "templates/mail/auth/reset_passwd.tmpl:10",
+      "internal/tool/tool.go:69-72"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/email/email.go:228",
+    "why": "SendResetPasswordMail is the one line the advisory summary points at: it feeds GenerateEmailActivateCode's output into the reset-password template, so an engineer greps the reset mail path first and sees the activate-code call."
+  },
+  "fix_sites": [
+    {"where": "internal/email/email.go:186", "entry_point": "email.User interface (consumed by every Send*Mail caller)", "module_kind": "library interface"},
+    {"where": "internal/email/email.go:228", "entry_point": "POST /api/web/user/reset-password (cmd/gogs/internal/web/webapi.go:121 -> webapi_user.go:235 -> SendResetPasswordMail)", "module_kind": "library function"},
+    {"where": "internal/database/issue_mail.go:38-46", "entry_point": "mailerUser wrapper (the only email.User implementation), reached from the same POST /api/web/user/reset-password via database.NewMailerUser (webapi_user.go:235)", "module_kind": "wrapper_or_composition (added method at fix.diff:25-33)"},
+    {"where": "internal/userx/userx.go:36-46", "entry_point": "userx.GenerateActivateCode, shared helper behind mailerUser and the activation mails (split into generateTimeLimitedUserCode at fix.diff:87-101)", "module_kind": "lower-level library function"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "internal/database/issue_mail.go:38-46"
+  },
+  "O3_reason_to_dismiss": "The new mailerUser method lands in internal/database/issue_mail.go, a file that reads as issue/comment mail plumbing rather than reset-password code, and the interface compile error points straight at it, so a solver treats it as mechanical boilerplate instead of part of the protection.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Account-activation and add-email confirmation codes must keep ACTIVATE_CODE_LIVES: GenerateActivateCode is shared by SendActivateAccountMail and SendActivateEmailMail, and the activation UI reports ACTIVATE_CODE_LIVES/60 as its lifetime, so an over-broad switch shortens/lengthens account activation and makes the activation page lie.",
+    "where": "internal/email/email.go:224,235; internal/userx/userx.go:36-41; cmd/gogs/internal/web/webapi_user.go:434,458,470"
+  },
+  "O6_input_shapes": [
+    "No user-input parsing changes: the fix is a lifetime-parameter split, and the only 'shape' is the unchanged token layout (12-digit start + 6-digit minutes + 40-hex HMAC) at internal/tool/tool.go:92-118",
+    "Both flows still emit the identical token shape, so an activation code and a reset code are indistinguishable to the verifier at cmd/gogs/internal/web/webapi_user.go:44-53",
+    "Codes arrive both as a query parameter (GET /api/web/user/reset-password?code=) and as a JSON body field (POST /api/web/user/reset-password/complete), with the hex-encoded username tail appended (userx.go:44)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "internal/tool/tool.go:92-118 (CreateTimeLimitCode embeds start + minutes in the token and hashes both); the verifier at internal/tool/tool.go:69-72 overwrites the caller-supplied minutes with the token's own field before checking expiry",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "POST /api/web/user/reset-password still reports the reset-email lifetime as conf.Auth.ActivateCodeLives/60 in its `hours` field on all three return paths, and the SPA renders it as 'check your inbox within {hours} hours'",
+      "where": "cmd/gogs/internal/web/webapi_user.go:242",
+      "reason_to_dismiss": "`hours` is only a UI hint for the confirmation page, not the token itself, and the advisory is about token lifetime, so it looks cosmetic and out of scope.",
+      "distance": "1 file / 1 package from the sending call, but in cmd/gogs/internal/web (handler layer) rather than internal/email; also lines 215 and 228",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "GET /api/web/user/reset-password?code= and POST /api/web/user/reset-password/complete accept ANY valid account-activation code as a reset token because both call the flow-agnostic verifyUserActiveCode, so a code minted with ACTIVATE_CODE_LIVES still authorises a password change after RESET_PASSWORD_CODE_LIVES",
+      "where": "cmd/gogs/internal/web/webapi_user.go:44-53",
+      "reason_to_dismiss": "Password reset is one of the flows that legitimately uses the shared 'active code' verifier; an activation link is a neighbouring feature with its own lifetime and was never named in the advisory, so the shared verifier looks like intended reuse.",
+      "distance": "1 file (webapi_user.go) plus internal/userx; the consumers are at webapi_user.go:188 and 246, and the same verifier also completes activation at webapi_user.go:478",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "internal/route/user/setting.go:333",
+      "sibling": "An add-email / alternate-address flow that mints its own time-limited code via GenerateActivateCode",
+      "why_realistic": "This file already sends activation codes for a newly added email and verifies them against conf.Auth.ActivateCodeLives at setting.go:265, so a maintainer adding 'reset the password to this confirmed address' would naturally reuse the same helper and hit the same lifetime question."
+    },
+    {
+      "where": "internal/route/api/v1/admin_user.go:72",
+      "sibling": "An admin 'send password reset email' API action beside the existing register-notify mail",
+      "why_realistic": "Admins already create and edit users and trigger mail from here (form.SendNotify), so an admin-initiated reset-email action is an obvious next feature and would be a second call site of email.SendResetPasswordMail needing the reset lifetime."
+    },
+    {
+      "where": "internal/email/email.go:231-251",
+      "sibling": "A second email.User implementation (queue/transport wrapper) that mints codes itself",
+      "why_realistic": "The User interface exists precisely to avoid import cycles and already has one implementation in another package (internal/database/issue_mail.go); a maintainer adding a queued or notification-service transport would plausibly re-implement the interface rather than reuse mailerUser."
+    }
+  ],
+  "O9_family": "token lifetime / expiration policy (CWE-324 use of a key past its expiry, CWE-613 insufficient session expiration)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26 (go.mod: 'go 1.26.0'); `go test ./...`; frontend assets served from the packed public/assets, pnpm 11 for web/ only",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "internal/userx/userx_test.go:31 TestGenerateActivateCode (only test of the code generator), internal/email/email_test.go:17 TestRenderEmbeddedTemplates with the testDoer stub at internal/email/email_test.go:121-124; no *_test.go under cmd/gogs/internal/web, so the reset-password handlers are untested"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/userx/userx.go, internal/email/email.go, internal/database/issue_mail.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Change the lifetime at the landing point only — make userx.GenerateActivateCode use RESET_PASSWORD_CODE_LIVES (or swap the constant at email.go:228) — which silently changes account-activation and email-confirmation lifetimes; or edit conf.Auth.ActivateCodeLives at webapi_user.go:48, which has no effect because the verifier reads the lifetime out of the token."
+  },
+  "out_of_scope_notes": [
+    "cmd/gogs/internal/web/webapi_user.go:478: a reset-password code can also complete account activation through the same shared verifier (inverse direction, outside this advisory's property).",
+    "A completed password reset does not invalidate other sessions or outstanding codes beyond the password/Rands change (CWE-613 session-expiry angle), outside the advisory's stated scope."
+  ],
+  "unverified": [
+    "Repo size in MB: no shell was available in this session, so tiny_repo/giant_repo were judged from the tree's breadth only and left unflagged.",
+    "present_in_latest for both O8 routes: only the pinned tree and the fix diff were available (no later tree, no network, 'latest release: none'); the fix diff does not touch cmd/gogs/internal/web/webapi_user.go, so both routes are unchanged by the published fix.",
+    "O1 counted by grepping all callers of SendResetPasswordMail/GenerateEmailActivateCode; only cmd/gogs/internal/web/webapi_user.go:235 mints a reset code.",
+    "regression_tests_in_pinned_commit not flagged: the fix's only test-file change (internal/email/email_test.go:121-125) adds the interface stub method to testDoer so the package compiles; it tests nothing about the lifetime split, and no such test exists at the pinned commit."
+  ]
+}

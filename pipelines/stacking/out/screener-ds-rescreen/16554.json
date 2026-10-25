@@ -1,0 +1,131 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16554",
+  "advisory_ids": ["GHSA-84VH-M24Q-WJJX", "CVE-2026-82410", "GO-2026-6489"],
+  "repo": "pocketbase/pocketbase",
+  "pinned_commit": "09044ef7a395ebfd97f54a9749ae8560a62f4a96",
+  "fix_commits": ["30b4184305904fae0d1b78216c4e3cc34700b220", "f1618ee59b6d1c0308bb474c827a2b1f24b12a95"],
+  "trust_decision": {
+    "summary": "Whether a panic raised inside any internal worker goroutine is converted into a value the caller can handle (error or log entry) instead of terminating the whole PocketBase process - decided at each goroutine/errgroup boundary, either by the existing routine.FireAndForget (void workers) or by the new routine.SafeWrap (error-returning workers).",
+    "evidence": ["tools/routine/routine.go:13-35", "apis/batch.go:198", "tools/search/provider.go:339-340", "apis/middlewares.go:253-283"]
+  },
+  "landing_point": {
+    "where": "apis/batch.go:198",
+    "why": "The report's phrase 'worker goroutines' plus the request-crash symptom points first at the batch processor, the only request-driven goroutine in the API layer (named p.process, with a results/errCh handshake); it is also the site a reader hits by grepping 'go func(' in apis/."
+  },
+  "fix_sites": [
+    {"where": "apis/batch.go:198-219", "entry_point": "POST /api/batch (superuser) -> batchProcessor.Process", "module_kind": "http_api"},
+    {"where": "apis/realtime.go:263-330", "entry_point": "/api/realtime websocket + record create/update/delete hooks (realtimeUpdateClientsAuth, realtimeUnsetClientsAuthBy*): group.Go at 263, 291, 315", "module_kind": "http_api"},
+    {"where": "apis/realtime.go:626-830", "entry_point": "/api/realtime broadcast triggered by any record/collection write: group.Go at 626, 785, 820", "module_kind": "http_api"},
+    {"where": "tools/search/provider.go:339-340", "entry_point": "any list/search endpoint -> search.Provider.ParseAndExec/Exec", "module_kind": "library"},
+    {"where": "core/base.go:1461", "entry_point": "pocketbase.New()/core.NewBaseApp() bootstrap (logger write loop inside initLogger)", "module_kind": "core_internal"},
+    {"where": "core/notify_watcher.go:155", "entry_point": "app bootstrap multi-instance notify dir watcher (createNotifyDirWatcher)", "module_kind": "core_internal"},
+    {"where": "pocketbase.go:189-203", "entry_point": "pb.Execute() / `pocketbase serve` CLI (signal + root command goroutines)", "module_kind": "cli"},
+    {"where": "plugins/jsvm/jsvm.go:410", "entry_point": "jsvm.MustRegister(app, config) with HooksWatch (dev file watcher)", "module_kind": "plugin"},
+    {"where": "tools/cron/cron.go:196", "entry_point": "app.Cron().Start() public Go API (ticker goroutine)", "module_kind": "library"},
+    {"where": "tools/filesystem/internal/s3blob/s3blob.go:362", "entry_point": "HTTP file upload with an S3-backed filesystem -> blob writer open()", "module_kind": "internal_package"},
+    {"where": "tools/filesystem/internal/s3blob/s3/uploader.go:342-380", "entry_point": "HTTP file upload with an S3-backed filesystem -> Uploader.multipartUpload workers (g.Go at 342 and 359)", "module_kind": "internal_package"},
+    {"where": "tools/routine/routine.go:35", "entry_point": "routine.SafeWrap public package API (new helper added by the fix)", "module_kind": "library"}
+  ],
+  "O1_entry_points": 8,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "tools/filesystem/internal/s3blob/s3/uploader.go:342-380"},
+  "O3_reason_to_dismiss": "The S3 upload workers sit in tools/filesystem/internal/s3blob - internal storage plumbing that only runs when an S3-backed filesystem is configured - so a solver can call them optional deployment code rather than an app 'worker'; the same move is available for the time.AfterFunc callbacks ('timers, not goroutines started by the app').",
+  "O4_distance": {"files": 11, "packages": 8, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The batch worker must still deliver a value on p.errCh so Process returns the per-request 'batch_request_failed' error promptly; a recover that only logs (or returns nil) leaves the select blocked until the transaction timeout and keeps the transaction open.",
+    "where": "apis/batch.go:218-231"
+  },
+  "O6_input_shapes": [
+    "void worker func() wrapped by routine.FireAndForget",
+    "error-returning worker func() error wrapped by routine.SafeWrap (errgroup-compatible)",
+    "panic value that is a non-error (string/int), stringified with %v",
+    "panic value that is itself an error"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "time.AfterFunc debounce callback (50ms) that reloads cached settings/collections runs in its own goroutine with no recover; only the enclosing watcher loop was wrapped by the fix",
+      "where": "core/notify_watcher.go:172-196",
+      "reason_to_dismiss": "The function's goroutine (line 155) was already wrapped by the published fix, and a debounce timer is not an app worker the advisory lists",
+      "distance": "same file as a fix site; core package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "time.AfterFunc callback calls app.Restart() in an unprotected goroutine while the sibling watcher loop was wrapped",
+      "where": "plugins/jsvm/jsvm.go:422-432",
+      "reason_to_dismiss": "dev-only hooks watcher (HooksWatch), and its surrounding goroutine is already wrapped",
+      "distance": "same file as a fix site; plugins/jsvm package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "The immediate runDue(time.Now()) executes inside the time.AfterFunc callback goroutine, outside the wrapped ticker goroutine; NewMoment/IsDue work is unrecovered (only job fn is FireAndForget at line 227)",
+      "where": "tools/cron/cron.go:187-193",
+      "reason_to_dismiss": "cron jobs themselves are already launched through routine.FireAndForget, so the scheduler is assumed covered",
+      "distance": "same package as a fix site (tools/cron), 3 lines above it",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Unauthenticated auth/reset flows schedule store-cleanup and timeout callbacks via time.AfterFunc with no recover (password reset, verification request, oauth2 redirect, auth-alert timeout, graceful shutdown)",
+      "where": "apis/record_auth_password_reset_request.go:63-65",
+      "reason_to_dismiss": "These callbacks only touch the in-memory store / a buffered channel, so they are argued to be trivially panic-free and not 'workers'",
+      "distance": "apis package, other files from the landing point (same package, different feature files)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "tools/filesystem/internal/fileblob/fileblob.go:650",
+      "sibling": "a background write/flush goroutine in the local-filesystem blob writer, mirroring s3blob's writer.open",
+      "why_realistic": "fileblob and s3blob are maintained as parallel storage backends; a maintainer adding buffered/async writes to the local backend would copy the s3blob writer shape, which uses a bare goroutine at the pinned commit"
+    },
+    {
+      "where": "apis/backup.go:146",
+      "sibling": "another background backup/restore-download task launched with routine.FireAndForget",
+      "why_realistic": "the existing restore route already hands work to a background goroutine; a new backup route (upload/download/create) written from the same template is a natural copy, and a panic there only logs"
+    },
+    {
+      "where": "apis/realtime.go:263-330",
+      "sibling": "a seventh errgroup broadcast helper (e.g. for a new realtime action) without routine.SafeWrap",
+      "why_realistic": "the six existing chunked-broadcast helpers are near-identical copies; adding one more action/channel is the obvious extension and nothing in the code enforces the wrapper"
+    }
+  ],
+  "O9_family": "Unhandled panic in concurrent worker goroutines (missing recover/error conversion; process-terminating panic, CWE-248)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.25.0 (go.mod); Makefile target `test: go test ./... -v --cover`",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tools/routine/routine_test.go (only TestFireAndForget at the pinned commit - TestSafeWrap does not exist yet), tools/cron/cron_test.go, apis/batch_test.go, apis/realtime_test.go, tools/search/provider_test.go, tools/filesystem/internal/s3blob/s3blob_test.go and s3/uploader_test.go"
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": ["protection_documented_without_exceptions"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "apis/batch.go, apis/realtime.go, core/base.go, core/notify_watcher.go, plugins/jsvm/jsvm.go, pocketbase.go, tools/cron/cron.go, tools/filesystem/internal/s3blob/s3/uploader.go, tools/filesystem/internal/s3blob/s3blob.go, tools/routine/routine.go, tools/search/provider.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap only the worker goroutine the report names (the batch processor), or harden routine.FireAndForget alone, leaving the errgroup workers and the implicit time.AfterFunc goroutines uncovered."
+  },
+  "out_of_scope_notes": [
+    "The first fix commit (30b41843) also carries a View-collection wildcard validator change in daos/view.go - that is issue #7761, a different advisory; the equivalent change is already in this tree (parent commit c388ade7) and is not part of this screen.",
+    "30b41843 is the same panic-hardening fix replayed on a release branch whose tree (daos/, tools/filesystem/internal/s3lite) does not exist here; only the f1618ee59 hunks apply to this pinned tree."
+  ],
+  "unverified": [
+    "repo_mb: no shell available to size the tree; clearly above 5 MB and below 1.5 GB from the file layout, so neither tiny_repo nor giant_repo is claimed.",
+    "offline_after_build: assumed true (embedded sqlite via modernc.org/sqlite, no external services) but the Go module cache was not inspected, so `go test ./...` may need a one-time `go mod download`.",
+    "present_in_latest: no latest release was provided for this advisory, so every O8 route is marked unknown.",
+    "O12 protection_documented_without_exceptions is based on the fix commit's changelog line (fix.diff:349-350, 'all existing internal worker functions were wrapped with routine.SafeWrap'); the pinned tree itself has no such documentation.",
+    "Whether hidden behavioural tests can exercise the S3/internal-storage workers without an S3 endpoint could not be checked (no tests were run)."
+  ]
+}

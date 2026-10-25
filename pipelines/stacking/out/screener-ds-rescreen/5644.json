@@ -1,0 +1,108 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "5644",
+  "advisory_ids": ["GHSA-V5RC-CPWC-CFPR", "CVE-2026-71303", "PYSEC-2026-3679"],
+  "repo": "netflix/lemur",
+  "pinned_commit": "e9ade7dad5c9bc1369a831554ed6df3277c9cbae",
+  "fix_commits": ["edca0390f930344d65ff4ca37a669c2320e3dfad"],
+  "trust_decision": {
+    "summary": "An authority's stored acme_url is fetched server-side at certificate issuance (ClientV2.get_directory), so any value written to Authority.options.acme_url must be https and in ACME_DIRECTORY_HOST_ALLOWLIST before it is persisted. The published fix decides this at authorities.service.update, i.e. the PUT /api/1/authorities/<id> path, and exports the existing creation-time validator from the ACME issuer plugin so the update path can call it.",
+    "evidence": [
+      "lemur/plugins/lemur_acme/plugin.py:41-53",
+      "lemur/authorities/service.py:42-43",
+      "lemur/plugins/lemur_acme/acme_handlers.py:161-163",
+      "lemur/plugins/lemur_acme/acme_handlers.py:188"
+    ]
+  },
+  "landing_point": {
+    "where": "lemur/authorities/service.py:42",
+    "why": "The advisory summary says the PUT update path stores options verbatim with no re-validation, so an engineer looks first at the 'if options:' block of authorities.service.update, where authority.options is assigned."
+  },
+  "fix_sites": [
+    {"where": "lemur/authorities/service.py:42-44", "entry_point": "PUT /api/1/authorities/<id> -> lemur/authorities/views.py:417 service.update", "module_kind": "service layer behind the REST handler"},
+    {"where": "lemur/plugins/lemur_acme/plugin.py:35", "entry_point": "helper used by both ACME create_authority implementations and now by authorities.service.update", "module_kind": "issuer plugin validation helper (renamed _validate_acme_url -> validate_acme_url)"},
+    {"where": "lemur/plugins/lemur_acme/plugin.py:337", "entry_point": "POST /api/1/authorities (slug acme-issuer) -> ACMEIssuerPlugin.create_authority", "module_kind": "issuer plugin, first implementation"},
+    {"where": "lemur/plugins/lemur_acme/plugin.py:481", "entry_point": "POST /api/1/authorities (slug acme-http-issuer) -> ACMEHttpIssuerPlugin.create_authority", "module_kind": "issuer plugin, second implementation"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "lemur/authorities/service.py:49-62 (authorities.service.update_options writes authority.options with no validation)"
+  },
+  "O3_reason_to_dismiss": "update_options is an internal helper that Lemur itself calls (lemur/plugins/lemur_acme/acme_handlers.py:237) with the authority's own already-stored options, so it carries no user input and is not a route the advisory's PUT attack can reach.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Existing authorities (and the ACME_DIRECTORY_URL config fallback) may legitimately hold an acme_url whose host is not in the allowlist; the validator docstring records that they are deliberately not re-validated. A fix that moves the check to the fetch site would break certificate issuance for every such authority - the test config itself points at https://acme-v01.api.letsencrypt.org, which is not in the default allowlist.",
+    "where": "lemur/plugins/lemur_acme/plugin.py:38-39, lemur/plugins/lemur_acme/acme_handlers.py:161-163, lemur/tests/conf.py:216"
+  },
+  "O6_input_shapes": [
+    "options supplied as a JSON string whose value is a list of {name, value} objects (the shape AuthorityUpdateSchema declares at lemur/authorities/schemas.py:101)",
+    "several entries in that list carrying name acme_url (the fix loops over all of them, not just the first)",
+    "an acme_url entry with a missing or empty value (option.get('value', '') is validated and rejected)"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "lemur/authorities/schemas.py:101 (options = fields.String() on input, vs fields.Dict() at :128 on output; the value is stored in the JSON column lemur/authorities/models.py:41 and re-parsed at lemur/plugins/lemur_acme/acme_handlers.py:157)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "authority options rewrite through the public service helper authorities.service.update_options (reached from the ACME store_account flow), which persists authority.options unvalidated",
+      "where": "lemur/authorities/service.py:49-62",
+      "reason_to_dismiss": "internal helper, only invoked by Lemur at lemur/plugins/lemur_acme/acme_handlers.py:237 with options derived from the authority's own stored value; no attacker-controlled input reaches it",
+      "distance": "caller one package away in lemur/plugins/lemur_acme/acme_handlers.py:237; helper itself sits 6 lines below the fixed function",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "lemur/plugins/lemur_acme/acme_handlers.py:152-188",
+      "sibling": "validate the stored acme_url immediately before ClientV2.get_directory (defence at the sink) instead of at each writer",
+      "why_realistic": "one call there covers every current and future write route, which is exactly the shortcut a maintainer fixing an 'incomplete fix' would reach for"
+    },
+    {
+      "where": "lemur/authorities/service.py:49",
+      "sibling": "the existing options-only write helper update_options as a second, unvalidated writer of authority.options",
+      "why_realistic": "it already exists at the pinned commit and is the natural place a UI/admin flow for editing authority options would be wired to"
+    },
+    {
+      "where": "lemur/authorities/models.py:79",
+      "sibling": "Authority.__init__ assigning kwargs['options'] directly, used by seed/import paths that skip both service functions",
+      "why_realistic": "Lemur already builds Authority objects outside authorities.service for upload and seeding flows, so an import CLI writing options is plausible"
+    }
+  ],
+  "O9_family": "SSRF (CWE-918) via an unvalidated URL stored in configuration and fetched server-side; incomplete fix, validation present on the create route only",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python 3 (Flask / SQLAlchemy / marshmallow)",
+    "toolchain": "pip + requirements.txt, tox envlist py310/py311, pytest",
+    "services": ["PostgreSQL (lemur/tests/conftest.py:81 creates the pg_trgm extension before create_all)"],
+    "offline_after_build": true,
+    "project_tests": "lemur/tests/test_authorities.py:417 exercises PUT /authorities/<id> with an options payload; lemur/plugins/lemur_acme/tests/test_acme_dns.py, test_acme_handler.py and test_acme_http.py cover setup_acme_client and the creation-time validation"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lemur/authorities/service.py; lemur/plugins/lemur_acme/plugin.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Move the allowlist check into the fetch path (setup_acme_client_no_retry before ClientV2.get_directory), which breaks issuance for existing authorities and the ACME_DIRECTORY_URL fallback."
+  },
+  "out_of_scope_notes": [
+    "The acme_regr option stores a registration URI supplied by the ACME server and reloads it into ClientNetwork; it is a sibling fetch parameter but is outside this advisory's acme_url allowlist and was not pursued."
+  ],
+  "unverified": [
+    "repo_mb: no shell available to measure the tree size",
+    "build and test execution: not run (shell disabled); buildability inferred from requirements.txt, tox.ini and conftest.py",
+    "present_in_latest for the O8 route: no latest-release tree was supplied",
+    "whether the bundled UI exposes another authority-options editor outside the Python tree (frontend JS not read)"
+  ]
+}

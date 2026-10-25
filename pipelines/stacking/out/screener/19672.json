@@ -1,0 +1,75 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "19672", "advisory_ids": ["GHSA-WQCR-7RF3-F64M", "CVE-2026-47215", "GO-2026-5715"],
+  "repo": "sylabs/singularity", "pinned_commit": "1db126f6fd295a25934e933e6aeb3fda99063013",
+  "fix_commits": ["c08791793e843d4c9c1f2fc1d9d12abef747378f"],
+  "trust_decision": {
+    "summary": "Decided: whether the resolved container image path may be used to run a container, i.e. whether it lies inside any administrator-configured 'limit container paths' directory tree. The decision is made by (*Image).AuthorizedPath from a raw string-prefix comparison of the resolved image path against each resolved limit path, and is enforced by EngineOperations.loadImage.",
+    "evidence": ["pkg/image/image.go:146-166", "pkg/image/image.go:160", "internal/pkg/runtime/engine/singularity/prepare_linux.go:1479-1485", "internal/pkg/runtime/engine/singularity/prepare_linux.go:1480", "pkg/util/singularityconf/config.go:61"]
+  },
+  "landing_point": {
+    "where": "internal/pkg/runtime/engine/singularity/prepare_linux.go:1479-1485",
+    "why": "It is the only consumer of the 'limit container paths' directive (the only reference to File.LimitContainerPaths in the tree), so anyone grepping the directive named in the advisory summary lands here; the matching logic itself is one hop away in a different package (pkg/image)."
+  },
+  "fix_sites": [
+    {"where": "pkg/image/image.go:146-166", "entry_point": "singularity run/exec/shell/instance start (and every image load in the engine: read-only/writable rootfs, --overlay images, --bind data images) -> (*Image).AuthorizedPath, which is also the exported Go API of pkg/image", "module_kind": "public library API (pkg/image), not the enforcement handler"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2 site and no O8 route exists inside the directive's own scope; the only available dismissal lever is the documented exception 'Only effective in setuid mode, with unprivileged user namespace creation disabled. Ignored for the root user.' (pkg/util/singularityconf/config.go:333-334), which lets a solver leave the --oci and 'shell oci run' routes alone.",
+  "O4_distance": {"files": 1, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A limit path that is exactly the image file itself, a limit path with a trailing separator, a symlink to the image's directory, and the root limit path '/' must all still authorize. A fix that simply appends os.PathSeparator to the limit path and keeps strings.HasPrefix passes the foobar-vs-foo case but wrongly denies an exact file match and breaks the pinned '/' test case.",
+    "where": "pkg/image/image.go:160 (pinned HasPrefix also authorizes an exact file match); pkg/image/image_test.go:192-196 (existing 'valid path /' case); fix.diff:126-144 (exact-file, trailing-slash and symlink cases added by the fix)"
+  },
+  "O6_input_shapes": [
+    "limit path equal to the image file itself",
+    "limit path with a trailing path separator",
+    "limit path that is a symlink to the image's directory (EvalSymlinks on the limit side)",
+    "relative limit path (filepath.Abs added before comparison)",
+    "limit path '/' (root)",
+    "image directory that is a pure string-prefix sibling of a limit path, e.g. /xxx/foobar vs /xxx/foo"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "pkg/util/singularityconf/parser.go:103-113 and pkg/util/singularityconf/parser.go:143-153 (directive value comma-split and TrimSpace'd only; no Clean/Abs/EvalSymlinks), field at pkg/util/singularityconf/config.go:61", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/pkg/runtime/launcher/oci/mounts_linux.go:721-731", "sibling": "a second implementation of the limit-container-paths containment check in the --oci launcher, at the place a SIF image bind is opened (image.Init at mounts_linux.go:728)", "why_realistic": "The --oci launcher already loads singularity.conf (internal/pkg/runtime/launcher/oci/launcher_linux.go:110) and honours other directives, so a maintainer extending 'limit container paths' to --oci mode would naturally put the check where the image is opened; it would be a separate package from pkg/image and would need the same component-aware comparison."},
+    {"where": "internal/pkg/util/fs/helper.go:207-235", "sibling": "component-aware containment for the symlink-descent helper, which today tests strings.HasPrefix(dest, absRoot) at helper.go:219", "why_realistic": "Same idiom as the fixed sink (resolved path + string prefix) used for a security-relevant containment decision; a maintainer hardening path containment would use the same filepath.Rel/IsLocal shape here."},
+    {"where": "internal/pkg/runtime/engine/singularity/prepare_linux.go:417-435", "sibling": "keepAutofsMount decides 'is this host path under an autofs mount point' with EvalSymlinks + strings.HasPrefix (prepare_linux.go:423-424)", "why_realistic": "Written in the same engine and the same style as the sink; a maintainer adding a path allow-list for autofs-openable paths would copy this prefix test verbatim and inherit the same defect."},
+    {"where": "pkg/ocibundle/sif/bundle_linux.go:95", "sibling": "an authorization check when a SIF is converted/wrapped into an OCI bundle", "why_realistic": "The bundle path is a wrapper/composition route that materialises a container from a host SIF path; if the policy were extended to bundle creation it would live here rather than in pkg/image."}
+  ],
+  "O9_family": "CWE-22 improper path containment (string prefix instead of path-component containment) for an administrator-configured container path allow-list",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go 1.25.7",
+    "toolchain": "./mconfig && make -C builddir (mconfig generates internal/pkg/buildcfg config via confgen); build deps per INSTALL.md: libseccomp-dev, squashfs-tools >= 4.5 (sqfstar), squashfs-tools-ng, cryptsetup, golangci-lint for lint; no vendor dir, modules fetched at build time",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/image TestAuthorizedPath (pkg/image/image_test.go:169-218; skipped under -short, uses test.DropPrivilege so usually run as root, and needs the in-tree fixture e2e/testdata/busybox_amd64.sif so it is offline); e2e coverage of the directive in e2e/config/config.go:501-516 (LimitContainerPathsProc / LimitContainerPathsTestdir, requires an installed setuid build)"
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "pkg/image/image.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Keep strings.HasPrefix and merely append os.PathSeparator to the limit path (with a '/' special case); it rejects the xxx/foobar-vs-xxx/foo case and passes the pinned tests, but wrongly denies a limit path that is exactly the image file, which only the fix's new test case covers."
+  },
+  "out_of_scope_notes": [
+    "internal/pkg/runtime/launcher/oci/mounts_linux.go:721-731 (--oci image bind) and internal/app/singularity/oci_linux.go (root-only 'oci run') never consult LimitContainerPaths; both are outside the directive as documented (setuid mode only, ignored for root) so they are not counted as O8 routes.",
+    "Unrelated same-idiom uses of strings.HasPrefix for containment outside this protection: pkg/util/archive/archive.go:97,248 and internal/pkg/util/fs/helper.go:219; only recorded as injection room, not pursued."
+  ],
+  "unverified": [
+    "No build or test was executed (no shell in this session); buildability is read from go.mod, INSTALL.md:246-248 and the absence of a checked-in internal/pkg/buildcfg config.go (generated by mconfig/confgen).",
+    "Repository size in MB could not be measured, so tiny_repo/giant_repo were not assessed; source tree is clearly larger than a small library but the tree also carries built SIF fixtures under e2e/testdata.",
+    "O1 counted as 1: the flaw is reachable only through the single loadImage enforcement path (prepare_linux.go:1216 rootfs, :1386 overlay images, :1436 bind data images) plus the exported method (*Image).AuthorizedPath itself, which is the sink rather than a separate entry point.",
+    "No release later than the pinned commit was supplied ('latest: none'), so O8 present_in_latest is unknown; there are no O8 routes to check in any case.",
+    "The published fix resolves a relative limit path with filepath.Abs inside the (setuid starter) prepare process, so a relative admin value becomes dependent on the caller's CWD; not evaluated further.",
+    "j_cause_other_layer=1 is based on O7 only: the protection's input list is produced raw by the config loader while the image path is abs/symlink-resolved by pkg/image ResolvePath (pkg/image/image.go:388-398); the bypass itself is entirely inside the fixed function."
+  ]
+}

@@ -1,0 +1,97 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18874",
+  "advisory_ids": ["GHSA-QG67-7M6V-QG25", "CVE-2026-61833", "GO-2026-6527"],
+  "repo": "project-zot/zot",
+  "pinned_commit": "5f0263d334fbcc383b4d85f52c67cba338cc297b",
+  "fix_commits": ["7bb211bcd4352b90f3e99752607fbd1f050bf7ca"],
+  "trust_decision": {
+    "summary": "For traditional bearer tokens the required scope action is decided once, in the authn middleware, purely from the HTTP method (anything except GET/HEAD becomes 'push', so DELETE is authorized by a push-only token); BearerAuthorizer then accepts the request if the token's access claim contains that single action. The fix adds a DELETE->'delete' case to that one switch.",
+    "evidence": ["pkg/api/authn.go:607-616", "pkg/api/bearer.go:124-146", "pkg/api/authz.go:622-629", "fix.diff:13-25"]
+  },
+  "landing_point": {
+    "where": "pkg/api/authn.go:607-610",
+    "why": "This is the only place in the tree that derives a distribution-spec scope action ('pull'/'push') from the request method; the advisory summary 'Bearer authentication maps DELETE to push scope' points straight at the `if m != GET && m != HEAD` line."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/api/authn.go:607-616",
+      "entry_point": "every bearer-authenticated route under /v2/ registered on prefixedRouter (pkg/api/routes.go:126-213); the delete-capable ones are DELETE /v2/{name}/manifests/{reference} (pkg/api/routes.go:171-175), DELETE /v2/{name}/blobs/{digest} (pkg/api/routes.go:180-181) and DELETE /v2/{name}/blobs/uploads/{session_id} (pkg/api/routes.go:190-191)",
+      "module_kind": "http middleware (authentication/scope enforcement)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "n/a: no O2 site and no O8 route exists at the pinned commit, because all three DELETE routes funnel through the single middleware at pkg/api/authn.go:607-616, so there is nothing for a solver to argue out of scope.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "DELETE /v2/{name}/blobs/uploads/{session_id} is an upload-session cancel, which the distribution spec scopes as 'push'; the published fix routes every DELETE, including this one, to 'delete', so a push-only client that opened an upload can no longer cancel it. A second trap: the bearer claim vocabulary is pull/push/delete (pkg/api/bearer.go:134), so copying the accessControl vocabulary read/create/update/delete from pkg/api/authz.go:693-715 breaks every pull/push bearer token.",
+    "where": "pkg/api/routes.go:190-191"
+  },
+  "O6_input_shapes": [
+    "GET -> pull",
+    "HEAD -> pull",
+    "POST -> push",
+    "PATCH -> push",
+    "PUT -> push",
+    "DELETE -> delete (added by the fix)",
+    "any other method -> pull (default branch; in practice OPTIONS never reaches it because it is served unauthenticated at pkg/api/authn.go:561-566)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "pkg/api/authn.go:604-616",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/api/authz.go:693-715",
+      "sibling": "a second method->action mapper for the accessControl vocabulary (read/create/update/delete) that a new route class must also be added to",
+      "why_realistic": "zot already keeps two parallel method mappings in two vocabularies (bearer scopes in authn.go, accessControl permissions in authz.go); a maintainer adding e.g. a tag-delete or tag-copy endpoint would naturally extend only one of them."
+    },
+    {
+      "where": "pkg/api/bearer.go:91-149",
+      "sibling": "a second caller of BearerAuthorizer.Authorize that builds its own ResourceAction (e.g. a gRPC or CLI-facing public API) instead of going through bearerAuthHandler",
+      "why_realistic": "Authorize takes the requested action as a parameter, so any new transport or public API in the same package can reach the same sink with its own action computation and skip the middleware's switch."
+    },
+    {
+      "where": "pkg/api/routes.go:224-228",
+      "sibling": "an extension route (search/userprefs/image-trust) that mutates or deletes repository state while still relying on the shared bearer middleware's method->scope mapping",
+      "why_realistic": "extension routes are registered on the same prefixedRouter and were written assuming read-only use; pkg/extensions/extension_userprefs.go:40-46 already serves PUT through the identical middleware."
+    }
+  ],
+  "O9_family": "improper authorization (CWE-285): HTTP method not mapped to the matching distribution-spec scope action, so a lower scope grants a higher-privilege operation",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.3 (go.mod:3), Makefile targets `make binary`, `make test-devmode`; repo tests run with GOEXPERIMENT=jsonv2, no vendor directory so modules are fetched at build time",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/api/bearer_test.go:21 TestBearerAuthorizer (unit), pkg/api/controller_test.go:3533 TestBearerAuth (end-to-end with the in-repo mock token server pkg/test/auth/bearer.go:31, but it never issues a DELETE), pkg/api/authn_test.go:1189 TestBearerOIDCWorkloadIdentity; the fix's TestTraditionalBearerMethodActionMapping is absent from the pinned tree."
+  },
+  "O11_fix_minutes": 10,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "none",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "pkg/api/authn.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Fix it locally in the manifests handler (or only for the manifests route), or copy the read/create/update/delete vocabulary from pkg/api/authz.go:693-715 into bearerAuthHandler; the first leaves blobs and uploads open, the second breaks every pull/push bearer token."
+  },
+  "out_of_scope_notes": [
+    "Same middleware, different property (not followed): non-repository routes under bearer auth (e.g. PUT /v2/_zot/ext/userprefs, GET /v2/_zot/ext/search) get a repository scope with an empty name, so those routes are unusable with bearer tokens - an availability quirk, not part of this advisory's delete-scope property.",
+    "Also noted and not pursued: DistSpecAuthzHandler bypasses authorization entirely for bearer-authenticated requests (pkg/api/authz.go:622-629), so the token claim check is the only guard for that path."
+  ],
+  "unverified": [
+    "Repository size in MB (no shell available in this session; repo_mb left null).",
+    "Whether the distribution-spec conformance suite treats DELETE /v2/{name}/blobs/uploads/{id} as push-scoped or delete-scoped, i.e. whether the published fix's mapping of that route is itself a regression.",
+    "Whether DistSpecAuthzHandler's `err != nil` fail-open branch (pkg/api/authz.go:623-629) is reachable at the pinned commit.",
+    "O1 is counted as one decision point (the shared middleware) rather than three routes; the three DELETE routes are listed explicitly in fix_sites[0].entry_point."
+  ]
+}

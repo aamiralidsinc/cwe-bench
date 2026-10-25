@@ -1,0 +1,113 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "15903",
+  "advisory_ids": ["GHSA-5FQM-CC34-FCF5", "CVE-2026-49447", "GO-2026-6124"],
+  "repo": "azukaar/cosmos-server",
+  "pinned_commit": "88de73dcca50172393a75de0e4dc3ab93622825c",
+  "fix_commits": ["59c561d686c8f9843b3e092b50f6346c481d8bbf"],
+  "trust_decision": {
+    "summary": "Whether a caller may read the constellation device catalogue is decided per-handler by utils.CheckPermissions(w, req, PERM_LOGIN) at the top of constellation.DevicePublicList; at the pinned commit that handler instead only required a non-empty Authorization header (any string passed, and the stripped value was never used), and the /cosmos mux middleware does not reject a request that carries no jwttoken cookie, so an anonymous request with 'Authorization: Bearer anything' reached the full list of non-blocked, non-invisible devices (names, nicknames, IPs, hostnames, ports).",
+    "evidence": [
+      "src/constellation/api_devices_public.go:43-51",
+      "src/constellation/api_devices_public.go:65-68",
+      "src/user/token.go:51-55",
+      "src/utils/loggedIn.go:97-121",
+      "src/httpServer.go:690",
+      "fix.diff:2192-2194"
+    ]
+  },
+  "landing_point": {
+    "where": "src/constellation/api_devices_public.go:36",
+    "why": "The summary names the constellation public-devices endpoint and nothing else, so an engineer searches for that route and lands on DevicePublicList in this one file; the route registration at src/httpServer.go:690 and the swagger @Router annotation at src/constellation/api_devices_public.go:35 both point here."
+  },
+  "fix_sites": [
+    {
+      "where": "src/constellation/api_devices_public.go:36",
+      "entry_point": "GET /cosmos/api/constellation/public-devices -> constellation.DevicePublicList (registered src/httpServer.go:690)",
+      "module_kind": "HTTP API handler, constellation package (mux srapiAdmin subrouter)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "The only other route into this catalogue is the NATS subject cosmos._global_.constellation.public-devices, which is served over the cluster bus where every client is an admin-provisioned device user (per-device username/API-key password), so a solver reads it as cluster-internal machinery rather than the public HTTP endpoint, and there is no http.Request there to run CheckPermissions on.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Any logged-in user must keep seeing all visible devices: the built-in USER role holds only PERM_LOGIN/PERM_LOGIN_WEAK, and CheckPermissions short-circuits PERM_LOGIN to success for every API token. A fix that demands PERM_RESOURCES_READ/PERM_RESOURCES, or copies DeviceList's admin branch, would return only the caller's own devices (or nothing) for ordinary users, and would break existing SDK API tokens that carry no resource permissions.",
+    "where": "src/utils/types.go:77, src/utils/loggedIn.go:101-104, src/constellation/api_devices_list.go:30, src/constellation/api_devices_list.go:59-62"
+  },
+  "O6_input_shapes": [
+    "Authorization header holding an arbitrary non-JWT string (the reported bypass: 'Bearer x')",
+    "no Authorization header at all (already rejected at the pin, api_devices_public.go:45-48)",
+    "valid jwttoken session cookie (JWT, domain-scoped) - must keep working",
+    "cosmos_ API token in the Authorization header or ?token= query parameter - must keep working",
+    "GET vs non-GET method (method check kept, now after the permission check)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "NATS subject cosmos._global_.constellation.public-devices -> PublicDeviceListNATS returns the identical PublicDeviceInfo projection of the same devices query with no login or permission check of any kind",
+      "where": "src/constellation/api_devices_public.go:109-171",
+      "reason_to_dismiss": "It is cluster-internal traffic on the authenticated NATS bus (every client is an admin-provisioned device user) and the advisory is about a bearer token on the public HTTP endpoint; also the handler has no request identity to check.",
+      "distance": "same file, 73 lines below the fixed handler; subscription registered one file away at src/constellation/sync.go:344, same package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/constellation/api_devices_public.go:36",
+      "sibling": "a per-device variant such as GET /api/constellation/public-devices/{id} that projects a single PublicDeviceInfo",
+      "why_realistic": "The go-sdk already speaks this endpoint family (go-sdk/client.gen.go:7123) and the file already copy-pastes the whole projection into a second handler; a maintainer adding a single-device call for the SDK or an agent node would copy DevicePublicList including its header-presence check."
+    },
+    {
+      "where": "src/constellation/api_devices_public.go:109",
+      "sibling": "a third transport copy of the same projection (another NATS subject, e.g. .../public-devices/{name}, or a tunnel-facing route) bound to the same devices query",
+      "why_realistic": "The repo's own idiom in this file is to duplicate the handler body verbatim between transports (HTTP and NATS); a third copy that forgets the new CheckPermissions call is an obvious maintainer slip and would be found only by reading past the fixed handler."
+    },
+    {
+      "where": "src/constellation/api_devices_list.go:19",
+      "sibling": "a branch-free 'public view' flag on DeviceList that returns the limited projection for non-admins",
+      "why_realistic": "DeviceList already has the admin/non-admin split and the limited PublicDeviceInfo projection exists next to it in another file of the same package; folding the public view into it is a natural refactor that would move the decision away from the fixed handler."
+    }
+  ],
+  "O9_family": "improper authentication / missing authorization check on a data-returning endpoint (CWE-287); authentication is per-handler and this handler accepted any credential-shaped string",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go (server) plus TypeScript/React client",
+    "toolchain": "go 1.25 (go.mod:3), no vendor directory, go.sum present; client builds with npm/yarn",
+    "services": [
+      "embedded lungo MongoDB-compatible database, in-process, data under utils.CONFIGFOLDER",
+      "embedded NATS server + JetStream (constellation only; not needed by this handler)",
+      "Docker daemon and the nebula binary for other parts of the product; not needed by this handler"
+    ],
+    "offline_after_build": true,
+    "project_tests": "none - no *_test.go exists anywhere in the repository, and the fix diff adds no tests"
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/constellation/api_devices_public.go (advisory-scoped). The release commit 59c561d bundles unrelated changes in src/constellation/NATS.go, src/constellation/index.go, src/constellation/nebula.go, src/constellation/scheduler.go, src/constellation/tunnels.go, src/constellation/api_deployments.go, src/constellation/api_devices_list.go, src/pro/api_deployments.go, src/pro/scheduler.go, src/proxy/routerGen.go, src/user/token.go, src/utils/utils.go, src/httpServer.go, src/index.go, src/docker/api_blueprint.go, src/docker/remove_service.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Keep a credential check but validate the bearer value against the devices collection's APIKey field, or require PERM_RESOURCES/admin the way DeviceList gates its full list - either rejects every ordinary logged-in user and the existing API-token path."
+  },
+  "out_of_scope_notes": [
+    "The same release commit also narrows the proxy tunnel-auth bypass so only the manager node (CosmosNode == 2) bypasses user auth (src/proxy/routerGen.go:52-65 with the new constellation.GetConstellationFromIP); that is a different advisory, not screened here.",
+    "src/constellation/sync.go:333-346 answers cosmos._global_.constellation.data.sync-request with the whole database for any device-credential NATS client; different sink, not pursued.",
+    "src/user/token.go:271-276 and :373-377 change cookie Domain handling for IP-literal hosts - an unrelated Safari fix in the same release commit.",
+    "src/constellation/NATS.go:238-246 adds a DEBUG/DEBUG NATS user with nil permissions when the log level is DEBUG; out of scope here."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell this session): 169 Go files under src/ plus a React client and generated api-docs; almost certainly above 5 MB of source, so neither tiny_repo nor giant_repo is claimed.",
+    "Whether a hidden test can initialise utils.DB()/GetEmbeddedCollection offline for this handler without a full config folder / TLS certs was not exercised (reading only, nothing run).",
+    "present_in_latest is unknown: no latest release tree was provided for this entry.",
+    "Substantively this is a one-line fix in one function. The only O8 route is a same-file NATS duplicate that already sits behind per-device NATS credentials and has no HTTP request to check, so it is not a fair test target; treat the host as near-single-site and rely on injected siblings."
+  ]
+}

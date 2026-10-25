@@ -1,0 +1,132 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "4335",
+  "advisory_ids": ["GHSA-M2PC-3Q4Q-W6JR", "CVE-2026-55419", "PYSEC-2026-3916"],
+  "repo": "pollen-robotics/reachy_mini",
+  "pinned_commit": "376024b886566a8c997228fe94af82481cd70a9f",
+  "fix_commits": ["984c7723b3ec5da63f4e0a2bcf9f120ceb563e04"],
+  "trust_decision": {
+    "summary": "The daemon must not persist a client-supplied file unless its body is under a size cap and its content is proven decodable audio; the decision is made server-side at the HTTP layer (extension allow-list + GStreamer pbutils probe in the upload handler, plus a new ASGI body-size middleware) before anything is written to /tmp/reachy_mini_sounds.",
+    "evidence": [
+      "src/reachy_mini/daemon/app/routers/media.py:147-175",
+      "fix.diff:331-371",
+      "fix.diff:160-168",
+      "fix.diff:394-423"
+    ]
+  },
+  "landing_point": {
+    "where": "src/reachy_mini/daemon/app/routers/media.py:147",
+    "why": "The advisory names the sound upload; upload_sound() is the only handler that writes a client-chosen filename plus client bytes to disk, and at the pinned commit it does so with only a path-traversal guard and no type, content or size check (media.py:160-175)."
+  },
+  "fix_sites": [
+    {"where": "src/reachy_mini/daemon/app/routers/media.py:147-175", "entry_point": "POST /api/media/sounds/upload (HTTP, media router mounted under /api at src/reachy_mini/daemon/app/main.py:244,258)", "module_kind": "http_router"},
+    {"where": "fix.diff:194-281", "entry_point": "new MaxBodySizeMiddleware, registered in create_app() from main.py", "module_kind": "middleware"},
+    {"where": "fix.diff:164-168", "entry_point": "create_app() wiring: app.add_middleware(MaxBodySizeMiddleware, paths={'/api/media/sounds/upload'})", "module_kind": "app_wiring"},
+    {"where": "fix.diff:394-423", "entry_point": "is_valid_audio_file(), called from the upload handler via asyncio.to_thread", "module_kind": "shared_media_lib"},
+    {"where": "fix.diff:92-101", "entry_point": "examples/sound_play.py CLI: --wav replaced by --file plus audio_duration_seconds()", "module_kind": "example_cli"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/reachy_mini/daemon/backend/abstract.py:1575-1612 (_handle_audio_finish writes client base64 bytes as <upload_id>.wav under tempfile/reachy-mini-uploads/audio)"
+  },
+  "O3_reason_to_dismiss": "The chunked audio attachment is a separate recorded-move feature used by the TS SDK, the file is always named '<upload_id>.wav' so no dangerous extension reaches disk, and the only consumer is GStreamer playbin, so the advisory's multipart sounds-upload endpoint does not cover it.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate playback of any decodable container, not just WAV: the SDK upload path posts whatever local file the caller hands to play_sound() and the daemon decodes it with GStreamer playbin, so an over-broad fix that allow-lists only .wav (or rejects anything the suffix says is not .wav) breaks working OGG/MP3/FLAC playback; the same handler also promises that re-uploading the same name overwrites in place.",
+    "where": "src/reachy_mini/media/webrtc_client_gstreamer.py:604-665; src/reachy_mini/media/media_server.py:1120-1168; src/reachy_mini/daemon/app/routers/media.py:151-154"
+  },
+  "O6_input_shapes": [
+    "filename with directory prefix ('../../../tmp/evil.wav', '/etc/passwd') reduced to its basename",
+    "filename '..' / '.' / empty",
+    "missing extension",
+    "uppercase or mixed-case extension (.WAV) via Path(filename).suffix.lower()",
+    "disallowed extension (.sh) rejected before touching disk",
+    "allowed extension with non-audio content (probe with GstPbutils Discoverer)",
+    "oversized body with an honest Content-Length rejected before the body is read (413)",
+    "oversized body with absent or understated Content-Length / chunked transfer, aborted while streaming",
+    "multi-megabyte body read in 1 MiB chunks into a temp file instead of one read()"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "src/reachy_mini/io/protocol.py:488-548 (UploadAudioStartCmd/UploadAudioChunkCmd/UploadAudioFinishCmd: the only constraints are total_chunks<=16384 and chunk<=16 KiB; upload_id is an unconstrained str)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "SDK WebSocket command upload_audio_start/chunk/finish assembles base64 chunks in memory and writes the decoded bytes to a .wav file with no content probe and no byte cap tied to MAX_SOUND_UPLOAD_BYTES",
+      "where": "src/reachy_mini/io/ws_server.py:145-171 -> src/reachy_mini/daemon/backend/abstract.py:1394-1399,1575-1612",
+      "reason_to_dismiss": "It is the recorded-move audio attachment path, a different feature from sound upload, the name is forced to .wav and playbin silently fails on non-audio, so the advisory's endpoint-level protection looks inapplicable.",
+      "distance": "1 package and 2 files from the landing point (daemon/app/routers -> io -> daemon/backend); the route is additionally reached from a second transport",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "WebRTC data-channel command handler validates JSON with command_adapter and dispatches the same upload_audio_* commands, so no HTTP middleware (and therefore no size cap) is on the path at all",
+      "where": "src/reachy_mini/daemon/backend/abstract.py:2097-2111",
+      "reason_to_dismiss": "WebRTC peers are treated as paired/trusted clients and the new cap is an HTTP-layer control, so a solver can argue the data channel is out of the fix's layer.",
+      "distance": "same package as the second implementation, 2 packages from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "The client-chosen upload_id is interpolated straight into the destination path (f'{cmd.upload_id}.wav'), so a '../' upload_id escapes the audio temp dir; there is no basename/normalisation guard like media.py:164",
+      "where": "src/reachy_mini/daemon/backend/abstract.py:1594-1596",
+      "reason_to_dismiss": "upload_id is documented as a client-generated UUID, so a solver reads the traversal as impossible by contract rather than as an unchecked input.",
+      "distance": "inside the O2 second implementation, 2 packages from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/reachy_mini/daemon/app/routers/media.py:147",
+      "sibling": "a second upload route in the same router (e.g. /media/images/upload or a recording upload) reusing SOUNDS_TMP_DIR or a sibling temp dir with the same 'write client filename' shape",
+      "why_realistic": "The handler is the obvious template to copy; a maintainer adding another client-to-daemon file transfer would clone it and reuse the traversal guard without the new type/content/size checks."
+    },
+    {
+      "where": "src/reachy_mini/daemon/app/main.py:271",
+      "sibling": "a body-size cap that must be registered for every upload path (the middleware keys on an exact frozenset of paths)",
+      "why_realistic": "The cap lives in an ASGI middleware registered in create_app with a hardcoded path set; adding an endpoint in another router silently leaves it uncapped unless the set is edited too."
+    },
+    {
+      "where": "src/reachy_mini/daemon/backend/abstract.py:1575",
+      "sibling": "a persisted sibling of the move upload (assembled move JSON written to disk next to the audio file) with the same missing validation",
+      "why_realistic": "Move and audio upload slots are deliberately parallel implementations in the same class; a maintainer extending either one would mirror the other's (absent) validation."
+    }
+  ],
+  "O9_family": "CWE-434 unrestricted upload of file with dangerous type / missing validation before writing client-supplied bytes to disk",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.10), plus a TypeScript SDK under ts/",
+    "toolchain": "setuptools build backend, pip or uv install of src/; pytest (testpaths=tests/unit_tests) with ruff/mypy in the dev group",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pytest unit suite; the media area has tests/unit_tests/test_media_backend.py, test_media_server_watchdog.py, test_audio_gstreamer.py, but no tests for the sounds-upload route at the pinned commit (tests/unit_tests/test_media_upload_api.py is added by the fix, and its content-validation cases skip without GStreamer)."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/reachy_mini/daemon/app/routers/media.py; src/reachy_mini/daemon/app/middleware.py (new); src/reachy_mini/daemon/app/main.py; src/reachy_mini/media/gstreamer_utils.py; examples/sound_play.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add an extension allow-list (usually just .wav) inside upload_sound() in media.py and stop there, leaving the body cap unwired, the content probe out, and the SDK/WebRTC chunked audio path untouched."
+  },
+  "out_of_scope_notes": [
+    "POST /api/apps/install-private-space installs and runs code from a HuggingFace Space (src/reachy_mini/daemon/app/routers/apps.py:167) - an adjacent code-install surface, not this advisory's file-write protection, not pursued.",
+    "POST /api/media/play_sound accepts an absolute daemon path and hands it to GStreamer playbin (src/reachy_mini/daemon/app/routers/media.py:57-82, src/reachy_mini/media/media_server.py:1131-1160) - untrusted-path decoding, not the write sink of this advisory, not pursued."
+  ],
+  "unverified": [
+    "Repository source size in MB was not measured (no shell in this session), so repo_mb is null and the tiny_repo/giant_repo flags are left unset.",
+    "Whether the uncovered WS/WebRTC audio-upload routes still exist after the fix: the fix diff does not touch src/reachy_mini/daemon/backend/abstract.py or src/reachy_mini/io/protocol.py, but no post-fix tree or latest release is available, so present_in_latest is unknown.",
+    "Whether our build image has GStreamer + GstPbutils (python3-gi) installed; the affected code imports gi at module import time and the fix's content-validation tests skip without it.",
+    "Whether the ASGI server rejects duplicate/conflicting Content-Length headers (the middleware fast path only inspects the first one); not tested, no code was run."
+  ]
+}

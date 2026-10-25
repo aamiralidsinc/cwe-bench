@@ -1,0 +1,110 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "19680",
+  "advisory_ids": ["GHSA-WQXV-W64V-5WH6", "CVE-2026-55435", "GO-2026-5925"],
+  "repo": "coder/coder",
+  "pinned_commit": "aba94072fe6bc00c816dd8254669169fcbf3a0ab",
+  "fix_commits": ["0d2c9f904a8b75b888140fcc8fbf4633660cc787"],
+  "trust_decision": {
+    "summary": "coderd/aibridgedserver.IsAuthorized decides whether an API key (full key, or a bare key ID on the delegated in-process path) may use the AI Bridge LLM proxy; it required an existing unexpired key with a matching secret owned by a non-deleted, non-system user, but never required the user to be active, so suspended/dormant owners kept proxy access.",
+    "evidence": [
+      "coderd/aibridgedserver/aibridgedserver.go:619-632",
+      "coderd/aibridgedserver/aibridgedserver.go:553-574",
+      "coderd/aibridged/http.go:131-136",
+      "enterprise/coderd/aibridge.go:72-96",
+      "coderd/httpmw/apikey.go:685-689",
+      "coderd/database/models.go:3737-3739"
+    ]
+  },
+  "landing_point": {
+    "where": "coderd/aibridgedserver/aibridgedserver.go:626-632",
+    "why": "The deleted/system-user block inside IsAuthorized is the only place that reads as 'the proxy's authorizer'; the report's symptom (suspended users still proxied) points straight at the user checks there."
+  },
+  "fix_sites": [
+    {
+      "where": "coderd/aibridgedserver/aibridgedserver.go:45-46",
+      "entry_point": "POST|GET /api/v2/aibridge/{provider}/* (enterprise/coderd/aibridge.go:76-95 -> coderd/aibridged/http.go:131 -> DRPC Authorizer.IsAuthorized); also the in-process delegated transport (coderd/aibridged/transport.go:62-119)",
+      "module_kind": "in-process dRPC service (sentinel error definition)"
+    },
+    {
+      "where": "coderd/aibridgedserver/aibridgedserver.go:626-632",
+      "entry_point": "POST|GET /api/v2/aibridge/{provider}/* (enterprise/coderd/aibridge.go:76-95 -> coderd/aibridged/http.go:131 -> DRPC Authorizer.IsAuthorized); also the in-process delegated transport (coderd/aibridged/transport.go:62-119)",
+      "module_kind": "in-process dRPC service (IsAuthorized)"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2 site and no O8 route exist; the nearest arguable edge is the delegated in-process branch, where a solver could claim chatd's transport already sits behind the chat API's active-user middleware and needs no re-check (coderd/aibridge/factory.go:36-41 states that contract), yet the published fix covers it inside the same function.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Dormant accounts are legitimately reactivated on first authenticated use (ActivateDormantUser turns dormant -> active); a fix that treats 'not active' as one undifferentiated rejection at a shared layer, or that conflates dormant with suspended across auth code, breaks that reactivation path.",
+    "where": "coderd/httpmw/apikey.go:668-689; coderd/userauth.go:643-660; coderd/coderd.go:945-951"
+  },
+  "O6_input_shapes": [
+    "full API key 'id-secret' supplied as Authorization: Bearer, X-Api-Key, or X-Coder-AI-Governance-Token",
+    "bare key ID (KeyId field, delegated in-process callers that never hold the secret)",
+    "user status suspended",
+    "user status dormant",
+    "any other non-active status value (the check is a negated equality against active)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "coderd/users.go:1021-1026 (UpdateUserStatus inside putUserStatus, reached from PUT /api/v2/users/{user}/status/suspend|activate); the check reads the persisted users row via GetUserByID at coderd/aibridgedserver/aibridgedserver.go:620, so no serialization/cache boundary is crossed",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "coderd/aibridgedserver/aibridgedserver.go:461-479",
+      "sibling": "an active-user check in GetMCPServerAccessTokensBatch before handing out the user's external-auth OAuth tokens",
+      "why_realistic": "same dRPC server, same AIBridged authz context, and the method already takes a bare UserId from the internal caller; a maintainer fixing 'suspended users keep AI access' would plausibly harden it in the same commit."
+    },
+    {
+      "where": "coderd/aibridged/transport.go:62-69",
+      "sibling": "enforce the delegated-identity contract (caller must have proven the owner may act) at the in-process transport boundary instead of in IsAuthorized",
+      "why_realistic": "the transport already fails fast on a missing delegated key ID, so the natural place for the next invariant is right beside it."
+    },
+    {
+      "where": "coderd/x/chatd/model_routing_aibridge.go:78-88",
+      "sibling": "gate AI Gateway routing on the chat owner's account status before stamping the delegated API key ID",
+      "why_realistic": "chatd stamps the active turn's key ID here for every model call, and a chat run can outlive the suspension that should have stopped it."
+    },
+    {
+      "where": "enterprise/aibridgeproxyd/aibridgeproxyd.go:661-683",
+      "sibling": "a second copy of the user-status policy at the MITM CONNECT edge",
+      "why_realistic": "authMiddleware already parses the Coder token from Proxy-Authorization and rejects on missing/invalid credentials; a maintainer could have added a status lookup there instead of relying on coderd."
+    }
+  ],
+  "O9_family": "incorrect authorization (CWE-863): API-key authorizer omits the account-state predicate",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26.4 per go.mod; standard `go build ./...` / `go test ./coderd/aibridgedserver/...`; no code generation needed for this area",
+    "services": ["postgres (enterprise integration tests such as enterprise/aibridged_integration_test.go only; the fix's own unit tests use gomock and need no services)"],
+    "offline_after_build": true,
+    "project_tests": "coderd/aibridgedserver/aibridgedserver_test.go: TestAuthorization (full key) and TestAuthorization_Delegated (KeyId), both table-driven over a gomock store with no DB and no network; the published fix extends both tables with 'suspended user' and 'dormant user' cases."
+  },
+  "O11_fix_minutes": 10,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "coderd/aibridgedserver/aibridgedserver.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Copy the advisory title and add `if user.Status == database.UserStatusSuspended { return ErrInactiveUser }` next to the deleted-user check, leaving dormant (and any future non-active) owners able to keep proxying."
+  },
+  "out_of_scope_notes": [
+    "GetMCPServerAccessTokensBatch (coderd/aibridgedserver/aibridgedserver.go:461-479) trusts a caller-supplied UserId and returns that user's external-auth OAuth access tokens with no user lookup or status check at all; adjacent to this advisory's mechanism but a different protected resource, so not pursued."
+  ],
+  "unverified": [
+    "repo_mb: no shell is available in this session, so the checkout size could not be measured (coder/coder is a large multi-language monorepo, clearly not under 5 MB and not believed to exceed 1.5 GB of source).",
+    "Whether `go test` for this package runs fully offline depends on the Go module cache being pre-populated; not checked.",
+    "Whether the same status gap once existed in any released build is not checked (no release snapshot beyond the pinned commit was reviewed)."
+  ]
+}

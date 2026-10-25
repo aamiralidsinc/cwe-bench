@@ -1,0 +1,49 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "6530", "advisory_ids": ["GHSA-XX4J-W367-7247", "CVE-2026-55571", "PYSEC-2026-3829"], "repo": "djust-org/djust", "pinned_commit": "3b369d0c1a5e1efd6d63ad244ef5874440675bd2", "fix_commits": ["1ae8aa9246b80477de7ddc4d90319a3b267bef04"],
+  "trust_decision": {
+    "summary": "Whether a client may dispatch @event_handler calls is decided at WebSocket mount time in LiveViewConsumer.handle_mount (check_view_auth, then close-the-socket on denial); the event path itself trusts only 'self.view_instance is set' and never re-runs the auth check.",
+    "evidence": ["python/djust/websocket.py:1970", "python/djust/websocket.py:1977", "python/djust/websocket.py:1979", "python/djust/websocket.py:1795", "python/djust/websocket.py:2722", "python/djust/auth/core.py:38"]
+  },
+  "landing_point": {"where": "python/djust/websocket.py:1979", "why": "The advisory summary names a 'login_required / on_mount LiveView mount redirect' that does not close the socket; an engineer reading that looks straight at the 'if redirect_url:' branch of handle_mount, which sends {'type':'navigate'} and returns without self.close()."},
+  "fix_sites": [
+    {"where": "python/djust/websocket.py:1979-1986", "entry_point": "WebSocket frame {\"type\":\"mount\"} (receive dispatch, websocket.py:1625) and {\"type\":\"live_redirect_mount\"} (websocket.py:1633 -> handle_live_redirect_mount at websocket.py:4290, which delegates to handle_mount)", "module_kind": "websocket consumer / transport handler"},
+    {"where": "python/djust/websocket.py:2005-2007", "entry_point": "same mount entries, redirect returned by an on_mount hook (run_on_mount_hooks, websocket.py:2002)", "module_kind": "websocket consumer / transport handler"},
+    {"where": "python/djust/websocket.py:2524-2537 (the fix adds the _mounting_in_batch suppression flag here, with its two restore points at fix.diff:410-416 and fix.diff:423-432)", "entry_point": "WebSocket frame {\"type\":\"mount_batch\"} (websocket.py:1627) -> handle_mount_batch (websocket.py:2615) -> _mount_one collector (websocket.py:2483)", "module_kind": "batch mount helper inside the consumer"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "python/djust/sse.py:242-244"},
+  "O3_reason_to_dismiss": "The SSE transport is presented as a degraded fallback (no presence, no actors, one-way stream) whose event endpoint is labelled legacy ('POST /djust/sse/<session_id>/event/' at docs/sse-transport.md:17), and the project documents auth as mount-time-only by design (docs/guides/authentication.md:197-201), so a solver can argue both the SSE mount and the missing per-event re-check are outside the advisory's WebSocket transport.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A login-redirecting view mounted inside a multiplexed mount_batch on a shared socket must NOT close that socket: sibling public views keep serving events and the redirect is reported in the batch's navigate[] array; an unconditional close in the redirect branch kills the whole batch, so the fix threads a _mounting_in_batch flag through _mount_one to suppress only the close.", "where": "python/djust/websocket.py:2615-2679 (handle_mount_batch), python/djust/websocket.py:2524-2537 (send_json collector in _mount_one)"},
+  "O6_input_shapes": [
+    "auth redirect: check_view_auth returns LOGIN_URL for anonymous (login_required), permission-less anonymous, or custom check_permissions() returning False",
+    "hook redirect: run_on_mount_hooks returns a redirect target",
+    "single mount frame on its own socket (close is allowed)",
+    "multiplexed mount_batch entry on a shared socket (close must be suppressed, the unmounted view must still be cleared)",
+    "live_redirect_mount, which re-enters handle_mount on an already-open socket"
+  ],
+  "O7_producer": {"kind": "handler", "where": "python/djust/websocket.py:1795", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "SSE legacy event path: GET /djust/sse/<id>/?view=<login_required view> mounts through _sse_mount_view, pushes navigate and returns with session.view_instance still set; POST /djust/sse/<id>/event/ then dispatches to @event_handler unauthenticated because the stream is never shut down and the session stays registered", "where": "python/djust/sse.py:242-244 (mount redirect), with the sink at python/djust/sse.py:352-355 and python/djust/sse.py:785-810", "reason_to_dismiss": "SSE is a fallback transport and /event/ is documented as the legacy endpoint (docs/sse-transport.md:10-17); the advisory and its remediation talk only about WebSocket close codes.", "distance": "another module in the same package, a separate hand-written mount implementation that the published diff never touches", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "No auth re-check on the live event path: a socket that mounted legitimately keeps dispatching @event_handler calls after the user logs out or loses the permission - the same sink, reached without any mount redirect", "where": "python/djust/websocket.py:2722-2724 (handle_event gates only on self.view_instance; no check_view_auth call in its body)", "reason_to_dismiss": "docs/guides/authentication.md:195-201 states mount-time-only auth as a conscious, documented trade-off shared with Phoenix/Livewire, so a solver can call a per-event re-check a new feature rather than part of this fix.", "distance": "about 700 lines below the landing point in the same file", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "python/djust/sse.py:242", "sibling": "a second mount implementation (long-poll / SSE / fallback transport) that pushes navigate but never clears session.view_instance and never shuts the transport down", "why_realistic": "_sse_mount_view is a hand-copied mirror of handle_mount whose docstring claims the same security model (python/djust/sse.py:159-166), so a maintainer re-implementing the branch would plausibly copy the 'send navigate, return' shape and forget the close."},
+    {"where": "python/djust/runtime.py:337-341", "sibling": "a transport built on the shared ViewRuntime that clears runtime.view_instance on an auth block but never terminates its own transport, leaving the session lingering", "why_realistic": "runtime.py is explicitly the transport-agnostic seam for new transports (ADR-016) and each transport owns its own Transport object, so a new transport can easily omit a shutdown call."},
+    {"where": "python/djust/websocket.py:2205-2213", "sibling": "a third denial branch (object-permission, post-mount) that sends an error and closes but never clears view_instance - or the reverse, a copied branch that clears but forgets to close", "why_realistic": "the same function already contains three denial branches written at different times; copy-paste of one branch into a new lifecycle stage is exactly the parallel-path drift the fix comments warn about (#1646)."}
+  ],
+  "O9_family": "improper authorization / missing authentication check on a live event-dispatch channel (CWE-285, CWE-306)", "O9_dos": false,
+  "O10_build": {"language": "Python 3.10+ with a Rust/PyO3 extension", "toolchain": "maturin build backend + cargo + pip/uv; pytest with pytest-django, pytest-asyncio, pytest-xdist; Django and channels[daphne] runtime deps", "services": [], "offline_after_build": true, "project_tests": "python/tests/test_auth.py and python/tests/test_auth_integration.py cover check_view_auth at unit level; python/tests/test_websocket_origin_validation.py covers the 4403 origin close; python/tests/test_sse.py exercises the SSE endpoints with no auth/redirect cases at all; the mount-redirect close test file added by the fix does not exist at the pinned commit."},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "python/djust/websocket.py", "j_sibling_sites": "yes", "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Replace the early return in handle_mount's redirect branch with an unconditional await self.close(code=4403), which fixes the single-mount case but kills multiplexed mount_batch siblings and drops the navigate frame the batch response needs."},
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo size in MB (no shell in this session), so tiny_repo/giant_repo could not be measured; the tree has 755+ Python files plus 5 Rust crates and is clearly not tiny",
+    "whether graders treat the missing per-event auth re-check (O8 route 2, the fix's own T3 follow-up) as in scope for this task",
+    "latest-release code was not available (listed as none), so present_in_latest for both O8 routes is unknown"
+  ]
+}

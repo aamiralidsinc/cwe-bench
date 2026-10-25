@@ -1,0 +1,64 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "17251", "advisory_ids": ["GHSA-CXVF-GVFQ-36W2", "CVE-2026-73293", "GO-2026-6371"],
+  "repo": "semaphoreui/semaphore", "pinned_commit": "419c655d6168290065cb11f9ee76c367d1a92ec8",
+  "fix_commits": ["1c4bb65df114962134f8829d4a03667106a01a68", "bb2a4e1f08c8023e618f8dd6eaca73554f2c33bb"],
+  "trust_decision": {
+    "summary": "A user's project permissions are decided by resolving the stored role slug through the store and trusting the DB row's `permissions` column, so any role row whose slug equals a built-in slug (owner/manager/task_runner/guest) replaces the code-defined permissions; the fix makes built-in slugs authoritative in code and confines the SQL slug lookup to the project or global scope.",
+    "evidence": ["api/projects/project.go:45-57", "db/ProjectUser.go:22-32", "db/sql/role.go:59-63", "db/sql/template.go:495-512", "db/sql/migrations/v2.17.1.sql:1-8"]
+  },
+  "landing_point": {"where": "api/projects/project.go:49", "why": "It is the single place every project route turns a stored role slug into a permission set for GetMustCanMiddleware, so a reader of 'custom-role slug collision' looks here first."},
+  "fix_sites": [
+    {"where": "api/projects/project.go:49-57", "entry_point": "all authenticated HTTP routes under /api/project/{project_id}/... mounted with projects.ProjectMiddleware (api/router.go:294, api/router.go:364, api/router.go:380)", "module_kind": "HTTP middleware (api handler layer)"},
+    {"where": "db/sql/role.go:59-63", "entry_point": "POST/PUT /api/project/{project_id}/users[/{user_id}] via api/projects/users.go:90 and api/projects/users.go:180, plus ProjectMiddleware itself", "module_kind": "SQL store implementation of the public db.Store interface (db/Store.go:517)"},
+    {"where": "db/sql/template.go:497-513", "entry_point": "POST /api/project/{project_id}/tasks/{task_id}/start|stop via api/projects/tasks.go:128, and any project route carrying template_id via api/projects/project.go:67", "module_kind": "SQL store query for template-level permissions"},
+    {"where": "db/Role.go:10-15", "entry_point": "no in-repo caller: the pro role endpoints that would call it are 404 stubs (pro/api/roles.go:28-63), so only db.Store.CreateRole callers exist here", "module_kind": "db validation helper"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "db/bolt/role.go:79-96"},
+  "O3_reason_to_dismiss": "The BoltDB store is the deprecated legacy backend (util/config.go:39, db/factory/store.go:18-19) and the advisory's store-level hunk only touched db/sql, so its unscoped `role.Slug == slug` lookup looks like an unrelated leftover once the middleware guard stops built-in slugs from shadowing.",
+  "O4_distance": {"files": 6, "packages": 5, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Global roles (project_id IS NULL) must stay resolvable for project users and project restore must keep importing roles under freshly generated slugs; the fixed SQL lookup therefore keeps `or project_id is null` (db/sql/role.go:61) and services/project/restore.go:57 randomises the slug. An over-broad fix that drops every DB role lookup, or filters only `project_id=?`, breaks global custom roles and role restore.", "where": "db/sql/role.go:59-63"},
+  "O6_input_shapes": [
+    "role slug as a plain JSON string in the user body: {\"role\": \"manager\"} on project user add/update (api/projects/users.go:82, api/projects/users.go:172)",
+    "each built-in slug string: owner, manager, task_runner, guest (db/ProjectUser.go:5-11)",
+    "empty slug \"\" (db.ProjectNone), which created a role row with no name/slug guard",
+    "arbitrary custom slug string stored in the role table (project-scoped project_id=<id> or global project_id IS NULL)",
+    "case/spelling variants such as \"Manager\", which are not IsValid and are therefore treated as custom roles"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "services/export/Role.go:52", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "On a BoltDB deployment, POST /api/project/{project_id}/users accepts a custom role slug that exists only in another project (unscoped bolt lookup), and ProjectMiddleware then grants that other project's role permissions here", "where": "db/bolt/role.go:79-96", "reason_to_dismiss": "BoltDB is deprecated in favour of sqlite and the advisory's store hunk only changed the SQL implementation, so the bolt copy reads as a legacy duplicate nobody needs to touch", "distance": "db/bolt package, 3 packages from the landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "CLI `semaphore migrate --from-boltdb` recreates role rows with their original slugs through the exporter and never calls db.ValidateRole, so the new reserved-slug rule is not enforced on the import path", "where": "services/export/Role.go:39-57", "reason_to_dismiss": "it is an offline, admin-only migration of a legacy bolt file (cli/cmd/migrate.go:59) and reads more like data plumbing than a role-creation entry point", "distance": "services/export + cli packages, away from every file the advisory names", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "db/bolt/role.go:79-96", "sibling": "a second store implementation of GetProjectOrGlobalRoleBySlug that also resolves by bare slug", "why_realistic": "the interface method already exists twice (db/Store.go:517, db/sql/role.go:59, db/bolt/role.go:79) and backends drift apart exactly like this"},
+    {"where": "api/projects/users.go:89-95", "sibling": "a third lookup site that accepts a custom role slug for assignment without re-checking its scope", "why_realistic": "the file already calls the same store method twice, before the fix exists, to validate role strings on user add/update"},
+    {"where": "db/sql/template.go:288-291", "sibling": "the templates-list join that reads project__template_role permissions straight off pu.role without resolving the role at all", "why_realistic": "it is the list-view twin of GetTemplatePermission written by a different author and never routed through the role resolver"},
+    {"where": "services/export/Role.go:39-57", "sibling": "a role exporter/importer that preserves the source slug on restore", "why_realistic": "the entity exporter pattern is copy-pasted per entity and role is the only one whose natural key is also a security-relevant name"}
+  ],
+  "O9_family": "improper privilege management / authorization bypass via identifier collision (role-slug shadowing)", "O9_dos": false,
+  "O10_build": {"language": "Go 1.24.6 (go.mod:3)", "toolchain": "go build ./... / go test ./... with modules vendored in the module cache; pro is a local replace (go.mod:22, go.mod:37)", "services": [], "offline_after_build": true, "project_tests": "Taskfile.yml:139-142 runs `go test -v -coverprofile=coverage.out ./...`; db tests are unit-level (db/bolt/*_test.go use bbolt files, db/sql/SqlDb_test.go only builds dialect SQL), db/ProjectUser_test.go covers the built-in permission map, and .dredd integration tests need a running server plus node so they are not usable here. The fix adds db/Role_test.go, which does not exist at the pinned commit."},
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "high",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "api/projects/project.go, db/Role.go, db/sql/role.go, db/sql/template.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Reject reserved slugs only where roles are created (ValidateRole/CreateRole, or the pro AddProjectRole stub) and leave the three read paths that trust a DB role row untouched."
+  },
+  "out_of_scope_notes": [
+    "Nothing outside this advisory's own protection was pursued; no other advisory, route family or repository was examined."
+  ],
+  "unverified": [
+    "repo_mb: no shell in this session, so the checkout size was not measured.",
+    "O10 build: `go build ./...` / `go test ./...` were not executed (reading-and-searching only); language, toolchain and test target were read from go.mod and Taskfile.yml.",
+    "O8 present_in_latest is unknown for both routes because the inputs state there is no latest release to compare against.",
+    "Whether the pro edition's role-creation endpoints (pro/api/roles.go, 404 stubs here) call db.ValidateRole after the fix cannot be checked from this repository."
+  ]
+}

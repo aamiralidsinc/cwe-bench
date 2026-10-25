@@ -1,0 +1,66 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "30289", "advisory_ids": ["GHSA-XR9X-R78C-5HRM", "CVE-2026-66066"], "repo": "rails/rails", "pinned_commit": "fa8f0812160665bff083a089d2bb2fc1817ea03e", "fix_commits": ["1c01bb587206ee6eb0e1179c2cef96a6a47acb1e", "349e7a5d5b5b715af1e416db824f3c078a7d59e5", "d79b7f4aa17dec8ce4960fef05733c8c0c7ef49a"],
+  "trust_decision": {
+    "summary": "libvips must not load or save attacker-controlled blob bytes with the loaders/savers libvips itself flags unfuzzed/untrusted; the decision is made once per process at boot by calling Vips.block_untrusted(true) after the dependency is loaded (and by hard-failing at boot when the installed ruby-vips cannot do it), not at any per-request sink.",
+    "evidence": ["activestorage/lib/active_storage/analyzer/image_analyzer/vips.rb:35-38", "activestorage/lib/active_storage/transformers/image_processing_transformer.rb:19-26", "fix.diff:485-493"]
+  },
+  "landing_point": {"where": "activestorage/lib/active_storage/transformers/vips.rb:5-7", "why": "The summary names 'variant processing'; the transformer is the module that turns blob bytes into a variant and ImageProcessing::Vips is the only vips sink on that path."},
+  "fix_sites": [
+    {"where": "fix.diff:450-494", "entry_point": "process boot: new activestorage/lib/active_storage/vips.rb loaded from both modules below (engine.rb:28 references the Vips analyzer at boot, so any app with ruby-vips loads it)", "module_kind": "boot-time dependency config (new file)"},
+    {"where": "fix.diff:59-62", "entry_point": "ActiveStorage::Blob#analyze / #analyze_later on upload, via config.active_storage.analyzers -> ActiveStorage::Analyzer::ImageAnalyzer::Vips", "module_kind": "analyzer (image metadata)"},
+    {"where": "fix.diff:430-440", "entry_point": "ActiveStorage::Blob#variant -> ActiveStorage::Variation#transform -> ActiveStorage.variant_transformer (ActiveStorage::Transformers::Vips)", "module_kind": "transformer (variant processing)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "activestorage/lib/active_storage/transformers/vips.rb:5-7"},
+  "O3_reason_to_dismiss": "A solver can argue the transformer is only reached through Blob#variant in practice: the docs call direct use of ActiveStorage::Variation rare (activestorage/app/models/active_storage/variation.rb:7-8), and a block installed from the analyzer alone is already process-wide, so the extra require in the transformer looks redundant -- which is exactly what the maintainer's own fix did on the 8-0 and 7-2 branches, where only the analyzer was touched (fix.diff:59-62 has no transformer change).",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Fuzzed formats and non-transform paths must keep working: JPEG/TIFF/WebP/GIF variants still produce output, attaching/storing/downloading BMP/ICO/PSD must still succeed (only transformation may raise), analysis must degrade to nil width/height instead of raising, and a loader re-enabled in an application initializer must stay enabled (the fix loads image_processing before blocking because image_processing 2.0 re-calls Vips.block_untrusted(true) when it loads).",
+    "where": "activestorage/lib/active_storage/analyzer/image_analyzer/vips.rb:39-52, activestorage/test/models/variant_test.rb:95-126, fix.diff:477-483"
+  },
+  "O6_input_shapes": [
+    "input file whose only libvips reader is an unfuzzed loader (BMP/ICO/PSD via ImageMagick; SVG, JPEG XL, JPEG 2000, Netpbm)",
+    "platform-dependent unfuzzed loader name (VipsForeignLoadMagick vs VipsForeignLoadMagick7)",
+    "unfuzzed saver / requested output format, e.g. variant(format: :jxl), FITS, anything delegated to ImageMagick",
+    "same bytes reached through metadata analysis (analyzer) as through transformation (transformer)",
+    "installed libvips/ruby-vips too old to block at all (must raise RuntimeError at boot instead of running unsecurable)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "fix.diff:476-483 — image_processing/vips is loaded lazily by the transformer's processor (activestorage/lib/active_storage/transformers/vips.rb:7); image_processing 2.0 calls Vips.block_untrusted(true) at that load, so the guard's value is produced by the gem at require time, not by any Active Storage handler", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "activestorage/lib/active_storage/previewer/video_previewer.rb:23-34", "sibling": "a Vips-backed previewer that decodes the first PDF/SVG page with Vips::Image.new_from_file before any analyzer or transformer runs", "why_realistic": "previewers are the third consumer of raw blob bytes next to the analyzer and the transformer, and this one already shells out per blob; a maintainer adding a libvips preview would put an untrusted load on a file the fix never requires active_storage/vips from."},
+    {"where": "activestorage/lib/active_storage/transformers/image_magick.rb:5-8", "sibling": "an ImageMagick-side policy/saver guard for the :mini_magick variant processor, mirroring libvips' blocked loaders and savers", "why_realistic": "the advisory's own guide discusses ImageMagick delegation and security policy, so a maintainer could plausibly harden the other variant processor the same way — the same property implemented in a second implementation."},
+    {"where": "activestorage/app/models/active_storage/blob/representable.rb:100-106", "sibling": "a per-call guard in Blob#variant / #variable? that refuses content types whose libvips reader is unfuzzed", "why_realistic": "variable_content_types already lists image/bmp, image/vnd.adobe.photoshop and image/vnd.microsoft.icon (activestorage/lib/active_storage/engine.rb:33-45), so a maintainer could plausibly express this policy as a content-type filter here instead of a process-wide block."}
+  ],
+  "O9_family": "unsafe-by-default native decoding of untrusted content: libvips unfuzzed/untrusted loaders and savers left enabled (CWE-1188 insecure default), leading to arbitrary file read and remote code execution",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Ruby",
+    "toolchain": "Ruby + Bundler (Gemfile.lock present), Minitest/Rake, sqlite3 for the activestorage dummy app",
+    "services": ["libvips >= 8.13 built with the ImageMagick delegate (ruby-vips 2.2.2 pinned at Gemfile.lock:528)", "ImageMagick (the reader for BMP/ICO/PSD in the fix's tests)", "ffmpeg and mutool/poppler only for the preview tests, not this area"],
+    "offline_after_build": true,
+    "project_tests": "activestorage/test/analyzer/image_analyzer/vips_test.rb (SVG assertions at :29-37) and activestorage/test/models/variant_test.rb (:73-115 PSD/ICO/BMP); the vips test file skips instead of failing when ruby-vips is absent unless BUILDKITE is set (vips_test.rb:83-84), and the expected results depend on how libvips was built"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "high",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "activestorage/lib/active_storage/analyzer/image_analyzer/vips.rb, activestorage/lib/active_storage/transformers/vips.rb, activestorage/lib/active_storage/vips.rb (new)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Block only the loader the report's example exercises (e.g. Vips.block(\"VipsForeignLoadMagick\")) inside the transformer or the analyzer sink, which leaves the saver direction and the other module unprotected and misses the second operation name (VipsForeignLoadMagick7) some builds use."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb could not be measured (no shell in this session); by inspection the source tree is far above 5 MB and below 1.5 GB, so neither tiny_repo nor giant_repo was flagged.",
+    "Whether the task image's libvips is built with the ImageMagick delegate: the published tests' 'BMP/ICO/PSD raise Vips::Error' only holds when ImageMagick is the reader; with a native BMP loader they would succeed unblocked.",
+    "Whether image_processing 2.x will be installed in the task image; Gemfile.lock:291 pins 1.14.0, where the load-order hazard described at fix.diff:477-483 has no observable effect, so the one genuine how-type trap here is dormant at the pinned lockfile.",
+    "Whether the ruby-vips gem source (the only place Vips.block_untrusted is documented) is available to the solver inside the task image; the pinned tree contains no occurrence of block_untrusted anywhere.",
+    "The diff's test files (vips_test.rb, variant_test.rb, test_helper.rb) exist at the pinned commit, but none of the added assertions or the with_vips_loaders_enabled helper is present, so regression_tests_in_pinned_commit was not set; the pre-existing tests assert the opposite behaviour."
+  ]
+}

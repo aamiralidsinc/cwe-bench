@@ -1,0 +1,91 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18444",
+  "advisory_ids": ["GHSA-MPWR-8VM7-H73F", "GO-2026-5052"],
+  "repo": "sslmate/go-pkcs12",
+  "pinned_commit": "09ae172c24ac95fc8eebca8fa163c1319a50f5c9",
+  "fix_commits": ["03c441f6b0267f695ca02464133c0b373bf4dd55"],
+  "trust_decision": {
+    "summary": "The decoder decides whether an attacker-supplied PFX is authentic by recomputing the PKCS#12 MAC with a key derived from the file's own PBKDF2 parameters; the fix makes that decision reject a PBMAC1 key length below 20 bytes instead of accepting any positive length.",
+    "evidence": ["mac.go:124-126", "mac.go:127-131", "mac.go:173-181", "pkcs12.go:573"]
+  },
+  "landing_point": {
+    "where": "pkcs12.go:426",
+    "why": "The summary says \"Authentication bypass in Decode functions\", so an engineer starts at the exported Decode/DecodeChain API; the MAC decision is two calls away in getSafeContents (pkcs12.go:550) and the actual key-length sink is in another file, mac.go:130."
+  },
+  "fix_sites": [
+    {
+      "where": "mac.go:123-131",
+      "entry_point": "pkcs12.Decode, pkcs12.DecodeChain, pkcs12.DecodeTrustStore, pkcs12.ToPEM (all reach getSafeContents -> verifyMac -> doMac -> doPBMAC1)",
+      "module_kind": "library public API into an unexported MAC helper in the root package"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2 site and no O8 route exists: every decode entry point funnels through the single verifyMac call at pkcs12.go:573 into doPBMAC1, and the encoder side always writes KeyLength 32 (mac.go:50), so there is no route a solver could argue is out of scope.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A PFX with no MacData at all is accepted when the caller passes an empty password (passwordless files produced by the Passwordless encoder); a fix that makes a verified MAC mandatory on decode breaks this documented behaviour.",
+    "where": "pkcs12.go:569-572"
+  },
+  "O6_input_shapes": [
+    "explicit PBMAC1 PBKDF2 keyLength of 1-19 inside the MAC AlgorithmIdentifier parameters (the shape the fix rejects)",
+    "absent or non-positive keyLength, already rejected before the fix by the neighbouring check",
+    "keyLength of 20 or more, including the encoder's own value of 32, which must keep verifying"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "crypto.go:200-205",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "crypto.go:207-260",
+      "sibling": "A PBES2 consumer that honours kdfParams.KeyLength instead of the encryption-scheme-fixed 16/24/32 (crypto.go:240-250) and derives an attacker-chosen-length AES key.",
+      "why_realistic": "The same pbkdf2Params type (crypto.go:200-205) is parsed for both PBMAC1 (mac.go:85-88) and PBES2 (crypto.go:217-220); RFC 8018 lets PBES2 carry keyLength, the field is parsed and silently ignored today, so a maintainer adding interop for files that set it would naturally use it and would need the same floor."
+    },
+    {
+      "where": "mac.go:42-61",
+      "sibling": "An encoder-side PBMAC1 parameter builder (a new encoder variant or an option) that emits a key length below the MAC digest size instead of the hard-coded 32.",
+      "why_realistic": "This tree just gained a new encoder variant with its own PBMAC1 parameters (Modern2026, pkcs12.go:185-193), so another variant carrying its own makePBMAC1Parameters-style builder is a normal change."
+    },
+    {
+      "where": "mac.go:101-108",
+      "sibling": "A companion PBMAC1 policy check on the PRF (reject the implicit SHA-1 default in the same validation block as the key-length floor).",
+      "why_realistic": "The PRF switch already enumerates HMAC-SHA1 and an ASN.1 default of SHA-1 (mac.go:101-105); a maintainer tightening PBMAC1 parameter policy writes such checks in exactly this block."
+    }
+  ],
+  "O9_family": "Improper input validation of untrusted KDF parameters leading to authentication bypass (CWE-20 / CWE-287)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.19 module (go.mod:3) with golang.org/x/crypto v0.11.0 (go.mod:5, go.sum:6-7); `go build ./...` / `go test ./...`",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkcs12_pbmac1_test.go exercises the RFC 9579 A.1-A.6 vectors through getSafeContents, including the missing-KeyLength error text (pkcs12_pbmac1_test.go:151-169); mac_test.go:76-148 tests PBMAC1 compute/verify; pkcs12_test.go round-trips Encode/Decode and trust stores."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["single_site", "tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "mac.go (doPBMAC1 is the single internal choke point that all four exported decode paths reach)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add the floor as `KeyLength == 32` (the encoder's own value) rather than `>= 20`, or check it in Decode/getSafeContents instead of the shared doPBMAC1, so interoperable files with other legal key lengths stop decoding."
+  },
+  "out_of_scope_notes": [
+    "getSafeContents accepts a PFX with no MacData at all when the password is empty (pkcs12.go:569-572); this is deliberate and documented (pkcs12.go:507-508, Passwordless at pkcs12.go:127-138), and it is not the PBMAC1 key-strength property this advisory fixes, so it was not pursued as a route."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured without a shell; the tree is 17 short Go files plus six small base64 testdata files, so tiny_repo is asserted on that basis rather than on a measured byte count.",
+    "The RFC 9579 testdata vectors were not DER-decoded, so it is unconfirmed whether any of them uses a KeyLength below 20 that a stricter-than-published fix would break.",
+    "j_multi_site is set to 1 by the stated O1>=2 rule; in reality all four exported entry points share the one check site in mac.go, so no second source site needs the fix."
+  ]
+}

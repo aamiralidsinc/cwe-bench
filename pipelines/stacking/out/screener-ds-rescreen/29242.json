@@ -1,0 +1,66 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "29242", "advisory_ids": ["GHSA-28HH-PR2H-2W89", "CVE-2026-54619"],
+  "repo": "sparklemotion/sqlite3-ruby", "pinned_commit": "b24e1e6076528b7f95f99acf7a81c70d0004c726",
+  "fix_commits": ["2bd436d17f77cdd4c31b00fe9d50b0d21cbaf033"],
+  "trust_decision": {
+    "summary": "The Ruby block is passed to SQLite as raw C user data ((void *)block) and is kept alive only by a per-database container. The published fix makes that container an Array and pushes every block, so re-registering a name with a different arity can no longer drop the sole Ruby reference to a block that SQLite still holds in a separate FuncDef. Decided at the single C write site (rb_hash_aset -> rb_ary_push) plus the container's Ruby default ({} -> []).",
+    "evidence": ["ext/sqlite3/database.c:519", "ext/sqlite3/database.c:527", "lib/sqlite3/database.rb:178", "fix.diff:13-14", "fix.diff:26-27"]
+  },
+  "landing_point": {"where": "ext/sqlite3/database.c:527", "why": "Anyone reading 'use-after-free when redefining SQLite functions with different arity' looks at define_function_with_flags, where the block is passed to sqlite3_create_function and then stored by name; the rb_hash_aset there is the one line that loses the old block on redefinition."},
+  "fix_sites": [
+    {"where": "ext/sqlite3/database.c:527", "entry_point": "SQLite3::Database#define_function (C, registered ext/sqlite3/database.c:967) and SQLite3::Database#define_function_with_flags (C, registered ext/sqlite3/database.c:968), both through define_function_with_flags at ext/sqlite3/database.c:503", "module_kind": "c_extension_public_api"},
+    {"where": "lib/sqlite3/database.rb:178", "entry_point": "SQLite3::Database#initialize (Database.new), whose @functions default is the keep-alive container written by the C extension; callers arrive via #create_function at lib/sqlite3/database.rb:412", "module_kind": "ruby_library_defaults"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "lib/sqlite3/database.rb:178"},
+  "O3_reason_to_dismiss": "The Ruby site is only an ivar default in the pure-Ruby constructor, in another language and directory from the C extension where the memory bug lives, so it reads as unrelated to a use-after-free.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Re-registering a name must stay legal: same-arity redefinition must replace the body (loop of define_function('hello') { |a| thing }, test/test_database.rb:508-513), and a different-arity registration must coexist, leaving the earlier arity callable ('select f(1)' still returns the original block, fix.diff:48-54; aggregate analogue with GC.start between registrations, test/test_integration_aggregate.rb:356-365). A fix that raises on a duplicate name or deletes the earlier registration breaks one of these.", "where": "test/test_database.rb:508-513"},
+  "O6_input_shapes": [
+    "same name re-registered with a different fixed block arity (1 then 2), the shape in the advisory and in fix.diff:48-54",
+    "variadic block (arity -1) versus fixed arity for the same name",
+    "same name and arity re-registered with a different text_rep encoding (SQLITE_UTF8 vs SQLITE_UTF16*/UTF16), which SQLite keeps as a separate function entry; the array keeps every block, a [name, arity]-keyed hash would not",
+    "create_function's wrapper proc is always variadic (-1, lib/sqlite3/database.rb:413), so mixing create_function with define_function on one name also leaves an entry behind"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "ext/sqlite3/database.c:749-767", "sibling": "collation() stores the comparator VALUE in a name-keyed single-slot hash with the comment 'Make sure our comparator doesn't get garbage collected.'", "why_realistic": "This is literally the same keep-alive shape and the same comment as the buggy @functions hash; a maintainer adding a text_rep/encoding argument to collation, or a second collation registry, would reproduce the redefinition UAF."},
+    {"where": "ext/sqlite3/aggregator.c:234-256", "sibling": "the aggregate registry already uses -aggregators as an Array and has the multi-arity GC test (test/test_integration_aggregate.rb:356-365)", "why_realistic": "It is the same mechanism done correctly in the same repo; a sibling that reverts one aggregator registry to a name-keyed hash (e.g. a per-connection subclass registry) is exactly what the scalar path looked like at the pinned commit."},
+    {"where": "lib/sqlite3/database.rb:412-419", "sibling": "create_function composes a fresh wrapper proc per call and stores it in the same container", "why_realistic": "Any solver-visible fix at this wrapper (e.g. caching one wrapper per name to avoid allocation) re-creates the single-reference problem independently of the C site."},
+    {"where": "ext/sqlite3/database.c:655-670", "sibling": "set_authorizer keeps the callback in a single @authorizer slot passed as (void *)self", "why_realistic": "The same 'callback must outlive the C registration' pattern; a maintainer extending it to a per-action or per-name authorizer table would store one proc per key."}
+  ],
+  "O9_family": "use-after-free (CWE-416) of a GC-managed Ruby callable held as raw C user data",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Ruby with a C extension",
+    "toolchain": "Ruby + mkmf/gcc/make; packaged build uses mini_portile2 to build SQLite 3.53.2 (dependencies.yml:10-13, downloads sqlite-autoconf-3530200.tar.gz from sqlite.org), or --enable-system-libraries with libsqlite3-dev; minitest + rake",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "minitest via rake test; test/test_database.rb covers custom functions (test_define_function:457, test_function_return_types:508, test_function_gc_segfault:515) on a :memory: database (test/test_database.rb:16); test/test_integration_aggregate.rb covers the aggregate UAF siblings (:142, :356, :367)"
+  },
+  "O11_fix_minutes": 12,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "ext/sqlite3/database.c, lib/sqlite3/database.rb",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Change rb_hash_aset to rb_ary_push in the C extension only and leave the Ruby @functions = {} default (TypeError), or keep a Hash keyed by [name, arity], which still drops blocks re-registered under a different text_rep encoding."
+  },
+  "out_of_scope_notes": [
+    "Related but outside this advisory: create_function(name, arity, ...) ignores its arity argument because the wrapper proc at lib/sqlite3/database.rb:413 is always variadic (-1); not pursued."
+  ],
+  "unverified": [
+    "repo_mb was not measured (no shell in this session); from the file tree (about 30 small source files, no vendored SQLite, SQLite downloaded at build time per dependencies.yml:10-13) it is estimated well under 5 MB.",
+    "SQLite's per-(name, arity, encoding) FuncDef identity is inferred from SQLite C API semantics; the SQLite sources are not in the pinned tree (fetched at build), so the encoding-variant claim has no file:line citation.",
+    "Whether re-registering a collation under the same name can leave a stale comparator VALUE is unknown (SQLite source not in the tree); recorded only as injection room, not as an O8 route.",
+    "No build or test run was performed (Bash disabled), so buildability and offline behaviour are from extconf.rb, dependencies.yml and test/helper.rb only.",
+    "No latest-code checkout is available for O8, so present_in_latest is not applicable."
+  ]
+}

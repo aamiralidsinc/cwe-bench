@@ -1,0 +1,100 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "15132",
+  "advisory_ids": ["GHSA-26GQ-P25F-99CP", "CVE-2026-73564", "GO-2026-6103"],
+  "repo": "fatedier/frp",
+  "pinned_commit": "d486018885a548ef9680c36920343df568207bac",
+  "fix_commits": ["7dc7be930e2452ae93fd32f2a77f8c6fcd0b652b"],
+  "trust_decision": {
+    "summary": "One decision, made in the frps SSH tunnel gateway's per-channel request loop: the length prefix of an SSH 'exec' channel request is trusted and used to slice the payload. `end := 4 + binary.BigEndian.Uint32(req.Payload[:4])` is uint32 arithmetic, so a prefix of 0xFFFFFFFF wraps end to 3 and `req.Payload[4:end]` panics in a bare goroutine, killing frps. No authentication is needed in the default config (authorizedKeysFile empty => NoClientAuth).",
+    "evidence": [
+      "pkg/ssh/server.go:312",
+      "pkg/ssh/server.go:315",
+      "pkg/ssh/server.go:316",
+      "pkg/ssh/server.go:319",
+      "pkg/ssh/server.go:226",
+      "pkg/ssh/gateway.go:74",
+      "pkg/ssh/gateway.go:119"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/ssh/server.go:315",
+    "why": "The summary names the SSH tunnel gateway and an integer overflow; the only integer arithmetic on a client-supplied value in the gateway is `4 + binary.BigEndian.Uint32(req.Payload[:4])` in handleNewChannel, immediately followed by a slice indexed by it (server.go:319). The package is only three files, so this is the first and only place to look."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/ssh/server.go:312-319",
+      "entry_point": "frps SSH tunnel gateway TCP listener (sshTunnelGateway.bindPort, server/service.go:279-285) -> Gateway.Run (pkg/ssh/gateway.go:105) -> handleConn -> TunnelServer.Run (pkg/ssh/server.go:87) -> waitForwardAddrAndExtraPayload -> handleNewChannel (spawned per client-opened channel, pkg/ssh/server.go:226)",
+      "module_kind": "server-side SSH protocol handler / gateway (network entry point, no HTTP route or CLI command)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2 site and no O8 route exists; the only dismissal a solver could reach for is that the crash needs the gateway run in its documented default (authorizedKeysFile empty => unauthenticated, doc/ssh_tunnel_gateway.md:144,148), i.e. that it is a deployment choice rather than a code defect.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A legitimate exec payload is a full cobra command line ('tcp --remote-port N --proxy-name x', 'tcpmux --mux=httpconnect --custom-domain d') that is split on single spaces and handed to cobra; and every channel request including a rejected one must still be answered with Reply(true, nil) on the channel that is also the proxy data path. An over-broad fix that rejects payloads with option-like tokens, caps the payload length, only accepts a fixed token set, or replies false / closes the channel on a parse failure breaks the documented client usage and the e2e tunnel cases.",
+    "where": "pkg/ssh/server.go:262"
+  },
+  "O6_input_shapes": [
+    "canonical RFC 4254 section 6.5 form: 4-byte big-endian length prefix followed by the command string",
+    "empty payload (nil)",
+    "payload shorter than the 4-byte prefix (3 bytes)",
+    "declared length greater than the remaining bytes (prefix 2, one data byte)",
+    "length prefix 0xFFFFFFFF, for which 4+prefix wraps to 3 in uint32 arithmetic"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/ssh/server.go:308-324",
+      "sibling": "a second per-request parser in the same request loop (e.g. a 'shell'/'pty-req' payload reader, or an inbound 'direct-tcpip' channel-open parser for ssh -L support) that hand-slices the request payload bytes",
+      "why_realistic": "This file already hand-writes RFC 4254 payloads (tcpipForward at server.go:50-53, forwardedTCPPayload at server.go:56-62, ssh.Marshal at server.go:352) instead of relying on library helpers, and handleNewChannel special-cases one request type; a maintainer adding a second one would copy the surrounding style, giving a HOW-type sibling one function away from the landing point."
+    },
+    {
+      "where": "pkg/ssh/server.go:262-270",
+      "sibling": "validation performed at the token layer instead of the byte layer: code that indexes strings.Split(extraPayload, \" \") results (or inspects args[i] for a flag value) without a length guard",
+      "why_realistic": "The payload's identity is re-derived here by a separator split and then re-parsed by cobra with WordSepNormalizeFunc (server.go:260,275) and '='-form flags used by the e2e client (test/e2e/v1/features/ssh_tunnel.go:134); a maintainer adding a check on this side would be validating argv, not the length prefix, so a byte-level fix at the sink does not carry over."
+    },
+    {
+      "where": "pkg/proto/wire/wire.go:70-78",
+      "sibling": "a frame reader on the main frps control connection that trusts the client-supplied uint32 frame length (allocate or slice from it before the bound check)",
+      "why_realistic": "wire v2 is new 2026 code with a hand-rolled 8-byte header and a 32-bit length taken straight off the wire (wire.go:68-76); the same 'client controls the length, we slice with it' mechanism lives two packages away from pkg/ssh on the most exposed port, and the current maxFramePayloadSize guard reads as an obvious thing to reorder or drop when adding a new frame kind."
+    }
+  ],
+  "O9_family": "improper validation of an array index / integer overflow (CWE-129, CWE-190) on a length-prefixed protocol field, yielding an out-of-bounds slice panic in an unrecovered goroutine",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 (go.mod:3); Makefile targets build/test; modules from the proxy (go.sum present, no vendor dir)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/e2e/v1/features/ssh_tunnel.go has five ginkgo cases (tcp, http, https, tcpmux, stcp) that start frps with sshTunnelGateway.bindPort and drive the gateway through test/e2e/pkg/ssh/client.go over 127.0.0.1; pkg/ssh has no test file at the pinned commit - pkg/ssh/server_test.go is created by the fix (fix.diff:216)."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "pkg/ssh/server.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "keep the hand-rolled parse and just stop the crash - a defer recover() in handleNewChannel, or rejecting only the exact 0xFFFFFFFF prefix from the report - leaving the length prefix unvalidated for every other wrapped value"
+  },
+  "out_of_scope_notes": [
+    "The same commit bumps golib 0.7.2->0.8.0 and x/crypto, x/net, x/sync, x/sys (fix.diff:30-157) and adds a staticcheck SA1019 exclusion for pkg/util/vhost/http.go, which reads as h2c migration collateral for a separate advisory; not pursued.",
+    "test/e2e/pkg/ssh/client.go:44-54 is an in-repo producer of the same length-prefixed exec payload (ssh.Marshal of command{Cmd string}, note the different field name from the fix's execPayload{Command}); it is test code and was not changed by the fix.",
+    "The only SSH implementation in the tree is golang.org/x/crypto/ssh, used in exactly pkg/ssh/gateway.go, pkg/ssh/server.go and test/e2e/pkg/ssh/client.go, so no second SSH server exists to carry a sibling of this sink."
+  ],
+  "unverified": [
+    "Repository size was not measured (no shell available in this session), so tiny_repo could not be ruled in or out; frp carries e2e tests, docs and a frontend asset package, so under 5 MB of source is unlikely.",
+    "Whether golang.org/x/crypto/ssh.Unmarshal rejects payloads with trailing bytes after the declared string was not checked against the dependency source (it is not in the tree); the fix therefore may or may not change behaviour for payloads where the declared length is shorter than the buffer, which the old code silently accepted (server.go:316-319).",
+    "The fix's new unit test marshals execPayload directly (fix.diff:246) rather than going through the e2e client, so parity with the in-repo producer at test/e2e/pkg/ssh/client.go:54 is asserted by inspection only.",
+    "Whether a panic in the goroutine spawned at pkg/ssh/server.go:226 is ever recovered: the only recover() calls in the tree are server/control.go:577 and pkg/util/net/udp.go:71,220, none on this path, so frps exits; this was read, not executed."
+  ]
+}

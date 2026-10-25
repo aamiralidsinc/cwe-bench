@@ -1,0 +1,119 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "18523",
+  "advisory_ids": ["GHSA-P2J4-C4G6-RPF5", "CVE-2026-47735", "GO-2026-5523"],
+  "repo": "basekick-labs/arc",
+  "pinned_commit": "82fc08062fab861b1409d6a97182e8f07f8f9ccc",
+  "fix_commits": ["91bdc29d1a02178ccf8c66375eccf85203108dfb"],
+  "trust_decision": {
+    "summary": "Whether a user-supplied query may open a file or URL is decided once for the whole DuckDB pool at engine-configuration time (allowed_directories + enable_external_access=false inside configureDatabase), not per request by the SQL-text denylist in the query handler; the published fix installs that lockdown as the last step of database.New and keeps imports/delete-staging/profile output inside the allowlist.",
+    "evidence": ["internal/api/query.go:1851-1871", "internal/database/duckdb.go:320", "fix.diff:930", "fix.diff:1559-1607"]
+  },
+  "landing_point": {
+    "where": "internal/api/query.go:1851",
+    "why": "The advisory summary says authenticated users read arbitrary local files through DuckDB I/O functions while bypassing RBAC table checks, so an engineer first looks at the only in-code user-SQL guard: the read_parquet()/arc_partition_agg() denylist inside ValidateSQLRequest, which the POST /api/v1/query, /query/msgpack, /query/arrow and /query/estimate handlers all call."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:1559", "entry_point": "database.New — reached by every authenticated query route (library layer; new internal/database/sandbox.go)", "module_kind": "library_datastore"},
+    {"where": "internal/database/duckdb.go:320", "entry_point": "database.New called from cmd/arc main() — lockdownExternalAccess added at end of configureDatabase (fix.diff:930)", "module_kind": "library_datastore"},
+    {"where": "internal/database/duckdb.go:757", "entry_point": "POST /api/v1/query with x-arc-profile:true (profile JSON output file, fix.diff:995)", "module_kind": "library_datastore"},
+    {"where": "internal/database/duckdb_arrow.go:80", "entry_point": "POST /api/v1/query/arrow with x-arc-profile:true (profile JSON output file, fix.diff:1099)", "module_kind": "library_datastore"},
+    {"where": "internal/api/import.go:193", "entry_point": "POST /api/v1/import/csv and /api/v1/import/parquet (multipart upload staging dir, fix.diff:596)", "module_kind": "http_handler"},
+    {"where": "internal/api/delete.go:789", "entry_point": "POST /api/v1/delete (S3 rewrite staging parquet, fix.diff:516)", "module_kind": "http_handler"},
+    {"where": "cmd/arc/main.go:190-237", "entry_point": "process startup (arc serve): Config allowlist fields, absolute-path resolution, upload-dir creation, handler wiring (fix.diff:113-382)", "module_kind": "entrypoint_wiring"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "internal/database/duckdb.go:320 (configureDatabase / database.New and its Config)"},
+  "O3_reason_to_dismiss": "The report blames the handler's SQL denylist, so the engine layer looks like someone else's concern: embedders and the compaction worker open their own DuckDB handle (internal/compaction/subprocess.go:97) and were never subject to this package's configuration.",
+  "O4_distance": {"files": 5, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Multipart CSV/Parquet import stages the upload in os.TempDir() and then runs COPY ... TO a parquet file beside it through the same pool, and DELETE on S3 backends stages its rewritten parquet the same way; an over-broad enable_external_access=false with an allowlist that does not include those staging dirs (and the DuckDB spill/profile dirs) breaks every import, every S3 DELETE and profile mode with a permission error.",
+    "where": "internal/api/import.go:193-212, internal/api/import.go:632-637, internal/api/delete.go:789, internal/database/duckdb.go:757"
+  },
+  "O6_input_shapes": [
+    "whole DuckDB I/O table-function family, not just read_parquet: read_csv_auto, read_csv, read_json, read_json_auto, read_text, read_blob, glob, parquet_metadata, parquet_schema, read_xlsx (fix.diff:1357-1376)",
+    "remote schemes http:// and https:// including link-local metadata IPs (SSRF) (fix.diff:1393-1404)",
+    "write sinks: COPY ... TO a local path, COPY ... TO 's3://attacker-bucket/...', EXPORT DATABASE (fix.diff:1406-1437)",
+    "extension-loading shape: INSTALL/LOAD after the flip, and SET GLOBAL enable_external_access=true at runtime (fix.diff:1439-1453)",
+    "operator path shapes feeding the allowlist: relative vs absolute, leading/interior double slash, trailing slash, '..' prefix, symlinked ancestors, Unicode control/format/line-separator characters (fix.diff:142-204, fix.diff:1690-1740)"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "internal/config/config.go:757-762 (also :810)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "GET /api/v1/query/:measurement — the where= query parameter is spliced verbatim into the SQL after only validateWhereClauseQuery (blocks ';', comments and DDL/DML keywords but allows SELECT, parentheses and any table function), then executed on the same pool; 'where=1=(SELECT count(*) FROM read_text('/etc/passwd'))>0' is not filtered by the read_parquet denylist and the rewriter leaves table functions untouched.",
+      "where": "internal/api/query.go:3391-3419 (validation at :3392, string build at :3413-3419, execution at :3444; table-function skip at :2054-2063)",
+      "reason_to_dismiss": "It is a convenience read endpoint with its own hand-rolled WHERE validator, not the /api/v1/query API the report names, so a solver treats it as already covered.",
+      "distance": "same file, ~1500 lines below the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "POST /api/v1/continuous_queries (+ PUT, + POST /:id/execute, + the cron scheduler) stores a raw user query in SQLite and later executes it via h.db.Query with only {start_time}/{end_time} substitution — ValidateSQLRequest is never called at write or at run time.",
+      "where": "internal/api/continuous_query.go:290-294 (store), internal/api/continuous_query.go:475-489 (substitute), internal/api/continuous_query.go:704 (execute), registered at internal/api/continuous_query.go:233-238",
+      "reason_to_dismiss": "Continuous queries are admin-only (auth.RequireAdmin) and run from a scheduler rather than the query API, so a solver argues the caller is already privileged and the route is a neighbouring feature.",
+      "distance": "another file in the same package; the executing code sits ~400 lines from the stored definition and in a different process path (scheduler)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "internal/api/query.go:3391",
+      "sibling": "a second convenience read endpoint (e.g. GET /api/v1/query/:measurement/filter or a measurements-search route) that splices a caller-supplied WHERE/ORDER BY fragment into SQL with the same small keyword list",
+      "why_realistic": "the file already ships exactly this pattern and its validator is a local slice, so a maintainer adding a filter variant would copy it verbatim"
+    },
+    {
+      "where": "internal/api/continuous_query.go:290",
+      "sibling": "a scheduled report / materialised-view feature that persists user SQL in SQLite and runs it from the cron scheduler",
+      "why_realistic": "continuous queries already store free-form SQL and re-execute it with string substitution, so a sibling scheduled-SQL feature is the natural next PR"
+    },
+    {
+      "where": "internal/database/duckdb_arrow.go:80",
+      "sibling": "another engine-output path that writes a file from DuckDB (EXPLAIN/ANALYZE dump, cache export, query-plan capture) using os.CreateTemp(\"\")",
+      "why_realistic": "two independent profile writers already did this at the pinned commit, so a third output writer is plausible"
+    },
+    {
+      "where": "internal/compaction/subprocess.go:97",
+      "sibling": "a second in-repo DuckDB opened with sql.Open that never goes through configureDatabase (the compaction worker, and the `arc compact` subcommand path)",
+      "why_realistic": "the published fix explicitly notes this process is not subject to the sandbox, so a maintainer adding another out-of-process worker would repeat it"
+    }
+  ],
+  "O9_family": "CWE-200/CWE-22/CWE-918 — arbitrary local-file read and SSRF through untrusted SQL reaching DuckDB I/O functions",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26 (go.mod:3), cgo required for github.com/duckdb/duckdb-go/v2 (embedded DuckDB, C++ compile); Makefile GOFLAGS='-v -tags=duckdb_arrow'; no vendor/ directory so `go mod download` needs network once",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "go test -tags=duckdb_arrow ./... ; area tests at the pinned commit are internal/api/query_test.go (dangerous-SQL/header validation), internal/api/import_test.go, internal/database/duckdb_arcx_test.go and internal/api/retention_test.go; the sandbox regression tests the fix adds (internal/database/duckdb_sandbox_test.go) do not exist at the pinned commit"
+  },
+  "O11_fix_minutes": 75,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "cmd/arc/main.go, internal/api/delete.go, internal/api/import.go, internal/database/duckdb.go, internal/database/duckdb_arrow.go, internal/database/sandbox.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Extend the ValidateSQLRequest denylist regex in internal/api/query.go to also block read_csv_auto/read_json/read_text/glob and the other names from the report, leaving the engine open to the rest of the I/O family and to the routes that never call the validator."
+  },
+  "out_of_scope_notes": [
+    "internal/compaction/subprocess.go:97 opens its own DuckDB with sql.Open outside database.New, so the sandbox never applies there; it takes no user SQL and was left alone."
+  ],
+  "unverified": [
+    "No build or test was run (read-only screening, no shell); buildability and offline behaviour are inferred from go.mod, go.sum, Makefile and Dockerfile.",
+    "Repository size in MB could not be measured without a shell; repo_mb is null and neither tiny_repo nor giant_repo was asserted.",
+    "The GET /api/v1/query/:measurement where-clause shape was reasoned from the rewriter's table-function skip (internal/api/query.go:2054-2063) and the validator's keyword list (internal/api/query.go:641-658); it was not executed.",
+    "Whether the hidden tests exercise the HTTP routes or the database layer directly (the fix's own TestSandbox uses database.New and raw SQL) is unknown.",
+    "internal/api/retention_test.go exists at the pinned commit and is touched by the fix, but only to add the LocalStorageRoot fixture; the security regression tests are in a new file absent at the pinned commit, so regression_tests_in_pinned_commit was not asserted."
+  ]
+}

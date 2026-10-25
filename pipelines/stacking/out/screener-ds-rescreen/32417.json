@@ -1,0 +1,126 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "32417",
+  "advisory_ids": ["GHSA-65FR-J4P9-VC33", "CVE-2026-81525"],
+  "repo": "mongodb/mongo-php-library",
+  "pinned_commit": "cbc33873a13362ddc7ff8ba228e4eca456316ab6",
+  "fix_commits": ["3a462213bb4fd46efa58a1937b06b1b0553b67a7", "6f305a3b21740080255a3093b12458274c7cc8ca"],
+  "trust_decision": {
+    "summary": "Caller-supplied database and collection names are trusted as soon as they are non-empty: Collection::__construct and Database::__construct only reject length < 1, no length-checked name is rejected for '.' or NUL, and each operation separately concatenates them into a 'db.coll' namespace string that the driver/server splits at the first '.' (and truncates at a NUL), so a '.' in the database name or a NUL in either name silently retargets the write/query to a different database or collection.",
+    "evidence": [
+      "src/Collection.php:177-183",
+      "src/Database.php:115-117",
+      "src/Operation/Find.php:263",
+      "src/Operation/BulkWrite.php:235",
+      "src/Operation/RenameCollection.php:84-85",
+      "src/ClientBulkWrite.php:70"
+    ]
+  },
+  "landing_point": {
+    "where": "src/Collection.php:177",
+    "why": "The summary says 'reject . and NUL bytes in database and collection names', and Collection::__construct already holds the only existing name check (strlen < 1), so an engineer patches that condition first; Database::__construct at src/Database.php:115 is the obvious clone. Both are high-level model classes, and the library's own code always reaches the operations through them."
+  },
+  "fix_sites": [
+    {"where": "src/Collection.php:177-183", "entry_point": "new MongoDB\\Collection() / MongoDB\\Client::getCollection() / MongoDB\\Database::getCollection()", "module_kind": "high-level model class"},
+    {"where": "src/Database.php:115-117", "entry_point": "new MongoDB\\Database() / MongoDB\\Client::getDatabase()", "module_kind": "high-level model class"},
+    {"where": "fix.diff:354", "entry_point": "MongoDB\\create_namespace() (new internal helper consumed by the operation classes)", "module_kind": "shared function"},
+    {"where": "src/Operation/BulkWrite.php:145", "entry_point": "new MongoDB\\Operation\\BulkWrite() / MongoDB\\Collection::bulkWrite()", "module_kind": "operation (lower-level public API)"},
+    {"where": "src/Operation/Delete.php:83", "entry_point": "new MongoDB\\Operation\\Delete() / Collection::deleteMany()/deleteOne()", "module_kind": "operation (lower-level public API)"},
+    {"where": "src/Operation/Find.php:133", "entry_point": "new MongoDB\\Operation\\Find() / Collection::find()", "module_kind": "operation (lower-level public API)"},
+    {"where": "src/Operation/InsertMany.php:78", "entry_point": "new MongoDB\\Operation\\InsertMany() / Collection::insertMany()", "module_kind": "operation (lower-level public API)"},
+    {"where": "src/Operation/InsertOne.php:68", "entry_point": "new MongoDB\\Operation\\InsertOne() / Collection::insertOne()", "module_kind": "operation (lower-level public API)"},
+    {"where": "src/Operation/RenameCollection.php:84-85", "entry_point": "new MongoDB\\Operation\\RenameCollection() / Collection::rename() / Database::renameCollection()", "module_kind": "operation (lower-level public API), two namespaces (from and to)"},
+    {"where": "src/Operation/Update.php:97", "entry_point": "new MongoDB\\Operation\\Update() / Collection::updateOne()/updateMany()/replaceOne()", "module_kind": "operation (lower-level public API)"}
+  ],
+  "O1_entry_points": 9,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "src/Operation/Find.php:133"
+  },
+  "O3_reason_to_dismiss": "The MongoDB\\Operation\\* classes look like internal plumbing that only the high-level Collection/Database use, so validating the two public model constructors - which is where the report's getCollection('foo.bar','coll')->insertOne() example lands - can be argued to close every path the library itself takes; you only reach them by constructing an operation yourself and calling execute() on a selected server.",
+  "O4_distance": {"files": 9, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Collection names containing '.' are legal and load-bearing. GridFS builds its two collections as '<bucket>.files' and '<bucket>.chunks', Collection::getNamespace() / (string) Collection are asserted to return 'db.foo.bar'-shaped strings, and the fix itself adds testConstructorAllowsDotInCollectionName asserting that 'foo.bar' is accepted. A fix that rejects '.' in the collection name (the symmetric-looking over-broad fix) breaks all GridFS access and those existing assertions.",
+    "where": "src/GridFS/CollectionWrapper.php:61-62"
+  },
+  "O6_input_shapes": [
+    "'.' in the database name (e.g. 'foo.bar')",
+    "NUL byte in the database name (\"foo\\0bar\")",
+    "NUL byte in the collection name (\"foo\\0bar\")",
+    "empty database/collection name (existing length check, kept and folded into the new helper)",
+    "rename carries four names: from-database, from-collection, to-database, to-collection, and both fromNamespace and toNamespace must be validated",
+    "'.' in a collection name must stay legal (GridFS, testConstructorAllowsDotInCollectionName)"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "src/Collection.php:837-840",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "ClientBulkWrite takes every bulk-write namespace from Collection::getNamespace() and hands it to the driver's BulkWriteCommand, which does the same first-dot split; the published fix never edits src/ClientBulkWrite.php or getNamespace(), it only relies on the Collection constructor.",
+      "where": "src/ClientBulkWrite.php:70",
+      "reason_to_dismiss": "The collection object used to build a ClientBulkWrite is already validated when it is constructed, and ClientBulkWrite (plus the deferring Collection::rename) is a newer API than the CRUD paths the advisory describes, so this route can be argued to be covered by construction.",
+      "distance": "src/Collection.php -> src/ClientBulkWrite.php: one file away, same PHP namespace (MongoDB), different subsystem (client bulk write vs. collection model)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "GridFS turns its bucket name into collection names '<bucket>.files' / '<bucket>.chunks' and builds a 'db.<bucket>.files' namespace, so a NUL in the bucketName of Database::getGridFSBucket(['bucketName' => ...]) retargets writes into a different collection; GridFS is untouched by the fix.",
+      "where": "src/GridFS/CollectionWrapper.php:61-62",
+      "reason_to_dismiss": "A GridFS bucket name is not a database or collection name, and the two collections are created through the Collection constructor, so this looks like it is covered already.",
+      "distance": "src/Collection.php -> src/GridFS/CollectionWrapper.php: one file, different package (MongoDB\\GridFS) and a different feature area",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/Operation/Aggregate.php:120",
+      "sibling": "Route Aggregate (and CountDocuments, Distinct, EstimatedDocumentCount, FindAndModify, ListIndexes, CreateIndexes, DropIndexes, CreateCollection, DropCollection, ModifyCollection) through the same create_namespace validation even though they pass the names in separate command fields rather than as a namespace.",
+      "why_realistic": "They are public, non-@internal operation classes in exactly the directory the fix edited, they take a raw database and collection name from the caller, and the CRUD spec's prose test 17 asks for name validation on every CRUD entry point, so a maintainer hardening this area would plausibly add the call to all of them."
+    },
+    {
+      "where": "src/GridFS/Bucket.php:177",
+      "sibling": "Reject NUL (and only NUL, not '.') in the bucketName option before it becomes '<bucket>.files' / '<bucket>.chunks'.",
+      "why_realistic": "GridFS is the one feature that legitimately relies on dots in collection names, so the author of this fix would naturally think about bucket names and could either validate them here or leave them to the Collection constructor."
+    },
+    {
+      "where": "src/Operation/CreateCollection.php:113",
+      "sibling": "Validate the collection name in the create/drop/modify collection operations, which accept a raw name and never build a Collection object.",
+      "why_realistic": "These paths never pass through the Collection constructor the fix hardens, so a maintainer writing prose-test-17 coverage could add a check here instead of (or as well as) in create_namespace."
+    }
+  ],
+  "O9_family": "improper neutralization of special elements in data query logic (CWE-943): namespace/query-target injection via '.' and NUL in database or collection names",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "PHP",
+    "toolchain": "PHP >= 8.1, composer (autoload of src/functions.php), ext-mongodb ^2.4 (PECL, required), PHPUnit 10.5",
+    "services": ["MongoDB server (mongod) only for the functional and spec-test suites"],
+    "offline_after_build": true,
+    "project_tests": "tests/Operation/*Test.php are pure unit tests that construct the operation classes and assert InvalidArgumentException without a server; tests/Collection/CollectionFunctionalTest.php and tests/Database/DatabaseFunctionalTest.php only build a Manager in setUp (no connection) so the constructor cases also run offline; the fix adds tests/SpecTests/Crud/Prose17_DatabaseAndCollectionNameValidationTest.php, which needs a live mongod."
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/Collection.php, src/Database.php, src/functions.php, src/Operation/BulkWrite.php, src/Operation/Delete.php, src/Operation/Find.php, src/Operation/InsertMany.php, src/Operation/InsertOne.php, src/Operation/RenameCollection.php, src/Operation/Update.php",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add the '.'/NUL checks only to Collection::__construct and Database::__construct - the two places the report's getCollection('foo.bar','coll')->insertOne() example leads to - which leaves the seven Operation classes that build the 'db.coll' string themselves accepting the same invalid names when constructed directly."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb: no shell in this session, so the tree size could not be measured; ~1171 tracked files with a large generated Builder/Operator tree suggests well over 5 MB, so tiny_repo/giant_repo was left off rather than guessed.",
+    "Driver-side behaviour (libmongoc splitting the namespace at the first '.' and treating NUL as a C-string terminator) is taken from the advisory summary and the fix's own create_namespace docblock; the driver source is not in this repository and was not read.",
+    "present_in_latest for both O8 routes: no latest release or latest checkout was provided ('none'), so both are marked unknown.",
+    "Whether MongoDB\\Operation\\* classes are advertised as public API on the docs site (not in the repo). They carry no @internal tag, are non-final, are constructed directly in the library's own tests, and their docblocks point at the corresponding Collection methods.",
+    "The two fix commits are the same change applied to two branches: 3a462213 targets a tree without ClientBulkWrite, 6f305a3b matches this pinned tree (final operation classes, ClientBulkWrite present). Line numbers in fix_sites are the pinned commit's pre-image lines."
+  ]
+}

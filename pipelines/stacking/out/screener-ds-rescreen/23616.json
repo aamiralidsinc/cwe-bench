@@ -1,0 +1,132 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "23616",
+  "advisory_ids": ["GHSA-5XWG-CFVJ-GFF5", "CVE-2026-61634"],
+  "repo": "rabbitmq/rabbitmq-java-client",
+  "pinned_commit": "bcc491d9e99755f62c24a2c293a24ae7d1439dbd",
+  "fix_commits": ["08790f09686173eb17b48d08a25edcb32e71a591", "b491075f42e89967610c40beded68d3680cfd472"],
+  "trust_decision": {
+    "summary": "Once Connection.Tune negotiates frame_max, every inbound frame whose total size exceeds it must be rejected by the frame reader, on both transports; before the fix the reader was bounded only by the user-configured maxInboundMessageBodySize (64 MiB default), so the reader accepted frames up to that size regardless of the negotiated value.",
+    "evidence": [
+      "src/main/java/com/rabbitmq/client/impl/Frame.java:132",
+      "src/main/java/com/rabbitmq/client/impl/SocketFrameHandler.java:200",
+      "src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java:544",
+      "src/main/java/com/rabbitmq/client/impl/AMQConnection.java:428-431",
+      "src/main/java/com/rabbitmq/client/ConnectionFactory.java:229"
+    ]
+  },
+  "landing_point": {
+    "where": "src/main/java/com/rabbitmq/client/impl/Frame.java:132",
+    "why": "The advisory names the frame reader; Frame.readFrom is the only place an inbound payload length is validated, and an engineer reading the summary lands there and sees the limit coming from a configured field rather than from the negotiated frame_max."
+  },
+  "fix_sites": [
+    {"where": "src/main/java/com/rabbitmq/client/impl/AMQConnection.java:431", "entry_point": "ConnectionFactory#newConnection(...) -> AMQConnection#start (both transports)", "module_kind": "core connection / handshake (caller of the new setter)"},
+    {"where": "src/main/java/com/rabbitmq/client/impl/FrameHandler.java:58", "entry_point": "FrameHandler SPI, reached from AMQConnection#start -> FrameHandler#setMaxInboundFramePayloadSize", "module_kind": "transport SPI interface (new default no-op method)"},
+    {"where": "src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java:351", "entry_point": "ConnectionFactory#netty() -> NettyFrameHandlerFactory#create -> NettyFrameHandler", "module_kind": "second transport implementation (Netty) - looks out of scope"},
+    {"where": "src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java:509", "entry_point": "Netty inbound AmqpHandler#channelRead", "module_kind": "second transport implementation (field made volatile)"},
+    {"where": "src/main/java/com/rabbitmq/client/impl/SocketFrameHandler.java:193", "entry_point": "ConnectionFactory#newConnection -> SocketFrameHandler#readFrame", "module_kind": "default socket transport"},
+    {"where": "src/main/java/com/rabbitmq/client/impl/SocketFrameHandler.java:60", "entry_point": "SocketFrameHandler#readFrame -> Frame#readFrom", "module_kind": "default socket transport (field made volatile)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java:544"
+  },
+  "O3_reason_to_dismiss": "The Netty transport is opt-in (ConnectionFactory.java:1827) and its AmqpHandler already duplicates the size check, so a socket-only fix looks complete; the pre-negotiation window and the Netty decoder's buffer limit are then argued away as 'not the negotiated value' and 'just an allocation detail'.",
+  "O4_distance": {"files": 4, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A frame whose total size is exactly frame_max must still be accepted (payload = frame_max - AMQCommand.EMPTY_FRAME_SIZE), hence the fix's '+1'; frame_max = 0 means 'no limit' and must not become a zero/negative cap (guarded by 'if (frameMax > 0)'); and a user-configured maxInboundMessageBodySize smaller than frame_max must keep applying via Math.min (ConnectionFactory.java:1679). Content header frames of exactly frame_max are already accepted outbound (AMQCommand.java:136-143).",
+    "where": "src/test/java/com/rabbitmq/client/test/functional/FrameMax.java:126-131"
+  },
+  "O6_input_shapes": [
+    "frame payload of exactly frame_max - AMQCommand.EMPTY_FRAME_SIZE bytes (total frame size = frame_max): must be accepted",
+    "frame payload of frame_max - EMPTY_FRAME_SIZE + 1 bytes (total = frame_max + 1): must be rejected",
+    "negotiated frame_max = 0 (unlimited in AMQP): no cap applied",
+    "ConnectionFactory#setMaxInboundMessageBodySize smaller than the negotiated frame_max: still wins (Math.min)",
+    "two transports: java.net.Socket reader (Frame.readFrom) and Netty inbound handler (AmqpHandler.channelRead)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "src/main/java/com/rabbitmq/client/impl/AMQConnection.java:428-431",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Netty's LengthFieldBasedFrameDecoder is still constructed with maxFrameLength derived from maxInboundMessageBodySize (64 MiB default), so an oversized frame is fully buffered and allocated before AmqpHandler rejects it; the negotiated frame_max never reaches the decoder.",
+      "where": "src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java:236",
+      "reason_to_dismiss": "The handler rejects the frame at the API level anyway; the decoder's maxFrameLength is an allocation/layering concern, not the validation the report describes.",
+      "distance": "same file as the Netty size check, 4 files from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Frames read before Connection.Tune are bounded only by maxInboundMessageBodySize: the main loop is already running (AMQConnection.java:334 initializes the handler, which starts the thread) while the negotiated cap is applied only after the tune value is computed at AMQConnection.java:428-431, so a Connection.Start or Connection.Tune frame of up to 64 MiB is accepted.",
+      "where": "src/main/java/com/rabbitmq/client/impl/AMQConnection.java:334",
+      "reason_to_dismiss": "No frame_max has been negotiated yet during the handshake, so the advisory's bound cannot apply to Connection.Start/Tune frames.",
+      "distance": "same file as the fix's call site",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "AMQConnection's public constructor accepts any FrameHandler (AMQConnection.java:218-220) and ConnectionFactory#createConnection is protected (ConnectionFactory.java:1406-1409); a handler that does not override the new method keeps the interface's no-op default, so its inbound frames remain bounded only by whatever it was constructed with.",
+      "where": "src/main/java/com/rabbitmq/client/impl/FrameHandler.java:68",
+      "reason_to_dismiss": "The fix deliberately makes the SPI method a default no-op for source/binary compatibility; third-party frame handlers are the user's code and out of the library's scope.",
+      "distance": "same package, interface file separate from both transports",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/main/java/com/rabbitmq/client/ConnectionFactory.java:1679",
+      "sibling": "a separate setter for a maximum inbound frame payload size, distinct from the message-body limit",
+      "why_realistic": "The client already exposes the reader limit as a configuration knob and threads it through both frame handler factories (ConnectionFactory.java:1080, 1093), so a maintainer adding a second knob is natural."
+    },
+    {
+      "where": "src/main/java/com/rabbitmq/client/impl/SocketFrameHandler.java:75",
+      "sibling": "a third public SocketFrameHandler constructor taking both an inbound message-body limit and an inbound frame limit",
+      "why_realistic": "The class already has two constructors whose only difference is the size argument (SocketFrameHandler.java:68-70 and 75-83)."
+    },
+    {
+      "where": "src/main/java/com/rabbitmq/client/impl/Frame.java:107",
+      "sibling": "a Frame.readFrom overload without a limit, or one that derives the limit from the frame type",
+      "why_realistic": "Frame is a public wire-format utility used by tools and tests, and readFrom is already public static with a caller-supplied bound."
+    },
+    {
+      "where": "src/main/java/com/rabbitmq/client/impl/recovery/RecoveryAwareAMQConnectionFactory.java:38",
+      "sibling": "a recovery path that recreates the frame handler without re-applying the negotiated frame_max",
+      "why_realistic": "Recovery rebuilds connections through the same AMQConnection#start handshake, so state that must be re-applied per connection is a natural place for a sibling omission."
+    }
+  ],
+  "O9_family": "Improper input validation (CWE-20) of inbound AMQP frame length against the negotiated frame_max, with memory-exhaustion impact",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Java",
+    "toolchain": "Maven (pom.xml; source/target 1.8, maven-compiler-plugin 3.15.0, surefire; JUnit 5.14.4, AssertJ 3.27.7, Netty 4.2.15.Final)",
+    "services": ["RabbitMQ broker only for the project's functional/integration tests; the affected frame-reader path needs none"],
+    "offline_after_build": true,
+    "project_tests": "FrameMax.java (functional, needs a broker: negotiation, frame sizes, oversize rejection), BrokenFramesTest (drives AMQConnection with a mock FrameHandler), UnexpectedFrames (functional); the fix adds NegotiatedFrameMaxInboundTest, a loopback-only unit test that is absent at the pinned commit."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/main/java/com/rabbitmq/client/impl/AMQConnection.java, src/main/java/com/rabbitmq/client/impl/FrameHandler.java, src/main/java/com/rabbitmq/client/impl/NettyFrameHandlerFactory.java, src/main/java/com/rabbitmq/client/impl/SocketFrameHandler.java",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Set the reader's limit to frameMax in SocketFrameHandler (or Frame.readFrom) once, forgetting the EMPTY_FRAME_SIZE +1 boundary, the frame_max = 0 no-limit case, and the Netty AmqpHandler copy of the same check."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "Repository source size in MB could not be measured (shell access is disabled in this session), so tiny_repo/giant_repo were not assessed.",
+    "Whether the O8 routes remain in the latest release is unknown: no latest release was provided ('none'), so latest_where is empty.",
+    "The full advisory text was not supplied; scope was taken from the published summary and the fix diff.",
+    "The Netty decoder's buffer-then-reject behaviour is inferred from pipeline order at NettyFrameHandlerFactory.java:255-263 and was not executed."
+  ]
+}

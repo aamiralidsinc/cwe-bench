@@ -1,0 +1,78 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash",
+  "entry_id": "20345", "advisory_ids": ["GHSA-2VH6-HW4J-32WW", "CVE-2026-82250"], "repo": "gitoxidelabs/gitoxide",
+  "pinned_commit": "eac50e1207e2549b23302c9faf595a420b9919fc",
+  "fix_commits": ["4bef04ae8a261634200b3a6faabdd77e25aeb8c1"],
+  "trust_decision": {
+    "summary": "A peer-supplied packet line whose payload is only the side-band designator (e.g. 0005\\x02) must yield empty text without panicking; decided in gix-packetline's two low-level primitives decode_band() and TextRef::from() (lib.rs), which both side-band readers call, with the reachable trigger being the 1-byte payload shape.",
+    "evidence": [
+      "gix-packetline/src/lib.rs:167",
+      "gix-packetline/src/lib.rs:199",
+      "gix-packetline/src/blocking_io/sidebands.rs:145",
+      "gix-packetline/src/blocking_io/sidebands.rs:155",
+      "gix-packetline/src/decode.rs:83",
+      "gix-packetline/src/blocking_io/encode.rs:93"
+    ]
+  },
+  "landing_point": {
+    "where": "gix-packetline/src/lib.rs:164-173",
+    "why": "The summary names an 'empty side-band packet', and decode_band() is the only public operation that turns a data line into a band; it indexes d[0] and slices &d[1..] without a length check."
+  },
+  "fix_sites": [
+    {"where": "gix-packetline/src/lib.rs:165-173", "entry_point": "PacketLineRef::decode_band() (public; called by both side-band readers)", "module_kind": "public core packet-line type (lib)"},
+    {"where": "gix-packetline/src/lib.rs:197-202", "entry_point": "impl From<&[u8]> for TextRef, used by PacketLineRef::as_text()", "module_kind": "public conversion / lower-level text helper"},
+    {"where": "gix-packetline/src/blocking_io/read.rs:36-42", "entry_point": "blocking_io::StreamingPeekableIter::read_line()/peek_line()", "module_kind": "blocking reader implementation"},
+    {"where": "gix-packetline/src/async_io/read.rs:38-45", "entry_point": "async_io::StreamingPeekableIter::read_line()/peek_line()", "module_kind": "async reader implementation (parallel copy of the blocking one)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "gix-packetline/src/lib.rs:197-202"},
+  "O3_reason_to_dismiss": "TextRef::from is framed as a trailing-newline text helper used by handshake code in other packages, not as part of side-band decoding, and our own serializer refuses to emit an empty payload (gix-packetline/src/blocking_io/encode.rs:93), so a solver who reproduces through the writer concludes the shape is unreachable and fixes only decode_band or only the blocking reader.",
+  "O4_distance": {"files": 3, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A data-band line with an empty payload (0005\\x01) is a legitimate keep-alive under sideband-all and is skipped, while an empty progress/error payload must still be forwarded to the progress handler as empty text; a fix that treats any payload-less band line as malformed, or that errors on empty progress text, breaks both.", "where": "gix-packetline/src/blocking_io/sidebands.rs:148-152"},
+  "O6_input_shapes": [
+    "empty packet-line payload constructed by API users: PacketLineRef::Data(b\"\")",
+    "one-byte payload that is only the band designator: 0005\\x02 and 0005\\x03 (empty progress/error text)",
+    "one-byte payload for the data band: 0005\\x01 (legitimate keep-alive, must be skipped)",
+    "band text with and without a trailing newline (TextRef strips one)",
+    "non-data lines (Flush/Delimiter/ResponseEnd) passed to decode_band",
+    "reader buffer shorter than the 4-byte hex prefix (the read.rs guard)"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "gix-packetline/src/blocking_io/encode.rs:81-95 and gix-packetline/src/async_io/encode.rs:213 (band_to_write), which reject an empty payload with DataIsEmpty, so the trigger shape exists only on the wire from a hand-crafted peer", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "gix-packetline/src/lib.rs:156-162", "sibling": "as_band(Channel) takes the whole slice without validating or stripping a designator", "why_realistic": "It is the sibling decoder next to decode_band and a maintainer could make it slice &d[1..] for symmetry, reintroducing the same unchecked index."},
+    {"where": "gix-packetline/src/read.rs:79-86", "sibling": "peek_buffer_replace_and_truncate indexes self.peek_buf[position] with a peer-derived position", "why_realistic": "The position comes from scanning a server line for a NUL byte in gix-transport/src/client/capabilities.rs:216, so the same 'trust the length' mistake is idiomatic there."},
+    {"where": "gix-transport/src/client/capabilities.rs:208-216", "sibling": "the v0/v1 handshake calls as_text() on the first line the server sends", "why_realistic": "This is the pre-auth entry point the advisory describes; a maintainer hardening the handshake would add its own emptiness check rather than the one in lib.rs."},
+    {"where": "gix-filter/src/driver/process/client.rs:186", "sibling": "lines read from an external filter process are passed to as_text()", "why_realistic": "It is a second transport into the same text conversion, in another package, with an equally untrusted peer."}
+  ],
+  "O9_family": "unchecked index / length arithmetic on attacker-controlled packet payload (CWE-191 shape, slice panic) leading to a remote DoS",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo workspace, edition 2024, rust-version 1.85 (Cargo.toml:13)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "gix-packetline/tests/{decode/mod.rs,read/mod.rs,read/sideband.rs,encode/mod.rs,write/mod.rs} plus tests/blocking-packetline.rs and tests/async-packetline.rs, driven by maybe-async; they feed in-memory byte slices, no network. The fix adds tests to tests/decode/mod.rs and tests/read/sideband.rs, neither of which exists in the pinned tree."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "gix-packetline/src/lib.rs; gix-packetline/src/blocking_io/read.rs; gix-packetline/src/async_io/read.rs",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add an emptiness check only at the blocking side-band reader (or only in decode_band) and validate through the same reader, leaving TextRef::from and the async reader's copy untouched."
+  },
+  "out_of_scope_notes": [
+    "gix-packetline/fuzz/fuzz_targets/packet_lines.rs:19-22 works around the panic with `if !data.is_empty()` before calling as_text()/decode_band(); it is a harness guard, not a product fix, and was not pursued."
+  ],
+  "unverified": [
+    "Repo size in MB could not be measured without shell access; the workspace lists ~70 crates so tiny_repo/giant_repo were judged inapplicable.",
+    "The two read.rs length guards are unreachable through the public API (read_line()/peek_line() always pass a MAX_LINE_LEN buffer, gix-packetline/src/blocking_io/read.rs:141-143 and :168), so no route exercises that hunk; stated from reading, not from running.",
+    "Caveat rather than a gap: gix-packetline is a small, easily read crate, so the 'too large to read whole' lever does not apply here; difficulty rests on the two sinks, the blocking/async duplication and the keep-alive trap."
+  ]
+}

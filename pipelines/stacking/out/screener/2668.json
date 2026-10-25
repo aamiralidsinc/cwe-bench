@@ -1,0 +1,122 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "2668",
+  "advisory_ids": ["GHSA-C39V-8HRW-H448", "CVE-2026-56104", "PYSEC-2026-4028"],
+  "repo": "chainlit/chainlit",
+  "pinned_commit": "76f59c076c7c1e1b401c7c458e6bf8f67114014c",
+  "fix_commits": ["5effb664f1e0af4a4f0a42fe63ea979676039a7f"],
+  "trust_decision": {
+    "summary": "Whether the user connecting on the socket.io handshake owns the session whose client-supplied sessionId is being restored: restore_existing_session refuses the restore unless session.user.identifier matches the freshly authenticated user's identifier, with the both-None case allowed so unauthenticated deployments keep working.",
+    "evidence": [
+      "backend/chainlit/socket.py:41-49",
+      "backend/chainlit/socket.py:152-154",
+      "backend/chainlit/socket.py:137-142",
+      "backend/chainlit/auth/__init__.py:86-90",
+      "fix.diff:14-23"
+    ]
+  },
+  "landing_point": {
+    "where": "backend/chainlit/socket.py:41-49",
+    "why": "The advisory is a websocket session hijack, and restore_existing_session is the only place a client-supplied sessionId from the connect payload is turned back into a live session bound to a new socket (session.restore at socket.py:44)."
+  },
+  "fix_sites": [
+    {
+      "where": "fix.diff:14-23",
+      "entry_point": "socket.io connect event (chainlit/socket.py:121)",
+      "module_kind": "socket event handler helper (new function in backend/chainlit/socket.py)"
+    },
+    {
+      "where": "backend/chainlit/socket.py:41-49",
+      "entry_point": "restore_existing_session, called only from the connect handler at socket.py:152-154",
+      "module_kind": "socket event handler module"
+    },
+    {
+      "where": "backend/chainlit/socket.py:152-154",
+      "entry_point": "socket.io connect event, auth.sessionId restore branch",
+      "module_kind": "socket event handler"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "backend/chainlit/session.py:310-315"
+  },
+  "O3_reason_to_dismiss": "WebsocketSession.restore() is an internal primitive with no other caller at the pinned commit, and the REST/feedback endpoints that reuse a sessionId are 'not the websocket restore path the advisory names', so neither is treated as covered.",
+  "O4_distance": {"files": 2, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Unauthenticated deployments: require_login() is false, so connect passes user=None on every handshake; a session with session.user=None must still restore, otherwise every reconnect in an open deployment is refused and the pinned success test (which calls restore_existing_session with no user) breaks.",
+    "where": "backend/tests/test_socket.py:116-134"
+  },
+  "O6_input_shapes": [
+    "unauthenticated connect (user=None) against an unauthenticated session (session.user=None) - must still restore",
+    "authenticated connect against a session created without a user (session.user=None, user set) - must refuse",
+    "authenticated connect against a session owned by the same identifier (User vs PersistedUser) - must restore",
+    "authenticated connect against a session owned by a different identifier - must refuse",
+    "restore of an unknown sessionId (get_by_id returns None) - unchanged fall-through to session creation"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "backend/chainlit/auth/__init__.py:58-83",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "PUT /feedback looks up the live session by the client-supplied sessionId (UpdateFeedbackRequest.sessionId) and runs config.code.on_feedback inside init_ws_context(session) with no comparison of session.user against current_user, while the six sibling sessionId routes all compare identifiers",
+      "where": "backend/chainlit/server.py:900-903",
+      "reason_to_dismiss": "It is a REST feedback endpoint that never rebinds a socket, the lookup only runs when the app defines on_feedback and a data layer exists, and failures there are swallowed by the surrounding try/except - so it reads as 'not the restore path'.",
+      "distance": "different module from the landing point (server.py vs socket.py), ~850 lines away; same package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "backend/chainlit/server.py:881-912",
+      "sibling": "A REST endpoint that takes a client-supplied sessionId and drives the session (stop the running task, re-send a step, clear the session) via init_ws_context(get_by_id(sessionId)) with no ownership comparison.",
+      "why_realistic": "Seven endpoints already follow exactly this shape (server.py:1071, 1107, 1257, 1313, 1465, 1510, 1644) and the react client posts sessionId on every one of them (libs/react-client/src/api/index.tsx:213, 302, 307, 313, 361), so an eighth endpoint that forgets the guard is the natural copy-paste slip."
+    },
+    {
+      "where": "backend/chainlit/session.py:310-315",
+      "sibling": "A second caller of WebsocketSession.restore() from a non-websocket bridge (e.g. a copilot/teams/slack adapter adopting a web session id) that rebinds the socket without any user context.",
+      "why_realistic": "The published fix guards the wrapper restore_existing_session, not the primitive; the primitive takes only a socket id, so it silently re-opens the sink for any new transport - and the repo already ships slack/teams/discord adapters that build sessions themselves (backend/chainlit/slack/app.py:311-313, backend/chainlit/teams/app.py:252-255)."
+    },
+    {
+      "where": "backend/chainlit/socket.py:182-218",
+      "sibling": "A 'connection_successful'/'restore' socket event that accepts a sessionId in its payload and re-binds the session, in addition to the connect handshake.",
+      "why_realistic": "The client already sends sessionId in the handshake auth map (libs/react-client/src/useChatSession.ts:122-133) and emits connection_successful right after (useChatSession.ts:142-145); a re-bind-on-event variant is a plausible refactor that would bypass the connect-time check."
+    }
+  ],
+  "O9_family": "CWE-862 missing authorization / broken access control (cross-user session takeover)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (backend), TypeScript/React (frontend and libs/react-client)",
+    "toolchain": "hatchling build, uv for the backend env (.github/actions/uv-python-install), pytest with asyncio_mode=auto and testpaths=backend/tests; the CI test job also runs pnpm run buildUi first",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "backend/tests/test_socket.py::TestRestoreExistingSession (test_restore_existing_session_success and test_restore_existing_session_not_found at the pinned commit; test_restore_existing_session_with_none_session_id at test_socket.py:409) plus the mocked-session route tests in backend/tests/test_server.py:241-300 (test_get_file_*) that exercise the same sessionId ownership comparison over HTTP"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "backend/chainlit/socket.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add 'if not session.user or not user or session.user.identifier != user.identifier: raise ConnectionRefusedError' inside restore_existing_session (or immediately after the restore call in connect) and stop there; that refuses every reconnect in an unauthenticated deployment, the both-None case the pinned success test encodes."
+  },
+  "out_of_scope_notes": [
+    "POST /set-session-cookie (backend/chainlit/server.py:764-780) accepts an arbitrary session_id from an unauthenticated body and writes it into the X-Chainlit-Session-id cookie; it is the sticky-session helper, not the restore sink, so it was only noted."
+  ],
+  "unverified": [
+    "repo size in MB - no shell was available to measure the tree, so repo_mb is null",
+    "present_in_latest for the /feedback route - no latest-release tree was provided (latest release: none)",
+    "whether hidden behavioural tests can reach the /feedback route offline (it needs both a data layer and config.code.on_feedback configured)",
+    "O2 is latent room rather than a live miss: WebsocketSession.restore() has no other caller at the pinned commit, so nothing currently reaches the sink through it"
+  ]
+}

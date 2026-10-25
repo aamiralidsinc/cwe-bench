@@ -1,0 +1,85 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "2257",
+  "advisory_ids": ["GHSA-8VH3-G2QG-2H2C", "CVE-2026-55640", "PYSEC-2026-3866"],
+  "repo": "cbcoutinho/nextcloud-mcp-server",
+  "pinned_commit": "a818b49b3ff19502530199c7788e324caca7beab",
+  "fix_commits": ["4fc2b10945108cf1008ec9698291de6706ffcb73"],
+  "trust_decision": {
+    "summary": "Whether an inbound POST to /webhooks/nextcloud may queue a vector-sync task is decided by comparing the Authorization header to 'Bearer <WEBHOOK_SECRET>' inside handle_nextcloud_webhook; when WEBHOOK_SECRET is unset (the default) no decision is made at all and the attacker-supplied payload user.uid/doc_id flow straight to Qdrant release_document_for_user.",
+    "evidence": [
+      "nextcloud_mcp_server/vector/webhook_receiver.py:55-78",
+      "nextcloud_mcp_server/vector/webhook_receiver.py:98-110",
+      "nextcloud_mcp_server/vector/webhook_parser.py:60",
+      "nextcloud_mcp_server/vector/processor.py:583-585",
+      "nextcloud_mcp_server/app.py:2324-2327",
+      "nextcloud_mcp_server/config.py:87"
+    ]
+  },
+  "landing_point": {
+    "where": "nextcloud_mcp_server/vector/webhook_receiver.py:55-78",
+    "why": "The advisory summary names POST /webhooks/nextcloud, and this handler is the only place the route's auth is enforced; an engineer reads the `if secret: ... else: _warn_missing_secret_once()` branch and sees the fail-open default immediately."
+  },
+  "fix_sites": [
+    {"where": "nextcloud_mcp_server/vector/webhook_receiver.py:55-78", "entry_point": "POST /webhooks/nextcloud", "module_kind": "http_handler"},
+    {"where": "nextcloud_mcp_server/app.py:2324-2327", "entry_point": "app factory route mounting (get_app), reached by POST /webhooks/nextcloud", "module_kind": "app_factory"},
+    {"where": "nextcloud_mcp_server/auth/webhook_routes.py:140-143", "entry_point": "POST /app/webhooks/enable/{preset_id} (via _register_preset_webhooks)", "module_kind": "html_admin_route"},
+    {"where": "nextcloud_mcp_server/api/webhooks.py:220", "entry_point": "POST /api/v1/webhooks (Astrolabe-facing JSON API)", "module_kind": "json_api_route"},
+    {"where": "nextcloud_mcp_server/api/management.py:242-248", "entry_point": "GET /api/v1/status (public status endpoint reports webhooks_enabled)", "module_kind": "json_api_route"},
+    {"where": "nextcloud_mcp_server/config.py:725-730", "entry_point": "settings load of WEBHOOK_SECRET via get_settings() (comment-only source change)", "module_kind": "config"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "nextcloud_mcp_server/client/webhooks.py:42"},
+  "O3_reason_to_dismiss": "WebhooksClient.create_webhook defaults auth_method=\"none\", but it is a thin OCS transport wrapper in client/ (a different package from the receiver); both known callers pass auth_method explicitly and webhook_auth_pair() now raises before either call, so a solver can argue the unsafe default is the caller's business and leave it alone.",
+  "O4_distance": {"files": 6, "packages": 5, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Polling-only deployments must keep starting and syncing with WEBHOOK_SECRET unset (docs/ADR-010 still promises 'webhooks are purely additive'); an over-broad fix that makes the secret a required/validated setting or makes the app refuse to boot without it breaks the shipped default stack, which runs semantic search with no WEBHOOK_SECRET at all.",
+    "where": "nextcloud_mcp_server/config.py:725-730"
+  },
+  "O6_input_shapes": [
+    "Authorization header absent entirely (401 when a secret is set; 503 from the handler when it is not)",
+    "Authorization present but wrong secret, or a non-bearer scheme such as 'Basic ...' (401)",
+    "Route not mounted at all (404 from the router) versus handler reached with no secret (503) - two distinct shapes of 'webhooks disabled'",
+    "Config shape: WEBHOOK_SECRET unset/None (dynaconf default) versus empty string versus set",
+    "Registration shapes: multi-event preset (all-or-nothing, zero webhooks may be created) and single JSON body {event, uri, eventFilter|event_filter}"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "nextcloud_mcp_server/vector/webhook_parser.py:60", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "nextcloud_mcp_server/client/webhooks.py:42", "sibling": "A CLI/script registration path (cli.py exposes run/worker/db only) calling create_webhook without auth_method, silently registering authMethod='none'.", "why_realistic": "The Nextcloud API accepts authMethod='none' and the client keeps that as its default, so a maintainer adding a 'nextcloud-mcp-server webhooks register' command or a provisioning hook would plausibly not thread the secret."},
+    {"where": "nextcloud_mcp_server/vector/webhook_receiver.py:89", "sibling": "A second receiver route (e.g. /webhooks/<app>) or a new event family reusing extract_document_task and the same task_producer, repeating the secret gate.", "why_realistic": "webhook_parser.py:9-10 states calendar and Tables parsers are planned follow-ups, and each new ingress must re-derive the same WEBHOOK_SECRET decision."},
+    {"where": "nextcloud_mcp_server/api/management.py:242-248", "sibling": "A management endpoint that queues an index/delete for a caller-supplied user_id (e.g. 'reindex user') straight onto app.state.task_producer.", "why_realistic": "The authenticated management API already has per-user routes (/api/v1/users/{user_id}/revoke, /app-password) and app.state.task_producer is deliberately reachable from route handlers, so a maintainer would reuse it."}
+  ],
+  "O9_family": "missing authentication for a critical function (CWE-306) - fail-open webhook receiver",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.11)",
+    "toolchain": "uv (uv_build backend), pytest + anyio (anyio_mode=auto, pytest-asyncio disabled), pytest-timeout, ruff; `uv sync` then `pytest -m unit`",
+    "services": ["none for unit tests", "qdrant (integration only)", "nextcloud (integration only)", "postgres (postgres marker)", "ollama/embedding provider (integration only)"],
+    "offline_after_build": true,
+    "project_tests": "tests/unit/test_webhook_endpoint.py (TestClient over a bare Starlette app + anyio memory stream), tests/unit/test_webhook_uri.py, tests/unit/test_webhook_routes_register.py, tests/unit/test_webhooks_api_auth.py, tests/unit/test_management_status_endpoint.py, tests/client/test_webhooks_client.py; integration/contract suites require docker-compose services."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "nextcloud_mcp_server/vector/webhook_receiver.py, nextcloud_mcp_server/app.py, nextcloud_mcp_server/auth/webhook_routes.py, nextcloud_mcp_server/api/webhooks.py, nextcloud_mcp_server/api/management.py, nextcloud_mcp_server/config.py",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add an unconditional bearer check inside handle_nextcloud_webhook() only (or make WEBHOOK_SECRET a required startup setting), leaving the mount gate, both registration call sites and the status field untouched."
+  },
+  "out_of_scope_notes": [
+    "docker-compose.yml at the pinned commit enables semantic search on three services without WEBHOOK_SECRET (lines 101, 162, 307), which is why the default shipped stack exposes the receiver unauthenticated - in scope, recorded as evidence rather than a separate finding.",
+    "third_party/oidc, third_party/notes and third_party/astrolabe are declared git submodules but are not checked out here, so any receiver or registration code in the Astrolabe PHP app could not be examined."
+  ],
+  "unverified": [
+    "Repository source size in MB (no shell available); tiny_repo/giant_repo therefore not asserted.",
+    "Whether the hidden behavioural tests assert the exact 503 body for POST /api/v1/webhooks and the webhooks_enabled status field, or only the receiver behaviour.",
+    "Whether any out-of-tree caller relies on WebhooksClient.create_webhook's auth_method=\"none\" default.",
+    "End-to-end delivery from a real Nextcloud instance was not exercised (read-only screening; integration stack not started)."
+  ]
+}

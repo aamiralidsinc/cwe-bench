@@ -1,0 +1,80 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash",
+  "entry_id": "30018", "advisory_ids": ["GHSA-PXCC-8665-PHX8", "CVE-2026-49342"], "repo": "lsegal/yard",
+  "pinned_commit": "d29a77cd5fe7ea2be352e4079c93c5dc216ccefe",
+  "fix_commits": ["f78c19f0dd33a407085b4ed181bb60c0aa0078b4"],
+  "trust_decision": {
+    "summary": "The static cache trusts raw request paths: both the disk read (StaticCaching#check_static_cache, keyed on request.path) and a second, independent disk write (Commands::Base#cache, keyed on request.path_info) join an unsanitised request path onto adapter.document_root, deciding which file outside --docroot is read or written; the router's cleanpath sanitisation only exists downstream of these two sinks.",
+    "evidence": ["lib/yard/server/static_caching.rb:36", "lib/yard/server/commands/base.rb:167", "lib/yard/server/router.rb:56", "lib/yard/server/router.rb:182", "lib/yard/server/commands/base.rb:91"]
+  },
+  "landing_point": {
+    "where": "lib/yard/server/static_caching.rb:36",
+    "why": "The advisory summary is 'static cache reads raw traversal paths before router sanitization'; the first thing an engineer greps is check_static_cache, where File.join(adapter.document_root, request.path...) is built from the untouched request path before Router#route runs its File.cleanpath."
+  },
+  "fix_sites": [
+    {"where": "lib/yard/server/static_caching.rb:34-43", "entry_point": "YARD::Server::Router#call -> check_static_cache (router.rb:56) for every HTTP GET, and the public mixin method StaticCaching#check_static_cache", "module_kind": "server mixin included by Router (cache read sink)"},
+    {"where": "fix.diff:95-106", "entry_point": "the new private StaticCaching#cache_path helper called by both cache read (request.path) and cache write (request.path_info)", "module_kind": "shared containment helper added by the fix"},
+    {"where": "lib/yard/server/commands/base.rb:165-174", "entry_point": "DisplayObjectCommand#render (display_object_command.rb:30,44), DisplayFileCommand#run (display_file_command.rb:16,23), ListCommand#run (list_command.rb:17), LibraryIndexCommand#run (library_index_command.rb:23) -> Commands::Base#cache", "module_kind": "commands layer: a second implementation of the same document_root path rule (cache write sink)"},
+    {"where": "fix.diff:20", "entry_point": "class-level wiring: Commands::Base now includes StaticCaching so Base#cache can delegate via super (fix.diff:36)", "module_kind": "mixin wiring into an unrelated class"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "lib/yard/server/commands/base.rb:165-174"},
+  "O3_reason_to_dismiss": "The advisory (and its title) is about static-cache *reads*; the write path in Commands::Base#cache only stores our own rendered HTML, and request.path_info looks sanitised because Commands::Base#call visibly runs File.cleanpath on the path (base.rb:91) - a solver can conclude the writer is already covered and fix only check_static_cache.",
+  "O4_distance": {"files": 2, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The cache key is the full Rack path including script_name (mount point) on the read side while the writer keys on request.path_info; an over-broad 'unify/normalise the cache path' fix relocates every cached page under a mounted server (static_caching_spec.rb:40-45 pins the mount-point key). Also legitimate: the root index '/' caches to document_root/.html, and filenames whose segment merely contains '..' (e.g. an extra file served as /docs/file/a..b.txt) must keep caching - a substring '..' test breaks them.",
+    "where": "lib/yard/server/static_caching.rb:36 vs lib/yard/server/commands/base.rb:167"
+  },
+  "O6_input_shapes": [
+    "'..' as a slash-separated path segment ('/../path/to/file.html', '/../secret')",
+    "'..' delimited by backslashes (cache_path splits on /[\\/\\\\]/)",
+    "absolute request path with leading slashes (sub(%r{\\A/+}, ''))",
+    "Windows drive-letter absolute path (rejected by /\\A[A-Za-z]:/)",
+    "path with and without the trailing .html suffix (suffix is appended)",
+    "both request fields: request.path for the read, request.path_info for the write"
+  ],
+  "O7_producer": {"kind": "cache", "where": "lib/yard/server/commands/base.rb:165-174", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Static asset serving joins document_root with the request path in StaticFileHelpers.find_file with no '..'/backslash/drive-letter guard; File.cleanpath only collapses '/' (File::SEPARATOR), so a segment like '..\\..\\x' survives the router/command sanitisation and File.join(document_root, url) escapes --docroot on Windows-style paths. Reached by the /static/... route (StaticFileCommand) and by the unmatched-path fallback RootRequestCommand (router.rb:57), which sets path from request.path_info (base.rb:91).",
+     "where": "lib/yard/server/commands/static_file_helpers.rb:47-49",
+     "reason_to_dismiss": "The advisory is about the static *cache*, not static asset/template file serving; and the incoming path is already run through File.cleanpath, which looks like sanitisation (on POSIX it happens to be).",
+     "distance": "1 file away, same YARD::Server namespace, commands/ subdirectory",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/yard/server/commands/static_file_helpers.rb:47", "sibling": "a second document_root-join sink, e.g. a download/preview route reusing find_file's File.join(path_prefix, url)", "why_realistic": "the module already exists to serve files from document_root plus registered static paths, so adding another asset route there is the obvious extension, and nothing marks the join as security-sensitive."},
+    {"where": "lib/yard/templates/engine.rb:165", "sibling": "template-asset resolution that joins a template path with the same request-derived relative path", "why_realistic": "find_file already falls back to this join (static_file_helpers.rb:55), so a 'cache rendered assets to disk' sibling would naturally reuse it."},
+    {"where": "lib/yard/server/commands/display_file_command.rb:12", "sibling": "a second 'join a trusted root with a command path' sink for extra files, beside the document_root one", "why_realistic": "extra-file serving already builds a root+path filename with File.cleanpath and reads it; a maintainer adding another served root (source tree, gems) would copy this two-line pattern."}
+  ],
+  "O9_family": "CWE-22 path traversal (arbitrary file read and write outside --docroot)", "O9_dos": false,
+  "O10_build": {
+    "language": "Ruby",
+    "toolchain": "pure Ruby, no native extensions; Ruby >= 2.2 (CI matrix 2.2-4.0, .github/workflows/ci.yml:28), bundler + rake + rspec; `bundle exec rake` runs spec plus a self-doc build (Rakefile:21,31)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "spec/server/static_caching_spec.rb, spec/server/commands/base_spec.rb, spec/server/router_spec.rb, spec/server/adapter_spec.rb, spec/server/rack_adapter_spec.rb (mock Rack/OpenStruct requests, no sockets)"
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/yard/server/static_caching.rb, lib/yard/server/commands/base.rb",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Reject '..' inside StaticCaching#check_static_cache only, leaving the Commands::Base#cache writer (request.path_info) unchecked."
+  },
+  "out_of_scope_notes": [
+    "lib/yard/server/commands/display_file_command.rb:12 joins library.source_path (not document_root) with the command path; outside this advisory's protection, not pursued.",
+    "The pinned commit already carries the earlier sibling advisory's router-side cleanpath defence (CHANGELOG.md:16, GHSA-xfhh-rx56-rxcr); not re-audited beyond the cache sinks."
+  ],
+  "unverified": [
+    "repo size in MB (no shell available in this session; ~639 files, likely close to the 5 MB tiny_repo threshold)",
+    "whether any release after the pinned commit exists, so present_in_latest for the O8 route is unknown (inputs state latest release: none)",
+    "whether the O8 StaticFileHelpers route is reachable in practice on the benchmark's Linux test host - it needs backslash-bearing paths, so hidden behavioural tests would have to emulate Windows path handling; the project's CI does include windows-latest",
+    "whether WEBrick/Rack front-ends normalise '..' before the router sees the path (affects exploitability, not the sink's correctness)"
+  ]
+}

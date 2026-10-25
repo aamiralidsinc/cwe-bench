@@ -1,0 +1,153 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "7471",
+  "advisory_ids": ["GHSA-2CF7-HPWF-47H9", "CVE-2026-55608"],
+  "repo": "czlonkowski/n8n-mcp",
+  "pinned_commit": "b0f5e25d22c1e28363c27aee160518c301341edc",
+  "fix_commits": ["c1ca1e73697feaec5ec2a5fb7e6992a2892b62c9"],
+  "trust_decision": {
+    "summary": "In multi-tenant HTTP mode the /mcp route is the trust decision: it admits a request that carries only one of X-n8n-url / X-n8n-key (the gate rejects only when both are absent), getInstanceScopeId then returns the empty default tenant key '' for that partial context, and handleWorkflowVersions uses that key unguarded for list/get/rollback/delete, so a tenant reads and deletes the operator's default-scope workflow_versions rows; the fix requires both tenant headers at the transport and separately fails closed in the handler when ENABLE_MULTI_TENANT is true and the derived scope is ''.",
+    "evidence": [
+      "src/http-server-single-session.ts:1338-1341",
+      "src/types/instance-context.ts:140-178",
+      "src/types/instance-context.ts:223-231",
+      "src/mcp/handlers-n8n-manager.ts:2401-2409",
+      "src/database/node-repository.ts:1135-1160",
+      "fix.diff:144",
+      "fix.diff:164"
+    ]
+  },
+  "landing_point": {
+    "where": "src/http-server-single-session.ts:1341",
+    "why": "The advisory summary is about authorization in multi-tenant HTTP mode; this is the only multi-tenant tenant-header gate on POST /mcp, so anyone grepping ENABLE_MULTI_TENANT in the HTTP server lands on this condition and the one-word change `&&` -> `||`."
+  },
+  "fix_sites": [
+    {
+      "where": "src/http-server-single-session.ts:1338-1355",
+      "entry_point": "POST /mcp (StreamableHTTP JSON-RPC endpoint of SingleSessionHTTPServer)",
+      "module_kind": "http_transport"
+    },
+    {
+      "where": "src/mcp/handlers-n8n-manager.ts:2401-2410",
+      "entry_point": "n8n_workflow_versions tool handler (handleWorkflowVersions), reachable from every transport that dispatches MCP tools",
+      "module_kind": "mcp_tool_handler"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/http-server.ts:195"
+  },
+  "O3_reason_to_dismiss": "The deprecated USE_FIXED_HTTP server (src/http-server.ts:4 tells readers to use SingleSessionHTTPServer instead, and src/mcp/index.ts:103-120 only reaches it behind an explicit env var with a deprecation warning) builds one process-wide context-less N8NDocumentationMCPServer and never reads ENABLE_MULTI_TENANT, so a solver can call it a legacy, non-SaaS path and leave it open.",
+  "O4_distance": {
+    "files": 5,
+    "packages": 4,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "Single-user / stdio deployments legitimately run with the empty scope '': getInstanceScopeId returns '' when no credentials are present and the workflow_versions.instance_id column defaults to '' (src/database/schema.sql:240). A fix that rejects an empty derived scope unconditionally, instead of only under ENABLE_MULTI_TENANT, breaks their entire existing version history and every new backup, including n8n_update_partial_workflow's non-blocking backups.",
+    "where": "src/types/instance-context.ts:216-231"
+  },
+  "O6_input_shapes": [
+    "X-n8n-url present, X-n8n-key absent (URL-only partial context)",
+    "X-n8n-key present, X-n8n-url absent (key-only partial context)",
+    "neither tenant header (pre-existing GHSA-jxx9-px88-pj69 case, now also covered by the handler guard)",
+    "X-instance-id only, no url/key",
+    "both tenant headers present (must keep working, and must keep working for both MULTI_TENANT_SESSION_STRATEGY values)",
+    "all tool modes list/get/rollback/delete/deleteAll/prune under each of the above contexts"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "src/types/instance-context.ts:223-231",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "GET /sse + POST /messages: the SSE transport constructs its server with no instance context at all, so n8n_workflow_versions runs with the derived scope '' in multi-tenant mode and lists/reads/deletes default-scope backups",
+      "where": "src/http-server-single-session.ts:866-871",
+      "reason_to_dismiss": "The source itself states 'SSE sessions do not support multi-tenant context. The SaaS backend uses StreamableHTTP exclusively.' (src/http-server-single-session.ts:866-867) and marks SSE deprecated (src/http-server-single-session.ts:1153-1156), which is exactly the plausible reason to treat the route as out of scope.",
+      "distance": "same file, ~200 lines above the fixed gate; the context-less server construction is ~470 lines away",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "USE_FIXED_HTTP=true server: a single process-wide N8NDocumentationMCPServer() with no context; tools/call dispatches n8n_workflow_versions straight into the handler, so every tenant shares scope ''",
+      "where": "src/http-server.ts:195",
+      "reason_to_dismiss": "Deprecated, opt-in legacy HTTP implementation (src/http-server.ts:4, src/mcp/index.ts:103-120) that never mentions multi-tenancy, so a solver can argue multi-tenant deployments cannot use it.",
+      "distance": "a separate HTTP server implementation in another file; it never reads ENABLE_MULTI_TENANT, so an env-var grep does not find it",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "n8n_update_partial_workflow (and n8n_autofix_workflow, which forwards createBackup:true into it) still writes backups stamped with the '' default scope when the request context is incomplete in multi-tenant mode; only the read handler got the fail-closed guard",
+      "where": "src/mcp/handlers-workflow-diff.ts:200-206",
+      "reason_to_dismiss": "Backups here are explicitly best-effort and non-blocking (errors swallowed at src/mcp/handlers-workflow-diff.ts:214-220) and the advisory text is about exposing backups rather than writing them, so a solver can treat the write path as a different, benign behaviour.",
+      "distance": "a different tool family in another file under src/mcp (update path vs versions path)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "n8n_update_full_workflow's pre-update backup writer also derives its scope from getInstanceScopeId(context) with no fail-closed check, so an incomplete context writes into the shared default scope",
+      "where": "src/mcp/handlers-n8n-manager.ts:990-995",
+      "reason_to_dismiss": "Same best-effort/non-blocking backup argument, and it sits in the very file the fix edited, so a solver may assume it was already reviewed and covered.",
+      "distance": "same file as the fixed handler, ~1400 lines above it",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/mcp/handlers-n8n-manager.ts:1416",
+      "sibling": "a fourth backup trigger that forwards createBackup:true into the partial-update path, which would need the same tenant-scope fail-closed rule",
+      "why_realistic": "The table already enumerates three triggers (schema.sql:245-249) and autofix already re-enters the partial-update handler this way, so adding another trigger/route is a normal maintainer change."
+    },
+    {
+      "where": "src/http-server-single-session.ts:1180",
+      "sibling": "a second message-delivery endpoint (/messages for the legacy SSE transport) that would need the same tenant-header gate as /mcp",
+      "why_realistic": "This file already carries two parallel transports side by side, and one of them was left without the multi-tenant gate."
+    },
+    {
+      "where": "src/types/instance-context.ts:223",
+      "sibling": "a second scope-derivation helper (for example keyed on instanceId, or one built from createCacheKey) used by some call sites but not others",
+      "why_realistic": "The function's own docstring (src/types/instance-context.ts:208-222) explains why createCacheKey must not be used, showing alternative derivations were considered; a maintainer could plausibly add one for a new route."
+    },
+    {
+      "where": "src/database/node-repository.ts:1262",
+      "sibling": "a repository read whose WHERE clause omits instance_id (a stats/export/admin variant)",
+      "why_realistic": "getVersionStorageStats is already a scope-wide aggregate next to the per-tenant reads, so a cross-workflow or export query without the predicate is a realistic addition."
+    }
+  ],
+  "O9_family": "incorrect authorization / broken tenant scoping exposing stored data (CWE-863, CWE-200)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node + npm, tsc via tsconfig.build.json, vitest ^3.2.4, express 5, @modelcontextprotocol/sdk 1.28.0, zod, native better-sqlite3 ^11.10.0",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/unit/http-server/ssrf-gate.test.ts:385 (multi-tenant header omission, mocked req/res on POST /mcp), tests/integration/security/ghsa-j6r7-workflow-versions.test.ts:13 (cross-tenant workflow_versions isolation, in-memory TestDatabase), tests/unit/http-server/multi-tenant-support.test.ts; run with `npm run test:run` / `npm run test:integration` (no network needed for this area)."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/http-server-single-session.ts, src/mcp/handlers-n8n-manager.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Flip the existing gate at src/http-server-single-session.ts:1341 from `!hasUrl && !hasKey` to `!hasUrl || !hasKey`, rerun the header tests, and stop there."
+  },
+  "out_of_scope_notes": [
+    "Adjacent protection not part of this advisory and not pursued: instance-context validation with the SSRF gate at src/http-server-single-session.ts:1374-1391 (GHSA-4ggg-h7ph-26qr).",
+    "The fix commit also regenerates committed dist/ bundles, source maps, package-lock and package.runtime.json; only the two src/ files were counted as source changes."
+  ],
+  "unverified": [
+    "repo_mb: no shell available to measure the checkout; 213 files under src/*.ts plus data/nodes.db and data/templates.db are present, so it is clearly above the 5 MB tiny threshold, but the exact size is unknown.",
+    "Whether a real multi-tenant deployment actually exposes /sse to tenants: the route is registered unconditionally behind the same bearer token, but deployment configuration was not inspected.",
+    "present_in_latest for every O8 route: no latest release was provided, so all are answered unknown."
+  ]
+}

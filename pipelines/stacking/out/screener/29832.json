@@ -1,0 +1,80 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash",
+  "entry_id": "29832",
+  "advisory_ids": ["GHSA-H8W8-99G7-QMVJ", "CVE-2026-54904"],
+  "repo": "ruby-concurrency/concurrent-ruby",
+  "pinned_commit": "2825cfa12cb708b76557803957f76862eb1151a2",
+  "fix_commits": ["6e37e0644b83b182971dc540d2e4bee38df61386"],
+  "trust_decision": {
+    "summary": "Decided in Concurrent::AtomicReference#compare_and_set (the AtomicNumericCompareAndSetWrapper mixed into the Mutex and C-extension backends): when the expected value is Numeric the loop compares with `old == old_value`, and NaN is never == to itself, so _compare_and_set is never attempted and every CAS-based retry (update/try_update/try_update!) never terminates. The published fix adds an explicit `nan?` branch to that one module; it does not touch the JRuby Java numeric CAS or AtomicMarkableReference's own numeric compare.",
+    "evidence": [
+      "lib/concurrent-ruby/concurrent/atomic_reference/numeric_cas_wrapper.rb:10-25",
+      "lib/concurrent-ruby/concurrent/atomic_reference/atomic_direct_update.rb:11",
+      "lib/concurrent-ruby/concurrent/atomic_reference/mutex_atomic.rb:12",
+      "lib/concurrent-ruby/concurrent/atomic/atomic_reference.rb:24"
+    ]
+  },
+  "landing_point": {
+    "where": "lib/concurrent-ruby/concurrent/atomic_reference/atomic_direct_update.rb:11",
+    "why": "The summary names AtomicReference#update livelocking on Float::NAN; this `true until compare_and_set(old_value = get, new_value = yield(old_value))` line is where the symptom is produced. The next hop is the compare_and_set it calls, lib/concurrent-ruby/concurrent/atomic_reference/numeric_cas_wrapper.rb:17, where the == comparison drops the NaN case."
+  },
+  "fix_sites": [
+    {"where": "lib/concurrent-ruby/concurrent/atomic_reference/numeric_cas_wrapper.rb:10-25", "entry_point": "Concurrent::AtomicReference#compare_and_set (alias #compare_and_swap); reached by #update / #try_update / #try_update! (lib/concurrent-ruby/concurrent/atomic_reference/atomic_direct_update.rb:10-35), Concurrent::Atom#swap (lib/concurrent-ruby/concurrent/atom.rb:157-170), Synchronization::Object attr_atomic generated update_<name> (lib/concurrent-ruby/concurrent/synchronization/object.rb:105-111) and Tuple#compare_and_set (lib/concurrent-ruby/concurrent/tuple.rb:69-73)", "module_kind": "internal mix-in module (AtomicNumericCompareAndSetWrapper) shared by MutexAtomicReference and CAtomicReference"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "ext/concurrent-ruby/com/concurrent_ruby/ext/AtomicReferenceLibrary.java:117-144 (compareAndSetNumeric), selected as Concurrent::AtomicReference#compare_and_set on JRuby by lib/concurrent-ruby/concurrent/atomic/atomic_reference.rb:28-34, which includes AtomicDirectUpdate but not AtomicNumericCompareAndSetWrapper"},
+  "O3_reason_to_dismiss": "Both remaining sites are easy to argue away: the Java numeric CAS is JRuby-only code in another language under ext/ that never loads on the MRI box the specs run on, and AtomicMarkableReference is a different class whose value+mark payload is compared its own way, so a solver can say the advisory covers AtomicReference#update and stop after the one Ruby hunk.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Numeric CAS must keep using value equality (==) rather than identity/eql?, so a stored Integer 1, 1.0, 2**100, Rational(1,3) or Complex(1,2) still matches an equal-but-different object (exercised at spec/concurrent/atomic/atomic_reference_spec.rb:128-144), and a NaN expected value must still fail against a non-NaN stored value. A fix that compares with eql?/equal?, or that accepts NaN as matching anything, breaks one or both.",
+    "where": "lib/concurrent-ruby/concurrent/atomic_reference/numeric_cas_wrapper.rb:17; identity semantics of the backend at lib/concurrent-ruby/concurrent/atomic_reference/mutex_atomic.rb:45-54"
+  },
+  "O6_input_shapes": [
+    "Float::NAN as the expected/old value while the stored value is also NaN (the reported shape; must now succeed)",
+    "Float::NAN expected while the stored value is a non-NaN Numeric (must stay a failed CAS; fix.diff:61-69 asserts this)",
+    "non-NaN Numerics: Integer, Bignum, Float with non-idempotent representation, Rational, Complex, compared with ==",
+    "Numeric expected value while the stored value is not Numeric (returns false before the loop body)",
+    "non-Numeric expected value: identity path via _compare_and_set, unchanged by the fix"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "AtomicReference#update on JRuby: JavaAtomicReference includes only AtomicDirectUpdate, so compare_and_set is the Java compareAndSetNumeric loop, whose `!currentNumber.equals(expectedValue)` returns false for NaN forever, so the Ruby #update loop still hangs after this fix", "where": "lib/concurrent-ruby/concurrent/atomic/atomic_reference.rb:28-34 and ext/concurrent-ruby/com/concurrent_ruby/ext/AtomicReferenceLibrary.java:117-144", "reason_to_dismiss": "JRuby-only; the numeric wrapper is a Ruby mixin and the JVM class already implements its own numeric CAS, so a solver can call it a separate implementation outside the Ruby fix (and it cannot be exercised on MRI)", "distance": "same file's implementation selector, then a Java source in the ext/ package tree", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "AtomicMarkableReference#update: its own loop retries on compare_and_set, which returns false for a Numeric expected value via `expected_val == curr_val`, so a stored Float::NAN livelocks; try_update returns nil and try_update! raises for the same reason", "where": "lib/concurrent-ruby/concurrent/atomic/atomic_markable_reference.rb:42-45 and lib/concurrent-ruby/concurrent/atomic/atomic_markable_reference.rb:105-114", "reason_to_dismiss": "A different class holding a frozen [value, mark] array with its own numeric-vs-identity comparison rule; the advisory names AtomicReference#update, so the markable reference reads as a neighbouring feature rather than a route into the same sink", "distance": "one file away, same directory (lib/concurrent-ruby/concurrent/atomic/)", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "TruffleRuby backend: TruffleRubyAtomicReference includes only AtomicDirectUpdate and inherits compare_and_set from TruffleRuby::AtomicReference, so the NaN equality rule is wherever that class implements it and is not covered by the Ruby wrapper", "where": "lib/concurrent-ruby/concurrent/atomic/atomic_reference.rb:35-43", "reason_to_dismiss": "Non-MRI engine, implementation lives outside this repository, so it is unverifiable and easy to leave alone", "distance": "same file's implementation selector; implementation is out of tree", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/concurrent-ruby/concurrent/atomic/mutex_atomic_fixnum.rb:44-53", "sibling": "A float-capable AtomicFixnum (or a numeric CAS helper next to it) whose update retries on `@value == expect.to_i`", "why_realistic": "AtomicFixnum already has a compare-and-set plus an update that takes a block; widening it to accept non-integer numerics is a natural change and would reproduce the NaN inequality with the same retry shape."},
+    {"where": "lib/concurrent-ruby/concurrent/synchronization/object.rb:105-111", "sibling": "An attr_atomic numeric field (generated compare_and_set_<name>/update_<name>) used for a floating-point threshold or average, whose update retry inherits the wrapper's equality rule", "why_realistic": "attr_atomic is the framework's main way to build new concurrency primitives; a numeric attribute is a one-line addition for a maintainer and immediately reaches the same sink."},
+    {"where": "lib/concurrent-ruby/concurrent/atom.rb:157-170", "sibling": "An Atom variant (or a swap-adjacent helper) with its own retry loop and a validator, bypassing compare_and_set_value", "why_realistic": "Atom#swap already sits next to compare_and_set and shares the pattern; a specialised numeric atom that skips the validator path would be a believable refactor that the wrapper would not cover."}
+  ],
+  "O9_family": "CWE-835 loop with unreachable exit condition: CAS retry loop proves equality with `==`, which a stored NaN can never satisfy, so #update never returns",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Ruby (optional C extension for MRI, optional Java extension for JRuby)",
+    "toolchain": "Ruby + Bundler; rspec ~>3.7 and timecop in the :testing group; rake + rake-compiler build concurrent-ruby-ext, which is optional because the loader falls back to the pure-Ruby MutexAtomicReference",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "spec/concurrent/atomic/atomic_reference_spec.rb holds RSpec shared examples run against AtomicReference, MutexAtomicReference and CAtomicReference (plus JavaAtomicReference / TruffleRubyAtomicReference on those engines); spec/concurrent/atomic/atomic_markable_reference_spec.rb covers the markable sibling (update retry at :80-90, numeric compare at :109-137). Run with `bundle exec rspec spec/concurrent/atomic`."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/concurrent-ruby/concurrent/atomic_reference/numeric_cas_wrapper.rb",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Special-case NaN in AtomicDirectUpdate#update itself (e.g. `return new_value if old_value.nan?`) or switch the numeric compare to eql?/equal?, leaving compare_and_set, try_update/try_update!, the JRuby Java loop and AtomicMarkableReference untouched."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb not measured (no shell available in this session), so tiny_repo/giant_repo was not assessed.",
+    "Whether hidden tests can score the JRuby/TruffleRuby backends at all: the MRI spec suite never loads the Java extension, so the O2 site and the JRuby O8 route are real code the report's own test command cannot exercise.",
+    "TruffleRuby::AtomicReference#compare_and_set NaN semantics live outside this repository and were not read.",
+    "Whether the published fix is a single commit upstream (the supplied fix.diff holds one commit, 6e37e064) was not cross-checked against the remote history.",
+    "Present-in-latest is unknown for every route because no latest release was provided."
+  ]
+}

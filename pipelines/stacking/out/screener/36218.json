@@ -1,0 +1,90 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash",
+  "entry_id": "36218",
+  "advisory_ids": ["GHSA-R5PM-VRC5-3M73", "CVE-2026-54713"],
+  "repo": "cakephp/queue",
+  "pinned_commit": "740258fad7549200c62e0c45a37961ea561c8e61",
+  "fix_commits": ["13890591e248acc8824becb24ba1939fa061bd34"],
+  "trust_decision": {
+    "summary": "The dedupe key for a unique job is md5(class . method . json_encode(data)), decided in one function, QueueManager::getUniqueId(). At the pinned commit sort($data) sorts by value and reindexes, so key/value association is discarded: ['a'=>1,'b'=>2] and ['a'=>2,'b'=>1] both hash as [1,2], and ['k'=>'admin','r'=>'guest'] collides with any other payload with the same value multiset. The second push is then silently ignored (Cache::read hit at line 251), so a legitimate job is dropped. The published fix replaces the value-sort with a recursive key-sort (ksort) so the identity depends on keys as well as values.",
+    "evidence": ["src/QueueManager.php:307", "src/QueueManager.php:309-315", "src/QueueManager.php:249", "src/QueueManager.php:251", "src/QueueManager.php:294-296", "fix.diff:13-14"]
+  },
+  "landing_point": {
+    "where": "src/QueueManager.php:307",
+    "why": "The advisory names getUniqueId, and sort($data) is the only normalisation between the caller's payload and the md5 at line 315; it is also the only place in the repository where a job's dedupe key is derived."
+  },
+  "fix_sites": [
+    {
+      "where": "src/QueueManager.php:307",
+      "entry_point": "QueueManager::push() public static API (reached directly by applications, by Cake\\Queue\\Mailer\\Transport\\QueueTransport::send(), by Cake\\Queue\\Mailer\\QueueTrait::push() and by the `bin/cake queue requeue` CLI); the method itself, QueueManager::getUniqueId(), is also a public static API",
+      "module_kind": "core library service, root namespace, public static API"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "src/Consumption/RemoveUniqueJobIdFromCacheExtension.php:38-42 (identity re-derived from the JSON-decoded broker body produced at src/Job/Message.php:46), registered by src/Command/WorkerCommand.php:146-147"
+  },
+  "O3_reason_to_dismiss": "Both the push side and the consumption side call the same getUniqueId() helper, so a solver will argue the key is identical by construction and the delete path (Consumption/) needs no change of its own.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Payloads that differ only in key insertion order must still collapse to one queue entry: ['a'=>1,'b'=>2] and ['b'=>2,'a'=>1] have to hash the same, or shouldBeUnique queues duplicates. An over-broad fix that hashes the payload as given (json_encode/serialize without normalising) breaks exactly this.",
+    "where": "src/QueueManager.php:307 (the normalisation that must stay) and tests/TestCase/QueueManagerTest.php:190-206 (testUniqueMessageIsQueuedOnlyOnce)"
+  },
+  "O6_input_shapes": [
+    "associative arrays whose keys differ but whose value multiset is identical: ['user_id'=>'admin','role'=>'guest'] vs ['foo'=>'admin','bar'=>'guest'] (fix.diff:72-78)",
+    "associative arrays with the same keys and permuted values: ['a'=>1,'b'=>2] vs ['a'=>2,'b'=>1] (fix.diff:68-70)",
+    "the same key/value pairs in different insertion order, which must stay equal (fix.diff:65-66)",
+    "nested arrays with reordered keys, requiring the sort to recurse (fix.diff:80-82)",
+    "list arrays, where the fixed behaviour is that [1,2,3] and [3,2,1] are now DIFFERENT because sorting is by key not value (fix.diff:51-53)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "src/Job/Message.php:46 (json_decode of the queue body) feeding src/Consumption/RemoveUniqueJobIdFromCacheExtension.php:38; for the requeue route src/Listener/FailedJobsListener.php:69 (json_encode) and src/Model/Entity/FailedJob.php:51-54 (json_decode) feed src/Command/RequeueCommand.php:134-142",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "src/Command/RequeueCommand.php:134",
+      "sibling": "a 'skip already-requeued duplicate' guard computing its own unique id from $failedJob->decoded_data",
+      "why_realistic": "Requeueing the same failed job twice is a real operational concern and the DB payload is already a normalised JSON string, so a maintainer would naturally add the check there instead of reusing getUniqueId()."
+    },
+    {
+      "where": "src/Mailer/Transport/QueueTransport.php:70-77",
+      "sibling": "a shouldBeUnique-style dedupe for queued mail, keyed on prepareData() where emailMessage is a JSON string whose header order depends on the caller (src/Mailer/Transport/QueueTransport.php:85-92)",
+      "why_realistic": "Duplicate queued mail is expensive and visible to users, so dedupe is the obvious feature to add on the mailer transport rather than in the generic push path."
+    }
+  ],
+  "O9_family": "CWE-1023 incomplete comparison: non-injective dedupe identity (payload hashed after a value-sort that discards keys, so distinct payloads collide and a legitimate job is silently suppressed)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "PHP >= 8.1",
+    "toolchain": "composer (cakephp/cakephp ^5.1, enqueue/simple-client ^0.10), phpunit ^10.5/^11/^12 with the Cake fixture extension; dev deps enqueue/fs and cakephp/bake",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/TestCase/QueueManagerTest.php:190 (testUniqueMessageIsQueuedOnlyOnce) and :208 (testDroppedJobIsLoggedForUniqueJob) exercise the push-side dedupe over a file:// queue with the File cache; tests/TestCase/Consumption/RemoveUniqueJobIdFromCacheExtensionTest.php:38 pushes a unique job, consumes it through the file queue and asserts the cache key is released. DB is not needed by these (tests/bootstrap.php:100-107 defaults to sqlite:///:memory:)."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "none",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/QueueManager.php",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "swap sort($data) for a top-level ksort($data) only (nested arrays stay order-dependent), or normalise at the push call site instead of inside the shared getUniqueId()"
+  },
+  "out_of_scope_notes": [
+    "Nothing outside the dedupe path was examined; the failed-job DB/requeue route was read only as a payload-shape route into the same sink and was not pursued further."
+  ],
+  "unverified": [
+    "Exact repository size in MB could not be measured without a shell; the tree has ~124 tracked files and no vendor/ directory, so it is far under the 5 MB threshold, but the number itself is unknown.",
+    "The serializer asymmetry (an object or JsonSerializable value in $data is hashed as its own JSON at push time but recursed-and-ksorted as a decoded array at consume time) follows from src/Job/Message.php:46 plus the array-only recursion in the fixed helper, but it was not executed, so whether it actually desynchronises the delete key is unconfirmed.",
+    "present_in_latest for the O2 site is unknown: no network access and the prompt reports no latest release.",
+    "Whether a planted sibling would survive the target models is unmeasured; O8b candidates are WHERE-type route additions, which the lessons record as costing only a search."
+  ]
+}

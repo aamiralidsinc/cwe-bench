@@ -1,0 +1,87 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "13290",
+  "advisory_ids": ["GHSA-QFVM-CV95-JQJF", "CVE-2026-77037"],
+  "repo": "expressjs/multer",
+  "pinned_commit": "25ec9bb55d0cd39990003305c902042ee1415487",
+  "fix_commits": ["eef74440b491ef0f976f3d25895e8089ae495df0"],
+  "trust_decision": {
+    "summary": "Per file, every storage callback must settle exactly once and any disk write stream's descriptor must be released before its partial file is unlinked, so an aborted request cannot leak a descriptor; this is decided in lib/make-middleware.js's pendingWrites accounting and in storage/disk.js's _handleFile/_removeFile.",
+    "evidence": [
+      "lib/make-middleware.js:235-242",
+      "lib/make-middleware.js:294-318",
+      "storage/disk.js:38-53",
+      "storage/disk.js:58-66",
+      "fix.diff:13-17",
+      "fix.diff:87-128"
+    ]
+  },
+  "landing_point": {
+    "where": "storage/disk.js:38-44",
+    "why": "The only place multer opens a disk descriptor: fs.createWriteStream(finalPath) at :40 is preceded by a bare `if (file.stream.destroyed) return` at :38 and followed by file.stream.pipe(outStream) at :44, while the file's only cleanup path (_removeFile, :58-66) just calls fs.unlink and never closes that stream - which is exactly the fd leak the summary names."
+  },
+  "fix_sites": [
+    {"where": "lib/make-middleware.js:235-242", "entry_point": "multer middleware returned by .single()/.array()/.fields()/.any(), mounted on a multipart HTTP route", "module_kind": "middleware / request handler"},
+    {"where": "lib/make-middleware.js:300-317", "entry_point": "the three storage-callback branches of the same middleware (aborting, err, success) that decrement pendingWrites", "module_kind": "middleware / request handler"},
+    {"where": "lib/multer-error.js:10-14", "entry_point": "MulterError constructor re-exported as multer.MulterError (index.js:107)", "module_kind": "error registry / public export"},
+    {"where": "storage/disk.js:27-56", "entry_point": "multer.diskStorage() engine used via multer({ storage }) or multer({ dest }), and its _handleFile method callable directly per StorageEngine.md", "module_kind": "storage engine (lower-level API)"},
+    {"where": "storage/disk.js:58-66", "entry_point": "the same engine's _removeFile, invoked from the abort cleanup at lib/make-middleware.js:146-148", "module_kind": "storage engine cleanup (lower-level API)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "storage/memory.js:5-12"},
+  "O3_reason_to_dismiss": "The other engine never opens a file descriptor, so it can be argued that an fd-leak advisory simply does not cover it ('memoryStorage has nothing to leak'); the same move is available for the untouched abort route, where the middleware deliberately skips waiting for in-flight writes because an aborted request must not be held open.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Abort cleanup must always reach next(err): removeUploadedFiles removes files strictly one after another and calls back only after the last one (lib/remove-uploaded-files.js:7-26), so a _removeFile that waits for a 'close' that never arrives (write stream destroyed with an error, where 'close' is not emitted) hangs the request and leaves the remaining files unremoved; the early fs.unlink path for a file with no tracked stream must stay too.",
+    "where": "storage/disk.js:58-66"
+  },
+  "O6_input_shapes": [
+    "source file stream already destroyed before _handleFile runs (the guard must call the callback instead of returning)",
+    "source destroyed or errored mid-write, where pipe() leaves the write side open and pipeline() destroys it",
+    "one file's failure reported twice - stream 'error' event plus storage callback - which must decrement pendingWrites exactly once",
+    "write stream already closed vs destroyed with an error so that 'close' is never emitted (Node < 14 emitClose=false); cleanup must settle on 'close' or 'error'"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "lib/make-middleware.js:296-315", "check_calls_producer": true},
+  "O8_uncovered_routes": [
+    {"route": "A storage write that errors drops the file from pendingFiles at the top of the storage callback and never puts it in uploadedFiles, so abort cleanup never calls _removeFile for it and the partially written file created by fs.createWriteStream stays on disk (the 'aborting' branch keeps the file, the 'err' branch does not).", "where": "lib/make-middleware.js:297-310", "reason_to_dismiss": "A file whose write failed has nothing valid to remove, and the error branch is about reporting the failure, not cleanup - the disk engine already destroyed its own stream.", "distance": "same middleware file, one function below the abort cleanup; the file on disk is produced in storage/disk.js:40", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "A client abort that lands while the disk engine is still resolving destination/filename leaves the file with no file.path yet, so filesToRemove = pendingFiles.filter(f => f.path) drops it; when the write later fails or lands, nothing unlinks the partial file.", "where": "lib/make-middleware.js:150-153", "reason_to_dismiss": "The file has no path yet, so there is nothing to unlink and the engine may not have created anything.", "distance": "the async window is in another module's callbacks (storage/disk.js:30-38, crypto.randomBytes at storage/disk.js:6-10) reached through lib/make-middleware.js:296", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Client abort takes abortWithError(err, true) / handleRequestFailure, which skips pendingWrites.onceZero, so cleanup unlinks immediately and the wait for in-flight writes exists only inside the one engine the fix touched; every other engine (including the documented custom-engine route) keeps the original behaviour.", "where": "lib/make-middleware.js:174-181", "reason_to_dismiss": "An aborted request must not be held open waiting for writes, and resource ownership belongs to the storage engine, not the middleware.", "distance": "same file, ~60 lines above the storage callback that reaches the sink", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "storage/memory.js:5-12", "sibling": "a memory engine that registers its concat stream and destroys it before releasing the buffer / calling back", "why_realistic": "It is the default engine (index.js:16-18) and implements the identical _handleFile contract documented at StorageEngine.md:3-4, so a maintainer hardening descriptor/callback lifecycles would plausibly add the same guard next door."},
+    {"where": "StorageEngine.md:50-69", "sibling": "a third disk-shaped engine copied from the documented template (pipe + createWriteStream + unlink) with its own _removeFile", "why_realistic": "The docs publish exactly that code as the template for custom engines, so a sibling engine file that repeats the unfixed pipe/unlink pattern is a realistic addition to our copy."}
+  ],
+  "O9_family": "CWE-400 resource exhaustion through CWE-459 incomplete cleanup (file-descriptor leak on aborted/failed uploads)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "JavaScript (Node.js, no compile step)",
+    "toolchain": "npm install; mocha (npm test) with standard for lint; Node >= 10.16.0 per package.json:44-46",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/orphan-file-cleanup.js and test/async-file-filter-orphan.js already cover abort/orphan cleanup, test/disk-storage.js and test/error-handling.js cover the disk engine; the fix adds four new mocha files under test/ (abort-fd-leak, abort-unlink-after-close, abort-destroyed-stream-callback, pending-writes), none of which exist at the pinned commit."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/make-middleware.js, lib/multer-error.js, storage/disk.js",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Destroy the write stream right before fs.unlink in _removeFile (and make the destroyed guard call cb) without waiting for 'close', and/or reach for file.stream in cleanup - which still unlinks while the descriptor closes, and file.stream is non-enumerable so it never survives the {...file, ...info} copy."
+  },
+  "out_of_scope_notes": [
+    "The pinned tree already carries abort-cleanup tests citing a different advisory (test/orphan-file-cleanup.js:12, GHSA-3p4h-7m6x-2hcm); used only as context for what the project considers this protection to cover, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell in this session); the source is four JS files in lib/ and storage/ plus doc/ translations, well under 5 MB, so tiny_repo is asserted from reading the tree.",
+    "node_modules is absent from the pinned tree, so busboy/concat-stream internals were not read: the memory-engine consequence (concat callback never fires when the source is destroyed, because pipe does not propagate destroy) is inferred from that well-known pipe/pipeline rule rather than observed.",
+    "Whether the fixed pipeline callback fires before or after the fs.WriteStream 'close' was not verified on a running Node, so the WeakMap-keyed-on-file vs {...file, ...info} copy concern is described in O7/O5 rather than claimed as a residual fd leak.",
+    "Latest release code is not available (input says none), so every present_in_latest is unknown."
+  ]
+}

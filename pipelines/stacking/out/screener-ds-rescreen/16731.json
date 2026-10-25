@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "16731", "advisory_ids": ["GHSA-8R6W-3QQ5-4P4R", "CVE-2026-54593", "GO-2026-6120"], "repo": "pterodactyl/panel", "pinned_commit": "3cabff156ec7fa32b1f73f8825b4c9c0481fab88", "fix_commits": ["7ffcd636310bb72b54bac3280d2a15e727feded7"],
+  "trust_decision": {
+    "summary": "Which Wings operation a Panel-issued JWT may authorise is decided at mint time: each call site declares an intent scope via setScopes() and NodeJWTService::handle() is the single place that signs the token and must refuse to sign without one. At the pinned commit handle() writes no scope claim at all, so every token minted for any route has the same shape and any node-signed token is accepted by any Wings endpoint, letting a token obtained for the websocket (needing only websocket.connect) be replayed against Wings' file-upload endpoint and bypassing the panel's file.create check.",
+    "evidence": [
+      "app/Services/Nodes/NodeJWTService.php:63-101",
+      "app/Services/Nodes/NodeJWTService.php:84-97",
+      "app/Http/Controllers/Api/Client/Servers/FileUploadController.php:42-46",
+      "app/Http/Controllers/Api/Client/Servers/WebsocketController.php:36-62",
+      "app/Http/Requests/Api/Client/Servers/Files/UploadFileRequest.php:10-13",
+      "routes/api-client.php:97"
+    ]
+  },
+  "landing_point": {"where": "app/Http/Controllers/Api/Client/Servers/FileUploadController.php:40-53", "why": "The report says a subuser can upload files without file.create, so the first place an engineer looks is the handler that mints the upload URL and its permission check."},
+  "fix_sites": [
+    {"where": "app/Services/Nodes/NodeJWTService.php:63-101", "entry_point": "NodeJWTService::handle() public API, called by all five HTTP entry points below", "module_kind": "service / lower-level API"},
+    {"where": "fix.diff:28-34", "entry_point": "Pterodactyl\\Enum\\JwtScope, new value type consumed by setScopes() at every mint site", "module_kind": "enum / value type"},
+    {"where": "app/Services/Backups/DownloadLinkService.php:30-37", "entry_point": "GET /api/client/servers/{server}/backups/{backup}/download", "module_kind": "service layer"},
+    {"where": "app/Http/Controllers/Api/Client/Servers/FileUploadController.php:42-46", "entry_point": "GET /api/client/servers/{server}/files/upload", "module_kind": "client API controller"},
+    {"where": "app/Http/Controllers/Api/Client/Servers/WebsocketController.php:55-62", "entry_point": "GET /api/client/servers/{server}/websocket", "module_kind": "client API controller"},
+    {"where": "app/Http/Controllers/Api/Client/Servers/FileController.php:79-86", "entry_point": "GET /api/client/servers/{server}/files/download", "module_kind": "client API controller"},
+    {"where": "app/Http/Controllers/Admin/Servers/ServerTransferController.php:78-84", "entry_point": "POST /admin/servers/view/{server}/manage/transfer", "module_kind": "admin controller"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "app/Services/Nodes/NodeJWTService.php:63-101"},
+  "O3_reason_to_dismiss": "The backup-download and admin-transfer tokens are minted for a different feature and a different actor than the reported subuser upload, and the shared handle() method can be argued to need no fail-closed guard because all of its callers were already updated.",
+  "O4_distance": {"files": 6, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A subuser holding only websocket.connect (no file.create) must still get a working websocket token, and during a server transfer that token is minted for transfer->newNode and must keep carrying the permissions claim; a fix that re-checks file.create on the websocket route, binds the token to $server->node, or drops the permissions claim breaks console access and transfer-log viewing.", "where": "app/Http/Controllers/Api/Client/Servers/WebsocketController.php:36-62"},
+  "O6_input_shapes": [
+    "zero scopes: handle() must raise instead of signing an unscoped token",
+    "one scope: setScopes(JwtScope::FileUpload)",
+    "several scopes in one token: variadic setScopes joined into a single space-delimited 'scope' claim",
+    "user-bound token (setUser, user_uuid claim) vs subject-only token with no user (admin transfer)",
+    "legacy third argument $algo (implicit md5, explicit 'sha256' from the admin controller) normalised to sha256 with the parameter removed"
+  ],
+  "O7_producer": {"kind": "handler", "where": "app/Services/Nodes/NodeJWTService.php:84-101", "check_calls_producer": true},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "app/Http/Controllers/Api/Client/Servers/BackupController.php:167-185", "sibling": "a backup restore/upload link that mints its own Wings token", "why_realistic": "restore already drives Wings (app/Http/Controllers/Api/Client/Servers/BackupController.php:198); a maintainer adding a Wings-side restore or upload URL would mint a second token here rather than reuse DownloadLinkService."},
+    {"where": "app/Console/Commands/Server/BulkPowerActionCommand.php:72", "sibling": "a CLI command that mints a scoped one-time token for Wings instead of using the node key", "why_realistic": "the command already speaks to Wings; a maintainer adding console/websocket access from the CLI would reuse NodeJWTService and be the sixth, easily missed call site."},
+    {"where": "app/Http/Controllers/Api/Application/Servers/ServerManagementController.php:55", "sibling": "an application-API server build/transfer action that mints a Wings token", "why_realistic": "the admin and application APIs both act on servers; a maintainer exposing transfer or reinstall through the application API would mint the token in that package, far from the client API where the report points."}
+  ],
+  "O9_family": "improper authorisation through unscoped security-token assignment (CWE-1259 / CWE-1270): a bearer token minted for one protected sink is accepted by every other sink using the node key",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "PHP",
+    "toolchain": "PHP ^8.2 || ^8.3, Composer v2, Laravel 11, lcobucci/jwt ^5.6, webmozart/assert",
+    "services": ["MySQL or MariaDB (integration tests need a database whose name contains 'test')"],
+    "offline_after_build": true,
+    "project_tests": "PHPUnit 10.5; tests/Integration/Api/Client/Server/WebsocketControllerTest.php asserts the JWT claims at the pinned commit (user_id at line 89, server_uuid, permissions) but no scope; there is no test for the upload/download/transfer token sites and no NodeJWTService unit test (tests/Integration/Services/Backups only has DeleteBackupServiceTest.php)."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": ["regression_tests_in_pinned_commit"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "app/Services/Nodes/NodeJWTService.php, app/Http/Controllers/Api/Client/Servers/WebsocketController.php, app/Http/Controllers/Api/Client/Servers/FileController.php, app/Http/Controllers/Api/Client/Servers/FileUploadController.php, app/Services/Backups/DownloadLinkService.php, app/Http/Controllers/Admin/Servers/ServerTransferController.php, app/Enum/JwtScope.php (new)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Re-check file.create in the upload handler (or refuse upload tokens in WebsocketController) and stop, treating it as a missing per-route permission check rather than a missing scope claim on every token."
+  },
+  "out_of_scope_notes": [
+    "The scope claim is consumed by Wings (pterodactyl/wings, a separate Go repository, GO-2026-6120); that enforcement code is not in this tree and was not examined."
+  ],
+  "unverified": [
+    "Repository size in MB (no shell available in this session; repo_mb left null).",
+    "Whether Wings rejects an unscoped token for every endpoint, i.e. the exact consumption side of the claim, cannot be checked from this repository.",
+    "Which route the reported subuser actually reused (websocket vs file-download token) is not stated in the advisory text available here.",
+    "Build and test run were not executed (read-only screen); O10 is derived from composer.json, phpunit.xml, bootstrap/tests.php, .env.ci and .github/workflows/ci.yaml.",
+    "The published fix leaves NodeJWTService::$scopes uninitialised, so a caller that omits setScopes() raises a PHP typed-property Error rather than the Assert exception the CHANGELOG promises; noted but not scored."
+  ]
+}

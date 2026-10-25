@@ -1,0 +1,123 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "15145",
+  "advisory_ids": ["GHSA-27C6-WP53-387X", "CVE-2026-58167", "GO-2026-6638"],
+  "repo": "ccfos/nightingale",
+  "pinned_commit": "4d4124b863e200009b7eedae0b1c2a583c2ae8d8",
+  "fix_commits": ["762819fbaa2350b73bce45bfaf6f8cf74b4abef8"],
+  "trust_decision": {
+    "summary": "Datasource credentials must not reach non-admin users; the decision is made in the HTTP handlers datasourceList and datasourceBriefs, which call models.Datasource.RedactSecrets on every returned object (list: only when !user.IsAdmin(), after DatasourceFilter; brief: unconditionally, then the plugin-specific whitelisted settings are put back).",
+    "evidence": [
+      "center/router/router_datasource.go:47-50",
+      "center/router/router_datasource.go:96-122",
+      "fix.diff:14-22",
+      "fix.diff:36-62",
+      "fix.diff:87-104"
+    ]
+  },
+  "landing_point": {
+    "where": "center/router/router_datasource.go:49-50",
+    "why": "The report is 'datasource list leaks credentials to low-privilege users'; datasourceList renders every datasource object straight from the DB (GetDatasourcesGetsBy) to any token holder through POST /api/n9e/datasource/list (router.go:501), so that is the first place an engineer reads."
+  },
+  "fix_sites": [
+    {
+      "where": "center/router/router_datasource.go:47-50",
+      "entry_point": "POST /api/n9e/datasource/list (rt.auth(), rt.user(); center/router/router.go:501)",
+      "module_kind": "http handler"
+    },
+    {
+      "where": "center/router/router_datasource.go:96-122",
+      "entry_point": "GET /api/n9e/datasource/brief (unauthenticated branch center/router/router.go:228 when AnonymousAccess.PromQuerier, authenticated branch center/router/router.go:255)",
+      "module_kind": "http handler"
+    },
+    {
+      "where": "models/datasource.go:557-565",
+      "entry_point": "models.Datasource.RedactSecrets (new model method, invoked from both handlers above); ClearPlaintext kept unchanged",
+      "module_kind": "model / lower-level API"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "models/datasource.go:491-516"
+  },
+  "O3_reason_to_dismiss": "ClearPlaintext in models already advertises itself as 'clearing sensitive fields', is called right after Encrypt on the edge-sync save path, and blanks Settings/SettingsJson and the basic-auth password, so a solver can argue that reusing or extending it inside the handlers is the whole fix and that the encoded blobs (SettingsEncoded/AuthEncoded) and edge-sync reload via Decrypt (models/datasource.go:519-555) are another layer's problem and outside the report.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "datasourceBriefs must keep the whitelisted, non-secret settings the datasource picker reads: keys starting with 'prometheus.' re-emitted with the prefix stripped, cloudwatch keys containing 'region', and HTTPJson.Url/Urls. A blanket 'SettingsJson = nil for every plugin type' or clearing HTTPJson wholesale breaks the UI's datasource chooser and its default query settings (the fix carries a comment saying Url/Urls must stay).",
+    "where": "center/router/router_datasource.go:96-114"
+  },
+  "O6_input_shapes": [
+    "settings map (SettingsJson) including plugin-specific credential keys such as prometheus.basic / prometheus.headers",
+    "settings_encoded (RSA blob that is serialized even when SettingsJson is nil)",
+    "http.headers map (bearer tokens / API keys)",
+    "http.tls client key, client key password and certs",
+    "auth object (basic_auth_user, basic_auth_password)",
+    "auth_encoded (RSA blob)",
+    "plugin-type-specific whitelists (prometheus prefix, cloudwatch region) that must survive redaction"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "models/datasource.go:449-488",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "center/router/router_datasource.go:384-394",
+      "sibling": "A datasource-detail endpoint reachable by rt.user() instead of rt.admin() that renders the full models.Datasource.",
+      "why_realistic": "datasourceGet already renders the whole object from the DB (req.Get + Render(c, req, err)); a maintainer adding a read-only 'detail' view for dashboard viewers would just relax the admin middleware, and the redaction added in this fix would not be on that path."
+    },
+    {
+      "where": "center/router/router_datasource.go:53-64",
+      "sibling": "A second listing handler (the service/edge-sync variant) that renders []*models.Datasource with only Encrypt applied.",
+      "why_realistic": "It is the same GetDatasourcesGetsBy + render shape twenty lines above the fixed handler, so a maintainer copy-pasting a new listing route (or fixing only the user-facing one) is very plausible."
+    },
+    {
+      "where": "aiagent/tools/datasource.go:82-123",
+      "sibling": "An AI/MCP tool that hand-projects datasource fields and starts including settings/http/auth in the projection.",
+      "why_realistic": "getDatasourceDetail builds datasourceDetailResult field by field with no reference to RedactSecrets; adding 'settings' so the model can debug a datasource is a natural, plausible commit."
+    },
+    {
+      "where": "models/datasource.go:24-51",
+      "sibling": "A new credential-bearing field on the Datasource struct that RedactSecrets is not taught to clear.",
+      "why_realistic": "RedactSecrets is a manual field-by-field method next to a struct with two parallel representations (raw JSON strings, decoded maps, RSA-encoded blobs); any new auth field (bearer token, client secret) defaults to being serialized."
+    }
+  ],
+  "O9_family": "CWE-862 missing authorization / exposure of datasource credentials to non-admin (broken access control); information exposure",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 (go.mod:3); standard go build/test; no vendor dir, so module download is needed once",
+    "services": [
+      "none for unit tests: in-memory sqlite is already used (models/alert_mute_test.go:15-21, gorm.io/driver/sqlite at go.mod:67)",
+      "MySQL or PostgreSQL plus Redis only to run the full server"
+    ],
+    "offline_after_build": true,
+    "project_tests": "No test for datasource listing/redaction at the pinned commit; nearest harnesses are the sqlite in-memory models tests (models/alert_mute_test.go:15-21) and the gin handler tests in center/router (center/router/router_notify_channel_test.go:8-17)."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "center/router/router_datasource.go, models/datasource.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Clear only the fields the report names (SettingsJson and the basic-auth password) in the two handlers, or simply call/strengthen models.ClearPlaintext, leaving HTTPJson.Headers, the TLS client key and key password, and SettingsEncoded/AuthEncoded in the response."
+  },
+  "out_of_scope_notes": [
+    "GET /v1/n9e/datasources (center/router/router_datasource.go:53-64) renders the same datasource objects with only Encrypt applied, so it returns plaintext settings/auth whenever OpenRSA is off; it is the service/edge-sync API behind its own basic-auth config (center/router/router.go:714-718), not a low-privilege user route, so it is outside the advisory's property and was not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB (no shell available in this session), so tiny_repo/giant_repo could not be assessed; file count is large (~1170 files), so it is unlikely to be tiny.",
+    "Latest released code was not available ('none' given), so present_in_latest / latest_where are not filled (O8 is empty).",
+    "Whether real prometheus datasources store credentials under settings keys (datasource/prom/prom.go:5-8 shows prometheus.basic.prometheus.user/password) — if so, the fixed datasourceBriefs still re-emits them, because the fix copies every 'prometheus.'-prefixed key back into SettingsJson after RedactSecrets (fix.diff:36-45). Not verified against real data; hidden tests should not assert on this without checking.",
+    "Whether APIForService.Enable is on by default (config-dependent), which is what would make the service listing route reachable in a default deployment."
+  ]
+}

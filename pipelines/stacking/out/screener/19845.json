@@ -1,0 +1,100 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "19845",
+  "advisory_ids": ["GHSA-XG4H-6GFC-H4M8", "BIT-ETCD-2026-73499", "CVE-2026-73499", "GO-2026-6114"],
+  "repo": "etcd-io/etcd",
+  "pinned_commit": "157aa183f6c25e7360b7eb0ec9c75bd6565ff95a",
+  "fix_commits": [
+    "afeaa624da19085b47fb5ccc7c22a8c421bc2eae",
+    "e863b001bbf3367003a543aa3099db9892134cd7",
+    "6643f80602461a6095c9b294b6512fd9719bef41"
+  ],
+  "trust_decision": {
+    "summary": "On Watch create the server decides whether the caller may observe the range [Key, RangeEnd) by calling authStore.IsRangePermitted (server/etcdserver/api/v3rpc/watch.go:296 via :246), which classifies len(rangeEnd)==0 as an exact-key point query (server/auth/range_perm_cache.go:124) and otherwise requires the user's permission interval to contain the requested interval (:73-95); at the pinned commit the handler rewrote the open-ended 0x00 sentinel into []byte{} (:270-278) before that call, so an open-ended '>= key' watch was authorized as a point read.",
+    "evidence": [
+      "server/etcdserver/api/v3rpc/watch.go:246",
+      "server/etcdserver/api/v3rpc/watch.go:270-278",
+      "server/etcdserver/api/v3rpc/watch.go:296",
+      "server/auth/range_perm_cache.go:124",
+      "server/auth/range_perm_cache.go:73-95"
+    ]
+  },
+  "landing_point": {
+    "where": "server/etcdserver/api/v3rpc/watch.go:270-296",
+    "why": "The advisory summary names the Watch API and the open-ended '>= key' request; this is the only place where a WatchCreateRequest's RangeEnd is rewritten and then handed to the permission check, which is exactly the region the fix reorders."
+  },
+  "fix_sites": [
+    {
+      "where": "server/etcdserver/api/v3rpc/watch.go:270-278",
+      "entry_point": "etcdserverpb.Watch/Watch bidirectional gRPC RPC, WatchCreateRequest (registered at server/etcdserver/api/v3rpc/grpc.go:81)",
+      "module_kind": "grpc_handler"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "The nearest sibling, the gRPC proxy's own watch permission check (server/proxy/grpcproxy/watch.go:213), lives in a separate binary/package and probes with a Range RPC instead of the auth store, so a solver can plausibly call it out of the advisory's scope; likewise an explicitly-present zero-length range_end is undocumented, which makes the Range route (server/etcdserver/v3_server.go:146) dismissible as an unsupported input shape.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A watch from a key by a user whose READ grant covers the open-ended range must keep working; mvcc distinguishes nil (single key, server/storage/mvcc/watcher_group.go:169) from []byte{} (>= key, :175), so the []byte{}/nil rewrite must remain in the handler for the watchStream.Watch call (server/etcdserver/api/v3rpc/watch.go:339) after the permission check. Deleting the rewrite instead of moving it silently turns a legitimately authorized WithFromKey watch into a single-key watch.",
+    "where": "server/etcdserver/api/v3rpc/watch.go:270-278"
+  },
+  "O6_input_shapes": [
+    "range_end absent (nil): exact-key watch, point-query authorization",
+    "range_end == []byte{0x00} (clientv3.WithFromKey): open-ended [key, +inf), interval-containment authorization",
+    "range_end present with zero length ([]byte{}): must be treated as absent, i.e. point-query authorization",
+    "range_end any other non-empty value (WithPrefix / bounded range): interval-containment authorization"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "server/etcdserver/api/v3rpc/watch.go:270-278 (recvLoop produces the nil/[]byte{} form consumed by watchStream.Watch at :339)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "server/proxy/grpcproxy/watch.go:213-229",
+      "sibling": "A second watch front-end that normalizes cr.RangeEnd (for example turns the 0x00 open-ended sentinel into []byte{}, mirroring recvLoop) before issuing its permission-probe Range RPC at :252.",
+      "why_realistic": "The proxy already re-implements watch authorization independently of v3rpc and already rewrites key/rangeEnd for the empty-key case at :214-219; a maintainer fixing the same class of bug here would naturally reuse the v3rpc normalization, and the check would then run on the translated value exactly as in the original bug."
+    },
+    {
+      "where": "server/etcdserver/api/v3rpc/key.go:48-60",
+      "sibling": "A KV Range handler that normalizes RangeEnd with txn.mkGteRange (server/etcdserver/txn/delete.go:63-68) before EtcdServer.Range's auth check (server/etcdserver/v3_server.go:146).",
+      "why_realistic": "RangeEnd sentinel translation already exists in two layers (server/etcdserver/api/v3rpc/watch.go:275-278 and server/etcdserver/txn/delete.go:63-68), so a third normalization inside the KV handler is a plausible refactor that would reorder normalization ahead of authorization."
+    },
+    {
+      "where": "server/auth/range_perm_cache.go:110-129",
+      "sibling": "A cached or merged permission lookup that stores/keys permissions by an already-translated rangeEnd, so the point-vs-interval decision at :124 is made from the post-normalization value.",
+      "why_realistic": "getMergedPerms already normalizes a grant's range_end at :43-51 and the comment block at :162-187 codifies the sentinel rules; caching on the translated representation is a natural optimization a maintainer could add there."
+    }
+  ],
+  "O9_family": "authorization bypass / incorrect authorization (CWE-863): point-vs-interval misclassification in the RBAC range check",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26, toolchain go1.26.5 (go.mod:3-5); multi-module workspace with local replace directives (go.mod:7-17)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/e2e/watch_test.go:581 TestWatchWithLowPermissionUser (a failing reproducer is already present at the pinned commit); server/auth/range_perm_cache_test.go; server/auth/store_test.go; tests/integration/v3_grpc_test.go"
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["regression_tests_in_pinned_commit", "single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "server/etcdserver/api/v3rpc/watch.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Change the classification in isRangeOpPermitted/checkKeyPoint (or delete the nil/[]byte{} rewrite outright) instead of reordering the handler, which either turns every exact-key read into an open-ended containment check or downgrades legitimate WithFromKey watches to single-key watches."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "Repository size in MB could not be measured without shell access (repo_mb left null); etcd is plainly well above 5 MB of source",
+    "Whether an explicitly encoded zero-length range_end can reach a Go handler as a non-nil []byte{} depends on the protobuf runtime, which is not vendored in this tree. If it can, the Range/RangeStream/Txn range routes (server/etcdserver/v3_server.go:146,183; server/etcdserver/apply/auth.go:97,130,148) would check it as a point (server/auth/range_perm_cache.go:124) while mvcc executes it as open-ended (server/storage/mvcc/index.go:95-107), which is the same class of bug on a different sink; the documented wire sentinel '\\0' (api/etcdserverpb/rpc.pb.go:2103-2108, api/etcdserverpb/rpc.proto:777-782) is checked correctly on those routes, so this is recorded as an adjacent observation, not as an O8 route",
+    "Go module cache state for an offline build was not inspected; go.sum pins are present but dependency availability was not checked"
+  ]
+}

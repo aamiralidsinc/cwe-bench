@@ -1,0 +1,121 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17882",
+  "advisory_ids": ["GHSA-HGPF-8634-G44C", "BIT-SEAWEEDFS-2026-55873", "CVE-2026-55873", "GO-2026-6329"],
+  "repo": "seaweedfs/seaweedfs",
+  "pinned_commit": "b56d155b315777dab97caea4380528ace087b529",
+  "fix_commits": ["b13463880c1fa62e255c058a9228b63cc95b4b36"],
+  "trust_decision": {
+    "summary": "CheckPermissionWithContext decides whether a principal may act on a table bucket, via checkPermission's chain principal==admin -> principal==owner -> hasIdentityPermission -> resource-policy statements -> DefaultAllow fallback; the principal is minted by getAccountID (reflection over the identity struct) and DefaultAllow is whatever bool each handler hands in.",
+    "evidence": [
+      "weed/s3api/s3tables/permissions.go:94-107",
+      "weed/s3api/s3tables/permissions.go:110-186",
+      "weed/s3api/s3tables/handler.go:178-235",
+      "weed/s3api/s3tables/handler_bucket_get_list_delete.go:100-109",
+      "weed/s3api/s3tables/manager.go:22-27"
+    ]
+  },
+  "landing_point": {
+    "where": "weed/s3api/s3tables/handler_bucket_get_list_delete.go:93-109",
+    "why": "The summary names enumeration of administrator-owned table buckets through the S3Tables/Iceberg management API, so the first stop is the ListTableBuckets handler and the CheckPermissionWithContext gate that is supposed to scope it."
+  },
+  "fix_sites": [
+    {"where": "weed/s3api/iceberg/server.go:47-55", "entry_point": "Iceberg REST catalog routes /v1/namespaces and /v1/{prefix}/namespaces/{namespace}/tables (weed/s3api/iceberg/server.go:88-113) -> Server.tablesManager.Execute", "module_kind": "HTTP route in a separate server package"},
+    {"where": "weed/s3api/s3tables/handler.go:50-52", "entry_point": "every S3Tables operation via S3TablesHandler.HandleRequest X-Amz-Target dispatch (handler.go:88-169); the new trusted field and its SetTrusted setter are inserted after SetDefaultAllow (handler.go:78-80)", "module_kind": "shared handler struct"},
+    {"where": "weed/s3api/s3tables/handler.go:208-219", "entry_point": "getAccountID, called by every s3tables handler and by the Manager path for Iceberg/shell callers", "module_kind": "shared handler helper (identity-to-principal mapper)"},
+    {"where": "weed/s3api/s3tables/handler_bucket_create.go:54-57", "entry_point": "CreateTableBucket (POST / with X-Amz-Target S3Tables.CreateTableBucket; PUT /buckets)", "module_kind": "HTTP handler"},
+    {"where": "weed/s3api/s3tables/handler_bucket_get_list_delete.go:72-76", "entry_point": "GetTableBucket (GET /buckets/{arn}); per-bucket listing check at :200-204; DeleteTableBucket at :303-307", "module_kind": "HTTP handler"},
+    {"where": "weed/s3api/s3tables/handler_namespace.go:116-122", "entry_point": "CreateNamespace / GetNamespace / ListNamespaces / DeleteNamespace (PUT,GET,DELETE /namespaces/{arn}...)", "module_kind": "HTTP handler"},
+    {"where": "weed/s3api/s3tables/handler_policy.go:94-98", "entry_point": "Put/Get/DeleteTableBucketPolicy, Put/Get/DeleteTablePolicy, TagResource, ListTagsForResource, UntagResource (REST /buckets/{arn}/policy, /tables/.../policy, /tag/{arn})", "module_kind": "HTTP handler"},
+    {"where": "weed/s3api/s3tables/handler_table.go:138-157", "entry_point": "CreateTable / GetTable / ListTables / DeleteTable / UpdateTable (PUT,GET,DELETE /tables/{arn}..., Iceberg REST table routes via Manager)", "module_kind": "HTTP handler"},
+    {"where": "weed/s3api/s3tables/iam.go:51", "entry_point": "the new defaultAllowFor helper is inserted at the isAnonymousIdentity definition (fix.diff:427-443) and consumed by all s3tables handlers, replacing the raw h.defaultAllow bool", "module_kind": "shared library helper"},
+    {"where": "weed/s3api/s3tables/manager.go:40-42", "entry_point": "SetTrusted is inserted after Manager.SetDefaultAllow (fix.diff:451-459) and reached through Manager.Execute (manager.go:45-63) by shell, admin dash, weed mini and the Iceberg catalog", "module_kind": "public library API / wrapper"},
+    {"where": "weed/s3api/s3tables/permissions.go:188-216", "entry_point": "hasIdentityPermission, restructured so the admin markers move into the new hasAdminAction (fix.diff:593-607), consumed by CheckPermissionWithContext for every operation", "module_kind": "shared library (policy evaluation)"},
+    {"where": "weed/shell/s3tables_helpers.go:30-32", "entry_point": "weed shell commands s3tables.bucket, s3tables.namespace, s3tables.table, s3tables.tag", "module_kind": "CLI"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "weed/s3api/iceberg/server.go:47-55 (Manager composed in the Iceberg catalog package, with NewManager defaulting SetDefaultAllow(true) at weed/s3api/s3tables/manager.go:22-27)"
+  },
+  "O3_reason_to_dismiss": "The Iceberg REST catalog is a separate, optional service with its own auth middleware that already forwards the authenticated identity name to the same handler, so an engineer can argue it is a different API surface and needs no change of its own.",
+  "O4_distance": {"files": 11, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "weed shell s3tables.* talks to the filer directly with no S3 auth and passes only an arbitrary -account name, so making the Manager/handler deny unless an explicit permission exists breaks every shell table command; the published fix has to re-open it with SetTrusted(true). The zero-config gateway (IAM not configured) and anonymous access must likewise stay on the open default.",
+    "where": "weed/shell/s3tables_helpers.go:26-34; weed/s3api/s3api_tables.go:67-78"
+  },
+  "O6_input_shapes": [
+    "principal from a full identity struct in request context (S3 route) vs identity name only in context (Manager/Iceberg route, no struct) vs no identity at all (zero-config) vs an explicitly anonymous identity",
+    "identity with Account.Id == admin but no admin action (must fall back to the identity's own name) vs an identity carrying Admin/s3:*/s3tables:* (must stay admin)",
+    "principal source order: JWT claims sub then preferred_username, then Account.Id, then identity name, then the X-Amz-Account-Id header",
+    "same operation delivered over three transports: X-Amz-Target RPC, REST-style S3Tables paths, and Iceberg REST catalog paths",
+    "table bucket with no policy vs with a bucket policy (default-allow only applies when resourcePolicy is empty)",
+    "inline identity actions vs empty actions with IAM policy names / session token (IAM path) vs neither"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "weed/s3api/s3tables/handler.go:178-235 (getAccountID)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Plain S3 ListBuckets (GET /) enumerates every directory under /buckets, which includes administrator-owned table buckets, passing each through the S3 ACL ownership check rather than the s3tables owner check.",
+      "where": "weed/s3api/s3api_bucket_handlers.go:36-101",
+      "reason_to_dismiss": "ListBuckets is the ordinary S3 bucket API, not the S3Tables/Iceberg management API; table buckets are not S3 buckets and are already filtered by S3 ownership plus VerifyActionPermission, so the advisory's scope does not cover it.",
+      "distance": "different package (weed/s3api) outside the s3tables handler, reached by a different router",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "weed/s3api/s3tables/manager.go:45-63",
+      "sibling": "A second Manager.Execute caller that builds a synthetic request with only the identity name (e.g. an admin API client or a maintenance job) and inherits NewManager's open default.",
+      "why_realistic": "Manager is already constructed this way in three places (shell, admin dash, weed mini), so one more caller that forgets SetTrusted/SetDefaultAllow is a natural maintainer mistake."
+    },
+    {
+      "where": "weed/s3api/s3tables/handler.go:178-235",
+      "sibling": "Another identity field read by reflection (e.g. a new PrincipalArn or token claim) added to getAccountID without updating the admin-collapse rule, or an extra account field consulted before Claims.",
+      "why_realistic": "getAccountID already reflects over four different identity shapes and its own comment warns that refactorers must keep the reflection in sync."
+    },
+    {
+      "where": "weed/s3api/iceberg/server.go:46-55",
+      "sibling": "A second catalog front-end (another transport or a reload path) that builds its own s3tables.Manager without mirroring the gateway's DefaultAllow.",
+      "why_realistic": "The Iceberg server itself is exactly that pattern, and the fix wires the setting by hand rather than by construction, so the next front-end repeats the omission."
+    }
+  ],
+  "O9_family": "authorization / access-control bypass: ownership and identity collapse plus an open default-allow fallback (CWE-863)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 (go.mod); no vendor directory, so the module cache must be populated at build time",
+    "services": ["filer gRPC (needed only to exercise the handlers end to end; unit tests substitute an in-memory FilerClient)"],
+    "offline_after_build": true,
+    "project_tests": "weed/s3api/s3tables/handler_identity_test.go, permissions_test.go, iceberg_layout_test.go, utils_namespace_test.go, weed/s3api/s3api_tables_routing_test.go, s3api_tables_rest_validation_test.go and weed/s3api/iceberg/*_test.go; no Manager test exists at the pinned commit (manager_test.go is added by the fix)"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "weed/s3api/iceberg/server.go, weed/s3api/s3tables/handler.go, handler_bucket_create.go, handler_bucket_get_list_delete.go, handler_namespace.go, handler_policy.go, handler_table.go, iam.go, manager.go, permissions.go, weed/shell/s3tables_helpers.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Tighten or replace the ListTableBuckets permission gate the report points at (or flip the Manager's default-allow to false) and stop, leaving getAccountID's admin-account collapse, the Iceberg catalog's own open default and the shell tooling path untouched."
+  },
+  "out_of_scope_notes": [
+    "weed/admin (dashboard) and weed/worker/tasks/iceberg read /buckets directly, but the admin console has its own admin-session auth and the workers are internal background jobs, so they are outside this advisory's S3-identity scope."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured without shell access; the tree is clearly far above 5 MB of source and far below 1.5 GB, so neither tiny_repo nor giant_repo was flagged.",
+    "The O8 ListBuckets route is only reachable by a non-admin identity that carries a global List action (weed/s3api/auth_credentials.go:1620 returns true when action == List regardless of bucket); whether the hidden tests target that identity shape is unknown.",
+    "No latest-release tree was supplied, so present_in_latest for the O8 route is unknown.",
+    "Regression-test red flag checked by hand: handler_identity_test.go exists at the pinned commit but none of the tests the fix adds (TestGetAccountIDNonAdminDoesNotInheritAdminAccount, TestGetAccountIDAdminActionKeepsAdminAccount, TestDefaultAllowForOnlyAppliesToUnauthenticatedOrAnonymous) are present, and manager_test.go does not exist, so the flag does not hold.",
+    "Build and offline claims come from reading go.mod and the test files only; the project was not built or run."
+  ]
+}

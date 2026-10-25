@@ -1,0 +1,87 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "18348",
+  "advisory_ids": ["GHSA-M8XG-8XG9-MXHM", "CVE-2026-45730", "GO-2026-5499"],
+  "repo": "nuclio/nuclio",
+  "pinned_commit": "a1bbd6084a0d57c259cb4529fddbd2da21e9649e",
+  "fix_commits": ["1915cd26d514dcdd487517d4be56673fc02298e0"],
+  "trust_decision": {
+    "summary": "An OPA permission query decides, per project resource (/projects/<name>) and per action (create/update/delete), whether the caller's member ids from the auth session may write that project; at the pinned commit this decision is only made on read paths (GetAll, getProjectByName, export) and on no project write path at all, so any authenticated user can create/update/delete any project.",
+    "evidence": [
+      "pkg/dashboard/resource/project.go:87-90",
+      "pkg/dashboard/resource/project.go:194-196",
+      "pkg/dashboard/resource/project.go:686-688",
+      "pkg/platform/kube/platform.go:733-738",
+      "pkg/platform/kube/platform.go:779-789",
+      "pkg/platform/abstract/platform.go:2241-2253"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/dashboard/resource/project.go:194",
+    "why": "The summary says project write paths lack authorization; the dashboard project resource is the first place to look, and there Update/deleteProject build PermissionOptions with only OverrideHeaderValue while the read paths in the same file (GetAll at project.go:87-90, getProjectByName at project.go:644-648) already pass MemberIds and RaiseForbidden."
+  },
+  "fix_sites": [
+    {"where": "pkg/dashboard/resource/project.go:194-196", "entry_point": "PUT /api/projects/{id} (ResourceMethodUpdate) and legacy PUT /api/projects -> updateProject -> Update", "module_kind": "http_handler (dashboard resource)"},
+    {"where": "pkg/dashboard/resource/project.go:686-688", "entry_point": "DELETE /api/projects (custom route deleteProject)", "module_kind": "http_handler (dashboard resource)"},
+    {"where": "pkg/platform/kube/platform.go:733-738", "entry_point": "POST /api/projects, POST /api/projects?import=true, nuctl create project, nuctl import project", "module_kind": "platform implementation (kube)"},
+    {"where": "pkg/platform/kube/platform.go:779-789", "entry_point": "PUT /api/projects/{id}, legacy PUT /api/projects (both arrive via the dashboard resource)", "module_kind": "platform implementation (kube)"},
+    {"where": "pkg/platform/kube/platform.go:792-801", "entry_point": "DELETE /api/projects, nuctl delete projects", "module_kind": "platform implementation (kube)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "pkg/platform/local/platform.go:554-605"},
+  "O3_reason_to_dismiss": "The local platform is a single-user dev/CI backend chosen by platform.kind (pkg/platform/factory/factory.go:56-62), so a solver can argue its project write paths never face authenticated multi-user traffic, even though the same file enforces OPA for functions and function events (pkg/platform/local/platform.go:180-189, 416-424, 629-639).",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Project read permissions are populated in OPA only AFTER the project exists (EnsureProjectRead is retried for 10s post-create), and the default OPA client is nop; an over-broad fix that reuses the read/EnsureProjectRead path at create time, or that forbids when MemberIds is empty, denies every first-time project creation and breaks the default no-OPA deployments and internal callers.",
+    "where": "pkg/platform/kube/platform.go:754-764, pkg/platformconfig/platformconfig.go:521-527"
+  },
+  "O6_input_shapes": [
+    "update with the project name in the URL path (PUT /api/projects/{id}) vs in the request body or X-Nuclio-Project-Name header (legacy PUT /api/projects)",
+    "create with an explicit metadata.name vs the create-and-wait path used by project import",
+    "delete with the X-Nuclio-Delete-Project-Strategy header set to cascading, restricted, or unset (default restricted)",
+    "caller with a populated auth session vs nil/empty session (MemberIds resolves to an empty list)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "nuctl delete projects calls Platform.DeleteProject directly; the fix's new check is passed the caller's PermissionOptions and never forces RaiseForbidden, so a false verdict returns (false, nil) and the delete proceeds", "where": "pkg/nuctl/command/delete.go:151-158", "reason_to_dismiss": "nuctl is an operator CLI that runs with cluster credentials, not the multiuser dashboard access path", "distance": "pkg/nuctl/command, two packages from the landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "nuctl create/import projects calls Platform.CreateProject with an empty PermissionOptions and no AuthSession, so the forced RaiseForbidden query has no member ids to authorize", "where": "pkg/nuctl/command/create.go:92-94", "reason_to_dismiss": "project creation from a CLI is assumed to be an operator/admin action outside the per-user permission model", "distance": "pkg/nuctl/command, two packages from the landing point", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "dashboard POST /api/projects?import=true creates the missing project via CreateAndWait with PermissionOptions carrying only OverrideHeaderValue, so the platform-level create check runs with no member ids", "where": "pkg/dashboard/resource/project.go:459-465", "reason_to_dismiss": "import first calls GetProjects with RaiseForbidden, so the caller can argue the project-existence check already authorizes the write", "distance": "same file as the landing point", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/platform/kube/platform.go:779-789", "sibling": "another platform method that queries OPA but forgets to force RaiseForbidden so the verdict is discarded", "why_realistic": "the surrounding platform methods in the same tree (kube/platform.go:1142-1152, 1181-1190) all copy the options and force RaiseForbidden, so a missing force looks like a deliberate pass-through."},
+    {"where": "pkg/dashboard/resource/resource.go:117-124", "sibling": "a dashboard write route that hand-builds PermissionOptions instead of calling the existing newPermissionOptions helper, dropping MemberIds", "why_realistic": "the helper already exists and is used by apigateway.go (five sites) and function.go:743, so an inlined struct with a missing field is an easy, plausible maintainer slip."},
+    {"where": "pkg/platform/local/platform.go:554-605", "sibling": "the same project write guard added to the local platform's CreateProject/UpdateProject/DeleteProject", "why_realistic": "the file already performs OPA checks in exactly this style for functions, redeploy and function events, so a maintainer mirroring them onto projects is natural."}
+  ],
+  "O9_family": "missing authorization on write paths (CWE-862, broken access control / A01)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.3 (go.mod:3); unit tests require -tags=test_unit (Makefile:770)",
+    "services": ["none for unit tests: fake kube clientset and opaclient.MockClient are used"],
+    "offline_after_build": true,
+    "project_tests": "pkg/dashboard/test/server_test.go projectTestSuite (create/update/delete/import, mock platform), pkg/platform/kube/platform_test.go ProjectKubePlatformTestSuite (mocked OPA client), pkg/nuctl/test/project_test.go"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/dashboard/resource/project.go, pkg/platform/kube/platform.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "add MemberIds and RaiseForbidden to the two dashboard PermissionOptions blocks (Update, deleteProject) and stop there, leaving the platform layer, the nuctl callers and the local platform untouched."
+  },
+  "out_of_scope_notes": [
+    "The leader/follower project-forwarding wrapper (pkg/platform/abstract/project/external/client.go:94-140) was read only to confirm those requests re-enter the same dashboard resource; nothing outside this advisory's project write protection was pursued."
+  ],
+  "unverified": [
+    "opa-client v0.0.1 (go.mod:43) could not be read offline, so whether a QueryPermissions call with an empty MemberIds list allows or denies is unverified; that decides whether the import/nuctl create routes are holes or just unaudited.",
+    "repo size in MB was not measured (no shell available); the tree is clearly above 5 MB and well below 1.5 GB.",
+    "Buildability was not executed (no shell); the assessment is from go.mod, the Makefile test targets and the existing mocked unit tests.",
+    "The latest release code was not available, so every present_in_latest is unknown.",
+    "The fix modifies two pre-existing tests (pkg/dashboard/test/server_test.go:2029, pkg/platform/kube/platform_test.go:172) only to satisfy new mock expectations; they do not encode the security property at the pinned commit."
+  ]
+}

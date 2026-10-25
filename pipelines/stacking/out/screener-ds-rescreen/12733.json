@@ -1,0 +1,125 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "12733",
+  "advisory_ids": ["GHSA-MWWR-P57H-56PF", "CVE-2026-61788"],
+  "repo": "bytebase/dbhub",
+  "pinned_commit": "d65c6b424e9d10678fb6f7dda93fba180d7baff9",
+  "fix_commits": ["872bb338f7d31f6afe517a076ac3e3edafaaaf08"],
+  "trust_decision": {
+    "summary": "Read-only mode is decided twice: per request at the MCP tool gate, where execute_sql splits the batch on ';' and asks isReadOnlySQL about each statement, and (after this fix) per execution inside each connector's executeSQL, where the database engine itself must reject the write. At the pinned commit the second decision does not exist, so a statement the keyword classifier mis-parses reaches the engine and is executed.",
+    "evidence": [
+      "src/tools/execute-sql.ts:59",
+      "src/tools/execute-sql.ts:26-29",
+      "src/utils/allowed-keywords.ts:75",
+      "src/connectors/interface.ts:62-71",
+      "src/connectors/postgres/index.ts:598",
+      "src/connectors/postgres/index.ts:612-627"
+    ]
+  },
+  "landing_point": {
+    "where": "src/tools/execute-sql.ts:59",
+    "why": "The advisory summary names read-only mode, and this is the only read-only gate applied to user SQL; an engineer starts here, then follows it into isReadOnlySQL in src/utils/allowed-keywords.ts."
+  },
+  "fix_sites": [
+    {"where": "src/connectors/manager.ts:245", "entry_point": "ConnectorManager.addConnector (CLI/TOML startup connect)", "module_kind": "config_wiring"},
+    {"where": "src/connectors/mysql/index.ts:606", "entry_point": "MCP execute_sql tool / custom tool handler", "module_kind": "connector_implementation"},
+    {"where": "src/connectors/mariadb/index.ts:593", "entry_point": "MCP execute_sql tool / custom tool handler", "module_kind": "connector_implementation (second implementation of mysql/index.ts)"},
+    {"where": "src/connectors/postgres/index.ts:608", "entry_point": "MCP execute_sql tool (single statement)", "module_kind": "connector_implementation"},
+    {"where": "src/connectors/postgres/index.ts:639", "entry_point": "MCP execute_sql tool (multi-statement batch)", "module_kind": "connector_implementation"},
+    {"where": "src/connectors/sqlite/index.ts:451", "entry_point": "MCP execute_sql tool / custom tool handler", "module_kind": "connector_implementation"},
+    {"where": "src/connectors/sqlite/index.ts:545", "entry_point": "MCP execute_sql tool (multi-statement batch, per-statement re-assert)", "module_kind": "connector_implementation"},
+    {"where": "src/utils/allowed-keywords.ts:107", "entry_point": "MCP execute_sql tool + custom tool handler (classifier)", "module_kind": "classifier"},
+    {"where": "src/utils/sql-parser.ts:136", "entry_point": "MCP execute_sql tool + custom tool handler (dialect tokenizer used by stripCommentsAndStrings and splitSQLStatements)", "module_kind": "tokenizer"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "src/connectors/mariadb/index.ts:593"},
+  "O3_reason_to_dismiss": "SQL Server is an optional driver whose engine has no READ ONLY transaction, and the project's own docs call read-only 'a safety net ... not a security boundary' (docs/tools/execute-sql.mdx:129), so the missing engine backstop there can be argued never to have been covered.",
+  "O4_distance": {"files": 7, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A non-read-only tool call on the same shared connection must stay writable after a read-only call (SQLite keeps one `this.db` for every tool, MySQL/MariaDB take one pooled connection per call), and legitimate read-only introspection pragmas must keep passing: sqlite allows the `pragma` keyword (src/utils/allowed-keywords.ts:13), the connector treats `pragma` + table_info/index_info/index_list/foreign_key_list as a read statement (src/connectors/sqlite/index.ts:468-472), and the pinned unit test asserts `PRAGMA table_info(users)` is read-only (src/utils/__tests__/allowed-keywords.test.ts:62-63). An over-broad fix that opens the database read-only, always sets a session read-only flag, or rejects every parenthesised/`=` pragma breaks one of these.",
+    "where": "src/connectors/sqlite/index.ts:451"
+  },
+  "O6_input_shapes": [
+    "single statement vs a ';'-joined multi-statement batch",
+    "SQLite `PRAGMA name = value` and the no-space `PRAGMA name=value`",
+    "SQLite parenthesised setter alias `PRAGMA name(value)` (and `schema.name(...)`) which SQLite treats like `=`",
+    "MySQL/MariaDB `--` followed by a non-space, e.g. `SELECT 1--1;DROP TABLE t` — two minus operators, not a comment",
+    "MySQL/MariaDB `--` followed by whitespace or a control char (0x7F) — a real comment that swallows the rest of the line",
+    "function-based writes that begin with an allowed keyword, e.g. `SELECT setval(pg_get_serial_sequence(...), 1, true)`",
+    "in-batch state toggles: `PRAGMA query_only = OFF; INSERT ...` / `PRAGMA query_only(0)`",
+    "per-dialect difference: `--` is always a comment for postgres/sqlite/sqlserver, conditional for mysql/mariadb",
+    "MySQL conditional comments `/*! ... */` and `/*M! ... */` stay executable text"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "src/connectors/manager.ts:245", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "SQL Server executeSQL has no engine-level backstop at all: a read-only execute_sql tool on a sqlserver source is protected only by the keyword classifier, and the published fix did not touch this connector.",
+      "where": "src/connectors/sqlserver/index.ts:609",
+      "reason_to_dismiss": "T-SQL has no READ ONLY transaction; the connector is an optional driver (mssql) and the fix's own comments scope the backstop to the four dialects it patched, while the docs say read-only is a keyword safety net, not a security boundary.",
+      "distance": "src/tools/execute-sql.ts -> src/connectors/sqlserver/index.ts (separate connector package, untouched by the fix)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Custom tools check `readonly` with isReadOnlySQL over the whole statement and never split on ';', so a stacked `SELECT 1; DROP TABLE t` statement passes the gate for every dialect (the execute_sql gate splits first).",
+      "where": "src/tools/custom-tool-handler.ts:186",
+      "reason_to_dismiss": "The statement is operator-authored TOML configuration, not request input, and its parameters are bound, so the route is 'not attacker controlled'.",
+      "distance": "sibling handler in the same tools package, check re-exported at src/utils/tool-handler-helpers.ts:36",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/connectors/sqlserver/index.ts:609",
+      "sibling": "The same per-execution engine backstop the fix added to the other four connectors (a READ ONLY transaction or an equivalent session guard).",
+      "why_realistic": "The SQL Server connector already implements executeSQL and EXPLAIN translation in the same shape as the postgres/mysql connectors; a maintainer adding a per-tool read-only backstop would naturally add it here too."
+    },
+    {
+      "where": "src/connectors/sqlserver/index.ts:711",
+      "sibling": "A second execution path (explainQuery: SET SHOWPLAN_XML ON, then request.query on the inner statement) that a guard placed in executeSQL would not cover.",
+      "why_realistic": "EXPLAIN is translated into its own private path with its own session handling, so hardening executeSQL alone leaves it out — exactly the shape of a how-type sibling."
+    },
+    {
+      "where": "src/tools/custom-tool-handler.ts:186",
+      "sibling": "Per-statement splitting (areAllStatementsReadOnly, src/tools/execute-sql.ts:26-29) instead of the whole-string isReadOnlySQL.",
+      "why_realistic": "The two read-only gates were written independently; a maintainer fixing the batch bypass would plausibly copy the splitter into the custom-tool handler."
+    },
+    {
+      "where": "src/connectors/postgres/index.ts:175",
+      "sibling": "Connection-level enforcement (default_transaction_read_only, and SQLite's read-only open at src/connectors/sqlite/index.ts:192) duplicating the per-execution route.",
+      "why_realistic": "That wider route already exists at the pinned commit and is the obvious place a maintainer would extend instead of adding a per-call transaction."
+    }
+  ],
+  "O9_family": "CWE-184 / CWE-636 / CWE-863: an incomplete keyword blacklist used as an authorization check for read-only mode, with no fail-safe enforcement below it",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node >=22.5, pnpm 10.17.1, tsup bundler, openapi-typescript, vitest (unit and integration projects)",
+    "services": ["PostgreSQL 15 container", "MySQL container", "MariaDB container", "SQL Server container", "SQLite via node:sqlite (no service)"],
+    "offline_after_build": true,
+    "project_tests": "src/utils/__tests__/allowed-keywords.test.ts and src/utils/__tests__/sql-parser.test.ts pin the classifier/splitter (unit, offline); src/tools/__tests__/execute-sql.test.ts covers the tool gate; src/connectors/__tests__/{sqlite,mysql,mariadb,postgres}.integration.test.ts cover execution, with sqlite on a temp file and the rest via testcontainers."
+  },
+  "O11_fix_minutes": 55,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/connectors/manager.ts, src/connectors/mysql/index.ts, src/connectors/mariadb/index.ts, src/connectors/postgres/index.ts, src/connectors/sqlite/index.ts, src/utils/allowed-keywords.ts, src/utils/sql-parser.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add the missing PRAGMA setter and MySQL `--` patterns to allowed-keywords.ts / sql-parser.ts and stop once the reported payload is rejected."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb could not be measured without shell/size tooling; O4.repo_mb is null",
+    "no released code is available in this environment (latest release: none), so present_in_latest for both O8 routes is unknown",
+    "SQL Server reachability of a write through the classifier was reasoned from code only; no SQL Server instance was run",
+    "the exact count of distinct fix hunks (16 per the candidate metadata) was not reconciled site-by-site; fix_sites lists the 9 source sites I could ground in the pinned tree"
+  ]
+}

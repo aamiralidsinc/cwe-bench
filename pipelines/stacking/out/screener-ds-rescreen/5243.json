@@ -1,0 +1,115 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "5243",
+  "advisory_ids": ["GHSA-QX36-8MW2-4R3X", "CVE-2026-96747"],
+  "repo": "mongodb/mongo-python-driver",
+  "pinned_commit": "1e7a56db4649b14c4c9a6ac20aa4a8d0d1bb238a",
+  "fix_commits": ["44119d0f9dfa0224d84b03be702a6d9a5ef1dea7", "640dd2383a1a2fb1a10e5222d50ebc0b22a61bd7"],
+  "trust_decision": {
+    "summary": "libmongocrypt hands the driver an attacker-influenced KMS endpoint string (master_key['endpoint']) and _EncryptionIO.kms_request passes it to parse_host, which maps any value ending in '.sock' to a Unix-domain-socket address that _create_connection then connects with AF_UNIX; nothing checks that a KMS endpoint is a TCP host[:port], so the connection is decided in _EncryptionIO.kms_request of the sync and async encryption modules.",
+    "evidence": [
+      "pymongo/synchronous/encryption.py:164",
+      "pymongo/synchronous/encryption.py:188",
+      "pymongo/asynchronous/encryption.py:189",
+      "pymongo/uri_parser_shared.py:196-197",
+      "pymongo/pool_shared.py:453-461",
+      "fix.diff:26-27"
+    ]
+  },
+  "landing_point": {
+    "where": "pymongo/synchronous/encryption.py:188",
+    "why": "The summary names a .sock KMS endpoint in client-side field level encryption; pymongo/encryption.py:19 re-exports the synchronous module, and line 188 is the only place where a KMS endpoint string becomes a socket address."
+  },
+  "fix_sites": [
+    {
+      "where": "pymongo/synchronous/encryption.py:188",
+      "entry_point": "ClientEncryption.create_data_key / rewrap_many_data_key / create_encrypted_collection and MongoClient(auto_encryption_opts=...) via the libmongocrypt callback _EncryptionIO.kms_request",
+      "module_kind": "internal libmongocrypt I/O callback inside the synchronous CSFLE module (public ClientEncryption lives in the same file)"
+    },
+    {
+      "where": "pymongo/asynchronous/encryption.py:189",
+      "entry_point": "AsyncClientEncryption.create_data_key / rewrap_many_data_key / create_encrypted_collection and AsyncMongoClient(auto_encryption_opts=...) via the libmongocrypt callback _EncryptionIO.kms_request",
+      "module_kind": "async duplicate implementation of the same module (separate package)"
+    }
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "pymongo/asynchronous/encryption.py:189"
+  },
+  "O3_reason_to_dismiss": "The async module is a full parallel copy of the sync one and the report reproduces the bug through the synchronous ClientEncryption, so AsyncClientEncryption looks like a separate API that the report never touched.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate MongoDB Unix-domain-socket connections must keep working: MongoClient('/tmp/mongodb-27017.sock') and parse_uri('mongodb://%2Ftmp%2Fmongodb-27017.sock') rely on exactly the '.sock' -> AF_UNIX mapping in _create_connection and on parse_host returning the socket path (pinned unit tests at test/test_uri_parser.py:73-81 already assert this). A fix that rejects '.sock' in parse_host, split_hosts or the shared connector instead of at the KMS callback breaks every unix-socket deployment.",
+    "where": "pymongo/pool_shared.py:453-464"
+  },
+  "O6_input_shapes": [
+    "one endpoint string ending in '.sock', relative ('example.sock') or absolute ('/tmp/kms.sock')",
+    "'.sock' host with an explicit port ('example.sock:443'): parse_host splits host/port, so the parsed address still ends in '.sock' and _create_connection still opens AF_UNIX",
+    "case variants ('EXAMPLE.SOCK'): parse_host lowercases non-.sock hosts, so the parsed address ends in '.sock' even though the raw string does not",
+    "the same endpoint on both the sync and the async callback"
+  ],
+  "O7_producer": {
+    "kind": "none",
+    "where": "pymongo/synchronous/encryption.py:164 (endpoint is read straight off libmongocrypt's MongoCryptKmsContext; no in-tree producer, so the value is never normalised or validated in Python)",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "pymongo/encryption_options.py:239",
+      "sibling": "validate a provider-level kms_providers['kmip']['endpoint'] (and aws/gcp 'endpoint') in AutoEncryptionOpts, rejecting '.sock'",
+      "why_realistic": "the provider-level KMIP endpoint already exists and is exercised at test/test_encryption.py:1235, and options construction is the obvious place for a config check"
+    },
+    {
+      "where": "pymongo/encryption_shared.py:192",
+      "sibling": "a shared _validate_kms_endpoint() helper called from _create_mongocrypt_options so sync and async inherit it",
+      "why_realistic": "the sync and async modules are duplicates that already share helpers in encryption_shared.py; factoring the guard in would remove the duplicated line"
+    },
+    {
+      "where": "pymongo/uri_parser_shared.py:196",
+      "sibling": "a strict KMS-only parser next to parse_host that refuses '.sock' (parse_host itself must stay permissive for MongoClient sockets)",
+      "why_realistic": "the '.sock' special case lives in the shared parser, so a maintainer would naturally add the KMS-specific variant there"
+    },
+    {
+      "where": "pymongo/synchronous/encryption.py:724",
+      "sibling": "validate master_key['endpoint'] in create_encrypted_collection before it delegates to create_data_key",
+      "why_realistic": "validating at the public method boundary looks safer than inside the libmongocrypt I/O callback, and create_encrypted_collection is the only public method that forwards a master_key to another entry point"
+    }
+  ],
+  "O9_family": "SSRF / improper input validation: attacker-controlled KMS endpoint forced into a Unix-domain-socket connection (CWE-918, CWE-20)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.9) with optional C extensions",
+    "toolchain": "hatchling build backend plus setuptools (pyproject.toml:2-3); pip/uv install; C compiler needed only for the optional _cbson/_cmessage extensions",
+    "services": ["a MongoDB deployment (mongod/replica set) for the encryption integration tests", "pymongocrypt/libmongocrypt (pip extra 'encryption')", "cloud KMS credentials only for the upstream TestCustomEndpoint class"],
+    "offline_after_build": true,
+    "project_tests": "test/test_encryption.py:TestCustomEndpoint (KMIP cases around test_04_kmip_endpoint_invalid_port at test/test_encryption.py:1291) plus its async mirror test/asynchronous/test_encryption.py:1297; these are integration tests and TestCustomEndpoint.setUp is skipped without AWS/Azure/GCP credentials. The .sock rejection itself raises before any socket is opened, so it is unit-testable offline once pymongocrypt is installed."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": ["regression_tests_in_pinned_commit"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pymongo/synchronous/encryption.py pymongo/asynchronous/encryption.py",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add `if endpoint.endswith('.sock'): raise ConfigurationError(...)` on the raw string at pymongo/synchronous/encryption.py:188 only - it misses 'example.sock:443', 'EXAMPLE.SOCK' and the async duplicate, all of which still reach AF_UNIX through parse_host's lowercasing and host/port split."
+  },
+  "out_of_scope_notes": [
+    "The second fix commit 640dd2383a1a2fb1a10e5222d50ebc0b22a61bd7 is a 4.18.2 release-prep merge that bundles two unrelated fixes: bson/buffer.c signed-integer overflow (PYTHON-5996, still unfixed at the pinned commit, bson/buffer.c:107-120) and per-host percent-decoding in the URI parser (PYTHON-5986, already applied at the pinned commit, pymongo/uri_parser_shared.py:453-468). The candidate metadata's c_fix_sites=7 / c_site_files=6 counts these; neither is this advisory and neither should be scored as its scope.",
+    "The regression_tests_in_pinned_commit flag holds only for the bundled PYTHON-5986 part: test/test_uri_parser.py:90-99 and :687-689 already exist at the pinned commit although the diff adds them. The advisory's own test (test_kmip_endpoint_unix_socket_rejected) and the bson test are absent at the pinned commit.",
+    "Only the CVE-2026-96747 (.sock KMS endpoint) protection is in scope here; nothing outside this repository or this pinned commit was examined."
+  ],
+  "unverified": [
+    "O1=6 counts the three public master_key-taking methods (create_data_key, rewrap_many_data_key, create_encrypted_collection) in each of ClientEncryption and AsyncClientEncryption; the MongoClient/AsyncMongoClient auto_encryption_opts route funnels through the same kms_request callback and could raise the count, as could delegated KMIP encrypt/decrypt, but the latter depends on libmongocrypt behaviour that is not visible in this tree.",
+    "Repository size in MB could not be measured without a shell; tiny_repo/giant_repo were therefore left unset (PyMongo source plus its large JSON test corpus is well above 5 MB and far below 1.5 GB).",
+    "Whether libmongocrypt substitutes kms_providers['kmip']['endpoint'] into kms_context.endpoint when the master key omits it was inferred from test/test_encryption.py:1235 and the encryption.py docstrings, not from libmongocrypt source (external, no network).",
+    "O8 is empty after checking every caller of _create_connection/_async_create_connection (only the two KMS callbacks, which the fix changes, and the MongoClient pool at pymongo/synchronous/pool.py:871, which is the legitimate unix-socket feature and not a KMS endpoint)."
+  ]
+}

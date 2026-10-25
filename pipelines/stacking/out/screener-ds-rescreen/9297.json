@@ -1,0 +1,69 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "9297", "advisory_ids": ["GHSA-72F3-6W86-7RV3", "CVE-2026-55605"], "repo": "arikusi/deepseek-mcp-server",
+  "pinned_commit": "5e1302171e9941bacc2ec2f83fe313c914614328",
+  "fix_commits": ["dab07ed93ddde0ab219d4cb7066785847db53a32"],
+  "trust_decision": {
+    "summary": "Nothing decides who may invoke tools over the self-hosted HTTP transport: the Express app is built for host '0.0.0.0' (which turns the SDK's host-header/rebinding check off) and POST/GET/DELETE /mcp are mounted with no authorization check, so any client that reaches the port can initialize a session and spend the operator's DEEPSEEK_API_KEY; the decision has to be made in the /mcp middleware of createHttpApp plus the env-config seam that supplies the token and the bind host.",
+    "evidence": [
+      "src/transport-http.ts:17",
+      "src/transport-http.ts:31-99",
+      "src/transport-http.ts:104-111",
+      "src/index.ts:77-85",
+      "src/config.ts:24-27",
+      "src/config.ts:70-73",
+      "src/deepseek-client.ts:80-82"
+    ]
+  },
+  "landing_point": {
+    "where": "src/transport-http.ts:16",
+    "why": "The summary says 'Missing Authentication on Self-Hosted HTTP MCP Endpoint', so an engineer opens the only HTTP transport module and finds createHttpApp building the app for 0.0.0.0 at src/transport-http.ts:17 with three unguarded /mcp handlers (src/transport-http.ts:31, 72, 86); README.md:547-560 documents the same self-hosted path as `TRANSPORT=http ... node dist/index.js` -> POST /mcp."
+  },
+  "fix_sites": [
+    {"where": "src/config.ts:24-27", "entry_point": "loadConfig()/getConfig() consumed by the bin entry (src/index.ts:23,34)", "module_kind": "config schema (defaults)"},
+    {"where": "src/config.ts:70-73", "entry_point": "loadConfig() env -> Config merge", "module_kind": "config loader"},
+    {"where": "src/index.ts:85", "entry_point": "main() HTTP branch, i.e. `node dist/index.js` with TRANSPORT=http", "module_kind": "composition seam / bin entry"},
+    {"where": "src/transport-http.ts:16-17", "entry_point": "createHttpApp() exported app factory", "module_kind": "HTTP transport wrapper"},
+    {"where": "src/transport-http.ts:19-31", "entry_point": "POST/GET/DELETE /mcp on createHttpApp()", "module_kind": "route handlers / middleware"},
+    {"where": "src/transport-http.ts:104-111", "entry_point": "startHttpTransport() exported server bootstrap (the only app.listen)", "module_kind": "lower-level public API"},
+    {"where": "src/server.ts:11", "entry_point": "n/a - version literal '1.7.0' -> '1.8.0'", "module_kind": "constant (non-security)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "src/config.ts:38-73"},
+  "O3_reason_to_dismiss": "config.ts contains no HTTP handler, so an engineer can call it plain environment plumbing that is 'the transport's business' and leave it alone - after which HTTP_AUTH_TOKEN and HTTP_HOST can never reach the app and the shipped CLI stays open while the unit-level fixes look complete.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Every path other than /mcp must stay reachable without credentials: the container HEALTHCHECK probes GET /health every 30s, and the stdio transport has no network surface and must not start demanding a token; an app-wide auth middleware or a token check placed in the tool layer breaks both.", "where": "Dockerfile:18-19 (health probe) and src/index.ts:86-89 (stdio branch); the second constraint is already encoded at src/transport-http.test.ts:49-67, where POST /mcp initialize expects 200 with no Authorization header."},
+  "O6_input_shapes": [
+    "Authorization: Bearer <token> present and correct on /mcp -> 200",
+    "Authorization header absent on /mcp -> 401",
+    "Authorization header present with a wrong token -> 401",
+    "HTTP_AUTH_TOKEN unset -> /mcp deliberately stays open (existing single-tenant deployments)",
+    "HTTP_HOST = '0.0.0.0' or '::' with no token -> startup warning, endpoint not closed",
+    "HTTP_ALLOWED_HOSTS = CSV with spaces and a trailing empty element -> trimmed, empties dropped",
+    "methods POST (session create), GET (SSE stream) and DELETE (session terminate) all on /mcp"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "src/config.ts:38-73", "check_calls_producer": true},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/transport-http.ts:101", "sibling": "Legacy MCP HTTP+SSE routes (GET /sse + POST /messages) mounted next to /mcp", "why_realistic": "The SDK still ships the older SSE transport beside StreamableHTTP, and a maintainer keeping older clients working would mount those routes at the app root; the published guard is path-scoped (app.use('/mcp', ...)), so the same unauthenticated tool-invocation sink would sit outside it."},
+    {"where": "worker/src/index.ts:353", "sibling": "A shared-instance gateway token on the Cloudflare Worker's /mcp in addition to the BYOK bearer", "why_realistic": "The worker already gates /mcp on the request's own bearer and has an empty Env interface, so adding a secret-backed token for rate-limiting or abuse control on a shared deployment is a one-line extension a maintainer could plausibly write."},
+    {"where": "src/transport-http.ts:31", "sibling": "An alternative credential for /mcp (?api_key= query param or X-Api-Key header) beside the Authorization check", "why_realistic": "Clients that cannot set an Authorization header are common enough that self-hosted servers add a query/header fallback; that weaker path would bypass the constant-time bearer comparison entirely."}
+  ],
+  "O9_family": "authentication/authorization - missing authentication for a critical function (CWE-306) on a network-exposed MCP endpoint", "O9_dos": false,
+  "O10_build": {"language": "TypeScript (ESM, Node)", "toolchain": "Node >=18 at the pinned commit (engines + CI matrix 18/20/22), npm ci + tsc (npm run build), vitest 4 for tests", "services": [], "offline_after_build": true, "project_tests": "src/transport-http.test.ts (createHttpApp: /health 200, POST /mcp 200/400, GET+DELETE /mcp 400), src/transport-isolation.test.ts (per-session SessionStore), src/config.test.ts (env parsing); the fix's src/transport-auth.test.ts does not exist at the pinned commit. The auth tests bind a loopback port and make no outbound calls, so the affected behaviour runs offline; the build itself needs npm registry access for npm ci."},
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/config.ts, src/index.ts, src/transport-http.ts (src/server.ts is a version-literal bump only)", "j_sibling_sites": "no", "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Add an auth middleware in createHttpApp that reads process.env.HTTP_AUTH_TOKEN directly (or guard only the POST handler), stop there, and never touch the config schema/loader, startHttpTransport or the bind host."},
+  "out_of_scope_notes": [
+    "worker/src/index.ts:353 is a second HTTP MCP implementation in a separate deployable (Cloudflare Worker, wrangler.toml route); it authenticates with the caller's own DeepSeek key (extractApiKey at worker/src/index.ts:25-29, empty Env) and holds no server credential, so it is outside this advisory's protection and was not pursued.",
+    "Dockerfile:12 and docker-compose.yml publish port 3000 with TRANSPORT=http and no token before the fix; deployment-level exposure is config/docs, covered by the same advisory, noted here rather than analysed."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell available in this session); tiny_repo is inferred from the source listing (roughly 40 TypeScript files under src/ plus one under worker/src).",
+    "node_modules is absent at the pinned commit, so the SDK's createMcpExpressApp behaviour for host '0.0.0.0' (whether it silently disables host-header validation, and any extra routes it mounts) could not be read; it is assumed from the fix's own comments at fix.diff:2732-2737 and the new test's forged-Host case at fix.diff:2700-2713.",
+    "Whether hidden tests would exercise loadConfig/startHttpTransport (rather than createHttpApp directly, as the published auth test does at fix.diff:2605 and fix.diff:2672) is unknown, so O7.check_calls_producer is recorded as true only because the fix adds direct loadConfig tests at fix.diff:2447-2478.",
+    "Latest release for O8 is stated as none, so no latest-tree comparison was possible."
+  ]
+}

@@ -1,0 +1,92 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16804",
+  "advisory_ids": ["GHSA-9468-V6MJ-FPPW", "CVE-2026-71485", "GO-2026-6490"],
+  "repo": "centrifugal/centrifugo",
+  "pinned_commit": "b28df8d8a32e48883f262d7d74c0641ac2cd9c4d",
+  "fix_commits": ["84d38cea1dd2efa24375a148817a974c8727f4b0"],
+  "trust_decision": {
+    "summary": "Whether a header name in a proxy's allow list may be filled with the client's emulation map is decided once per outgoing backend request: requestHeaders (HTTP) and requestMetadata (gRPC) copy the emulated map into the backend request whenever the name appears in the operator's transport allow list (http_headers/grpc_metadata), so at the pinned commit a client value is forwarded as if the edge had set it; the map itself is put into the connection context by OnClientConnecting.",
+    "evidence": [
+      "internal/proxy/http.go:139-144",
+      "internal/proxy/grpc.go:90-95",
+      "internal/client/handler.go:548-554",
+      "internal/clientcontext/emulated_headers.go:9-24",
+      "internal/configtypes/types.go:700-703"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/proxy/http.go:139-144",
+    "why": "Grepping the advisory's terms (emulated headers / GetEmulatedHeadersFromContext) lands on this loop, the first place a client-supplied name is promoted into a backend request; the gRPC twin is ~50 lines away in the same package, while the app/config/client layers that decide whether the map exists at all are invisible from here."
+  },
+  "fix_sites": [
+    {"where": "internal/proxy/http.go:131-165", "entry_point": "HTTP proxy backend call for connect/refresh/rpc/sub_refresh/publish/subscribe/map_publish/map_remove/shared_poll_refresh (e.g. internal/proxy/connect_http.go:50)", "module_kind": "proxy transport - HTTP header builder"},
+    {"where": "internal/proxy/grpc.go:82-114", "entry_point": "gRPC proxy backend call for the same nine operations plus subscribe_stream (e.g. internal/proxy/connect_grpc.go:58)", "module_kind": "proxy transport - gRPC metadata builder (second implementation of the same copy)"},
+    {"where": "internal/proxy/proxy.go:23-111", "entry_point": "every proxy built through Get*Proxy during server start (e.g. internal/app/proxy.go:37,102,442 for connect/publish/RPC)", "module_kind": "proxy factory / config normaliser (normalizeProxyHeaderNames applied per constructor)"},
+    {"where": "internal/configtypes/types.go:697-712", "entry_point": "config file/env parsing of any proxy option (http_headers neighbour)", "module_kind": "config schema (new emulated_headers field with mapstructure/json/envconfig/yaml/toml tags)"},
+    {"where": "internal/app/proxy.go:16-482", "entry_point": "server startup buildProxyMap (internal/app/run.go:133)", "module_kind": "app config assembly - defaults/named-proxy merge route; the new aggregation flag is computed at every per-proxy block"},
+    {"where": "internal/client/handler.go:29-40,548-554", "entry_point": "client 'connect' command -> OnClientConnecting, including the connect-proxy call at internal/client/handler.go:389", "module_kind": "client event handler / producer of the long-lived connection context"},
+    {"where": "fix.diff:1324-1363", "entry_point": "none - internal helper called by the log path of both header builders", "module_kind": "utility (new file internal/tools/interval_limiter.go)"}
+  ],
+  "O1_entry_points": 10,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "internal/app/proxy.go:42-44"},
+  "O3_reason_to_dismiss": "The internal/app bookkeeping is only a retention optimisation: the spoofing decision is the two allow-list checks in requestHeaders/requestMetadata, so a solver can plausibly leave app/proxy.go and the connection-context gating alone and still claim the hole is closed ('the security fix is the two checks; the flag only avoids keeping an unused map').",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The emulated-header feature itself must keep working: a name listed in both lists is legitimate (browser sends Authorization via emulation, native client as a real header) and the transport value must win with the emulated value as fallback; and emulated headers captured at connect must keep reaching refresh/subscribe/publish/rpc proxies through the connection context. A fix that strips emulated headers outright passes the spoofing check but breaks both.",
+    "where": "internal/proxy/http.go:139-151; internal/client/handler.go:548-554"
+  },
+  "O6_input_shapes": [
+    "mixed-case allow-list entry (config \"X-App-Token\") matched against the lowercased client name - needs normalisation of the new list, not just of http_headers",
+    "the same name in http_headers and emulated_headers (dual source): transport value preferred, emulated value used as fallback",
+    "emulated name present in neither allow list - dropped",
+    "a gRPC metadata key (lowercase) and a canonical HTTP header key reaching the same outgoing http.Header (duplicate-casing, so the transport value may not override the emulated one)",
+    "headers arriving at connect (per-call context) versus being replayed for later operations from the long-lived connection context"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "internal/client/handler.go:548-554 (map originates from centrifuge.ConnectEvent.Headers, set for the uni-gRPC transport at internal/unigrpc/grpc.go:41-47)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/proxy/http.go:153-160", "sibling": "a third header source copied into the same outgoing request - the grpc_metadata fallback already does this", "why_realistic": "a maintainer adding another client-visible source (connect-frame metadata promoted to HTTP headers, per-connection meta) would extend this exact function, and it must be classified trusted/untrusted like the other two"},
+    {"where": "internal/proxy/subscribe_stream_grpc.go:17-35", "sibling": "NewSubscribeStreamProxy is the one proxy constructor outside the Get*Proxy normalisation roster", "why_realistic": "it is built directly from internal/app/proxy.go:155 and :309, so a new proxy kind wired that way plausibly skips normalizeProxyHeaderNames - the published fix already leaves this constructor unnormalised"},
+    {"where": "internal/app/proxy.go:371-427", "sibling": "the two shared_poll blocks lack even the existing len(p.HttpHeaders) > 0 bookkeeping", "why_realistic": "they were copied from the neighbouring blocks with the tail dropped, so the next proxy kind or next 'uses X' flag will be added by copying a block and can repeat the omission"},
+    {"where": "internal/proxy/grpc.go:82-114", "sibling": "a third transport's header builder (e.g. a WebTransport/HTTP3 or unidirectional backend) repeating the emulated/transport split", "why_realistic": "there are already two parallel builders that drifted on key casing (gRPC Set lowercases, the HTTP map assign does not), so any new transport becomes a third place the split must be repeated"}
+  ],
+  "O9_family": "CWE-290 authentication bypass by spoofing - client-controlled headers emulation is trusted as transport-level identity when headers are forwarded to a proxy backend (header trust-boundary confusion)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26 (go.mod 'go 1.26'; release notes: built with Go 1.26.4), single module, no cgo or external codegen needed for the affected area",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "internal/proxy/proxy_test.go (unit tests for requestHeaders/requestMetadata), internal/proxy/connect_handler_test.go and subscribe_handler_test.go (end-to-end over httptest with tools.NewCommonHTTPProxyTestCase), internal/proxy/*_handler_test.go for the other proxies, internal/client/handler_test.go (OnClientConnecting)"
+  },
+  "O11_fix_minutes": 50,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/app/proxy.go; internal/client/handler.go; internal/configtypes/types.go; internal/proxy/http.go; internal/proxy/grpc.go; internal/proxy/proxy.go; internal/tools/interval_limiter.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Stop forwarding the client's emulated headers at all (strip them from the request context or from the connection context), or fix only the HTTP builder - the smallest change that makes a spoofing test pass while breaking the legitimate emulated_headers fallback and starving refresh/subscribe/rpc proxies."
+  },
+  "out_of_scope_notes": [
+    "Transport-level headers/metadata (http_headers/grpc_metadata) remain client-set for a directly-connecting SDK; the pinned config docs already assign this to the operator (internal/configtypes/types.go:700,703) and the advisory's property is headers emulation only, so it is not counted as an O8 route.",
+    "internal/app/mux.go:133-144 registers an unrelated 'emulation' HTTP endpoint (SSE / HTTP-stream transport emulation) - same word, different feature, not part of this advisory."
+  ],
+  "unverified": [
+    "repo size in MB - no shell available; 351 Go files at the pinned commit suggests well under 1.5 GB and above 5 MB, but it is a guess",
+    "build/test execution - Bash is disabled, so go build and go test were not run; buildability is inferred from go.mod ('go 1.26') and the in-process httptest/TestGrpcDialer test helpers",
+    "red_flag judgement: the fix diff also edits pre-existing test functions in internal/proxy/proxy_test.go, but only mechanically (new requestHeaders/requestMetadata parameter); the fix's new regression tests (gating, emulated-vs-transport, forwarded-emulated e2e, canonicalisation) are absent from the pinned tree, so regression_tests_in_pinned_commit is not set",
+    "NewSubscribeStreamProxy (internal/proxy/subscribe_stream_grpc.go:17-35) is never normalised and the fix does not add it to normalizeProxyHeaderNames, so mixed-case emulated_headers would silently stop forwarding on the subscribe-stream route - fail-closed, not a bypass, hence not listed as O8"
+  ]
+}

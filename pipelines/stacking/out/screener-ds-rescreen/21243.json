@@ -1,0 +1,115 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "21243",
+  "advisory_ids": ["GHSA-M8F5-RH7H-VGG3", "CVE-2026-61670"],
+  "repo": "superradcompany/microsandbox",
+  "pinned_commit": "3773bf2f00cf4987a8e1c663bcb7508f3b21f83c",
+  "fix_commits": ["2ac6a177b11212d392bf1e7dc77aaf14e4768aa8", "fbfb2366bfafad5e6df8778183f95fd8ca3c00a4"],
+  "trust_decision": {
+    "summary": "A sandbox's secret-bearing configuration (guest env, init-handoff env, and the network SecretEntry.value blob) must never be formatted onto the `msb sandbox` child process command line, because /proc/<pid>/cmdline is world-readable; the decision is made at the SDK-to-CLI spawn handoff, where the SDK assembles argv and the internal CLI re-parses it.",
+    "evidence": [
+      "sdk/rust/lib/runtime/spawn.rs:1310-1320",
+      "sdk/rust/lib/runtime/spawn.rs:1322-1325",
+      "sdk/rust/lib/runtime/spawn.rs:1402-1407",
+      "crates/cli/lib/sandbox_cmd.rs:169-171",
+      "crates/cli/lib/sandbox_cmd.rs:181-184"
+    ]
+  },
+  "landing_point": {
+    "where": "sdk/rust/lib/runtime/spawn.rs:1322-1325",
+    "why": "The only loop that formats every sandbox env var as `--env KEY=VALUE` on the child argv; a search for where secret values reach a command line lands here first, with `--network-config` (spawn.rs:1316-1317) as the immediate neighbour."
+  },
+  "fix_sites": [
+    {"where": "sdk/rust/lib/runtime/spawn.rs:1044-1391", "entry_point": "microsandbox::runtime::spawn_sandbox (reached by Sandbox::spawn, msb run/create/start and every language binding)", "module_kind": "sdk_runtime"},
+    {"where": "sdk/rust/lib/runtime/spawn.rs:197-264", "entry_point": "spawn_sandbox command construction and pre_exec fd handoff", "module_kind": "sdk_runtime"},
+    {"where": "crates/cli/lib/sandbox_cmd.rs:21-194", "entry_point": "msb sandbox CLI (hidden internal command, crates/cli/bin/main.rs:68-70)", "module_kind": "cli"},
+    {"where": "crates/cli/lib/sandbox_cmd.rs:215-325", "entry_point": "msb sandbox | run() builds microsandbox_runtime::vm::Config", "module_kind": "cli"},
+    {"where": "fix.diff:534-663", "entry_point": "microsandbox_runtime::launch::LaunchConfig (new public schema, crates/runtime/lib/launch.rs)", "module_kind": "runtime_library"},
+    {"where": "crates/runtime/lib/vm.rs:60-64", "entry_point": "microsandbox_runtime::vm::{CONFIG_FD new, PARENT_WATCH_FD, STARTUP_FD}", "module_kind": "runtime_library"},
+    {"where": "crates/runtime/lib/vm.rs:143-172", "entry_point": "microsandbox_runtime::vm::{StartupCommand, MetricsSlotHandoff} gain Serialize/Deserialize", "module_kind": "runtime_library"},
+    {"where": "crates/runtime/lib/lib.rs:14-24", "entry_point": "runtime crate module exports", "module_kind": "runtime_library"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "crates/cli/lib/sandbox_cmd.rs:21-194"
+  },
+  "O3_reason_to_dismiss": "`msb sandbox` is a hidden internal command (`#[command(hide = true)]`, documented as 'Run the sandbox process (internal)'), so its own --env/--startup-env/--network-config flags read as a manual/debugging surface rather than part of the leak the report describes.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Operator-readable labels must stay on the real argv (--name, --sandbox-id, --vcpus, --memory-mib, the log-level flag, --parent-watch-fd, --startup-fd) so the sandbox stays identifiable in ps and logs, while the piped JSON must still deliver the complete env/network config to the guest; the published fix's own test asserts labels survive and bulk/secret flags do not.",
+    "where": "sdk/rust/lib/runtime/spawn.rs:1061-1088"
+  },
+  "O6_input_shapes": [
+    "env vars as KEY=VALUE, including values merged in from the OCI image env and from init.env",
+    "real secret values nested inside the NetworkConfig JSON (SecretEntry.value) rather than in --env",
+    "init handoff: cmd path, args and env encoded as base64url JSON, plus cwd",
+    "startup workload: cmd, args (including args beginning with '-'), env, cwd and user",
+    "mounts: bind tag:host:opts, staged single-file mounts, named volumes, tmpfs specs, disk id:host:format[:ro]",
+    "rlimits encoded into one MSB_RLIMITS string",
+    "rootfs variants: bind path, OCI vmdk + writable upper, disk image with format and fstype",
+    "optional/absent fields (workdir, user, hostname, log level, idle/max duration) and the metrics slot triple (shm name, slot, generation)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "sdk/rust/lib/runtime/spawn.rs:1044-1390",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "sdk/rust/lib/runtime/spawn.rs:1393-1414",
+      "sibling": "a second copy of the same env values on argv as `--startup-env=KEY=VALUE`, emitted only when a startup command is requested",
+      "why_realistic": "a maintainer adding 'run this workload after boot' naturally forwards the sandbox env to the workload and reuses the easiest channel, the argv the process already parses"
+    },
+    {
+      "where": "crates/cli/lib/sandbox_cmd.rs:215-325",
+      "sibling": "a resume/restart entry point that rebuilds the launch config from the persisted sandbox spec and re-executes `msb sandbox` with the old flag set",
+      "why_realistic": "msb start already re-spawns a stopped sandbox from stored config (sdk/rust/lib/sandbox/mod.rs:705), so a separate resume path that restored argv rather than the fd payload is a natural refactor"
+    },
+    {
+      "where": "sdk/rust/lib/runtime/spawn.rs:197-264",
+      "sibling": "a `--config-file <path>` manual route that writes the JSON launch config to a named, world-readable temporary file instead of an unlinked fd",
+      "why_realistic": "the published fix itself adds exactly this debugging route, so a maintainer could ship it as the only handoff and leak the same secrets through a different, file-shaped channel"
+    },
+    {
+      "where": "crates/cli/lib/commands/exec.rs:100-150",
+      "sibling": "a host-side exec helper that spawns a local process with the merged exec env on its command line",
+      "why_realistic": "exec already merges sandbox env with caller env (sdk/rust/lib/sandbox/mod.rs:1628-1673) and a local fallback runner is an easy convenience addition"
+    }
+  ],
+  "O9_family": "Information exposure through process arguments (CWE-214): secret values written to a child process command line, world-readable via /proc/<pid>/cmdline",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust (edition 2024 workspace, 36 members, 5 crates touched)",
+    "toolchain": "cargo/rustc >= 1.85 for edition 2024; C toolchain for msb_krun 0.1.17 (features blk + net); no rust-toolchain file in the tree",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Pure arg-construction tests in `sdk/rust/lib/runtime/spawn.rs` #[cfg(test)] mod tests (render_args at spawn.rs:1486 uses LocalBackend::lazy(), no DB/FS) and unit tests in `crates/cli/lib/sandbox_cmd.rs` (mod tests from ~line 400). Integration tests under sdk/rust/tests spawn a real VM and need /dev/kvm + libkrunfw."
+  },
+  "O11_fix_minutes": 90,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "crates/cli/lib/sandbox_cmd.rs, crates/runtime/lib/launch.rs, crates/runtime/lib/lib.rs, crates/runtime/lib/vm.rs, sdk/rust/lib/runtime/spawn.rs",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Stop emitting `--env` in the SDK (or scrub secret values where SandboxBuilder::env is called) while leaving `--startup-env`, `--network-config` and the CLI's own flag schema on argv"
+  },
+  "out_of_scope_notes": [
+    "The same SecretEntry.value also round-trips through the persisted SandboxConfig network spec (sdk/rust/lib/sandbox/config.rs:467-472); any exposure via the on-disk sqlite store is a file channel outside this advisory's process-argument scope and was not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured (no shell/du available); repo_mb left null, and tiny_repo/giant_repo were not asserted.",
+    "Build was checked statically only: the two fix commits carry identical patch bodies in scr-21243.fix.diff and no cargo invocation was possible, so whether msb_krun 0.1.17 needs libkrun/libkrunfw headers at compile time is unverified.",
+    "The advisory text itself was not available; scope was taken from the summary line and the fix diff.",
+    "Whether secret values are written into the sandbox sqlite DB (out_of_scope_notes) was not checked.",
+    "Whether `--mount`/`--disk` host paths or `--db-path`/`--log-dir` are sensitive in the project's threat model was not established; only env, init env and network secrets are evidenced as secret-bearing."
+  ]
+}

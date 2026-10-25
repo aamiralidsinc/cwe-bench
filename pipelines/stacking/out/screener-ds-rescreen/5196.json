@@ -1,0 +1,128 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "5196",
+  "advisory_ids": ["GHSA-QQJ6-54Q6-CXV6", "CVE-2026-86597", "GO-2026-6665"],
+  "repo": "snowflakedb/gosnowflake",
+  "pinned_commit": "bc2bc0c198471d83a0fde73b64d68812234df3ff",
+  "fix_commits": ["52e397ecd02f741dda99994fad9d42154149ef6a"],
+  "trust_decision": {
+    "summary": "The driver writes credentials to logs because log sites render whole http.Header maps and raw config values with %v, a shape the pattern-based MaskSecrets (key=value / sig=...) can never match, so the published fix removes the values at the call sites instead of widening the masking table.",
+    "evidence": ["internal/logger/secret_detector.go:26-38", "restful.go:332", "chunk_downloader.go:440", "internal/config/dsn.go:834"]
+  },
+  "landing_point": {
+    "where": "internal/logger/secret_detector.go:26-38",
+    "why": "the advisory text says only that the driver writes sensitive information to logs; the driver's declared protection is this pattern table, so it is the first place a reader inspects and the first place a fix is attempted."
+  },
+  "fix_sites": [
+    {"where": "restful.go:332", "entry_point": "QueryContext / ExecContext -> postRestfulQueryHelper", "module_kind": "http_client (query POST)"},
+    {"where": "restful.go:386", "entry_point": "snowflakeConn.Close / database/sql DB.Close -> closeSession", "module_kind": "http_client (session close)"},
+    {"where": "restful.go:453", "entry_point": "QueryContext on an expired session -> renewExpiredSessionToken -> renewRestfulSession", "module_kind": "http_client (session renew)"},
+    {"where": "restful.go:542", "entry_point": "QueryContext with a cancelled context -> sr.FuncCancelQuery -> cancelQuery", "module_kind": "http_client (query cancel)"},
+    {"where": "auth.go:230", "entry_point": "Open / OpenWithConfig / Connector.Connect -> authenticate -> postAuth", "module_kind": "auth"},
+    {"where": "authokta.go:303", "entry_point": "Open / Connect with authenticator=OKTA -> postAuthOKTA", "module_kind": "auth (external IdP)"},
+    {"where": "authokta.go:344", "entry_point": "Open / Connect with authenticator=OKTA -> getSSO", "module_kind": "auth (external IdP)"},
+    {"where": "heartbeat.go:125", "entry_point": "long-lived QueryContext/session keep-alive -> heartbeatMain", "module_kind": "http_client (heartbeat)"},
+    {"where": "chunk_downloader.go:415", "entry_point": "QueryContext on a large result set -> downloadChunkHelper", "module_kind": "stage storage client"},
+    {"where": "internal/config/connection_configuration.go:275", "entry_point": "Open(\"autoConfig\") / OpenConnector -> LoadConnectionConfig -> checkParsingError", "module_kind": "config_loader (internal package)"},
+    {"where": "internal/config/connection_configuration.go:278", "entry_point": "Open(\"autoConfig\") / OpenConnector -> LoadConnectionConfig -> checkParsingError", "module_kind": "config_loader (internal package)"},
+    {"where": "internal/logger/secret_detector.go:26-38", "entry_point": "every log line (masking logger wraps all output)", "module_kind": "logger / masking primitive"},
+    {"where": "fix.diff:2496-2517", "entry_point": "shared helper used by the eight header-dump sites", "module_kind": "util (new headerNames helper)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "save_reload_or_serialization", "where": "internal/config/connection_configuration.go:268-280"},
+  "O3_reason_to_dismiss": "The TOML loader is local configuration parsing, not the driver's HTTP/session logging the advisory describes, and its message already passes through the masking logger, so the existing patterns are assumed to cover it.",
+  "O4_distance": {"files": 9, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The chunk-header map must still be forwarded onto the outgoing stage request (SSE-C algorithm and customer key), and diagnostics must still show which setting/header was involved; an over-broad fix that deletes the loop body or blanks the map breaks encrypted chunk downloads.",
+    "where": "chunk_downloader.go:414-421"
+  },
+  "O6_input_shapes": [
+    "full http.Header collection rendered with %v as map[Name:[value]]",
+    "single chunk-request header name/value pair (SSE-C customer key)",
+    "TOML connection-config values of mixed types (string, int, bool, array) in a parse message",
+    "signed-URL query parameters sig / signature / AWSAccessKeyId / password / passcode",
+    "Snowflake session tokens of the form ver:N-hint:<keyId>[-did:<id>]-<enc>, containing ':'",
+    "S3 SSE-C customer-key header value (base64)",
+    "X-Amz-Credential and X-Amz-Security-Token query parameters (values contain '%')"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "internal/config/connection_configuration.go:268-280 and internal/config/dsn.go:820-834",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "parseDSNParams logs the entire DSN query string at INFO, which can carry password, privateKey, token or clientSecret values",
+      "where": "internal/config/dsn.go:834",
+      "reason_to_dismiss": "the string already goes through the masking logger, so the existing password= / token= patterns are assumed to cover it",
+      "distance": "internal/config, a different package and two files from the landing point; reached from ParseDSN/Open(dsn), not from any HTTP response path",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "heartbeatMain logs the whole *http.Response with %v, which renders the complete header map with values, two lines above the fixed Header: line",
+      "where": "heartbeat.go:103",
+      "reason_to_dismiss": "it is a debug dump of the response object rather than a deliberate header log, and its header values were assumed to be masked",
+      "distance": "same function as a fixed site (heartbeat.go:125), so cheap to spot but skipped by anyone grepping resp.Header only",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "a failed stage-storage chunk download logs the full response header collection with %v at DEBUG",
+      "where": "chunk_downloader.go:440",
+      "reason_to_dismiss": "these are S3/GCS/Azure object-store response headers on a debug-only non-200 path, not Snowflake session headers",
+      "distance": "root package, same file as the fixed chunk-header line but a different function (downloadChunkHelper error path)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "gcs_storage_client.go:41",
+      "sibling": "debug log of a presigned GCS URL, which carries credential and signature query parameters",
+      "why_realistic": "the code already logs the full presigned URL at Debug; the S3/azure storage clients are written in the same style, so a maintainer adding stage-download diagnostics would produce this exact line again"
+    },
+    {
+      "where": "chunk_downloader.go:420",
+      "sibling": "debug log of the outgoing SSE-C request headers for an encrypted chunk download",
+      "why_realistic": "the neighbouring loop already logged exactly those header name/value pairs, so re-adding a request-header dump in the else-branch is a natural maintainer edit"
+    },
+    {
+      "where": "auth_wif.go:204",
+      "sibling": "log of the cloud token-endpoint response body or headers after an attestation fetch",
+      "why_realistic": "this file already logs each failed token-fetch step at Debug, and the token endpoint response carries the ambient credential"
+    }
+  ],
+  "O9_family": "information exposure through log files (CWE-532)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.25 (go.mod declares go 1.25.0); module github.com/snowflakedb/gosnowflake/v2",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "internal/logger/secret_detector_test.go and secret_masking_test.go, internal/config/connection_configuration_test.go, restful_test.go, heartbeat_test.go, authokta_test.go, util_test.go; the HTTP-level tests use wiremock mappings served locally from testdata/"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["protection_documented_without_exceptions"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "auth.go, authokta.go, heartbeat.go, restful.go, chunk_downloader.go, util.go, internal/config/connection_configuration.go, internal/logger/secret_detector.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add one more regex to internal/logger/secret_detector.go that redacts header-map / 'value:' shapes, prove it with a MaskSecrets unit test, and stop, leaving the eight %v header dumps and the two config loaders logging raw values."
+  },
+  "out_of_scope_notes": [
+    "The published fix commit is the v2.2.0 release commit and bundles unrelated security fixes for other advisories (WORKLOAD_IDENTITY host allowlist SNOW-3649730, Azure IMDS query encoding SNOW-3649876 and IDENTITY_ENDPOINT validation SNOW-3649837, account/region hostname validation SNOW-3711332, OCSP response/cache validation SNOW-3649697/3649733/3649896, SAML post-back URL check SNOW-3649735, TLS config preservation when OCSP is disabled SNOW-3649867); only the CWE-532 logging subset was screened."
+  ],
+  "unverified": [
+    "repo size in MB could not be measured without shell access; it was not estimated, so tiny_repo/giant_repo was not judged.",
+    "present_in_latest for the O8 routes is unknown because no latest release tree was provided.",
+    "The initial Go module download needs network unless the module cache is already populated; the affected behaviour itself (log formatting/masking, TOML parsing, local wiremock HTTP) runs offline after that."
+  ]
+}

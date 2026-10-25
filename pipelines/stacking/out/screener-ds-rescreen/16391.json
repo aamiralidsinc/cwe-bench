@@ -1,0 +1,87 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16391",
+  "advisory_ids": ["GHSA-7CFQ-5MHV-JRP9", "CVE-2026-44778", "GO-2026-5214"],
+  "repo": "inspektor-gadget/inspektor-gadget",
+  "pinned_commit": "40398a64e15b96366215dbd05e0a52b969a4a0c1",
+  "fix_commits": ["ec69da2e00c39bc43f389f943899e5ff9c7b011a"],
+  "trust_decision": {
+    "summary": "A privileged gadget process opens files owned by an unprivileged container (the ELF a usdt/uprobe program names, and the container's /etc/ld.so.cache) and must treat their contents as untrusted data; getUsdtInfo decides that a note's DescSize-derived buffer is a bounded array and reads three words out of it unconditionally, so a crafted .note.stapsdt desc turns attacker input into an out-of-range slice panic in the host-side process instead of an error.",
+    "evidence": [
+      "pkg/uprobetracer/usdt.go:66",
+      "pkg/uprobetracer/usdt.go:121-131",
+      "pkg/uprobetracer/usdt.go:137-139",
+      "pkg/uprobetracer/tracer.go:196",
+      "pkg/utils/secureopen/secureopen.go:83",
+      "pkg/uprobetracer/ldcache_parser.go:143"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/uprobetracer/usdt.go:137",
+    "why": "The summary names the USDT note parser, so an engineer opens pkg/uprobetracer/usdt.go and finds the note walk: desc is allocated with the attacker-chosen DescSize (usdt.go:127) and then sliced for the location/base/semaphore words at usdt.go:137-139 with no length check, so any DescSize below 3 words (and any 32-bit ELF, where wordSize is 4 but ByteOrder.Uint64 needs 8 bytes) panics."
+  },
+  "fix_sites": [
+    {"where": "pkg/uprobetracer/usdt.go:137-139", "entry_point": "uprobetracer.Tracer.AttachProg (pkg/uprobetracer/tracer.go:124) with ProgUSDT, from the ebpf operator's usdt/ section handling (pkg/operators/ebpf/attach.go:81), reachable from a gadget with a usdt/<file>:<provider>:<probe> program (docs/gadget-devel/program-types.md:98)", "module_kind": "ELF note parser in a public library package (the sink: three unchecked word reads from the attacker-sized desc slice)"},
+    {"where": "pkg/uprobetracer/usdt.go:121-131", "entry_point": "uprobetracer.Tracer.AttachProg with ProgUSDT (same route); also Tracer.AttachContainer (pkg/uprobetracer/tracer.go:260) for a container that appears after the program is loaded", "module_kind": "note header/name/desc length handling (header-driven allocation and read)"},
+    {"where": "pkg/uprobetracer/bytes.go:24-34", "entry_point": "shared byte-conversion helper used by both parsers: parseLdCache via readFromBytes (pkg/uprobetracer/ldcache_parser.go:80) and the USDT note reads", "module_kind": "lower-level deserialization helper (reconstructed: the fix's same-check name reinterpretBytes, 3 call sites, most plausibly the three desc word reads)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "The advisory and its fix are about the USDT note parser; /etc/ld.so.cache has its own, older parser that already carries length checks in readCacheFormat1/readCacheFormat2 (pkg/uprobetracer/ldcache_parser.go:77, :112), so a solver reads it as 'a different bug, already guarded, not part of this advisory' and leaves both header slices open.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The note walk must skip and keep scanning: notes whose name is not \"stapsdt\\x00\" or whose type is not 3 are skipped with continue (usdt.go:133-135) and a note with a different provider/probe falls through to the next one (usdt.go:156), because one library's .note.stapsdt holds many probes and the requested one may not be first. A fix that returns an error on the first short/unexpected note, or that hardcodes a 24-byte 64-bit desc, stops attaching to a valid probe after an unrelated note and rejects every legitimate 32-bit (ELFCLASS32, wordSize 4) USDT binary.",
+    "where": "pkg/uprobetracer/usdt.go:133-135"
+  },
+  "O6_input_shapes": [
+    "desc shorter than three words: DescSize 0, 4 or 16 on a 64-bit ELF (empty desc slice, slice bounds panic at usdt.go:138-139)",
+    "ELFCLASS32 note: wordSize 4, so ByteOrder.Uint64(desc[:4]) panics even on an otherwise valid note (usdt.go:137)",
+    "name/desc sizes not a multiple of 4, i.e. the alignUp padding path (usdt.go:121, :127)",
+    "desc with extra bytes after the provider/probe strings, where readStringFromBytes starts beyond the slice and returns \"\" (usdt.go:154-155)",
+    "semaphore word zero versus non-zero (vaddr2ElfOffset only for non-zero, usdt.go:147-152)"
+  ],
+  "O7_producer": {"kind": "cache", "where": "pkg/uprobetracer/ldcache_parser.go:142", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Any uprobe/uretprobe gadget whose program names a library (relative path, e.g. libc) goes through searchForLibrary -> parseLdCache, which slices the container's /etc/ld.so.cache at a fixed header length before any size check: an empty or shorter-than-11-byte cache panics on ldCacheFile[:len(cache1Header)] (ldcache_parser.go:152). getUsdtInfo never calls this parser, yet it is what chooses which container file the USDT parser later opens, so the same attacker and the same crash impact reach it on routes the advisory's fix did not touch.", "where": "pkg/uprobetracer/ldcache_parser.go:152", "reason_to_dismiss": "It is the ld.so.cache parser, not the USDT note parser, and the file already contains length checks, so it looks guarded and out of this advisory's scope.", "distance": "same package, one file from the landing point; reached from the sibling ProgUprobe/ProgUretprobe branches of the same Tracer (pkg/uprobetracer/tracer.go:190-195, :176)", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "readCacheFormat2 is called directly with the raw file when the cache does not start with the ld.so-1.7.0 header (ldcache_parser.go:169) and immediately compares data[:len(cache2Header)] = data[:20] with no size check (ldcache_parser.go:108); a container can write a 1-byte /etc/ld.so.cache and panic the privileged process.", "where": "pkg/uprobetracer/ldcache_parser.go:108", "reason_to_dismiss": "Same 'different parser' argument as above, and this branch is only a format sniff, so it reads as harmless.", "distance": "same function chain as the previous route; it is the same concept and would fall with a fix to parseLdCache", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/uprobetracer/ldcache_parser.go:105", "sibling": "a readCacheFormat3 for a newer glibc ld.so.cache layout, written in the same hand-rolled style (header compare then fixed offsets)", "why_realistic": "the package already carries two formats with parallel readers and format selection in parseLdCache (ldcache_parser.go:161-169), so a maintainer adding a third layout would copy readCacheFormat2 and inherit its unchecked header slice."},
+    {"where": "pkg/uprobetracer/usdt.go:111", "sibling": "a second SHT_NOTE walker in the same loop shape, e.g. for .note.gnu.build-id or .note.gnu.property, reading fixed words out of desc before validating DescSize", "why_realistic": "USDT notes and build-id notes are parsed from the same container ELF with the same nhdr layout, and the existing walk (usdt.go:111-159) is the obvious template to copy; a build-id is also what the symbolizer needs, so the same file is a natural home."},
+    {"where": "pkg/uprobetracer/tracer.go:169", "sibling": "a library-name resolution helper for a different container loader (e.g. musl's /etc/ld-musl-*.path or a RPATH/LD_LIBRARY_PATH lookup) that also opens container-supplied files", "why_realistic": "searchForLibrary already special-cases a container path lookup and returns a slice of candidate paths, which is exactly the shape a musl or RPATH fallback would be added in."}
+  ],
+  "O9_family": "CWE-20 improper input validation -> out-of-bounds slice panic parsing an untrusted container file in a privileged process (unchecked length before fixed-offset reads)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.7 (go.mod:3); the full repo additionally needs clang/llvm, bpftool and libbpf headers for the eBPF gadgets, but pkg/uprobetracer itself is pure Go (debug/elf + cilium/ebpf). No vendor directory, so one online module download is needed before the tree builds offline.",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "none for this area: pkg/uprobetracer has no *_test.go at all (only usdt.go, ldcache_parser.go, bytes.go, tracer.go) and integration/ contains no uprobe or USDT test; repo-wide `make test` runs `go test -exec sudo -v` over all non-gadget packages (Makefile:270-273), so any regression test for this parser has to be supplied with the task."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/uprobetracer/usdt.go, pkg/uprobetracer/bytes.go (reconstructed: the supplied fix.diff is the empty diff of merge ec69da2e)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add `if len(desc) < 3*wordSize { continue }` (or a flat 24-byte check) at pkg/uprobetracer/usdt.go:137, run a USDT unit test on a 64-bit crafted ELF, call it fully validated and stop - leaving parseLdCache's two unchecked header slices open and rejecting legitimate 32-bit notes."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "The supplied fix.diff contains only the header of merge commit ec69da2e (a merge shows no diff against its first parent), so the published fix's exact source hunks were not readable. fix_sites, O2, O5, O6 and j_sites_touched are reconstructed from the pinned code plus the candidate metadata (c_site_files=6, c_fix_sites=14, c_same_check_name=reinterpretBytes with 3 sites); the usdt.go:137-139 sink itself is verified from the code.",
+    "Whether the published fix also hardened parseLdCache is unknown; O8 assumes it did not, which is consistent with the metadata naming no cache-parser site, but the empty diff prevents confirmation.",
+    "pkg/uprobetracer/bytes.go:24-34 (readFromBytes) already validates exact length, so it is a plausible home for the fix's reinterpretBytes helper but not itself a missing protection; I could not confirm from the diff that it was touched.",
+    "repo_mb not measurable without a shell; inspektor-gadget is far above 5 MB of source and far below 1.5 GB, so neither tiny_repo nor giant_repo is claimed.",
+    "Latest release is reported as none, so present_in_latest / latest_where are unknown for both O8 routes.",
+    "End-to-end reachability of the panic needs root and an eBPF-capable kernel (the gadget must be loaded and attach to a container); only the parser functions can be exercised offline, which is what a unit-test task would do.",
+    "The 32-bit (ELFCLASS32) panic at usdt.go:137 is a pre-existing defect on the same sink; I did not verify whether the published fix addressed it or only the short-desc case."
+  ]
+}

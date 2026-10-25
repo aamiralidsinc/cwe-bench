@@ -1,0 +1,64 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "999",
+  "advisory_ids": ["GHSA-54P9-H82J-F925", "CVE-2026-104874"],
+  "repo": "aio-libs/multidict",
+  "pinned_commit": "3954324a6781b941d3b25ef1a662c5a58525be57",
+  "fix_commits": ["350b4a07bf8ff851b6d7544e81b1c748bdc74c40"],
+  "trust_decision": {
+    "summary": "The project decides, in the C extension's items-view set operations, that the identity and value references taken while parsing each right-hand operand element must be released at the end of every loop iteration: two Py_CLEAR pairs are added to the reflected-union loop and the subtraction loop, plus the missing Py_CLEAR(arg) on the subtraction error path.",
+    "evidence": ["multidict/_multilib/views.h:565-576", "multidict/_multilib/views.h:686-697", "multidict/_multilib/views.h:733-741", "multidict/_multilib/views.h:189-230", "fix.diff:26-27", "fix.diff:35-36"]
+  },
+  "landing_point": {"where": "multidict/_multilib/views.h:565", "why": "The advisory summary names 'items-view union and subtraction' and the changelog's first example is `operand | md.items()`, which is the operand-parsing loop of multidict_itemsview_or2_impl; a reader who greps for the parse loop and finds Py_CLEAR(arg) with no Py_CLEAR(identity)/Py_CLEAR(value) lands here first."},
+  "fix_sites": [
+    {"where": "multidict/_multilib/views.h:575-576", "entry_point": "`operand | md.items()` (reflected union: Py_nb_or -> multidict_itemsview_or -> Items_CheckExact(rht) branch -> multidict_itemsview_or2_impl)", "module_kind": "C extension core, shared multilib header compiled into the single multidict._multidict module"},
+    {"where": "multidict/_multilib/views.h:696-697", "entry_point": "`md.items() - operand` (Py_nb_subtract -> multidict_itemsview_sub1_impl); also reached by `md.items() ^ operand`, whose xor subtracts the operand set through the same function (views.h:907-911)", "module_kind": "C extension core, shared multilib header compiled into the single multidict._multidict module"},
+    {"where": "multidict/_multilib/views.h:733-741", "entry_point": "error path of the same `md.items() - operand` call: the fail label never released `arg` (and cleared `ret` twice)", "module_kind": "C extension core, shared multilib header compiled into the single multidict._multidict module"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": "No out-of-scope source site: the pure-Python twin of these operations (multidict/_multidict_py.py:233, __ror__ at 366, __sub__ at 379) owns no C references so it cannot leak, and the proxy route (_multidict.c:1789-1791) returns the same ItemsView type from views.h, so the published fix correctly stays in one file."},
+  "O3_reason_to_dismiss": "\"xor is just subtract-then-union and the pure-Python implementation has no refcounting, so only the two C operand loops need touching\" - both dismissals happen to be correct here, which is why this advisory has no genuinely unprotected route to argue away.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Operand elements that are not (key, value) 2-tuples must be copied verbatim into the result set - `md.items() | {'non-tuple', ('a','b','c')}` returns them unchanged and `md.items() - operand` still returns the view's pairs; a fix that treats an unparseable operand element as an error, or that releases the argument on the branch where the result set now owns it, breaks this documented behaviour.", "where": "multidict/_multilib/views.h:471-477"},
+  "O6_input_shapes": [
+    "non-empty operand of (key, value) pairs (the leaking shape, which the pinned leak script never exercises)",
+    "operand elements that are not 2-tuples, or whose key is not hashable/str (parse returns 0 and the loop must still clear the previous element's refs)",
+    "list operand vs set operand (both consumed through PyObject_GetIter/PyIter_NextItem)",
+    "MultiDict and CIMultiDict items views (identical C loop, different identity mapper via md_calc_identity); the fix's test parametrises over both (fix.diff:88)"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "multidict/_multilib/views.h:189-230 (_multidict_itemsview_parse_item), which interns key identity via md_calc_identity at multidict/_multilib/hashtable.h:836 and hands the caller two new references; the pinned leak check (tests/isolated/multidict_itemsview_set_operations.py:20,26) passes an empty operand, so the producer is never called for any element and the leak is invisible.", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "multidict/_multilib/views.h:872-929", "sibling": "a native itemsview_xor_impl that parses the operand in its own loop instead of delegating to PyNumber_Subtract", "why_realistic": "the file already carries four per-operator impls plus a mirrored *_2 variant, so a maintainer writing xor natively (to avoid PySet_New(other)) matches the surrounding style and would need the same per-iteration clears"},
+    {"where": "multidict/_multilib/views.h:1035-1101", "sibling": "an isdisjoint-style operand loop that forgets to clear identity/value on the skip (tmp == 0) branch", "why_realistic": "isdisjoint already parses every operand element and clears only at the loop tail - exactly the shape that leaked in or2/sub1"},
+    {"where": "multidict/_multilib/views.h:244-322", "sibling": "a second pass that re-walks matches via md_finder_collect and keeps a value alive across the set add", "why_realistic": "and1/or1/sub2 all materialise matches through md_finder_collect for __eq__ re-entrancy, so a variant that pins the value while comparing is a natural edit"},
+    {"where": "multidict/_multidict_py.py:290-298", "sibling": "a pure-Python fast path that caches per-element identity objects in _tmp_set", "why_realistic": "the Python twin mirrors the same two-phase tmp_set/entry-walk design, so a cached-identity optimisation there is the obvious port of the C structure"}
+  ],
+  "O9_family": "reference-count leak / memory leak (CWE-401) in the C extension: one key and one value reference leaked per operand element, so memory grows with operand size",
+  "O9_dos": true,
+  "O10_build": {"language": "C (CPython C-API extension) plus Python", "toolchain": "CPython >= 3.10 headers, C11 compiler (gcc), setuptools >= 47 via pyproject build-backend setuptools.build_meta, CFLAGS -O3 -Wall -Werror (-std=c11); test env needs pytest 9.1.1, hypothesis, objgraph 3.6.2, coverage (requirements/pytest.txt)", "services": [], "offline_after_build": true, "project_tests": "tests/isolated/multidict_itemsview_set_operations.py, driven by tests/test_leaks.py:11-35 in a subprocess under `coverage run`; operator-level cases in tests/test_multidict.py:1239-1373 and tests/test_hypothesis_views.py:126-129"},
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "multidict/_multilib/views.h",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Fix only multidict_itemsview_sub1_impl because the summary's concrete example is `md.items() - operand`, or hoist a single Py_CLEAR pair to after the operand loop so only the last element's refs drop; the reflected-union loop in or2 keeps leaking and the existing empty-operand leak test still passes."
+  },
+  "out_of_scope_notes": [
+    "No defect outside this advisory's protection was found or pursued: the other items-view loops (and1/and2/or1/sub2/isdisjoint, views.h:244-322,335-407,443-524,754-835,1035-1101) release identity/key/value themselves, and the keys-view operations (views.h:1211-1720) carry no value references."
+  ],
+  "unverified": [
+    "repo_mb was not measured (no shell available); source plus tests are ~20.4k non-empty lines over 56 files, which is the basis for the tiny_repo flag.",
+    "Slot dispatch was read, not executed: reflected union/subtraction reach the *_2 impls only because the dispatcher checks Items_CheckExact(rht) (views.h:651-652, 865-866), which the reflected-subtraction test expectation at tests/test_multidict.py:1338-1343 corroborates; no code was built or run.",
+    "Whether the fix's added union case (`union_operand | md.items()`, fix.diff:93-94) actually leaks without the or2 hunk could not be confirmed without a build.",
+    "Latest release code was not provided (none), so anything about present-day code is unknown."
+  ]
+}

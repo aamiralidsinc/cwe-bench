@@ -1,0 +1,96 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "19844",
+  "advisory_ids": ["GHSA-XG3J-C7Q4-F9PH", "CVE-2026-10720", "GO-2026-5755"],
+  "repo": "canonical/microceph",
+  "pinned_commit": "2688eaec23a0e6a0dd8c40de78b58c4732f7c252",
+  "fix_commits": ["5c2760d8fb765d670e2673d3a537b67eae4b67c6"],
+  "trust_decision": {
+    "summary": "Whether an attacker-supplied remote/local name may be used as a filename component is decided by validating it as a cluster name in the remote handlers (microceph/api/remote.go) and again at each file sink: the generic Config.WriteConfig/GetPath, DeleteRemoteDb and writeRemotePeerToken.",
+    "evidence": [
+      "microceph/api/remote.go:140-141",
+      "microceph/api/remote.go:159-166",
+      "microceph/ceph/configwriter.go:23-32",
+      "microceph/database/remote_extras.go:87-96",
+      "microceph/ceph/rbd_mirror.go:722-731",
+      "microceph/api/remote.go:78-80"
+    ]
+  },
+  "landing_point": {
+    "where": "microceph/api/remote.go:47",
+    "why": "The advisory names the remote-import API; cmdRemotePut hands req.Name and req.LocalName straight to renderConfAndKeyringFiles, which builds '<name>.conf' and '<name>.keyring' under the ceph conf dir, so this call is what a reader of the summary inspects first."
+  },
+  "fix_sites": [
+    {"where": "microceph/api/remote.go:39-50", "entry_point": "PUT /1.0/client/remotes/{name} (CLI: microceph remote import <name> <token>) — cmdRemotePut", "module_kind": "http handler (remote import)"},
+    {"where": "microceph/api/remote.go:77-96", "entry_point": "GET /1.0/client/remotes/{name} and GET /1.0/client/remotes — cmdRemoteGet", "module_kind": "http handler (remote query)"},
+    {"where": "microceph/api/remote.go:99-122", "entry_point": "DELETE /1.0/client/remotes/{name} (CLI: microceph remote remove) — cmdRemoteDelete", "module_kind": "http handler (remote delete)"},
+    {"where": "microceph/api/remote.go:124-129", "entry_point": "shared by the three remote handlers — validateRemoteName / validateRemoteImportRequest helpers (new in the fix)", "module_kind": "api validation helper"},
+    {"where": "microceph/ceph/configwriter.go:23-40", "entry_point": "every Config.WriteConfig caller: remote import (microceph/api/remote.go:145,159), UpdateConfig (microceph/ceph/config.go:421,444), ganesha/radosgw/bootstrap configs", "module_kind": "lower-level config-writer library"},
+    {"where": "microceph/ceph/rbd_mirror.go:708-742", "entry_point": "POST|PUT /1.0/ops/replication/{wl}/{name} → EnablePoolMirroring (microceph/ceph/rbd_mirror.go:178) → BootstrapPeer (microceph/ceph/rbd_mirror.go:322) → writeRemotePeerToken", "module_kind": "ceph subsystem file sink (rbd mirror peer token)"},
+    {"where": "microceph/ceph/rbd_mirror.go:731-741", "entry_point": "same replication route — file descriptor never closed; the fix adds defer file.Close()", "module_kind": "resource handling in the same sink"},
+    {"where": "microceph/constants/constants.go:90-93", "entry_point": "shared validator IsValidClusterName used by the handlers, DeleteRemoteDb and writeRemotePeerToken", "module_kind": "constants / validation helper"},
+    {"where": "microceph/database/remote_extras.go:71-98", "entry_point": "DELETE /1.0/client/remotes/{name} — cmdRemoteDelete → DeleteRemoteDb (os.Remove of <name>.conf and <name>.keyring)", "module_kind": "database helper that also removes conf files"},
+    {"where": "microceph/api/cluster.go:32-38", "entry_point": "GET /1.0/cluster (CLI: microceph cluster export <remote-name>) — cmdClusterGet; an existing regexp check is replaced/tightened", "module_kind": "http handler (cluster export)"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "microceph/ceph/configwriter.go:23-40"},
+  "O3_reason_to_dismiss": "The generic Config.WriteConfig is shared plumbing for radosgw/ganesha/bootstrap configs and is not part of the remote-import API, so a solver can scope the fix to the remote handlers and call this lower-level writer out of scope, trusting the handler-level name check.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "An absent/empty remote name on GET /1.0/client/remotes means 'list all remotes'; unconditionally rejecting a name that does not match ^[a-z0-9]+$ at the top of cmdRemoteGet (or inside GetRemoteDb) breaks `microceph remote list`. The published fix guards with an explicit `if remoteName != \"\"`.",
+    "where": "microceph/api/remote.go:78-80, microceph/database/remote_extras.go:41"
+  },
+  "O6_input_shapes": [
+    "URL path segment name for GET/DELETE (percent-decoded with url.PathUnescape) and now the PUT route name",
+    "JSON body remote name (req.Name), independent of the route name",
+    "route name and body name disagree (PUT client/remotes/<A> with body name <B>)",
+    "JSON body local name (req.LocalName), written into the keyring as client.<local_name>",
+    "reserved names ceph / ganesha / radosgw: syntactically valid cluster names that collide with fixed files in the conf dir",
+    "over-long names (the new regex caps cluster names at 63 chars)",
+    "config filenames ../escaped, /tmp/absolute and subdir/escaped (rejected at the generic writer)",
+    "empty name (list-all) which must keep working"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "microceph/database/remote.mapper.go:234", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "microceph/ceph/rbd_mirror.go:581-586", "sibling": "the read side of the mirror peer token path (peerBootstrapImport) builds ConfPath/rbd_mirror/<name>_peer_keyring with no validation; a caller that does not first go through writeRemotePeerToken would traverse", "why_realistic": "the fix hardens the write half at microceph/ceph/rbd_mirror.go:709 while the identical path construction two functions away is untouched, so a maintainer adding a re-import/repair command would copy the unvalidated form."},
+    {"where": "microceph/ceph/cephfs_snapshot.go:49-58", "sibling": "the CephFS mirror peer bootstrap could persist its token to a file named from remoteName, exactly like the RBD path", "why_realistic": "both replication paths mint a bootstrap token; the CephFS one currently only passes it as an argv value, so mirroring the RBD token-file design is the natural next change and would repeat the same sink."},
+    {"where": "microceph/api/remote.go:30-35", "sibling": "a client/remotes/{name}/token or .../keyring GET/PUT route that serves or rewrites the per-remote files", "why_realistic": "the endpoint already exposes per-name GET and DELETE and the files live in a known dir; a per-remote file-download route is the obvious extension and would need the same validator."}
+  ],
+  "O9_family": "CWE-23 relative path traversal (untrusted remote/local name used as a filename component)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.10 (microceph/go.mod:3); cgo with libdqlite (CI installs libdqlite1.17-dev); make build = go install -ldflags ... ./cmd/microceph ./cmd/microcephd; make check-unit = go test -cover ./...",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "no tests for the remote API at the pinned commit (no microceph/api/remote_test.go); microceph/ceph/configwriter_test.go covers config writing; unit suite is go test ./... (CI job unit-tests, .github/workflows/tests.yml:173-196); system/DSL suites need LXD+snapd and are not used for unit behaviour."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "microceph/api/cluster.go, microceph/api/remote.go, microceph/ceph/configwriter.go, microceph/ceph/rbd_mirror.go, microceph/constants/constants.go, microceph/database/remote_extras.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Sanitise req.Name (filepath.Base / regex) inside cmdRemotePut or filepath.Clean inside renderConfAndKeyringFiles and stop, leaving the DELETE route's os.Remove, the generic Config.WriteConfig, writeRemotePeerToken and the reserved names (ceph/ganesha/radosgw) open."
+  },
+  "out_of_scope_notes": [
+    "The fix commit also edits tests/scripts/adoptutils.sh (snap glob path in the adopt CI helper); that is test infrastructure, not the protection, and is excluded from the source count.",
+    "Other filenames built from names exist in the tree (microceph/ceph/service_placement_client.go:74 uses a service name; microceph/cmd/microcephd/adopt_bootstrapper.go:242 removes a constant relative path); neither is reachable from the remote API and neither was pursued."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell in this screen, so repo_mb is null and neither tiny_repo nor giant_repo is claimed.",
+    "The full advisory text was not supplied, only the one-line summary; whether it names the DELETE route, the cluster-export handler or the rbd token writer is unknown.",
+    "Latest release is reported as none, so present_in_latest / latest_where cannot be answered (O8 is empty).",
+    "O1 counts the five public entry points behind the fix's source changes (PUT/GET/DELETE client/remotes/{name}, GET /cluster, POST|PUT /ops/replication/{wl}/{name}); cmdClusterGet already had the ClusterNameRegex check at the pinned commit, so there only the error wrapping and the length limit changed.",
+    "Whether hidden tests exercise the handlers end-to-end (which needs a bootstrapped microcluster/dqlite state) or only pure helpers, as the fix's own tests do by calling unexported validateRemoteName/validateRemoteImportRequest directly, is unknown.",
+    "go test ./... passing offline from the pinned tree with a warm module cache and libdqlite present was not verified (no running of code allowed)."
+  ]
+}

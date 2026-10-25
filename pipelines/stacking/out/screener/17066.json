@@ -1,0 +1,91 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17066",
+  "advisory_ids": ["GHSA-C534-2W9C-X7FM", "GO-2026-6105"],
+  "repo": "kite-org/kite",
+  "pinned_commit": "d74c979deddb612e9b7d1066ccf7acee35b281f2",
+  "fix_commits": ["08116eed557f8d6982cc83af0b02991e0f3577d5", "69ad938937af8f375a2e183d1a331926ab851d98"],
+  "trust_decision": {
+    "summary": "Whether a caller may read the pods/services proxy subresource is decided once, in the route handler, by rbac.CanAccess(user, kind, \"get\", cluster, namespace) on the decoded route params — before pkg/kube builds the upstream URL with Kite's own service-account credentials.",
+    "evidence": ["pkg/proxy/handler.go:34", "pkg/proxy/handler.go:38", "pkg/kube/proxy.go:16", "pkg/kube/proxy.go:23"]
+  },
+  "landing_point": {
+    "where": "pkg/kube/proxy.go:64",
+    "why": "The summary says 'proxy path traversal', so an engineer follows pkg/proxy/handler.go:38 into kube.HandleProxy and lands on url.JoinPath, the line that lexically cleans '..' after the route parameters have already been decoded."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/kube/proxy.go:63-79",
+      "entry_point": "GET /api/v1/namespaces/:namespace/:kind/:name/proxy/*path — mounted twice on the same handler: routes.go:145-147 (default cluster) and routes.go:149-151 (under /api/v1/_clusters/:cluster)",
+      "module_kind": "handler"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "A solver can call the :name axis unreachable because a single Gin path segment cannot contain '/', and only notice the raw-path middleware turns %2f inside :name into a separator.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate nested proxy sub-paths must still be forwarded (e.g. /proxy/logs/ keeping its trailing slash, /proxy/api/v1/data/snapshot, /proxy/%2e%2e/secrets re-encoded rather than rejected), and an API-server host that already carries a path prefix (https://example.com/k8s/clusters/local) must keep it; rejecting any path containing '/' or escaping the whole proxy path breaks these.",
+    "where": "pkg/kube/proxy_test.go:24-32"
+  },
+  "O6_input_shapes": [
+    "plain '..' segments in the *path catch-all",
+    "deeper '..' chain reaching the cluster-scoped /api/v1/secrets",
+    "traversal hidden in the :name resource segment, with %2f-encoded separators",
+    "percent-encoded %2e%2e segments, which must be re-encoded (%252e%252e) rather than cleaned",
+    "legitimate nested proxy path /api/v1/data/snapshot",
+    "API-server host that already has a path prefix"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "pkg/middleware/raw_path.go:13-21", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/proxy/handler.go:21",
+      "sibling": "A second proxy route for another kind or subresource (e.g. nodes/CRD subresources) that reuses the same buildProxyURL sink.",
+      "why_realistic": "The handler already switches on a :kind param with an allowlist, so widening the allowlist is a one-line maintainer change that inherits the same URL construction."
+    },
+    {
+      "where": "pkg/cluster/cluster_manager.go:162-173",
+      "sibling": "The k8sProxyTransport already prefixes /api/v1/namespaces/<ns>/services/<svc>:<port>/proxy onto an outbound request and sends it with the API server's credentials.",
+      "why_realistic": "A maintainer adding an in-cluster add-on (metrics, dashboards) with a user-supplied path would reuse this transport and reintroduce the same path-prefix primitive outside buildProxyURL."
+    },
+    {
+      "where": "pkg/middleware/raw_path.go:10-21",
+      "sibling": "A second route that consumes once-decoded params with path semantics, where the check validates the escaped form instead of the decoded one.",
+      "why_realistic": "The middleware is global, so any new *path route inherits the same decoded identity while its own validation may assume a single segment."
+    }
+  ],
+  "O9_family": "path_traversal",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.0 (go.mod:3); Gin 1.12; Node + Playwright for the e2e suite",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/kube/proxy_test.go TestBuildProxyURL (pure URL-building, runs offline); the fix adds a new Playwright spec e2e/specs/proxy-path-escape.spec.ts that requires a live kind cluster and registry image pulls."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "pkg/kube/proxy.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a strings.Contains(proxyPath, \"..\") guard inside the HTTP handler (pkg/proxy/handler.go) and keep url.JoinPath, which still cleans the :name and host-prefix cases away."
+  },
+  "out_of_scope_notes": [
+    "pkg/terminal/kubectl_terminal_handler.go:118-138 creates a shared cluster-admin ServiceAccount and ClusterRoleBinding for the admin-only kubectl terminal; noticed, not pursued.",
+    "pkg/resources/pod_handler.go:290-296 passes a user-supplied path query value as an argument to ls/cat inside a pod via exec; a different sink, noticed, not pursued."
+  ],
+  "unverified": [
+    "repo MB could not be measured (no shell in this session), so tiny_repo/giant_repo was not assessed; repo_mb is null.",
+    "No latest release is provided ('none'), so present_in_latest for siblings is unknown; O8 is empty on the pinned tree.",
+    "Whether a hidden behavioural test can be graded offline: the URL construction itself is testable with httptest, but the repo's own end-to-end reproduction of this fix needs a kind cluster."
+  ]
+}

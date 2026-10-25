@@ -1,0 +1,83 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16994",
+  "advisory_ids": ["GHSA-9VCR-P3RJ-Q5Q6", "CVE-2026-49834", "GO-2026-5952"],
+  "repo": "sigstore/sigstore-go",
+  "pinned_commit": "7e8ee0fa3154ccfaf0183e6d5d7b218faca59bae",
+  "fix_commits": ["dbb07e62623edd5b175fb9dd5a41dcb85a159207"],
+  "trust_decision": {
+    "summary": "A bundle is accepted only if at least `threshold` independently verified witnesses exist; the deciding counts are the Rekor-entry counter at pkg/verify/tlog.go:196-201 and the SCT counter at pkg/verify/sct.go:90-97, and at the pinned commit both count items (entries, SCT-chain pairs) rather than distinct logs, so one compromised log meets a multi-log threshold.",
+    "evidence": ["pkg/verify/tlog.go:196-201", "pkg/verify/sct.go:88-97", "pkg/verify/tlog.go:51-58"]
+  },
+  "landing_point": {
+    "where": "pkg/verify/tlog.go:196-201",
+    "why": "The summary says 'multi-log threshold bypass via single compromised log', so an engineer opens the tlog threshold comparison first; the pre-existing duplicate-entry guard at pkg/verify/tlog.go:51-58, whose comment claims to stop duplicates being used 'to bypass the threshold', makes the function look already defended."
+  },
+  "fix_sites": [
+    {"where": "pkg/verify/tlog.go:196", "entry_point": "verify.VerifyTlogEntry (public func); also reached by (*verify.Verifier).Verify via VerifyTransparencyLogInclusion (pkg/verify/signed_entity.go:812) and by the deprecated verify.VerifyArtifactTransparencyLog (pkg/verify/tlog.go:218)", "module_kind": "public verification API (pkg/verify)"},
+    {"where": "pkg/verify/tlog.go:199-200", "entry_point": "verify.VerifyTlogEntry / (*verify.Verifier).Verify with WithTransparencyLog(threshold)", "module_kind": "public verification API (pkg/verify)"},
+    {"where": "pkg/verify/tlog.go:99-101", "entry_point": "verify.VerifyTlogEntry, whose returned []root.Timestamp is consumed by (*verify.Verifier).VerifyObserverTimestamps (pkg/verify/signed_entity.go:849-852)", "module_kind": "public verification API, integrated-timestamp producer"},
+    {"where": "pkg/verify/sct.go:53", "entry_point": "verify.VerifySignedCertificateTimestamp (public func); reached by (*verify.Verifier).Verify when WithSignedCertificateTimestamps is set (pkg/verify/signed_entity.go:679)", "module_kind": "public verification API (certificate transparency)"},
+    {"where": "pkg/verify/sct.go:88-91", "entry_point": "verify.VerifySignedCertificateTimestamp (per-chain increment in the inner chains loop)", "module_kind": "public verification API (certificate transparency)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "pkg/verify/sct.go:53-97"},
+  "O3_reason_to_dismiss": "The advisory names the transparency log; the SCT check is a separate certificate-transparency check against a different trust root (TrustedMaterial.CTLogs() rather than RekorLogs()), enabled by a different verifier option (WithSignedCertificateTimestamps), its own error text counts 'SCT entries' not logs, and VerifyTlogEntry's doc (pkg/verify/tlog.go:38-39) only promises 'unique transparency log entries' - so sct.go reads as a neighbouring feature rather than the same protection.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Bundles legitimately carry more than one entry from the same log, and one certificate legitimately carries several SCTs; these must still verify at threshold 1 and still contribute exactly one integrated timestamp, so the fix must dedupe the count rather than reject duplicate-log items, and it must key the dedupe on the log's key ID, not on its BaseURL/URI - Rekor v1 trusted roots may leave BaseURL empty (pkg/verify/tlog.go:112 rejects v2 entries without it), and root.Timestamp.URI is set from BaseURL at pkg/verify/tlog.go:100, so copying isDuplicateTSA's URI dedupe (pkg/verify/tsa.go:67-74) would collapse distinct v1 logs. The repo's own pinned test pkg/verify/sct_test.go:357-386 asserts that two SCTs from one log meet a threshold of 2, i.e. it encodes the vulnerable behaviour as expected.",
+    "where": "pkg/verify/tlog.go:99-101"
+  },
+  "O6_input_shapes": [
+    "several tlog entries with the same log key ID but different log index (the existing guard at pkg/verify/tlog.go:51-58 only rejects same key ID AND same index)",
+    "entries from one log where only some carry an inclusion promise (HasInclusionPromise) and others only an inclusion proof",
+    "several SCTs embedded in one leaf certificate that name the same CT log ID",
+    "one SCT that verifies against more than one chain returned by cert.Verify (pkg/root/certificate_authority.go:65), inflating the per-chain counter"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "pkg/bundle/bundle.go:300-327 materialises []*tlog.Entry from the bundle's protobuf/JSON tlog entries; the identity the count keys on is produced by pkg/tlog/entry.go:402-404 (LogKeyID() returns the raw LogId.KeyId bytes as a string)",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/verify/tsa.go:81-89", "sibling": "a TSA threshold that counts verified timestamps without deduping per authority", "why_realistic": "the same count-until-threshold helper is written three times (tlog.go, sct.go, tsa.go); the URI-keyed isDuplicateTSA at pkg/verify/tsa.go:67-74 is that mechanism written a third time, so a new option could easily omit it."},
+    {"where": "pkg/verify/signed_entity.go:849-851", "sibling": "an integrated-timestamp threshold that counts len(logTimestamps) with no dedupe of its own", "why_realistic": "it consumes the tlog producer's slice, so a maintainer adding a further timestamp option would naturally re-count the slice instead of the distinct logs."},
+    {"where": "pkg/bundle/bundle.go:300-327", "sibling": "a per-bundle-version branch that materialises tlog entries and enforces its own per-log rule", "why_realistic": "the version switch at pkg/bundle/bundle.go:101-124 already special-cases inclusion promise vs proof per bundle version, so a per-version log-count rule is a plausible addition on the deserialization path."},
+    {"where": "pkg/tlog/entry.go:402-404", "sibling": "a second log-identity accessor (for example keyed on the log's base URL) that a count could key on", "why_realistic": "Entry exposes both LogKeyID() and the raw TransparencyLogEntry(), so a counter keyed on GetLogId().KeyId versus the verifier's own ID is an easy divergence to write."}
+  ],
+  "O9_family": "CWE-345/CWE-347 improper verification of a cryptographic signature: a threshold is satisfied by non-distinct witnesses (verification bypass via one compromised transparency log)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 (go.mod:3); modules resolved from go.sum, no vendor directory present",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/verify/tlog_test.go, sct_test.go, tsa_test.go and signed_entity_test.go cover this area and run offline against the in-memory sigstore in pkg/testing/ca; test/e2e/e2e_test.go and test/conformance/main.go need a live Sigstore deployment. The pinned pkg/verify/sct_test.go:357-386 asserts the vulnerable expectation (two SCTs from one log meet a threshold of 2) and must be changed by a correct fix."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/verify/tlog.go, pkg/verify/sct.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a dedupe keyed on the log's BaseURL/URI (mirroring isDuplicateTSA at pkg/verify/tsa.go:67-74) or reject any bundle carrying two entries from the same log, instead of counting distinct log key IDs."
+  },
+  "out_of_scope_notes": [
+    "test/conformance/main.go and test/e2e/e2e_test.go are test harnesses (also network-dependent) and were not assessed as routes, per the ignore-tests rule."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell in this session); the 116-file tree with ~76 Go files suggests roughly 1-2 MB of source, hence the tiny_repo flag, but the size is inferred rather than measured.",
+    "Whether the composite observer-timestamp threshold at pkg/verify/signed_entity.go:862-863 is a bypass when one log plus one TSA is compromised - judged not a bypass because those are distinct trust roots, but not tested.",
+    "Whether cert.Verify (pkg/root/certificate_authority.go:65) returns more than one chain in a realistic Fulcio deployment was not exercised; multi-chain counting in pkg/verify/sct.go:88-91 is reported from the code shape only.",
+    "Buildability not executed (no shell); inferred from go.mod/go.sum and the absence of a vendor directory, so a first build needs module downloads.",
+    "present_in_latest / latest_where for O8: no O8 routes recorded and the task states no latest release is available for O8."
+  ]
+}

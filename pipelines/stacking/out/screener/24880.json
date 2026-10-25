@@ -1,0 +1,111 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "24880",
+  "advisory_ids": ["GHSA-9JJC-FW8X-FMWX", "CVE-2026-85058"],
+  "repo": "moquette-io/moquette",
+  "pinned_commit": "3f2e023913f0febc72181ffd39aa46fbaa15d47b",
+  "fix_commits": ["e23df019f6a11e22c7d2047d4f86d07095466c97", "f5a323fe782d1505c0097498cb22eb6ec6c96973"],
+  "trust_decision": {
+    "summary": "Whether a client may publish its Last Will on the will topic is decided in PostOffice.publishWill by authorizator.canWrite(topic, user, client), after the will PUBLISH is built and before publish2Subscribers routes it.",
+    "evidence": [
+      "broker/src/main/java/io/moquette/broker/PostOffice.java:324-341",
+      "broker/src/main/java/io/moquette/broker/Authorizator.java:122-130",
+      "fix.diff:24-27"
+    ]
+  },
+  "landing_point": {
+    "where": "broker/src/main/java/io/moquette/broker/PostOffice.java:324",
+    "why": "publishWill is the one method that builds a Last Will PUBLISH and hands it to the routing sink; the advisory names the will publish as the unguarded operation, so a reader starts here."
+  },
+  "fix_sites": [
+    {
+      "where": "broker/src/main/java/io/moquette/broker/PostOffice.java:324-341",
+      "entry_point": "MQTT CONNECT carrying the Will flag, fired either on abnormal connection loss (MQTTConnection.processConnectionLost) or on MQTT5 DISCONNECT with a non-normal reason code (MQTTConnection.processDisconnect)",
+      "module_kind": "broker core / message routing (single private sink for will publishes)"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "broker/src/main/java/io/moquette/persistence/H2SessionsRepository.java:166-226"
+  },
+  "O3_reason_to_dismiss": "The will topic is already in hand at the sink, so the persistence/serialization layer (H2 WillDataValueType, ISessionsRepository.Will) never has to carry the publisher's identity - the published guard itself proves it by passing \"\" and the synthetic WILL_PUBLISHER to canWrite.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A will the connecting client IS authorised to publish must still be delivered (and its retain flag / expiry properties still honoured): existing will tests connect with the default PermitAll policy and assert delivery, so an over-broad guard that drops wills whenever the identity is empty or no user rule matches breaks them.",
+    "where": "broker/src/test/java/io/moquette/integration/ServerLowlevelMessagesIntegrationTest.java:119-143"
+  },
+  "O6_input_shapes": [
+    "MQTT3 will topic (no will properties, delay interval 0) fired immediately by fireWill",
+    "MQTT5 will with will-delay-interval, fired later by ScheduledExpirationService -> publishWill, not by fireWill",
+    "will restored from the session store at broker start (recreateWillExpires -> ScheduledExpirationService -> publishWill)",
+    "single topic string only; the protocol gives no array/multi-value variant here, and QoS 0/1/2 plus the retain flag are orthogonal to the check"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "broker/src/main/java/io/moquette/persistence/H2SessionsRepository.java:166-226",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Server.internalPublish -> PostOffice.internalPublish -> publish2Subscribers with no canWrite call at all",
+      "where": "broker/src/main/java/io/moquette/broker/PostOffice.java:1065-1071",
+      "reason_to_dismiss": "documented as an embedded-only API deliberately written to avoid the security check (PostOffice.java:1055-1060, Server.java:594-603) and not reachable by an MQTT client",
+      "distance": "same file and package as the fix",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "broker/src/main/java/io/moquette/broker/PostOffice.java:340",
+      "sibling": "a second will-publish route that calls publish2Subscribers directly instead of going through publishWill",
+      "why_realistic": "MQTT5 will-delay already needs a deferred publish path, so a maintainer adding a retry, flush or 'publish will now' admin hook would naturally reach for the routing helper."
+    },
+    {
+      "where": "broker/src/main/java/io/moquette/persistence/H2SessionsRepository.java:180-220",
+      "sibling": "a persisted will record that also carries the owner's client id/username so the check can run with the real identity after a reload",
+      "why_realistic": "the will is already written and read field by field here; adding an identity field is the natural way to make the check identity-aware across restart."
+    },
+    {
+      "where": "broker/src/main/java/io/moquette/broker/Server.java:603-614",
+      "sibling": "an embedded publish entry that receives a publisher identity and is expected to consult canWrite",
+      "why_realistic": "Server already exposes internalPublish for embedding hosts and already takes a clientId argument, so wiring a policy check there is a small, plausible maintainer change."
+    }
+  ],
+  "O9_family": "missing authorization (CWE-862) on the Last Will publish",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Java",
+    "toolchain": "Maven multi-module (broker, distribution, embedding_moquette, metrics_prometheus); source/target 1.8; bnd-maven-plugin 6.4.0 and maven-checkstyle-plugin at validate; broker surefire runs **/*Test.java",
+    "services": ["none - embedded H2 store; tests bind MQTT on loopback 1883"],
+    "offline_after_build": true,
+    "project_tests": "broker/src/test/java/io/moquette/integration/ServerLowlevelMessagesIntegrationTest.java:119-172 (will fired on keep-alive expiry and on bad disconnection) and broker/src/test/java/io/moquette/integration/ServerIntegrationFuseTest.java:79-110 (will on connection kill); unit coverage in PostOfficePublishTest, MQTTConnectionConnectTest and SessionRegistryTest; the fix's WillUnauthorizedPublishTest does not exist at the pinned commit"
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "broker/src/main/java/io/moquette/broker/PostOffice.java",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Put the canWrite call in PostOffice.fireWill (the branch MQTTConnection calls) or reject the will at CONNECT, which leaves the will-delay/scheduler and post-restart restored-will route through publishWill unguarded and can judge the will with the wrong identity."
+  },
+  "out_of_scope_notes": [
+    "broker/src/main/java/io/moquette/broker/Server.java:432-433 POSTs telemetry to https://telemetry.moquette.io at startup (tests disable it via ENABLE_TELEMETRY_NAME); not pursued.",
+    "broker/src/main/java/io/moquette/broker/PostOffice.java:324-341 never calls manageRetain, so a will with the retain flag is routed but never stored in the retained repository - a separate functional gap beyond this advisory."
+  ],
+  "unverified": [
+    "repo_mb not measurable without a shell; left null.",
+    "Build not executed (reading/searching only): toolchain read from the poms; bnd-maven-plugin 6.4.0 needs a JDK 11+ runtime even though source/target are 1.8.",
+    "Whether hidden tests can require the will publisher's real identity: the published guard hard-codes user=\"\" and client=\"will_publisher\", so an identity-aware test would fail the reference fix; if tests only cover the anonymous topic-ACL case this host is in practice a single-site three-line guard.",
+    "O8 internalPublish is embedded-only and not reachable by an MQTT client, so treating it as in-scope for this advisory is a judgement call.",
+    "present_in_latest for O8 unknown: no latest release was provided."
+  ]
+}
