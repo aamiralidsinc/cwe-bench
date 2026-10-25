@@ -60,7 +60,9 @@ They differ in **how the hidden difficulty is made**:
 
 ## Machines
 
-The pipelines run on the VM (`~/cwe-bench`, a git checkout of this repo). The Mac checkout holds the sourcer's
+The pipelines run on the VM (`~/cwe-bench`, a git checkout of this repo since 2026-10-25). The pre-reorganisation tree is
+kept read-only at `~/cwe-bench-legacy-20261025`. On the VM, `git status` lists run data as changed or untracked: new
+records under `build/`, `tasks/` and `pipelines/*/out/`. That is expected. Code changes outside those folders are not. The Mac checkout holds the sourcer's
 candidate index (`sourcer/index/`, git-ignored) and runs the Mac-side steps (picking, ranking, selection reading).
 
 Not in git, because the data is large or secret:
