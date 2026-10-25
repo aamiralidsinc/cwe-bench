@@ -4,7 +4,7 @@
 # run_pipeline.sh <deepseek|mimo> <slug>
 # One candidate, end to end, model-driven generation + both-target trial:
 #   build (driver) -> gate (nop/oracle/patches) -> if sound, trial BOTH targets -> ledger.
-# Fairness/blind-fix are deferred to tasks that come back both-fail (validated separately).
+# Fairness is deferred to tasks that come back both-fail; the blind fix now runs with the gate (postbuild.sh).
 set -uo pipefail
 D=${1:?driver}; S=${2:?slug}
 R="$CWE_ROOT"; cd "$R" || exit 1
@@ -35,7 +35,10 @@ if [ "$tf" -lt 5 ]; then log build "stopped/failed: agent finished but left tf=$
 # The gate (nop/oracle/patches) and its retry policy live in one place: gate_one_ds.sh retries
 # only infrastructure errors, never task failures, and leaves exactly one of .sound / .unsound /
 # .gate_error (see its header). Its one-line result goes to the ledger.
-res=$(bash "$CWE_GATE_ONE" "$S" 2>>"$LOG"); rc=$?
+# 2026-10-25: post-build checks run together (common/gate/postbuild.sh: the gate with its stages in parallel,
+# and the blind fix), then the blind patch check; same exit codes as gate_one_ds.sh.
+bash "$CWE_COMMON/gate/postbuild.sh" "$S" >> "$LOG" 2>&1; rc=$?
+res="$S $(tail -1 "build/$S/postbuild.log" 2>/dev/null)"
 echo "gate: $res" >> "$LOG"
 case $rc in
   0) : ;;

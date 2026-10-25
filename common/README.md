@@ -24,6 +24,11 @@ instead of building paths from their own location. The repo root is the folder h
 
 ## Contracts other code relies on
 
+- **Post-build checks** (2026-10-25): `common/gate/postbuild.sh <slug> [--listing]` runs the gate (static, then
+  nop/oracle/patches in parallel), the blind fix and (stacking) the listing check at the same time, then the blind
+  patch check; both pipelines' build chains call it.
+- **Human decisions** (2026-10-25): `build/<slug>/HUMAN-DECISION.md` (`DECISION: KEEP|REPAIR|DROP`, `DATE:`) is the one
+  place a person's answer to a fairness question goes; `fairness/fairness_verdict.py` reports it.
 - **Gate fingerprint** (2026-10-25): `common/gate/fingerprint.py` records what a SOUND gate covered; trials and
   regrades refuse a task whose tests/solution/environment/checks changed since. See the re-gate rule in
   `pipelines/*/GUIDE.md`.

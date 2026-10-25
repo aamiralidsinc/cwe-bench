@@ -43,10 +43,14 @@ def main():
     ap.add_argument("job_id")
     ap.add_argument("--project-root", required=True, help="cwe-bench path ON THE BUILD MACHINE")
     ap.add_argument("--out-root", default=ROOT, help="where build/<slug>/BUILD-PROMPT.md is written")
+    ap.add_argument("--jobs-file", default=os.path.join(str(paths.STACKING_OUT), "reader_jobs.jsonl"),
+                    help="reader job list (scale run: out/reader_jobs_ds.jsonl)")
+    ap.add_argument("--reader-dir", default=os.path.join(str(paths.STACKING_OUT), "reader"),
+                    help="reader records (scale run: out/reader-ds)")
     a = ap.parse_args()
-    jobs = {j["id"]: j for j in (json.loads(l) for l in open(os.path.join(str(paths.STACKING_OUT), "reader_jobs.jsonl")) if l.strip())}
+    jobs = {j["id"]: j for j in (json.loads(l) for l in open(a.jobs_file) if l.strip())}
     job = jobs[a.job_id]
-    rec = json.load(open(os.path.join(str(paths.STACKING_OUT), "reader", f"{a.job_id}.json")))
+    rec = json.load(open(os.path.join(a.reader_dir, f"{a.job_id}.json")))
     if not rec.get("usable"):
         raise SystemExit(f"{a.job_id}: the reader marked this candidate not usable; not preparing a build")
     slug = slug_for(job)

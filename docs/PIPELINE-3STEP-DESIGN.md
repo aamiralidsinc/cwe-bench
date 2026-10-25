@@ -1,6 +1,6 @@
 # Three-step pipeline design (scale run)
 
-**Status:** design, 2026-10-25, from the project owner's brief. Not built yet; section 7 lists what to build.
+**Status:** built 2026-10-25 (section 7); runbook in `pipelines/router/README.md`. Dry run: see section 9.
 
 ## 1. The idea in one paragraph
 
@@ -73,19 +73,23 @@ ledger counts, checks each trajectory with Harbor's validator, and lists skipped
 stk-filebrowser and mockoon-ds (13 rollouts, all valid). The precision_validation runs have no trajectory (GitHub
 Actions kept none), so those tasks need VM runs before they can be delivered this way.
 
-## 7. What to build before launch
+## 7. Launch items (built 2026-10-25)
 
-| # | Item | Size |
+| # | Item | Where |
 |---|---|---|
-| 1 | Router: one script that reads the screen records and stacking's selection, writes the step-2 pool (exclusions above) and the step-3 queue, and is re-run as stacked verdicts arrive | small |
-| 2 | Parallel gate: run nop, oracle and each patch check of one task as concurrent Harbor jobs, then merge into the same `gate_verdict.json` / markers `gate_one_ds.sh` writes today | medium |
-| 3 | Parallel post-build checks: listing check, Docker gate and blind fix started together; trial queue waits for all three | small |
-| 4 | Decision file: `build/<slug>/HUMAN-DECISION.md` with a `DECISION: KEEP / REPAIR / DROP` line; `fairness_verdict.py` reports it (today decisions live in `HUMAN-REVIEW.md`, `NEEDS_HUMAN_REVIEW.md` "User decision" sections, or `build/audit/UNCOVERED-UPSTREAM-CLASS.md`, and the reader sees none of them) | small |
-| 5 | Stacking scale mode: skip control gate and control trials | small |
-| 6 | One dry run of the whole chain on 3–5 candidates before the full launch | half a day |
+| 1 | Router: stacking batch, step-2 pool, step-3 queue | `pipelines/router/route.py`, `README.md`; sibling lane folder overrides `LANE_RECS` / `LANE_PIPE` / `LANE_SUFFIX` |
+| 2 | Parallel gate: static, then nop / oracle / patches at the same time, each with its own report and retries; combined `gate_report.json` | `common/gate/gate_one_ds.sh`, `gate.py --report/--patch` |
+| 3 | Parallel post-build checks: listing (stacking), gate, blind fix together; then the blind patch check; fingerprint | `common/gate/postbuild.sh`, used by both build chains |
+| 4 | Decision file `build/<slug>/HUMAN-DECISION.md`, read by the fairness reader; 13 earlier decisions migrated | `common/fairness/fairness_verdict.py` |
+| 5 | Stacking scale mode: no control gate, no control trials (`STACK_CONTROLS=1` restores) | `run_stack_pipeline.sh`, `stk_queue.py` |
+| 6 | Dry run | section 9 |
 
-Done on 2026-10-25: blind-fix `/workspace` fix (tested on stk-dagu and mockoon-ds), gate fingerprint + re-gate
-rule, delivery exporter.
+Also done: blind-fix `/workspace` fix, gate fingerprint + re-gate rule, delivery exporter, DeepSeek screening of
+the whole OSV pool (771 repos) and the DeepSeek stacking reader (125 designs).
+
+Open point for the owner: `run_blindfix.sh` gives its agent only the instruction and the code, while
+`BLIND-FIX-BRIEF.md` (and the 2026-10-20 rule) says the soundness control is written with everything in view. So a
+failing blind patch is treated as a warning (`.blind_fail`), never as unsound.
 
 ## 8. Estimate: stacking screens the OSV pool
 
@@ -108,3 +112,7 @@ Grouping and scoring between the two stages are scripts and take minutes. The li
 account's rate limit, not the VM: the agents mostly wait on the model API. **Parallel 10 (about half a day) is the
 realistic plan**; try 20 if the account allows it. Step 2 needs no extra screening, because it reuses these
 records. The whole pool screened also gives step 2 a ranked pool for the rest of the scale run.
+
+## 9. Dry run
+
+(to be filled with the dry-run result)

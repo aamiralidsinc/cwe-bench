@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 . "$CWE_DOCKER_TUNING" 2>/dev/null || true
-# gate_one_ds.sh <slug> : gate one built task through nop/oracle/patches and leave exactly ONE
+# gate_one_ds.sh <slug> : gate one built task through static, then nop/oracle/patches IN PARALLEL, and leave exactly ONE
 # marker in build/<slug>/:
 #   .sound       every stage passed                                         (exit 0)
 #   .unsound     a stage failed on the TASK itself; deterministic, so it is
@@ -17,7 +17,7 @@
 # a missing or stale report now counts as an internal error, never as a pass or a fail.
 s=${1:?usage: gate_one_ds.sh <slug>}
 cd "$CWE_ROOT" || exit 2
-B="build/$s"; LOG="$B/recover.log"; P="$B/gate_report.partial.json"
+B="build/$s"; LOG="$B/recover.log"
 [ -d "$B" ] || { echo "$s: no $B"; exit 2; }
 # One gate per task at a time: two gates on one slug overwrite each other's reports and markers.
 exec 9>"$B/.gate.lock"
@@ -26,15 +26,20 @@ flock -n 9 || { echo "$s: another gate already holds $B/.gate.lock; not starting
 MAX_INFRA=4
 verdict=pass; vstage=""; vkind=""; verror=""
 echo "=== gate $s start $(date -u +%FT%TZ) ===" >> "$LOG"
-for st in nop oracle patches; do
+
+# One stage, with its infra retries. Each stage has its OWN report (gate_report.partial.<stage>.json),
+# stage record (.stage_result.<stage>.json) and log (recover.<stage>.log), so stages can run at once.
+# Result line "kind<TAB>summary" goes to .stage.<stage>.res.
+run_stage() {
+  local st=$1 a rc res kind err
+  local SP="$B/gate_report.partial.$st.json" KEEP="$B/.stage_result.$st.json" SL="$B/recover.$st.log"
+  : > "$SL"
   for a in $(seq 1 $MAX_INFRA); do
-    rm -f "$P"
-    python3 -I common/gate/gate.py "$s" --only "$st" >> "$LOG" 2>&1
+    rm -f "$SP"
+    python3 -I common/gate/gate.py "$s" --only "$st" --report "gate_report.partial.$st.json" >> "$SL" 2>&1
     rc=$?
     # kind<TAB>one-line summary, validated against slug + stage; anything else is "internal".
-    # The failing stage's FULL record (complete error, evidence lines, evidence_file) is kept in
-    # $B/.stage_result.json for gate_verdict.json; the log line names the evidence file.
-    res=$(python3 - "$P" "$s" "$st" "$rc" "$B/.stage_result.json" "$LOG" <<'PY'
+    res=$(python3 - "$SP" "$s" "$st" "$rc" "$KEEP" "$SL" <<'PY'
 import json, sys
 path, slug, stage, rc, keep, log = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5], sys.argv[6]
 def out(kind, summary, record):
@@ -67,8 +72,55 @@ PY
     [ "$kind" = infra ] || break
     [ "$a" -lt "$MAX_INFRA" ] && sleep $((30 * a))
   done
-  if [ "$kind" != pass ]; then verdict=$kind; vstage=$st; vkind=$kind; verror=$err; break; fi
+  printf '%s\n' "$res" > "$B/.stage.$st.res"
+}
+
+# static needs no Docker and is quick: it runs first, alone. Then nop, oracle and patches run AT THE SAME
+# TIME (2026-10-25; they are independent Harbor runs), unless GATE_STAGES_PARALLEL=0. The verdict is read
+# in the fixed order static, nop, oracle, patches, so it names the same failing stage the old one-at-a-time
+# loop would have named.
+STAGES="static nop oracle patches"
+rm -f "$B"/.stage.*.res
+run_stage static
+if [ "$(cut -f1 "$B/.stage.static.res")" = pass ]; then
+  if [ "${GATE_STAGES_PARALLEL:-1}" = 0 ]; then
+    for st in nop oracle patches; do
+      run_stage "$st"; [ "$(cut -f1 "$B/.stage.$st.res")" = pass ] || break
+    done
+  else
+    pids=()
+    for st in nop oracle patches; do run_stage "$st" & pids+=($!); sleep 2; done
+    wait "${pids[@]}"
+  fi
+fi
+for st in $STAGES; do cat "$B/recover.$st.log" >> "$LOG" 2>/dev/null; done
+for st in $STAGES; do
+  f="$B/.stage.$st.res"
+  if [ ! -f "$f" ]; then
+    # a later stage never ran because an earlier one failed (or was not reached): verdict already set
+    break
+  fi
+  res=$(cat "$f"); kind=${res%%$'\t'*}; err=${res#*$'\t'}
+  if [ "$kind" != pass ]; then
+    verdict=$kind; vstage=$st; vkind=$kind; verror=$err
+    cp -f "$B/.stage_result.$st.json" "$B/.stage_result.json" 2>/dev/null
+    break
+  fi
 done
+# Combined report (gate_report.json), the file run_stack_pipeline.sh and older tools read for "passed".
+python3 - "$B" "$s" "$verdict" "$vstage" <<'PY'
+import json, sys, time, glob, os
+b, slug, verdict, stage = sys.argv[1:5]
+stages = {}
+for st in ("static", "nop", "oracle", "patches"):
+    try:
+        stages[st] = json.load(open(os.path.join(b, f"gate_report.partial.{st}.json"))).get("stages", {}).get(st)
+    except Exception:
+        pass
+json.dump({"slug": slug, "passed": verdict == "pass", "verdict": verdict, "failed_stage": stage or None,
+           "stages": stages, "via": "common/gate/gate_one_ds.sh (stages in parallel)",
+           "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}, open(os.path.join(b, "gate_report.json"), "w"), indent=1)
+PY
 
 case "$verdict" in
   pass) mark=.sound;       code=0; word=SOUND ;;

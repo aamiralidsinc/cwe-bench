@@ -15,6 +15,14 @@ as READY. Three review formats exist; the newest one present wins:
             leniency, not unfairness (the 2026-10-19 audit); the source label says so.
 A missing file, no verdict in any format, or a fairness run that did not finish
 (build/<slug>/fairness_status.txt, written by pipelines/sibling/9-fairness/run_fairness.sh) is ERROR: a person decides.
+
+Human decisions (2026-10-25): build/<slug>/HUMAN-DECISION.md holds a `DECISION: KEEP|REPAIR|DROP` line and a
+`DATE: YYYY-MM-DD` line. It is the ONE place a person's answer to a fairness question is recorded (before this,
+answers sat in HUMAN-REVIEW.md, NEEDS_HUMAN_REVIEW.md "User decision" sections or build/audit/
+UNCOVERED-UPSTREAM-CLASS.md, which this reader never saw). KEEP reads as READY (it may overrule a NOT_READY the
+person judged stale or wrong); REPAIR and DROP read as NOT_READY. A decision dated before the current FAIRNESS.md
+was written is reported as stale and ignored. A review that sets `NEEDS_HUMAN_REVIEW: YES` with no current
+decision is reported with "human question open".
 """
 import re
 import sys
@@ -54,6 +62,28 @@ def labelled(text, label):
     return None
 
 
+DECISION = re.compile(r"(?mi)^\s*DECISION\s*:\s*(KEEP|REPAIR|DROP)\b")
+DATE = re.compile(r"(?mi)^\s*DATE\s*:\s*(\d{4}-\d{2}-\d{2})")
+NEEDS_HUMAN = re.compile(r"(?mi)^[\s>*`_|-]*NEEDS_HUMAN_REVIEW[*`_]*\s*[:=]\s*[*`_]*\s*YES")
+
+
+def human_decision(slug):
+    """(decision, date, stale) from build/<slug>/HUMAN-DECISION.md, or None."""
+    f = ROOT / "build" / slug / "HUMAN-DECISION.md"
+    if not f.is_file():
+        return None
+    t = f.read_text(errors="replace")
+    d, dt = DECISION.search(t), DATE.search(t)
+    if not d:
+        return None
+    fair = ROOT / "build" / slug / "FAIRNESS.md"
+    stale = False
+    if dt and fair.is_file():
+        import datetime as _dt
+        stale = dt.group(1) < _dt.datetime.fromtimestamp(fair.stat().st_mtime, _dt.timezone.utc).strftime("%Y-%m-%d")
+    return d.group(1).upper(), (dt.group(1) if dt else "undated"), stale
+
+
 def verdict(slug):
     b = ROOT / "build" / slug
     st = b / "fairness_status.txt"
@@ -75,9 +105,24 @@ def verdict(slug):
     return "ERROR", "FAIRNESS.md states no verdict in any known format"
 
 
+def final(slug):
+    """The review's verdict, then a current human decision on top of it."""
+    v, why = verdict(slug)
+    hd = human_decision(slug)
+    if hd and not hd[2]:
+        dec, date, _ = hd
+        base = f"{v} ({why})" if v != "ERROR" else f"ERROR: {why}"
+        return ("READY" if dec == "KEEP" else "NOT_READY"), f"human decision {dec} {date}; review said {base}"
+    note = f"; stale human decision {hd[0]} {hd[1]} (older than FAIRNESS.md)" if hd else ""
+    f = ROOT / "build" / slug / "FAIRNESS.md"
+    if v != "ERROR" and f.is_file() and NEEDS_HUMAN.search(f.read_text(errors="replace")):
+        note += "; human question open (NEEDS_HUMAN_REVIEW: YES, no decision in HUMAN-DECISION.md)"
+    return v, why + note
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit("usage: fairness_verdict.py <slug>")
-    v, why = verdict(sys.argv[1])
+    v, why = final(sys.argv[1])
     print(f"{v} ({why})" if v != "ERROR" else f"ERROR: {why}")
     sys.exit({"READY": 0, "NOT_READY": 1}.get(v, 2))

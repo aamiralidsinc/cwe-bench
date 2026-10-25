@@ -3,14 +3,11 @@
 # For ONE stacked slug (built from pipelines/stacking/2-prepare/build_prepare_stack.py) and its control:
 #   1. build      : common/launch/drive.sh deepseek bash common/launch/run_build.sh SLUG        (unchanged sibling launcher)
 #   2. check      : python3 -I pipelines/stacking/3-build-gate/check_stack.py SLUG           (stacking static check)
-#   2b. listing   : common/launch/drive.sh deepseek bash pipelines/stacking/4-listing/run_listing_check.sh SLUG  (build rule 7).
-#                   With pipelines/stacking/4-listing/LISTING_ENFORCE: a FAIL/ERROR keeps the build but withholds .sound
-#                   and writes .listing_fail, exit 3. Without it (reviewer not yet calibrated): advisory,
-#                   .listing_warn only, the task is marked sound as before.
-#   3. gate       : python3 -I common/gate/gate.py SLUG                    (unchanged)
-#   4. blind fix  : common/launch/drive.sh deepseek bash common/blindfix/run_blindfix.sh SLUG      (unchanged)
-#   5. mark       : build/<slug>/.sound when steps 2-4 pass; then the control is gated and marked
-#                   sound on its own (its failure never blocks SLUG). Trials run from
+#   3. postbuild  : bash common/gate/postbuild.sh SLUG --listing  (2026-10-25: listing check, gate and blind fix
+#                   run AT THE SAME TIME, then the blind patch check; .sound/.unsound/.gate_error/.listing_fail).
+#                   With pipelines/stacking/4-listing/LISTING_ENFORCE a listing FAIL/ERROR withholds .sound (exit 3);
+#                   without it the listing result is advisory (.listing_warn).
+#   4. control    : only with STACK_CONTROLS=1 (scale run default: skipped); its failure never blocks SLUG. Trials run from
 #                   pipelines/stacking/6-trial/stk_queue.py trial, or the unchanged
 #                   common/trial/trial_set.sh 'stk-*' <deepseek|mimo> picks it up (early exit:
 #                   stop a model at its first solve; 3 runs only while it keeps failing).
@@ -39,42 +36,21 @@ python3 -I pipelines/stacking/3-build-gate/check_stack.py "$SLUG" >> "$L" 2>&1 |
 CTL=$(python3 -c "import json; print((json.load(open('build/$SLUG/manifest.json')).get('stacking') or {}).get('control_slug',''))")
 [ -n "$CTL" ] || { log "STOP: manifest has no stacking.control_slug"; exit 1; }
 
-# Listing check (build rule 7, 2026-10-24): does instruction.md list the hidden traps? Read-only and
-# cheap, so it runs before the gates; one retry on a review error. The result decides .sound below.
-log "listing: check"
-for try in 1 2; do
-  "$CWE_DRIVE" deepseek bash pipelines/stacking/4-listing/run_listing_check.sh "$SLUG" >> "$L" 2>&1
-  python3 -I pipelines/stacking/4-listing/listing_verdict.py "$SLUG" >> "$L" 2>&1; LST=$?
-  [ "$LST" -ne 2 ] && break
-done
-log "listing: $(python3 -I pipelines/stacking/4-listing/listing_verdict.py "$SLUG" | head -1)"
-
-log "gate: $SLUG"
-python3 -I common/gate/gate.py "$SLUG" >> "$L" 2>&1
-gate_ok "$SLUG" || { log "STOP: gate failed for $SLUG"; exit 1; }
-
-log "blind fix: $SLUG"
-"$CWE_DRIVE" deepseek bash common/blindfix/run_blindfix.sh "$SLUG" >> "$L" 2>&1
-python3 -I common/gate/gate.py "$SLUG" --only patches >> "$L" 2>&1
-gate_ok "$SLUG" || { log "STOP: patch checks failed after the blind fix"; exit 1; }
-
-# The listing check gates only once its reviewer is calibrated (2026-10-24): until
-# pipelines/stacking/4-listing/LISTING_ENFORCE exists (created after pipelines/stacking/4-listing/listing_calibrate.py agrees with the batch-1
-# audit), a FAIL or ERROR is recorded as build/SLUG/.listing_warn and the task is marked sound as before.
-if [ "$LST" -ne 0 ] && [ -f pipelines/stacking/4-listing/LISTING_ENFORCE ]; then
-  rm -f "build/$SLUG/.sound" "build/$SLUG/.listing_warn"; touch "build/$SLUG/.listing_fail"
-  log "LISTING: $SLUG is gated but its instruction lists hidden traps (or the check errored); not marked sound. Rewrite the instruction (build rule 7) and copy it to the control $CTL, re-run pipelines/stacking/4-listing/run_listing_check.sh, then mark it."
-  exit 3
+# Post-build checks, all AT THE SAME TIME (common/gate/postbuild.sh, 2026-10-25): the listing check (build
+# rule 7), the gate (static, then nop/oracle/patches in parallel, with infra retries and the gate fingerprint)
+# and the blind fix; then the blind patch check. It leaves .sound / .unsound / .gate_error / .listing_fail.
+log "postbuild: listing + gate + blind fix in parallel"
+bash common/gate/postbuild.sh "$SLUG" --listing >> "$L" 2>&1; PRC=$?
+case $PRC in
+  0) log "SOUND: $SLUG ready for trials" ;;
+  3) log "LISTING: $SLUG is gated but its instruction lists hidden traps (or the check errored); not marked sound. Rewrite the instruction (build rule 7) and copy it to the control $CTL, re-run pipelines/stacking/4-listing/run_listing_check.sh, then mark it."; exit 3 ;;
+  *) log "STOP: postbuild exit $PRC for $SLUG (see build/$SLUG/postbuild.log)"; exit 1 ;;
+esac
+# Scale run (owner decision 2026-10-25): controls are not gated or trialled unless STACK_CONTROLS=1.
+if [ "${STACK_CONTROLS:-0}" != 1 ]; then
+  log "control $CTL: skipped (scale mode; set STACK_CONTROLS=1 to gate it)"; exit 0
 fi
-rm -f "build/$SLUG/.listing_fail" "build/$SLUG/.listing_warn"
-if [ "$LST" -ne 0 ]; then
-  touch "build/$SLUG/.listing_warn"
-  log "LISTING (advisory; reviewer not calibrated, no pipelines/stacking/4-listing/LISTING_ENFORCE): verdict exit $LST recorded in build/$SLUG/.listing_warn; marking sound as before"
-fi
-touch "build/$SLUG/.sound"
-log "SOUND: $SLUG ready for trials"
 # The control is lowest priority (user, 2026-10-22): a failed control gate never blocks its stacked task.
 log "gate: $CTL (control)"
-python3 -I common/gate/gate.py "$CTL" >> "$L" 2>&1
-if gate_ok "$CTL"; then touch "build/$CTL/.sound"; log "SOUND: $CTL (control) ready for trials"
+if bash common/gate/gate_one_ds.sh "$CTL" >> "$L" 2>&1; then log "SOUND: $CTL (control) ready for trials"
 else log "control gate failed for $CTL; the stacked task stays sound, the control is not trialled"; fi

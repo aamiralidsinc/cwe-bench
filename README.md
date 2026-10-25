@@ -14,6 +14,7 @@ runs, every failing run passes an independent audit, and a fairness review finds
 |---|---|
 | run or extend the **sibling-injection** pipeline | `pipelines/sibling/GUIDE.md`, then `COMPONENTS.md` |
 | run or extend the **stacking** pipeline | `pipelines/stacking/GUIDE.md`, then `COMPONENTS.md` |
+| run the **three-step scale run** | `pipelines/router/README.md` |
 | understand the shared gate, trial, audit and launch tools | `common/README.md` |
 | find new candidate advisories | `sourcer/README.md` |
 | see results | `reports/BREAKERS.md`, `reports/SINGLE-MODEL-BREAKERS.md`, `reports/stacking-night-20261025.md` |
@@ -31,6 +32,8 @@ pipelines/
                      upgrade; out/ (batch records); archive/ (old versions, one-offs)
   stacking/          stacking: 1-select 2-prepare 3-build-gate 4-listing 5-upgrade 6-trial 7-fairness 8-fairfix;
                      out/; archive/
+  router/            the three-step scale run: stacking first, sibling on the rest, sibling on solved stacked
+                     tasks (README.md, route.py; design in docs/PIPELINE-3STEP-DESIGN.md)
 sourcer/             advisory sourcing (OSV index, scoring); reserve/ holds the reserve sources (R1-R5)
 experiments/         precision_validation/: a FAILED experiment, kept for the record. Do not use (see its README)
 reports/             breaker registers and run reports

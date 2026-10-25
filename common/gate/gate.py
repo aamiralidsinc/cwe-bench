@@ -642,11 +642,17 @@ def check_oracle(task: Path, n: int = 2) -> dict:
     return {"ok": True, "trials": [r["trial_dir"] for r in runs]}
 
 
-def check_patches(task: Path, build: Path, manifest: dict) -> dict:
+def check_patches(task: Path, build: Path, manifest: dict, only=()) -> dict:
     out = {}
     checks = [c for c in manifest.get("patch_checks", [])
               # blind fix produced later by run_blindfix; validated in the --only patches re-gate
               if not (c.get("kind") == "blind" and not (build / "checks" / c["patch"]).is_file())]
+    if only:
+        checks = [c for c in checks if c["patch"] in only]
+        missing = sorted(set(only) - {c["patch"] for c in checks})
+        if missing:
+            # a wrong call, not a task verdict: main() reports it as an internal error
+            raise RuntimeError(f"patches: --patch {missing} not in manifest patch_checks (or file missing)")
 
     def one(patch):
         with tempfile.TemporaryDirectory(prefix="gate-") as tmp:
@@ -699,6 +705,10 @@ def main() -> int:
     ap.add_argument("slug")
     ap.add_argument("--only", choices=["static", "nop", "oracle", "patches"])
     ap.add_argument("--keep-jobs", action="store_true", help="kept for compatibility; jobs are always kept")
+    ap.add_argument("--report", default="", help="with --only: report file name in build/<slug>/ (default "
+                    "gate_report.partial.json); gate_one_ds.sh gives each concurrent stage its own file")
+    ap.add_argument("--patch", action="append", default=[], help="with --only patches: check only these patch "
+                    "files (repeatable); postbuild.sh uses it for the blind patch after the blind fix")
     args = ap.parse_args()
 
     task, build = ROOT / "tasks" / args.slug, ROOT / "build" / args.slug
@@ -728,7 +738,7 @@ def main() -> int:
             elif stage == "oracle":
                 report["stages"][stage] = check_oracle(task, 3 if strict(manifest) else 2)
             else:
-                report["stages"][stage] = check_patches(task, build, manifest)
+                report["stages"][stage] = check_patches(task, build, manifest, only=args.patch)
         report["passed"] = not args.only
         report["partial"] = bool(args.only)
         report["verdict"] = "pass"
@@ -752,7 +762,7 @@ def main() -> int:
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if build.is_dir():
         # A partial run (--only) must never overwrite the full report that a trial relies on.
-        out = "gate_report.partial.json" if args.only else "gate_report.json"
+        out = (args.report or "gate_report.partial.json") if args.only else "gate_report.json"
         tmp = build / (out + ".tmp")
         tmp.write_text(json.dumps(report, indent=1))
         tmp.replace(build / out)

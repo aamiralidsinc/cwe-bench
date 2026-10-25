@@ -7,7 +7,7 @@ set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 D=${1:?usage: pipelines/sibling/4-select/select.sh <deepseek|mimo>}
 R="$CWE_ROOT"; cd "$R" || exit 1
-P=pipelines/sibling/out/pipeline
+P=${LANE_PIPE:-pipelines/sibling/out/pipeline}   # the router sets LANE_PIPE for steps 2 and 3
 mkdir -p "$P"
 POOL=$P/pool.jsonl
 [ -s "$POOL" ] || { echo "no pool ($POOL); run pipelines/sibling/4-select/lane.py pool" >&2; exit 2; }

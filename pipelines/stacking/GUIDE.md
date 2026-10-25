@@ -32,7 +32,8 @@ the scripts refuse to run without `MODEL`.
 ```
 [Mac]  1-select: screen -> H4/H3/SZZ -> reader jobs -> reader (Opus) -> score -> out/batch1.txt (chosen by hand)
 [VM]   2-prepare -> 6-trial/stk_queue.py build (= 3-build-gate/run_stack_pipeline.sh per slug:
-         build -> normalize -> check -> listing -> gate -> blind fix -> .sound -> control gate)
+         build -> normalize -> check -> postbuild [listing | gate (stages in parallel) | blind fix] -> blind patch check
+         -> .sound + fingerprint -> control gate only with STACK_CONTROLS=1 (scale run: skipped))
        (optional, separate) 5-upgrade: instruction-only rewrite of already-built tasks
        6-trial/stk_queue.py trial -> audit every graded run -> fairness after a model fails 3/3
        -> repair loop (fairfix / test fix, gate, re-trial) -> breaker review (NEEDS_HUMAN_REVIEW.md)

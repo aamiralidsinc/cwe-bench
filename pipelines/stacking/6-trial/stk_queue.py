@@ -62,7 +62,10 @@ def build_jobs(slugs, retry):
 def trial_jobs():
     sound = sorted(d for d in os.listdir(os.path.join(ROOT, "build"))
                    if d.startswith("stk-") and os.path.isfile(os.path.join(ROOT, "build", d, ".sound")))
-    order = [s for s in sound if not s.endswith("-control")] + [s for s in sound if s.endswith("-control")]
+    order = [s for s in sound if not s.endswith("-control")]
+    # Scale run (owner decision 2026-10-25): no control trials unless STACK_CONTROLS=1.
+    if os.environ.get("STACK_CONTROLS", "0") == "1":
+        order += [s for s in sound if s.endswith("-control")]
     jobs = []
     for s in order:
         for m in MODELS:

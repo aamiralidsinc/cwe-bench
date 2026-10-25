@@ -13,8 +13,11 @@ sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 
 import paths  # noqa: E402  (repo locations: common/paths.py)
 
 ROOT = str(paths.ROOT)
-RECS = os.path.join(str(paths.SIBLING_OUT), "screener")
-PIPE = str(paths.SIBLING_OUT / "pipeline")
+# Folder overrides (2026-10-25, three-step scale run): the router gives steps 2 and 3 their own screen pool and
+# pipeline folder, e.g. LANE_RECS=pipelines/router/out/step2/screener LANE_PIPE=pipelines/router/out/step2/pipeline
+# LANE_SUFFIX=s2. Unset, the lane works on the sibling2 folders exactly as before.
+RECS = os.path.abspath(os.environ.get("LANE_RECS") or os.path.join(str(paths.SIBLING_OUT), "screener"))
+PIPE = os.path.abspath(os.environ.get("LANE_PIPE") or str(paths.SIBLING_OUT / "pipeline"))
 
 
 def load(name, rel):
@@ -34,7 +37,7 @@ def prepare(driver):
     pl = load("prepare_lane", "pipelines/sibling/5-prepare/prepare_lane.py")      # for PLAN and VM_ROOT, read as is
     bp = load("build_prepare", str(paths.BUILD_PREPARE))
     bp.RECORDS = RECS
-    suffix = "ds" if driver == "deepseek" else "mm"
+    suffix = os.environ.get("LANE_SUFFIX") or ("ds" if driver == "deepseek" else "mm")
     sel = json.load(open(os.path.join(PIPE, f"selection_{driver}.json")))
     specdir = os.path.join(PIPE, f"specs_{driver}")
     os.makedirs(specdir, exist_ok=True)
