@@ -40,5 +40,5 @@ Source: overnight hardening→trial run 2026-10-21→22 (hardening dropped from 
 | task | who failed | evidence | note |
 |------|-----------|----------|------|
 | knowns-ds | DeepSeek (0/3 on the VM, 0/3 in the at-risk re-trial) | MiMo solved the delivered package 1.0 (at-risk ta04, `ext-actions-atrisk-knowns-ds-mimo-a2`) | withdrawn from BREAKERS.md |
-| pv-spring-ws | DeepSeek (0/3, trusted medium) | MiMo a4 failed only the unfair XmppForeignDomain test | listed as a breaker by the ledger; see BREAKERS.md |
+| pv-spring-ws | DeepSeek (0/3 [0.8,0.8,0.6], trusted medium) | MiMo a4 = 1.0 after the unfair XmppForeignDomain test was removed and the runs rescored | fairness READY otherwise; ledger agrees (rejected, MiMo solved) |
 

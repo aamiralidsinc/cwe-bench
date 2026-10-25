@@ -26,17 +26,20 @@ control) and trialled on GitHub Actions under a strict no-network harness. The r
 folder as `ext-actions-*` (build/audit/EXTERNAL-RUNS.md), so they appear in the ledger under the track
 `precision-validation`. Each failing run was audited by an Opus 5.5-high sub-agent from the tests, grading output,
 harness logs and build records; the Actions artifacts kept **no final code and no transcript**, so every audit is
-at medium confidence (project-owner rule: missing logs are not a reason to distrust a run). Fairness review: not run.
+at medium confidence (project-owner rule: missing logs are not a reason to distrust a run). Fairness review
+(2026-10-25, DeepSeek reviewer + Opus validation of every NOT_READY or disputed point): READY for quarkus, pacioli,
+device-builder, apostrophe; svgo NOT_READY but the breaker holds (every run fails a fair test); see
+`build/<slug>/FAIRNESS.md` and `FAIRNESS-VALIDATION.md`.
 
 | # | task | arm | DeepSeek | MiMo | audit | what the models missed | open issue |
 |---|------|-----|----------|------|-------|------------------------|------------|
 | 16 | pv-quarkus | A | failed 0/3 [0,0.9091,0.7273] | failed 0/3 [0,0,0] | trusted model-failed medium (6/6) | encoded `;` and NUL spellings of a protected servlet path (security miss at a far site); 4 runs also over-normalised a protected route (fair regression, zeroes the reward) | functional test pins exact 401/403 (a 400 would fail) |
-| 17 | pv-svgo | B | failed 0/3 [0,0,0] | failed 0/4 [0,0,0,0] | trusted model-failed medium (7/7) | animation value-lists and data-URL anchors left executable (security miss), in every run | 1 functional + 4 security tests demand frame elements stay (instruction never says so): repair before shipping; gate never finished (blind patch missing) |
+| 17 | pv-svgo | B | failed 0/3 [0,0,0] | failed 0/4 [0,0,0,0] | trusted model-failed medium (7/7) | animation value-lists and data-URL anchors left executable (security miss), in every run | fairness NOT_READY (validated): `<animate>`-must-be-absent and frames-must-survive assertions are unfair (the reviewer's anchor claim was wrong); **breaker holds**, every run fails a fair test (3 runs rest only on `elements_from_other_vocabularies_keep_their_content`). Tests need repair before shipping; gate never finished (blind patch missing) |
 | 18 | pv-pacioli | B | failed 0/3 [0.75,0.75,0.875] | failed 0/3 [0.875,0.75,0.75] | trusted model-failed medium (6/6) | one act's authority carried to another document via a cascade or an amended copy (security miss) | cascade test rests on a per-level reading; one instruction sentence would settle it |
 | 19 | pv-device-builder | B | failed 0/3 [0,0.6,0.6] | failed 0/3 [0.8,0.6,0.6] | trusted model-failed medium (6/6) | pre-login WebSocket summary command and the config-download path left open (security miss) | none found |
 | 20 | pv-apostrophe | B | failed 0/3 [0.7,0.95,0.95] | failed 0/3 [0.75,0.65,0.7] | trusted model-failed medium (6/6) | meta-refresh destinations (unreported route) skipped or only partly covered (security miss) | 2 SMIL tests are defence-in-depth; the bundled refresh test hides which variant failed |
-| — | pv-spring-ws | A | failed 0/3 [0.7273,0.7273,0.5455] | ledger: failed 0/3 (+1 untrusted) | DS 3/3 trusted; MiMo 3/4 trusted, a4 untrusted | JMS indirection/alias and mail localhost/cc destinations (security miss) | **XmppForeignDomain test is unfair** (7/7 runs fail it); MiMo a4 failed only that test, so it is effectively a MiMo solve → treat as **DeepSeek-only** unless the test is repaired and MiMo re-run. The ledger still lists it as a breaker |
-| — | pv-nx | B | 5 runs 0.8667, untrusted | — | instruction-ambiguity (5/6), harness (1/6) | — | tests reject a sanctioned refusal; **not a breaker** until tests are repaired and re-run |
+| — | pv-spring-ws | A | failed 0/3 [0.8,0.8,0.6] | **SOLVED** (a4, rescored) | DS 3/3 trusted | JMS indirection/alias and mail localhost/cc destinations (security miss) | XmppForeignDomain test ruled unfair (Opus validation) and **removed**; all 7 runs rescored from saved results (`common/audit/rescore_from_results.py`): MiMo a4 = 1.0. **DeepSeek-only**, moved to SINGLE-MODEL-BREAKERS.md |
+| — | pv-nx | B | 5 runs 0.8667, untrusted | — | instruction-ambiguity (5/6), harness (1/6) | — | fairness NOT_READY (validated): both decisive tests reject a sanctioned refusal. Repair changes what they accept, so the old runs **cannot be rescored** (no code): needs repair + new runs |
 
 Not imported (single-model or unfinished in precision_validation): DeepSeek-only pv-wire, pv-cline, pv-izpack;
 MiMo-only pv-vllm, pv-axios; unfinished pv-nuclei, pv-angular (DeepSeek 0/3, MiMo never finished).
