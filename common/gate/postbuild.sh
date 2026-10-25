@@ -55,14 +55,10 @@ if [ "$BRC" = 0 ] && [ -f "$B/checks/blind.patch" ]; then
   else
     # run_blindfix.sh gives its agent only the instruction and the code, so a failing blind patch can be a
     # model miss rather than an unsound task: it does not block. It is unwired (so later gates do not fail on
-    # it) and kept for review as checks/blind.failed.patch + .blind_fail.
+    # it: the file is moved aside) and kept for review as checks/blind.failed.patch + .blind_fail.
+    # The manifest keeps its declared blind entry (the static stage requires the declaration); without the
+    # file the gate skips that check.
     mv -f "$B/checks/blind.patch" "$B/checks/blind.failed.patch"
-    python3 - "$B/manifest.json" <<'PY'
-import json, sys
-p = sys.argv[1]; m = json.load(open(p))
-m["patch_checks"] = [c for c in m.get("patch_checks", []) if c.get("patch") != "blind.patch"]
-json.dump(m, open(p, "w"), indent=1)
-PY
     touch "$B/.blind_fail"
     log "blind patch check: FAILED (kept as checks/blind.failed.patch, unwired; .blind_fail). Not blocking."
   fi

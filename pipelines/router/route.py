@@ -164,21 +164,58 @@ def solved_cells():
     return out
 
 
+def reader_job(job_id):
+    for f in sorted(SO.glob("reader_jobs*.jsonl")) + sorted(SO.glob("batch1-selection-*/reader_jobs.jsonl")):
+        for l in open(f):
+            if l.strip():
+                j = json.loads(l)
+                if j.get("id") == job_id:
+                    return j
+    return None
+
+
+def screen_job_for(slug, job):
+    """A screener job for a solved stacked task's repo that was never screened (H3 pairs need no screen):
+    its advisories and fix commits come from the stacking reader job."""
+    c = job.get("candidate") or {}
+    fixes = [x for x in (job.get("pin_from") or [])] + [x for x in str(c.get("b_fix", "")).split(";") if x]
+    eid = "s3-" + slug
+    row = {"entry_id": eid, "ids": " ".join(x for x in (c.get("a"), c.get("b"), c.get("entry")) if x),
+           "cve": "", "repo": norm(job["repo"]), "cwe_ids": str(c.get("cwes", "")).replace(";", " "),
+           "summary": c.get("family") or c.get("summary") or f"stacked task {slug} (solved); its advisories",
+           "parent_commit": None, "fix_commits": " ".join(fixes), "language": c.get("language", ""),
+           "score": 0, "published": ""}
+    return {"id": f"scr-{eid}", "entry_id": eid, "repo": norm(job["repo"]), "row": row}
+
+
 def step3(a):
     led = solved_cells()
     by_repo = screens_by_repo()
+    own = OUT / "step3" / "screens"            # DeepSeek screens made for step 3 (see --screen-missing)
+    if own.is_dir():
+        for f in sorted(own.glob("*.json")):
+            if f.name.startswith(("_", ".")) or f.name.endswith(".run.json"):
+                continue
+            try:
+                by_repo.setdefault(norm(json.loads(f.read_text()).get("repo")), f)
+            except Exception:
+                pass
     built = built_repos()
+    missing = []
     d = OUT / "step3"; (d / "screener").mkdir(parents=True, exist_ok=True); (d / "pipeline").mkdir(parents=True, exist_ok=True)
     state = d / "routed.tsv"
     done = {l.split("\t")[0] for l in state.read_text().splitlines()[1:]} if state.is_file() else set()
     sel_p = d / "pipeline" / "selection_deepseek.json"
     sel = json.loads(sel_p.read_text()) if sel_p.is_file() else []
     new = []
+    routed_repos = {norm(x.get("repo", "")) for x in sel if x.get("repo")}
     for b in batches():
         for r in batch_rows(b):
             slug = r["slug"]
             if slug in done or slug not in led:
                 continue
+            if norm(r["repo"]) in routed_repos:
+                continue                                  # one sibling task per repo
             ds, mm, verdict = led[slug]
             if not (ds or mm):
                 continue
@@ -188,12 +225,19 @@ def step3(a):
                 continue
             f = by_repo.get(norm(r["repo"]))
             if not f:
-                print(f"  {slug}: solved, but no DeepSeek screen record for {r['repo']}; not routed"); continue
+                j = reader_job(r.get("job_id", ""))
+                if j:
+                    missing.append(screen_job_for(slug, j))
+                print(f"  {slug}: solved, but {r['repo']} has no DeepSeek screen yet; "
+                      + ("screen job written (--screen-missing)" if j else "no reader job found; not routed"))
+                continue
             rec = json.loads(f.read_text())
-            shutil.copy2(f, d / "screener" / f.name)
-            sel.append({"entry_id": str(rec.get("entry_id") or f.stem), "source": "step3", "from_stacked": slug,
+            eid = str(rec.get("entry_id") or f.stem)
+            shutil.copy2(f, d / "screener" / f"{eid}.json")
+            sel.append({"entry_id": eid, "repo": norm(r["repo"]), "source": "step3", "from_stacked": slug,
                         "why": verdict})
-            new.append((slug, f.stem, verdict))
+            routed_repos.add(norm(r["repo"]))
+            new.append((slug, eid, verdict))
     sel_p.write_text(json.dumps(sel, indent=1))
     if not state.is_file():
         state.write_text("slug\tentry_id\tverdict\n")
@@ -201,6 +245,13 @@ def step3(a):
         for s, e, v in new:
             f.write(f"{s}\t{e}\t{v}\n")
     print(f"step 3: {len(new)} newly routed ({len(done)} earlier); selection has {len(sel)} entries -> {sel_p.relative_to(ROOT)}")
+    if missing:
+        jf = d / "screen_jobs.jsonl"
+        jf.write_text("".join(json.dumps(j) + "\n" for j in {j["repo"]: j for j in missing}.values()))
+        print(f"{len(missing)} solved stacked tasks wait for a screen: run\n"
+              f"  common/launch/drive.sh deepseek bash -c 'CLAUDE_BIN=$HOME/.local/bin/claude python3 -I "
+              f"common/screener/run_screener.py --run --parallel 70 --model \"$MODEL\" --outdir "
+              f"{(d / 'screens').relative_to(ROOT)} --jobs-file {jf.relative_to(ROOT)}'\n  then run step3 again")
     env = "LANE_RECS=pipelines/router/out/step3/screener LANE_PIPE=pipelines/router/out/step3/pipeline LANE_SUFFIX=s3"
     if new:
         print(f"next:\n  {env} python3 -I pipelines/sibling/4-select/lane.py prepare deepseek\n"

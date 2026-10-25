@@ -51,6 +51,10 @@ def prepare(driver):
         repo = r.get("repo", "")
         slug = f"{repo.split('/')[-1].lower().replace('_', '-')}-{suffix}"
         if os.path.exists(os.path.join(ROOT, "build", slug)):
+            # With a router suffix (s2/s3) the slug is unique to this lane, so an existing BUILD-PROMPT is this
+            # lane's own earlier prepare: keep it in the list (a re-run must not drop it from slugs_<driver>.txt).
+            if os.environ.get("LANE_SUFFIX") and os.path.isfile(os.path.join(ROOT, "build", slug, "BUILD-PROMPT.md")):
+                print(f"already prepared: {slug}"); slugs.append(slug); continue
             print(f"skip (build/{slug} already exists, would overwrite another batch):", eid); continue
         pf = r.get("pattern_fit") if r.get("pattern_fit") in ("A", "B", "A+B") else "A+B"
         adv = r.get("advisory_ids"); adv = adv if isinstance(adv, str) else json.dumps(adv)
