@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Router for the three-step scale run (docs/PIPELINE-3STEP-DESIGN.md). Run on the VM from ~/cwe-bench.
 
-  step 1  stacking-batch  stacking's batch: the best usable stacked design per unbuilt repo, from the DeepSeek reader
-                          (pipelines/stacking/out/stack_scores.tsv + reader_jobs_ds.jsonl + reader-ds/), then its
+  step 1  stacking-batch  stacking's batch: the best usable stacked design per unbuilt repo VERSION (pinned commit), from the DeepSeek reader
+                          (pipelines/stacking/out/stack_scores_ds.tsv + reader_jobs_ds.jsonl + reader-ds/), then its
                           BUILD-PROMPTs. Writes pipelines/stacking/out/<name>.{tsv,txt}; registers the batch.
   step 2  step2           sibling pool: every DeepSeek screen record (pipelines/stacking/out/screener-ds/) whose repo
                           stacking did NOT take (any registered batch, any stk- build) and that is not built already.
@@ -87,19 +87,35 @@ def stacking_batch(a):
     spec = importlib.util.spec_from_file_location("bps", ROOT / "pipelines/stacking/2-prepare/build_prepare_stack.py")
     bps = importlib.util.module_from_spec(spec); spec.loader.exec_module(bps)
     jobs = {j["id"]: j for j in (json.loads(l) for l in open(SO / "reader_jobs_ds.jsonl") if l.strip())}
-    scores = [r for r in csv.DictReader(open(SO / "stack_scores.tsv"), delimiter="\t") if r["usable"] == "True"]
+    # stack_scores_ds.tsv: the frozen DeepSeek scores of the full-pool selection (stack_scores.tsv is rewritten
+    # whenever score_stack.py runs, e.g. by a builder; 2026-10-25 a builder overwrote it with batch 1's scores).
+    scores = [r for r in csv.DictReader(open(SO / "stack_scores_ds.tsv"), delimiter="\t") if r["usable"] == "True"]
     built = built_repos()
     taken = {norm(r["repo"]) for b in batches() for r in batch_rows(b)}
+    # One stacked task per repo VERSION (owner decision 2026-10-25): designs pinned to different commits are
+    # different code with different bugs (e.g. a year apart), so each can be its own task. Two designs on the
+    # same pinned commit overlap (same checkout, shared routes): only the best-scored one is taken.
+    def pin_of(job_id):
+        try:
+            rec = json.loads((SO / "reader-ds" / f"{job_id}.json").read_text())
+            return str(rec.get("pinned_commit") or rec.get("pin") or "")[:12]
+        except Exception:
+            return ""
     best = {}
     for r in sorted(scores, key=lambda r: -float(r["score"])):
         j = jobs.get(r["candidate"])
         if not j:
             continue
         repo = norm(j["repo"])
-        if repo in built or repo in taken or repo in best or float(r["score"]) < a.min_score:
+        key = (repo, pin_of(j["id"]) or j["id"])
+        if repo in built or repo in taken or key in best or float(r["score"]) < a.min_score:
             continue
-        best[repo] = (r, j)
+        best[key] = (r, j)
     chosen = list(best.values())[: a.top] if a.top else list(best.values())
+    if a.count:
+        print(f"{len(chosen)} stacked tasks in {len({k[0] for k in best})} repos "
+              f"({len(scores)} usable designs; one per repo version)")
+        return
     tsv, txt = SO / f"{a.name}.tsv", SO / f"{a.name}.txt"
     if tsv.exists():
         sys.exit(f"{tsv} exists: choose another --name (a batch is never rewritten)")
@@ -275,6 +291,7 @@ def main():
     s = sub.add_parser("stacking-batch"); s.add_argument("--name", required=True)
     s.add_argument("--top", type=int, default=0); s.add_argument("--min-score", type=float, default=0.0)
     s.add_argument("--prepare", action="store_true")
+    s.add_argument("--count", action="store_true", help="only print how many tasks the batch would hold")
     sub.add_parser("step2"); sub.add_parser("step3"); sub.add_parser("status")
     a = ap.parse_args()
     {"stacking-batch": stacking_batch, "step2": step2, "step3": step3, "status": status}[a.cmd](a)

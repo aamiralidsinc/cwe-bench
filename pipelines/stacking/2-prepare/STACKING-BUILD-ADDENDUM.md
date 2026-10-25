@@ -85,7 +85,8 @@ pinned code before you rely on it. The record is a lead.
 - `reader_record`;
 - `concepts` (groups of trap ids);
 - `history`: advisories A and B with their fix commits, `pinned_commit` and its rule;
-- `score_at_build`: from `pipelines/stacking/1-select/score_stack.py`;
+- `score_at_build`: copy the `score` of your job's row in `pipelines/stacking/out/stack_scores_ds.tsv` (do NOT run
+  `score_stack.py`: it rewrites the shared selection file);
 - `control_slug`.
 
 **Exact manifest fields the static conformance check reads (step 5, `pipelines/stacking/3-build-gate/check_stack.py`). Emit these literally — the field NAMES and VALUES below must match, or the build is rejected before the container gate:**
