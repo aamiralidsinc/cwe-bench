@@ -34,3 +34,11 @@ Source: overnight hardening→trial run 2026-10-21→22 (hardening dropped from 
 - Audit mechanics: `build/postmortem.py prepare` on each failing-side run → one Opus-5.5-high auditor per task → `record-ready`; verdicts read from `build/audit_results.py`.
 - MiMo provider content-moderation refusals recur on security tasks (also seen on hermes-agent-ds) — treat an aborted (0-code) MiMo run as infra, not a model failure, and re-run it.
 - Pipeline bugs observed during this batch (verdicts unaffected): harvest truncation dropped real `src` edits in favour of cache/dist-types on a few runs (confirmed via transcripts); concurrent audit subagents must use unique scratchpad paths or write verdicts directly on the VM (a shared-path collision briefly cross-wrote intermediate verdict files — all final VM verdicts re-verified task-correct).
+
+## Added 2026-10-25 (withdrawn both-model breakers and precision_validation)
+
+| task | who failed | evidence | note |
+|------|-----------|----------|------|
+| knowns-ds | DeepSeek (0/3 on the VM, 0/3 in the at-risk re-trial) | MiMo solved the delivered package 1.0 (at-risk ta04, `ext-actions-atrisk-knowns-ds-mimo-a2`) | withdrawn from BREAKERS.md |
+| pv-spring-ws | DeepSeek (0/3, trusted medium) | MiMo a4 failed only the unfair XmppForeignDomain test | listed as a breaker by the ledger; see BREAKERS.md |
+

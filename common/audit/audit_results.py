@@ -4,7 +4,8 @@
     python3 common/audit/audit_results.py
 
 Reads every trial folder under ~/.tb-graders/cwe/jobs (every trial in every job — early
-jobs ran 3 trials in one job), and nothing else: not queue.json, not runs_<model>.log,
+jobs ran 3 trials in one job; ext-actions-* jobs are runs made on GitHub Actions and imported, see
+build/audit/EXTERNAL-RUNS.md), and nothing else: not queue.json, not runs_<model>.log,
 not trial_detail_*.json. Those derived files were written by a reader with two bugs (see
 docs/history/RESULTS-AUDIT.md) and are superseded by this script.
 
@@ -43,7 +44,7 @@ import paths  # noqa: E402  (repo locations: common/paths.py)
 ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 OUT = ROOT / "build" / "audit"
-TRACK_ORDER = {"mined": 0, "stacking": 1, "injection": 2}
+TRACK_ORDER = {"mined": 0, "stacking": 1, "injection": 2, "precision-validation": 3}
 MODELS = (("deepseek", "DeepSeek"), ("mimo", "MiMo"))
 # Agent time limit of runs that predate CWE_AGENT_LIMIT_SEC (all runs before the
 # 2026-10-15 switch to 7200 s ran at 3600 s; each task had one checksum throughout).
@@ -58,6 +59,10 @@ def jload(p):
 
 
 def track_of(task):
+    # pv-*: built by the closed precision_validation experiment (experiments/precision_validation), trialled on
+    # GitHub Actions; its runs are imported as ext-actions-* jobs (see build/audit/EXTERNAL-RUNS.md).
+    if task.startswith("pv-"):
+        return "precision-validation"
     toml = ROOT / "tasks" / task / "task.toml"
     m = re.search(r'^\s*source\s*=\s*"([^"]+)"', toml.read_text(), re.M) if toml.is_file() else None
     src = m.group(1) if m else "?"
