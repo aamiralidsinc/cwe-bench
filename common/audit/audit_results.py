@@ -259,10 +259,14 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     harness = [r for r in review if dec(r) == "harness"]
     pending = [r for r in review if r not in harness]
     runs = [r for r in runs if r not in review]
-    # Every graded run needs an independent post-run audit (common/audit/postmortem.py) before it can
+    # Every graded FAILING run needs an independent post-run audit (common/audit/postmortem.py) before it can
     # count: awaiting -> not yet final; untrusted -> excluded until a human decides.
+    # Solves are not audited (user decision 2026-10-25: solve audits rarely change a verdict and are not worth
+    # the throughput). An unaudited solve counts as graded and is marked "solves counted, not audited"; an
+    # audited solve that came back untrusted is still excluded.
     audit = {id(r): postmortem_state(r["job"], r["trial"], r["grading"]) for r in runs if r["reward"] is not None}
-    awaiting = [r for r in runs if audit.get(id(r)) == "awaiting"]
+    unaudited_solves = [r for r in runs if audit.get(id(r)) == "awaiting" and r["reward"] == 1.0]
+    awaiting = [r for r in runs if audit.get(id(r)) == "awaiting" and r["reward"] != 1.0]
     untrusted = [r for r in runs if audit.get(id(r)) == "untrusted"]
     runs = [r for r in runs if r not in awaiting and r not in untrusted]
     AWAITING.extend(awaiting)
@@ -294,6 +298,7 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
         f" (+{len(leaked_task)} task leaked the answer)" if leaked_task else "") + (
         f" (+{len(stopped)} provider stop)" if stopped else "") + (
         f" (+{len(awaiting)} awaiting audit)" if awaiting else "") + (
+        f" ({len(unaudited_solves)} solves counted, not audited)" if unaudited_solves else "") + (
         f" (+{len(untrusted)} audit: untrusted)" if untrusted else "") + (
         f" (+{len(own)} solved using the internet)" if own else "") + (
         f" (+{len(harness)} grader fault)" if harness else "") + (
@@ -304,8 +309,6 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     scores = ", ".join(f"{g:g}" for g in graded)
     if passes:
         return f"SOLVED {passes}/{len(graded)}{tail}", "solved"
-    if any(r["reward"] == 1.0 for r in awaiting):   # an unaudited solve could still decide it
-        return f"0/{len(graded)} audited, a solve awaits audit [{scores}]{tail}", "open"
     if len(graded) < 3:                      # pass@3 needs 3 graded failures
         return f"0/{len(graded)} so far, needs 3 [{scores}]{tail}", "open"
     return f"**failed 0/{len(graded)}** [{scores}]{tail}", "failed"
