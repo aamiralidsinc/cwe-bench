@@ -19,7 +19,10 @@ def sh(cmd):
     return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
 
 
-subprocess.run([sys.executable, "-I", "common/audit/audit_results.py"], capture_output=True)
+# Not -I: isolated mode drops the script's own folder from sys.path, so audit_results.py could not import its
+# helpers and the report read a stale ledger (2026-10-26). A failure is reported, never hidden.
+_ar = subprocess.run([sys.executable, "common/audit/audit_results.py"], capture_output=True, text=True)
+LEDGER_ERR = "" if _ar.returncode == 0 else (_ar.stderr.strip().splitlines() or ["?"])[-1][:200]
 led = {}
 for l in open("build/audit/ledger.md").read().split("## All tasks")[1].splitlines():
     c = [x.strip() for x in l.split("|")]
@@ -103,8 +106,11 @@ rg = sh("grep -c '\\[start\\]' pipelines/router/out/queue/regate-b1.log"), sh("g
 out.append(f"== queues: {' | '.join(qs)} | re-gate queue started {rg[0]}, finished {rg[1]} | failing runs awaiting audit: {pend}")
 load = open("/proc/loadavg").read().split()[0]
 disk = sh("df -BG / | tail -1 | awk '{print $4}'")
-out.append(f"== machine: load {load} (64 CPUs) | disk free {disk} | gate/trial Harbor runs {sh('pgrep -fc \"harbor run\"')} | "
-           f"containers {sh('docker ps -q 2>/dev/null | wc -l')} | agents {sh('pgrep -fc \"claude -p\"')}")
+n_harbor = sh("pgrep -fc 'harbor run'")
+n_cont = sh("docker ps -q 2>/dev/null | wc -l")
+n_agents = sh("pgrep -fc 'claude -p'")
+out.append(f"== machine: load {load} (64 CPUs) | disk free {disk} | gate/trial Harbor runs {n_harbor} | "
+           f"containers {n_cont} | agents {n_agents}")
 
 # what changed or looks wrong
 alerts = []
@@ -123,6 +129,8 @@ if disk and int(disk.rstrip("G")) < 150:
 for s, st in now.items():
     if st == "waiting for re-gate" and not proc_has(s, "regate"):
         pass
+if LEDGER_ERR:
+    alerts.append(f"LEDGER NOT REBUILT (trial results may be stale): {LEDGER_ERR}")
 out.append("== new or odd since last report: " + ("; ".join(alerts) if alerts else "nothing"))
 print(time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()))
 print("\n".join(out))
