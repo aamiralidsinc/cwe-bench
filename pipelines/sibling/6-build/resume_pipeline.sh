@@ -20,7 +20,7 @@ if [ "$STAGE" = build ]; then
   MSG="Note from the operator: this build was paused for about an hour while we fixed a host Docker bug (the system Docker daemon was deadlocking under load; it is fixed and restarted now). Containers that were running before the pause were stopped, and any private dockerd started during this session was shut down. Use the system Docker only; do not start your own dockerd. Continue the task from where you left off and finish it as the original brief says."
   "$CWE_DRIVE" deepseek bash -c '
     date -u +%FT%TZ > "build/'"$S"'/resume_start_utc.txt"
-    timeout "${BUILD_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$0" --resume "'"$SESS"'" \
+    timeout "${BUILD_TIMEOUT:-18000}" "$HOME/.local/bin/claude" -p "$0" --resume "'"$SESS"'" \
       --model "$MODEL" --permission-mode bypassPermissions \
       --add-dir "'"$CWE_ROOT"'" --add-dir "$HOME/.tb-graders/cwe/work" \
       --output-format json > "build/'"$S"'/build-run.json" 2> "build/'"$S"'/build-run.err"
