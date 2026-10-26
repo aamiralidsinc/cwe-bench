@@ -1,0 +1,338 @@
+diff --git a/packages/builder-util-runtime/src/httpExecutor.ts b/packages/builder-util-runtime/src/httpExecutor.ts
+index 1b10ecc..d389ea4 100644
+--- a/packages/builder-util-runtime/src/httpExecutor.ts
++++ b/packages/builder-util-runtime/src/httpExecutor.ts
+@@ -12,6 +12,16 @@ import { ProgressCallbackTransform, ProgressInfo } from "./ProgressCallbackTrans
+ 
+ const debug = _debug("electron-builder")
+ 
++// Header names are case-insensitive and are commonly written with '-' or '_' between words, so
++// compare them in one normalised form.
++const CREDENTIAL_HEADER_NAMES = new Set(["authorization", "proxyauthorization", "cookie", "xapikey", "xauthtoken", "xaccesstoken", "xgitlabtoken", "privatetoken", "xcsrftoken", "xsrftoken"])
++const CREDENTIAL_HEADER_PATTERN = /(authoriz|auth|token|apikey|secret|credential|cookie|session|password|passwd)/
++
++function isCredentialHeaderName(name: string): boolean {
++  const normalized = name.toLowerCase().replace(/[-_\s]/g, "")
++  return CREDENTIAL_HEADER_NAMES.has(normalized) || CREDENTIAL_HEADER_PATTERN.test(normalized)
++}
++
+ export interface RequestHeaders extends OutgoingHttpHeaders {
+   [key: string]: OutgoingHttpHeader | undefined
+ }
+@@ -87,7 +97,9 @@ export abstract class HttpExecutor<T extends Request> {
+     const json = data == null ? undefined : JSON.stringify(data)
+     const encodedData = json ? Buffer.from(json) : undefined
+     if (encodedData != null) {
+-      debug(json!)
++      if (debug.enabled) {
++        debug(safeStringifyJson(data))
++      }
+       const { headers, ...opts } = options
+       options = {
+         method: "post",
+@@ -206,7 +218,7 @@ Please double check that your authentication token is correct. Due to security r
+               `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
+ 
+           Data:
+-          ${isJson ? JSON.stringify(JSON.parse(data)) : data}
++          ${isJson ? safeStringifyJson(JSON.parse(data)) : data}
+           `
+             )
+           )
+@@ -320,19 +332,28 @@ Please double check that your authentication token is correct. Due to security r
+   static prepareRedirectUrlOptions(redirectUrl: string, options: RequestOptions): RequestOptions {
+     const newOptions = configureRequestOptionsFromUrl(redirectUrl, { ...options })
+     const headers = newOptions.headers
+-    if (headers?.authorization) {
+-      // Parse original and redirect URLs to compare origins
+-      const originalUrl = HttpExecutor.reconstructOriginalUrl(options)
+-      const parsedRedirectUrl = parseUrl(redirectUrl, options)
+-
+-      // Strip authorization header on cross-origin redirects (different protocol, hostname, or port)
+-      if (HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {
+-        if (debug.enabled) {
+-          debug(`Given the cross-origin redirect (from ${originalUrl.host} to ${parsedRedirectUrl.host}), the Authorization header will be stripped out.`)
+-        }
+-        delete headers.authorization
++    if (headers == null) {
++      return newOptions
++    }
++
++    const originalUrl = HttpExecutor.reconstructOriginalUrl(options)
++    const parsedRedirectUrl = parseUrl(redirectUrl, options)
++    if (!HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {
++      return newOptions
++    }
++    // Copy before removing: the options object and its headers are shared with the request that
++    // produced this redirect. Basic authentication carried on `auth` is a credential too.
++    const stripped: OutgoingHttpHeaders = { ...headers }
++    for (const name of Object.keys(stripped)) {
++      if (isCredentialHeaderName(name)) {
++        delete (stripped as Record<string, unknown>)[name]
+       }
+     }
++    newOptions.headers = stripped
++    delete (newOptions as any).auth
++    if (debug.enabled) {
++      debug(`Cross-origin redirect (${originalUrl.host} -> ${parsedRedirectUrl.host}): credential headers are dropped`)
++    }
+     return newOptions
+   }
+ 
+@@ -583,21 +604,23 @@ export function configureRequestOptions(options: RequestOptions, token?: string
+   return options
+ }
+ 
+-export function safeStringifyJson(data: any, skippedNames?: Set<string>) {
++const SENSITIVE_FIELD_PATTERNS = ["token", "password", "passwd", "secret", "authorization", "credential", "apikey", "passphrase", "auth", "cookie", "session"]
++
++export function isSensitiveFieldName(name: string): boolean {
++  const normalized = name.toLowerCase().replace(/[-_\s]/g, "")
++  return SENSITIVE_FIELD_PATTERNS.some(pattern => normalized.includes(pattern)) || normalized.endsWith("key")
++}
++
++export function hashSensitiveValue(value: string): string {
++  return `${createHash("sha256").update(value).digest("hex")} (sha256 hash)`
++}
++
++export function safeStringifyJson(data: any, skippedNames?: Set<string>): string {
+   return JSON.stringify(
+     data,
+     (name, value) => {
+-      if (
+-        name.endsWith("Authorization") ||
+-        name.endsWith("authorization") ||
+-        name.endsWith("Password") ||
+-        name.endsWith("PASSWORD") ||
+-        name.endsWith("Token") ||
+-        name.includes("password") ||
+-        name.includes("token") ||
+-        (skippedNames != null && skippedNames.has(name))
+-      ) {
+-        return "<stripped sensitive data>"
++      if (isSensitiveFieldName(name) || (skippedNames != null && skippedNames.has(name))) {
++        return typeof value === "string" ? hashSensitiveValue(value) : "<stripped sensitive data>"
+       }
+       return value
+     },
+diff --git a/packages/builder-util/src/util.ts b/packages/builder-util/src/util.ts
+index e5698e5..ab60913 100644
+--- a/packages/builder-util/src/util.ts
++++ b/packages/builder-util/src/util.ts
+@@ -48,7 +48,7 @@ export function serializeToYaml(object: any, skipInvalid = false, noRefs = false
+ export function removePassword(input: string): string {
+   // Sensitive parameter stems — any of `-`, `--`, or `/` prefix is accepted for all stems.
+   // `pass:` is intentionally absent; the dedicated pass: handler below covers it without double-processing.
+-  const sensitiveStems = ["accessKey", "secretKey", "passphrase", "password", "secret", "token", "String", "pass", "p"]
++  const sensitiveStems = ["accessKey", "secretKey", "privateToken", "apiKey", "passphrase", "password", "secret", "token", "String", "pass", "p"]
+   const stemAlt = sensitiveStems.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
+   // (?:--?|/) matches -, --, or / prefix. Longest stems listed first to minimise backtracking.
+   // (?<!\S) / (?=[\s"']|$) word-boundary guards prevent matching -path, -StringLength, etc.
+@@ -183,13 +183,13 @@ export function exec(file: string, args?: Array<string> | null, options?: ExecFi
+             if (file.endsWith("wine")) {
+               stdout = stdout.toString()
+             }
+-            message += `\n${chalk.yellow(stdout.toString())}`
++            message += `\n${chalk.yellow(removePassword(stdout.toString()))}`
+           }
+           if (stderr.length !== 0) {
+             if (file.endsWith("wine")) {
+               stderr = stderr.toString()
+             }
+-            message += `\n${chalk.red(stderr.toString())}`
++            message += `\n${chalk.red(removePassword(stderr.toString()))}`
+           }
+ 
+           // TODO: switch to ECMA Script 2026 Error class with `cause` property to return stack trace
+diff --git a/packages/electron-publish/src/gitHubPublisher.ts b/packages/electron-publish/src/gitHubPublisher.ts
+index ea525cb..2259dda 100644
+--- a/packages/electron-publish/src/gitHubPublisher.ts
++++ b/packages/electron-publish/src/gitHubPublisher.ts
+@@ -1,4 +1,5 @@
+ import { Arch, Fields, httpExecutor, InvalidConfigurationError, isEmptyOrSpaces, isEnvTrue, isTokenCharValid, log } from "builder-util"
++import { createHash } from "crypto"
+ import { configureRequestOptions, GithubOptions, HttpError, parseJson, githubTagPrefix } from "builder-util-runtime"
+ import { ClientRequest } from "http"
+ import { Lazy } from "lazy-val"
+@@ -58,7 +59,7 @@ export class GitHubPublisher extends HttpPublisher {
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitHub Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GH_TOKEN"`)
++        throw new InvalidConfigurationError(`GitHub Personal Access Token ${createHash("sha256").update(token).digest("hex")} (sha256 hash) contains invalid characters, please check env "GH_TOKEN"`)
+       }
+     }
+ 
+diff --git a/packages/electron-publish/src/giteaPublisher.ts b/packages/electron-publish/src/giteaPublisher.ts
+index 409ca40..83b072d 100644
+--- a/packages/electron-publish/src/giteaPublisher.ts
++++ b/packages/electron-publish/src/giteaPublisher.ts
+@@ -1,5 +1,6 @@
+ import { Arch, httpExecutor, InvalidConfigurationError, isEmptyOrSpaces, isTokenCharValid, log } from "builder-util"
+-import { configureRequestOptions, configureRequestUrl, GiteaOptions, safeGetHeader } from "builder-util-runtime"
++import { createHash } from "crypto"
++import { configureRequestOptions, configureRequestUrl, GiteaOptions, HttpExecutor, safeGetHeader } from "builder-util-runtime"
+ import { ClientRequest, RequestOptions } from "http"
+ import { URL } from "url"
+ import { HttpPublisher } from "./httpPublisher"
+@@ -34,7 +35,7 @@ export class GiteaPublisher extends HttpPublisher {
+ 
+     token = token.trim()
+     if (!isTokenCharValid(token)) {
+-      throw new InvalidConfigurationError(`Gitea access token (${JSON.stringify(token)}) contains invalid characters, please check env "GITEA_TOKEN"`)
++      throw new InvalidConfigurationError(`Gitea access token ${createHash("sha256").update(token).digest("hex")} (sha256 hash) contains invalid characters, please check env "GITEA_TOKEN"`)
+     }
+ 
+     this.token = token
+@@ -51,28 +52,28 @@ export class GiteaPublisher extends HttpPublisher {
+     const target = new URL(`/api/v1/repos/${this.info.owner}/${this.info.repo}/releases/${this.tag}/assets`, this.baseUrl)
+     target.searchParams.set("name", fileName)
+ 
+-    return this.send(target, dataLength, requestProcessor, 0)
++    const requestOptions: RequestOptions = {
++      method: "PUT",
++      headers: {
++        "Content-Type": "application/octet-stream",
++        "Content-Length": dataLength,
++        Authorization: `token ${this.token}`,
++      },
++    }
++    configureRequestUrl(target, requestOptions)
++    configureRequestOptions(requestOptions)
++
++    return this.send(requestOptions, dataLength, requestProcessor, 0)
+   }
+ 
+-  private send(target: URL, dataLength: number, requestProcessor: RequestProcessor, redirects: number): Promise<any> {
++  private send(requestOptions: RequestOptions, dataLength: number, requestProcessor: RequestProcessor, redirects: number): Promise<any> {
+     return new Promise((resolve, reject) => {
+-      const requestOptions: RequestOptions = {
+-        method: "PUT",
+-        headers: {
+-          "Content-Type": "application/octet-stream",
+-          "Content-Length": dataLength,
+-          Authorization: `token ${this.token}`,
+-        },
+-      }
+-      configureRequestUrl(target, requestOptions)
+-      configureRequestOptions(requestOptions)
+-
+       const request = httpExecutor.createRequest(requestOptions, response => {
+         const location = safeGetHeader(response, "location")
+         if (response.statusCode >= 300 && response.statusCode < 400 && location != null) {
+           response.resume()
+           if (redirects < 5) {
+-            resolve(this.send(new URL(String(location), target), dataLength, requestProcessor, redirects + 1))
++            resolve(this.send(HttpExecutor.prepareRedirectUrlOptions(String(location), requestOptions), dataLength, requestProcessor, redirects + 1))
+             return
+           }
+           reject(new Error(`Too many redirects (> 5) while uploading to Gitea`))
+diff --git a/packages/electron-publish/src/gitlabPublisher.ts b/packages/electron-publish/src/gitlabPublisher.ts
+index ce210a9..b490811 100644
+--- a/packages/electron-publish/src/gitlabPublisher.ts
++++ b/packages/electron-publish/src/gitlabPublisher.ts
+@@ -1,4 +1,5 @@
+ import { Arch, Fields, httpExecutor, InvalidConfigurationError, isEmptyOrSpaces, isTokenCharValid, log } from "builder-util"
++import { createHash } from "crypto"
+ import { createReadStream } from "fs"
+ import { stat } from "fs/promises"
+ import { readFile } from "fs/promises"
+@@ -46,7 +47,7 @@ export class GitlabPublisher extends HttpPublisher {
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitLab Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GITLAB_TOKEN"`)
++        throw new InvalidConfigurationError(`GitLab Personal Access Token ${createHash("sha256").update(token).digest("hex")} (sha256 hash) contains invalid characters, please check env "GITLAB_TOKEN"`)
+       }
+     }
+ 
+diff --git a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
+index d62c0dd..53a6faf 100644
+--- a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
++++ b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
+@@ -45,6 +45,9 @@ export abstract class DifferentialDownloader {
+         ...this.options.requestHeaders,
+         accept: "*/*",
+       },
++      // Redirects are followed by the listeners below instead of by Electron, so a redirect to
++      // another origin can be refused before the request headers are sent there.
++      redirect: "manual",
+     }
+     configureRequestUrl(this.options.newUrl, result)
+     // user-agent, cache-control and other common options
+@@ -52,6 +55,22 @@ export abstract class DifferentialDownloader {
+     return result
+   }
+ 
++  /**
++   * Follow a redirect only when the new location may keep every request header. Otherwise stop the
++   * request and let the caller fall back to a full download, which drops credentials for another origin.
++   */
++  followRedirectIfSameHeaders(request: any, requestOptions: RequestOptions, redirectUrl: string, reject: (error: Error) => void): void {
++    const next = HttpExecutor.prepareRedirectUrlOptions(redirectUrl, { ...requestOptions, headers: { ...requestOptions.headers } })
++    const before = Object.keys(requestOptions.headers ?? {}).length
++    const after = Object.keys(next.headers ?? {}).length
++    if (before === after) {
++      request.followRedirect()
++      return
++    }
++    request.abort()
++    reject(new Error(`Redirect to ${removeQuery(redirectUrl)} would drop request headers; falling back to a full download`))
++  }
++
+   protected doDownload(oldBlockMap: BlockMap, newBlockMap: BlockMap): Promise<any> {
+     // we don't check other metadata like compressionMethod - generic check that it is make sense to differentially update is suitable for it
+     if (oldBlockMap.version !== newBlockMap.version) {
+@@ -194,7 +213,6 @@ export abstract class DifferentialDownloader {
+       }
+ 
+       let downloadOperationCount = 0
+-      let actualUrl: string | null = null
+       this.logger.info(`Differential download: ${this.options.newUrl}`)
+ 
+       const requestOptions = this.createRequestOptions()
+@@ -259,9 +277,7 @@ export abstract class DifferentialDownloader {
+         })
+         request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
+           this.logger.info(`Redirect to ${removeQuery(redirectUrl)}`)
+-          actualUrl = redirectUrl
+-          configureRequestUrl(new URL(actualUrl), requestOptions)
+-          request.followRedirect()
++          this.followRedirectIfSameHeaders(request, requestOptions, redirectUrl, reject)
+         })
+         this.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+         request.end()
+@@ -302,6 +318,9 @@ export abstract class DifferentialDownloader {
+         response.on("data", dataHandler)
+         response.on("end", () => resolve())
+       })
++      request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
++        this.followRedirectIfSameHeaders(request, requestOptions, redirectUrl, reject)
++      })
+       this.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+       request.end()
+     })
+diff --git a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
+index fe72f15..8a5db2e 100644
+--- a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
++++ b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
+@@ -82,6 +82,9 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+           })
+           response.once("end", () => w(index))
+         })
++        request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
++          differentialDownloader.followRedirectIfSameHeaders(request, requestOptions, redirectUrl, reject)
++        })
+         differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+         request.end()
+       }
+@@ -116,6 +119,9 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+       }, 10000)
+     })
+   })
++  request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
++    differentialDownloader.followRedirectIfSameHeaders(request, requestOptions, redirectUrl, reject)
++  })
+   differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+   request.end()
+ }

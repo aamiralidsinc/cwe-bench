@@ -1,0 +1,437 @@
+--- a/agent/api_server.py	2026-10-18 19:24:35.001672797 +0000
++++ variants/ff-run-storage-only//agent/api_server.py	2026-10-19 18:15:10.791406947 +0000
+@@ -25,6 +25,7 @@
+ from fastapi.middleware.cors import CORSMiddleware
+ from rich.console import Console
+ 
++from src.tools.path_utils import safe_document_path
+ from src.ui_services import build_run_analysis, load_run_context
+ 
+ # UTF-8 on Windows
+@@ -1407,7 +1408,10 @@
+     that path back here to show the document before the user asks the agent
+     to analyse it.
+     """
+-    target = Path(path)
++    try:
++        target = safe_document_path(path)
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail=str(exc)) from exc
+     if not target.exists() or not target.is_file():
+         raise HTTPException(status_code=404, detail=f"Stored file not found: {path}")
+     media_type = "application/pdf" if target.suffix.lower() == ".pdf" else "application/octet-stream"
+--- a/agent/src/agent/skills.py	2026-10-18 19:24:43.501666707 +0000
++++ variants/ff-run-storage-only//agent/src/agent/skills.py	2026-10-19 18:15:11.683406381 +0000
+@@ -44,7 +44,10 @@
+         """
+         if not self.dir_path:
+             return None
+-        path = self.dir_path / filename
++        base = self.dir_path.resolve()
++        path = (base / filename).resolve()
++        if not path.is_relative_to(base):
++            return None
+         if not path.exists():
+             return None
+         try:
+--- a/agent/src/tools/backtest_tool.py	2026-10-18 19:24:38.245670473 +0000
++++ variants/ff-run-storage-only//agent/src/tools/backtest_tool.py	2026-10-19 18:15:13.731405072 +0000
+@@ -9,6 +9,7 @@
+ 
+ from src.agent.tools import BaseTool
+ from src.core.runner import Runner
++from src.tools.path_utils import safe_run_dir, safe_user_path
+ 
+ 
+ def run_backtest(run_dir: str) -> str:
+@@ -20,7 +21,10 @@
+     Returns:
+         JSON-formatted execution result.
+     """
+-    run_path = Path(run_dir)
++    try:
++        run_path = safe_run_dir(run_dir)
++    except ValueError as exc:
++        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+ 
+     config_path = run_path / "config.json"
+     if not config_path.exists():
+@@ -52,6 +56,15 @@
+         if not data_path.is_absolute():
+             data_path = run_path / data_path
+         try:
++            data_path = safe_user_path(str(data_path))
++        except ValueError:
++            try:
++                data_path = safe_run_dir(str(data_path))
++            except ValueError as exc:
++                return json.dumps(
++                    {"status": "error", "error": f"local_data_file: {exc}"}, ensure_ascii=False
++                )
++        try:
+             frame = pd.read_csv(data_path)
+         except Exception as exc:
+             return json.dumps(
+--- a/agent/src/tools/doc_reader_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/doc_reader_tool.py	2026-10-19 18:15:02.339412155 +0000
+@@ -20,6 +20,7 @@
+ from typing import Any, Callable
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_document_path
+ 
+ _MAX_CHARS = 15000
+ _MIN_TEXT_PER_PAGE = 50
+@@ -267,7 +268,10 @@
+         JSON envelope: status, file, format, char_count, truncated, text,
+         plus format-specific metadata (total_pages, sheets, etc.).
+     """
+-    path = Path(file_path)
++    try:
++        path = safe_document_path(file_path)
++    except ValueError as exc:
++        return _err(str(exc))
+     if not path.exists():
+         return _err(f"File not found: {file_path}")
+     if not path.is_file():
+--- a/agent/src/tools/edit_file_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/edit_file_tool.py	2026-10-19 18:15:02.343412152 +0000
+@@ -8,6 +8,7 @@
+ 
+ from src.agent.tools import BaseTool
+ from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import safe_run_dir as _safe_run_dir
+ 
+ 
+ class EditFileTool(BaseTool):
+@@ -48,7 +49,8 @@
+             }, ensure_ascii=False)
+ 
+         try:
+-            resolved = _safe_path(file_path, Path(run_dir))
++            run_root = _safe_run_dir(str(run_dir))
++            resolved = _safe_path(file_path, run_root)
+         except ValueError as exc:
+             return json.dumps({
+                 "status": "error",
+--- a/agent/src/tools/factor_analysis_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/factor_analysis_tool.py	2026-10-19 18:15:02.343412152 +0000
+@@ -11,6 +11,15 @@
+ from scipy.stats import spearmanr
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_run_dir, safe_user_path
++
++
++def _safe_input_csv(p: str) -> Path:
++    """Validate an input CSV path: an imported/uploaded file or a run artifact."""
++    try:
++        return safe_user_path(p)
++    except ValueError:
++        return safe_run_dir(p)
+ 
+ 
+ def _compute_ic_series(factor_df: pd.DataFrame, return_df: pd.DataFrame) -> pd.Series:
+@@ -110,12 +119,17 @@
+     Returns:
+         JSON-formatted analysis summary.
+     """
+-    out_path = Path(output_dir)
++    try:
++        factor_path = _safe_input_csv(factor_csv)
++        return_path = _safe_input_csv(return_csv)
++        out_path = safe_run_dir(output_dir)
++    except ValueError as exc:
++        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+     out_path.mkdir(parents=True, exist_ok=True)
+ 
+     try:
+-        factor_df = pd.read_csv(factor_csv, index_col=0, parse_dates=True)
+-        return_df = pd.read_csv(return_csv, index_col=0, parse_dates=True)
++        factor_df = pd.read_csv(factor_path, index_col=0, parse_dates=True)
++        return_df = pd.read_csv(return_path, index_col=0, parse_dates=True)
+     except Exception as e:
+         return json.dumps({"status": "error", "error": f"Failed to read CSV: {e}"}, ensure_ascii=False)
+ 
+--- a/agent/src/tools/path_utils.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/path_utils.py	2026-10-19 18:18:47.651202320 +0000
+@@ -1,23 +1,28 @@
+ """Path safety helpers used by file-access tools.
+ 
+-Two helpers, two threat models:
++Three helpers, three threat models:
+ 
+ * `safe_path(p, workdir)` — tool-controlled sandbox. Resolves `p` under
+   `workdir` and rejects any escape. Used by `read_file` / `write_file` /
+   `edit_file` where the LLM must stay inside the current run dir.
+ 
+-* `safe_user_path(p)` — user-supplied broker files. Accepts any path inside
+-  the user's home directory or the project CWD, rejects UNC and system
+-  paths. Used by `analyze_trade_journal` and the Shadow Account tools
+-  where the journal CSV is legitimately anywhere in the user's filesystem.
++* `safe_user_path(p)` — user-supplied broker files. Accepts files only under
++  explicit import roots, not the whole home directory or project tree.
+ 
+-Both raise ``ValueError`` on rejection — callers already expect this.
++* `safe_document_path(p)` — document-reader inputs. Uses the same import-root
++  boundary as `safe_user_path()`.
++
++All helpers raise ``ValueError`` on rejection — callers already expect this.
+ """
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ 
++_ALLOWED_FILE_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
++_ALLOWED_RUN_ROOTS_ENV = "VIBE_TRADING_ALLOWED_RUN_ROOTS"
++
+ 
+ def _rejects_unc(p: str) -> None:
+     """Raise ValueError if `p` starts with a UNC share prefix."""
+@@ -49,33 +54,160 @@
+     return resolved
+ 
+ 
+-def safe_user_path(p: str) -> Path:
+-    """Validate a user-supplied absolute file path.
++def _agent_root() -> Path:
++    """Return the agent package root."""
++    return Path(__file__).resolve().parents[2]
++
++
++def _configured_file_roots() -> list[Path]:
++    """Return file roots configured through the environment."""
++    raw = os.getenv(_ALLOWED_FILE_ROOTS_ENV, "")
++    roots: list[Path] = []
++    for item in raw.split(","):
++        item = item.strip()
++        if not item:
++            continue
++        _rejects_unc(item)
++        roots.append(Path(item).expanduser().resolve())
++    return roots
++
++
++def _default_file_roots() -> list[Path]:
++    """Return default roots for uploaded/imported user files."""
++    cwd = Path.cwd().resolve()
++    home = Path.home().resolve()
++    agent_root = _agent_root()
++    return [
++        agent_root / "uploads",
++        agent_root / "runs",
++        cwd / "uploads",
++        cwd / "data",
++        home / ".vibe-trading" / "uploads",
++        home / ".vibe-trading" / "imports",
++    ]
++
++
++def _default_run_roots() -> list[Path]:
++    """Return default roots for generated backtest/tool run directories."""
++    cwd = Path.cwd().resolve()
++    home = Path.home().resolve()
++    agent_root = _agent_root()
++    return [
++        agent_root / "runs",
++        cwd / "runs",
++        home / ".vibe-trading" / "shadow_runs",
++    ]
++
++
++def _allowed_file_roots() -> list[Path]:
++    """Return all roots allowed for document and broker-file reads."""
++    roots: list[Path] = []
++    for root in [*_default_file_roots(), *_configured_file_roots()]:
++        resolved = root.resolve()
++        if resolved not in roots:
++            roots.append(resolved)
++    return roots
++
++
++def _allowed_run_roots() -> list[Path]:
++    """Return all roots allowed for run_dir-based tools."""
++    raw = os.getenv(_ALLOWED_RUN_ROOTS_ENV, "")
++    configured: list[Path] = []
++    for item in raw.split(","):
++        item = item.strip()
++        if not item:
++            continue
++        _rejects_unc(item)
++        configured.append(Path(item).expanduser().resolve())
++
++    roots: list[Path] = []
++    for root in [*_default_run_roots(), *configured]:
++        resolved = root.resolve()
++        if resolved not in roots:
++            roots.append(resolved)
++    return roots
++
+ 
+-    Used when the LLM passes a broker-export path the user referenced in
+-    natural language. The path may legitimately live anywhere the user
+-    keeps files (Desktop, Downloads, a project subdirectory), so the
+-    envelope is HOME ∪ CWD rather than a tight sandbox.
++def _safe_import_path(p: str, *, purpose: str) -> Path:
++    """Validate a user-supplied path against explicit import roots.
+ 
+     Args:
+-        p: User-supplied path. `~` expansion supported.
++        p: User-supplied path. `~` expansion is supported.
++        purpose: Human-readable purpose for error messages.
+ 
+     Returns:
+-        Absolute resolved path.
++        Absolute resolved path inside an allowed import root.
+ 
+     Raises:
+-        ValueError: If `p` is a UNC share, or resolves outside both the
+-            user's home directory and the current working directory.
++        ValueError: If `p` is a UNC share or resolves outside all allowed
++            import roots.
+     """
+     _rejects_unc(p)
+     resolved = Path(p).expanduser().resolve()
+ 
+-    home = Path.home().resolve()
+-    cwd = Path.cwd().resolve()
++    for root in _allowed_run_roots():
++        if resolved.is_relative_to(root):
++            return resolved
++
++    raise ValueError(
++        f"Path {p!r} is outside allowed {purpose} roots. "
++        f"Set {_ALLOWED_FILE_ROOTS_ENV} to add an import directory."
++    )
++
++
++def safe_user_path(p: str) -> Path:
++    """Validate a user-supplied broker/export file path.
++
++    Args:
++        p: User-supplied path. `~` expansion is supported.
++
++    Returns:
++        Absolute resolved path inside an allowed import root.
++
++    Raises:
++        ValueError: If `p` is a UNC share or resolves outside all allowed
++            import roots.
++    """
++    return _safe_import_path(p, purpose="user-file")
++
++
++def safe_document_path(p: str) -> Path:
++    """Validate a document-reader file path.
++
++    Args:
++        p: User-supplied document path. `~` expansion is supported.
++
++    Returns:
++        Absolute resolved path inside an allowed import root.
++
++    Raises:
++        ValueError: If `p` is a UNC share or resolves outside all allowed
++            import roots.
++    """
++    return _safe_import_path(p, purpose="document")
++
++
++def safe_run_dir(p: str) -> Path:
++    """Validate a run directory used by generated-code tools.
++
++    Args:
++        p: User/LLM-supplied run directory. `~` expansion is supported.
++
++    Returns:
++        Absolute resolved path inside an allowed run root.
++
++    Raises:
++        ValueError: If `p` is a UNC share or resolves outside all allowed run
++            roots.
++    """
++    _rejects_unc(p)
++    resolved = Path(p).expanduser().resolve()
+ 
+-    if resolved.is_relative_to(home) or resolved.is_relative_to(cwd):
+-        return resolved
++    for root in _allowed_run_roots():
++        if resolved.is_relative_to(root):
++            return resolved
+ 
+     raise ValueError(
+-        f"Path {p!r} is outside the user home directory and project directory"
++        f"run_dir {p!r} is outside allowed run roots. "
++        f"Set {_ALLOWED_RUN_ROOTS_ENV} to add a run directory."
+     )
+--- a/agent/src/tools/pattern_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/pattern_tool.py	2026-10-19 18:15:02.343412152 +0000
+@@ -14,6 +14,7 @@
+ import pandas as pd
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_run_dir
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -313,7 +314,12 @@
+     Returns:
+         JSON-formatted detection results.
+     """
+-    arts = Path(run_dir) / "artifacts"
++    try:
++        run_path = safe_run_dir(run_dir)
++    except ValueError as exc:
++        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
++
++    arts = run_path / "artifacts"
+     ohlcv_files = list(arts.glob("ohlcv_*.csv"))
+     if not ohlcv_files:
+         return json.dumps({"status": "error", "error": "No OHLCV data found; run backtest first"}, ensure_ascii=False)
+--- a/agent/src/tools/read_file_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/read_file_tool.py	2026-10-19 18:15:02.343412152 +0000
+@@ -8,6 +8,7 @@
+ 
+ from src.agent.tools import BaseTool
+ from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import safe_run_dir as _safe_run_dir
+ 
+ _OUTPUT_LIMIT = 50_000
+ 
+@@ -42,7 +43,13 @@
+ 
+         allowed_roots = []
+         if run_dir:
+-            allowed_roots.append(Path(run_dir).resolve())
++            try:
++                allowed_roots.append(_safe_run_dir(str(run_dir)))
++            except ValueError as exc:
++                return json.dumps({
++                    "status": "error",
++                    "error": str(exc),
++                }, ensure_ascii=False)
+         # Read-only access to skills/
+         skills_dir = Path(__file__).resolve().parents[1] / "skills"
+         if skills_dir.exists():
+--- a/agent/src/tools/write_file_tool.py	2026-10-17 06:25:18.000000000 +0000
++++ variants/ff-run-storage-only//agent/src/tools/write_file_tool.py	2026-10-19 18:15:02.343412152 +0000
+@@ -8,6 +8,7 @@
+ 
+ from src.agent.tools import BaseTool
+ from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import safe_run_dir as _safe_run_dir
+ 
+ 
+ class WriteFileTool(BaseTool):
+@@ -46,7 +47,8 @@
+             }, ensure_ascii=False)
+ 
+         try:
+-            resolved = _safe_path(file_path, Path(run_dir))
++            run_root = _safe_run_dir(str(run_dir))
++            resolved = _safe_path(file_path, run_root)
+         except ValueError as exc:
+             return json.dumps({
+                 "status": "error",

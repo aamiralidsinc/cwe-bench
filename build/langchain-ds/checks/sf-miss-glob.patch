@@ -1,0 +1,278 @@
+diff --git a/libs/langchain_v1/langchain/agents/middleware/file_search.py b/libs/langchain_v1/langchain/agents/middleware/file_search.py
+index e4e0325..9b4b17c 100644
+--- a/libs/langchain_v1/langchain/agents/middleware/file_search.py
++++ b/libs/langchain_v1/langchain/agents/middleware/file_search.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ 
+ import fnmatch
+ import json
++import os
+ import re
+ import subprocess
+ from contextlib import suppress
+@@ -20,6 +21,25 @@ from langchain_core.tools import tool
+ from langchain.agents.middleware.types import AgentMiddleware, AgentState, ContextT, ResponseT
+ 
+ 
++def _is_within_root(candidate: Path, root: Path) -> bool:
++    """Return True iff `candidate` resolves to a path inside `root` (symlinks resolved).
++
++    Args:
++        candidate: The path to check. It is resolved (following symlinks and
++            normalizing `..`) before the containment check.
++        root: The allowed root directory. Also resolved before comparison.
++
++    Returns:
++        `True` if the fully resolved `candidate` lies inside the resolved `root`,
++        using path-segment boundaries; `False` otherwise (including on resolution
++        errors).
++    """
++    try:
++        return candidate.resolve().is_relative_to(root.resolve())
++    except (OSError, ValueError):
++        return False
++
++
+ def _expand_include_patterns(pattern: str) -> list[str] | None:
+     """Expand brace patterns like `*.{py,pyi}` into a list of globs."""
+     if "}" in pattern and "{" not in pattern:
+@@ -160,6 +180,9 @@ class FilesystemFileSearchMiddleware(AgentMiddleware[AgentState[ResponseT], Cont
+             # Use pathlib glob
+             matching: list[tuple[str, str]] = []
+             for match in base_full.glob(pattern):
++                # Re-check containment after resolving so an in-root symlink or
++                # symlinked directory that points outside the root is never
++                # enumerated.
+                 if match.is_file():
+                     # Convert to virtual path
+                     virtual_path = "/" + str(match.relative_to(self.root_path))
+@@ -298,6 +321,10 @@ class FilesystemFileSearchMiddleware(AgentMiddleware[AgentState[ResponseT], Cont
+                 data = json.loads(line)
+                 if data["type"] == "match":
+                     path = data["data"]["path"]["text"]
++                    # Defense in depth: drop any result whose resolved path lies
++                    # outside the root (e.g. surfaced via an in-root symlink).
++                    if not _is_within_root(Path(path), self.root_path):
++                        continue
+                     # Convert to virtual path
+                     virtual_path = "/" + str(Path(path).relative_to(self.root_path))
+                     line_num = data["data"]["line_number"]
+@@ -326,31 +353,40 @@ class FilesystemFileSearchMiddleware(AgentMiddleware[AgentState[ResponseT], Cont
+         regex = re.compile(pattern)
+         results: dict[str, list[tuple[int, str]]] = {}
+ 
+-        # Walk directory tree
+-        for file_path in base_full.rglob("*"):
+-            if not file_path.is_file():
+-                continue
+-
+-            # Check include filter
+-            if include and not _match_include_pattern(file_path.name, include):
+-                continue
+-
+-            # Skip files that are too large
+-            if file_path.stat().st_size > self.max_file_size_bytes:
+-                continue
+-
+-            try:
+-                content = file_path.read_text()
+-            except (UnicodeDecodeError, PermissionError):
+-                continue
+-
+-            # Search content
+-            for line_num, line in enumerate(content.splitlines(), 1):
+-                if regex.search(line):
+-                    virtual_path = "/" + str(file_path.relative_to(self.root_path))
+-                    if virtual_path not in results:
+-                        results[virtual_path] = []
+-                    results[virtual_path].append((line_num, line))
++        # Walk directory tree without following symlinked directories so traversal
++        # cannot leave the root via a symlinked subdirectory.
++        for walk_root, _dirs, files in os.walk(base_full, followlinks=False):
++            for name in files:
++                file_path = Path(walk_root) / name
++
++                # Re-check containment after resolving so an in-root symlinked file
++                # pointing outside the root is never read.
++                if not _is_within_root(file_path, self.root_path):
++                    continue
++
++                if not file_path.is_file():
++                    continue
++
++                # Check include filter
++                if include and not _match_include_pattern(file_path.name, include):
++                    continue
++
++                # Skip files that are too large
++                if file_path.stat().st_size > self.max_file_size_bytes:
++                    continue
++
++                try:
++                    content = file_path.read_text()
++                except (UnicodeDecodeError, PermissionError):
++                    continue
++
++                # Search content
++                for line_num, line in enumerate(content.splitlines(), 1):
++                    if regex.search(line):
++                        virtual_path = "/" + str(file_path.relative_to(self.root_path))
++                        if virtual_path not in results:
++                            results[virtual_path] = []
++                        results[virtual_path].append((line_num, line))
+ 
+         return results
+ 
+diff --git a/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py b/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py
+index ba0c601..a232ef3 100644
+--- a/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py
++++ b/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py
+@@ -94,6 +94,31 @@ class AnthropicToolsState(AgentState):
+     """Virtual file system for memory tools."""
+ 
+ 
++def _is_within_allowed_prefix(normalized: str, prefixes: Sequence[str]) -> bool:
++    """Check whether a normalized path lies within an allowed prefix directory.
++
++    Uses a segment-boundary comparison rather than a raw string prefix test so
++    that sibling directories sharing a textual prefix cannot escape the allowed
++    directory. For example, with prefix `/memories` the path `/memories2/evil.txt`
++    is rejected because it is not the prefix itself nor a descendant of it.
++
++    Args:
++        normalized: A normalized, forward-slash, absolute-style path.
++        prefixes: Allowed path prefixes to compare against.
++
++    Returns:
++        `True` if `normalized` exactly equals one of the prefix directories or is
++        contained within one of them, `False` otherwise.
++    """
++    for prefix in prefixes:
++        # Normalize the prefix the same way the path was normalized so the
++        # comparison is consistent (drop any trailing slash for the boundary).
++        prefix_dir = prefix.rstrip("/")
++        if normalized == prefix_dir or normalized.startswith(f"{prefix_dir}/"):
++            return True
++    return False
++
++
+ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) -> str:
+     """Validate and normalize file path for security.
+ 
+@@ -123,8 +148,8 @@ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None)
+         normalized = f"/{normalized}"
+ 
+     # Check allowed prefixes if specified
+-    if allowed_prefixes is not None and not any(
+-        normalized.startswith(prefix) for prefix in allowed_prefixes
++    if allowed_prefixes is not None and not _is_within_allowed_prefix(
++        normalized, allowed_prefixes
+     ):
+         msg = f"Path must start with one of {allowed_prefixes}: {path}"
+         raise ValueError(msg)
+@@ -581,7 +606,10 @@ class _StateClaudeFileToolMiddleware(AgentMiddleware):
+         normalized_path = _validate_path(path, allowed_prefixes=self.allowed_prefixes)
+ 
+         files = cast("dict[str, Any]", state.get(self.state_key, {}))
+-        matching = sorted(fp for fp in files if fp.startswith(normalized_path))
++        dir_path = normalized_path if normalized_path.endswith("/") else f"{normalized_path}/"
++        matching = sorted(
++            fp for fp in files if fp == normalized_path or fp.startswith(dir_path)
++        )
+         content = "\n".join(matching) if matching else "No files found"
+ 
+         return Command(
+@@ -886,14 +914,11 @@ class _FilesystemClaudeFileToolMiddleware(AgentMiddleware):
+ 
+         # Check allowed prefixes
+         virtual_path = "/" + str(full_path.relative_to(self.root_path))
+-        if self.allowed_prefixes:
+-            allowed = any(
+-                virtual_path.startswith(prefix) or virtual_path == prefix.rstrip("/")
+-                for prefix in self.allowed_prefixes
+-            )
+-            if not allowed:
+-                msg = f"Path must start with one of: {self.allowed_prefixes}"
+-                raise ValueError(msg)
++        if self.allowed_prefixes and not _is_within_allowed_prefix(
++            virtual_path, self.allowed_prefixes
++        ):
++            msg = f"Path must start with one of: {self.allowed_prefixes}"
++            raise ValueError(msg)
+ 
+         return full_path
+ 
+@@ -1112,6 +1137,11 @@ class _FilesystemClaudeFileToolMiddleware(AgentMiddleware):
+             msg = "Path traversal not allowed"
+             raise ValueError(msg)
+         source_full = (self.root_path / source.lstrip("/")).resolve()
++        try:
++            source_full.relative_to(self.root_path)
++        except ValueError:
++            msg = f"Path outside root directory: {args['path']}"
++            raise ValueError(msg) from None
+         if not source_full.exists() or not source_full.is_file():
+             msg = f"File not found: {args['path']}"
+             raise FileNotFoundError(msg)
+@@ -1137,20 +1167,7 @@ class _FilesystemClaudeFileToolMiddleware(AgentMiddleware):
+     def _handle_list(self, args: dict, tool_call_id: str | None) -> Command:
+         """Handle list command: list the entries of a directory."""
+         path = args["path"]
+-        if not path.startswith("/"):
+-            path = "/" + path
+-        if ".." in path or "~" in path:
+-            msg = "Path traversal not allowed"
+-            raise ValueError(msg)
+-
+-        directory = self.root_path / path.lstrip("/")
+-
+-        # Confirm the directory we are about to list sits inside the root.
+-        try:
+-            directory.relative_to(self.root_path)
+-        except ValueError:
+-            msg = f"Path outside root directory: {path}"
+-            raise ValueError(msg) from None
++        directory = self._validate_and_resolve_path(path)
+ 
+         if not directory.is_dir():
+             msg = f"Directory not found: {path}"
+@@ -1176,11 +1193,9 @@ class _FilesystemClaudeFileToolMiddleware(AgentMiddleware):
+         path = args["path"]
+         file_text = args["file_text"]
+ 
+-        # Make sure the directory the text is added to is inside the root.
+-        parent = os.path.dirname(path) or "/"
+-        self._validate_and_resolve_path(parent)
+-
+-        full_path = self.root_path / path.lstrip("/")
++        # Resolve and contain the target before adding to it; this also catches an
++        # in-root link that points outside the root.
++        full_path = self._validate_and_resolve_path(path)
+         full_path.parent.mkdir(parents=True, exist_ok=True)
+         with full_path.open("a", encoding="utf-8") as handle:
+             handle.write(file_text + "\n")
+@@ -1207,10 +1222,20 @@ class _FilesystemClaudeFileToolMiddleware(AgentMiddleware):
+         matches: list[str] = []
+         for walk_root, _dirs, files in os.walk(directory, followlinks=True):
+             for name in files:
+-                if fnmatch.fnmatch(name, pattern):
+-                    matches.append(
+-                        "/" + str((Path(walk_root) / name).relative_to(self.root_path))
+-                    )
++                if not fnmatch.fnmatch(name, pattern):
++                    continue
++
++                candidate = Path(walk_root) / name
++                try:
++                    virtual_path = "/" + str(candidate.relative_to(self.root_path))
++                    # Resolve the match and re-check both the root and the allowed
++                    # directories, so a link met during the walk cannot surface an
++                    # out-of-bounds entry.
++                    self._validate_and_resolve_path(virtual_path)
++                except (OSError, ValueError):
++                    continue
++
++                matches.append(virtual_path)
+ 
+         matches.sort()
+         content = "\n".join(matches) if matches else "No files found"

@@ -1,0 +1,645 @@
+diff --git a/internal/api/dependency/service_manager.go b/internal/api/dependency/service_manager.go
+index 94079b8..2014cdd 100644
+--- a/internal/api/dependency/service_manager.go
++++ b/internal/api/dependency/service_manager.go
+@@ -123,12 +123,12 @@ func newServiceManager(dao PersistenceManager, conf config.Config) (ServiceManag
+ 	pluginService := plugin.New(conf.Plugin)
+ 	schemaService := pluginService.Schema()
+ 	migrateService := pluginService.Migration()
+-	dashboardService := dashboardImpl.NewService(conf, dao.GetDashboard(), dao.GetGlobalVariable(), dao.GetVariable(), schemaService)
+-	datasourceService := datasourceImpl.NewService(dao.GetDatasource(), schemaService)
+-	ephemeralDashboardService := ephemeralDashboardImpl.NewService(dao.GetEphemeralDashboard(), dao.GetGlobalVariable(), dao.GetVariable(), schemaService)
++	dashboardService := dashboardImpl.NewService(conf, dao.GetDashboard(), dao.GetGlobalVariable(), dao.GetVariable(), schemaService, authzService)
++	datasourceService := datasourceImpl.NewService(dao.GetDatasource(), schemaService, authzService)
++	ephemeralDashboardService := ephemeralDashboardImpl.NewService(dao.GetEphemeralDashboard(), dao.GetGlobalVariable(), dao.GetVariable(), schemaService, authzService)
+ 	folderService := folderImpl.NewService(dao.GetFolder())
+ 	variableService := variableImpl.NewService(dao.GetVariable(), schemaService)
+-	globalDatasourceService := globalDatasourceImpl.NewService(dao.GetGlobalDatasource(), schemaService)
++	globalDatasourceService := globalDatasourceImpl.NewService(dao.GetGlobalDatasource(), schemaService, authzService)
+ 	globalRole := globalRoleImpl.NewService(dao.GetGlobalRole(), authzService, schemaService)
+ 	globalRoleBinding := globalRoleBindingImpl.NewService(dao.GetGlobalRoleBinding(), dao.GetGlobalRole(), dao.GetUser(), authzService, schemaService)
+ 	globalSecret := globalSecretImpl.NewService(dao.GetGlobalSecret(), cryptoService)
+diff --git a/internal/api/impl/proxy/globaldatasource.go b/internal/api/impl/proxy/globaldatasource.go
+index 81d27f9..e7cbea0 100644
+--- a/internal/api/impl/proxy/globaldatasource.go
++++ b/internal/api/impl/proxy/globaldatasource.go
+@@ -26,12 +26,10 @@ import (
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+-func (e *endpoint) proxyGlobalDatasource(ctx echo.Context, datasourceName string, spec datasource.Spec) error {
++func (e *endpoint) proxyGlobalDatasource(ctx echo.Context, datasourceName string, spec datasource.Spec, retrieveSecret func(name string) (*v1.SecretSpec, error)) error {
+ 	path := ctx.Param("*")
+ 
+-	pr, err := newProxy(datasourceName, "", spec, path, e.crypto, func(name string) (*v1.SecretSpec, error) {
+-		return e.getGlobalSecret(datasourceName, name)
+-	})
++	pr, err := newProxy(datasourceName, "", spec, path, e.crypto, retrieveSecret)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -55,7 +53,12 @@ func (e *endpoint) proxyUnsavedGlobalDatasource(ctx echo.Context) error {
+ 		dtsName = body.Spec.Display.Name
+ 	}
+ 
+-	return e.proxyGlobalDatasource(ctx, dtsName, body.Spec)
++	return e.proxyGlobalDatasource(ctx, dtsName, body.Spec, func(name string) (*v1.SecretSpec, error) {
++		if err := e.checkPermission(ctx, v1.WildcardProject, role.GlobalSecretScope, role.ReadAction); err != nil {
++			return nil, err
++		}
++		return e.getGlobalSecret(dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) proxySavedGlobalDatasource(ctx echo.Context) error {
+@@ -69,7 +72,9 @@ func (e *endpoint) proxySavedGlobalDatasource(ctx echo.Context) error {
+ 		return err
+ 	}
+ 
+-	return e.proxyGlobalDatasource(ctx, dts.Metadata.Name, dts.Spec)
++	return e.proxyGlobalDatasource(ctx, dts.Metadata.Name, dts.Spec, func(name string) (*v1.SecretSpec, error) {
++		return e.getGlobalSecret(dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) getGlobalDatasource(name string) (*v1.GlobalDatasource, error) {
+diff --git a/internal/api/impl/proxy/localdatasource.go b/internal/api/impl/proxy/localdatasource.go
+index 8fbc3d8..b71e1bb 100644
+--- a/internal/api/impl/proxy/localdatasource.go
++++ b/internal/api/impl/proxy/localdatasource.go
+@@ -26,12 +26,10 @@ import (
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+-func (e *endpoint) proxyDashboardDatasource(ctx echo.Context, projectName, dtsName string, spec datasource.Spec) error {
++func (e *endpoint) proxyDashboardDatasource(ctx echo.Context, projectName, dtsName string, spec datasource.Spec, retrieveSecret func(name string) (*v1.SecretSpec, error)) error {
+ 	path := ctx.Param("*")
+ 
+-	pr, err := newProxy(dtsName, projectName, spec, path, e.crypto, func(name string) (*v1.SecretSpec, error) {
+-		return e.getProjectSecret(projectName, dtsName, name)
+-	})
++	pr, err := newProxy(dtsName, projectName, spec, path, e.crypto, retrieveSecret)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -56,7 +54,12 @@ func (e *endpoint) proxyUnsavedDashboardDatasource(ctx echo.Context) error {
+ 		dtsName = body.Spec.Display.Name
+ 	}
+ 
+-	return e.proxyDashboardDatasource(ctx, projectName, dtsName, body.Spec)
++	return e.proxyDashboardDatasource(ctx, projectName, dtsName, body.Spec, func(name string) (*v1.SecretSpec, error) {
++		if err := e.checkPermission(ctx, projectName, role.SecretScope, role.ReadAction); err != nil {
++			return nil, err
++		}
++		return e.getProjectSecret(projectName, dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) proxySavedDashboardDatasource(ctx echo.Context) error {
+@@ -73,7 +76,9 @@ func (e *endpoint) proxySavedDashboardDatasource(ctx echo.Context) error {
+ 		return err
+ 	}
+ 
+-	return e.proxyDashboardDatasource(ctx, projectName, dtsName, dts)
++	return e.proxyDashboardDatasource(ctx, projectName, dtsName, dts, func(name string) (*v1.SecretSpec, error) {
++		return e.getProjectSecret(projectName, dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) getDashboardDatasource(projectName string, dashboardName string, name string) (datasource.Spec, error) {
+diff --git a/internal/api/impl/proxy/projectdatasource.go b/internal/api/impl/proxy/projectdatasource.go
+index 767843c..356d8fc 100644
+--- a/internal/api/impl/proxy/projectdatasource.go
++++ b/internal/api/impl/proxy/projectdatasource.go
+@@ -26,11 +26,9 @@ import (
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+-func (e *endpoint) proxyProjectDatasource(ctx echo.Context, projectName, dtsName string, spec datasource.Spec) error {
++func (e *endpoint) proxyProjectDatasource(ctx echo.Context, projectName, dtsName string, spec datasource.Spec, retrieveSecret func(name string) (*v1.SecretSpec, error)) error {
+ 	path := ctx.Param("*")
+-	pr, err := newProxy(dtsName, projectName, spec, path, e.crypto, func(name string) (*v1.SecretSpec, error) {
+-		return e.getProjectSecret(projectName, dtsName, name)
+-	})
++	pr, err := newProxy(dtsName, projectName, spec, path, e.crypto, retrieveSecret)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -55,7 +53,12 @@ func (e *endpoint) proxyUnsavedProjectDatasource(ctx echo.Context) error {
+ 		dtsName = body.Spec.Display.Name
+ 	}
+ 
+-	return e.proxyProjectDatasource(ctx, projectName, dtsName, body.Spec)
++	return e.proxyProjectDatasource(ctx, projectName, dtsName, body.Spec, func(name string) (*v1.SecretSpec, error) {
++		if err := e.checkPermission(ctx, projectName, role.SecretScope, role.ReadAction); err != nil {
++			return nil, err
++		}
++		return e.getProjectSecret(projectName, dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) proxySavedProjectDatasource(ctx echo.Context) error {
+@@ -70,7 +73,9 @@ func (e *endpoint) proxySavedProjectDatasource(ctx echo.Context) error {
+ 		return err
+ 	}
+ 
+-	return e.proxyProjectDatasource(ctx, projectName, dtsName, dts)
++	return e.proxyProjectDatasource(ctx, projectName, dtsName, dts, func(name string) (*v1.SecretSpec, error) {
++		return e.getProjectSecret(projectName, dtsName, name)
++	})
+ }
+ 
+ func (e *endpoint) getProjectDatasource(projectName string, name string) (datasource.Spec, error) {
+diff --git a/internal/api/impl/v1/dashboard/service.go b/internal/api/impl/v1/dashboard/service.go
+index 06be82d..bda0b2c 100644
+--- a/internal/api/impl/v1/dashboard/service.go
++++ b/internal/api/impl/v1/dashboard/service.go
+@@ -16,9 +16,11 @@ package dashboard
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/http"
+ 
+ 	"github.com/brunoga/deep"
+ 	"github.com/labstack/echo/v4"
++	"github.com/perses/perses/internal/api/authorization"
+ 	apiInterface "github.com/perses/perses/internal/api/interface"
+ 	"github.com/perses/perses/internal/api/interface/v1/dashboard"
+ 	"github.com/perses/perses/internal/api/interface/v1/globalvariable"
+@@ -28,6 +30,8 @@ import (
+ 	"github.com/perses/perses/pkg/model/api"
+ 	"github.com/perses/perses/pkg/model/api/config"
+ 	v1 "github.com/perses/perses/pkg/model/api/v1"
++	datasourceV1 "github.com/perses/perses/pkg/model/api/v1/datasource"
++	"github.com/perses/perses/pkg/model/api/v1/role"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+@@ -40,9 +44,10 @@ type service struct {
+ 	isDatasourceDisable bool
+ 	isVariableDisable   bool
+ 	customRules         []*config.CustomLintRule
++	authz               authorization.Authorization
+ }
+ 
+-func NewService(cfg config.Config, dao dashboard.DAO, globalVarDAO globalvariable.DAO, projectVarDAO variable.DAO, sch schema.Schema) dashboard.Service {
++func NewService(cfg config.Config, dao dashboard.DAO, globalVarDAO globalvariable.DAO, projectVarDAO variable.DAO, sch schema.Schema, authz authorization.Authorization) dashboard.Service {
+ 	return &service{
+ 		dao:                 dao,
+ 		globalVarDAO:        globalVarDAO,
+@@ -51,14 +56,18 @@ func NewService(cfg config.Config, dao dashboard.DAO, globalVarDAO globalvariabl
+ 		isDatasourceDisable: cfg.Datasource.DisableLocal,
+ 		isVariableDisable:   cfg.Variable.DisableLocal,
+ 		customRules:         cfg.Dashboard.CustomLintRules,
++		authz:               authz,
+ 	}
+ }
+ 
+-func (s *service) Create(_ echo.Context, entity *v1.Dashboard) (*v1.Dashboard, error) {
++func (s *service) Create(ctx echo.Context, entity *v1.Dashboard) (*v1.Dashboard, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.create(copyEntity)
+ }
+ 
+@@ -76,11 +85,14 @@ func (s *service) create(entity *v1.Dashboard) (*v1.Dashboard, error) {
+ 	return entity, nil
+ }
+ 
+-func (s *service) Update(_ echo.Context, entity *v1.Dashboard, parameters apiInterface.Parameters) (*v1.Dashboard, error) {
++func (s *service) Update(ctx echo.Context, entity *v1.Dashboard, parameters apiInterface.Parameters) (*v1.Dashboard, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.update(copyEntity, parameters)
+ }
+ 
+@@ -168,6 +180,37 @@ func (s *service) Validate(entity *v1.Dashboard) error {
+ 	return nil
+ }
+ 
++// checkSecretPermission ensures that the user that creates/updates a dashboard whose local datasources
++// reference stored secrets is allowed to read those secrets.
++func (s *service) checkSecretPermission(ctx echo.Context, dashboard *v1.Dashboard) error {
++	return nil
++
++	if !s.authz.IsEnabled() {
++		return nil
++	}
++	for dtsName, dtsSpec := range dashboard.Spec.Datasources {
++		if dtsSpec == nil {
++			continue
++		}
++		referencedSecrets, err := datasourceV1.ReferencedSecrets(dtsSpec.Plugin.Spec)
++		if err != nil {
++			logrus.WithError(err).WithFields(map[string]interface{}{
++				"dashboard":  dashboard.Metadata.Name,
++				"project":    dashboard.Metadata.Project,
++				"datasource": dtsName,
++			}).Error("unable to build or find the config in the datasource spec")
++			return echo.NewHTTPError(http.StatusBadGateway, "unable to build or find the config")
++		}
++		if len(referencedSecrets) == 0 {
++			continue
++		}
++		if ok := s.authz.HasPermission(ctx, role.ReadAction, dashboard.Metadata.Project, role.SecretScope); !ok {
++			return apiInterface.HandleForbiddenError(fmt.Sprintf("missing '%s' permission in '%s' project for '%s' kind", role.ReadAction, dashboard.Metadata.Project, role.SecretScope))
++		}
++	}
++	return nil
++}
++
+ func (s *service) collectProjectVariables(project string) ([]*v1.Variable, error) {
+ 	if len(project) == 0 {
+ 		return nil, nil
+diff --git a/internal/api/impl/v1/datasource/service.go b/internal/api/impl/v1/datasource/service.go
+index aa79ada..ff13513 100644
+--- a/internal/api/impl/v1/datasource/service.go
++++ b/internal/api/impl/v1/datasource/service.go
+@@ -16,36 +16,45 @@ package datasource
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/http"
+ 
+ 	"github.com/brunoga/deep"
+ 	"github.com/labstack/echo/v4"
++	"github.com/perses/perses/internal/api/authorization"
+ 	apiInterface "github.com/perses/perses/internal/api/interface"
+ 	"github.com/perses/perses/internal/api/interface/v1/datasource"
+ 	"github.com/perses/perses/internal/api/plugin/schema"
+ 	"github.com/perses/perses/internal/api/validate"
+ 	"github.com/perses/perses/pkg/model/api"
+ 	v1 "github.com/perses/perses/pkg/model/api/v1"
++	datasourceV1 "github.com/perses/perses/pkg/model/api/v1/datasource"
++	"github.com/perses/perses/pkg/model/api/v1/role"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+ type service struct {
+ 	datasource.Service
+-	dao datasource.DAO
+-	sch schema.Schema
++	dao   datasource.DAO
++	sch   schema.Schema
++	authz authorization.Authorization
+ }
+ 
+-func NewService(dao datasource.DAO, sch schema.Schema) datasource.Service {
++func NewService(dao datasource.DAO, sch schema.Schema, authz authorization.Authorization) datasource.Service {
+ 	return &service{
+-		dao: dao,
+-		sch: sch,
++		dao:   dao,
++		sch:   sch,
++		authz: authz,
+ 	}
+ }
+ 
+-func (s *service) Create(_ echo.Context, entity *v1.Datasource) (*v1.Datasource, error) {
++func (s *service) Create(ctx echo.Context, entity *v1.Datasource) (*v1.Datasource, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.create(copyEntity)
+ }
+ 
+@@ -61,11 +70,14 @@ func (s *service) create(entity *v1.Datasource) (*v1.Datasource, error) {
+ 	return entity, nil
+ }
+ 
+-func (s *service) Update(_ echo.Context, entity *v1.Datasource, parameters apiInterface.Parameters) (*v1.Datasource, error) {
++func (s *service) Update(ctx echo.Context, entity *v1.Datasource, parameters apiInterface.Parameters) (*v1.Datasource, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.update(copyEntity, parameters)
+ }
+ 
+@@ -136,3 +148,41 @@ func (s *service) validate(entity *v1.Datasource) error {
+ 	}
+ 	return validate.Datasource(entity, list, s.sch)
+ }
++
++// checkSecretPermission ensures that the user that creates/updates a datasource with a secret actually has the secret
++// reader permission.
++func (s *service) checkSecretPermission(ctx echo.Context, datasource *v1.Datasource) error {
++	if !s.authz.IsEnabled() {
++		return nil
++	}
++
++	referencedSecrets, proxyErr := datasourceV1.ReferencedSecrets(datasource.Spec.Plugin.Spec)
++	if proxyErr != nil {
++		logrus.WithError(proxyErr).WithFields(map[string]interface{}{
++			"datasource": datasource.Metadata.Name,
++			"project":    datasource.Metadata.Project,
++		}).Error("unable to build or find the config in the datasource spec")
++		return echo.NewHTTPError(http.StatusBadGateway, "unable to build or find the config")
++	}
++
++	if len(referencedSecrets) == 0 {
++		return nil
++	}
++	if ok := s.authz.HasPermission(ctx, role.ReadAction, datasource.Metadata.Project, role.SecretScope); !ok {
++		return apiInterface.HandleForbiddenError(fmt.Sprintf("missing '%s' permission in '%s' project for '%s' kind", role.ReadAction, datasource.Metadata.Project, role.SecretScope))
++	}
++
++	return nil
++}
++
++func manageQuery(q *datasource.Query, params apiInterface.Parameters) (*datasource.Query, error) {
++	// Query is copied because it can be modified by the toolbox.go: listWhenPermissionIsActivated(...) and need to `q` need to keep initial value
++	query, err := deep.Copy(q)
++	if err != nil {
++		return nil, fmt.Errorf("unable to copy the query: %w", err)
++	}
++	if len(query.Project) == 0 {
++		query.Project = params.Project
++	}
++	return query, nil
++}
+diff --git a/internal/api/impl/v1/ephemeraldashboard/service.go b/internal/api/impl/v1/ephemeraldashboard/service.go
+index b4333d8..cdb4fc5 100644
+--- a/internal/api/impl/v1/ephemeraldashboard/service.go
++++ b/internal/api/impl/v1/ephemeraldashboard/service.go
+@@ -16,9 +16,11 @@ package ephemeraldashboard
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/http"
+ 
+ 	"github.com/brunoga/deep"
+ 	"github.com/labstack/echo/v4"
++	"github.com/perses/perses/internal/api/authorization"
+ 	apiInterface "github.com/perses/perses/internal/api/interface"
+ 	"github.com/perses/perses/internal/api/interface/v1/ephemeraldashboard"
+ 	"github.com/perses/perses/internal/api/interface/v1/globalvariable"
+@@ -27,6 +29,8 @@ import (
+ 	"github.com/perses/perses/internal/api/validate"
+ 	"github.com/perses/perses/pkg/model/api"
+ 	v1 "github.com/perses/perses/pkg/model/api/v1"
++	datasourceV1 "github.com/perses/perses/pkg/model/api/v1/datasource"
++	"github.com/perses/perses/pkg/model/api/v1/role"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+@@ -36,22 +40,27 @@ type service struct {
+ 	globalVarDAO  globalvariable.DAO
+ 	projectVarDAO variable.DAO
+ 	sch           schema.Schema
++	authz         authorization.Authorization
+ }
+ 
+-func NewService(dao ephemeraldashboard.DAO, globalVarDAO globalvariable.DAO, projectVarDAO variable.DAO, sch schema.Schema) ephemeraldashboard.Service {
++func NewService(dao ephemeraldashboard.DAO, globalVarDAO globalvariable.DAO, projectVarDAO variable.DAO, sch schema.Schema, authz authorization.Authorization) ephemeraldashboard.Service {
+ 	return &service{
+ 		dao:           dao,
+ 		globalVarDAO:  globalVarDAO,
+ 		projectVarDAO: projectVarDAO,
+ 		sch:           sch,
++		authz:         authz,
+ 	}
+ }
+ 
+-func (s *service) Create(_ echo.Context, entity *v1.EphemeralDashboard) (*v1.EphemeralDashboard, error) {
++func (s *service) Create(ctx echo.Context, entity *v1.EphemeralDashboard) (*v1.EphemeralDashboard, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.create(copyEntity)
+ }
+ 
+@@ -69,11 +78,14 @@ func (s *service) create(entity *v1.EphemeralDashboard) (*v1.EphemeralDashboard,
+ 	return entity, nil
+ }
+ 
+-func (s *service) Update(_ echo.Context, entity *v1.EphemeralDashboard, parameters apiInterface.Parameters) (*v1.EphemeralDashboard, error) {
++func (s *service) Update(ctx echo.Context, entity *v1.EphemeralDashboard, parameters apiInterface.Parameters) (*v1.EphemeralDashboard, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.update(copyEntity, parameters)
+ }
+ 
+@@ -148,6 +160,37 @@ func (s *service) Validate(entity *v1.EphemeralDashboard) error {
+ 	return nil
+ }
+ 
++// checkSecretPermission ensures that the user that creates/updates an ephemeral dashboard whose local
++// datasources reference stored secrets is allowed to read those secrets.
++func (s *service) checkSecretPermission(ctx echo.Context, dashboard *v1.EphemeralDashboard) error {
++	return nil
++
++	if !s.authz.IsEnabled() {
++		return nil
++	}
++	for dtsName, dtsSpec := range dashboard.Spec.Datasources {
++		if dtsSpec == nil {
++			continue
++		}
++		referencedSecrets, err := datasourceV1.ReferencedSecrets(dtsSpec.Plugin.Spec)
++		if err != nil {
++			logrus.WithError(err).WithFields(map[string]interface{}{
++				"dashboard":  dashboard.Metadata.Name,
++				"project":    dashboard.Metadata.Project,
++				"datasource": dtsName,
++			}).Error("unable to build or find the config in the datasource spec")
++			return echo.NewHTTPError(http.StatusBadGateway, "unable to build or find the config")
++		}
++		if len(referencedSecrets) == 0 {
++			continue
++		}
++		if ok := s.authz.HasPermission(ctx, role.ReadAction, dashboard.Metadata.Project, role.SecretScope); !ok {
++			return apiInterface.HandleForbiddenError(fmt.Sprintf("missing '%s' permission in '%s' project for '%s' kind", role.ReadAction, dashboard.Metadata.Project, role.SecretScope))
++		}
++	}
++	return nil
++}
++
+ func (s *service) collectProjectVariables(project string) ([]*v1.Variable, error) {
+ 	if len(project) == 0 {
+ 		return nil, nil
+diff --git a/internal/api/impl/v1/globaldatasource/service.go b/internal/api/impl/v1/globaldatasource/service.go
+index fcc8be9..43a383c 100644
+--- a/internal/api/impl/v1/globaldatasource/service.go
++++ b/internal/api/impl/v1/globaldatasource/service.go
+@@ -16,36 +16,45 @@ package globaldatasource
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/http"
+ 
+ 	"github.com/brunoga/deep"
+ 	"github.com/labstack/echo/v4"
++	"github.com/perses/perses/internal/api/authorization"
+ 	apiInterface "github.com/perses/perses/internal/api/interface"
+ 	"github.com/perses/perses/internal/api/interface/v1/globaldatasource"
+ 	"github.com/perses/perses/internal/api/plugin/schema"
+ 	"github.com/perses/perses/internal/api/validate"
+ 	"github.com/perses/perses/pkg/model/api"
+ 	v1 "github.com/perses/perses/pkg/model/api/v1"
++	datasourceV1 "github.com/perses/perses/pkg/model/api/v1/datasource"
++	"github.com/perses/perses/pkg/model/api/v1/role"
+ 	"github.com/sirupsen/logrus"
+ )
+ 
+ type service struct {
+ 	globaldatasource.Service
+-	dao globaldatasource.DAO
+-	sch schema.Schema
++	dao   globaldatasource.DAO
++	sch   schema.Schema
++	authz authorization.Authorization
+ }
+ 
+-func NewService(dao globaldatasource.DAO, sch schema.Schema) globaldatasource.Service {
++func NewService(dao globaldatasource.DAO, sch schema.Schema, authz authorization.Authorization) globaldatasource.Service {
+ 	return &service{
+-		dao: dao,
+-		sch: sch,
++		dao:   dao,
++		sch:   sch,
++		authz: authz,
+ 	}
+ }
+ 
+-func (s *service) Create(_ echo.Context, entity *v1.GlobalDatasource) (*v1.GlobalDatasource, error) {
++func (s *service) Create(ctx echo.Context, entity *v1.GlobalDatasource) (*v1.GlobalDatasource, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.create(copyEntity)
+ }
+ 
+@@ -61,11 +70,14 @@ func (s *service) create(entity *v1.GlobalDatasource) (*v1.GlobalDatasource, err
+ 	return entity, nil
+ }
+ 
+-func (s *service) Update(_ echo.Context, entity *v1.GlobalDatasource, parameters apiInterface.Parameters) (*v1.GlobalDatasource, error) {
++func (s *service) Update(ctx echo.Context, entity *v1.GlobalDatasource, parameters apiInterface.Parameters) (*v1.GlobalDatasource, error) {
+ 	copyEntity, err := deep.Copy(entity)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to copy entity: %w", err)
+ 	}
++	if errPerm := s.checkSecretPermission(ctx, copyEntity); errPerm != nil {
++		return nil, errPerm
++	}
+ 	return s.update(copyEntity, parameters)
+ }
+ 
+@@ -106,6 +118,31 @@ func (s *service) List(q *globaldatasource.Query) ([]*v1.GlobalDatasource, error
+ 	return v1.FilterDatasource(q.Kind, q.Default, dtsList), nil
+ }
+ 
++// checkSecretPermission ensures that the user that creates/updates a datasource with a secret actually has the secret
++// reader permission.
++func (s *service) checkSecretPermission(ctx echo.Context, datasource *v1.GlobalDatasource) error {
++	if !s.authz.IsEnabled() {
++		return nil
++	}
++
++	referencedSecrets, proxyErr := datasourceV1.ReferencedSecrets(datasource.Spec.Plugin.Spec)
++	if proxyErr != nil {
++		logrus.WithError(proxyErr).WithFields(map[string]interface{}{
++			"datasource": datasource.Metadata.Name,
++		}).Error("unable to build or find the config in the datasource spec")
++		return echo.NewHTTPError(http.StatusBadGateway, "unable to build or find the config")
++	}
++
++	if len(referencedSecrets) == 0 {
++		return nil
++	}
++	if ok := s.authz.HasPermission(ctx, role.ReadAction, v1.WildcardProject, role.GlobalSecretScope); !ok {
++		return apiInterface.HandleForbiddenError(fmt.Sprintf("missing '%s' permission for '%s' kind", role.ReadAction, role.GlobalSecretScope))
++	}
++
++	return nil
++}
++
+ func (s *service) MetadataList(_ *globaldatasource.Query) ([]api.Entity, error) {
+ 	return nil, fmt.Errorf("not implemented")
+ }
+diff --git a/pkg/model/api/v1/datasource/proxy.go b/pkg/model/api/v1/datasource/proxy.go
+index 8efa6ab..a1578cd 100644
+--- a/pkg/model/api/v1/datasource/proxy.go
++++ b/pkg/model/api/v1/datasource/proxy.go
+@@ -16,6 +16,7 @@ package datasource
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"regexp"
+ 	"reflect"
+ 	"strings"
+ 
+@@ -37,6 +38,42 @@ func ValidateAndExtract(pluginSpec any) (any, string, error) {
+ 	return finder.config, finder.foundKind, finder.err
+ }
+ 
++
++// headerSecretReference matches a header value that references a stored secret by name.
++var headerSecretReference = regexp.MustCompile(`\{\{secret:([A-Za-z0-9._-]+)\}\}`)
++
++// ReferencedSecrets returns the name of every stored secret referenced by the given plugin spec.
++// A reference is either the secret of the proxy configuration or a secret named in one of its header
++// values. The returned names are de-duplicated and keep their order of appearance.
++func ReferencedSecrets(pluginSpec any) ([]string, error) {
++	cfg, kind, err := ValidateAndExtract(pluginSpec)
++	if err != nil {
++		return nil, err
++	}
++	seen := make(map[string]bool)
++	var names []string
++	add := func(name string) {
++		if len(name) == 0 || seen[name] {
++			return
++		}
++		seen[name] = true
++		names = append(names, name)
++	}
++	switch kind {
++	case http.ProxyKindName:
++		httpConfig := cfg.(*http.Config)
++		add(httpConfig.Secret)
++		for _, value := range httpConfig.Headers {
++			for _, match := range headerSecretReference.FindAllStringSubmatch(value, -1) {
++				add(match[1])
++			}
++		}
++	case sql.ProxyKindName:
++		add(cfg.(*sql.Config).Secret)
++	}
++	return names, nil
++}
++
+ type configFinder struct {
+ 	err       error
+ 	found     bool

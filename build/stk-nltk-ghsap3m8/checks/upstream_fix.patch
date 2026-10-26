@@ -1,0 +1,1827 @@
+diff --git a/nltk/data.py b/nltk/data.py
+index fb24272..9e74650 100644
+--- a/nltk/data.py
++++ b/nltk/data.py
+@@ -1,7 +1,8 @@
+ # Natural Language Toolkit: Utility functions
+ #
+-# Copyright (C) 2001-2023 NLTK Project
++# Copyright (C) 2001-2026 NLTK Project
+ # Author: Edward Loper <edloper@gmail.com>
++# Author: ekaf (Restricting and switching pickles)
+ # URL: <https://www.nltk.org/>
+ # For license information, see LICENSE.TXT
+ 
+@@ -38,12 +39,35 @@ import pickle
+ import re
+ import sys
+ import textwrap
++import urllib.request
+ import zipfile
+ from abc import ABCMeta, abstractmethod
+ from gzip import WRITE as GZ_WRITE
+ from gzip import GzipFile
+ from io import BytesIO, TextIOWrapper
+-from urllib.request import url2pathname, urlopen
++from urllib.request import url2pathname
++
++from nltk.pathsec import ZipFile
++from nltk.pathsec import open as _secure_open
++from nltk.pathsec import urlopen as _secure_urlopen
++
++# Reject unsafe no-protocol paths: traversal segments, trailing '..', absolute paths,
++# backslashes, Windows drive letters. Use a raw-string pattern and do not anchor only
++# at the start — we'll use search() for safety checks.
++_UNSAFE_NO_PROTOCOL_RE = re.compile(r"(?:\.\./|\.\.$|^/|\\|[A-Za-z]:[/\\])")
++
++
++def _reject_unsafe_no_protocol(resource_url):
++    """
++    Reject unsafe resource strings that *omit an explicit protocol*.
++
++    Note: some no-protocol inputs are interpreted by split_resource_url() as
++    file-style paths (e.g., bare Windows drive paths like "C:/foo"). These must
++    still be rejected here when they contain unsafe patterns.
++    """
++    if _UNSAFE_NO_PROTOCOL_RE.search(resource_url):
++        raise ValueError(f"Unsafe resource path: {resource_url!r}")
++
+ 
+ try:
+     from zlib import Z_SYNC_FLUSH as FLUSH
+@@ -51,7 +75,6 @@ except ImportError:
+     from zlib import Z_FINISH as FLUSH
+ 
+ from nltk import grammar, sem
+-from nltk.compat import add_py3_data, py3_data
+ from nltk.internals import deprecated
+ 
+ textwrap_indent = functools.partial(textwrap.indent, prefix="  ")
+@@ -133,6 +156,16 @@ def split_resource_url(resource_url):
+     ('file', '/C:/home/nltk')
+     """
+     protocol, path_ = resource_url.split(":", 1)
++
++    # Handle plain Windows drive paths like "C:/foo" or "D:/bar"
++    # Treat these as file-style inputs even without "file:" prefix.
++    if (
++        len(protocol) == 1
++        and protocol.isalpha()
++        and (path_.startswith("/") or path_.startswith("\\"))
++    ):
++        return "file", f"/{protocol}:{path_.lstrip('/')}"
++
+     if protocol == "nltk":
+         pass
+     elif protocol == "file":
+@@ -140,6 +173,7 @@ def split_resource_url(resource_url):
+             path_ = "/" + path_.lstrip("/")
+     else:
+         path_ = re.sub(r"^/{0,2}", "", path_)
++
+     return protocol, path_
+ 
+ 
+@@ -161,10 +195,6 @@ def normalize_resource_url(resource_url):
+     True
+     >>> not windows or normalize_resource_url('file:////C:/dir/file') == 'file:///C:/dir/file'
+     True
+-    >>> not windows or normalize_resource_url('nltk:C:/dir/file') == 'file:///C:/dir/file'
+-    True
+-    >>> not windows or normalize_resource_url('nltk:C:\\dir\\file') == 'file:///C:/dir/file'
+-    True
+     >>> windows or normalize_resource_url('file:/dir/file/toy.cfg') == 'file:///dir/file/toy.cfg'
+     True
+     >>> normalize_resource_url('nltk:home/nltk')
+@@ -175,28 +205,58 @@ def normalize_resource_url(resource_url):
+     'https://example.com/dir/file'
+     >>> normalize_resource_url('dir/file')
+     'nltk:dir/file'
++
++    # Security: reject attempts to smuggle local Windows paths via the "nltk:" protocol.
++    >>> normalize_resource_url('nltk:C:/dir/file')  # doctest: +ELLIPSIS
++    Traceback (most recent call last):
++    ...
++    ValueError: Unsafe resource path: ...
++    >>> normalize_resource_url(r'nltk:C:\dir\file')  # doctest: +ELLIPSIS
++    Traceback (most recent call last):
++    ...
++    ValueError: Unsafe resource path: ...
+     """
+     try:
+         protocol, name = split_resource_url(resource_url)
+     except ValueError:
+-        # the resource url has no protocol, use the nltk protocol by default
++        # No protocol → default to 'nltk:'
++        _reject_unsafe_no_protocol(resource_url)
+         protocol = "nltk"
+         name = resource_url
+-    # use file protocol if the path is an absolute path
+-    if protocol == "nltk" and os.path.isabs(name):
+-        protocol = "file://"
+-        name = normalize_resource_name(name, False, None)
++    # If split_resource_url() inferred "file" from an input that *omitted* an explicit
++    # protocol (e.g., "C:/dir/file" or "C:\\dir\\file"), then treat it as a no-protocol
++    # input for security validation to prevent unsafe local path access.
++    if protocol == "file" and not resource_url.lower().startswith("file:"):
++        _reject_unsafe_no_protocol(resource_url)
++
++    # ----------------------------------------------------------------------
++    # Protocol-specific handling
++    # ----------------------------------------------------------------------
++
++    # Case 1: nltk:<path>
++    if protocol == "nltk":
++        # If "nltk:" is used with an absolute path, treat it as "file://"
++        # Reject Windows drive-letter paths even when explicitly using the nltk: protocol.
++        # This prevents smuggling filesystem paths through nltk: URLs.
++        if re.match(r"^[A-Za-z]:[/\\]", name):
++            raise ValueError(f"Unsafe resource path: {resource_url!r}")
++        if os.path.isabs(name):
++            protocol = "file://"
++            name = normalize_resource_name(name, False, None)
++        else:
++            protocol = "nltk:"
++            name = normalize_resource_name(name, True)
++
++    # Case 2: file:<path>
+     elif protocol == "file":
+         protocol = "file://"
+-        # name is absolute
+         name = normalize_resource_name(name, False, None)
+-    elif protocol == "nltk":
+-        protocol = "nltk:"
+-        name = normalize_resource_name(name, True)
++
++    # Case 3: External URLs (http, https, ftp, etc.)
+     else:
+-        # handled by urllib
+         protocol += "://"
+-    return "".join([protocol, name])
++
++    return protocol + name
+ 
+ 
+ def normalize_resource_name(resource_name, allow_relative=True, relative_path=None):
+@@ -299,7 +359,6 @@ class FileSystemPathPointer(PathPointer, str):
+     directly via a given absolute path.
+     """
+ 
+-    @py3_data
+     def __init__(self, _path):
+         """
+         Create a new path pointer for the given absolute path.
+@@ -321,7 +380,12 @@ class FileSystemPathPointer(PathPointer, str):
+         return self._path
+ 
+     def open(self, encoding=None):
+-        stream = open(self._path, "rb")
++        """
++        Secure open — prevents absolute direct access outside pointer root.
++        Path validation is enforced by pathsec.open() which checks the
++        resolved path against allowed NLTK data roots.
++        """
++        stream = _secure_open(self._path, "rb")
+         if encoding is not None:
+             stream = SeekableUnicodeStreamReader(stream, encoding)
+         return stream
+@@ -330,8 +394,23 @@ class FileSystemPathPointer(PathPointer, str):
+         return os.stat(self._path).st_size
+ 
+     def join(self, fileid):
+-        _path = os.path.join(self._path, fileid)
+-        return FileSystemPathPointer(_path)
++        """
++        Harden join() to prevent traversal & ensure corpus-root sandbox.
++        """
++        fileid = str(fileid).replace("\\", "/")
++
++        # Block ../ traversal
++        if ".." in fileid.split("/"):
++            raise ValueError(f"Traversal blocked: {fileid}")
++
++        joined = os.path.normpath(os.path.join(self._path, fileid))
++        root = os.path.normpath(self._path)
++
++        # Enforce root boundary — must stay inside corpus root
++        if not (joined == root or joined.startswith(root + os.sep)):
++            raise ValueError(f"Escape outside root blocked: {joined}")
++
++        return FileSystemPathPointer(joined)
+ 
+     def __repr__(self):
+         return "FileSystemPathPointer(%r)" % self._path
+@@ -348,7 +427,6 @@ class BufferedGzipFile(GzipFile):
+     Python versions.
+     """
+ 
+-    @py3_data
+     def __init__(
+         self, filename=None, mode=None, compresslevel=9, fileobj=None, **kwargs
+     ):
+@@ -381,7 +459,6 @@ class ZipFilePathPointer(PathPointer):
+     which can be accessed by reading that zipfile.
+     """
+ 
+-    @py3_data
+     def __init__(self, zipfile, entry=""):
+         """
+         Create a new path pointer pointing at the specified entry
+@@ -420,7 +497,7 @@ class ZipFilePathPointer(PathPointer):
+     @property
+     def zipfile(self):
+         """
+-        The zipfile.ZipFile object used to access the zip file
++        The ZipFile object used to access the zip file
+         containing the entry identified by this path pointer.
+         """
+         return self._zipfile
+@@ -467,6 +544,36 @@ _resource_cache = {}
+    need to be loaded more than once."""
+ 
+ 
++def open_datafile(path, file_name="", encoding="utf-8"):
++    """
++    Open a data file using a PathPointer, supporting both filesystem and zip file paths.
++
++    The function can be used in two ways:
++
++    1. `path` is a PathPointer to a directory, and `file_name` is the name of a file
++       within that directory.
++    2. `path` is a PathPointer to a file, and `file_name` is left empty.
++
++    :param path: A PathPointer (e.g. FileSystemPathPointer or ZipFilePathPointer)
++        representing either the file to open (when file_name is empty), or the
++        directory containing the file.
++    :type path: PathPointer
++    :param file_name: The name of the file to open within the directory. Leave empty
++        if `path` already points to the file.
++    :type file_name: str
++    :param encoding: The character encoding to use when opening the file. If None,
++        a binary stream is returned.
++    :type encoding: str or None
++    :return: A file-like object (binary stream if encoding is None, otherwise a text
++        stream with the specified encoding).
++    :rtype: file-like
++    """
++    if file_name:
++        # Use .join() to reach the file regardless of zip/real FS.
++        path = path.join(file_name)
++    return path.open(encoding=encoding)
++
++
+ def find(resource_name, paths=None):
+     """
+     Find the given resource by searching through the directories and
+@@ -505,6 +612,10 @@ def find(resource_name, paths=None):
+     :rtype: str
+     """
+     resource_name = normalize_resource_name(resource_name, True)
++    # Defense-in-depth: reject traversal/absolute paths even if caller bypassed normalize_resource_url()
++    # Use search() so traversal components anywhere in the resource_name trigger rejection.
++    if _UNSAFE_NO_PROTOCOL_RE.search(resource_name):
++        raise ValueError(f"Unsafe resource path: {resource_name!r}")
+ 
+     # Resolve default paths at runtime in-case the user overrides
+     # nltk.data.path
+@@ -512,8 +623,18 @@ def find(resource_name, paths=None):
+         paths = path
+ 
+     # Check if the resource name includes a zipfile name
+-    m = re.match(r"(.*\.zip)/?(.*)$|", resource_name)
+-    zipfile, zipentry = m.groups()
++    m = re.match(r"(.*?\.zip)/?(.*)$", resource_name)
++    if m:
++        zipfile, zipentry = m.groups()
++    else:
++        zipfile = None
++
++    # Evidence that the *package* exists but the specific entry does not.
++    _package_present_but_entry_missing = []
++
++    def _note_near_miss(where):
++        if where not in _package_present_but_entry_missing:
++            _package_present_but_entry_missing.append(where)
+ 
+     # Check each item in our path
+     for path_ in paths:
+@@ -523,6 +644,7 @@ def find(resource_name, paths=None):
+                 return ZipFilePathPointer(path_, resource_name)
+             except OSError:
+                 # resource not in zipfile
++                _note_near_miss(path_)
+                 continue
+ 
+         # Is the path item a directory or is resource_name an absolute path?
+@@ -534,6 +656,22 @@ def find(resource_name, paths=None):
+                         return GzipFileSystemPathPointer(p)
+                     else:
+                         return FileSystemPathPointer(p)
++                else:
++                    # If the package exists (either as a directory or as a .zip)
++                    # but the specific requested file doesn't, record a "near miss"
++                    # so the eventual LookupError isn't misleading.
++                    parts = [p for p in resource_name.split("/") if p]
++                    # Only record a "near miss" when there is a sub-entry *within* a
++                    # package (i.e. more than two meaningful path components), so we
++                    # don't misclassify requests for the package root itself.
++                    if len(parts) > 2:
++                        pkg = "/".join(parts[:2])  # e.g. "corpora/stopwords"
++                        pkg_dir = os.path.join(path_, url2pathname(pkg))
++                        pkg_zip = os.path.join(path_, url2pathname(pkg + ".zip"))
++                        if os.path.isdir(pkg_dir):
++                            _note_near_miss(pkg_dir)
++                        elif os.path.isfile(pkg_zip):
++                            _note_near_miss(pkg_zip)
+             else:
+                 p = os.path.join(path_, url2pathname(zipfile))
+                 if os.path.exists(p):
+@@ -541,6 +679,7 @@ def find(resource_name, paths=None):
+                         return ZipFilePathPointer(p, zipentry)
+                     except OSError:
+                         # resource not in zipfile
++                        _note_near_miss(p)
+                         continue
+ 
+     # Fallback: if the path doesn't include a zip file, then try
+@@ -556,25 +695,53 @@ def find(resource_name, paths=None):
+                 pass
+ 
+     # Identify the package (i.e. the .zip file) to download.
+-    resource_zipname = resource_name.split("/")[1]
++    parts = resource_name.split("/")
++    resource_zipname = parts[1] if len(parts) > 1 else parts[0]
+     if resource_zipname.endswith(".zip"):
+         resource_zipname = resource_zipname.rpartition(".")[0]
+-    # Display a friendly error message if the resource wasn't found:
+-    msg = str(
+-        "Resource \33[93m{resource}\033[0m not found.\n"
+-        "Please use the NLTK Downloader to obtain the resource:\n\n"
+-        "\33[31m"  # To display red text in terminal.
+-        ">>> import nltk\n"
+-        ">>> nltk.download('{resource}')\n"
+-        "\033[0m"
+-    ).format(resource=resource_zipname)
++
++    # HuggingFace fallback: if the corpus is in the HF registry and has
++    # already been downloaded to the HF datasets cache, serve it from there.
++    # Uses local_files_only=True so no network request is made here.
++    try:
++        from nltk.huggingface.dataset import REGISTRY, HFDatasetPathPointer, _is_cached
++
++        if resource_zipname in REGISTRY and _is_cached(resource_zipname):
++            return HFDatasetPathPointer(resource_zipname)
++    except ImportError:
++        pass
++
++    # Display a friendly error message if the resource wasn't found.
++    # If the package appears present but the specific entry is missing, keep
++    # the download hint as a secondary suggestion.
++    if _package_present_but_entry_missing:
++        msg = (
++            f"Resource entry '{resource_name}' not found in installed package "
++            f"'{resource_zipname}'.\n"
++            "The package appears to be installed, but the requested file is missing.\n"
++            "\n"
++            "If you believe the package is corrupted or out of date, you can try "
++            "re-downloading it with the NLTK Downloader:\n\n"
++            ">>> import nltk\n"
++            f">>> nltk.download('{resource_zipname}')\n"
++        )
++    else:
++        msg = (
++            f"Resource '{resource_zipname}' not found.\n"
++            "Please use the NLTK Downloader to obtain the resource:\n\n"
++            ">>> import nltk\n"
++            f">>> nltk.download('{resource_zipname}')\n"
++        )
+     msg = textwrap_indent(msg)
+ 
+     msg += "\n  For more information see: https://www.nltk.org/data.html\n"
+ 
+-    msg += "\n  Attempted to load \33[93m{resource_name}\033[0m\n".format(
+-        resource_name=resource_name
+-    )
++    msg += f"\n  Attempted to load '{resource_name}'\n"
++
++    if _package_present_but_entry_missing:
++        msg += "\n  Package was found in:" + "".join(
++            "\n    - %r" % d for d in _package_present_but_entry_missing
++        )
+ 
+     msg += "\n  Searched in:" + "".join("\n    - %r" % d for d in paths)
+     sep = "*" * 70
+@@ -662,11 +829,78 @@ def restricted_pickle_load(string):
+     """
+     Prevents any class or function from loading.
+     """
+-    from nltk.app.wordnet_app import RestrictedUnpickler
++    from nltk.picklesec import RestrictedUnpickler
+ 
+     return RestrictedUnpickler(BytesIO(string)).load()
+ 
+ 
++def switch_punkt(lang="english"):
++    """
++    Return a pickle-free Punkt tokenizer instead of loading a pickle.
++
++    >>> import nltk
++    >>> tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
++    >>> print(tokenizer.tokenize("Hello! How are you?"))
++    ['Hello!', 'How are you?']
++    """
++    from nltk.tokenize import PunktTokenizer as tok
++
++    return tok(lang)
++
++
++def switch_chunker(fmt="multiclass"):
++    """
++    Return a pickle-free Named Entity Chunker instead of loading a pickle.
++
++    >>> import nltk
++    >>> from nltk.corpus import treebank
++    >>> from pprint import pprint
++    >>> chunker = nltk.data.load('chunkers/maxent_ne_chunker/PY3/english_ace_multiclass.pickle')
++    >>> pprint(chunker.parse(treebank.tagged_sents()[2][8:14])) # doctest: +NORMALIZE_WHITESPACE
++    Tree('S', [('chairman', 'NN'), ('of', 'IN'), Tree('ORGANIZATION', [('Consolidated', 'NNP'), ('Gold', 'NNP'), ('Fields', 'NNP')]), ('PLC', 'NNP')])
++
++    """
++    from nltk.chunk import ne_chunker
++
++    return ne_chunker(fmt)
++
++
++def switch_t_tagger():
++    """
++    Return a pickle-free Treebank Pos Tagger instead of loading a pickle.
++
++    >>> import nltk
++    >>> from nltk.tokenize import word_tokenize
++    >>> tagger = nltk.data.load('taggers/maxent_treebank_pos_tagger/PY3/english.pickle')
++    >>> print(tagger.tag(word_tokenize("Hello, how are you?")))
++    [('Hello', 'NNP'), (',', ','), ('how', 'WRB'), ('are', 'VBP'), ('you', 'PRP'), ('?', '.')]
++
++    """
++    from nltk.classify.maxent import maxent_pos_tagger
++
++    return maxent_pos_tagger()
++
++
++def switch_p_tagger(lang):
++    """
++    Return a pickle-free Averaged Perceptron Tagger instead of loading a pickle.
++
++    >>> import nltk
++    >>> from nltk.tokenize import word_tokenize
++    >>> tagger = nltk.data.load('taggers/averaged_perceptron_tagger/averaged_perceptron_tagger.pickle')
++    >>> print(tagger.tag(word_tokenize("Hello, how are you?")))
++    [('Hello', 'NNP'), (',', ','), ('how', 'WRB'), ('are', 'VBP'), ('you', 'PRP'), ('?', '.')]
++
++    """
++    from nltk.tag import _get_tagger
++
++    if lang == "ru":
++        lang = "rus"
++    else:
++        lang = None
++    return _get_tagger(lang)
++
++
+ def load(
+     resource_url,
+     format="auto",
+@@ -723,7 +957,6 @@ def load(
+     :param encoding: the encoding of the input; only used for text formats.
+     """
+     resource_url = normalize_resource_url(resource_url)
+-    resource_url = add_py3_data(resource_url)
+ 
+     # Determine the format of the resource.
+     if format == "auto":
+@@ -750,6 +983,21 @@ def load(
+                 print(f"<<Using cached copy of {resource_url}>>")
+             return resource_val
+ 
++    protocol, path_ = split_resource_url(resource_url)
++
++    if path_[-7:] == ".pickle":
++        if verbose:
++            print(f"<<Loading pickle-free alternative to {resource_url}>>")
++        fil = os.path.split(path_[:-7])[-1]
++        if path_.startswith("tokenizers/punkt"):
++            return switch_punkt(fil)
++        elif path_.startswith("chunkers/maxent_ne_chunker"):
++            return switch_chunker(fil.split("_")[-1])
++        elif path_.startswith("taggers/maxent_treebank_pos_tagger"):
++            return switch_t_tagger()
++        elif path_.startswith("taggers/averaged_perceptron_tagger"):
++            return switch_p_tagger(fil.split("_")[-1])
++
+     # Let the user know what's going on.
+     if verbose:
+         print(f"<<Loading {resource_url}>>")
+@@ -877,16 +1125,29 @@ def _open(resource_url):
+         loaded from.  The default protocol is "nltk:", which searches
+         for the file in the the NLTK data package.
+     """
+-    resource_url = normalize_resource_url(resource_url)
+-    protocol, path_ = split_resource_url(resource_url)
++    # Restore "no protocol" handling for internal resilience
++    resource_url = str(resource_url)
++    if ":" not in resource_url:
++        resource_url = "nltk:" + resource_url
++
++    protocol, path_ = resource_url.split(":", 1)
+ 
+-    if protocol is None or protocol.lower() == "nltk":
+-        return find(path_, path + [""]).open()
+-    elif protocol.lower() == "file":
+-        # urllib might not use mode='rb', so handle this one ourselves:
+-        return find(path_, [""]).open()
++    if protocol == "nltk":
++        # If find() or .open() raises a ValueError (security) or LookupError,
++        # let it bubble up or handle it based on load() logic.
++        return find(path_).open()
++    elif protocol == "file":
++        local_path = url2pathname(path_)
++        try:
++            # 1. Attempt to use NLTK's standard search paths (Safe/Normalized)
++            return find(local_path).open()
++        except (LookupError, ValueError):
++            # 2. Fallback for absolute paths (e.g., file:///etc/passwd)
++            # This ensures even direct file access hits the pathsec sentinel.
++            return _secure_open(local_path, "rb")
+     else:
+-        return urlopen(resource_url)
++        # Network protocols (http, https, ftp)
++        return _secure_urlopen(resource_url)
+ 
+ 
+ ######################################################################
+@@ -895,7 +1156,7 @@ def _open(resource_url):
+ 
+ 
+ class LazyLoader:
+-    @py3_data
++
+     def __init__(self, _path):
+         self._path = _path
+ 
+@@ -925,9 +1186,9 @@ class LazyLoader:
+ ######################################################################
+ 
+ 
+-class OpenOnDemandZipFile(zipfile.ZipFile):
++class OpenOnDemandZipFile(ZipFile):
+     """
+-    A subclass of ``zipfile.ZipFile`` that closes its file pointer
++    A subclass of ``ZipFile`` that closes its file pointer
+     whenever it is not using it; and re-opens it when it needs to read
+     data from the zipfile.  This is useful for reducing the number of
+     open file handles when many zip files are being accessed at once.
+@@ -936,11 +1197,10 @@ class OpenOnDemandZipFile(zipfile.ZipFile):
+     read-only (i.e. ``write()`` and ``writestr()`` are disabled.
+     """
+ 
+-    @py3_data
+     def __init__(self, filename):
+         if not isinstance(filename, str):
+             raise TypeError("ReopenableZipFile filename must be a string")
+-        zipfile.ZipFile.__init__(self, filename)
++        ZipFile.__init__(self, filename)
+         assert self.filename == filename
+         self.close()
+         # After closing a ZipFile object, the _fileRefCnt needs to be cleared
+@@ -949,12 +1209,11 @@ class OpenOnDemandZipFile(zipfile.ZipFile):
+ 
+     def read(self, name):
+         assert self.fp is None
+-        self.fp = open(self.filename, "rb")
++        # This will be validated by pathsec.open
++        self.fp = _secure_open(self.filename, "rb")
+         value = zipfile.ZipFile.read(self, name)
+-        # Ensure that _fileRefCnt needs to be set for Python2and3 compatible code.
+-        # Since we only opened one file here, we add 1.
+-        self._fileRefCnt += 1
+-        self.close()
++        self.fp.close()
++        self.fp = None
+         return value
+ 
+     def write(self, *args, **kwargs):
+@@ -993,7 +1252,6 @@ class SeekableUnicodeStreamReader:
+ 
+     DEBUG = True  # : If true, then perform extra sanity checks.
+ 
+-    @py3_data
+     def __init__(self, stream, encoding, errors="strict"):
+         # Rewind the stream to its beginning.
+         stream.seek(0)
+diff --git a/nltk/downloader.py b/nltk/downloader.py
+index e877364..b5bd668 100644
+--- a/nltk/downloader.py
++++ b/nltk/downloader.py
+@@ -1,6 +1,6 @@
+ # Natural Language Toolkit: Corpus & Model Downloader
+ #
+-# Copyright (C) 2001-2023 NLTK Project
++# Copyright (C) 2001-2026 NLTK Project
+ # Author: Edward Loper <edloper@gmail.com>
+ # URL: <https://www.nltk.org/>
+ # For license information, see LICENSE.TXT
+@@ -66,6 +66,7 @@ or::
+ 
+     python -m nltk.downloader [-d DATADIR] [-q] [-f] [-k] PACKAGE_IDS
+ """
++
+ # ----------------------------------------------------------------------
+ 
+ """
+@@ -161,7 +162,6 @@ default: unzip or not?
+ import functools
+ import itertools
+ import os
+-import shutil
+ import subprocess
+ import sys
+ import textwrap
+@@ -169,24 +169,14 @@ import threading
+ import time
+ import warnings
+ import zipfile
+-from hashlib import md5
++from hashlib import md5, sha256
++from urllib.error import HTTPError, URLError
+ from xml.etree import ElementTree
+ 
+-try:
+-    TKINTER = True
+-    from tkinter import Button, Canvas, Entry, Frame, IntVar, Label, Menu, TclError, Tk
+-    from tkinter.messagebox import showerror
+-
+-    from nltk.draw.table import Table
+-    from nltk.draw.util import ShowText
+-except ImportError:
+-    TKINTER = False
+-    TclError = ValueError
+-
+-from urllib.error import HTTPError, URLError
+-from urllib.request import urlopen
++from defusedxml.ElementTree import parse as safe_parse
+ 
+ import nltk
++from nltk.pathsec import ZipFile, urlopen
+ 
+ # urllib2 = nltk.internals.import_from_stdlib('urllib2')
+ 
+@@ -228,10 +218,22 @@ class Package:
+         self.name = name or id
+         """A string name for this package."""
+ 
++        # Validate subdir to prevent path traversal from malicious XML index
++        if os.path.isabs(subdir) or ".." in subdir.replace("\\", "/").split("/"):
++            raise ValueError(
++                f"Invalid package subdir {subdir!r}: must be a relative path "
++                f"without parent directory references"
++            )
+         self.subdir = subdir
+         """The subdirectory where this package should be installed.
+            E.g., ``'corpora'`` or ``'taggers'``."""
+ 
++        # Validate id to prevent path traversal
++        if os.sep in id or "/" in id or "\\" in id or ".." in id:
++            raise ValueError(
++                f"Invalid package id {id!r}: must not contain path separators"
++            )
++
+         self.url = url
+         """A URL that can be used to download this package's file."""
+ 
+@@ -676,67 +678,181 @@ class Downloader:
+         yield StartPackageMessage(info)
+         yield ProgressMessage(0)
+ 
+-        # Do we already have the current version?
+-        status = self.status(info, download_dir)
+-        if not force and status == self.INSTALLED:
++        filepath = os.path.join(download_dir, info.filename)
++        tmp_filepath = filepath + ".tmp"
++        lock_filepath = filepath + ".lock"
++
++        # Defense-in-depth: verify filepath stays within download_dir
++        real_download = os.path.realpath(os.path.abspath(download_dir))
++        real_filepath = os.path.realpath(os.path.abspath(filepath))
++        if not real_filepath.startswith(real_download + os.sep):
++            yield ErrorMessage(
++                info,
++                f"Path traversal blocked: package '{info.id}' attempted to "
++                f"write outside download directory (subdir='{info.subdir}')",
++            )
++            return
++
++        unzipdir = filepath[:-4] if filepath.endswith(".zip") else None
++        MAX_ZOMBIE_TIME = 60
++        POLL_INTERVAL = 1
++
++        def _safe_remove(path):
++            try:
++                os.remove(path)
++            except FileNotFoundError:
++                pass
++            except OSError:
++                pass
++
++        def _safe_rmtree(path):
++            if not os.path.isdir(path):
++                return
++            for root, dirs, files in os.walk(path, topdown=False):
++                for name in files:
++                    try:
++                        os.remove(os.path.join(root, name))
++                    except OSError:
++                        pass
++                for name in dirs:
++                    try:
++                        os.rmdir(os.path.join(root, name))
++                    except OSError:
++                        pass
++            try:
++                os.rmdir(path)
++            except OSError:
++                pass
++
++        def _touch_lock():
++            try:
++                os.utime(lock_filepath, None)
++            except OSError:
++                pass
++
++        def _lock_exists():
++            return os.path.exists(lock_filepath)
++
++        def _status_now():
++            self._status_cache.pop(info.id, None)
++            return self.status(info, download_dir)
++
++        def _installed_now():
++            return _status_now() == self.INSTALLED
++
++        os.makedirs(download_dir, exist_ok=True)
++        os.makedirs(os.path.join(download_dir, info.subdir), exist_ok=True)
++
++        # Fast path before taking the lock.
++        # Do not return "up to date" while another process still holds the install lock.
++        if not force and _installed_now() and not _lock_exists():
+             yield UpToDateMessage(info)
+             yield ProgressMessage(100)
+             yield FinishPackageMessage(info)
+             return
+ 
+-        # Remove the package from our status cache
+-        self._status_cache.pop(info.id, None)
++        # Acquire a package-wide install lock that covers download + unzip.
++        while True:
++            if not force and _installed_now() and not _lock_exists():
++                yield UpToDateMessage(info)
++                yield ProgressMessage(100)
++                yield FinishPackageMessage(info)
++                return
+ 
+-        # Check for (and remove) any old/stale version.
+-        filepath = os.path.join(download_dir, info.filename)
+-        if os.path.exists(filepath):
++            try:
++                fd = os.open(lock_filepath, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
++                os.close(fd)
++                break
++            except FileExistsError:
++                try:
++                    age = time.time() - os.stat(lock_filepath).st_mtime
++                    if age >= MAX_ZOMBIE_TIME:
++                        _safe_remove(lock_filepath)
++                        continue
++                except FileNotFoundError:
++                    continue
++                time.sleep(POLL_INTERVAL)
++
++        try:
++            # Recheck after lock acquisition in case another process completed first.
++            if not force and _installed_now():
++                yield UpToDateMessage(info)
++                yield ProgressMessage(100)
++                yield FinishPackageMessage(info)
++                return
++
++            status = _status_now()
++
++            # Only the lock holder may clean stale state.
+             if status == self.STALE:
+                 yield StaleMessage(info)
+-            os.remove(filepath)
++                _safe_remove(tmp_filepath)
++                _safe_remove(filepath)
++                if unzipdir:
++                    _safe_rmtree(unzipdir)
++                self._status_cache.pop(info.id, None)
+ 
+-        # Ensure the download_dir exists
+-        os.makedirs(download_dir, exist_ok=True)
+-        os.makedirs(os.path.join(download_dir, info.subdir), exist_ok=True)
++            # Download if needed.
++            if force or not os.path.exists(filepath):
++                yield StartDownloadMessage(info)
++                yield ProgressMessage(5)
+ 
+-        # Download the file.  This will raise an IOError if the url
+-        # is not found.
+-        yield StartDownloadMessage(info)
+-        yield ProgressMessage(5)
+-        try:
+-            infile = urlopen(info.url)
+-            with open(filepath, "wb") as outfile:
+-                num_blocks = max(1, info.size / (1024 * 16))
+-                for block in itertools.count():
+-                    s = infile.read(1024 * 16)  # 16k blocks.
+-                    outfile.write(s)
+-                    if not s:
+-                        break
+-                    if block % 2 == 0:  # how often?
+-                        yield ProgressMessage(min(80, 5 + 75 * (block / num_blocks)))
+-            infile.close()
+-        except OSError as e:
+-            yield ErrorMessage(
+-                info,
+-                "Error downloading %r from <%s>:" "\n  %s" % (info.id, info.url, e),
+-            )
+-            return
+-        yield FinishDownloadMessage(info)
+-        yield ProgressMessage(80)
+-
+-        # If it's a zipfile, uncompress it.
+-        if info.filename.endswith(".zip"):
+-            zipdir = os.path.join(download_dir, info.subdir)
+-            # Unzip if we're unzipping by default; *or* if it's already
+-            # been unzipped (presumably a previous version).
+-            if info.unzip or os.path.exists(os.path.join(zipdir, info.id)):
+-                yield StartUnzipMessage(info)
+-                for msg in _unzip_iter(filepath, zipdir, verbose=False):
+-                    # Somewhat of a hack, but we need a proper package reference
+-                    msg.package = info
+-                    yield msg
+-                yield FinishUnzipMessage(info)
++                try:
++                    infile = urlopen(info.url)
++                    with open(tmp_filepath, "wb") as outfile:
++                        num_blocks = max(1, info.size / (1024 * 16))
++                        for block in itertools.count():
++                            s = infile.read(1024 * 16)
++                            if not s:
++                                break
++                            outfile.write(s)
++                            if block % 2 == 0:
++                                _touch_lock()
++                                yield ProgressMessage(
++                                    min(80, 5 + 75 * (block / num_blocks))
++                                )
++                    infile.close()
++                    os.replace(tmp_filepath, filepath)
++                    self._status_cache.pop(info.id, None)
++                except OSError as e:
++                    _safe_remove(tmp_filepath)
++                    yield ErrorMessage(
++                        info,
++                        "Error downloading %r from <%s>:"
++                        "\n  %s" % (info.id, info.url, e),
++                    )
++                    return
+ 
+-        yield FinishPackageMessage(info)
++                yield FinishDownloadMessage(info)
++                yield ProgressMessage(80)
++
++            # Unzip while still holding the same install lock.
++            if info.filename.endswith(".zip"):
++                zipdir = os.path.join(download_dir, info.subdir)
++                if info.unzip or os.path.exists(os.path.join(zipdir, info.id)):
++                    yield StartUnzipMessage(info)
++                    for msg in _unzip_iter(filepath, zipdir, verbose=False):
++                        _touch_lock()
++                        msg.package = info
++                        yield msg
++                        if isinstance(msg, ErrorMessage):
++                            return
++                    yield FinishUnzipMessage(info)
++
++            # Final verification: followers should only ever observe INSTALLED.
++            if not _installed_now():
++                yield ErrorMessage(
++                    info,
++                    f"Package {info.id!r} did not reach installed state "
++                    f"(final status: {_status_now()})",
++                )
++                return
++
++            yield FinishPackageMessage(info)
++
++        finally:
++            _safe_remove(tmp_filepath)
++            _safe_remove(lock_filepath)
+ 
+     def download(
+         self,
+@@ -748,7 +864,14 @@ class Downloader:
+         halt_on_error=True,
+         raise_on_error=False,
+         print_error_to=sys.stderr,
++        hf=False,
+     ):
++        # Delegate to HuggingFace downloader when hf=True.
++        if hf and info_or_id is not None:
++            from nltk.huggingface.dataset import download as hf_download
++
++            return hf_download(info_or_id, quiet=quiet)
++
+         print_to = functools.partial(print, file=print_error_to)
+         # If no info or id is given, then use the interactive shell.
+         if info_or_id is None:
+@@ -892,9 +1015,28 @@ class Downloader:
+         if filestat.st_size != int(info.size):
+             return self.STALE
+ 
+-        # Check if the file's checksum matches
+-        if md5_hexdigest(filepath) != info.checksum:
+-            return self.STALE
++        # Check if the file's checksum matches.
++        # Prefer sha256, but fall back to legacy md5 if sha256 is unavailable.
++        sha256_checksum = getattr(info, "sha256_checksum", None)
++        if sha256_checksum:
++            if sha256_hexdigest(filepath) != sha256_checksum:
++                return self.STALE
++        else:
++            if not getattr(self, "_warned_missing_sha256_checksum", False):
++                warnings.warn(
++                    "NLTK downloader package metadata is missing SHA256 checksums; "
++                    "falling back to legacy MD5 verification. Consider updating your "
++                    "NLTK data index (or re-running the downloader) to get SHA256 checksums.",
++                    RuntimeWarning,
++                    stacklevel=2,
++                )
++                self._warned_missing_sha256_checksum = True
++
++            md5_checksum = getattr(info, "checksum", None)
++            if not md5_checksum:
++                return self.STALE
++            if md5_hexdigest(filepath) != md5_checksum:
++                return self.STALE
+ 
+         # If it's a zipfile, and it's been at least partially
+         # unzipped, then check if it's been fully unzipped.
+@@ -946,7 +1088,7 @@ class Downloader:
+ 
+         # Download the index file.
+         self._index = nltk.internals.ElementWrapper(
+-            ElementTree.parse(urlopen(self._url)).getroot()
++            safe_parse(urlopen(self._url)).getroot()
+         )
+         self._index_timestamp = time.time()
+ 
+@@ -1037,7 +1179,7 @@ class Downloader:
+         original_url = self._url
+         try:
+             self._update_index(url)
+-        except:
++        except Exception:
+             self._url = original_url
+             raise
+ 
+@@ -1103,14 +1245,26 @@ class Downloader:
+     # /////////////////////////////////////////////////////////////////
+ 
+     def _interactive_download(self):
++        # Only import tkinter if the user has indicated that they
++        # want to draw a UI. See issue #2949 for more info.
++        if (
++            os.environ.get("NLTK_DOWNLOADER_FORCE_INTERACTIVE_SHELL", "false").lower()
++            == "true"
++        ):
++            DownloaderShell(self).run()
++            return
++
+         # Try the GUI first; if that doesn't work, try the simple
+         # interactive shell.
+-        if TKINTER:
+-            try:
+-                DownloaderGUI(self).mainloop()
+-            except TclError:
+-                DownloaderShell(self).run()
+-        else:
++        try:
++            import tkinter
++        except ImportError:
++            DownloaderShell(self).run()
++            return
++
++        try:
++            DownloaderGUI(self).mainloop()
++        except tkinter.TclError:
+             DownloaderShell(self).run()
+ 
+ 
+@@ -1270,7 +1424,7 @@ class DownloaderShell:
+                     print("  Cancelled!")
+                 else:
+                     if not new_url.startswith(("http://", "https://")):
+-                        new_url = "http://" + new_url
++                        new_url = "https://" + new_url
+                     try:
+                         self._ds.url = new_url
+                     except Exception as e:
+@@ -1370,6 +1524,11 @@ class DownloaderGUI:
+     # /////////////////////////////////////////////////////////////////
+ 
+     def __init__(self, dataserver, use_threads=True):
++        # Only import tkinter if the user has indicated that they
++        # want to draw a UI. See issue #2949 for more info.
++        import tkinter
++        from tkinter.messagebox import showerror
++
+         self._ds = dataserver
+         self._use_threads = use_threads
+ 
+@@ -1388,7 +1547,7 @@ class DownloaderGUI:
+         self._log("NLTK Downloader Started!")
+ 
+         # Create the main window.
+-        top = self.top = Tk()
++        top = self.top = tkinter.Tk()
+         top.geometry("+50+50")
+         top.title("NLTK Downloader")
+         top.configure(background=self._BACKDROP_COLOR[1])
+@@ -1428,23 +1587,29 @@ class DownloaderGUI:
+     # /////////////////////////////////////////////////////////////////
+ 
+     def _init_widgets(self):
++        # Only import tkinter if the user has indicated that they
++        # want to draw a UI. See issue #2949 for more info.
++        import tkinter
++
++        from nltk.draw.table import Table
++
+         # Create the top-level frame structures
+-        f1 = Frame(self.top, relief="raised", border=2, padx=8, pady=0)
++        f1 = tkinter.Frame(self.top, relief="raised", border=2, padx=8, pady=0)
+         f1.pack(sid="top", expand=True, fill="both")
+         f1.grid_rowconfigure(2, weight=1)
+         f1.grid_columnconfigure(0, weight=1)
+-        Frame(f1, height=8).grid(column=0, row=0)  # spacer
+-        tabframe = Frame(f1)
++        tkinter.Frame(f1, height=8).grid(column=0, row=0)  # spacer
++        tabframe = tkinter.Frame(f1)
+         tabframe.grid(column=0, row=1, sticky="news")
+-        tableframe = Frame(f1)
++        tableframe = tkinter.Frame(f1)
+         tableframe.grid(column=0, row=2, sticky="news")
+-        buttonframe = Frame(f1)
++        buttonframe = tkinter.Frame(f1)
+         buttonframe.grid(column=0, row=3, sticky="news")
+-        Frame(f1, height=8).grid(column=0, row=4)  # spacer
+-        infoframe = Frame(f1)
++        tkinter.Frame(f1, height=8).grid(column=0, row=4)  # spacer
++        infoframe = tkinter.Frame(f1)
+         infoframe.grid(column=0, row=5, sticky="news")
+-        Frame(f1, height=8).grid(column=0, row=6)  # spacer
+-        progressframe = Frame(
++        tkinter.Frame(f1, height=8).grid(column=0, row=6)  # spacer
++        progressframe = tkinter.Frame(
+             self.top, padx=3, pady=3, background=self._BACKDROP_COLOR[1]
+         )
+         progressframe.pack(side="bottom", fill="x")
+@@ -1455,7 +1620,7 @@ class DownloaderGUI:
+         self._tab_names = ["Collections", "Corpora", "Models", "All Packages"]
+         self._tabs = {}
+         for i, tab in enumerate(self._tab_names):
+-            label = Label(tabframe, text=tab, font=self._TAB_FONT)
++            label = tkinter.Label(tabframe, text=tab, font=self._TAB_FONT)
+             label.pack(side="left", padx=((i + 1) % 2) * 10)
+             label.bind("<Button-1>", self._select_tab)
+             self._tabs[tab.lower()] = label
+@@ -1492,8 +1657,8 @@ class DownloaderGUI:
+         ]
+         self._info = {}
+         for i, (key, label, callback) in enumerate(info):
+-            Label(infoframe, text=label).grid(column=0, row=i, sticky="e")
+-            entry = Entry(
++            tkinter.Label(infoframe, text=label).grid(column=0, row=i, sticky="e")
++            entry = tkinter.Entry(
+                 infoframe,
+                 font="courier",
+                 relief="groove",
+@@ -1510,23 +1675,23 @@ class DownloaderGUI:
+         self.top.bind("<Button-1>", self._info_save)
+ 
+         # Create Download & Refresh buttons.
+-        self._download_button = Button(
++        self._download_button = tkinter.Button(
+             buttonframe, text="Download", command=self._download, width=8
+         )
+         self._download_button.pack(side="left")
+-        self._refresh_button = Button(
++        self._refresh_button = tkinter.Button(
+             buttonframe, text="Refresh", command=self._refresh, width=8
+         )
+         self._refresh_button.pack(side="right")
+ 
+         # Create Progress bar
+-        self._progresslabel = Label(
++        self._progresslabel = tkinter.Label(
+             progressframe,
+             text="",
+             foreground=self._BACKDROP_COLOR[0],
+             background=self._BACKDROP_COLOR[1],
+         )
+-        self._progressbar = Canvas(
++        self._progressbar = tkinter.Canvas(
+             progressframe,
+             width=200,
+             height=16,
+@@ -1539,9 +1704,11 @@ class DownloaderGUI:
+         self._progresslabel.pack(side="left")
+ 
+     def _init_menu(self):
+-        menubar = Menu(self.top)
++        import tkinter
++
++        menubar = tkinter.Menu(self.top)
+ 
+-        filemenu = Menu(menubar, tearoff=0)
++        filemenu = tkinter.Menu(menubar, tearoff=0)
+         filemenu.add_command(
+             label="Download", underline=0, command=self._download, accelerator="Return"
+         )
+@@ -1567,9 +1734,9 @@ class DownloaderGUI:
+         # Create a menu to control which columns of the table are
+         # shown.  n.b.: we never hide the first two columns (mark and
+         # identifier).
+-        viewmenu = Menu(menubar, tearoff=0)
++        viewmenu = tkinter.Menu(menubar, tearoff=0)
+         for column in self._table.column_names[2:]:
+-            var = IntVar(self.top)
++            var = tkinter.IntVar(self.top)
+             assert column not in self._column_vars
+             self._column_vars[column] = var
+             if column in self.INITIAL_COLUMNS:
+@@ -1582,7 +1749,7 @@ class DownloaderGUI:
+         # Create a sort menu
+         # [xx] this should be selectbuttons; and it should include
+         # reversed sorts as options.
+-        sortmenu = Menu(menubar, tearoff=0)
++        sortmenu = tkinter.Menu(menubar, tearoff=0)
+         for column in self._table.column_names[1:]:
+             sortmenu.add_command(
+                 label="Sort by %s" % column,
+@@ -1597,7 +1764,7 @@ class DownloaderGUI:
+             )
+         menubar.add_cascade(label="Sort", underline=0, menu=sortmenu)
+ 
+-        helpmenu = Menu(menubar, tearoff=0)
++        helpmenu = tkinter.Menu(menubar, tearoff=0)
+         helpmenu.add_command(label="About", underline=0, command=self.about)
+         helpmenu.add_command(
+             label="Instructions", underline=0, command=self.help, accelerator="F1"
+@@ -1615,6 +1782,8 @@ class DownloaderGUI:
+                 self._table.hide_column(column)
+ 
+     def _refresh(self):
++        from tkinter.messagebox import showerror
++
+         self._ds.clear_status_cache()
+         try:
+             self._fill_table()
+@@ -1626,7 +1795,7 @@ class DownloaderGUI:
+ 
+     def _info_edit(self, info_key):
+         self._info_save()  # just in case.
+-        (entry, callback) = self._info[info_key]
++        entry, callback = self._info[info_key]
+         entry["state"] = "normal"
+         entry["relief"] = "sunken"
+         entry.focus()
+@@ -1661,6 +1830,8 @@ class DownloaderGUI:
+             return "  %s" % val
+ 
+     def _set_url(self, url):
++        from tkinter.messagebox import showerror
++
+         if url == self._ds.url:
+             return
+         try:
+@@ -1671,6 +1842,8 @@ class DownloaderGUI:
+         self._show_info()
+ 
+     def _set_download_dir(self, download_dir):
++        from tkinter.messagebox import showerror
++
+         if self._ds.download_dir == download_dir:
+             return
+         # check if the dir exists, and if not, ask if we should create it?
+@@ -1696,6 +1869,8 @@ class DownloaderGUI:
+             entry["state"] = "disabled"
+ 
+     def _prev_tab(self, *e):
++        from tkinter.messagebox import showerror
++
+         for i, tab in enumerate(self._tab_names):
+             if tab.lower() == self._tab and i > 0:
+                 self._tab = self._tab_names[i - 1].lower()
+@@ -1707,6 +1882,8 @@ class DownloaderGUI:
+                     showerror("Error connecting to server", e.reason)
+ 
+     def _next_tab(self, *e):
++        from tkinter.messagebox import showerror
++
+         for i, tab in enumerate(self._tab_names):
+             if tab.lower() == self._tab and i < (len(self._tabs) - 1):
+                 self._tab = self._tab_names[i + 1].lower()
+@@ -1718,6 +1895,8 @@ class DownloaderGUI:
+                     showerror("Error connecting to server", e.reason)
+ 
+     def _select_tab(self, event):
++        from tkinter.messagebox import showerror
++
+         self._tab = event.widget["text"].lower()
+         try:
+             self._fill_table()
+@@ -1884,6 +2063,8 @@ class DownloaderGUI:
+         self._table.select(delta=1)
+ 
+     def _show_log(self):
++        from nltk.draw.util import ShowText
++
+         text = "\n".join(self._log_messages)
+         ShowText(self.top, "NLTK Downloader Log", text)
+ 
+@@ -1966,6 +2147,8 @@ class DownloaderGUI:
+     )
+ 
+     def help(self, *e):
++        from nltk.draw.util import ShowText
++
+         # The default font's not very legible; try using 'fixed' instead.
+         try:
+             ShowText(
+@@ -1975,10 +2158,12 @@ class DownloaderGUI:
+                 width=75,
+                 font="fixed",
+             )
+-        except:
++        except Exception:
+             ShowText(self.top, "Help: NLTK Downloader", self.HELP.strip(), width=75)
+ 
+     def about(self, *e):
++        from nltk.draw.util import ShowText
++
+         ABOUT = "NLTK Downloader\n" + "Written by Edward Loper"
+         TITLE = "About: NLTK Downloader"
+         try:
+@@ -2220,6 +2405,27 @@ def _md5_hexdigest(fp):
+     return md5_digest.hexdigest()
+ 
+ 
++def sha256_hexdigest(file):
++    """
++    Calculate and return the SHA-256 checksum for a given file.
++    ``file`` may either be a filename or an open stream.
++    """
++    if isinstance(file, str):
++        with open(file, "rb") as infile:
++            return _sha256_hexdigest(infile)
++    return _sha256_hexdigest(file)
++
++
++def _sha256_hexdigest(fp):
++    sha256_digest = sha256()
++    while True:
++        block = fp.read(1024 * 16)  # 16k blocks
++        if not block:
++            break
++        sha256_digest.update(block)
++    return sha256_digest.hexdigest()
++
++
+ # change this to periodically yield progress messages?
+ # [xx] get rid of topdir parameter -- we should be checking
+ # this when we build the index, anyway.
+@@ -2233,24 +2439,118 @@ def unzip(filename, root, verbose=True):
+             raise Exception(message)
+ 
+ 
++def _validate_member(member, root_abs):
++    """
++    Check a single ZIP member name for path-traversal and escape vectors.
++
++    Returns ``None`` if the member is safe, or a human-readable error
++    string if the member must be rejected.  Comparison prefixes are
++    derived from *root_abs* internally via ``os.path.normcase`` so that
++    callers cannot supply inconsistent values.
++
++    Parameters
++    ----------
++    member : str
++        The archive entry name (forward-slash separated, as stored in the ZIP).
++    root_abs : str
++        Absolute path of the extraction root (used to build candidate paths
++        and derive comparison prefixes via ``os.path.normcase``).
++    """
++    if "\x00" in member:
++        return f"Null byte in entry name blocked: {member!r}"
++
++    abs_prefix = os.path.normcase(root_abs).rstrip(os.sep) + os.sep
++    target_abs = os.path.normcase(os.path.abspath(os.path.join(root_abs, member)))
++    if not target_abs.startswith(abs_prefix):
++        return f"Zip Slip blocked: {member}"
++
++    real_prefix = os.path.normcase(os.path.realpath(root_abs)).rstrip(os.sep) + os.sep
++    target_real = os.path.normcase(os.path.realpath(os.path.join(root_abs, member)))
++    if not target_real.startswith(real_prefix):
++        return f"Symlink escape blocked: {member}"
++
++    return None
++
++
+ def _unzip_iter(filename, root, verbose=True):
++    """
++    Secure ZIP extraction using validate-then-extract.
++
++    All members are validated before any extraction occurs.  If any member
++    fails validation the entire archive is rejected and nothing is written
++    to disk.
++
++    Checks performed on every member name:
++    - Null-byte rejection (platform path-truncation vector)
++    - Zip-Slip (.., absolute paths, drive letters)
++    - Symlink-escape (writes through pre-existing symlinks)
++
++    All path comparisons use ``os.path.normcase`` so that the checks
++    are case-insensitive on Windows (no-op on POSIX).
++
++    Members are validated again immediately before each extraction as a
++    best-effort check against filesystem changes between Phase 1 and the
++    actual write, but this cannot eliminate TOCTOU races inherent in
++    non-atomic extraction.
++
++    Extraction aborts on the first error (including I/O errors) rather
++    than skipping individual members.  Partial extraction of a potentially
++    malicious archive is worse than no extraction.
++    """
++
+     if verbose:
+         sys.stdout.write("Unzipping %s" % os.path.split(filename)[1])
+         sys.stdout.flush()
+ 
+     try:
+-        zf = zipfile.ZipFile(filename)
+-    except zipfile.BadZipFile:
+-        yield ErrorMessage(filename, "Error with downloaded zip file")
+-        return
++        zf = ZipFile(filename)
+     except Exception as e:
+         yield ErrorMessage(filename, e)
++        # Flush the "Unzipping ..." line here because the try/finally that
++        # normally handles this is never entered (zf was never assigned).
++        if verbose:
++            print()
+         return
+ 
+-    zf.extractall(root)
++    try:
++        root_abs = os.path.abspath(root)
++        members = zf.namelist()
++
++        # Phase 1 -- validate every member before touching the filesystem.
++        has_violations = False
++        for member in members:
++            error = _validate_member(member, root_abs)
++            if error is not None:
++                yield ErrorMessage(filename, error)
++                has_violations = True
++                continue
+ 
+-    if verbose:
+-        print()
++        if has_violations:
++            return
++
++        # Phase 2 -- all members passed; extract.
++        try:
++            os.makedirs(root_abs, exist_ok=True)
++        except Exception as e:
++            yield ErrorMessage(filename, f"Extraction error: {e}")
++            return
++
++        for member in members:
++            error = _validate_member(member, root_abs)
++            if error is not None:
++                yield ErrorMessage(filename, f"{error} (during extraction)")
++                return
++            try:
++                zf.extract(member, root_abs)
++            except Exception as e:
++                yield ErrorMessage(filename, f"Extraction error for {member}: {e}")
++                return
++    except Exception as e:
++        yield ErrorMessage(filename, f"Validation error: {e}")
++    finally:
++        zf.close()
++        if verbose:
++            print()
+ 
+ 
+ ######################################################################
+@@ -2300,6 +2600,7 @@ def build_index(root, base_url):
+         pkg_xml.set("unzipped_size", "%s" % unzipped_size)
+         pkg_xml.set("size", "%s" % zipstat.st_size)
+         pkg_xml.set("checksum", "%s" % md5_hexdigest(zf.filename))
++        pkg_xml.set("sha256_checksum", "%s" % sha256_hexdigest(zf.filename))
+         pkg_xml.set("subdir", subdir)
+         # pkg_xml.set('svn_revision', _svn_revision(zf.filename))
+         if not pkg_xml.get("url"):
+@@ -2376,7 +2677,7 @@ def _svn_revision(filename):
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+     )
+-    (stdout, stderr) = p.communicate()
++    stdout, stderr = p.communicate()
+     if p.returncode != 0 or stderr or not stdout:
+         raise ValueError(
+             "Error determining svn_revision for %s: %s"
+@@ -2403,7 +2704,7 @@ def _find_packages(root):
+     ``(pkg_xml, zf, subdir)``, where:
+       - ``pkg_xml`` is an ``ElementTree.Element`` holding the xml for a
+         package
+-      - ``zf`` is a ``zipfile.ZipFile`` for the package's contents.
++      - ``zf`` is a ``ZipFile`` for the package's contents.
+       - ``subdir`` is the subdirectory (relative to ``root``) where
+         the package was found (e.g. 'corpora' or 'grammars').
+     """
+@@ -2418,7 +2719,7 @@ def _find_packages(root):
+                 xmlfilename = os.path.join(dirname, filename)
+                 zipfilename = xmlfilename[:-4] + ".zip"
+                 try:
+-                    zf = zipfile.ZipFile(zipfilename)
++                    zf = ZipFile(zipfilename)
+                 except Exception as e:
+                     raise ValueError(f"Error reading file {zipfilename!r}!\n{e}") from e
+                 try:
+@@ -2531,7 +2832,7 @@ if __name__ == "__main__":
+         help="download server index url",
+     )
+ 
+-    (options, args) = parser.parse_args()
++    options, args = parser.parse_args()
+ 
+     downloader = Downloader(server_index_url=options.server_index_url)
+ 
+@@ -2544,7 +2845,7 @@ if __name__ == "__main__":
+                 force=options.force,
+                 halt_on_error=options.halt_on_error,
+             )
+-            if rv == False and options.halt_on_error:
++            if not rv and options.halt_on_error:
+                 break
+     else:
+         downloader.download(
+diff --git a/nltk/pathsec.py b/nltk/pathsec.py
+new file mode 100644
+index 0000000..9f14a3c
+--- /dev/null
++++ b/nltk/pathsec.py
+@@ -0,0 +1,328 @@
++# Natural Language Toolkit: Centralized I/O security sentinel
++#
++# Copyright (C) 2001-2026 NLTK Project
++# Author: Eric Kafe <kafe.eric@gmail.com>
++# URL: <https://www.nltk.org/>
++# For license information, see LICENSE.TXT
++#
++"""Centralized I/O security sentinel for NLTK."""
++
++"""Centralized I/O security sentinel for NLTK."""
++import builtins
++import ipaddress
++import os
++import socket
++import sys
++import urllib.request
++import warnings
++import zipfile
++from functools import lru_cache
++from pathlib import Path
++from urllib.parse import unquote, urlparse
++
++# Security Enforcement Toggle
++# ENFORCE = False
++ENFORCE = True
++
++_ALLOWED_ROOTS_CACHE = None
++_LAST_DATA_PATHS = None
++
++
++def _get_allowed_roots():
++    """Dynamically determines allowed directories based on NLTK data paths."""
++    global _ALLOWED_ROOTS_CACHE, _LAST_DATA_PATHS
++
++    current_paths = []
++    if "nltk.data" in sys.modules:
++        # Accessing nltk.data.path via sys.modules to avoid top-level circularity
++        current_paths = list(getattr(sys.modules["nltk.data"], "path", []))
++
++    env_paths = os.environ.get("NLTK_DATA", "")
++    current_state = (current_paths, env_paths)
++
++    if _ALLOWED_ROOTS_CACHE is not None and _LAST_DATA_PATHS == current_state:
++        return _ALLOWED_ROOTS_CACHE
++
++    roots = set()
++    for p in current_paths + env_paths.split(os.pathsep):
++        if p:
++            try:
++                # Handle both string paths and PathPointer objects
++                raw_p = p.path if hasattr(p, "path") else p
++                roots.add(Path(str(raw_p)).resolve())
++            except (OSError, ValueError, RuntimeError):
++                continue
++
++    import tempfile
++
++    for loc in ["~/nltk_data", "/usr/share/nltk_data", tempfile.gettempdir()]:
++        try:
++            p = Path(loc).expanduser().resolve()
++            if p.exists():
++                roots.add(p)
++        except (OSError, ValueError, RuntimeError):
++            continue
++
++    _ALLOWED_ROOTS_CACHE = roots
++    _LAST_DATA_PATHS = current_state
++    return roots
++
++
++def validate_path(path_input, context="NLTK", required_root=None):
++    """
++    Ensures file access is restricted to allowed data directories.
++
++    :param path_input: The path to validate.
++    :param context: Diagnostic context for warnings/errors.
++    :param required_root: If provided, enforces that the path is strictly
++                          within this specific directory (scoped sandbox).
++    """
++    if isinstance(path_input, int) or not path_input or not str(path_input).strip():
++        return
++    try:
++        raw = path_input.path if hasattr(path_input, "path") else str(path_input)
++
++        if "://" in raw:
++            parsed = urlparse(raw)
++            if parsed.scheme in ("http", "https", "ftp"):
++                return
++            if parsed.scheme == "file":
++                raw = unquote(parsed.path)
++
++        # Resolve path to catch symlink escapes
++        try:
++            target = Path(raw).resolve()
++        except (OSError, ValueError):
++            # Fallback for virtual paths inside ZIPs (e.g. corpora/foo.zip/file.txt)
++            lower_raw = raw.lower()
++            if ".zip" in lower_raw:
++                zip_idx = lower_raw.find(".zip") + 4
++                target = Path(raw[:zip_idx]).resolve()
++            else:
++                target = Path(raw)
++
++        # LAYER 1: Scoped Sandbox (PR #3528 Integration)
++        # This resolves both target and root to block symlink-based escapes.
++        if required_root:
++            root_raw = (
++                required_root.path
++                if hasattr(required_root, "path")
++                else str(required_root)
++            )
++            scoped_root = Path(root_raw).resolve()
++            if not (target == scoped_root or target.is_relative_to(scoped_root)):
++                # Raise ValueError to match NLTK's historical CorpusReader error type
++                raise ValueError(
++                    f"Security Violation [{context}]: Path {target} escapes root {scoped_root}"
++                )
++
++        # LAYER 2: Global NLTK_DATA Sandbox
++        allowed_roots = _get_allowed_roots()
++        if any(target == root or target.is_relative_to(root) for root in allowed_roots):
++            return
++
++        # CWD Fallback (Explicit Opt-In for ENFORCE mode)
++        try:
++            cwd = Path(os.getcwd()).resolve()
++            if target == cwd or target.is_relative_to(cwd):
++                if any(cwd == root for root in allowed_roots):
++                    return
++                msg = (
++                    f"Security Violation [{context}]: CWD access restricted in ENFORCE mode. "
++                    "Authorize via: nltk.data.path.append('.')"
++                )
++                if ENFORCE:
++                    raise PermissionError(msg)
++                else:
++                    warnings.warn(
++                        f"Security Warning [{context}]: Path {target} allowed via CWD.",
++                        RuntimeWarning,
++                        stacklevel=3,
++                    )
++                    return
++        except (OSError, ValueError):
++            pass
++
++        msg = f"Security Violation [{context}]: Unauthorized path {target}"
++        if ENFORCE:
++            raise PermissionError(msg)
++        else:
++            warnings.warn(msg, RuntimeWarning, stacklevel=3)
++    except (PermissionError, ValueError):
++        raise
++    except Exception:
++        if ENFORCE:
++            raise
++
++
++def validate_zip_archive(
++    zip_obj_or_path, target_root, specific_member=None, context="ZipAudit"
++):
++    """Enhanced Zip-Slip protection using Pathlib for cross-platform safety."""
++    try:
++        target = Path(target_root).resolve()
++
++        def _audit(zf):
++            members = (
++                [specific_member] if specific_member is not None else zf.namelist()
++            )
++            for name in members:
++                name_str = name.filename if hasattr(name, "filename") else str(name)
++                if "\0" in name_str:
++                    raise ValueError(f"Null byte in ZIP member: {name_str}")
++
++                member_path = (target / name_str).resolve()
++                if not (member_path == target or member_path.is_relative_to(target)):
++                    msg = f"Security Violation [{context}]: Traversal member '{name_str}' detected."
++                    if ENFORCE:
++                        raise PermissionError(msg)
++                    else:
++                        warnings.warn(msg, RuntimeWarning, stacklevel=3)
++
++        if isinstance(zip_obj_or_path, zipfile.ZipFile):
++            _audit(zip_obj_or_path)
++        else:
++            with zipfile.ZipFile(zip_obj_or_path, "r") as zf:
++                _audit(zf)
++    except (PermissionError, ValueError):
++        raise
++    except (OSError, zipfile.BadZipFile):
++        if ENFORCE:
++            raise PermissionError("Zip validation failed")
++
++
++@lru_cache(maxsize=256)
++def _resolve_hostname(hostname):
++    """Cached hostname resolution to mitigate DNS rebinding."""
++    try:
++        return socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
++    except (OSError, ValueError):
++        return []
++
++
++def validate_network_url(url_input, context="NetworkIO"):
++    """Hardened URL validation with SSRF protection."""
++    if not url_input or not str(url_input).strip():
++        return
++    try:
++        parsed = urlparse(str(url_input))
++
++        if parsed.scheme == "file":
++            file_path = unquote(parsed.path)
++            netloc = parsed.netloc
++
++            # Only local file:// URIs are allowed.
++            # Reject remote/UNC-style authorities so validation matches actual access.
++            if netloc not in ("", "localhost"):
++                raise OSError(
++                    f"Security Violation [{context}.file_scheme]: "
++                    f"Non-local file URI authority not allowed: {netloc!r}"
++                )
++
++            # Windows file:// URIs arrive like /C:/path/to/file
++            # Convert them to a native absolute path before validation.
++            if (
++                os.name == "nt"
++                and len(file_path) >= 3
++                and file_path[0] == "/"
++                and file_path[2] == ":"
++            ):
++                file_path = file_path[1:]
++
++            validate_path(file_path, context=f"{context}.file_scheme")
++            return
++
++        if parsed.scheme not in ("http", "https"):
++            msg = (
++                f"Security Violation [{context}]: Unsupported scheme '{parsed.scheme}'."
++            )
++            if ENFORCE:
++                raise PermissionError(msg)
++            else:
++                warnings.warn(msg, RuntimeWarning, stacklevel=3)
++            return
++
++        for result in _resolve_hostname(parsed.hostname or ""):
++            ip = ipaddress.ip_address(result[4][0])
++            if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_private:
++                msg = f"Security Violation [{context}]: SSRF attempt to restricted IP {ip}"
++                if ENFORCE:
++                    raise PermissionError(msg)
++                else:
++                    warnings.warn(msg, RuntimeWarning, stacklevel=3)
++    except (PermissionError, ValueError):
++        raise
++    except Exception:
++        if ENFORCE:
++            raise
++
++
++class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
++    """Ensures that every step of a redirect chain is re-validated against SSRF."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        validate_network_url(newurl, context="NetworkRedirect")
++        return super().redirect_request(req, fp, code, msg, headers, newurl)
++
++
++def urlopen(url, *args, **kwargs):
++    """
++    Secure wrapper for urllib.request.urlopen with redirect validation.
++    Inherits NLTK proxy settings, but intentionally ignores other custom
++    global handlers to strictly enforce the security sandbox.
++    """
++    url_str = url.full_url if hasattr(url, "full_url") else str(url)
++    validate_network_url(url_str, context="pathsec.urlopen")
++
++    # Start with our security-enforcing redirect handler
++    handlers = [_ValidatingRedirectHandler()]
++
++    # Safely inherit proxy settings without reusing handler instances
++    # (Reusing instances overwrites their .parent, breaking the global opener)
++    if urllib.request._opener is not None:
++        for handler in urllib.request._opener.handlers:
++            if isinstance(handler, urllib.request.ProxyHandler):
++                # Copy the dictionary to prevent shared mutable state
++                isolated_proxies = dict(handler.proxies) if handler.proxies else {}
++                handlers.append(urllib.request.ProxyHandler(isolated_proxies))
++            elif isinstance(handler, urllib.request.ProxyBasicAuthHandler):
++                handlers.append(urllib.request.ProxyBasicAuthHandler(handler.passwd))
++            elif isinstance(handler, urllib.request.ProxyDigestAuthHandler):
++                handlers.append(urllib.request.ProxyDigestAuthHandler(handler.passwd))
++
++    opener = urllib.request.build_opener(*handlers)
++    return opener.open(url, *args, **kwargs)
++
++
++def open(file, mode="r", **kwargs):
++    """Secure wrapper for builtins.open."""
++    validate_path(file, context="pathsec.open")
++    return builtins.open(file, mode=mode, **kwargs)
++
++
++class ZipFile(zipfile.ZipFile):
++    """Secure wrapper for zipfile.ZipFile."""
++
++    def __init__(self, file, *args, **kwargs):
++        if isinstance(file, (str, Path)):
++            validate_path(file, context="pathsec.ZipFile")
++        super().__init__(file, *args, **kwargs)
++
++    def extract(self, member, path=None, pwd=None):
++        validate_zip_archive(self, path or os.getcwd(), specific_member=member)
++        return super().extract(member, path, pwd)
++
++    def extractall(self, path=None, members=None, pwd=None):
++        validate_zip_archive(self, path or os.getcwd())
++        super().extractall(path, members, pwd)
++
++
++__all__ = [
++    "validate_path",
++    "validate_network_url",
++    "validate_zip_archive",
++    "open",
++    "urlopen",
++    "ZipFile",
++    "ENFORCE",
++]

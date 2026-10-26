@@ -1,0 +1,159 @@
+--- a/packages/sanitize-html/index.js
++++ b/packages/sanitize-html/index.js
+@@ -12,6 +12,17 @@
+ ];
+ // Tags that are inherently vulnerable to being used in XSS attacks.
+ const vulnerableTags = [ 'script', 'style' ];
++// SVG SMIL animation elements. These do not carry a URL themselves: they
++// retarget an attribute of another element, naming it with `attributeName`
++// and supplying the new value(s) in `values`, `from`, `to` and `by`.
++const svgAnimationTags = [
++  'animate', 'animatecolor', 'animatemotion', 'animatetransform', 'set'
++];
++// Attribute names that always name a URL sink, whatever
++// `allowedSchemesAppliedToAttributes` has been narrowed to. A namespace prefix
++// is ignored when matching, so `xlink:href` and any other prefixed spelling of
++// `href` are covered.
++const alwaysUrlAttributes = [ 'href' ];
+ 
+ function each(obj, cb) {
+   if (obj) {
+@@ -272,6 +283,7 @@
+         }
+       }
+ 
++      filterAnimationDestinations(name, attribs);
+       if (!tagAllowed(name) || (options.disallowedTagsMode === 'recursiveEscape' && !isEmptyObject(skipMap)) || (options.nestingLimit != null && depth >= options.nestingLimit)) {
+         skip = true;
+         skipMap[depth] = true;
+@@ -378,6 +390,14 @@
+               }
+             }
+ 
++            // `<meta http-equiv="refresh" content="0;url=...">` navigates to a
++            // URL embedded in `content`, so scheme check that URL too. Other
++            // meta `content` values are left alone.
++            if (name === 'meta' && a.toLowerCase() === 'content' && isRefresh(attribs) && naughtyRefresh(value)) {
++              delete frame.attribs[a];
++              return;
++            }
++
+             if (name === 'script' && a === 'src') {
+ 
+               let allowed = true;
+@@ -444,7 +464,7 @@
+               try {
+                 let parsed = parseSrcset(value);
+                 parsed.forEach(function(value) {
+-                  if (naughtyHref(a, value.url)) {
++                  if (naughtyHref(name, value.url)) {
+                     value.evil = true;
+                   }
+                 });
+@@ -762,17 +782,101 @@
+   }
+ 
+   function naughtyHref(name, href) {
+-    // A per-tag list names the schemes that are additionally allowed for that
+-    // tag; combine it with the global list.
+-    const allowedSchemes = (options.allowedSchemes || []).concat(
+-      has(options.allowedSchemesByTag, name) ? options.allowedSchemesByTag[name] : []
+-    );
++    // Resolve the per-tag scheme allowlist if one is configured for
++    // this tag, otherwise fall back to the global allowedSchemes.
++    const allowedSchemes = has(options.allowedSchemesByTag, name)
++      ? options.allowedSchemesByTag[name]
++      : (options.allowedSchemes || []);
+     return launderNaughtyHref(href, {
+       allowedSchemes,
+       allowProtocolRelative: options.allowProtocolRelative
+     });
+   }
+ 
++  function isRefresh(attribs) {
++    return Object.keys(attribs).some(function(a) {
++      return a.toLowerCase() === 'http-equiv' &&
++        String(attribs[a]).trim().toLowerCase() === 'refresh';
++    });
++  }
++
++  // True if the `content` of a `<meta http-equiv="refresh">` must be dropped:
++  // its destination URL fails the scheme policy, or it cannot be parsed as a
++  // refresh at all (a browser would ignore it then, so nothing is lost).
++  // Extracts the URL the way the HTML standard's shared declarative refresh
++  // steps do, so that spelling, separator, quoting and case variations of
++  // `url=`, or no `url=` at all, all yield the URL a browser would navigate to.
++  function naughtyRefresh(content) {
++    const input = String(content);
++    const match = /^\s*(?:\d+(?:\.\d+)?|\.\d+)\s*(?:[;,]\s*|\s+)?(.*)$/i.exec(input);
++    if (!match) {
++      return true;
++    }
++    let rest = match[1];
++    if (!rest) {
++      return false;
++    }
++    const urlEq = /^url\s*=\s*/i.exec(rest);
++    if (urlEq) {
++      rest = rest.slice(urlEq[0].length);
++    }
++    while (rest.length && /[ \t\n\f\r]/.test(rest[0])) {
++      rest = rest.slice(1);
++    }
++    const quote = rest[0];
++    if (quote === '"' || quote === "'") {
++      const end = rest.indexOf(quote, 1);
++      rest = end === -1 ? rest.slice(1) : rest.slice(1, end);
++    } else {
++      rest = rest.replace(/[ \t\n\f\r]+$/, '');
++    }
++    return naughtyHref('meta', rest);
++  }
++
++  // Remove the destination-carrying attributes of an animation when the
++  // animation retargets an attribute the scheme policy covers. Entries of a
++  // list value are judged one by one; the element itself may stay because
++  // without a destination it is inert.
++  function filterAnimationDestinations(name, attribs) {
++    if (typeof name !== 'string' || svgAnimationTags.indexOf(name.toLowerCase()) === -1) {
++      return;
++    }
++    const schemeCheckedAttributes = options.allowedSchemesAppliedToAttributes || [];
++    let targetsUrl = false;
++    Object.keys(attribs || {}).forEach(function(attributeName) {
++      if (attributeName.toLowerCase() !== 'attributename') {
++        return;
++      }
++      const target = (attribs[attributeName] || '').trim().toLowerCase();
++      const localName = target.slice(target.lastIndexOf(':') + 1);
++      if (alwaysUrlAttributes.indexOf(localName) !== -1 ||
++        schemeCheckedAttributes.indexOf(target) !== -1 ||
++        schemeCheckedAttributes.indexOf(localName) !== -1) {
++        targetsUrl = true;
++      }
++    });
++    if (!targetsUrl) {
++      return;
++    }
++    Object.keys(attribs || {}).forEach(function(attributeName) {
++      const lower = attributeName.toLowerCase();
++      if (lower === 'values') {
++        const kept = String(attribs[attributeName]).split(';').filter(function(entry) {
++          return !naughtyHref(name, entry.trim());
++        });
++        if (kept.length) {
++          attribs[attributeName] = kept.join(';');
++        } else {
++          delete attribs[attributeName];
++        }
++      } else if (lower === 'from' || lower === 'to' || lower === 'by') {
++        if (naughtyHref(name, attribs[attributeName])) {
++          delete attribs[attributeName];
++        }
++      }
++    });
++  }
++
+   function parseUrl(value) {
+     value = value.replace(/^(\w+:)?\s*[\\/]\s*[\\/]/, '$1//');
+     if (value.startsWith('relative:')) {

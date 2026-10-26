@@ -1,0 +1,219 @@
+diff --git a/cli/cli.go b/cli/cli.go
+index ca532a23..e11cff46 100644
+--- a/cli/cli.go
++++ b/cli/cli.go
+@@ -318,10 +318,12 @@ func (r *Runner) runNode() (*node.Node, error) {
+ 	if r.telemetryEnabled {
+ 		tracker := telemetry.NewTracker(metrics, r.config, r.telemetryConfig)
+ 
+-		r.log.With("context", "telemetry").Info(tracker.Announce())
+-		go tracker.Collect()
++		if tracker.Enabled() {
++			r.log.With("context", "telemetry").Info(tracker.Announce())
++			go tracker.Collect()
+ 
+-		r.shutdownables = append(r.shutdownables, tracker)
++			r.shutdownables = append(r.shutdownables, tracker)
++		}
+ 	}
+ 
+ 	subscriber, err := r.subscriberFactory(appNode, r.config, r.log)
+diff --git a/config/config.go b/config/config.go
+index 62d9dd38..09502937 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -77,20 +77,12 @@ type TelemetryConfig struct {
+ }
+ 
+ // TelemetryOptions returns the telemetry credentials configured for this deployment.
+-// Configurations that enable telemetry without providing a token are authenticated
+-// with the shared AnyCable telemetry token.
+ func (c *Config) TelemetryOptions() (string, string) {
+-	if !c.Telemetry.Enabled {
++	if !c.Telemetry.Enabled || c.Telemetry.Token == "" {
+ 		return "", ""
+ 	}
+ 
+-	token := c.Telemetry.Token
+-
+-	if token == "" {
+-		token = "anycable-hosted"
+-	}
+-
+-	return token, c.Telemetry.Endpoint
++	return c.Telemetry.Token, c.Telemetry.Endpoint
+ }
+ 
+ // NewConfig returns a new empty config
+diff --git a/telemetry/config.go b/telemetry/config.go
+index 6b507056..36ec093c 100644
+--- a/telemetry/config.go
++++ b/telemetry/config.go
+@@ -9,11 +9,11 @@ type Config struct {
+ 	Debug       bool
+ }
+ 
+-var authToken = "secret" // make it overridable during build time
++var auth = "" // provide a secret token during the build time to enable tracking
+ 
+ func NewConfig() *Config {
+ 	return &Config{
+-		Token:       authToken,
++		Token:       auth,
+ 		Endpoint:    "https://telemetry.anycable.io",
+ 		Debug:       os.Getenv("ANYCABLE_TELEMETRY_DEBUG") == "1",
+ 		CustomProps: map[string]string{},
+diff --git a/telemetry/telemetry.go b/telemetry/telemetry.go
+index 1728c23c..85af473d 100644
+--- a/telemetry/telemetry.go
++++ b/telemetry/telemetry.go
+@@ -51,9 +51,17 @@ type Tracker struct {
+ 	// Observed metrics values
+ 	observations   map[string]interface{}
+ 	customizations map[string]string
++
++	enabled bool
+ }
+ 
+ func NewTracker(instrumenter *metrics.Metrics, c *config.Config, tc *Config) *Tracker {
++	tc.Token = strings.TrimSpace(tc.Token)
++
++	if tc.Token == "" {
++		return &Tracker{}
++	}
++
+ 	id, _ := nanoid.Nanoid(8)
+ 
+ 	client := &http.Client{}
+@@ -69,6 +77,7 @@ func NewTracker(instrumenter *metrics.Metrics, c *config.Config, tc *Config) *Tr
+ 	fingerprint := clusterFingerprint(c)
+ 
+ 	return &Tracker{
++		enabled:        true,
+ 		client:         client,
+ 		url:            tc.Endpoint,
+ 		authToken:      tc.Token,
+@@ -82,11 +91,19 @@ func NewTracker(instrumenter *metrics.Metrics, c *config.Config, tc *Config) *Tr
+ 	}
+ }
+ 
++func (t *Tracker) Enabled() bool {
++	return t.enabled
++}
++
+ func (t *Tracker) Announce() string {
+ 	return "Anonymized telemetry is on. Learn more: https://docs.anycable.io/anycable-go/telemetry"
+ }
+ 
+ func (t *Tracker) Collect() {
++	if !t.enabled {
++		return
++	}
++
+ 	t.Send("boot", t.bootProperties())
+ 
+ 	go t.monitorUsage()
+@@ -117,6 +134,10 @@ func (t *Tracker) Shutdown(ctx context.Context) error {
+ }
+ 
+ func (t *Tracker) Send(event string, props map[string]interface{}) {
++	if !t.enabled || t.authToken == "" {
++		return
++	}
++
+ 	t.logger.Debug("send telemetry event", "event", event)
+ 
+ 	// Avoid storing IP address
+@@ -255,7 +276,6 @@ func (t *Tracker) appProperties() map[string]interface{} {
+ 	props.Set("statsd", t.config.Metrics.Statsd.Enabled())
+ 	props.Set("prom", t.config.Metrics.HTTPEnabled())
+ 	props.Set("rpc-impl", t.config.RPC.Impl())
+-	props.Set("redis-url", t.config.Redis.URL)
+ 
+ 	// AnyCable+
+ 	name, ok := os.LookupEnv("ANYCABLEPLUS_APP_NAME")
+@@ -326,12 +346,15 @@ func clusterFingerprint(c *config.Config) string {
+ 	}
+ 
+ 	platform := guessPlatform()
+-	// Explicitly set env vars
+-	env := anycableEnvVarsList()
+-	// Command line arguments
+-	opts := anycableCLIArgs()
+-	// File configuration as a string
+-	file := anycableFileConfig(c.ConfigFilePath)
++	// Explicitly set env vars (names only: values may contain credentials)
++	env := anycableEnvVarNamesList()
++	// Command line options (names only: values may contain credentials)
++	opts := anycableCLIArgNames()
++	// Configuration file presence only: its contents may contain credentials
++	file := ""
++	if c.ConfigFilePath != "" {
++		file = "file"
++	}
+ 
+ 	// Likely development environment
+ 	if env == "" && opts == "" && file == "" && platform == "" {
+@@ -383,40 +406,41 @@ func generateDigest(prefix string, parts ...string) string {
+ 	return fmt.Sprintf("%s%x", prefix, h.Sum(nil))
+ }
+ 
+-// Return a sorted list of AnyCable environment variables.
+-func anycableEnvVarsList() string {
++// Return a sorted list of AnyCable environment variable names. Values are omitted,
++// because they may contain credentials.
++func anycableEnvVarNamesList() string {
+ 	pairs := os.Environ()
+-	vars := []string{}
++	names := []string{}
+ 
+ 	for _, pair := range pairs {
+-		if strings.HasPrefix(pair, "ANYCABLE") {
+-			vars = append(vars, pair)
++		name, _, _ := strings.Cut(pair, "=")
++
++		if strings.HasPrefix(name, "ANYCABLE") {
++			names = append(names, name)
+ 		}
+ 	}
+ 
+-	slices.Sort(vars)
++	slices.Sort(names)
+ 
+-	return strings.Join(vars, ",")
++	return strings.Join(names, ",")
+ }
+ 
+-// Return a sorted list of AnyCable CLI arguments.
+-func anycableCLIArgs() string {
++// Return a sorted list of AnyCable CLI option names. Values are omitted, because
++// they may contain credentials.
++func anycableCLIArgNames() string {
+ 	args := os.Args[1:]
+-	slices.Sort(args)
++	names := []string{}
+ 
+-	return strings.Join(args, ",")
+-}
++	for _, arg := range args {
++		if !strings.HasPrefix(arg, "-") {
++			continue
++		}
+ 
+-// Return the contents of AnyCable configuration file if any.
+-func anycableFileConfig(path string) string {
+-	if path == "" {
+-		return ""
++		name, _, _ := strings.Cut(arg, "=")
++		names = append(names, name)
+ 	}
+ 
+-	bytes, err := os.ReadFile(path)
+-	if err != nil {
+-		return ""
+-	}
++	slices.Sort(names)
+ 
+-	return string(bytes)
++	return strings.Join(names, ",")
+ }

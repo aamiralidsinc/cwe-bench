@@ -1,0 +1,82 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "21040",
+  "advisory_ids": ["GHSA-GGXF-9F6J-W742", "RUSTSEC-2026-0172"],
+  "repo": "diesel-rs/diesel",
+  "pinned_commit": "dddc8fa60efb5bb0e86df3f1b9e7728ea8fde4a9",
+  "fix_commits": ["1bc2ea46d9840e8d9af844239d3c84f37fe7d84b"],
+  "trust_decision": {
+    "summary": "sqlite3_deserialize is called with SQLITE_DESERIALIZE_READONLY and without FREEONCLOSE, so SQLite keeps the caller's buffer pointer for the whole life of the connection; the public wrapper passes a borrowed &[u8] whose owner (a SerializedDatabase freed with sqlite3_free, or any Rust Vec) may drop immediately after the call, so the fix moves the lifetime decision into SqliteConnection by copying the bytes into a connection-owned Vec<u8>.",
+    "evidence": [
+      "diesel/src/sqlite/connection/raw.rs:243-250",
+      "diesel/src/sqlite/connection/mod.rs:664-666",
+      "diesel/src/sqlite/connection/serialized_database.rs:42-49",
+      "fix.diff:36-42"
+    ]
+  },
+  "landing_point": {
+    "where": "diesel/src/sqlite/connection/mod.rs:664",
+    "why": "The advisory summary names SqliteConnection::deserialize_readonly_database_from_buffer; it is the only public deserialize entry and the only caller of the raw primitive, so an engineer who read only the summary starts here."
+  },
+  "fix_sites": [
+    {"where": "diesel/src/sqlite/connection/mod.rs:664-666", "entry_point": "SqliteConnection::deserialize_readonly_database_from_buffer (public API, gated by the 'sqlite' feature)", "module_kind": "public connection API"},
+    {"where": "diesel/src/sqlite/connection/mod.rs:165-176", "entry_point": "SqliteConnection struct (new owning field serialized_data; ordering relative to raw_connection is load-bearing)", "module_kind": "connection state"},
+    {"where": "diesel/src/sqlite/connection/mod.rs:780-793", "entry_point": "SqliteConnection::establish -> establish_inner (constructor must initialise the new field)", "module_kind": "internal constructor"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2/O8 site exists; the nearest dismissal a solver could use is for the crate-private primitive itself - RawConnection::deserialize is pub(super) and RawConnection is never exposed, so nothing outside diesel/src/sqlite/connection/mod.rs can reach the sink and the caller-side copy is 'enough'.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Connection teardown must still read the deserialized pages: RawConnection::drop calls sqlite3_close while the pager still points at the buffer, so the owning Vec<u8> has to be declared after raw_connection (Rust drops fields in declaration order). A fix that puts the new field first, or that hands ownership to SQLite via SQLITE_DESERIALIZE_FREEONCLOSE, breaks close (and frees Rust-allocated memory with sqlite3_free / double-frees a SerializedDatabase).",
+    "where": "diesel/src/sqlite/connection/mod.rs:165-176; diesel/src/sqlite/connection/raw.rs:330-334; fix.diff:17-29"
+  },
+  "O6_input_shapes": [
+    "borrowed &[u8] from SerializedDatabase::as_slice() - sqlite3_malloc'd memory released by sqlite3_free in Drop (diesel/src/sqlite/connection/serialized_database.rs:28-31,42-49)",
+    "borrowed &[u8] from any Rust-owned Vec<u8>/file read, dropped right after the call",
+    "'static slices (include_bytes!), which never needed the copy",
+    "empty slice / length that does not fit sqlite3_int64 (error path still stores the copy) (diesel/src/sqlite/connection/raw.rs:236-239)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "diesel/src/sqlite/connection/raw.rs:218-233 (sqlite3_serialize) and diesel/src/sqlite/connection/serialized_database.rs:42-49 (Drop -> sqlite3_free)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "diesel/src/sqlite/connection/raw.rs:235", "sibling": "A second public wrapper over RawConnection::deserialize (e.g. SqliteConnection::from_serialized_database(&SerializedDatabase) or a fixture loader) that forwards the borrowed slice without copying.", "why_realistic": "The raw layer already takes a plain &[u8] and encodes the 'buffer must outlive the connection' contract only in the new field, so any new thin wrapper added later inherits the same trap; diesel's style is one thin wrapper per convenience (mod.rs:624 vs raw.rs:218)."},
+    {"where": "diesel/src/sqlite/connection/mod.rs:664", "sibling": "A second consecutive call to deserialize_readonly_database_from_buffer (swap databases on a live connection): self.serialized_data = data.to_vec() frees the previous buffer before sqlite3_deserialize re-points the pager at the new one.", "why_realistic": "Re-using one connection to load a second snapshot is the obvious runtime use of this API, and the fix's own comment only reasons about the connection-lifetime case, not replacement."},
+    {"where": "diesel/src/sqlite/connection/sqlite_blob.rs:60", "sibling": "A blob/open-statement handle retaining a pager that is pointing at a buffer the connection no longer owns.", "why_realistic": "The read-only blob type already hands out handles onto the main database; a maintainer adding 'reload the database' support would have to think about it explicitly."}
+  ],
+  "O9_family": "CWE-416 use-after-free: FFI borrow of a caller-owned buffer (sqlite3_deserialize with READONLY, no copy) outliving the Rust borrow",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo / rustc >= 1.88.0, edition 2024 (Cargo.toml:40-42); libsqlite3-sys >= 0.30.1,<0.38.0 with bundled_bindings (diesel/Cargo.toml:54), optional 'bundled' feature via __with_asan_tests (diesel/Cargo.toml:101-108); the sqlite backend requires --features sqlite (__sqlite-shared, diesel/Cargo.toml:100)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "unit test database_serializes_and_deserializes_successfully (diesel/src/sqlite/connection/mod.rs:1122-1155) uses an in-memory connection (mod.rs:842-844), so no server is needed: cargo test -p diesel --features sqlite sqlite::connection; an ASan build exists via the __with_asan_tests feature, which is what would actually detect this UAF."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "diesel/src/sqlite/connection/mod.rs",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Pass SQLITE_DESERIALIZE_FREEONCLOSE (or drop SQLITE_DESERIALIZE_READONLY) so SQLite 'owns' the buffer - which frees a SerializedDatabase twice or runs sqlite3_free on Rust memory - instead of copying the bytes into a field declared after raw_connection."
+  },
+  "out_of_scope_notes": [
+    "Adjacent, not this advisory: the SQLite bind path also uses SQLITE_STATIC with a Rust-owned Box kept alive next to the statement (diesel/src/sqlite/connection/stmt.rs:105-158); separate lifetime contract, not pursued."
+  ],
+  "unverified": [
+    "Repo size in MB not measured (no shell), so tiny_repo/giant_repo was not assessed; diesel is clearly larger than 5 MB.",
+    "Present-in-latest is unknown for everything (no latest release provided for O8).",
+    "Whether a second call to deserialize_readonly_database_from_buffer actually touches the freed previous buffer inside sqlite3_deserialize/sqlite3_close could not be checked without running SQLite; the O8b entry for it is therefore a candidate, not a confirmed uncovered route.",
+    "The existing test at diesel/src/sqlite/connection/mod.rs:1122-1155 is the same test function the fix extends, but the asserting lines the fix adds (std::mem::drop + requery) are absent at the pinned commit, so regression_tests_in_pinned_commit was not set; a solver can still see the test area."
+  ]
+}

@@ -1,0 +1,126 @@
+diff -ruN base/server/origin.go alt_correct_fix/server/origin.go
+--- base/server/origin.go	1970-01-01 00:00:00.000000000 +0000
++++ alt_correct_fix/server/origin.go	2026-10-26 02:22:45.726040742 +0000
+@@ -0,0 +1,92 @@
++package server
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// requestScheme returns the scheme the client used to reach this server.
++func requestScheme(r *http.Request) string {
++	if r.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++// configuredOrigins returns the origins the operator has allowed for cross-origin use.
++func configuredOrigins() []string {
++	return strings.FieldsFunc(AccessControlAllowOrigin, func(c rune) bool {
++		return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r'
++	})
++}
++
++// originAllowed reports whether a request may proceed based on its Origin header.
++// A request without an Origin header does not originate from a cross-origin browser
++// context and is allowed. A present Origin must be this server's own origin, or an
++// origin the operator has configured.
++func originAllowed(r *http.Request) bool {
++	values := r.Header.Values("Origin")
++	if len(values) == 0 {
++		return true
++	}
++	origin := strings.TrimSpace(values[0])
++	if origin == "" {
++		return true
++	}
++
++	u, err := url.Parse(origin)
++	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
++		return false
++	}
++
++	// Same origin as the request itself.
++	if strings.EqualFold(u.Scheme, requestScheme(r)) && strings.EqualFold(u.Host, r.Host) {
++		return true
++	}
++
++	// Operator-configured origins: a full origin (scheme://host[:port]), a bare
++	// host[:port], or the wildcard.
++	for _, entry := range configuredOrigins() {
++		if entry == "*" {
++			return true
++		}
++
++		host, scheme := entry, ""
++		if strings.Contains(entry, "://") {
++			a, err := url.Parse(entry)
++			if err != nil {
++				continue
++			}
++			host, scheme = a.Host, a.Scheme
++		}
++
++		if host != "" && strings.EqualFold(host, u.Host) &&
++			(scheme == "" || strings.EqualFold(scheme, u.Scheme)) {
++			return true
++		}
++	}
++
++	return false
++}
++
++// isStateChangingMethod reports whether a method is unsafe for cross-origin requests.
++func isStateChangingMethod(method string) bool {
++	switch method {
++	case http.MethodGet, http.MethodHead, http.MethodOptions:
++		return false
++	}
++	return true
++}
++
++// originGuard wraps a handler so that a state-changing request or the event stream
++// is admitted only from an allowed origin.
++func originGuard(fn http.HandlerFunc) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		if !originAllowed(r) {
++			http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
++			return
++		}
++		fn(w, r)
++	}
++}
+diff -ruN base/server/server.go alt_correct_fix/server/server.go
+--- base/server/server.go	2026-10-26 02:22:29.914055187 +0000
++++ alt_correct_fix/server/server.go	2026-10-26 02:22:45.726040742 +0000
+@@ -164,7 +164,7 @@
+ 	r.HandleFunc(config.Webroot+"api/v1/messages", middleWareFunc(apiv1.DeleteMessages)).Methods("DELETE")
+ 	r.HandleFunc(config.Webroot+"api/v1/search", middleWareFunc(apiv1.Search)).Methods("GET")
+ 	r.HandleFunc(config.Webroot+"api/v1/search", middleWareFunc(apiv1.DeleteSearch)).Methods("DELETE")
+-	r.HandleFunc(config.Webroot+"api/v1/send", sendAPIAuthMiddleware(apiv1.SendMessageHandler)).Methods("POST")
++	r.HandleFunc(config.Webroot+"api/v1/send", originGuard(sendAPIAuthMiddleware(apiv1.SendMessageHandler))).Methods("POST")
+ 	r.HandleFunc(config.Webroot+"api/v1/tags", middleWareFunc(apiv1.GetAllTags)).Methods("GET")
+ 	r.HandleFunc(config.Webroot+"api/v1/tags", middleWareFunc(apiv1.SetMessageTags)).Methods("PUT")
+ 	r.HandleFunc(config.Webroot+"api/v1/tags/{tag}", middleWareFunc(apiv1.RenameTag)).Methods("PUT")
+@@ -173,7 +173,7 @@
+ 	r.HandleFunc(config.Webroot+"api/v1/message/{id}/part/{partID}/thumb", middleWareFunc(apiv1.Thumbnail)).Methods("GET")
+ 	r.HandleFunc(config.Webroot+"api/v1/message/{id}/headers", middleWareFunc(apiv1.GetHeaders)).Methods("GET")
+ 	r.HandleFunc(config.Webroot+"api/v1/message/{id}/raw", middleWareFunc(apiv1.DownloadRaw)).Methods("GET")
+-	r.HandleFunc(config.Webroot+"api/v1/message/{id}/release", middleWareFunc(apiv1.ReleaseMessage)).Methods("POST")
++	r.HandleFunc(config.Webroot+"api/v1/message/{id}/release", originGuard(middleWareFunc(apiv1.ReleaseMessage))).Methods("POST")
+ 	r.HandleFunc(config.Webroot+"api/v1/message/{id}/html-check", middleWareFunc(apiv1.HTMLCheck)).Methods("GET")
+ 	r.HandleFunc(config.Webroot+"api/v1/message/{id}/link-check", middleWareFunc(apiv1.LinkCheck)).Methods("GET")
+ 	if config.EnableSpamAssassin != "" {
+@@ -196,7 +196,7 @@
+ 	}
+ 
+ 	// web UI websocket
+-	r.HandleFunc(config.Webroot+"api/events", apiWebsocket).Methods("GET")
++	r.HandleFunc(config.Webroot+"api/events", originGuard(apiWebsocket)).Methods("GET")
+ 
+ 	// return blank 200 response for OPTIONS requests for CORS
+ 	r.PathPrefix(config.Webroot + "api/v1/").Handler(middleWareFunc(apiv1.GetOptions)).Methods("OPTIONS")

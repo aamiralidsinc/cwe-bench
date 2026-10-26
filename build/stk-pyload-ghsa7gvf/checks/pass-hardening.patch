@@ -1,0 +1,274 @@
+diff --git a/src/pyload/core/network/http/http_chunk.py b/src/pyload/core/network/http/http_chunk.py
+index 5254b14..65b3545 100644
+--- a/src/pyload/core/network/http/http_chunk.py
++++ b/src/pyload/core/network/http/http_chunk.py
+@@ -133,6 +133,8 @@ class HTTPChunk(HTTPRequest):
+ 
+         self.code = 0  #: last http code, set by parent
+ 
++        self.allow_private_ip = False
++        self.redirect_refused = False
+         self.aborted = False  # indicates that the chunk aborted gracefully
+ 
+         self.c = pycurl.Curl()
+@@ -227,6 +229,10 @@ class HTTPChunk(HTTPRequest):
+         return self.c
+ 
+     def _write_header_callback(self, buf):
++        if not self._scan_headers(buf):
++            self.redirect_refused = True
++            return -1
++
+         self._header_buffer += buf
+         # TODO: forward headers?, this is possibly unneeded, when we just parse valid 200 headers
+         # as first chunk, we will parse the headers
+diff --git a/src/pyload/core/network/http/http_download.py b/src/pyload/core/network/http/http_download.py
+index be0f346..ecd7169 100644
+--- a/src/pyload/core/network/http/http_download.py
++++ b/src/pyload/core/network/http/http_download.py
+@@ -5,7 +5,7 @@ from logging import getLogger
+ import pycurl
+ from pyload import APPID
+ 
+-from ..exceptions import Abort
++from ..exceptions import Abort, Fail
+ from .http_chunk import ChunkInfo, HTTPChunk
+ from .http_request import BadHeader
+ 
+@@ -235,6 +235,11 @@ class HTTPDownload:
+ 
+                 for c, errno, msg in err_list:
+                     chunk = self.find_chunk(c)
++                    if chunk.redirect_refused:
++                        failed.append(chunk)
++                        ex = Fail("Refusing to follow a redirect to a non-public address")
++                        continue
++
+                     #: test if chunk was finished
+                     if errno != pycurl.E_WRITE_ERROR or not chunk.aborted:
+                         failed.append(chunk)
+diff --git a/src/pyload/core/network/http/http_request.py b/src/pyload/core/network/http/http_request.py
+index d36cc3e..1c8d3f5 100644
+--- a/src/pyload/core/network/http/http_request.py
++++ b/src/pyload/core/network/http/http_request.py
+@@ -5,7 +5,7 @@ import os
+ import tempfile
+ from itertools import chain
+ from logging import getLogger
+-from urllib.parse import quote, urlencode
++from urllib.parse import quote, urlencode, urljoin, urlsplit
+ 
+ import certifi
+ import pycurl
+@@ -16,9 +16,10 @@ from pyload import APPID
+ 
+ from ...utils.check import is_mapping
+ from ...utils.convert import to_bytes, to_str
++from ...utils.web.check import is_global_host
+ from ...utils.web.parse import http_header as parse_header_line
+ from ...utils.web.purge import unescape as html_unescape
+-from ..exceptions import Abort
++from ..exceptions import Abort, Fail
+ from .exceptions import BadHeader
+ from .http_headers import HttpHeaders
+ 
+@@ -71,6 +72,10 @@ class HTTPRequest:
+     def __init__(self, cookies=None, options=None, limit=2_000_000):
+         self.exception = None
+         self.limit = limit
++        self.allow_private_ip = False
++        self._proxy = False
++        self._scan_buffer = b""
++        self._current_url = None
+ 
+         self.c = pycurl.Curl()
+ 
+@@ -148,6 +153,8 @@ class HTTPRequest:
+             options["ipv6"],
+         )
+ 
++        self._proxy = bool(proxy)
++
+         if interface and interface.lower() != "none":
+             self.c.setopt(pycurl.INTERFACE, interface)
+ 
+@@ -237,6 +244,11 @@ class HTTPRequest:
+             get = urlencode(get)
+             url = f"{url}?{get}"
+ 
++        self._current_url = url
++        self._scan_buffer = b""
++        self._follow_redirects = True
++        self.check_destination(url)
++
+         if self.ssl_aiachaser and url.startswith("https://"):
+             chaser = AiaChaser()
+             try:
+@@ -344,6 +356,8 @@ class HTTPRequest:
+         elif type(redirect) is int:
+             self.c.setopt(pycurl.MAXREDIRS, redirect)
+ 
++        self._follow_redirects = bool(redirect)
++
+         if just_header:
+             self.c.setopt(pycurl.NOBODY, 1)
+ 
+@@ -558,10 +572,80 @@ class HTTPRequest:
+ 
+         return None  #: Everything is OK, please continue
+ 
++    def check_destination(self, url):
++        """
++        Refuse a destination that is not globally routable.
++        """
++        if self.allow_private_ip:
++            return
++
++        hostname = urlsplit(url).hostname
++        if not hostname or not is_global_host(hostname):
++            raise Fail(f"Refusing to fetch from a non-public address: {hostname}")
++
++    def _check_redirect(self, block):
++        """
++        Refuse to follow a redirect that leaves the globally routable space.
++        """
++        if self.allow_private_ip or not self._follow_redirects:
++            return True
++
++        lines = to_str(block, encoding="iso-8859-1").split("\r\n")
++        if not lines:
++            return True
++
++        status = lines[0].split()
++        if len(status) < 2 or not status[0].upper().startswith("HTTP/"):
++            return True
++
++        try:
++            code = int(status[1])
++        except ValueError:
++            return True
++
++        #: the HTTP client follows any 3xx answer that carries a Location
++        if not 300 <= code < 400:
++            return True
++
++        location = None
++        for line in lines[1:]:
++            name, sep, value = line.partition(":")
++            if sep and name.strip().lower() == "location":
++                location = value.strip()
++                break
++
++        if not location:
++            return True
++
++        target = urljoin(self._current_url or "", location)
++        hostname = urlsplit(target).hostname
++        if not hostname or not is_global_host(hostname):
++            self.exception = Fail(
++                f"Refusing to follow a redirect to a non-public address: {hostname}"
++            )
++            return False
++
++        self._current_url = target
++        return True
++
++    def _scan_headers(self, buf):
++        """
++        Inspect every response header block, including those of redirects.
++        """
++        self._scan_buffer += buf
++        while b"\r\n\r\n" in self._scan_buffer:
++            block, self._scan_buffer = self._scan_buffer.split(b"\r\n\r\n", 1)
++            if not self._check_redirect(block):
++                return False
++        return True
++
+     def _write_header_callback(self, buf):
+         """
+         writes header.
+         """
++        if not self._scan_headers(buf):
++            return -1
++
+         self._header_buffer += buf
+ 
+         if self._header_buffer.endswith(b"\r\n\r\n"):
+diff --git a/src/pyload/core/utils/web/check.py b/src/pyload/core/utils/web/check.py
+index 96146ba..e30939b 100644
+--- a/src/pyload/core/utils/web/check.py
++++ b/src/pyload/core/utils/web/check.py
+@@ -3,7 +3,7 @@ import random
+ import re
+ import time
+ 
+-from ...network.request_factory import get_url
++from .convert import host_to_ip
+ 
+ 
+ def is_ipv4_address(value):
+@@ -100,6 +100,36 @@ def is_global_address(value):
+         return False
+ 
+ 
++def is_global_host(value):
++    """
++    Check whether the provided host resolves only to globally routable addresses.
++
++    Parameters:
++    - value (str): The input host or IP address to check.
++
++    Returns:
++    - bool: True if the value is an IP address that is globally routable or a
++      host that resolves to at least one address and all of them are global,
++      False otherwise.
++    """
++    if not value:
++        return False
++
++    value = value.strip().rstrip(".")
++
++    if not value or "%" in value:
++        return False
++
++    if value.lower() == "localhost" or value.lower().endswith(".localhost"):
++        return False
++
++    if is_ip_address(value):
++        return is_global_address(value)
++
++    ips = host_to_ip(value)
++    return bool(ips) and all(is_global_address(ip) for ip in ips)
++
++
+ def is_port(value):
+     """
+     Validate whether an integer is a valid TCP/UDP port number.
+@@ -121,6 +151,8 @@ def get_public_address(addr_type="ipv4"):
+     - str: The public IPv4 or IPv6 address as returned by the external service, or
+       an empty string if all attempts fail.
+     """
++    from ...network.request_factory import get_url
++
+     if addr_type == "ipv4":
+         services = [
+             ("https://ipv4.icanhazip.com/", r"(\S+)"),
+diff --git a/src/pyload/core/utils/web/convert.py b/src/pyload/core/utils/web/convert.py
+index 4effbb8..1b86f3d 100644
+--- a/src/pyload/core/utils/web/convert.py
++++ b/src/pyload/core/utils/web/convert.py
+@@ -25,12 +25,12 @@ def host_to_ip(hostname):
+     try:
+         IPs = [
+             result [4][0]
+-            for result in socket.getaddrinfo(hostname, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
++            for result in socket.getaddrinfo(hostname, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
+         ]
+     except socket.gaierror:
+         IPs = []
+ 
+-    return IPs
++    return list(dict.fromkeys(IPs))
+ 
+ 
+ def ip_to_host(ipaddress):

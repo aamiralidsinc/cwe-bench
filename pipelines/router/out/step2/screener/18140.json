@@ -1,0 +1,57 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "18140", "advisory_ids": ["GHSA-JH6H-V6MP-H22V", "BIT-MILVUS-2026-10814", "CVE-2026-10814", "GO-2026-5999"], "repo": "milvus-io/milvus", "pinned_commit": "e86820224d11d16b496c777bb2fa2405a1e1441f", "fix_commits": ["3d932f1c3e065351c4440c27abe1e6479752544d"],
+  "trust_decision": {
+    "summary": "The RBAC metastore trusts a 64-bit-truncated MD5 of the grantee key as a unique identifier that binds a role/object/collection grant to its privilege-record subtree (grantee-id/<id>/<privilege>); every read, delete and rename of grants keys off that id, so two distinct grantees can share one id and each other's privileges/records.",
+    "evidence": ["internal/metastore/kv/rootcoord/kv_catalog.go:1366", "internal/metastore/kv/rootcoord/kv_catalog.go:1374", "pkg/util/crypto/crypto.go:47", "internal/metastore/kv/rootcoord/kv_catalog.go:1414", "internal/metastore/kv/rootcoord/kv_catalog.go:1526", "internal/metastore/kv/rootcoord/kv_catalog.go:1655", "internal/metastore/kv/rootcoord/kv_catalog.go:1680"]
+  },
+  "landing_point": {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1366", "why": "The summary says 'grantee-id uses truncated MD5'; the first code a reader lands on is where the grantee id is minted for a grant, `idStr = crypto.MD5(k)`, then written under GranteeIDPrefix at kv_catalog.go:1374. The 64-bit truncation itself sits one package away in pkg/util/crypto."},
+  "fix_sites": [
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1335", "entry_point": "gRPC OperatePrivilege (internal/rootcoord/root_coord.go:2597) and gRPC RestoreRBAC (internal/rootcoord/root_coord.go:2862), both via MetaTable.OperatePrivilege/MetaTable.RestoreRBAC -> Catalog.AlterGrant", "module_kind": "metastore kv catalog (internal)"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1404", "entry_point": "gRPC SelectGrant (internal/rootcoord/root_coord.go:2713) -> Catalog.ListGrant; also Catalog.BackupRBAC (kv_catalog.go:1773) and the revoke bookkeeping in internal/rootcoord/rbac_task.go:86", "module_kind": "metastore kv catalog (internal)"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1497", "entry_point": "gRPC DropCollection (internal/rootcoord/root_coord.go:1086) -> MetaTable.DropCollection (meta_table.go:650) and MetaTable.RemoveCollection (meta_table.go:734)", "module_kind": "metastore kv catalog (internal)"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1558", "entry_point": "gRPC RenameCollection (internal/rootcoord/root_coord.go:2889) -> AlterCollection ack callback (meta_table.go:1084)", "module_kind": "metastore kv catalog (internal), DDL ack-callback path"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1639", "entry_point": "gRPC DropRole (internal/rootcoord/root_coord.go:2369) -> dropRoleV2AckCallback (internal/rootcoord/ddl_callbacks_rbac_role.go:90) -> MetaTable.DropGrant (meta_table.go:2034)", "module_kind": "metastore kv catalog (internal), DDL ack-callback path"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1665", "entry_point": "internal gRPC ListPolicy (internal/rootcoord/root_coord.go:2771), consumed by the proxy privilege cache (internal/proxy/privilege/cache.go:75)", "module_kind": "metastore kv catalog (internal)"},
+    {"where": "pkg/util/crypto/crypto.go:48", "entry_point": "public package API pkg/util/crypto.GranteeID, called from Catalog.AlterGrant and Catalog.MigrateGrantCollectionName", "module_kind": "shared utility package (pkg)"},
+    {"where": "fix.diff:13-180", "entry_point": "no independent entry point; new private helpers (buildGranteeIDKey, granteeIDCandidates, isLegacyGranteeID, logicalGranteeKeyFromEtcdKey, findOtherGranteeWithID*, shouldRemoveGranteeIDSubtree, loadGranteeIDPrefix, migrateGranteeID) reached from the six Catalog functions above", "module_kind": "metastore kv catalog (internal), new shared helpers"}
+  ],
+  "O1_entry_points": 7,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "pkg/util/crypto/crypto.go:44-48"},
+  "O3_reason_to_dismiss": "crypto.MD5 is a generic shared util whose 16-char contract is asserted by its own test and by already-persisted metadata, so a solver can argue the truncation itself is out of RBAC scope and only the two minting call sites need the new full-length hash; the pre-existing 16-char ids then look like legacy data that 'is not part of this bug'.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Grants written before the fix carry 16-char ids and may live under the legacy no-db grantee key (role/object/collectionName) instead of the db-qualified key; a fix that just recomputes ids or prefix-deletes old grantee-id subtrees makes live grants unreadable and silently drops other roles' privilege records. A stored id can also be 16 chars without being the MD5 of its key (the fix's own 'unreferenced computed legacy id' case), so length alone must not trigger migration/collision handling.", "where": "internal/metastore/kv/rootcoord/kv_catalog.go:1345-1350"},
+  "O6_input_shapes": [
+    "legacy no-db grantee key (role/object/collectionName) vs db-qualified key (role/object/db.collection)",
+    "wildcard-db key (role/object/*.collectionName) consulted as a ListGrant fallback",
+    "16-char stored id (legacy, kv_catalog.go:1366) vs 32-char full-length id",
+    "a 16-char stored id that is not the MD5 of its grantee key (unreferenced computed legacy id)",
+    "one 16-char id referenced by two different grantee keys (shared/colliding id), in both the read and delete paths",
+    "collection rename: old name -> new name, with child grantee-id entries moved and the old parent removed",
+    "backup/restore: grants serialized in RBACMeta without any id, re-minted on restore",
+    "single-role query vs tenant-wide prefix scan of all grantees"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "internal/metastore/kv/rootcoord/kv_catalog.go:1523", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1796", "sibling": "RestoreRBAC writing GranteePrefix/GranteeIDPrefix entries directly from the backup blob instead of re-minting through AlterGrant", "why_realistic": "the backup already carries role/object/objectName per grant, so a bulk write looks cheaper and would bypass the id derivation and the shared-id check entirely"},
+    {"where": "internal/metastore/kv/rootcoord/kv_catalog.go:1639", "sibling": "a third prefix-deletion path (e.g. DropDatabase or DropPartition grant cleanup) reusing the DeleteGrantByCollectionName loop", "why_realistic": "DeleteGrantByCollectionName and DeleteGrant already duplicate the same prefix-remove pattern, so a maintainer adding another drop path would copy it, including the unguarded prefix removal"},
+    {"where": "internal/metastore/kv/rootcoord/legacy_tombstone_gc.go:33", "sibling": "a background grantee-id GC that walks the GranteeIDPrefix and deletes all 16-char (legacy) ids", "why_realistic": "the package already has a prefix-walking background sweeper that deletes keys by value shape; a 'clean up legacy ids' migration job written the same way would delete subtrees shared by two roles"},
+    {"where": "pkg/util/crypto/crypto.go:44", "sibling": "a second short-id helper copied from MD5 for another RBAC object (privilege group, user-role key)", "why_realistic": "the truncated MD5 helper is exported from a shared package and already used as a general key-hashing idiom, so copying it for a neighbouring id is the path of least resistance"}
+  ],
+  "O9_family": "identifier derivation with a 64-bit-truncated MD5 (CWE-327): grantee-id collision leading to cross-role privilege binding, plus the legacy-id migration/cleanup semantics around that identifier", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "Go 1.25.9 (go.mod:3); Go modules with replace github.com/milvus-io/milvus/pkg/v3 => ./pkg (go.mod:320); the affected package is pure Go, the full Milvus binary additionally needs a cgo/C++ build", "services": ["etcd (external endpoint, default etcd.use.embed=false; can be switched to in-process embedded etcd via etcd.use.embed=true)"], "offline_after_build": true, "project_tests": "internal/metastore/kv/rootcoord/kv_catalog_test.go (TestRBAC_Grant, TestRBAC_Backup at 2736, TestMigrateGrantCollectionName at 3711, TestDeleteGrantByCollectionName at 3549) and pkg/util/crypto/crypto_test.go; run via Makefile:362 test-rootcoord and Makefile:354 test-kv -> scripts/run_go_unittest.sh. The catalog tests need a live etcd endpoint because etcd.use.embed defaults to false (pkg/util/paramtable/service_param.go:136-143) and they build a real etcd-backed catalog (kv_catalog_test.go:2736-2749), seeding metadata keys directly, which is exactly the shape hidden behavioural tests would need."},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "internal/metastore/kv/rootcoord/kv_catalog.go, pkg/util/crypto/crypto.go", "j_sibling_sites": "no", "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Replace crypto.MD5 with the full-length hash at the two minting sites (kv_catalog.go:1366 and 1597) and stop there: new grants get 32-char ids, but existing 16-char ids are neither migrated nor read, and the delete/rename paths still prefix-delete subtrees that a second grantee shares."},
+  "out_of_scope_notes": ["AlterGrant builds its grantee key without funcutil.HandleTenantForEtcdPrefix (kv_catalog.go:1338) while ListGrant and DeleteGrant do add the tenant prefix (kv_catalog.go:1475, kv_catalog.go:1641) - a tenancy inconsistency next to this sink, not covered by this advisory and not pursued."],
+  "unverified": [
+    "repo_mb: no shell in this session, so repository size could not be measured; the Go/C++ source tree is obviously far above 5 MB, and whether the checkout exceeds 1.5 GB is unknown.",
+    "O12 regression_tests_in_pinned_commit judged false: the fix's added test functions (TestRBACGrantLegacyGranteeIDCompatibility etc.) are absent from the pinned tree; only assertions inside older tests (kv_catalog_test.go:2285, kv_catalog_test.go:3756, crypto_test.go:46) are rewritten by the diff, which asserts the pre-fix MD5 behaviour and does not reveal the fix.",
+    "Compilation of internal/metastore/kv/rootcoord without the project's dynamic/test build tags and without a warmed Go module cache was not executed (no build allowed); the package is pure Go but the module graph is large and has no vendor directory.",
+    "Whether the hidden tests can run without an external etcd service was not executed; the repo default (pkg/util/paramtable/service_param.go:136-143) is etcd.use.embed=false, so a local etcd binary or embedded-etcd config would be needed.",
+    "latest_where / present_in_latest are not applicable: O8 is empty and no latest release tree was provided."
+  ]
+}

@@ -1,0 +1,674 @@
+diff --git a/runtime/csharp/Prompty.Core/ReferenceResolver.cs b/runtime/csharp/Prompty.Core/ReferenceResolver.cs
+--- a/runtime/csharp/Prompty.Core/ReferenceResolver.cs	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/csharp/Prompty.Core/ReferenceResolver.cs	2026-10-20 02:50:42.150739159 +0000
+@@ -102,7 +102,7 @@
+     /// </summary>
+     private static object ResolveFileRef(string relativePath, string parentDir, string key)
+     {
+-        var fullPath = Path.GetFullPath(Path.Combine(parentDir, relativePath));
++        var fullPath = ResolveContainedPath(parentDir, relativePath);
+         if (!File.Exists(fullPath))
+             throw new FileNotFoundException(
+                 $"Referenced file '{relativePath}' not found (resolved to '{fullPath}', key: '{key}').");
+@@ -118,6 +118,65 @@
+         };
+     }
+ 
++    /// <summary>
++    /// Resolves <paramref name="reference"/> relative to <paramref name="baseDir"/> and ensures the
++    /// result stays inside <paramref name="baseDir"/>. Symbolic links are followed before the
++    /// containment check, so ".." segments, absolute paths and links pointing outward are all
++    /// rejected without the target being opened. Callers must read the returned path.
++    /// </summary>
++    /// <exception cref="InvalidOperationException">If the reference escapes <paramref name="baseDir"/>.</exception>
++    public static string ResolveContainedPath(string baseDir, string reference)
++    {
++        if (reference.IndexOf('\0') >= 0)
++            throw new InvalidOperationException($"Invalid file reference '{reference}'.");
++
++        var basePath = ResolveRealPath(Path.GetFullPath(baseDir));
++        var target = ResolveRealPath(Path.GetFullPath(Path.Combine(basePath, reference)));
++
++        var rel = Path.GetRelativePath(basePath, target);
++        if (rel == ".."
++            || rel.StartsWith(".." + Path.DirectorySeparatorChar)
++            || rel.StartsWith(".." + Path.AltDirectorySeparatorChar)
++            || Path.IsPathRooted(rel))
++        {
++            throw new InvalidOperationException(
++                $"File reference '{reference}' resolves outside the prompt directory '{basePath}'.");
++        }
++
++        return target;
++    }
++
++    /// <summary>
++    /// Resolves symbolic links in every component of an absolute path.
++    /// Components that do not exist are kept as-is.
++    /// </summary>
++    private static string ResolveRealPath(string fullPath, int depth = 0)
++    {
++        if (depth > 40)
++            throw new IOException($"Too many levels of symbolic links resolving '{fullPath}'.");
++
++        var root = Path.GetPathRoot(fullPath) ?? string.Empty;
++        var parts = fullPath[root.Length..].Split(
++            new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
++            StringSplitOptions.RemoveEmptyEntries);
++
++        var current = root;
++        for (var i = 0; i < parts.Length; i++)
++        {
++            var next = Path.Combine(current, parts[i]);
++            FileSystemInfo info = Directory.Exists(next) ? new DirectoryInfo(next) : new FileInfo(next);
++            if (info.LinkTarget is string linkTarget)
++            {
++                var resolved = Path.GetFullPath(Path.IsPathRooted(linkTarget) ? linkTarget : Path.Combine(current, linkTarget));
++                var rest = string.Join(Path.DirectorySeparatorChar, parts[(i + 1)..]);
++                return ResolveRealPath(rest.Length > 0 ? Path.Combine(resolved, rest) : resolved, depth + 1);
++            }
++            current = next;
++        }
++
++        return current;
++    }
++
+     private static object LoadJsonAsDict(string content, string path)
+     {
+         try
+diff --git a/runtime/csharp/Prompty.Core/ToolDispatch.cs b/runtime/csharp/Prompty.Core/ToolDispatch.cs
+--- a/runtime/csharp/Prompty.Core/ToolDispatch.cs	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/csharp/Prompty.Core/ToolDispatch.cs	2026-10-20 02:50:42.150739159 +0000
+@@ -129,7 +129,15 @@
+         var parentDir = agent.Metadata?.TryGetValue("__source_path", out var sp) == true && sp is string srcPath
+             ? System.IO.Path.GetDirectoryName(srcPath)
+             : Directory.GetCurrentDirectory();
+-        var childPath = System.IO.Path.Combine(parentDir ?? ".", promptyTool.Path);
++        string childPath;
++        try
++        {
++            childPath = ReferenceResolver.ResolveContainedPath(parentDir ?? ".", promptyTool.Path);
++        }
++        catch (InvalidOperationException ex)
++        {
++            throw new ToolHandlerError($"Prompty tool '{tool.Name}' path is not allowed: {ex.Message}");
++        }
+         var childAgent = PromptyLoader.Load(childPath);
+ 
+         // Execute as single-shot by default
+diff --git a/runtime/python/prompty/prompty/core/loader.py b/runtime/python/prompty/prompty/core/loader.py
+--- a/runtime/python/prompty/prompty/core/loader.py	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/python/prompty/prompty/core/loader.py	2026-10-20 02:50:47.190734621 +0000
+@@ -18,7 +18,7 @@
+ from ..model import LoadContext, Prompty, SaveContext
+ from .utils import load_fragment, load_prompty, load_prompty_async
+ 
+-__all__ = ["load", "load_async", "default_save_context"]
++__all__ = ["load", "load_async", "default_save_context", "resolve_contained_path"]
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -99,7 +99,7 @@
+     # base defines are inherited unless this prompt sets them explicitly.
+     base_ref = data.pop("base", None)
+     if isinstance(base_ref, str) and base_ref:
+-        base_data = load_prompty(path.parent / base_ref)
++        base_data = load_prompty(resolve_contained_path(path.parent, base_ref))
+         if isinstance(base_data, dict):
+             for base_key, base_value in base_data.items():
+                 data.setdefault(base_key, base_value)
+@@ -162,7 +162,7 @@
+                     data[key] = env_val
+ 
+             elif protocol == "file":
+-                relative_path = (agent_file.parent / val).resolve()
++                relative_path = resolve_contained_path(agent_file.parent, val)
+                 if not relative_path.exists():
+                     raise FileNotFoundError(
+                         f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
+@@ -170,6 +170,11 @@
+                 data[key] = _load_file_content(relative_path)
+ 
+             elif protocol == "prompt":
++                fragment_path = resolve_contained_path(agent_file.parent, val)
++                if not fragment_path.exists():
++                    raise FileNotFoundError(
++                        f"Referenced fragment '{val}' not found for key '{key}' (resolved to {fragment_path})"
++                    )
+                 data[key] = load_fragment(agent_file.parent, val)
+ 
+         return data
+@@ -177,6 +182,24 @@
+     return process
+ 
+ 
++def resolve_contained_path(base_dir: str | Path, reference: str | Path) -> Path:
++    """Resolve *reference* relative to *base_dir* and ensure it stays inside it.
++
++    Symlinks are followed (on both sides) before the containment check, so
++    ``..`` segments, absolute paths and links pointing outward are all
++    rejected.  Raises ``ValueError`` without opening the target if the
++    resolved path escapes *base_dir*.
++    """
++    base = Path(base_dir).resolve()
++    ref = str(reference)
++    if "\x00" in ref:
++        raise ValueError(f"Invalid file reference '{ref}'")
++    target = (base / ref).resolve()
++    if target != base and base not in target.parents:
++        raise ValueError(f"File reference '{ref}' resolves outside the prompt directory '{base}'")
++    return target
++
++
+ def _load_file_content(path: Path) -> Any:
+     """Load a file as JSON, YAML, or plain text based on its extension."""
+     with open(path, encoding="utf-8") as f:
+diff --git a/runtime/python/prompty/prompty/core/loader.py.orig b/runtime/python/prompty/prompty/core/loader.py.orig
+--- a/runtime/python/prompty/prompty/core/loader.py.orig	1970-01-01 00:00:00.000000000 +0000
++++ b/runtime/python/prompty/prompty/core/loader.py.orig	2026-10-18 02:06:03.000000000 +0000
+@@ -0,0 +1,188 @@
++"""Prompty loader — loads .prompty files into typed Prompty objects.
++
++The loader splits frontmatter (YAML) from the markdown body, resolves
++``${protocol:value}`` references (env vars, file includes), and
++delegates to ``Prompty.load()`` from the generated model package.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++from collections.abc import Callable
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++from ..model import LoadContext, Prompty, SaveContext
++from .utils import load_fragment, load_prompty, load_prompty_async
++
++__all__ = ["load", "load_async", "default_save_context"]
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++
++def load(path: str | Path) -> Prompty:
++    """Load a ``.prompty`` file and return a typed ``Prompty``.
++
++    Parameters
++    ----------
++    path:
++        File system path to a ``.prompty`` file.
++
++    Returns
++    -------
++    Prompty
++        Fully typed prompt definition.
++    """
++    path = Path(path).resolve()
++    if not path.exists():
++        raise FileNotFoundError(f"Prompty file not found: {path}")
++
++    # 1. Split frontmatter + body
++    data = load_prompty(path)
++
++    # 2–7 shared pipeline
++    return _build_agent(data, path)
++
++
++async def load_async(path: str | Path) -> Prompty:
++    """Async variant of :func:`load`."""
++    path = Path(path).resolve()
++    if not path.exists():
++        raise FileNotFoundError(f"Prompty file not found: {path}")
++
++    data = await load_prompty_async(path)
++    return _build_agent(data, path)
++
++
++def default_save_context(**kwargs: Any) -> SaveContext:
++    """Return a ``SaveContext`` that strips internal ``__``-prefixed metadata keys.
++
++    This is the save-side counterpart to the ``LoadContext`` used during
++    :func:`load`. Pass it to ``agent.save()``, ``agent.to_yaml()``, or
++    ``agent.to_json()`` to keep serialised output clean.
++    """
++
++    def _strip_internals(data: dict[str, Any]) -> dict[str, Any]:
++        meta = data.get("metadata")
++        if isinstance(meta, dict):
++            cleaned = {k: v for k, v in meta.items() if not k.startswith("__")}
++            if cleaned:
++                data["metadata"] = cleaned
++            else:
++                data.pop("metadata", None)
++        return data
++
++    return SaveContext(post_save=_strip_internals, **kwargs)
++
++
++# ---------------------------------------------------------------------------
++# Internal pipeline
++# ---------------------------------------------------------------------------
++
++
++def _build_agent(data: dict[str, Any] | str, path: Path) -> Prompty:
++    """Shared pipeline that transforms raw frontmatter dict into a Prompty."""
++
++    # Handle body-only files (no frontmatter — parse returns a string)
++    if isinstance(data, str):
++        data = {"instructions": data}
++    if not isinstance(data, dict):
++        data = {}
++
++    # Apply a base template so prompts can share common defaults. Fields the
++    # base defines are inherited unless this prompt sets them explicitly.
++    base_ref = data.pop("base", None)
++    if isinstance(base_ref, str) and base_ref:
++        base_data = load_prompty(path.parent / base_ref)
++        if isinstance(base_data, dict):
++            for base_key, base_value in base_data.items():
++                data.setdefault(base_key, base_value)
++
++    # 2. Load via Prompty.load() with pre_process for ${protocol:value} expansion
++    ctx = LoadContext(pre_process=_pre_process(path))
++    agent = Prompty.load(data, ctx)
++
++    # Store source path for PromptyTool resolution (relative path lookups)
++    if agent.metadata is None:
++        agent.metadata = {}
++    agent.metadata["__source_path"] = str(path)
++
++    return agent
++
++
++# ---------------------------------------------------------------------------
++# Reference resolution via pre_process
++# ---------------------------------------------------------------------------
++
++
++def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
++    """Return a ``pre_process`` callback that resolves ``${protocol:value}``
++    references in every dict the loader visits.
++
++    Supported protocols:
++
++    * ``${env:VAR_NAME}`` — environment variable (required)
++    * ``${env:VAR_NAME:default}`` — environment variable with default
++    * ``${file:relative/path}`` — load file content (JSON / YAML / text)
++    * ``${prompt:relative/path}`` — inline a shared prompt fragment
++    """
++
++    def process(data: Any) -> Any:
++        if not isinstance(data, dict):
++            return data
++
++        for key, value in list(data.items()):
++            if not isinstance(value, str) or not value.startswith("${"):
++                continue
++
++            # Must end with }
++            if not value.endswith("}"):
++                continue
++
++            inner = value[2:-1]
++            protocol, _, val = inner.partition(":")
++            protocol = protocol.lower()
++
++            if protocol == "env":
++                # Support ${env:VAR:default}
++                var_name, _, default = val.partition(":")
++                env_val = os.environ.get(var_name)
++                if env_val is None:
++                    if default:
++                        data[key] = default
++                    else:
++                        raise ValueError(f"Environment variable '{var_name}' not set for key '{key}'")
++                else:
++                    data[key] = env_val
++
++            elif protocol == "file":
++                relative_path = (agent_file.parent / val).resolve()
++                if not relative_path.exists():
++                    raise FileNotFoundError(
++                        f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
++                    )
++                data[key] = _load_file_content(relative_path)
++
++            elif protocol == "prompt":
++                data[key] = load_fragment(agent_file.parent, val)
++
++        return data
++
++    return process
++
++
++def _load_file_content(path: Path) -> Any:
++    """Load a file as JSON, YAML, or plain text based on its extension."""
++    with open(path, encoding="utf-8") as f:
++        if path.suffix == ".json":
++            return json.load(f)
++        elif path.suffix in (".yml", ".yaml"):
++            return yaml.safe_load(f)
++        else:
++            return f.read()
+diff --git a/runtime/python/prompty/prompty/core/tool_dispatch.py b/runtime/python/prompty/prompty/core/tool_dispatch.py
+--- a/runtime/python/prompty/prompty/core/tool_dispatch.py	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/python/prompty/prompty/core/tool_dispatch.py	2026-10-20 02:50:42.150739159 +0000
+@@ -277,7 +277,9 @@
+         parent_path = metadata.get("__source_path", "")
+         if not parent_path:
+             raise FileNotFoundError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path")
+-        return str(Path(parent_path).parent / tool.path)
++        from .loader import resolve_contained_path
++
++        return str(resolve_contained_path(Path(parent_path).parent, tool.path))
+ 
+     @staticmethod
+     def _check_circular(child_path: str, agent: Any) -> None:
+diff --git a/runtime/python/prompty/prompty/providers/openai/executor.py b/runtime/python/prompty/prompty/providers/openai/executor.py
+--- a/runtime/python/prompty/prompty/providers/openai/executor.py	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/python/prompty/prompty/providers/openai/executor.py	2026-10-20 02:50:42.150739159 +0000
+@@ -141,7 +141,7 @@
+     """
+     from pathlib import Path
+ 
+-    from ...core.loader import load
++    from ...core.loader import load, resolve_contained_path
+ 
+     # Validate tool.path
+     tool_path = getattr(tool, "path", None)
+@@ -152,7 +152,7 @@
+     parent_path = (parent.metadata or {}).get("__source_path", "")
+     if not parent_path:
+         raise ValueError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path in metadata")
+-    child_path = Path(parent_path).parent / tool_path
++    child_path = resolve_contained_path(Path(parent_path).parent, tool_path)
+     child = load(str(child_path))
+ 
+     func_def: dict[str, Any] = {"name": tool.name}
+diff --git a/runtime/rust/prompty/src/loader/resolve.rs b/runtime/rust/prompty/src/loader/resolve.rs
+--- a/runtime/rust/prompty/src/loader/resolve.rs	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/rust/prompty/src/loader/resolve.rs	2026-10-20 02:50:42.150739159 +0000
+@@ -3,7 +3,7 @@
+ //! Recursively walks all string values in a `serde_json::Value` tree,
+ //! resolving `${env:VAR}`, `${env:VAR:default}`, and `${file:path}`.
+ 
+-use std::path::Path;
++use std::path::{Component, Path, PathBuf};
+ 
+ use super::error::LoadError;
+ 
+@@ -103,7 +103,7 @@
+     agent_dir: &Path,
+     _key: &str,
+ ) -> Result<Option<serde_json::Value>, LoadError> {
+-    let full_path = agent_dir.join(relative_path);
++    let full_path = resolve_contained_path(agent_dir, relative_path)?;
+     let content = std::fs::read_to_string(&full_path).map_err(|e| LoadError::FileReference {
+         path: full_path.clone(),
+         detail: e.to_string(),
+@@ -136,6 +136,85 @@
+     }
+ }
+ 
++/// Resolve `reference` relative to `base_dir` and ensure the result stays
++/// inside `base_dir`.
++///
++/// Symlinks are followed (via canonicalization) before the containment check,
++/// so `..` segments, absolute paths and links pointing outward are all
++/// rejected without the target being opened.
++pub fn resolve_contained_path(base_dir: &Path, reference: &str) -> Result<PathBuf, LoadError> {
++    let escape = |base: &Path| LoadError::FileReference {
++        path: PathBuf::from(reference),
++        detail: format!(
++            "reference resolves outside the prompt directory '{}'",
++            base.display()
++        ),
++    };
++
++    if reference.contains('\0') {
++        return Err(LoadError::FileReference {
++            path: PathBuf::from(reference),
++            detail: "invalid file reference".to_string(),
++        });
++    }
++
++    let base = canonicalize_lenient(base_dir);
++    let target = canonicalize_lenient(&base.join(reference));
++    if !target.starts_with(&base) {
++        return Err(escape(&base));
++    }
++    Ok(target)
++}
++
++/// Canonicalize `path`, tolerating a missing tail: the longest existing
++/// prefix is canonicalized (resolving symlinks) and the remaining components
++/// are applied lexically.
++fn canonicalize_lenient(path: &Path) -> PathBuf {
++    let absolute = if path.is_absolute() {
++        path.to_path_buf()
++    } else {
++        std::env::current_dir()
++            .map(|d| d.join(path))
++            .unwrap_or_else(|_| path.to_path_buf())
++    };
++    if let Ok(c) = absolute.canonicalize() {
++        return c;
++    }
++
++    let mut existing = absolute.clone();
++    let mut tail: Vec<std::ffi::OsString> = Vec::new();
++    loop {
++        if let Ok(c) = existing.canonicalize() {
++            let mut out = c;
++            for comp in tail.iter().rev() {
++                out.push(comp);
++            }
++            return normalize_lexically(&out);
++        }
++        match (existing.file_name().map(|n| n.to_os_string()), existing.parent()) {
++            (Some(name), Some(parent)) => {
++                tail.push(name);
++                existing = parent.to_path_buf();
++            }
++            _ => return normalize_lexically(&absolute),
++        }
++    }
++}
++
++fn normalize_lexically(path: &Path) -> PathBuf {
++    let mut out = PathBuf::new();
++    for comp in path.components() {
++        match comp {
++            Component::ParentDir => {
++                out.pop();
++            }
++            Component::CurDir => {}
++            other => out.push(other.as_os_str()),
++        }
++    }
++    out
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/runtime/rust/prompty/src/loader.rs b/runtime/rust/prompty/src/loader.rs
+--- a/runtime/rust/prompty/src/loader.rs	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/rust/prompty/src/loader.rs	2026-10-20 02:50:42.150739159 +0000
+@@ -14,6 +14,7 @@
+ mod resolve;
+ 
+ pub use error::LoadError;
++pub use resolve::resolve_contained_path;
+ 
+ /// Load a `.prompty` file and return a typed `Prompty`.
+ ///
+diff --git a/runtime/rust/prompty/src/tool_dispatch.rs b/runtime/rust/prompty/src/tool_dispatch.rs
+--- a/runtime/rust/prompty/src/tool_dispatch.rs	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/rust/prompty/src/tool_dispatch.rs	2026-10-20 02:50:42.150739159 +0000
+@@ -481,7 +481,12 @@
+             })?;
+ 
+         let parent_dir = Path::new(parent_path).parent().unwrap_or(Path::new("."));
+-        let child_path = parent_dir.join(child_relative);
++        let child_path = crate::loader::resolve_contained_path(parent_dir, child_relative)
++            .map_err(|e| {
++                ToolHandlerError::Execution(format!(
++                    "failed to resolve PromptyTool '{tool_name}': {e}"
++                ))
++            })?;
+ 
+         // Circular reference detection
+         let stack: Vec<String> = agent
+diff --git a/runtime/typescript/packages/core/src/core/index.ts b/runtime/typescript/packages/core/src/core/index.ts
+--- a/runtime/typescript/packages/core/src/core/index.ts	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/typescript/packages/core/src/core/index.ts	2026-10-20 02:50:42.150739159 +0000
+@@ -2,7 +2,7 @@
+ export * from "./interfaces.js";
+ export * from "./registry.js";
+ export * from "./connections.js";
+-export { load, defaultSaveContext } from "./loader.js";
++export { load, defaultSaveContext, resolveContainedPath } from "./loader.js";
+ export {
+   validateInputs,
+   render,
+diff --git a/runtime/typescript/packages/core/src/core/loader.ts b/runtime/typescript/packages/core/src/core/loader.ts
+--- a/runtime/typescript/packages/core/src/core/loader.ts	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/typescript/packages/core/src/core/loader.ts	2026-10-20 02:50:42.150739159 +0000
+@@ -8,9 +8,10 @@
+  * @module
+  */
+ 
+-import { readFileSync } from "node:fs";
+-import { resolve, dirname, extname } from "node:path";
++import { readFileSync, realpathSync } from "node:fs";
++import { resolve, dirname, extname, relative, isAbsolute, sep } from "node:path";
+ import matter from "gray-matter";
++import * as yaml from "yaml";
+ import { LoadContext, SaveContext } from "../model/context.js";
+ import { Prompty } from "../model/agent/prompty.js";
+ 
+@@ -144,7 +145,7 @@
+           );
+         }
+       } else if (protocol === "file") {
+-        const filePath = resolve(agentDir, val);
++        const filePath = resolveContainedPath(agentDir, val);
+         record[key] = loadFileContent(filePath);
+       }
+     }
+@@ -153,6 +154,40 @@
+   };
+ }
+ 
++/**
++ * Resolve `reference` relative to `baseDir` and ensure the result stays
++ * inside `baseDir`. Symlinks are followed before the containment check, so
++ * `..` segments, absolute paths and links pointing outward are all rejected
++ * before the target is read.
++ *
++ * @throws Error if the reference escapes `baseDir`.
++ */
++export function resolveContainedPath(baseDir: string, reference: string): string {
++  if (reference.includes("\0")) {
++    throw new Error(`Invalid file reference '${reference}'`);
++  }
++  const base = realpathOrResolve(resolve(baseDir));
++  const target = realpathOrResolve(resolve(base, reference));
++  const rel = relative(base, target);
++  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
++    throw new Error(
++      `File reference '${reference}' resolves outside the prompt directory '${base}'`,
++    );
++  }
++  return target;
++}
++
++/** realpath that tolerates a missing leaf by resolving the nearest existing ancestor. */
++function realpathOrResolve(p: string): string {
++  try {
++    return realpathSync(p);
++  } catch {
++    const parent = dirname(p);
++    if (parent === p) return p;
++    return resolve(realpathOrResolve(parent), p.slice(parent.length).replace(/^[\\/]+/, ""));
++  }
++}
++
+ function loadFileContent(path: string): unknown {
+   const raw = readFileSync(path, "utf-8");
+   const ext = extname(path).toLowerCase();
+@@ -160,6 +195,8 @@
+   if (ext === ".json") {
+     return JSON.parse(raw);
+   }
+-  // For YAML we return raw string — the loader handles YAML natively
++  if (ext === ".yaml" || ext === ".yml") {
++    return yaml.parse(raw);
++  }
+   return raw;
+ }
+diff --git a/runtime/typescript/packages/core/src/core/tool-dispatch.ts b/runtime/typescript/packages/core/src/core/tool-dispatch.ts
+--- a/runtime/typescript/packages/core/src/core/tool-dispatch.ts	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/typescript/packages/core/src/core/tool-dispatch.ts	2026-10-20 02:50:42.150739159 +0000
+@@ -23,6 +23,7 @@
+ 
+ import { dirname, resolve } from "node:path";
+ import type { Prompty } from "../model/agent/prompty.js";
++import { resolveContainedPath } from "./loader.js";
+ 
+ // ---------------------------------------------------------------------------
+ // ToolHandler interface
+@@ -181,7 +182,12 @@
+       return `Error: cannot resolve PromptyTool '${tool.name}': parent has no __source_path`;
+     }
+ 
+-    const childPath = resolve(dirname(parentPath), tool.path as string);
++    let childPath: string;
++    try {
++      childPath = resolveContainedPath(dirname(parentPath), tool.path as string);
++    } catch (err) {
++      return `Error executing PromptyTool '${tool.name}': ${err instanceof Error ? err.message : String(err)}`;
++    }
+ 
+     // Circular reference detection
+     const stack = ((agent.metadata ?? {}).__prompty_tool_stack as string[] | undefined) ?? [];
+diff --git a/runtime/typescript/packages/core/src/index.ts b/runtime/typescript/packages/core/src/index.ts
+--- a/runtime/typescript/packages/core/src/index.ts	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/typescript/packages/core/src/index.ts	2026-10-20 02:50:42.150739159 +0000
+@@ -57,6 +57,7 @@
+ 
+   // Loader
+   load,
++  resolveContainedPath,
+ 
+   // Pipeline functions
+   validateInputs,
+diff --git a/runtime/typescript/packages/openai/src/wire.ts b/runtime/typescript/packages/openai/src/wire.ts
+--- a/runtime/typescript/packages/openai/src/wire.ts	2026-10-18 02:06:03.000000000 +0000
++++ b/runtime/typescript/packages/openai/src/wire.ts	2026-10-20 02:50:42.154739156 +0000
+@@ -6,8 +6,8 @@
+ 
+ import type { Prompty } from "@prompty/core";
+ import type { ContentPart, Message } from "@prompty/core";
+-import { load as loadPrompty } from "@prompty/core";
+-import { dirname, resolve } from "node:path";
++import { load as loadPrompty, resolveContainedPath } from "@prompty/core";
++import { dirname } from "node:path";
+ 
+ /**
+  * Convert an abstract Message to OpenAI wire format.
+@@ -375,7 +375,7 @@
+       `Cannot resolve PromptyTool '${tool.name}': parent agent has no __source_path in metadata`,
+     );
+   }
+-  const childPath = resolve(dirname(parentPath), toolPath);
++  const childPath = resolveContainedPath(dirname(parentPath), toolPath);
+   const child = loadPrompty(childPath);
+ 
+   const funcDef: Record<string, unknown> = { name: tool.name };

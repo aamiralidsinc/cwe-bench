@@ -1,0 +1,243 @@
+--- a/lib/ansible/utils/__init__.py
++++ b/lib/ansible/utils/__init__.py
+@@ -18,6 +18,7 @@
+ import sys
+ import re
+ import os
++import ast
+ import shlex
+ import yaml
+ import copy
+@@ -945,51 +946,78 @@
+             return False
+     return True
+ 
+-def safe_eval(str, locals=None, include_exceptions=False):
++def safe_eval(expr, locals=None, include_exceptions=False):
+     '''
+     this is intended for allowing things like:
+     with_items: a_list_variable
+     where Jinja2 would return a string
+     but we do not want to allow it to call functions (outside of Jinja2, where
+-    the env is constrained)
++    the env is constrained).  Only literal data -- containers, strings,
++    numbers and plain arithmetic -- is parsed; anything else is left as text.
+     '''
+-    # FIXME: is there a more native way to do this?
+-
+-    def is_set(var):
+-        return not var.startswith("$") and not '{{' in var
+-
+-    def is_unset(var):
+-        return var.startswith("$") or '{{' in var
+-
+-    # do not allow method calls to modules
+-    if not isinstance(str, basestring):
++    SAFE_NODES = (
++        ast.Expression, ast.Str, ast.Num, ast.List, ast.Tuple, ast.Dict,
++        ast.Set, ast.Name, ast.Load, ast.UnaryOp, ast.UAdd, ast.USub,
++        ast.Invert, ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div,
++        ast.Mod, ast.Pow, ast.FloorDiv, ast.Compare, ast.Eq, ast.NotEq,
++        ast.Lt, ast.LtE, ast.Gt, ast.GtE,
++    )
++    LITERAL_NAMES = ('True', 'False', 'None')
++
++    def reject(reason):
++        exc = ValueError(reason)
++        if include_exceptions:
++            return (expr, exc)
++        return expr
++
++    if not isinstance(expr, basestring):
+         # already templated to a datastructure, perhaps?
+         if include_exceptions:
+-            return (str, None)
+-        return str
+-    if re.search(r'\w\.\w+\(', str):
+-        if include_exceptions:
+-            return (str, None)
+-        return str
+-    # do not allow imports
+-    if re.search(r'import \w+', str):
+-        if include_exceptions:
+-            return (str, None)
+-        return str
++            return (expr, None)
++        return expr
++
+     try:
+-        result = None
++        parsed = ast.parse(expr, mode='eval')
++    except SyntaxError:
++        return reject("not a literal expression")
++
++    def check(node):
++        if isinstance(node, ast.Call):
++            # the historical set([...]) shorthand is the only call we accept
++            if not (isinstance(node.func, ast.Name) and node.func.id == 'set'
++                    and len(node.args) == 1 and not node.keywords
++                    and not getattr(node, 'starargs', None)
++                    and not getattr(node, 'kwargs', None)):
++                raise ValueError("function calls are not allowed")
++            check(node.args[0])
++            return
++        if isinstance(node, ast.Name):
++            if node.id not in LITERAL_NAMES and not (locals and node.id in locals):
++                raise ValueError("name %s is not a literal" % node.id)
++            return
++        if not isinstance(node, SAFE_NODES):
++            raise ValueError("invalid expression element: %s" % type(node).__name__)
++        for child in ast.iter_child_nodes(node):
++            check(child)
++
++    try:
++        check(parsed)
++    except ValueError, e:
++        return reject("not a literal expression: %s" % e)
++
++    try:
++        compiled = compile(parsed, '<safe_eval>', 'eval')
+         if not locals:
+-            result = eval(str)
++            result = eval(compiled, {}, {})
+         else:
+-            result = eval(str, None, locals)
++            result = eval(compiled, {}, locals)
+         if include_exceptions:
+             return (result, None)
+-        else:
+-            return result
++        return result
+     except Exception, e:
+         if include_exceptions:
+-            return (str, e)
+-        return str
++            return (expr, e)
++        return expr
+ 
+ 
+ def listify_lookup_plugin_terms(terms, basedir, inject):
+--- a/lib/ansible/module_utils/basic.py
++++ b/lib/ansible/module_utils/basic.py
+@@ -47,6 +47,7 @@
+ import os
+ import re
+ import shlex
++import ast
+ import subprocess
+ import sys
+ import syslog
+@@ -637,38 +638,76 @@
+             else:
+                 self.fail_json(msg="internal error: do not know how to interpret argument_spec")
+ 
+-    def safe_eval(self, str, locals=None, include_exceptions=False):
+-
+-        # do not allow method calls to modules
+-        if not isinstance(str, basestring):
++    def safe_eval(self, expr, locals=None, include_exceptions=False):
++        """Parse a literal data expression; never execute it.
++
++        Only containers, strings, numbers and plain arithmetic are parsed.
++        Anything else is reported back with an exception so the caller can
++        refuse the value instead of handing it on.
++        """
++        SAFE_NODES = (
++            ast.Expression, ast.Str, ast.Num, ast.List, ast.Tuple, ast.Dict,
++            ast.Set, ast.Name, ast.Load, ast.UnaryOp, ast.UAdd, ast.USub,
++            ast.Invert, ast.BinOp, ast.Add, ast.Sub, ast.Mult, ast.Div,
++            ast.Mod, ast.Pow, ast.FloorDiv, ast.Compare, ast.Eq, ast.NotEq,
++            ast.Lt, ast.LtE, ast.Gt, ast.GtE,
++        )
++        LITERAL_NAMES = ('True', 'False', 'None')
++
++        def reject(reason):
++            exc = ValueError(reason)
++            if include_exceptions:
++                return (expr, exc)
++            return expr
++
++        if not isinstance(expr, basestring):
+             # already templated to a datastructure, perhaps?
+             if include_exceptions:
+-                return (str, None)
+-            return str
+-        if re.search(r'\w\.\w+\(', str):
+-            if include_exceptions:
+-                return (str, None)
+-            return str
+-        # do not allow imports
+-        if re.search(r'import \w+', str):
+-            if include_exceptions:
+-                return (str, None)
+-            return str
++                return (expr, None)
++            return expr
++
+         try:
+-            result = None
++            parsed = ast.parse(expr, mode='eval')
++        except SyntaxError:
++            return reject("not a literal expression")
++
++        def check(node):
++            if isinstance(node, ast.Call):
++                # the historical set([...]) shorthand is the only call we accept
++                if not (isinstance(node.func, ast.Name) and node.func.id == 'set'
++                        and len(node.args) == 1 and not node.keywords
++                        and not getattr(node, 'starargs', None)
++                        and not getattr(node, 'kwargs', None)):
++                    raise ValueError("function calls are not allowed")
++                check(node.args[0])
++                return
++            if isinstance(node, ast.Name):
++                if node.id not in LITERAL_NAMES and not (locals and node.id in locals):
++                    raise ValueError("name %s is not a literal" % node.id)
++                return
++            if not isinstance(node, SAFE_NODES):
++                raise ValueError("invalid expression element: %s" % type(node).__name__)
++            for child in ast.iter_child_nodes(node):
++                check(child)
++
++        try:
++            check(parsed)
++        except ValueError, e:
++            return reject("not a literal expression: %s" % e)
++
++        try:
++            compiled = compile(parsed, '<safe_eval>', 'eval')
+             if not locals:
+-                result = eval(str)
++                result = eval(compiled, {}, {})
+             else:
+-                result = eval(str, None, locals)
++                result = eval(compiled, {}, locals)
+             if include_exceptions:
+                 return (result, None)
+-            else:
+-                return result
++            return result
+         except Exception, e:
+             if include_exceptions:
+-                return (str, e)
+-            return str
+-
++                return (expr, e)
++            return expr
+ 
+     def _check_argument_types(self):
+         ''' ensure all arguments have the requested type '''
+--- a/lib/ansible/utils/template.py
++++ b/lib/ansible/utils/template.py
+@@ -399,7 +399,10 @@
+         if isinstance(var, dict) and type(var) != dict:
+             return var
+         else:
+-            return template(self.basedir, var, self.vars, fail_on_undefined=self.fail_on_undefined)
++            result = template(self.basedir, var, self.vars, fail_on_undefined=self.fail_on_undefined)
++            if isinstance(result, basestring) and '__' in result:
++                raise errors.AnsibleError("unsafe value")
++            return result
+ 
+     def add_locals(self, locals):
+         '''

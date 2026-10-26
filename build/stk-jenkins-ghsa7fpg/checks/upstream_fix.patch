@@ -1,0 +1,132 @@
+diff --git a/core/src/main/java/hudson/model/AbstractProject.java b/core/src/main/java/hudson/model/AbstractProject.java
+index c581a2e8..53bf8c94 100644
+--- a/core/src/main/java/hudson/model/AbstractProject.java
++++ b/core/src/main/java/hudson/model/AbstractProject.java
+@@ -43,6 +43,7 @@ import hudson.model.Cause.LegacyCodeCause;
+ import hudson.model.Cause.RemoteCause;
+ import hudson.model.Cause.UserIdCause;
+ import hudson.model.Descriptor.FormException;
++import hudson.security.ACL;
+ import hudson.model.Fingerprint.RangeSet;
+ import hudson.model.Queue.Executable;
+ import hudson.model.Queue.Task;
+@@ -103,6 +104,8 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
+ 
+ import javax.servlet.ServletException;
+ import java.io.File;
++import org.acegisecurity.context.SecurityContext;
++import org.acegisecurity.context.SecurityContextHolder;
+ import java.io.IOException;
+ import java.lang.reflect.InvocationTargetException;
+ import java.util.ArrayList;
+@@ -1794,6 +1797,20 @@ public abstract class AbstractProject<P extends AbstractProject<P,R>,R extends A
+         triggers = buildDescribable(req, Trigger.for_(this));
+         for (Trigger t : triggers)
+             t.start(this,true);
++
++        for (Publisher _t : Descriptor.newInstancesFromHeteroList(req, json, "publisher", Jenkins.getInstance().getExtensionList(BuildTrigger.DescriptorImpl.class))) {
++            BuildTrigger t = (BuildTrigger) _t;
++            List<AbstractProject> childProjects;
++            SecurityContext orig = ACL.impersonate(ACL.SYSTEM);
++            try {
++                childProjects = t.getChildProjects(this);
++            } finally {
++                SecurityContextHolder.setContext(orig);
++            }
++            for (AbstractProject downstream : childProjects) {
++                downstream.checkPermission(BUILD);
++            }
++        }
+     }
+ 
+     /**
+diff --git a/core/src/main/java/hudson/model/Descriptor.java b/core/src/main/java/hudson/model/Descriptor.java
+index 1ba4236b..7e918abf 100644
+--- a/core/src/main/java/hudson/model/Descriptor.java
++++ b/core/src/main/java/hudson/model/Descriptor.java
+@@ -72,6 +72,7 @@ import java.lang.reflect.Type;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.ParameterizedType;
+ import java.beans.Introspector;
++import javax.annotation.CheckForNull;
+ 
+ /**
+  * Metadata about a configurable instance.
+@@ -909,7 +910,10 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
+             for (Object o : JSONArray.fromObject(formData)) {
+                 JSONObject jo = (JSONObject)o;
+                 String kind = jo.getString("kind");
+-                items.add(find(descriptors,kind).newInstance(req,jo));
++                Descriptor<T> d = find(descriptors, kind);
++                if (d != null) {
++                    items.add(d.newInstance(req, jo));
++                }
+             }
+         }
+ 
+@@ -919,7 +923,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
+     /**
+      * Finds a descriptor from a collection by its class name.
+      */
+-    public static <T extends Descriptor> T find(Collection<? extends T> list, String className) {
++    public static @CheckForNull <T extends Descriptor> T find(Collection<? extends T> list, String className) {
+         for (T d : list) {
+             if(d.getClass().getName().equals(className))
+                 return d;
+@@ -933,7 +937,7 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
+         return null;
+     }
+ 
+-    public static Descriptor find(String className) {
++    public static @CheckForNull Descriptor find(String className) {
+         return find(Jenkins.getInstance().getExtensionList(Descriptor.class),className);
+     }
+ 
+diff --git a/core/src/main/java/hudson/tasks/BuildTrigger.java b/core/src/main/java/hudson/tasks/BuildTrigger.java
+index 2392086b..c66592b1 100644
+--- a/core/src/main/java/hudson/tasks/BuildTrigger.java
++++ b/core/src/main/java/hudson/tasks/BuildTrigger.java
+@@ -318,7 +318,7 @@ public class BuildTrigger extends Recorder implements DependecyDeclarer {
+         /**
+          * Form validation method.
+          */
+-        public FormValidation doCheck(@AncestorInPath Item project, @QueryParameter String value ) {
++        public FormValidation doCheck(@AncestorInPath Item project, @QueryParameter String value, @QueryParameter boolean upstream) {
+             // Require CONFIGURE permission on this project
+             if(!project.hasPermission(Item.CONFIGURE))      return FormValidation.ok();
+ 
+@@ -333,6 +333,9 @@ public class BuildTrigger extends Recorder implements DependecyDeclarer {
+                                 AbstractProject.findNearest(projectName,project.getParent()).getRelativeNameFrom(project)));
+                     if(!(item instanceof AbstractProject))
+                         return FormValidation.error(Messages.BuildTrigger_NotBuildable(projectName));
++                    if (!upstream && !item.hasPermission(Item.BUILD)) {
++                        return FormValidation.error(Messages.BuildTrigger_you_have_no_permission_to_build_(projectName));
++                    }
+                     hasProjects = true;
+                 }
+             }
+diff --git a/core/src/main/resources/hudson/tasks/Messages.properties b/core/src/main/resources/hudson/tasks/Messages.properties
+index 3612c006..0499c27c 100644
+--- a/core/src/main/resources/hudson/tasks/Messages.properties
++++ b/core/src/main/resources/hudson/tasks/Messages.properties
+@@ -47,6 +47,7 @@ BuildTrigger.NoSuchProject=No such project ''{0}''. Did you mean ''{1}''?
+ BuildTrigger.NoProjectSpecified=No project specified
+ BuildTrigger.NotBuildable={0} is not buildable
+ BuildTrigger.Triggering=Triggering a new build of {0}
++BuildTrigger.you_have_no_permission_to_build_=You have no permission to build {0}
+ 
+ CommandInterpreter.CommandFailed=command execution failed
+ CommandInterpreter.UnableToDelete=Unable to delete script file {0}
+diff --git a/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly b/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
+index 1aa57e75..a4634c72 100644
+--- a/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
++++ b/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
+@@ -38,7 +38,7 @@ THE SOFTWARE.
+     <f:entry title="${%Projects names}"
+              description="${%Multiple projects can be specified like 'abc, def'}">
+       <f:textbox name="upstreamProjects" value="${h.getProjectListString(up)}"
+-        checkUrl="'descriptorByName/hudson.tasks.BuildTrigger/check?value='+encodeURIComponent(this.value)"
++        checkUrl="'descriptorByName/hudson.tasks.BuildTrigger/check?upstream=true&amp;value='+encodeURIComponent(this.value)"
+         autoCompleteField="upstreamProjects"/>
+     </f:entry>
+   </f:optionalBlock>

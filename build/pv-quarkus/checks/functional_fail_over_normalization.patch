@@ -1,0 +1,251 @@
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/StaticResourcesRecorder.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/StaticResourcesRecorder.java
+@@ -62,15 +62,15 @@
+                 handlers.add(new Handler<>() {
+                     @Override
+                     public void handle(RoutingContext ctx) {
+-                        if (pathRules.isExcluded(ctx)) {
+-                            // excluded paths must never be served as static content
+-                            ctx.next();
+-                            return;
+-                        }
+                         try {
+                             String path = getNormalizedAndDecodedPath(ctx);
+                             if (path == null) {
+                                 ctx.fail(HttpResponseStatus.BAD_REQUEST.code());
++                                return;
++                            }
++                            if (pathRules.isExcluded(path)) {
++                                // excluded paths must never be served as static content
++                                ctx.next();
+                                 return;
+                             }
+                             compressIfNeeded(httpBuildTimeConfig, compressMediaTypes, ctx, path);
+@@ -103,14 +103,14 @@
+             handlers.add(new Handler<>() {
+                 @Override
+                 public void handle(RoutingContext ctx) {
+-                    if (pathRules.isExcluded(ctx)) {
+-                        // excluded paths must never be served as static content
+-                        ctx.next();
+-                        return;
+-                    }
+                     String rel = resolvePath(ctx);
+                     if (rel == null) {
+                         ctx.fail(HttpResponseStatus.BAD_REQUEST.code());
++                        return;
++                    }
++                    if (pathRules.isExcluded(rel)) {
++                        // excluded paths must never be served as static content
++                        ctx.next();
+                         return;
+                     }
+                     // check effective path, otherwise the index page when path ends with '/'
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/StaticPathRules.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/StaticPathRules.java
+@@ -1,8 +1,6 @@
+ package io.quarkus.vertx.http.runtime;
+ 
+ import java.util.List;
+-
+-import io.vertx.ext.web.RoutingContext;
+ 
+ /**
+  * Applies the path rules configured for static resources.
+@@ -16,13 +14,13 @@
+     }
+ 
+     /**
+-     * @return {@code true} when the request path matches one of the excluded prefixes
++     * @param path the path the static resource is resolved from
++     * @return {@code true} when the resolved path matches one of the excluded prefixes
+      */
+-    boolean isExcluded(RoutingContext context) {
++    boolean isExcluded(String path) {
+         if (excludedPrefixes.isEmpty()) {
+             return false;
+         }
+-        String path = context.normalizedPath();
+         for (String prefix : excludedPrefixes) {
+             if (path.startsWith(prefix)) {
+                 return true;
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/HttpSecurityUtils.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/HttpSecurityUtils.java
+@@ -1,5 +1,6 @@
+ package io.quarkus.vertx.http.runtime.security;
+ 
++import java.nio.charset.StandardCharsets;
+ import java.util.Map;
+ 
+ import javax.naming.InvalidNameException;
+@@ -14,6 +15,7 @@
+ import io.quarkus.security.identity.request.AuthenticationRequest;
+ import io.quarkus.vertx.http.runtime.DefaultAuthConfig;
+ import io.smallrye.config.SmallRyeConfig;
++import io.vertx.core.http.impl.HttpUtils;
+ import io.vertx.ext.web.RoutingContext;
+ 
+ public final class HttpSecurityUtils {
+@@ -65,6 +67,78 @@
+     }
+ 
+     /**
++     * Fully normalizes a request path to its canonical form, closing the gap between
++     * the security layer's partial decoding and downstream handlers' full decoding.
++     * <p>
++     * Transformations applied in order:
++     * <ol>
++     * <li>Fully decode percent-encoded characters (loop handles double/triple encoding)</li>
++     * <li>Strip matrix parameters — after decoding so that encoded semicolons ({@code %3B}) are caught</li>
++     * <li>Remove null bytes</li>
++     * <li>Normalize backslashes to forward slashes</li>
++     * <li>Resolve dot segments ({@code .} and {@code ..})</li>
++     * </ol>
++     *
++     * @param path the path from {@link RoutingContext#normalizedPath()}
++     * @return the fully normalized path
++     */
++    public static String normalizePath(String path) {
++        while (path.indexOf('%') >= 0) {
++            String decoded = decodePercent(path);
++            if (decoded.equals(path)) {
++                break;
++            }
++            path = decoded;
++        }
++        path = pathWithoutMatrixParams(path);
++        if (path.indexOf('\0') >= 0) {
++            path = path.replace("\0", "");
++        }
++        if (path.indexOf('\\') >= 0) {
++            path = path.replace('\\', '/');
++        }
++        path = HttpUtils.removeDots(path);
++        return path;
++    }
++
++    /**
++     * RFC 3986 percent-decoding. Malformed sequences are left as-is.
++     */
++    private static String decodePercent(String path) {
++        byte[] buf = path.getBytes(StandardCharsets.UTF_8);
++        int pos = 0;
++        int i = 0;
++        boolean modified = false;
++        while (i < path.length()) {
++            char c = path.charAt(i);
++            if (c == '%' && i + 2 < path.length()) {
++                int hi = hexDigit(path.charAt(i + 1));
++                int lo = hexDigit(path.charAt(i + 2));
++                if (hi >= 0 && lo >= 0) {
++                    buf[pos++] = (byte) ((hi << 4) | lo);
++                    i += 3;
++                    modified = true;
++                    continue;
++                }
++            }
++            buf[pos++] = (byte) c;
++            i++;
++        }
++        return modified ? new String(buf, 0, pos, StandardCharsets.UTF_8) : path;
++    }
++
++    private static int hexDigit(char c) {
++        if (c >= '0' && c <= '9') {
++            return c - '0';
++        } else if (c >= 'a' && c <= 'f') {
++            return c - 'a' + 10;
++        } else if (c >= 'A' && c <= 'F') {
++            return c - 'A' + 10;
++        }
++        return -1;
++    }
++
++    /**
+      * Provides all the {@link SecurityIdentity} created by the inclusive authentication.
+      *
+      * @return null if {@link RoutingContext} is not available or {@link #getSecurityIdentities(RoutingContext)}
+--- a/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/AbstractPathMatchingHttpSecurityPolicy.java
++++ b/extensions/vertx-http/runtime/src/main/java/io/quarkus/vertx/http/runtime/security/AbstractPathMatchingHttpSecurityPolicy.java
+@@ -194,7 +194,7 @@
+             HttpMatcher m = new HttpMatcher(httpPermission.getAuthMechanisms(), httpPermission.getMethods(), policy);
+             List<HttpMatcher> perms = new ArrayList<>();
+             perms.add(m);
+-            builder.addPath(path, perms);
++            builder.addPath(HttpSecurityUtils.normalizePath(path), perms);
+         }
+     }
+ 
+@@ -210,7 +210,7 @@
+     private static List<HttpMatcher> findHttpMatchers(RoutingContext context,
+             ImmutablePathMatcher<List<HttpMatcher>> pathMatcher) {
+         String normalizedPath = context.normalizedPath();
+-        PathMatch<List<HttpMatcher>> toCheck = pathMatcher.match(HttpSecurityUtils.pathWithoutMatrixParams(normalizedPath));
++        PathMatch<List<HttpMatcher>> toCheck = pathMatcher.match(HttpSecurityUtils.normalizePath(normalizedPath));
+         if (toCheck.getValue() == null || toCheck.getValue().isEmpty()) {
+             return List.of();
+         }
+--- a/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletHttpSecurityPolicy.java
++++ b/extensions/undertow/runtime/src/main/java/io/quarkus/undertow/runtime/ServletHttpSecurityPolicy.java
+@@ -26,7 +26,7 @@
+     public Uni<CheckResult> checkPermission(RoutingContext request, Uni<SecurityIdentity> identity,
+             AuthorizationRequestContext requestContext) {
+ 
+-        String requestPath = HttpSecurityUtils.pathWithoutMatrixParams(request.normalizedPath());
++        String requestPath = HttpSecurityUtils.normalizePath(request.normalizedPath());
+         if (!requestPath.startsWith(contextPath)) {
+             //anything outside the context path we don't have anything to do with
+             return CheckResult.permit();
+--- a/extensions/keycloak-authorization/runtime/src/main/java/io/quarkus/keycloak/pep/runtime/KeycloakPolicyEnforcerAuthorizer.java
++++ b/extensions/keycloak-authorization/runtime/src/main/java/io/quarkus/keycloak/pep/runtime/KeycloakPolicyEnforcerAuthorizer.java
+@@ -63,7 +63,7 @@
+                                         @Override
+                                         public PathConfig get() {
+                                             return policyEnforcer.getPathMatcher().matches(HttpSecurityUtils
+-                                                    .pathWithoutMatrixParams(routingContext.normalizedPath()));
++                                                    .normalizePath(routingContext.normalizedPath()));
+                                         }
+                                     }).flatMap(new Function<PathConfig, Uni<? extends CheckResult>>() {
+                                         @Override
+--- a/extensions/keycloak-authorization/runtime/src/main/java/io/quarkus/keycloak/pep/runtime/VertxHttpFacade.java
++++ b/extensions/keycloak-authorization/runtime/src/main/java/io/quarkus/keycloak/pep/runtime/VertxHttpFacade.java
+@@ -120,7 +120,7 @@
+ 
+             @Override
+             public String getRelativePath() {
+-                return HttpSecurityUtils.pathWithoutMatrixParams(routingContext.normalizedPath());
++                return HttpSecurityUtils.normalizePath(routingContext.normalizedPath());
+             }
+ 
+             @Override
+--- a/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/StaticTenantResolver.java
++++ b/extensions/oidc/runtime/src/main/java/io/quarkus/oidc/runtime/StaticTenantResolver.java
+@@ -126,7 +126,7 @@
+ 
+         @Override
+         public String resolve(RoutingContext context) {
+-            String[] pathSegments = HttpSecurityUtils.pathWithoutMatrixParams(context.normalizedPath())
++            String[] pathSegments = HttpSecurityUtils.normalizePath(context.normalizedPath())
+                     .split(PATH_SEPARATOR);
+             for (String canonicalSegment : pathSegments) {
+                 if (tenantConfigBean.getStaticTenant(canonicalSegment) != null) {
+@@ -159,7 +159,7 @@
+ 
+         @Override
+         public String resolve(RoutingContext context) {
+-            String canonicalPath = HttpSecurityUtils.pathWithoutMatrixParams(context.normalizedPath());
++            String canonicalPath = HttpSecurityUtils.normalizePath(context.normalizedPath());
+             String tenantId = staticTenantPaths.match(canonicalPath).getValue();
+             if (tenantId != null) {
+                 LOG.debugf(
+--- a/extensions/resteasy-reactive/rest-csrf/runtime/src/main/java/io/quarkus/csrf/reactive/runtime/CsrfRequestResponseReactiveFilter.java
++++ b/extensions/resteasy-reactive/rest-csrf/runtime/src/main/java/io/quarkus/csrf/reactive/runtime/CsrfRequestResponseReactiveFilter.java
+@@ -275,7 +275,7 @@
+ 
+     private static boolean isCsrfTokenRequired(RoutingContext routing, RestCsrfConfig config) {
+         return config.createTokenPath()
+-                .map(value -> value.contains(HttpSecurityUtils.pathWithoutMatrixParams(routing.normalizedPath()))).orElse(true);
++                .map(value -> value.contains(HttpSecurityUtils.normalizePath(routing.normalizedPath()))).orElse(true);
+     }
+ 
+     private static void createCookie(String cookieTokenValue, RoutingContext routing, RestCsrfConfig config) {

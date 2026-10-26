@@ -1,0 +1,184 @@
+diff --git a/core/src/main/java/hudson/model/AbstractItem.java b/core/src/main/java/hudson/model/AbstractItem.java
+index f95c77f9..4b85d01f 100644
+--- a/core/src/main/java/hudson/model/AbstractItem.java
++++ b/core/src/main/java/hudson/model/AbstractItem.java
+@@ -27,6 +27,7 @@ package hudson.model;
+ import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+ import hudson.AbortException;
+ import hudson.XmlFile;
++import hudson.tasks.BuildTrigger;
+ import hudson.Util;
+ import hudson.Functions;
+ import hudson.BulkChange;
+@@ -580,6 +581,14 @@ public abstract class AbstractItem extends Actionable implements Item, HttpDelet
+                 t.transform(source,
+                         new StreamResult(out));
+                 out.close();
++
++                // Validate the submitted definition before applying it: the new
++                // configuration must not make this job build projects the current
++                // user is not allowed to build.
++                Item preview = (Item) new XmlFile(Items.XSTREAM, out.getTemporaryFile()).read();
++                if (preview instanceof AbstractProject) {
++                    BuildTrigger.checkDownstreamPermissions((AbstractProject) preview);
++                }
+             } catch (TransformerException e) {
+                 throw new IOException2("Failed to persist configuration.xml", e);
+             }
+diff --git a/core/src/main/java/hudson/model/AbstractProject.java b/core/src/main/java/hudson/model/AbstractProject.java
+index c581a2e8..0a867420 100644
+--- a/core/src/main/java/hudson/model/AbstractProject.java
++++ b/core/src/main/java/hudson/model/AbstractProject.java
+@@ -1794,6 +1794,10 @@ public abstract class AbstractProject<P extends AbstractProject<P,R>,R extends A
+         triggers = buildDescribable(req, Trigger.for_(this));
+         for (Trigger t : triggers)
+             t.start(this,true);
++
++        for (Publisher _t : Descriptor.newInstancesFromHeteroList(req, json, "publisher", Jenkins.getInstance().getExtensionList(BuildTrigger.DescriptorImpl.class))) {
++            BuildTrigger.checkDownstreamPermissions((BuildTrigger) _t, this);
++        }
+     }
+ 
+     /**
+diff --git a/core/src/main/java/hudson/model/Descriptor.java b/core/src/main/java/hudson/model/Descriptor.java
+index 1ba4236b..ba02ba98 100644
+--- a/core/src/main/java/hudson/model/Descriptor.java
++++ b/core/src/main/java/hudson/model/Descriptor.java
+@@ -909,7 +909,10 @@ public abstract class Descriptor<T extends Describable<T>> implements Saveable {
+             for (Object o : JSONArray.fromObject(formData)) {
+                 JSONObject jo = (JSONObject)o;
+                 String kind = jo.getString("kind");
+-                items.add(find(descriptors,kind).newInstance(req,jo));
++                Descriptor<T> d = find(descriptors, kind);
++                if (d != null) {
++                    items.add(d.newInstance(req, jo));
++                }
+             }
+         }
+ 
+diff --git a/core/src/main/java/hudson/model/ItemGroupMixIn.java b/core/src/main/java/hudson/model/ItemGroupMixIn.java
+index 43209cba..e4a02b08 100644
+--- a/core/src/main/java/hudson/model/ItemGroupMixIn.java
++++ b/core/src/main/java/hudson/model/ItemGroupMixIn.java
+@@ -24,6 +24,7 @@
+ package hudson.model;
+ 
+ import hudson.Util;
++import hudson.tasks.BuildTrigger;
+ import hudson.model.listeners.ItemListener;
+ import hudson.security.AccessControlled;
+ import hudson.util.CopyOnWriteMap;
+@@ -225,6 +226,14 @@ public abstract class ItemGroupMixIn {
+ 
+             // load it
+             TopLevelItem result = (TopLevelItem)Items.load(parent,configXml.getParentFile());
++            if (result instanceof AbstractProject) {
++                try {
++                    BuildTrigger.checkDownstreamPermissions((AbstractProject) result);
++                } catch (RuntimeException e) {
++                    Util.deleteRecursive(configXml.getParentFile());
++                    throw e;
++                }
++            }
+             add(result);
+ 
+             ItemListener.fireOnCreated(result);
+diff --git a/core/src/main/java/hudson/tasks/BuildTrigger.java b/core/src/main/java/hudson/tasks/BuildTrigger.java
+index 2392086b..8fc18d07 100644
+--- a/core/src/main/java/hudson/tasks/BuildTrigger.java
++++ b/core/src/main/java/hudson/tasks/BuildTrigger.java
+@@ -43,12 +43,15 @@ import hudson.model.Items;
+ import hudson.model.Job;
+ import hudson.model.Project;
+ import hudson.model.Result;
++import hudson.security.ACL;
+ import hudson.model.Run;
+ import hudson.model.TaskListener;
+ import hudson.model.listeners.ItemListener;
+ import hudson.tasks.BuildTrigger.DescriptorImpl.ItemListenerImpl;
+ import hudson.util.FormValidation;
+ import net.sf.json.JSONObject;
++import org.acegisecurity.context.SecurityContext;
++import org.acegisecurity.context.SecurityContextHolder;
+ import org.apache.commons.lang.StringUtils;
+ import org.kohsuke.stapler.AncestorInPath;
+ import org.kohsuke.stapler.DataBoundConstructor;
+@@ -147,6 +150,34 @@ public class BuildTrigger extends Recorder implements DependecyDeclarer {
+         return Items.fromNameList(base,childProjects,AbstractProject.class);
+     }
+ 
++    /**
++     * Verifies that the current user is allowed to build every project this
++     * trigger names. Names are resolved with full privileges so that a project
++     * the user cannot see is still checked, and the permission itself is then
++     * checked as the current user.
++     */
++    public static void checkDownstreamPermissions(BuildTrigger trigger, AbstractProject owner) {
++        List<AbstractProject> children;
++        SecurityContext orig = ACL.impersonate(ACL.SYSTEM);
++        try {
++            children = trigger.getChildProjects(owner);
++        } finally {
++            SecurityContextHolder.setContext(orig);
++        }
++        for (AbstractProject downstream : children)
++            downstream.checkPermission(Item.BUILD);
++    }
++
++    /**
++     * Same as {@link #checkDownstreamPermissions(BuildTrigger, AbstractProject)},
++     * using the trigger stored on the given project.
++     */
++    public static void checkDownstreamPermissions(AbstractProject owner) {
++        BuildTrigger trigger = (BuildTrigger) owner.getPublishersList().get(BuildTrigger.class);
++        if (trigger != null)
++            checkDownstreamPermissions(trigger, owner);
++    }
++
+     public BuildStepMonitor getRequiredMonitorService() {
+         return BuildStepMonitor.NONE;
+     }
+@@ -318,7 +349,7 @@ public class BuildTrigger extends Recorder implements DependecyDeclarer {
+         /**
+          * Form validation method.
+          */
+-        public FormValidation doCheck(@AncestorInPath Item project, @QueryParameter String value ) {
++        public FormValidation doCheck(@AncestorInPath Item project, @QueryParameter String value, @QueryParameter boolean upstream ) {
+             // Require CONFIGURE permission on this project
+             if(!project.hasPermission(Item.CONFIGURE))      return FormValidation.ok();
+ 
+@@ -333,6 +364,9 @@ public class BuildTrigger extends Recorder implements DependecyDeclarer {
+                                 AbstractProject.findNearest(projectName,project.getParent()).getRelativeNameFrom(project)));
+                     if(!(item instanceof AbstractProject))
+                         return FormValidation.error(Messages.BuildTrigger_NotBuildable(projectName));
++                    if (!upstream && !item.hasPermission(Item.BUILD)) {
++                        return FormValidation.error(Messages.BuildTrigger_you_have_no_permission_to_build_(projectName));
++                    }
+                     hasProjects = true;
+                 }
+             }
+diff --git a/core/src/main/resources/hudson/tasks/Messages.properties b/core/src/main/resources/hudson/tasks/Messages.properties
+index 3612c006..73581aea 100644
+--- a/core/src/main/resources/hudson/tasks/Messages.properties
++++ b/core/src/main/resources/hudson/tasks/Messages.properties
+@@ -46,6 +46,7 @@ BuildTrigger.InQueue={0} is already in the queue
+ BuildTrigger.NoSuchProject=No such project ''{0}''. Did you mean ''{1}''?
+ BuildTrigger.NoProjectSpecified=No project specified
+ BuildTrigger.NotBuildable={0} is not buildable
++BuildTrigger.you_have_no_permission_to_build_=You have no permission to build {0}
+ BuildTrigger.Triggering=Triggering a new build of {0}
+ 
+ CommandInterpreter.CommandFailed=command execution failed
+diff --git a/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly b/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
+index 1aa57e75..a4634c72 100644
+--- a/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
++++ b/core/src/main/resources/lib/hudson/project/config-upstream-pseudo-trigger.jelly
+@@ -38,7 +38,7 @@ THE SOFTWARE.
+     <f:entry title="${%Projects names}"
+              description="${%Multiple projects can be specified like 'abc, def'}">
+       <f:textbox name="upstreamProjects" value="${h.getProjectListString(up)}"
+-        checkUrl="'descriptorByName/hudson.tasks.BuildTrigger/check?value='+encodeURIComponent(this.value)"
++        checkUrl="'descriptorByName/hudson.tasks.BuildTrigger/check?upstream=true&amp;value='+encodeURIComponent(this.value)"
+         autoCompleteField="upstreamProjects"/>
+     </f:entry>
+   </f:optionalBlock>

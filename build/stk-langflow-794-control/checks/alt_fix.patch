@@ -1,0 +1,82 @@
+diff --git a/src/backend/base/langflow/api/v1/mcp_utils.py b/src/backend/base/langflow/api/v1/mcp_utils.py
+index 8b6700d0..39f8c141 100644
+--- a/src/backend/base/langflow/api/v1/mcp_utils.py
++++ b/src/backend/base/langflow/api/v1/mcp_utils.py
+@@ -11,7 +11,7 @@ from functools import wraps
+ from pathlib import Path
+ from typing import Any, ParamSpec, TypeVar
+ from urllib.parse import quote, unquote, urlparse
+-from uuid import uuid4
++from uuid import UUID, uuid4
+ 
+ from lfx.base.mcp.constants import MAX_MCP_TOOL_NAME_LENGTH
+ from lfx.base.mcp.util import get_flow_snake_case, get_unique_name, sanitize_mcp_name
+@@ -158,34 +158,48 @@ async def handle_list_resources(project_id=None):
+     return resources
+ 
+ 
+-async def handle_read_resource(uri: str) -> bytes:
++async def handle_read_resource(uri: str, project_id: UUID | str | None = None) -> bytes:
+     """Handle resource read requests."""
+     try:
+-        # Parse the URI properly
+         parsed_uri = urlparse(str(uri))
+-        # Path will be like /api/v1/files/download/{namespace}/{filename}
+-        path_parts = parsed_uri.path.split("/")
+-        # Remove empty strings from split
+-        path_parts = [p for p in path_parts if p]
+-
+-        # The flow_id and filename should be the last two parts
+-        two = 2
+-        if len(path_parts) < two:
++        path_parts = [p for p in parsed_uri.path.split("/") if p]
++        if len(path_parts) < 2:
+             msg = f"Invalid URI format: {uri}"
+             raise ValueError(msg)
+-
+-        flow_id = path_parts[-2]
+-        filename = unquote(path_parts[-1])  # URL decode the filename
+-
++        namespace = path_parts[-2]
++        name = unquote(path_parts[-1])
++        if not name or "/" in name or "\\" in name or ".." in name or "\x00" in name:
++            msg = "Invalid filename"
++            raise ValueError(msg)
++        try:
++            user = current_user_ctx.get()
++        except LookupError as exc:
++            msg = "Authenticated user context is required to read MCP resources"
++            raise ValueError(msg) from exc
++        user_uuid = UUID(str(user.id))
++        flow = None
++        try:
++            namespace_uuid = UUID(str(namespace))
++        except (ValueError, AttributeError):
++            namespace_uuid = None
++        if namespace_uuid is not None:
++            async with session_scope() as session:
++                candidate = await session.get(Flow, namespace_uuid)
++            if candidate is not None:
++                owner_ok = candidate.user_id == user_uuid
++                folder_ok = project_id is None or str(candidate.folder_id) == str(project_id)
++                if owner_ok and folder_ok:
++                    flow = candidate
++        if flow is None:
++            own_bucket = str(user.id) == str(namespace)
++            if not own_bucket or project_id is not None:
++                msg = "Resource not found or access denied"
++                raise ValueError(msg)
+         storage_service = get_storage_service()
+-
+-        # Read the file content
+-        content = await storage_service.get_file(flow_id=flow_id, file_name=filename)
++        content = await storage_service.get_file(flow_id=namespace, file_name=name)
+         if not content:
+-            msg = f"File {filename} not found in flow {flow_id}"
++            msg = f"File {name} not found in flow {namespace}"
+             raise ValueError(msg)
+-
+-        # Ensure content is base64 encoded
+         if isinstance(content, str):
+             content = content.encode()
+         return base64.b64encode(content)

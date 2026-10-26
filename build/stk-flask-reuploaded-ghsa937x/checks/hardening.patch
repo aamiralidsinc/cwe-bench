@@ -1,0 +1,102 @@
+diff --git a/src/flask_uploads/flask_uploads.py b/src/flask_uploads/flask_uploads.py
+index fecfaa4..c1982ca 100644
+--- a/src/flask_uploads/flask_uploads.py
++++ b/src/flask_uploads/flask_uploads.py
+@@ -39,6 +39,11 @@ def addslash(url: str) -> str:
+     return url + '/'
+ 
+ 
++def _is_within(root: str, path: str) -> bool:
++    """Whether a resolved path is the root itself or lies below it."""
++    return path == root or path.startswith(root + os.sep)
++
++
+ def config_for_set(
+         uset: 'UploadSet',
+         app: Flask,
+@@ -276,6 +281,38 @@ class UploadSet:
+         return ((ext in self.config.allow) or
+                 (ext in self.extensions and ext not in self.config.deny))
+ 
++    def _refused_type(self, ext: str) -> bool:
++        """Whether the configuration explicitly refuses this file type.
++
++        `UPLOADED_X_ALLOW` is checked first because an explicitly allowed
++        extension wins over the upload set's presets and the deny setting.
++        """
++        ext = ext.lower()
++        allow = {str(item).lower() for item in self.config.allow}
++        if ext in allow:
++            return False
++        deny = {str(item).lower() for item in self.config.deny}
++        if ext in deny:
++            return True
++        excluded = getattr(self.extensions, 'items', None)
++        if excluded is not None:
++            return ext in {str(item).lower() for item in excluded}
++        return False
++
++    def _check_basename(
++        self, storage: FileStorage, basename: str
++    ) -> None:
++        """Apply the set's type rules to a basename that will be stored."""
++        if not basename:
++            raise UploadNotAllowed()
++        if any(ord(char) < 32 or char == '\x7f' for char in basename):
++            raise ValueError("Invalid filename")
++        if not self.file_allowed(storage, basename):
++            raise UploadNotAllowed()
++        for part in basename.split('.')[1:]:
++            if self._refused_type(part):
++                raise UploadNotAllowed()
++
+     def get_basename(self, filename: str) -> str:
+         # `secure_filename` is already typed via typeshed
+         # cf https://github.com/python/typeshed/pull/4308
+@@ -313,27 +350,42 @@ class UploadSet:
+             folder, name = os.path.split(name)
+         if storage.filename is None:
+             raise ValueError("Filename must not be empty!")
++        name_ends_with_dot = name is not None and name.rstrip().endswith('.')
++        if folder:
++            folder = secure_filename(folder)
+         basename = self.get_basename(storage.filename)
+ 
+-        if not self.file_allowed(storage, basename):
+-            raise UploadNotAllowed()
++        self._check_basename(storage, basename)
+ 
+         if name:
+-            if name.endswith('.'):
+-                basename = name + extension(basename)
++            name = secure_filename(name)
++            if not name:
++                raise ValueError("Invalid filename after sanitization")
++            if name_ends_with_dot and not name.endswith('.'):
++                basename = name + '.' + extension(basename)
+             else:
+                 basename = name
++            basename = lowercase_ext(basename)
++            if extension(basename):
++                self._check_basename(storage, basename)
+ 
+         if folder:
+             target_folder = os.path.join(self.config.destination, folder)
+         else:
+             target_folder = self.config.destination
++        destination_real = os.path.realpath(self.config.destination)
++        if not _is_within(destination_real, os.path.realpath(target_folder)):
++            raise ValueError("Security: Path traversal attempt detected")
+         if not os.path.exists(target_folder):
+             os.makedirs(target_folder)
+         if os.path.exists(os.path.join(target_folder, basename)):
+             basename = self.resolve_conflict(target_folder, basename)
+ 
+         target = os.path.join(target_folder, basename)
++        if not _is_within(destination_real, os.path.realpath(target)):
++            raise ValueError("Security: Path traversal attempt detected")
++        if os.path.islink(target):
++            raise ValueError("Security: refusing to write through a link")
+         storage.save(target)
+         if folder:
+             return posixpath.join(folder, basename)

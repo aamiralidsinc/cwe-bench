@@ -1,0 +1,216 @@
+diff --git a/kernel/api/icon.go b/kernel/api/icon.go
+index f6f629e..363de7f 100644
+--- a/kernel/api/icon.go
++++ b/kernel/api/icon.go
+@@ -18,6 +18,7 @@ package api
+ 
+ import (
+ 	"fmt"
++	"html"
+ 	"math"
+ 	"net/http"
+ 	"regexp"
+@@ -576,10 +577,13 @@ func generateTypeEightSVG(color, content, id string) string {
+ 		}
+ 	}
+ 
++	// 文本图标只显示文字，不解释其中的标记
++	display := html.EscapeString(content)
++
+ 	return fmt.Sprintf(`
+     <svg id="dynamic_icon_type8" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+         <path d="M39,0h434c20.97,0,38,17.03,38,38v412c0,33.11-26.89,60-60,60H60c-32.56,0-59-26.44-59-59V38C1,17.03,18.03,0,39,0Z" style="fill: %s;"/>
+         <text x="50%%" y="55%%" dy="%s" style="font-size: %.2fpx; fill: #fff; text-anchor: middle; dominant-baseline:middle;font-family: -apple-system, BlinkMacSystemFont, 'Noto Sans', 'Noto Sans CJK SC', 'Microsoft YaHei'; ">%s</text>
+ 	</svg>
+-    `, colorScheme.Primary, dy, fontSize, content)
++    `, colorScheme.Primary, dy, fontSize, display)
+ }
+diff --git a/kernel/server/serve.go b/kernel/server/serve.go
+index ad1798d..484a7d8 100644
+--- a/kernel/server/serve.go
++++ b/kernel/server/serve.go
+@@ -360,7 +360,32 @@ func servePlugins(ginServer *gin.Engine) {
+ 
+ func serveEmojis(ginServer *gin.Engine) {
+ 	emojis := ginServer.Group("/emojis/", model.CheckAuth)
+-	emojis.Static("", filepath.Join(util.DataDir, "emojis"))
++	emojisDir := filepath.Join(util.DataDir, "emojis")
++	serveEmojiFile := func(context *gin.Context) {
++		p := filepath.Join(emojisDir, context.Param("filepath"))
++		if !util.IsSubPath(emojisDir, p) {
++			context.Status(http.StatusNotFound)
++			return
++		}
++		serveFileOrSanitizedSVG(context, p)
++	}
++	emojis.GET("/*filepath", serveEmojiFile)
++	emojis.HEAD("/*filepath", serveEmojiFile)
++}
++
++// serveFileOrSanitizedSVG 返回文件内容，SVG 图片在未开启脚本时先清理可执行内容
++func serveFileOrSanitizedSVG(context *gin.Context, absPath string) {
++	if strings.HasSuffix(strings.ToLower(absPath), ".svg") {
++		data, err := os.ReadFile(absPath)
++		if err == nil {
++			if !model.Conf.Editor.AllowSVGScript {
++				data = []byte(util.SanitizeSVG(string(data)))
++			}
++			context.Data(http.StatusOK, "image/svg+xml", data)
++			return
++		}
++	}
++	http.ServeFile(context.Writer, context.Request, absPath)
+ }
+ 
+ func serveTemplates(ginServer *gin.Engine) {
+@@ -611,7 +636,7 @@ func serveAssets(ginServer *gin.Engine) {
+ 
+ 	ginServer.GET("/history/*path", model.CheckAuth, model.CheckAdminRole, func(context *gin.Context) {
+ 		p := filepath.Join(util.HistoryDir, context.Param("path"))
+-		http.ServeFile(context.Writer, context.Request, p)
++		serveFileOrSanitizedSVG(context, p)
+ 		return
+ 	})
+ }
+@@ -625,7 +650,7 @@ func serveSVG(context *gin.Context, assetAbsPath string) bool {
+ 		}
+ 
+ 		if !model.Conf.Editor.AllowSVGScript {
+-			data = []byte(util.RemoveScriptsInSVG(string(data)))
++			data = []byte(util.SanitizeSVG(string(data)))
+ 		}
+ 
+ 		context.Data(200, "image/svg+xml", data)
+@@ -656,7 +681,7 @@ func serveRepoDiff(ginServer *gin.Engine) {
+ 	ginServer.GET("/repo/diff/*path", model.CheckAuth, model.CheckAdminRole, func(context *gin.Context) {
+ 		requestPath := context.Param("path")
+ 		p := filepath.Join(util.TempDir, "repo", "diff", requestPath)
+-		http.ServeFile(context.Writer, context.Request, p)
++		serveFileOrSanitizedSVG(context, p)
+ 		return
+ 	})
+ }
+diff --git a/kernel/util/misc.go b/kernel/util/misc.go
+index 63151eb..c56e418 100644
+--- a/kernel/util/misc.go
++++ b/kernel/util/misc.go
+@@ -271,6 +271,119 @@ func RemoveScriptsInSVG(svgInput string) string {
+ 	return extractSVG(buf.String())
+ }
+ 
++var safeSVGElements = map[string]bool{
++	"svg": true, "g": true, "defs": true, "symbol": true, "use": true, "switch": true,
++	"path": true, "rect": true, "circle": true, "ellipse": true, "line": true,
++	"polyline": true, "polygon": true, "text": true, "tspan": true, "textpath": true,
++	"image": true, "a": true, "style": true, "title": true, "desc": true, "metadata": true,
++	"lineargradient": true, "radialgradient": true, "stop": true, "pattern": true,
++	"clippath": true, "mask": true, "filter": true, "fegaussianblur": true,
++	"feblend": true, "fecolormatrix": true, "fecomposite": true, "fedropshadow": true,
++	"feoffset": true, "femerge": true, "femergenode": true, "marker": true,
++	"view": true, "animate": true, "animatetransform": true, "animatemotion": true,
++	"set": true, "mpath": true,
++}
++
++func svgElementName(name string) string {
++	name = strings.ToLower(strings.TrimSpace(name))
++	if idx := strings.LastIndex(name, ":"); 0 <= idx {
++		name = name[idx+1:]
++	}
++	return name
++}
++
++func safeSVGURL(value string) bool {
++	switch {
++	case strings.HasPrefix(value, "javascript:"), strings.HasPrefix(value, "vbscript:"),
++		strings.HasPrefix(value, "livescript:"), strings.HasPrefix(value, "mocha:"):
++		return false
++	case strings.HasPrefix(value, "data:"):
++		mediaType := value[len("data:"):]
++		if idx := strings.IndexAny(mediaType, ";,"); 0 <= idx {
++			mediaType = mediaType[:idx]
++		}
++		switch strings.TrimSpace(mediaType) {
++		case "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp":
++			return true
++		}
++		return false
++	}
++	return true
++}
++
++func safeSVGAttribute(attr *html.Attribute) bool {
++	if nil == attr {
++		return false
++	}
++	key := strings.ToLower(strings.TrimSpace(attr.Key))
++	if strings.HasPrefix(key, "on") {
++		return false
++	}
++	value := strings.ToLower(strings.TrimSpace(attr.Val))
++	value = strings.TrimLeft(value, "\x00\x09\x0a\x0c\x0d\x20")
++	switch svgElementName(key) {
++	case "href", "src", "action", "formaction", "poster":
++		return safeSVGURL(value)
++	case "style":
++		return !strings.Contains(value, "expression(") && !strings.Contains(value, "javascript:") && !strings.Contains(value, "vbscript:")
++	}
++	return true
++}
++
++func findSVGElement(n *html.Node) *html.Node {
++	if n.Type == html.ElementNode && "svg" == svgElementName(n.Data) {
++		return n
++	}
++	for c := n.FirstChild; c != nil; c = c.NextSibling {
++		if found := findSVGElement(c); nil != found {
++			return found
++		}
++	}
++	return nil
++}
++
++// SanitizeSVG 只保留已知安全的 SVG 元素和属性
++func SanitizeSVG(svgInput string) string {
++	doc, err := html.Parse(strings.NewReader(svgInput))
++	if err != nil {
++		logging.LogWarnf("parse svg failed: %v", err)
++		return svgInput
++	}
++	root := findSVGElement(doc)
++	if nil == root {
++		return svgInput
++	}
++	var walk func(*html.Node)
++	walk = func(n *html.Node) {
++		if 0 < len(n.Attr) {
++			filtered := n.Attr[:0]
++			for _, attr := range n.Attr {
++				if safeSVGAttribute(attr) {
++					filtered = append(filtered, attr)
++				}
++			}
++			n.Attr = filtered
++		}
++		for c := n.FirstChild; c != nil; {
++			next := c.NextSibling
++			if c.Type == html.ElementNode && !safeSVGElements[svgElementName(c.Data)] {
++				n.RemoveChild(c)
++				c = next
++				continue
++			}
++			walk(c)
++			c = next
++		}
++	}
++	walk(root)
++	var buf bytes.Buffer
++	if err = html.Render(&buf, doc); err != nil {
++		logging.LogWarnf("render svg failed: %v", err)
++		return svgInput
++	}
++	return extractSVG(buf.String())
++}
++
+ func extractSVG(fullHTML string) string {
+ 	start := strings.Index(fullHTML, "<svg")
+ 	end := strings.LastIndex(fullHTML, "</svg>")

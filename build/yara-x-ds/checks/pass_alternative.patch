@@ -1,0 +1,147 @@
+diff --git a/lib/src/compiler/mod.rs b/lib/src/compiler/mod.rs
+index 1df2b984..1bba26f4 100644
+--- a/lib/src/compiler/mod.rs
++++ b/lib/src/compiler/mod.rs
+@@ -2941,7 +2941,18 @@ impl From<PatternId> for usize {
+ /// For each pattern there's one or more sub-patterns, depending on the pattern
+ /// and its modifiers. For example the pattern `"foo" ascii wide` may have one
+ /// subpattern for the ascii case and another one for the wide case.
+-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
++#[derive(
++    Copy,
++    Clone,
++    Debug,
++    Eq,
++    Hash,
++    PartialEq,
++    PartialOrd,
++    Ord,
++    Serialize,
++    Deserialize,
++)]
+ #[serde(transparent)]
+ pub(crate) struct SubPatternId(u32);
+ 
+@@ -3188,3 +3199,64 @@ impl From<Warnings> for Vec<Warning> {
+         value.warnings
+     }
+ }
++
++impl Rules {
++    /// Verifies that `self` is consistent with the invariants established by
++    /// the compiler. Serialized rules are used through unchecked accesses, so
++    /// a blob that violates any of them is refused before it can be used.
++    fn check_compiled_data(&self) -> Result<(), crate::errors::SerializationError> {
++        let sub_patterns = self.sub_patterns.len();
++        let code = self.re_code.len();
++
++        for atom in &self.atoms {
++            if atom.sub_pattern_id().0 as usize >= sub_patterns
++                || atom.fwd_code().is_some_and(|loc| {
++                    crate::re::CodeLoc::location(&loc) >= code
++                })
++                || atom.bck_code().is_some_and(|loc| {
++                    crate::re::CodeLoc::location(&loc) >= code
++                })
++            {
++                return Err(crate::errors::SerializationError::InvalidFormat);
++            }
++        }
++
++        if self
++            .anchored_sub_patterns
++            .iter()
++            .any(|id| id.0 as usize >= sub_patterns)
++        {
++            return Err(crate::errors::SerializationError::InvalidFormat);
++        }
++
++        for (_, sub_pattern) in &self.sub_patterns {
++            if sub_pattern
++                .chained_to()
++                .is_some_and(|id| id.0 as usize >= sub_patterns)
++            {
++                return Err(crate::errors::SerializationError::InvalidFormat);
++            }
++        }
++
++        for rule in &self.rules {
++            for (_, value) in &rule.metadata {
++                if let crate::compiler::rules::MetaValue::String(id) = value
++                    && self
++                        .lit_pool
++                        .get_bytes(*id)
++                        .is_none_or(|bytes| std::str::from_utf8(bytes).is_err())
++                {
++                    return Err(crate::errors::SerializationError::InvalidFormat);
++                }
++            }
++        }
++
++        if self.fast_scan_patterns.len() != self.num_patterns
++            || self.filesize_bounds.len() != self.num_patterns
++        {
++            return Err(crate::errors::SerializationError::InvalidFormat);
++        }
++
++        Ok(())
++    }
++}
+diff --git a/lib/src/compiler/rules.rs b/lib/src/compiler/rules.rs
+index d629f6ce..a58e03dd 100644
+--- a/lib/src/compiler/rules.rs
++++ b/lib/src/compiler/rules.rs
+@@ -218,6 +218,13 @@ impl Rules {
+ 
+     /// Deserializes the rules from a sequence of bytes produced by
+     /// [`Rules::serialize`].
++    ///
++    /// # Safety
++    ///
++    /// The bytes are validated: content that the compiler could not have
++    /// produced is rejected with [`SerializationError::InvalidFormat`]. As
++    /// long as you are deserializing rules from binary content produced by
++    /// [`Rules::serialize`] you are safe.
+     pub fn deserialize<B>(bytes: B) -> Result<Self, SerializationError>
+     where
+         B: AsRef<[u8]>,
+@@ -254,6 +261,12 @@ impl Rules {
+         #[cfg(feature = "logging")]
+         info!("Deserialization time: {:?}", Instant::elapsed(&start));
+ 
++        // The decoded data is used with unchecked accesses while scanning
++        // and when reading metadata, so it must satisfy the same invariants
++        // that the compiler establishes. Anything else is rejected here,
++        // before the rules can be used.
++        rules.check_compiled_data()?;
++
+         // `rules.compiled_wasm_mod` can be `None` for two reasons:
+         //
+         //  1- The rules were serialized without compiled rules (i.e: the
+@@ -284,6 +297,11 @@ impl Rules {
+ 
+         rules.build_ac_automaton();
+ 
++        // Make sure that the maximum SubPatternId is within the boundaries
++        // of sub_patterns array. This check is important because during
++        // the scanning phase we use SubPatternId as indexes in the array
++        // without boundary checks for better performance.
++
+         Ok(rules)
+     }
+ 
+diff --git a/lib/src/models.rs b/lib/src/models.rs
+index 7bf583e8..b1440925 100644
+--- a/lib/src/models.rs
++++ b/lib/src/models.rs
+@@ -203,9 +203,7 @@ impl<'r> Iterator for Metadata<'_, 'r> {
+             compiler::MetaValue::Float(f) => MetaValue::Float(*f),
+             compiler::MetaValue::String(id) => {
+                 let s = self.rules.lit_pool().get(*id).unwrap();
+-                // We can be sure that s is a valid UTF-8 string, because
+-                // the type of meta is MetaValue::String.
+-                let s = unsafe { s.to_str_unchecked() };
++                let s = s.to_str().unwrap();
+                 MetaValue::String(s)
+             }
+             compiler::MetaValue::Bytes(id) => {

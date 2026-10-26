@@ -1,0 +1,151 @@
+diff --git a/src/resources/handlers.ts b/src/resources/handlers.ts
+index b0144cf..da534c6 100644
+--- a/src/resources/handlers.ts
++++ b/src/resources/handlers.ts
+@@ -1,5 +1,7 @@
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
++import { execFileSync } from "child_process";
+ import { KubernetesManager } from "../types.js";
++import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ 
+ export const getResourceHandlers = (k8sManager: KubernetesManager) => ({
+   listResources: async () => {
+@@ -35,6 +37,13 @@ export const getResourceHandlers = (k8sManager: KubernetesManager) => ({
+           mimeType: "application/json",
+           description: "List of all nodes in the cluster",
+         },
++        {
++          uri: "k8s://raw/default/pods",
++          name: "Raw Resource Read",
++          mimeType: "application/json",
++          description:
++            "Read any resource kind through kubectl: k8s://raw/<namespace>/<kind>[/<name>]",
++        },
+       ],
+     };
+   },
+@@ -44,6 +53,31 @@ export const getResourceHandlers = (k8sManager: KubernetesManager) => ({
+       const uri = request.params.uri;
+       const parts = uri.replace("k8s://", "").split("/");
+ 
++      // Raw pass-through for kinds the typed clients do not wrap. The path
++      // segments become the kubectl arguments directly.
++      if (parts[0] === "raw") {
++        const [, rawNamespace, rawKind, rawName] = parts;
++        const rawArgs = ["get", rawKind];
++        if (rawName) rawArgs.push(rawName);
++        rawArgs.push("-n", rawNamespace || "default", "-o", "json");
++
++        const rawOutput = execFileSync("kubectl", rawArgs, {
++          encoding: "utf8",
++          maxBuffer: getSpawnMaxBuffer(),
++          env: { ...process.env, KUBECONFIG: process.env.KUBECONFIG },
++        });
++
++        return {
++          contents: [
++            {
++              uri: request.params.uri,
++              mimeType: "application/json",
++              text: rawOutput,
++            },
++          ],
++        };
++      }
++
+       const isNamespaces = parts[0] === "namespaces";
+       const isNodes = parts[0] === "nodes";
+       if ((isNamespaces || isNodes) && parts.length === 1) {
+diff --git a/src/tools/kubectl-logs.ts b/src/tools/kubectl-logs.ts
+index b30d588..ff7c235 100644
+--- a/src/tools/kubectl-logs.ts
++++ b/src/tools/kubectl-logs.ts
+@@ -2,6 +2,7 @@ import { KubernetesManager } from "../types.js";
+ import { execFileSync } from "child_process";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
++import { streamCommand } from "../utils/log-stream.js";
+ import {
+   contextParameter,
+   namespaceParameter,
+@@ -113,6 +114,13 @@ export async function kubectlLogs(
+ 
+       // Execute the command
+       try {
++        // Follow mode keeps the stream open until the caller stops reading,
++        // so it runs as a long-lived child process instead.
++        if (input.follow) {
++          const streamed = await streamCommand(command, args);
++          return formatLogOutput(name, streamed);
++        }
++
+         const result = execFileSync(command, args, {
+           encoding: "utf8",
+           maxBuffer: getSpawnMaxBuffer(),
+diff --git a/src/utils/log-stream.ts b/src/utils/log-stream.ts
+new file mode 100644
+index 0000000..fbeac87
+--- /dev/null
++++ b/src/utils/log-stream.ts
+@@ -0,0 +1,61 @@
++import { spawn } from "child_process";
++
++/**
++ * Run a long-lived kubectl/helm command and collect its output until the
++ * child exits, the stream has been idle for a moment, or the output cap is
++ * reached.
++ *
++ * A synchronous child process cannot be used for this: follow/stream commands
++ * stay open until the caller stops reading, so the child has to be spawned and
++ * its pipes drained as data arrives.
++ */
++export function streamCommand(
++  command: string,
++  args: string[],
++  options: { idleMs?: number; maxBytes?: number } = {}
++): Promise<string> {
++  const idleMs = options.idleMs ?? 1500;
++  const maxBytes = options.maxBytes ?? 4 * 1024 * 1024;
++
++  return new Promise((resolve, reject) => {
++    const child = spawn(command, args);
++
++    let output = "";
++    let settled = false;
++    let idleTimer: NodeJS.Timeout | undefined;
++
++    const finish = (error?: Error) => {
++      if (settled) return;
++      settled = true;
++      if (idleTimer) clearTimeout(idleTimer);
++      try {
++        child.kill("SIGKILL");
++      } catch {
++        // the child may already have exited
++      }
++      if (error) reject(error);
++      else resolve(output);
++    };
++
++    const armIdle = () => {
++      if (idleTimer) clearTimeout(idleTimer);
++      idleTimer = setTimeout(() => finish(), idleMs);
++    };
++
++    child.stdout.on("data", (chunk) => {
++      output += chunk.toString();
++      if (output.length >= maxBytes) finish();
++      else armIdle();
++    });
++
++    child.stderr.on("data", (chunk) => {
++      output += chunk.toString();
++      armIdle();
++    });
++
++    child.on("error", (error) => finish(error));
++    child.on("close", () => finish());
++
++    armIdle();
++  });
++}

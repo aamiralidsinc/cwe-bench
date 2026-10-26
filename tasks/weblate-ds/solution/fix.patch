@@ -1,0 +1,261 @@
+diff -ruN injected/weblate/auth/models.py oracle/weblate/auth/models.py
+--- a/weblate/auth/models.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/auth/models.py	2026-10-24 03:01:30.092690617 +0000
+@@ -977,6 +977,11 @@
+     def needs_project_filter(self):
+         if self.is_superuser:
+             return False
++        if any(
++            key > 0 and permissions == [(None, None)]
++            for key, permissions in self.project_permissions.items()
++        ):
++            return True
+         if self.project_permissions[-SELECTION_ALL]:
+             return False
+         return Project.objects.exclude(
+diff -ruN injected/weblate/checks/views.py oracle/weblate/checks/views.py
+--- a/weblate/checks/views.py	2026-10-24 03:01:14.028705379 +0000
++++ b/weblate/checks/views.py	2026-10-24 03:01:30.108690602 +0000
+@@ -316,12 +316,7 @@
+ @login_required
+ def check_summary(request: AuthenticatedHttpRequest, check_id):
+     """Return a summary of a check for the AJAX popup."""
+-    obj = get_object_or_404(
+-        Check.objects.filter(
+-            unit__translation__component__project__in=request.user.allowed_projects
+-        ),
+-        pk=check_id,
+-    )
++    obj = get_object_or_404(Check.objects.filter_access(request.user), pk=check_id)
+     if not request.user.has_perm("unit.check", obj):
+         raise PermissionDenied
+     return JsonResponse(
+diff -ruN injected/weblate/machinery/views.py oracle/weblate/machinery/views.py
+--- a/weblate/machinery/views.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/machinery/views.py	2026-10-24 03:01:30.104690605 +0000
+@@ -473,14 +473,14 @@
+ @require_POST
+ def translate(request: AuthenticatedHttpRequest, unit_id: int, service: str):
+     """AJAX handler for translating."""
+-    unit = get_object_or_404(Unit, pk=unit_id)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=unit_id)
+     return handle_machinery(request, service, unit)
+ 
+ 
+ @require_POST
+ def memory(request: AuthenticatedHttpRequest, unit_id: int):
+     """AJAX handler for translation memory."""
+-    unit = get_object_or_404(Unit, pk=unit_id)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=unit_id)
+     query = request.POST.get("q")
+     if not query:
+         return HttpResponseBadRequest("Missing search string")
+diff -ruN injected/weblate/trans/models/announcement.py oracle/weblate/trans/models/announcement.py
+--- a/weblate/trans/models/announcement.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/models/announcement.py	2026-10-24 03:01:30.092690617 +0000
+@@ -129,6 +129,31 @@
+ 
+ 
+ class AnnouncementQuerySet(models.QuerySet["Announcement", "Announcement"]):
++    def filter_access(self, user):
++        if user.is_superuser:
++            return self
++
++        global_scope = Q(
++            project__isnull=True, category__isnull=True, component__isnull=True
++        )
++        project_scope = Q(category__isnull=True, component__isnull=True) & (
++            user.get_project_access_query("project")
++        )
++        category_scope = Q(category__isnull=False, component__isnull=True) & (
++            user.get_project_access_query("category__project")
++        )
++        component_scope = Q(component__isnull=False) & (
++            user.get_project_access_query("component__project")
++        )
++        if user.needs_component_restrictions_filter:
++            component_scope &= Q(component__restricted=False) | Q(
++                component_id__in=user.component_permissions
++            )
++
++        return self.filter(
++            global_scope | project_scope | category_scope | component_scope
++        )
++
+     def order(self):
+         return self.order_by("id")
+ 
+diff -ruN injected/weblate/trans/views/bulk_suggestions.py oracle/weblate/trans/views/bulk_suggestions.py
+--- a/weblate/trans/views/bulk_suggestions.py	2026-10-24 03:01:14.028705379 +0000
++++ b/weblate/trans/views/bulk_suggestions.py	2026-10-24 03:01:30.108690602 +0000
+@@ -165,7 +165,9 @@
+         )
+ 
+     suggestions = list(
+-        Suggestion.objects.filter(pk__in=suggestion_ids).select_related("unit")
++        Suggestion.objects.filter_access(request.user)
++        .filter(pk__in=suggestion_ids)
++        .select_related("unit")
+     )
+     if len(suggestions) != len(set(suggestion_ids)):
+         return JsonResponse(
+@@ -207,9 +209,9 @@
+         )
+ 
+     try:
+-        suggestion = Suggestion.objects.get(
+-            pk=int(request.POST.get("suggestion", ""))
+-        )
++        suggestion = Suggestion.objects.filter(
++            unit__translation=translation
++        ).get(pk=int(request.POST.get("suggestion", "")))
+     except (Suggestion.DoesNotExist, ValueError):
+         return JsonResponse(
+             {"error": gettext("Invalid suggestion.")}, status=404
+diff -ruN injected/weblate/trans/views/changes.py oracle/weblate/trans/views/changes.py
+--- a/weblate/trans/views/changes.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/changes.py	2026-10-24 03:01:30.092690617 +0000
+@@ -328,16 +328,26 @@
+ 
+ @login_required
+ def show_change(request: AuthenticatedHttpRequest, pk: int):
+-    change = get_object_or_404(Change, pk=pk)
++    accessible_changes = Change.objects.last_changes(request.user)
++    change = get_object_or_404(accessible_changes, pk=pk)
+     acl_obj = change.translation or change.component or change.project
+     if not request.user.has_perm("unit.edit", acl_obj):
+         raise PermissionDenied
+-    others = request.GET.getlist("other")
++    others = []
++    for other in request.GET.getlist("other"):
++        try:
++            others.append(int(other))
++        except ValueError:
++            continue
+     changes = None
+     if others:
+-        changes = Change.objects.filter(pk__in=[*others, change.pk])
+-        for change in changes:
+-            acl_obj = change.translation or change.component or change.project
++        changes = accessible_changes.filter(pk__in=[*others, change.pk])
++        for related_change in changes:
++            acl_obj = (
++                related_change.translation
++                or related_change.component
++                or related_change.project
++            )
+             if not request.user.has_perm("unit.edit", acl_obj):
+                 raise PermissionDenied
+     if change.action not in NOTIFICATIONS_ACTIONS:
+diff -ruN injected/weblate/trans/views/edit.py oracle/weblate/trans/views/edit.py
+--- a/weblate/trans/views/edit.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/edit.py	2026-10-24 03:01:30.092690617 +0000
+@@ -930,7 +930,7 @@
+ @session_ratelimit_post("comment", logout_user=False)
+ def comment(request: AuthenticatedHttpRequest, pk):
+     """Add new comment."""
+-    unit = get_object_or_404(Unit, pk=pk)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=pk)
+ 
+     if not request.user.has_perm("comment.add", unit.translation):
+         raise PermissionDenied
+@@ -954,7 +954,10 @@
+ @transaction.atomic
+ def delete_comment(request: AuthenticatedHttpRequest, pk):
+     """Delete comment."""
+-    comment_obj = get_object_or_404(Comment, pk=pk)
++    comment_obj = get_object_or_404(
++        Comment.objects.filter(unit__in=Unit.objects.filter_access(request.user)),
++        pk=pk,
++    )
+ 
+     if not request.user.has_perm("comment.delete", comment_obj):
+         raise PermissionDenied
+@@ -974,7 +977,10 @@
+ @transaction.atomic
+ def resolve_comment(request: AuthenticatedHttpRequest, pk):
+     """Resolve comment."""
+-    comment_obj = get_object_or_404(Comment, pk=pk)
++    comment_obj = get_object_or_404(
++        Comment.objects.filter(unit__in=Unit.objects.filter_access(request.user)),
++        pk=pk,
++    )
+ 
+     if not request.user.has_perm("comment.resolve", comment_obj):
+         raise PermissionDenied
+@@ -1181,7 +1187,7 @@
+ @transaction.atomic
+ def delete_unit(request: AuthenticatedHttpRequest, unit_id):
+     """Delete unit."""
+-    unit = get_object_or_404(Unit, pk=unit_id)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=unit_id)
+ 
+     if not request.user.has_perm("unit.delete", unit):
+         raise PermissionDenied
+diff -ruN injected/weblate/trans/views/js.py oracle/weblate/trans/views/js.py
+--- a/weblate/trans/views/js.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/js.py	2026-10-24 03:01:30.092690617 +0000
+@@ -35,7 +35,7 @@
+ 
+ def get_unit_translations(request: AuthenticatedHttpRequest, unit_id):
+     """Return unit's other translations."""
+-    unit = get_object_or_404(Unit, pk=int(unit_id))
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=int(unit_id))
+     user = request.user
+     user.check_access_component(unit.translation.component)
+ 
+@@ -58,7 +58,9 @@
+ @login_required
+ @transaction.atomic
+ def ignore_check(request: AuthenticatedHttpRequest, check_id):
+-    obj = get_object_or_404(Check.objects.select_for_update(), pk=int(check_id))
++    obj = get_object_or_404(
++        Check.objects.filter_access(request.user).select_for_update(), pk=int(check_id)
++    )
+ 
+     if not request.user.has_perm("unit.check", obj):
+         raise PermissionDenied
+@@ -73,7 +75,7 @@
+ @login_required
+ @transaction.atomic
+ def ignore_check_source(request: AuthenticatedHttpRequest, check_id):
+-    obj = get_object_or_404(Check, pk=int(check_id))
++    obj = get_object_or_404(Check.objects.filter_access(request.user), pk=int(check_id))
+     unit = obj.unit.source_unit
+ 
+     if not request.user.has_perm("unit.check", obj) or not request.user.has_perm(
+@@ -106,7 +108,7 @@
+ @login_required
+ @transaction.atomic
+ def dismiss_automatically_translated(request: AuthenticatedHttpRequest, unit_id):
+-    unit = get_object_or_404(Unit, pk=int(unit_id))
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=int(unit_id))
+     if not request.user.has_perm("unit.edit", unit):
+         raise PermissionDenied
+ 
+diff -ruN injected/weblate/trans/views/settings.py oracle/weblate/trans/views/settings.py
+--- a/weblate/trans/views/settings.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/settings.py	2026-10-24 03:01:30.092690617 +0000
+@@ -481,7 +481,9 @@
+ @login_required
+ @require_POST
+ def announcement_delete(request: AuthenticatedHttpRequest, pk):
+-    announcement = get_object_or_404(Announcement, pk=pk)
++    announcement = get_object_or_404(
++        Announcement.objects.filter_access(request.user), pk=pk
++    )
+ 
+     if not request.user.has_perm("announcement.delete", announcement):
+         raise PermissionDenied
+diff -ruN injected/weblate/trans/views/source.py oracle/weblate/trans/views/source.py
+--- a/weblate/trans/views/source.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/source.py	2026-10-24 03:01:30.092690617 +0000
+@@ -29,7 +29,7 @@
+ @login_required
+ @transaction.atomic
+ def edit_context(request: AuthenticatedHttpRequest, pk):
+-    unit = get_object_or_404(Unit, pk=pk)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=pk)
+     if not unit.is_source and not unit.translation.component.is_glossary:
+         msg = "Non source unit!"
+         raise Http404(msg)

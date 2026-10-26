@@ -1,0 +1,298 @@
+diff --git a/pyod/mcp_server.py b/pyod/mcp_server.py
+index 21e517d..321cbbb 100644
+--- a/pyod/mcp_server.py
++++ b/pyod/mcp_server.py
+@@ -63,7 +63,11 @@ def _to_json(obj):
+     return json.dumps(obj, indent=2, default=str)
+ 
+ 
+-def profile_data(data_path: str, data_type: str = "auto") -> str:
++def profile_data(
++    data_path: str,
++    data_type: str = "auto",
++    trusted: bool = False
++) -> str:
+     """Profile a dataset for anomaly detection.
+ 
+     Loads data from path, detects data type and characteristics.
+@@ -72,8 +76,10 @@ def profile_data(data_path: str, data_type: str = "auto") -> str:
+     Args:
+         data_path: Path to data file (CSV, NPY, JSON).
+         data_type: Override. One of 'tabular', 'text', 'image', or 'auto'.
++        trusted: Acknowledge that a pickle-based data file came from a
++            trusted source.
+     """
+-    X = _load_data(data_path)
++    X = _load_data(data_path, trusted=trusted)
+     dt = None if data_type == "auto" else data_type
+     return _to_json(_get_engine().profile_data(X, data_type=dt))
+ 
+@@ -256,7 +262,8 @@ def _deserialize_result(result_json: str):
+ def run_detection(
+     data_path: str,
+     plan: str,
+-    test_data_path: str = ""
++    test_data_path: str = "",
++    trusted: bool = False
+ ) -> str:
+     """Run anomaly detection with a given plan.
+ 
+@@ -270,6 +277,8 @@ def run_detection(
+         data_path: Path to training data file (CSV, NPY, NPZ, JSON, MAT).
+         plan: JSON string from plan_detection().
+         test_data_path: Optional path to held-out test data.
++        trusted: Acknowledge that a pickle-based data file came from a
++            trusted source.
+     """
+     try:
+         plan_dict = json.loads(plan)
+@@ -278,14 +287,14 @@ def run_detection(
+     if not isinstance(plan_dict, dict):
+         return _to_json({"error": "plan must be a JSON object"})
+     try:
+-        X_train = _load_data(data_path)
++        X_train = _load_data(data_path, trusted=trusted)
+     except (OSError, ValueError) as e:
+         return _to_json({"error": "Failed to load training data",
+                          "details": str(e)})
+     X_test = None
+     if test_data_path:
+         try:
+-            X_test = _load_data(test_data_path)
++            X_test = _load_data(test_data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load test data",
+                              "details": str(e)})
+@@ -308,7 +317,8 @@ def run_detection(
+ def analyze_results(
+     result: str,
+     data_path: str = "",
+-    top_k: int = 10
++    top_k: int = 10,
++    trusted: bool = False
+ ) -> str:
+     """Analyze a detection result.
+ 
+@@ -327,7 +337,7 @@ def analyze_results(
+     X = None
+     if data_path:
+         try:
+-            X = _load_data(data_path)
++            X = _load_data(data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load data",
+                              "details": str(e)})
+@@ -345,7 +355,8 @@ def explain_findings(
+     result: str,
+     indices: str = "",
+     top_k: int = 5,
+-    data_path: str = ""
++    data_path: str = "",
++    trusted: bool = False
+ ) -> str:
+     """Explain why specific samples were flagged as anomalies.
+ 
+@@ -374,7 +385,7 @@ def explain_findings(
+     X = None
+     if data_path:
+         try:
+-            X = _load_data(data_path)
++            X = _load_data(data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load data",
+                              "details": str(e)})
+@@ -388,8 +399,13 @@ def explain_findings(
+     return _to_json(explanations)
+ 
+ 
+-def _load_data(path):
+-    """Load data from file path."""
++def _load_data(path, *, trusted=False):
++    """Load data from file path.
++
++    ``trusted`` is the caller's acknowledgement that a pickle-based
++    file came from a trusted source; the other formats never execute
++    code from the file.
++    """
+     import numpy as np
+ 
+     ext = os.path.splitext(path)[1].lower()
+@@ -418,6 +434,11 @@ def _load_data(path):
+     elif ext in ('.pkl', '.pickle', '.joblib'):
+         # Pickled feature matrices saved by older pipelines (a plain
+         # ndarray or a (X, y) tuple) instead of .npy/.npz.
++        if trusted is not True:
++            raise ValueError(
++                "Unsupported file format: %s (a pickle file may execute "
++                "code while it is read; pass trusted=True only for files "
++                "from a trusted source)" % ext)
+         import joblib
+         return joblib.load(path)
+     else:
+diff --git a/pyod/models/base_dl.py b/pyod/models/base_dl.py
+index d958b5f..337846d 100644
+--- a/pyod/models/base_dl.py
++++ b/pyod/models/base_dl.py
+@@ -330,13 +330,20 @@ class BaseDeepLearningDetector(BaseDetector):
+             pickle.dump(self, file)
+ 
+     @classmethod
+-    def load(cls, path):
++    def load(cls, path, *, trusted=False):
+         """Load the model from the specified path.
+ 
++        A pickled detector can execute code while it is being
++        deserialized, so the caller must pass ``trusted=True`` to
++        acknowledge that the file came from a trusted source.
++
+         Parameters
+         ----------
+         path : str
+             The path to load the model.
++        trusted : bool, default False
++            The caller's acknowledgement that the file came from a
++            trusted source. When False, the file is not opened.
+ 
+         Returns
+         -------
+diff --git a/pyod/utils/persistence.py b/pyod/utils/persistence.py
+index 90406ca..dd56ce4 100644
+--- a/pyod/utils/persistence.py
++++ b/pyod/utils/persistence.py
+@@ -98,6 +98,21 @@ _VERSION_CHECKS: list[tuple[str, Any, str]] = [
+ ]
+ 
+ 
++def _require_trust(trusted: Any, api: str) -> None:
++    """Refuse to deserialize unless the caller vouched for the source.
++
++    Called before any file is opened, so a reducer stored in the
++    artifact cannot run while the artifact is being examined.
++    """
++    if trusted is not True:
++        raise ValueError(
++            f"{api}: refusing to deserialize a pickle/joblib artifact "
++            "whose source the caller has not vouched for. Pass "
++            "trusted=True only for artifacts from a trusted source; "
++            "strict=True and envelope validation cannot make an "
++            "untrusted pickle safe to read.")
++
++
+ def _running_version(package_name: str) -> str:
+     """Resolve the running version of an optional dependency."""
+     if package_name == "sklearn":
+@@ -170,9 +185,16 @@ def save(model: Any, path: Any, metadata: dict | None = None) -> None:
+ def load(
+         path: Any,
+         strict: bool = False,
+-        return_metadata: bool = False) -> Any:
++        return_metadata: bool = False,
++        *,
++        trusted: bool = False) -> Any:
+     """Load a PyOD detector saved by `save()` or by raw joblib.dump.
+ 
++    Pickle and joblib artifacts can execute code while they are being
++    deserialized, so the caller must pass ``trusted=True`` to
++    acknowledge that the artifact came from a trusted source. Nothing
++    in the artifact is deserialized before that acknowledgement.
++
+     `load()` understands three input shapes:
+ 
+     1. An envelope dict written by `save()`. The envelope's recorded
+@@ -201,6 +223,10 @@ def load(
+         When True, return ``(model, envelope_without_model_field)``
+         instead of just the model. For legacy artifacts the second
+         element is ``None``.
++    trusted : bool, default False
++        The caller's acknowledgement that the artifact came from a
++        trusted source. When False, `load()` raises before the file is
++        opened.
+ 
+     Returns
+     -------
+@@ -212,9 +238,10 @@ def load(
+     ------
+     ValueError
+         On schema-version mismatch, strict-mode drift, strict-mode
+-        legacy artifacts, or after a successful compat repair under
+-        strict mode.
++        legacy artifacts, an unvouched-for artifact source, or after a
++        successful compat repair under strict mode.
+     """
++    _require_trust(trusted, "load()")
+     try:
+         obj = joblib.load(path)
+     except ValueError as exc:
+@@ -308,7 +335,9 @@ def _handle_compat_fallthrough(
+         strict: bool,
+         return_metadata: bool) -> Any:
+     try:
+-        obj = compat_load(path)
++        # load() already refused unvouched-for sources before touching
++        # the file; the repair path is reached only afterwards.
++        obj = compat_load(path, trusted=True)
+     except Exception as compat_exc:
+         raise compat_exc from original_exc
+     return _handle_loaded_object(
+@@ -388,7 +417,7 @@ def _format_strict_compat_drift_msg(
+ # inspect_artifact
+ # ----------------------------------------------------------------------
+ 
+-def inspect_artifact(path: Any) -> dict:
++def inspect_artifact(path: Any, *, trusted: bool = False) -> dict:
+     """Read the version envelope of a saved detector.
+ 
+     Returns the envelope written by `save()` with the ``model`` field
+@@ -400,6 +429,9 @@ def inspect_artifact(path: Any) -> dict:
+     ----------
+     path : str or pathlib.Path
+         Path to the artifact.
++    trusted : bool, default False
++        The caller's acknowledgement that the artifact came from a
++        trusted source. When False, the artifact is not opened.
+ 
+     Returns
+     -------
+@@ -409,8 +441,10 @@ def inspect_artifact(path: Any) -> dict:
+     Raises
+     ------
+     ValueError
+-        When the artifact has no PyOD version envelope.
++        When the caller has not vouched for the source, or when the
++        artifact has no PyOD version envelope.
+     """
++    _require_trust(trusted, "inspect_artifact()")
+     obj = joblib.load(path)
+     if not _is_envelope(obj):
+         raise ValueError(
+@@ -423,7 +457,11 @@ def inspect_artifact(path: Any) -> dict:
+ # compat_load
+ # ----------------------------------------------------------------------
+ 
+-def compat_load(path: Any, mmap_mode: str | None = None) -> Any:
++def compat_load(
++        path: Any,
++        mmap_mode: str | None = None,
++        *,
++        trusted: bool = False) -> Any:
+     """Load an artifact whose sklearn Tree node dtype no longer matches.
+ 
+     Mirrors `joblib.load` but plugs a dispatch-table override into
+@@ -446,6 +484,9 @@ def compat_load(path: Any, mmap_mode: str | None = None) -> Any:
+     mmap_mode : str or None, default None
+         Forwarded to joblib's underlying load path. Supported values
+         mirror joblib's: None, 'r', 'r+', 'w+', 'c'.
++    trusted : bool, default False
++        The caller's acknowledgement that the artifact came from a
++        trusted source. When False, the artifact is not opened.
+ 
+     Returns
+     -------
+@@ -454,6 +495,7 @@ def compat_load(path: Any, mmap_mode: str | None = None) -> Any:
+         legacy raw saves; an envelope dict for Phase 2 saves). Callers
+         that need envelope unwrapping should use `load()`.
+     """
++    _require_trust(trusted, "compat_load()")
+     trees_realigned = [0]
+ 
+     class _CompatNumpyUnpickler(NumpyUnpickler):

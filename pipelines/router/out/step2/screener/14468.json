@@ -1,0 +1,69 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "14468", "advisory_ids": ["GHSA-WFPM-5GCM-94CG", "CVE-2026-102600"], "repo": "socketio/socket.io", "pinned_commit": "64066c367386b3eb96677479a8978d6a8230c5ee", "fix_commits": ["830e3642ebb8dc3784eb749b0a004fe2b932b429"],
+  "trust_decision": {
+    "summary": "Every lookup of a client-provided session id in the inherited plain-object `clients` record must be an own-property lookup, decided at five sites in packages/socket.io-cluster-engine/lib/engine.ts (four in onMessage, one in onWebSocket) with a new safeGet() helper.",
+    "evidence": [
+      "packages/engine.io/lib/server.ts:195",
+      "packages/engine.io/lib/server.ts:310",
+      "packages/socket.io-cluster-engine/lib/engine.ts:188",
+      "packages/socket.io-cluster-engine/lib/engine.ts:260",
+      "packages/socket.io-cluster-engine/lib/engine.ts:334",
+      "packages/socket.io-cluster-engine/lib/engine.ts:556",
+      "fix.diff:13-17"
+    ]
+  },
+  "landing_point": {
+    "where": "packages/engine.io/lib/server.ts:316",
+    "why": "The summary ('unsafe client session lookup') names the only session map in the monorepo, `clients`; the base engine.io verify() resolves `this.clients[sid]` there, and it is already guarded by hasOwn() at server.ts:310, so a reader starting from the report finds a fixed-looking base server and has to discover on their own that four other packages repeat the same lookup (the vulnerable copies are in packages/socket.io-cluster-engine/lib/engine.ts)."
+  },
+  "fix_sites": [
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:188", "entry_point": "HTTP polling request carrying ?sid= on a peer node: ClusterEngine.verify (engine.ts:427) publishes ACQUIRE_LOCK, which every node handles here; also reachable from the inter-node bus subscribed in redis.ts:147 and cluster.ts:48", "module_kind": "library (cluster-engine message handler)"},
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:260", "entry_point": "client packet POSTed to a peer node's polling endpoint -> _hookTransport packet listener (engine.ts:475) -> _onPacket (engine.ts:526) -> PACKET message handled here", "module_kind": "library (cluster-engine message handler)"},
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:275", "entry_point": "WebSocket upgrade probe on a peer node -> _onUpgradeSuccess (engine.ts:628) -> UPGRADE message handled here", "module_kind": "library (cluster-engine message handler)"},
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:334", "entry_point": "transport error/close on a hooked transport (engine.ts:478-483) -> _onClose (engine.ts:538) -> CLOSE message handled here", "module_kind": "library (cluster-engine message handler)"},
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:556", "entry_point": "GET /engine.io/?EIO=4&transport=websocket&sid=... upgrade request (Server.handleUpgrade -> verify -> ws.handleUpgrade -> onWebSocket)", "module_kind": "library (cluster-engine HTTP/WebSocket adapter)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Cross-node WebSocket takeover: a sid owned by another node must fall through the truthiness test at engine.ts:556 so the upgrade path can create a *new* local client for it (engine.ts:596, clientsCount++). A fix that rejects or closes any sid not already present in the local map, instead of only refusing inherited keys, breaks the 'should upgrade' / 'should upgrade and send buffered messages' flows.",
+    "where": "packages/socket.io-cluster-engine/lib/engine.ts:556"
+  },
+  "O6_input_shapes": [
+    "plain string sid",
+    "prototype member names such as __proto__ / constructor / toString, which resolve to inherited values on a plain-object map",
+    "a 20-character name that really exists on Object.prototype (e.g. propertyIsEnumerable), which passes the length-only isValidSessionId() gate at engine.ts:409 and so reaches the ACQUIRE_LOCK site through verify",
+    "the same sid string arriving inside an inter-node message payload (redis.ts:150 decode / cluster.ts:48 process message) rather than in a query string"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "packages/socket.io-cluster-engine/lib/redis.ts:147-163", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:246-257", "sibling": "a new message type (e.g. heartbeat/migrate) resolving its sid through this.clients instead of the Map used by DRAIN", "why_realistic": "the DRAIN handler sits directly between the patched handlers and already resolves a sid-keyed session; the next message type a maintainer adds would copy that shape, and clients is the only sid-keyed store that is a plain object"},
+    {"where": "packages/socket.io-cluster-engine/lib/engine.ts:596", "sibling": "a session hand-off / restore path that reads or writes this.clients[sid] from a message payload without an own-property check", "why_realistic": "the takeover flow already writes this.clients[sid] = socket for a sid that came from another process, so an 'adopt/restore session' variant is a small, natural extension"},
+    {"where": "packages/engine.io/lib/userver.ts:147", "sibling": "the uWebSockets.js HTTP path resolving a session by req._query.sid with no local guard (it leans on BaseServer.verify)", "why_realistic": "it is a second HTTP implementation of the same lookup; a maintainer adding a pre-verify fast path there would index clients directly, exactly as the old cluster-engine code did"}
+  ],
+  "O9_family": "unsafe object-key lookup / prototype-chain confusion in a client-controlled session map (CWE-20), reachable as a crash of the worker", "O9_dos": true,
+  "O10_build": {
+    "language": "TypeScript (Node.js, CommonJS)",
+    "toolchain": "npm; `npm run compile` = rimraf dist && tsc; `npm run test:unit` = mocha --import=tsx test/*.ts; prettier --check",
+    "services": ["redis (only for test/redis.ts; compose.yaml in packages/socket.io-cluster-engine)"],
+    "offline_after_build": true,
+    "project_tests": "packages/socket.io-cluster-engine/test/in-memory.ts (three engines on localhost ports 3000-3002 sharing an EventEmitter bus: read/write, locks, close, upgrade), test/cluster.ts (node cluster, 3 workers), test/redis.ts (needs a local Redis). No test covers prototype-named sids; the published fix adds no tests."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "packages/socket.io-cluster-engine/lib/engine.ts", "j_sibling_sites": "no", "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Patch only the HTTP-facing check at engine.ts:556 (the path you can reproduce in a browser) or blacklist the names __proto__/constructor/toString, leaving the four onMessage lookups on the inherited map untouched."},
+  "out_of_scope_notes": [
+    "The inter-node bus accepts any message whose _source is the literal \"_eio\" (packages/socket.io-cluster-engine/lib/redis.ts:50-58, lib/cluster.ts:48-53), so anyone able to publish on the Redis channel can forge cluster messages; noted only as the reachability path into onMessage and not pursued."
+  ],
+  "unverified": [
+    "repo_mb could not be measured (no shell in this session)",
+    "the full advisory text was not available; only the summary line 'Socket.IO: Prototype Pollution via Unsafe Client Session Lookup' was read",
+    "whether the fix commit added tests outside the supplied diff (fix.diff contains source changes only) is unknown"
+  ]
+}

@@ -1,0 +1,202 @@
+diff -ruN pristine/packages/argv-parser/src/args/parse-argv.ts app/packages/argv-parser/src/args/parse-argv.ts
+--- a/packages/argv-parser/src/args/parse-argv.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/args/parse-argv.ts	2026-10-26 05:07:19.677132572 +0000
+@@ -16,7 +16,11 @@
+    const task = taskIndex < tokens.length ? String(tokens[taskIndex]).toLowerCase() : null;
+    const taskTokens = task !== null ? tokens.slice(taskIndex + 1) : [];
+ 
+-   const { positionals, pathspecs } = parseTaskFlags(taskTokens, task, flags);
++   const { positionals, pathspecs } = parseTaskFlags(taskTokens, task, flags, {
++      // `git config -- <name> [<value>]` names its setting after the separator; for every
++      // other sub-command the separator introduces paths.
++      separatorAsPath: task !== 'config',
++   });
+    const config = collectConfigAccess(task, flags, positionals);
+ 
+    return {
+diff -ruN pristine/packages/argv-parser/src/config/detect-config-action.ts app/packages/argv-parser/src/config/detect-config-action.ts
+--- a/packages/argv-parser/src/config/detect-config-action.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/config/detect-config-action.ts	2026-10-26 05:08:30.949068482 +0000
+@@ -9,6 +9,11 @@
+ } from './config-operands';
+ 
+ export function detectConfigAction(flags: Flag[], positionals: string[]): ConfigOperation | null {
++   const rename = renameDestination(flags, positionals);
++   if (rename !== undefined) {
++      return { isWrite: true, isRead: false, key: rename.toLowerCase() };
++   }
++
+    for (const { name } of scopedFlags(flags, 'task')) {
+       if (CONFIG_WRITE_FLAGS.has(name)) {
+          return configOperation(true, positionals);
+@@ -54,6 +59,25 @@
+    };
+ }
+ 
++/**
++ * A section rename creates the destination section, so the destination - not the source -
++ * is the name this invocation writes. Both the switch and the sub-command spelling put the
++ * destination in the last operand position.
++ */
++function renameDestination(flags: Flag[], positionals: string[]): string | undefined {
++   for (const { name } of scopedFlags(flags, 'task')) {
++      if (name === '--rename-section') {
++         return positionals.at(1);
++      }
++   }
++
++   if (positionals.at(0)?.toLowerCase() === 'rename-section') {
++      return positionals.at(2);
++   }
++
++   return undefined;
++}
++
+ export function toOperation(scope: ConfigScope, operation: ConfigOperation) {
+    if (operation.isWrite && operation.value !== undefined) {
+       return { key: operation.key, value: operation.value, scope };
+diff -ruN pristine/packages/argv-parser/src/flags/parse-task-flags.ts app/packages/argv-parser/src/flags/parse-task-flags.ts
+--- a/packages/argv-parser/src/flags/parse-task-flags.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/flags/parse-task-flags.ts	2026-10-26 05:07:19.001133179 +0000
+@@ -10,10 +10,20 @@
+    pathspecs: string[];
+ };
+ 
++export interface TaskFlagOptions {
++   /**
++    * Whether tokens after the `--` separator are file-system paths. `true` for the vast
++    * majority of sub-commands; `git config` instead uses the separator to end option
++    * parsing, so its operands follow it as ordinary arguments.
++    */
++   separatorAsPath?: boolean;
++}
++
+ export function parseTaskFlags(
+    tokens: readonly unknown[],
+    task: string | null,
+-   flags: Flag[] = []
++   flags: Flag[] = [],
++   { separatorAsPath = true }: TaskFlagOptions = {}
+ ): TaskFlags {
+    const spec = getFlagSpecForTask(task);
+    const positionals: string[] = [];
+@@ -34,7 +44,11 @@
+       if (raw === '--') {
+          for (let j = i + 1; j < tokens.length; j++) {
+             const t = tokens[j];
+-            isPathSpec(t) ? pathspecs.push(...toPaths(t as string)) : pathspecs.push(String(t));
++            if (separatorAsPath) {
++               isPathSpec(t) ? pathspecs.push(...toPaths(t as string)) : pathspecs.push(String(t));
++            } else {
++               positionals.push(String(t));
++            }
+          }
+          break;
+       }
+diff -ruN pristine/packages/argv-parser/src/tokens/flag-specs.ts app/packages/argv-parser/src/tokens/flag-specs.ts
+--- a/packages/argv-parser/src/tokens/flag-specs.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/tokens/flag-specs.ts	2026-10-26 05:09:49.384997917 +0000
+@@ -88,6 +88,25 @@
+       short: new Map(),
+       long: new Set(['exec', 'receive-pack']),
+    },
++   rebase: {
++      // Every boolean switch is listed so that no cluster containing it stays opaque and
++      // hides a following `x`; the value-taking switches are marked true.
++      short: new Map([
++         ['f', false], // -f force-rebase
++         ['i', false], // -i interactive
++         ['k', false], // -k keep-base
++         ['m', false], // -m merge
++         ['n', false], // -n no-stat
++         ['p', false], // -p preserve-merges
++         ['q', false], // -q quiet
++         ['r', false], // -r rebase-merges
++         ['s', true], //  -s <strategy>
++         ['v', false], // -v verbose
++         ['x', true], //  -x <cmd>       exec
++         ['X', true], //  -X <option>    strategy option
++      ]),
++      long: new Set(['exec', 'onto', 'strategy', 'strategy-option']),
++   },
+ };
+ 
+ const EMPTY: FlagSpec = { short: new Map(), long: new Set() };
+diff -ruN pristine/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts app/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts	2026-10-26 05:07:06.661144272 +0000
+@@ -36,6 +36,25 @@
+    return preventConfigBuilder(regex, category, config);
+ }
+ 
++/**
++ * `trailer.<token>.cmd` and `trailer.<token>.command` name the program that a later
++ * `git log` (or any operation that interprets trailers) runs. The builders above key off
++ * a fixed prefix, but these settings carry a caller-chosen token between the section and
++ * the name, so match the section and the final segment directly instead.
++ */
++function preventTrailerCommand(config: string): Vulnerability | void {
++   const [section, ...rest] = config.trim().toLowerCase().split('.');
++   const leaf = rest.at(-1);
++
++   if (section === 'trailer' && (leaf === 'cmd' || leaf === 'command')) {
++      const category = 'allowUnsafeCommandBinaries';
++      return {
++         category,
++         message: `Configuring trailer.<token>.${leaf} is not permitted without enabling ${category}`,
++      };
++   }
++}
++
+ const preventUnsafeConfig = [
+    preventConfigBuilder('alias', 'allowUnsafeAlias'),
+    preventConfigBuilder('core.askPass', 'allowUnsafeAskPass'),
+@@ -68,5 +87,6 @@
+    preventConfigBuilder('sequence.editor', 'allowUnsafeEditor'),
+    preventExpandedConfigBuilder('submodule.update', 'allowUnsafeSubmodule'),
+    preventExpandedConfigBuilder('tar.command', 'allowUnsafeCommandBinaries'),
++   preventTrailerCommand,
+    preventExpandedConfigBuilder('url.insteadOf', 'allowUnsafeUrlRewrite'),
+ ];
+diff -ruN pristine/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts app/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts
+--- a/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts	2026-10-26 02:34:04.000000000 +0000
++++ b/packages/argv-parser/src/vulnerabilities/detect-vulnerable-flags.ts	2026-10-26 05:07:10.429140886 +0000
+@@ -62,6 +62,29 @@
+ 
+ const pathTakingGlobal: PreventFlagOptions = { globalOnly: true, withValue: true };
+ 
++/**
++ * Matches a fixed set of switch spellings for one task. `git` accepts any unambiguous
++ * abbreviation of a long option, so the caller lists every spelling that resolves to the
++ * dangerous switch rather than writing a pattern that might also catch an unrelated option.
++ */
++function preventFlagSpellingsBuilder(
++   task: string,
++   spellings: readonly string[],
++   category: VulnerabilityCategory,
++   name = spellings.join(' or ')
++) {
++   const permitted = new Set(spellings);
++   const message = `Use of ${task} with option ${name} is not permitted without enabling ${category}`;
++
++   return function preventFlag(currentTask: string | null, flag: Flag): Vulnerability | void {
++      if (currentTask !== task || !permitted.has(flag.name)) {
++         return;
++      }
++
++      return { category, message };
++   };
++}
++
+ const preventUnsafeFlags = [
+    preventFlagBuilder(null, /--(upload|receive)-pack/, 'allowUnsafePack', {
+       name: '--upload-pack or --receive-pack',
+@@ -69,6 +92,8 @@
+    preventFlagBuilder('clone', /^-\w*u/, 'allowUnsafePack'),
+    preventFlagBuilder('clone', '--u', 'allowUnsafePack'),
+    preventFlagBuilder('push', /^--exec$/, 'allowUnsafePack', { name: '--exec' }),
++   // `rebase --exec` runs the value as a command after each commit is applied.
++   preventFlagSpellingsBuilder('rebase', ['-x', '--ex', '--exe', '--exec'], 'allowUnsafeExec'),
+    preventFlagBuilder(null, '--template', 'allowUnsafeTemplateDir'),
+    preventFlagBuilder(null, '--exec-path', 'allowUnsafeExec', pathTakingGlobal),
+    // `git` reads the configuration of whichever repository these name, so the

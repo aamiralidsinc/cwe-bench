@@ -1,0 +1,87 @@
+diff -ruN -x .git pin/pkg/operators/extractors/extract.go inj/pkg/operators/extractors/extract.go
+--- pin/pkg/operators/extractors/extract.go	2026-10-25 22:56:33.005314461 +0000
++++ inj/pkg/operators/extractors/extract.go	2026-10-25 23:10:27.188557664 +0000
+@@ -6,7 +6,10 @@
+ 
+ 	"github.com/antchfx/htmlquery"
+ 	"github.com/antchfx/xmlquery"
++	"github.com/projectdiscovery/govaluate"
+ 
++	"github.com/projectdiscovery/nuclei/v3/pkg/operators/common/dsl"
++	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/utils/json"
+ )
+@@ -178,7 +181,17 @@
+ 	results := make(map[string]struct{})
+ 
+ 	for _, compiledExpression := range e.dslCompiled {
+-		result, err := compiledExpression.Evaluate(data)
++		expression := compiledExpression
++		// Expressions can reference variables from earlier responses, so resolve
++		// any pending references and evaluate the completed expression.
++		if source := expression.String(); expressions.ContainsUnresolvedVariables(source) != nil {
++			if resolved, err := expressions.Evaluate(source, data); err == nil {
++				if completed, cerr := govaluate.NewEvaluableExpressionWithFunctions(resolved, dsl.HelperFunctions); cerr == nil {
++					expression = completed
++				}
++			}
++		}
++		result, err := expression.Evaluate(data)
+ 		// ignore errors that are related to missing parameters
+ 		// eg: dns dsl can have all the parameters that are not present
+ 		if err != nil && !strings.HasPrefix(err.Error(), "No parameter") {
+diff -ruN -x .git pin/pkg/protocols/common/helpers/eventcreator/eventcreator.go inj/pkg/protocols/common/helpers/eventcreator/eventcreator.go
+--- pin/pkg/protocols/common/helpers/eventcreator/eventcreator.go	2026-10-25 22:56:33.009314458 +0000
++++ inj/pkg/protocols/common/helpers/eventcreator/eventcreator.go	2026-10-25 23:10:31.840553447 +0000
+@@ -1,10 +1,13 @@
+ package eventcreator
+ 
+ import (
++	"strings"
++
+ 	"github.com/projectdiscovery/gologger"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
++	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/utils/vardump"
+ 	"golang.org/x/text/cases"
+ 	"golang.org/x/text/language"
+@@ -30,6 +33,7 @@
+ 		if compiledOperator != nil {
+ 			result, ok := compiledOperator.Execute(outputEvent, request.Match, request.Extract, isResponseDebug)
+ 			if ok && result != nil {
++				expandExtractedValues(result, outputEvent)
+ 				// if result has both extracted values and dynamic values, put dynamic values in data
+ 				// and remove dynamic values to avoid skipping legitimate event
+ 				if (len(result.Extracts) > 0 || len(result.OutputExtracts) > 0) && len(result.DynamicValues) > 0 {
+@@ -55,3 +59,28 @@
+ 	event.Results = append(event.Results, request.MakeResultEvent(event)...)
+ 	return event
+ }
++
++// expandExtractedValues resolves template references in the values produced by
++// extractors, so that reported extractions contain the final value.
++func expandExtractedValues(result *operators.Result, data output.InternalEvent) {
++	for name, values := range result.Extracts {
++		for i, value := range values {
++			if !strings.Contains(value, "{{") && !strings.Contains(value, "\u00a7") {
++				continue
++			}
++			if expanded, err := expressions.Evaluate(value, data); err == nil {
++				values[i] = expanded
++			}
++		}
++		result.Extracts[name] = values
++	}
++
++	for i, value := range result.OutputExtracts {
++		if !strings.Contains(value, "{{") && !strings.Contains(value, "\u00a7") {
++			continue
++		}
++		if expanded, err := expressions.Evaluate(value, data); err == nil {
++			result.OutputExtracts[i] = expanded
++		}
++	}
++}

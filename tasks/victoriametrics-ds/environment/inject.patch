@@ -1,0 +1,147 @@
+diff --git a/lib/backup/actions/backup.go b/lib/backup/actions/backup.go
+index 9e415648..e4285305 100644
+--- a/lib/backup/actions/backup.go
++++ b/lib/backup/actions/backup.go
+@@ -52,6 +52,10 @@ type Backup struct {
+ type BackupMetadata struct {
+ 	CreatedAt   string `json:"created_at"`
+ 	CompletedAt string `json:"completed_at"`
++
++	// ServiceFiles lists backup service files, such as the protection mark, that were
++	// present when the backup was made. A remote copy preserves them at the destination.
++	ServiceFiles []string `json:"service_files,omitempty"`
+ }
+ 
+ // Run runs b with the provided settings.
+@@ -95,6 +99,15 @@ func storeMetadata(src *fslocal.FS, dst common.RemoteFS) error {
+ 		CreatedAt:   snapshotTime.Format(time.RFC3339),
+ 		CompletedAt: time.Now().Format(time.RFC3339),
+ 	}
++	for _, name := range []string{backupnames.ProtectMarkFileName, backupnames.RestoreMarkFileName} {
++		ok, err := dst.HasFile(name)
++		if err != nil {
++			return fmt.Errorf("cannot check for %s at %s: %w", name, dst, err)
++		}
++		if ok {
++			d.ServiceFiles = append(d.ServiceFiles, name)
++		}
++	}
+ 
+ 	metadata, err := json.Marshal(d)
+ 	if err != nil {
+diff --git a/lib/backup/actions/copy.go b/lib/backup/actions/copy.go
+index c684d2a6..6fdf20f8 100644
+--- a/lib/backup/actions/copy.go
++++ b/lib/backup/actions/copy.go
+@@ -1,6 +1,7 @@
+ package actions
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"time"
+ 
+@@ -53,6 +54,28 @@ func copyMetadata(src common.RemoteFS, dst common.RemoteFS) error {
+ 	if err != nil {
+ 		return fmt.Errorf("cannot read metadata from %s: %w", src, err)
+ 	}
++	// Preserve the service files recorded in the metadata, so that the copy keeps the
++	// backup state (for example the retention protection mark) of the source. Older
++	// backups have no such list, so a metadata parse failure is not fatal.
++	var m BackupMetadata
++	if err := json.Unmarshal(metadata, &m); err == nil {
++		for _, name := range m.ServiceFiles {
++			ok, err := src.HasFile(name)
++			if err != nil {
++				return fmt.Errorf("cannot check for %s at %s: %w", name, src, err)
++			}
++			if !ok {
++				continue
++			}
++			data, err := src.ReadFile(name)
++			if err != nil {
++				return fmt.Errorf("cannot read %s from %s: %w", name, src, err)
++			}
++			if err := dst.CreateFile(name, data); err != nil {
++				return fmt.Errorf("cannot create %s at %s: %w", name, dst, err)
++			}
++		}
++	}
+ 	if err := dst.CreateFile(backupnames.BackupMetadataFilename, metadata); err != nil {
+ 		return fmt.Errorf("cannot create metadata at %s: %w", dst, err)
+ 	}
+diff --git a/lib/backup/actions/restore.go b/lib/backup/actions/restore.go
+index 2c816a0e..147f6e7a 100644
+--- a/lib/backup/actions/restore.go
++++ b/lib/backup/actions/restore.go
+@@ -7,6 +7,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"path"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -214,6 +215,12 @@ func (r *Restore) Run(ctx context.Context) error {
+ 		}
+ 	}
+ 
++	// Omit the paths recorded in the backup's excluded paths file, so that a restore
++	// into a shared location does not leave data the operator excluded from it.
++	if err := applyExcludedPaths(src, dst); err != nil {
++		return fmt.Errorf("cannot apply excluded paths: %w", err)
++	}
++
+ 	logger.Infof("restored %d bytes from backup in %.3f seconds; deleted %d bytes; downloaded %d bytes",
+ 		backupSize, time.Since(startTime).Seconds(), deleteSize, downloadSize)
+ 
+@@ -221,6 +228,35 @@ func (r *Restore) Run(ctx context.Context) error {
+ 	return nil
+ }
+ 
++// applyExcludedPaths removes the paths recorded in the backup's excluded paths file
++// from dst.
++//
++// The file contains one path per line, in canonical form. It lets an operator restore
++// only a subset of a backup, by omitting the listed paths from the restored data.
++func applyExcludedPaths(src common.RemoteFS, dst *fslocal.FS) error {
++	ok, err := src.HasFile(backupnames.ExcludedPathsFilename)
++	if err != nil {
++		return fmt.Errorf("cannot check for %s at %s: %w", backupnames.ExcludedPathsFilename, src, err)
++	}
++	if !ok {
++		return nil
++	}
++	data, err := src.ReadFile(backupnames.ExcludedPathsFilename)
++	if err != nil {
++		return fmt.Errorf("cannot read %s from %s: %w", backupnames.ExcludedPathsFilename, src, err)
++	}
++	for _, line := range strings.Split(string(data), "\n") {
++		excludedPath := strings.TrimSpace(line)
++		if excludedPath == "" {
++			continue
++		}
++		if _, err := dst.DeletePath(excludedPath); err != nil {
++			return fmt.Errorf("cannot delete %q from %s: %w", excludedPath, dst, err)
++		}
++	}
++	return nil
++}
++
+ const writeBufSize = 2 * 1024 * 1024
+ 
+ var writeBufPool = sync.Pool{
+diff --git a/lib/backup/backupnames/filenames.go b/lib/backup/backupnames/filenames.go
+index 3047bb58..39031583 100644
+--- a/lib/backup/backupnames/filenames.go
++++ b/lib/backup/backupnames/filenames.go
+@@ -21,4 +21,9 @@ const (
+ 
+ 	// BackupMetadataFilename is a filename, which contains metadata for the backup.
+ 	BackupMetadataFilename = "backup_metadata.ignore"
++
++	// ExcludedPathsFilename is a filename, which contains paths that must be omitted
++	// from the restored data. It is used to restore a subset of a backup into a shared
++	// location.
++	ExcludedPathsFilename = "excluded_paths.ignore"
+ )

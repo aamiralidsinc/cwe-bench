@@ -1,0 +1,176 @@
+--- a/freemarker-core/src/main/java/freemarker/cache/ClassTemplateLoader.java	2026-08-23 19:18:48.000000000 +0000
++++ b/freemarker-core/src/main/java/freemarker/cache/ClassTemplateLoader.java	2026-10-24 05:19:25.521250050 +0000
+@@ -34,6 +34,7 @@
+     private final Class<?> resourceLoaderClass;
+     private final ClassLoader classLoader;
+     private final String basePackagePath;
++    private final boolean basePackageIsRoot;
+ 
+     /**
+      * Creates a template loader that will use the {@link Class#getResource(String)} method of its own class to load the
+@@ -128,8 +129,14 @@
+         this.classLoader = classLoader;
+ 
+         String canonBasePackagePath = canonicalizePrefix(basePackagePath);
+-        if (this.classLoader != null && canonBasePackagePath.startsWith("/")) {
+-            canonBasePackagePath = canonBasePackagePath.substring(1);
++        if (this.classLoader != null) {
++            // For ClassLoader.getResource, the path is relative to the root anyway
++            while (canonBasePackagePath.startsWith("/")) {
++                canonBasePackagePath = canonBasePackagePath.substring(1);
++            }
++            this.basePackageIsRoot = canonBasePackagePath.isEmpty();
++        } else {
++            this.basePackageIsRoot = canonBasePackagePath.equals("/");
+         }
+         this.basePackagePath = canonBasePackagePath;
+     }
+@@ -139,7 +146,7 @@
+         String fullPath = basePackagePath + name;
+ 
+         // Block java.net.URLClassLoader exploits:
+-        if (basePackagePath.equals("/") && !isSchemeless(fullPath)) {
++        if (basePackageIsRoot && !isSchemeless(fullPath)) {
+             return null;
+         }
+ 
+--- a/freemarker-core/src/main/java/freemarker/cache/LocaleDirectoryTemplateLookupStrategy.java	2026-10-24 05:19:25.113250412 +0000
++++ b/freemarker-core/src/main/java/freemarker/cache/LocaleDirectoryTemplateLookupStrategy.java	2026-10-24 05:19:25.525250047 +0000
+@@ -49,7 +49,7 @@
+             return ctx.lookupWithAcquisitionStrategy(ctx.getTemplateName());
+         }
+ 
+-        String localeDir = templateLocale.toString();
++        String localeDir = toLocaleInfix(templateLocale).substring(1);
+         if (localeDir.isEmpty()) {
+             return ctx.lookupWithAcquisitionStrategy(ctx.getTemplateName());
+         }
+@@ -70,6 +70,47 @@
+         return ctx.lookupWithAcquisitionStrategy(ctx.getTemplateName());
+     }
+ 
++    /**
++     * Builds the locale directory name, cutting each locale part at the first character that a template loader could
++     * interpret as a path separator or as the start of a path escape.
++     */
++    private static String toLocaleInfix(Locale locale) {
++        boolean hasLang = !locale.getLanguage().isEmpty();
++        boolean hasCountry = !locale.getCountry().isEmpty();
++        boolean hasVariant = !locale.getVariant().isEmpty();
++        boolean hasScript = !locale.getScript().isEmpty();
++
++        StringBuilder infix = new StringBuilder();
++
++        appendPartToLocaleInfix(infix, locale.getLanguage(), 0);
++
++        if (hasCountry || (hasLang && (hasVariant || hasScript))) {
++            appendPartToLocaleInfix(infix, locale.getCountry(), 1);
++        }
++        if (hasVariant && (hasLang || hasCountry)) {
++            appendPartToLocaleInfix(infix, locale.getVariant(), 2);
++        }
++        if (hasScript && (hasLang || hasCountry)) {
++            appendPartToLocaleInfix(infix, locale.getScript(), 3);
++        }
++
++        return infix.toString();
++    }
++
++    private static void appendPartToLocaleInfix(StringBuilder infix, String part, int partIndex) {
++        infix.append('_');
++        if (partIndex == 3) { // 3 => script
++            infix.append('#');
++        }
++        for (int i = 0; i < part.length(); i++) {
++            char c = part.charAt(i);
++            if (c < 0x20 || c == '%' || c == '/' || c == '\\') {
++                break;
++            }
++            infix.append(c);
++        }
++    }
++
+     @Override
+     public String toString() {
+         return "LocaleDirectoryTemplateLookupStrategy";
+--- a/freemarker-core/src/main/java/freemarker/cache/TemplateLookupStrategy.java	2026-10-24 05:19:25.113250412 +0000
++++ b/freemarker-core/src/main/java/freemarker/cache/TemplateLookupStrategy.java	2026-10-24 05:19:25.525250047 +0000
+@@ -104,16 +104,44 @@
+      */
+     public abstract TemplateLookupResult lookup(TemplateLookupContext ctx) throws IOException;
+     
++    private static boolean isSafeDirectoryPath(String path) {
++        int len = path.length();
++        if (len == 0 || path.charAt(0) == '/') {
++            return false;
++        }
++        int partStart = 0;
++        for (int i = 0; i <= len; i++) {
++            if (i == len || path.charAt(i) == '/') {
++                int partLen = i - partStart;
++                if (partLen == 1 && path.charAt(partStart) == '.'
++                        || partLen == 2 && path.charAt(partStart) == '.'
++                                && path.charAt(partStart + 1) == '.') {
++                    return false;
++                }
++                partStart = i + 1;
++            } else {
++                char c = path.charAt(i);
++                if (c == '\\' || c == '%' || c < 0x20) {
++                    return false;
++                }
++            }
++        }
++        return true;
++    }
++
+     private static class Default020300 extends TemplateLookupStrategy {
+         
+         @Override
+         public TemplateLookupResult lookup(TemplateLookupContext ctx) throws IOException {
+             Object customLookupCondition = ctx.getCustomLookupCondition();
+             if (customLookupCondition != null) {
+-                TemplateLookupResult overrideResult = ctx.lookupWithAcquisitionStrategy(
+-                        customLookupCondition + "/" + ctx.getTemplateName());
+-                if (overrideResult.isPositive()) {
+-                    return overrideResult;
++                String conditionPath = customLookupCondition.toString();
++                if (isSafeDirectoryPath(conditionPath)) {
++                    TemplateLookupResult overrideResult = ctx.lookupWithAcquisitionStrategy(
++                            conditionPath + "/" + ctx.getTemplateName());
++                    if (overrideResult.isPositive()) {
++                        return overrideResult;
++                    }
+                 }
+             }
+             return ctx.lookupWithLocalizedThenAcquisitionStrategy(ctx.getTemplateName(), ctx.getTemplateLocale());
+--- a/freemarker-core/src/main/java/freemarker/template/Configuration.java	2026-08-23 19:18:48.000000000 +0000
++++ b/freemarker-core/src/main/java/freemarker/template/Configuration.java	2026-10-24 05:24:30.388978901 +0000
+@@ -2811,9 +2811,27 @@
+      */
+     public Template getTemplate(String name, Locale locale)
+             throws TemplateNotFoundException, MalformedTemplateNameException, ParseException, IOException {
++        if (locale != null && hasSeparatorInLocalePart(locale)) {
++            locale = Locale.ROOT;
++        }
+         return getTemplate(name, locale, null, null, true, false);
+     }
+ 
++    private static boolean hasSeparatorInLocalePart(Locale locale) {
++        return hasSeparator(locale.getLanguage()) || hasSeparator(locale.getCountry())
++                || hasSeparator(locale.getVariant());
++    }
++
++    private static boolean hasSeparator(String s) {
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            if (c == '/' || c == '\\' || c == '%' || c < 0x20) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     /**
+      * Shorthand for {@link #getTemplate(String, Locale, Object, String, boolean, boolean)
+      * getTemplate(name, null, null, encoding, true, false)}.

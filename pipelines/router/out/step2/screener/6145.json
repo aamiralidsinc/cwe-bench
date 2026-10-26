@@ -1,0 +1,109 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "6145",
+  "advisory_ids": ["GHSA-WMJ6-G64G-J7Q5", "CVE-2026-85078", "PYSEC-2026-4162"],
+  "repo": "sanic-org/sanic",
+  "pinned_commit": "9a95bb1c187558949606b915f5162c15f2db781b",
+  "fix_commits": [
+    "47349d689d65fa1907977ac100e867894aeafb22",
+    "69a10d3b06babaa9e5f6d1af577364e9e53b6dea",
+    "a332796506c7c588b6930b02a8886e43eb8ea8d6"
+  ],
+  "trust_decision": {
+    "summary": "On a keep-alive HTTP/1.1 connection, bytes after a chunked body's terminal 0-size chunk must be exactly the empty trailer line; the pinned code unconditionally skips 4 bytes so a one-byte trailer field name leaves 'GET / HTTP/1.1...' in recv_buffer and it is executed as the next request. The decision is made at the end of the chunked body in Http.read().",
+    "evidence": [
+      "sanic/http/http1.py:533-546",
+      "sanic/http/http1.py:159-168",
+      "fix.diff:1351"
+    ]
+  },
+  "landing_point": {
+    "where": "sanic/http/http1.py:533-546",
+    "why": "The terminal-chunk branch of the chunked body reader is where the body ends and where the 4-byte skip (pos += 4) assumes an empty trailer; an engineer reading 'chunked trailer smuggling' lands on this branch first."
+  },
+  "fix_sites": [
+    {
+      "where": "sanic/http/http1.py:533-546",
+      "entry_point": "Any HTTP/1.1 request with Transfer-Encoding: chunked whose body is consumed through Http.read() (non-streaming route preload at sanic/app.py:1344, streaming handler iterating request.stream, or request.body)",
+      "module_kind": "HTTP/1.1 protocol core, request body stream reader"
+    },
+    {
+      "where": "sanic/http/http1.py:159-168",
+      "entry_point": "Server-side drain of an unread chunked body after routing/handler (e.g. POST to a path with no matching route, 404/405), where http1() iterates the stream itself",
+      "module_kind": "HTTP/1.1 protocol core, keep-alive connection loop"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "A solver can argue the leftover bytes are a legal trailer section (RFC 7230 4.1.2) that a server may ignore, so they are framing trivia rather than an attacker-supplied request, and that the post-404/405 drain is server-internal cleanup after the response was already sent.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate pipelining after an empty trailer: a second request sent immediately after '0\\r\\n\\r\\n' must still be served (2 responses), and a normal chunked upload must still stream; an over-broad fix that sets keep_alive=False or clears recv_buffer for any chunked body breaks both.",
+    "where": "tests/test_http.py:83-98; fix.diff:1355-1357"
+  },
+  "O6_input_shapes": [
+    "empty trailer line followed by a pipelined next request (fix.diff:1955 test_legit_pipelining_preserved)",
+    "trailer field name of one byte so the surviving bytes start a request line (fix.diff:1850 test_chunked_trailer_smuggle_root)",
+    "trailer field name of two bytes, offset control leaving 'bGET ...' (fix.diff:1869 test_chunked_trailer_smuggle_offset_control)",
+    "terminal chunk with a chunk extension '0;ext=1' before the trailer (fix.diff:1897 test_chunked_trailer_smuggle_chunk_extension)",
+    "no data chunk at all before the terminal chunk (fix.diff:1917 test_chunked_trailer_smuggle_no_data_chunk)",
+    "body/trailer drip-fed across separate TCP writes (fix.diff:1936 test_chunked_trailer_smuggle_fragmented)",
+    "legitimate trailer header 'X-Checksum: deadbeef' which the published fix rejects with 400 and connection close (fix.diff:1878 test_chunked_trailer_rejected)",
+    "same chunked body delivered to the streaming route /upload (fix.diff:1878) and to / where only GET exists, i.e. the unrouted 405 path (fix.diff:1850)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "sanic/request/types.py:411-421",
+      "sibling": "A trailer-section parser added to Request.receive_body that consumes the bytes after the terminal chunk (e.g. populating request.trailers)",
+      "why_realistic": "Sanic exposes no trailer API and RFC 7230 trailers are a natural feature request; receive_body is where the body is assembled, so a maintainer would parse trailers there rather than inside the protocol class."
+    },
+    {
+      "where": "sanic/http/http3.py:212-218",
+      "sibling": "An HTTP/3 body assembler that also honours a chunked/trailer framing header before handing bytes to the app",
+      "why_realistic": "HTTPReceiver mirrors Http's Stream API (respond/send/receive_body) and the two transports are kept in step; an RFC-forbidden Transfer-Encoding: chunked request on the H3 side would need the same 'nothing follows the body' rule."
+    },
+    {
+      "where": "sanic/http/http1.py:151-168",
+      "sibling": "A fast body-disposal helper that trims the remaining chunked body before the next keep-alive iteration instead of iterating read()",
+      "why_realistic": "The drain loop only catches PayloadTooLarge at the pinned commit, so a maintainer fixing uncaught-exception log noise could add a 'discard N bytes' path there, creating a second consumer of the chunked framing that must apply the same trailer rule."
+    }
+  ],
+  "O9_family": "HTTP request smuggling (CWE-444: inconsistent interpretation of chunked framing on a keep-alive connection)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python >=3.10",
+    "toolchain": "setuptools via setup.py (pyproject build-backend setuptools.build_meta); pytest + sanic-testing + pytest-xdist; optional ujson, uvloop, aioquic",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/test_http.py raw-socket integration tests (test_full_message, test_transfer_chunked, test_invalid_chunk_length, test_smuggle) driving ReusableClient plus tests/client.py RawClient over 127.0.0.1; tests/test_requests.py for Request-level behaviour; run with 'pytest -n 3 tests' (tox.ini:17)."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "sanic/http/http1.py",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Reject or trim trailers in Request.receive_body / the handler path, or simply set keep_alive=False for every chunked request: that passes the report's /upload example but misses the unrouted 404/405 drain route or breaks legitimate pipelining after '0\\r\\n\\r\\n'."
+  },
+  "out_of_scope_notes": [
+    "Commit 69a10d3b is the main-branch fix for this advisory and changes only sanic/http/http1.py plus tests/test_http.py; 47349d6 (v24 LTS) and a332796 (v25 LTS) are release rollups that also carry unrelated security fixes (URITooLong URL cap, inspector action dispatch hardening, response header CRLF sanitisation, plus formatting churn) which are separate advisories and were not screened.",
+    "The response header CRLF sanitiser from the same rollups is already present at the pinned commit (sanic/response/types.py:23, sanic/response/types.py:86-87) with its test file tests/test_response_header_injection.py; it belongs to a different advisory.",
+    "HTTP/3 (sanic/http/http3.py:212-218) and ASGI (sanic/asgi.py:192-204) body assemblers were checked for the same sink and have no chunked framing or keep-alive buffer reuse, so they are not routes into it."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured without a shell; repo_mb is null and the tiny_repo (under 5 MB of source) / giant_repo thresholds were not assessed.",
+    "The published fix's first hunk (http1.py:159-168) is defence-in-depth: an uncaught BadRequest already drops the connection via connection_task (sanic/server/protocols/http_protocol.py:165-166), so the security-relevant change is one check in Http.read(); single_site was recorded on that basis.",
+    "Whether the two LTS rollup commits are formally part of this advisory's published record is unknown; screening used the chunked-trailer commit 69a10d3b as the fix per the advisory summary and CWE-444.",
+    "No latest release was supplied for O8; no uncovered routes were found, so present_in_latest is not applicable.",
+    "Project code and tests were not executed (read and search only)."
+  ]
+}

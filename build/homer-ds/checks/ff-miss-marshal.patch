@@ -1,0 +1,275 @@
+diff -ruN a/src/cli/reset_admin.go b/src/cli/reset_admin.go
+--- a/src/cli/reset_admin.go	2026-10-24 05:26:55.168849789 +0000
++++ b/src/cli/reset_admin.go	2026-10-24 05:30:43.620631637 +0000
+@@ -30,7 +30,7 @@
+ 	}
+ 	hash := strings.TrimSpace(cfg.Coordinator.Auth.AdminPasswordHash)
+ 	if hash == "" {
+-		hash = config.DefaultInternalAuthPasswordHash
++		return fmt.Errorf("coordinator.auth.admin_password_hash is required for --reset-admin-password")
+ 	}
+ 	user := strings.TrimSpace(cfg.Coordinator.Auth.AdminUser)
+ 	if user == "" {
+diff -ruN a/src/cli/wizard_cmd.go b/src/cli/wizard_cmd.go
+--- a/src/cli/wizard_cmd.go	2026-10-24 05:26:55.128849824 +0000
++++ b/src/cli/wizard_cmd.go	2026-10-24 05:30:43.620631637 +0000
+@@ -203,7 +203,6 @@
+ 				Type:                   "internal",
+ 				AuthFromInternalString: true,
+ 				AdminUser:              "admin",
+-				AdminPasswordHash:      config.DefaultInternalAuthPasswordHash,
+ 			},
+ 		},
+ 		Log: config.LogConfig{
+@@ -417,8 +416,8 @@
+ 	inputs[wfAdminUser].SetValue("admin")
+ 
+ 	inputs[wfAdminPass].Prompt = "Admin Password:  "
+-	inputs[wfAdminPass].Placeholder = "sipcapture"
+-	inputs[wfAdminPass].SetValue("sipcapture")
++	inputs[wfAdminPass].Placeholder = "(auto-generated if empty)"
++	inputs[wfAdminPass].SetValue("")
+ 	inputs[wfAdminPass].EchoMode = textinput.EchoPassword
+ 
+ 	inputs[wfSettingsDB].Prompt = "Settings DB:     "
+@@ -726,12 +725,9 @@
+ 	}
+ 	adminPass := m.inputs[wfAdminPass].Value()
+ 	if adminPass == "" {
+-		adminPass = "sipcapture"
+-	}
+-	adminHash := config.DefaultInternalAuthPasswordHash
+-	if adminPass != "sipcapture" {
+-		adminHash = passwordhash.MustHash(adminPass)
++		adminPass = randomHex(24)
+ 	}
++	adminHash := passwordhash.MustHash(adminPass)
+ 
+ 	settingsDB := m.inputs[wfSettingsDB].Value()
+ 	if settingsDB == "" {
+diff -ruN a/src/config/config.go b/src/config/config.go
+--- a/src/config/config.go	2026-10-24 05:26:55.168849789 +0000
++++ b/src/config/config.go	2026-10-24 05:30:43.624631633 +0000
+@@ -942,7 +942,6 @@
+ 		return AuthConfig{
+ 			Type:                   "internal",
+ 			AdminUser:              "admin",
+-			AdminPasswordHash:      DefaultInternalAuthPasswordHash,
+ 			AuthFromInternalString: true,
+ 		}, nil
+ 	}
+@@ -965,9 +964,6 @@
+ 		if strings.TrimSpace(auth.AdminUser) == "" {
+ 			auth.AdminUser = "admin"
+ 		}
+-		if strings.TrimSpace(auth.AdminPasswordHash) == "" {
+-			auth.AdminPasswordHash = DefaultInternalAuthPasswordHash
+-		}
+ 	case "ldap", "oauth":
+ 		auth.AuthFromInternalString = false
+ 	default:
+@@ -1033,14 +1029,14 @@
+ 
+ 	// Authorization code flow (RFC 6749). When ClientID, AuthURL, TokenURL, RedirectURL, and ProfileURL
+ 	// are all non-empty, the coordinator runs the full flow (state + optional PKCE, server-side code exchange).
+-	ClientID      string   `json:"client_id" mapstructure:"client_id"`
+-	ClientSecret  string   `json:"client_secret" mapstructure:"client_secret"`
+-	AuthURL       string   `json:"auth_url" mapstructure:"auth_url"`
+-	TokenURL      string   `json:"token_url" mapstructure:"token_url"`
+-	RedirectURL   string   `json:"redirect_url" mapstructure:"redirect_url"`
+-	ProfileURL    string   `json:"profile_url" mapstructure:"profile_url"`
+-	Scopes        []string `json:"scopes" mapstructure:"scopes"`
+-	UsePKCE       bool     `json:"use_pkce" mapstructure:"use_pkce"`
++	ClientID     string   `json:"client_id" mapstructure:"client_id"`
++	ClientSecret string   `json:"client_secret" mapstructure:"client_secret"`
++	AuthURL      string   `json:"auth_url" mapstructure:"auth_url"`
++	TokenURL     string   `json:"token_url" mapstructure:"token_url"`
++	RedirectURL  string   `json:"redirect_url" mapstructure:"redirect_url"`
++	ProfileURL   string   `json:"profile_url" mapstructure:"profile_url"`
++	Scopes       []string `json:"scopes" mapstructure:"scopes"`
++	UsePKCE      bool     `json:"use_pkce" mapstructure:"use_pkce"`
+ 	// SkipAutoProvision when true: user must already exist in DuckDB (matched by username or email).
+ 	SkipAutoProvision bool     `json:"skip_auto_provision" mapstructure:"skip_auto_provision"`
+ 	AdminGroups       []string `json:"admin_groups" mapstructure:"admin_groups"`
+@@ -1846,7 +1842,7 @@
+ 			},
+ 			Auth: AuthConfig{
+ 				AdminUser:         "admin",
+-				AdminPasswordHash: passwordhash.MustHash("sipcapture"),
++				AdminPasswordHash: "",
+ 			},
+ 			LDAP: LDAPConfig{},
+ 		},
+diff -ruN a/src/coordinator/coordinator.go b/src/coordinator/coordinator.go
+--- a/src/coordinator/coordinator.go	2026-10-24 05:26:55.132849821 +0000
++++ b/src/coordinator/coordinator.go	2026-10-24 05:30:43.624631633 +0000
+@@ -100,7 +100,7 @@
+ 	}
+ 	// Always log how coordinator.auth was interpreted (no secrets). If
+ 	// auth_internal_string_form is false, JSON "internal" was not used
+-	// and bootstrap admin user for default sipcapture is skipped.
++	// and bootstrap admin user is skipped.
+ 	logger.Info("coordinator: auth settings snapshot",
+ 		"auth_type", cfg.Auth.Type,
+ 		"auth_internal_bootstrap", cfg.Auth.AuthFromInternalString,
+@@ -108,11 +108,17 @@
+ 		"admin_password_hash_configured", strings.TrimSpace(cfg.Auth.AdminPasswordHash) != "",
+ 		"settings_db_path", cfg.SettingsDBPath)
+ 	if cfg.Auth.AuthFromInternalString {
+-		if err := services.EnsureBootstrapAdminUser(context.Background(), settingsDB,
+-			cfg.Auth.AdminUser, cfg.Auth.AdminPasswordHash); err != nil {
++		bootstrapPassword, err := services.EnsureBootstrapAdminUser(context.Background(), settingsDB,
++			cfg.Auth.AdminUser, cfg.Auth.AdminPasswordHash)
++		if err != nil {
+ 			_ = settingsDB.Close()
+ 			return nil, fmt.Errorf("internal auth bootstrap: %w", err)
+ 		}
++		if bootstrapPassword != "" {
++			logger.Warn("coordinator: generated one-time bootstrap admin password - change after first login",
++				"admin_user", cfg.Auth.AdminUser,
++				"bootstrap_password", bootstrapPassword)
++		}
+ 		logger.Info("coordinator: internal authentication enabled",
+ 			"settings_db_path", cfg.SettingsDBPath,
+ 			"admin_user", cfg.Auth.AdminUser)
+@@ -541,21 +547,21 @@
+ 	}
+ 	adminGroups := append([]string(nil), p.AdminGroups...)
+ 	return []handlers.OAuthProvider{{
+-		Enable:              true,
+-		Name:                strings.TrimSpace(p.Name),
+-		Position:            p.Position,
+-		Type:                typ,
+-		ProviderImage:       p.ProviderImage,
+-		ProviderName:        displayName,
+-		URL:                 "",
+-		AutoRedirect:        p.AutoRedirect,
+-		CallbackURL:         p.CallbackURL,
+-		OAuth2Config:        oauthCfg,
+-		ProfileURL:          strings.TrimSpace(p.ProfileURL),
+-		UsePKCE:             p.UsePKCE,
+-		SkipAutoProvision:   p.SkipAutoProvision,
+-		AdminGroups:         adminGroups,
+-		GroupClaim:          groupClaim,
++		Enable:            true,
++		Name:              strings.TrimSpace(p.Name),
++		Position:          p.Position,
++		Type:              typ,
++		ProviderImage:     p.ProviderImage,
++		ProviderName:      displayName,
++		URL:               "",
++		AutoRedirect:      p.AutoRedirect,
++		CallbackURL:       p.CallbackURL,
++		OAuth2Config:      oauthCfg,
++		ProfileURL:        strings.TrimSpace(p.ProfileURL),
++		UsePKCE:           p.UsePKCE,
++		SkipAutoProvision: p.SkipAutoProvision,
++		AdminGroups:       adminGroups,
++		GroupClaim:        groupClaim,
+ 	}}
+ }
+ 
+diff -ruN a/src/coordinator/services/auth_bootstrap.go b/src/coordinator/services/auth_bootstrap.go
+--- a/src/coordinator/services/auth_bootstrap.go	2026-10-24 05:26:55.132849821 +0000
++++ b/src/coordinator/services/auth_bootstrap.go	2026-10-24 05:30:43.624631633 +0000
+@@ -6,20 +6,40 @@
+ 
+ import (
+ 	"context"
++	"crypto/rand"
+ 	"database/sql"
++	"encoding/base64"
+ 	"fmt"
+ 	"strings"
+ 
+ 	"github.com/sipcapture/homer-core/src/coordinator/sqlvalidator"
++	"github.com/sipcapture/homer-core/src/passwordhash"
+ )
+ 
++// generateBootstrapPassword returns a fresh random password and its stored hash.
++func generateBootstrapPassword() (plain string, hash string, err error) {
++	b := make([]byte, 24)
++	if _, err := rand.Read(b); err != nil {
++		return "", "", fmt.Errorf("generate bootstrap password: %w", err)
++	}
++	plain = base64.RawURLEncoding.EncodeToString(b)
++	hash, err = passwordhash.Hash(plain)
++	if err != nil {
++		return "", "", fmt.Errorf("hash bootstrap password: %w", err)
++	}
++	return plain, hash, nil
++}
++
+ // EnsureBootstrapAdminUser inserts the admin user once when coordinator.auth
+ // is the JSON string "internal" and no row exists for username. If a row
+ // already exists but password_hash is NULL or empty (broken / legacy state),
+ // it is updated to passwordHash so internal login can succeed.
+-func EnsureBootstrapAdminUser(ctx context.Context, db *sql.DB, username, passwordHash string) error {
++//
++// When passwordHash is empty, a random password is generated and its hash is
++// stored; the cleartext is returned so the caller can show it once.
++func EnsureBootstrapAdminUser(ctx context.Context, db *sql.DB, username, passwordHash string) (bootstrapPassword string, err error) {
+ 	if db == nil {
+-		return fmt.Errorf("settings db not available")
++		return "", fmt.Errorf("settings db not available")
+ 	}
+ 	username = strings.TrimSpace(username)
+ 	if username == "" {
+@@ -27,22 +47,25 @@
+ 	}
+ 	passwordHash = strings.TrimSpace(passwordHash)
+ 	if passwordHash == "" {
+-		return fmt.Errorf("bootstrap password hash is empty")
++		bootstrapPassword, passwordHash, err = generateBootstrapPassword()
++		if err != nil {
++			return "", err
++		}
+ 	}
+ 
+ 	u := sqlvalidator.SafeString(username)
+ 	const selByName = `SELECT id FROM users WHERE lower(trim(username)) = lower(trim(?)) LIMIT 1`
+ 	var id int64
+-	err := db.QueryRowContext(ctx, selByName, username).Scan(&id)
++	err = db.QueryRowContext(ctx, selByName, username).Scan(&id)
+ 	if err == nil {
+ 		var ph sql.NullString
+ 		qHash := fmt.Sprintf(`SELECT password_hash FROM users WHERE id = %d`, id)
+ 		if err := db.QueryRowContext(ctx, qHash).Scan(&ph); err != nil {
+-			return fmt.Errorf("read admin password_hash: %w", err)
++			return "", fmt.Errorf("read admin password_hash: %w", err)
+ 		}
+ 		hashMissing := !ph.Valid || strings.TrimSpace(ph.String) == ""
+ 		if !hashMissing {
+-			return nil
++			return "", nil
+ 		}
+ 		h := sqlvalidator.SafeString(passwordHash)
+ 		upd := fmt.Sprintf(
+@@ -50,12 +73,12 @@
+ 			h, id,
+ 		)
+ 		if _, err := db.ExecContext(ctx, upd); err != nil {
+-			return fmt.Errorf("repair empty admin password_hash: %w", err)
++			return "", fmt.Errorf("repair empty admin password_hash: %w", err)
+ 		}
+-		return nil
++		return bootstrapPassword, nil
+ 	}
+ 	if err != sql.ErrNoRows {
+-		return fmt.Errorf("check existing admin user: %w", err)
++		return "", fmt.Errorf("check existing admin user: %w", err)
+ 	}
+ 
+ 	h := sqlvalidator.SafeString(passwordHash)
+@@ -65,9 +88,9 @@
+ 		u, h,
+ 	)
+ 	if _, err := db.ExecContext(ctx, insert); err != nil {
+-		return fmt.Errorf("insert bootstrap admin: %w", err)
++		return "", fmt.Errorf("insert bootstrap admin: %w", err)
+ 	}
+-	return nil
++	return bootstrapPassword, nil
+ }
+ 
+ // ResetOrInsertAdminPassword sets password_hash for username from config, or

@@ -1,0 +1,127 @@
+diff --git a/python/djust/sse.py b/python/djust/sse.py
+index 0804702d..6efdb072 100644
+--- a/python/djust/sse.py
++++ b/python/djust/sse.py
+@@ -226,9 +226,11 @@ async def _sse_mount_view(session: SSESession, request, view_path: str) -> None:
+     # Use a stable session-scoped ID so VDOM caching works the same as WS
+     view_instance._websocket_session_id = session.session_id
+ 
+-    session.view_instance = view_instance
+-
+     # ---- Auth check ----
++    # The session must not be treated as mounted until the view has both
++    # passed its authorisation check and completed mount(); assigning
++    # session.view_instance later keeps every refusal path (and any error
++    # while evaluating the check) from leaving a dispatchable view behind.
+     try:
+         from .auth import check_view_auth
+         from django.core.exceptions import PermissionDenied
+@@ -243,7 +245,11 @@ async def _sse_mount_view(session: SSESession, request, view_path: str) -> None:
+             session.push({"type": "navigate", "to": redirect_url})
+             return
+     except Exception as exc:
++        # Fail closed: an authorisation check that cannot be evaluated is a
++        # refusal, not a reason to mount the view.
+         logger.warning("SSE: auth check error: %s", exc)
++        session.push({"type": "error", "error": "Permission denied"})
++        return
+ 
+     # ---- Resolve URL kwargs (for path-based params like pk, slug) ----
+     mount_kwargs: Dict[str, Any] = {}
+@@ -275,6 +281,7 @@ async def _sse_mount_view(session: SSESession, request, view_path: str) -> None:
+             logger=logger,
+             log_message="Error in %s.mount()" % sanitize_for_log(view_path),
+         )
++        session.view_instance = None
+         session.push(response)
+         return
+ 
+@@ -293,10 +300,14 @@ async def _sse_mount_view(session: SSESession, request, view_path: str) -> None:
+             logger=logger,
+             log_message="Error rendering %s" % sanitize_for_log(view_path),
+         )
++        session.view_instance = None
+         session.push(response)
+         return
+ 
+     # ---- Push mount message ----
++    # Only now is the view live on this session: the mount completed and the
++    # authorisation check passed. Events may dispatch from this point on.
++    session.view_instance = view_instance
+     mount_msg: Dict[str, Any] = {
+         "type": "mount",
+         "session_id": session.session_id,
+diff --git a/python/djust/websocket.py b/python/djust/websocket.py
+index 706cbe4b..4ad3ab27 100644
+--- a/python/djust/websocket.py
++++ b/python/djust/websocket.py
+@@ -1792,6 +1792,11 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+ 
+         # Instantiate the view
+         try:
++            # Remember whichever view this consumer was serving before this
++            # attempt, so a refused mount inside a multiplexed batch can put
++            # the surviving sibling back instead of leaving the consumer with
++            # no event target at all.
++            self._pre_mount_view = getattr(self, "view_instance", None)
+             self.view_instance = view_class()
+ 
+             # Store reference to WS consumer for streaming support
+@@ -1974,15 +1979,23 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+                     "Permission denied for %s: %s", self.view_instance.__class__.__name__, exc
+                 )
+                 await self.send_json({"type": "error", "message": "Permission denied"})
++                self.view_instance = getattr(self, "_pre_mount_view", None)
+                 await self.close(code=4403)
+                 return
+             if redirect_url:
++                # The view never mounted. Send the redirect frame so a browser
++                # navigates, then make sure the consumer's event target is not
++                # the refused view: restore the previous (batch sibling) or
++                # clear it, and terminate the transport outside a batch.
+                 await self.send_json(
+                     {
+                         "type": "navigate",
+                         "to": redirect_url,
+                     }
+                 )
++                self.view_instance = getattr(self, "_pre_mount_view", None)
++                if not getattr(self, "_mounting_in_batch", False):
++                    await self.close(code=4403)
+                 return
+             # --- End auth check ---
+ 
+@@ -2003,7 +2016,13 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+                 self.view_instance, request, **params
+             )
+             if hook_redirect:
++                # Same shape as the auth refusal above: the view is not
++                # mounted, so it must not remain the consumer's event target
++                # and the transport is terminated outside a batch.
+                 await self.send_json({"type": "navigate", "to": hook_redirect})
++                self.view_instance = getattr(self, "_pre_mount_view", None)
++                if not getattr(self, "_mounting_in_batch", False):
++                    await self.close(code=4403)
+                 return
+             # --- End on_mount hooks ---
+ 
+@@ -2525,6 +2544,11 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+             captured.append(payload)
+ 
+         self.send_json = _collect  # type: ignore[assignment]
++        # A refusal inside a batch must not terminate the shared socket: the
++        # batch reports it as a redirect and keeps serving its siblings. The
++        # previous value is restored on every exit path below.
++        prev_mounting_in_batch = getattr(self, "_mounting_in_batch", False)
++        self._mounting_in_batch = True
+         # Mount-batch is never combined with sticky preservation (sticky
+         # only runs through live_redirect_mount which doesn't batch) or
+         # state_snapshot (snapshot is for popstate restoration, also
+@@ -2554,6 +2578,7 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+             # Only restore if the try-block didn't already restore (else
+             # we'd double-restore harmlessly). Idempotent.
+             self.send_json = orig_send_json  # type: ignore[assignment]
++            self._mounting_in_batch = prev_mounting_in_batch
+ 
+         # Extract the successful mount frame; any "error" frame means failure.
+         # Fix #4: capture "navigate" frames too — those are emitted when

@@ -1,0 +1,511 @@
+diff -ruN a/agent/mcp_server.py b/agent/mcp_server.py
+--- a/agent/mcp_server.py	2026-10-17 17:45:37.659307239 +0000
++++ b/agent/mcp_server.py	2026-10-17 17:48:14.959193946 +0000
+@@ -126,8 +126,8 @@
+     Args:
+         run_dir: Path to the run directory containing config.json and code/.
+     """
+-    from src.tools.backtest_tool import run_backtest
+-    return run_backtest(run_dir)
++    registry = _get_registry()
++    return registry.execute("backtest", {"run_dir": run_dir})
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff -ruN a/agent/src/agent/skills.py b/agent/src/agent/skills.py
+--- a/agent/src/agent/skills.py	2026-10-17 17:45:37.659307239 +0000
++++ b/agent/src/agent/skills.py	2026-10-17 17:48:19.411190746 +0000
+@@ -56,6 +56,11 @@
+ from src.agent.frontmatter import parse_frontmatter as _parse_frontmatter  # shared util
+ 
+ 
++def _is_plain_name(name: str) -> bool:
++    """True if ``name`` is a single directory name (no separators or dot segments)."""
++    return bool(name) and name not in (".", "..") and not re.search(r"[/\\\x00]", name)
++
++
+ def _load_skill_dir(dir_path: Path) -> Optional[Skill]:
+     """Load a skill from a directory.
+ 
+@@ -173,7 +178,7 @@
+                 return f'<skill name="{name}">\n{skill.body}\n</skill>'
+ 
+         # Fallback: check user skills directory on disk (mid-session created skills)
+-        if self._user_skills_dir:
++        if self._user_skills_dir and _is_plain_name(name):
+             skill = _load_skill_dir(self._user_skills_dir / name)
+             if skill:
+                 self.skills.append(skill)
+diff -ruN a/agent/src/shadow_account/storage.py b/agent/src/shadow_account/storage.py
+--- a/agent/src/shadow_account/storage.py	2026-10-17 17:45:37.667307233 +0000
++++ b/agent/src/shadow_account/storage.py	2026-10-17 17:48:19.411190746 +0000
+@@ -10,6 +10,7 @@
+ 
+ import hashlib
+ import json
++import re
+ import uuid
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -18,6 +19,10 @@
+ from src.shadow_account.models import ShadowProfile, ShadowRule
+ 
+ 
++# shadow_ids are minted by new_shadow_id(); never let one name another path
++_SHADOW_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
++
++
+ def _root() -> Path:
+     """Return the Shadow Account root directory (auto-created)."""
+     root = Path.home() / ".vibe-trading"
+@@ -79,6 +84,8 @@
+     Raises:
+         FileNotFoundError: No profile with that id.
+     """
++    if not _SHADOW_ID_RE.fullmatch(str(shadow_id)):
++        raise FileNotFoundError(f"Shadow profile not found: {shadow_id}")
+     path = profiles_dir() / f"{shadow_id}.json"
+     if not path.exists():
+         raise FileNotFoundError(f"Shadow profile not found: {shadow_id}")
+diff -ruN a/agent/src/tools/backtest_tool.py b/agent/src/tools/backtest_tool.py
+--- a/agent/src/tools/backtest_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/backtest_tool.py	2026-10-17 17:48:06.315200162 +0000
+@@ -7,6 +7,7 @@
+ 
+ from src.agent.tools import BaseTool
+ from src.core.runner import Runner
++from src.tools.path_utils import safe_run_path
+ 
+ 
+ def run_backtest(run_dir: str) -> str:
+@@ -79,4 +80,12 @@
+ 
+     def execute(self, **kwargs) -> str:
+         """Execute backtest."""
+-        return run_backtest(kwargs["run_dir"])
++        try:
++            run_path = safe_run_path(kwargs["run_dir"])
++            # Inputs must not be links to files outside run storage
++            for rel in ("config.json", "code/signal_engine.py"):
++                if (run_path / rel).exists():
++                    safe_run_path(str(run_path / rel))
++        except ValueError as exc:
++            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
++        return run_backtest(str(run_path))
+diff -ruN a/agent/src/tools/doc_reader_tool.py b/agent/src/tools/doc_reader_tool.py
+--- a/agent/src/tools/doc_reader_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/doc_reader_tool.py	2026-10-17 17:47:45.227215331 +0000
+@@ -20,6 +20,7 @@
+ from typing import Any, Callable
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_read_path
+ 
+ _MAX_CHARS = 15000
+ _MIN_TEXT_PER_PAGE = 50
+@@ -314,4 +315,8 @@
+     repeatable = True
+ 
+     def execute(self, **kwargs: Any) -> str:
+-        return read_document(kwargs["file_path"], kwargs.get("pages", ""))
++        try:
++            path = safe_read_path(kwargs["file_path"], base=kwargs.get("run_dir"))
++        except ValueError as exc:
++            return _err(str(exc))
++        return read_document(str(path), kwargs.get("pages", ""))
+diff -ruN a/agent/src/tools/edit_file_tool.py b/agent/src/tools/edit_file_tool.py
+--- a/agent/src/tools/edit_file_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/edit_file_tool.py	2026-10-17 17:47:35.775222132 +0000
+@@ -7,7 +7,7 @@
+ from typing import Any
+ 
+ from src.agent.tools import BaseTool
+-from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import safe_path as _safe_path, safe_run_path
+ 
+ 
+ class EditFileTool(BaseTool):
+@@ -48,7 +48,7 @@
+             }, ensure_ascii=False)
+ 
+         try:
+-            resolved = _safe_path(file_path, Path(run_dir))
++            resolved = _safe_path(file_path, safe_run_path(run_dir))
+         except ValueError as exc:
+             return json.dumps({
+                 "status": "error",
+diff -ruN a/agent/src/tools/factor_analysis_tool.py b/agent/src/tools/factor_analysis_tool.py
+--- a/agent/src/tools/factor_analysis_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/factor_analysis_tool.py	2026-10-17 17:48:06.315200162 +0000
+@@ -11,6 +11,7 @@
+ from scipy.stats import spearmanr
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_read_path, safe_run_path
+ 
+ 
+ def _compute_ic_series(factor_df: pd.DataFrame, return_df: pd.DataFrame) -> pd.Series:
+@@ -214,9 +215,16 @@
+         Returns:
+             JSON-formatted analysis summary.
+         """
++        run_dir = kwargs.get("run_dir")
++        try:
++            factor_csv = safe_read_path(kwargs["factor_csv"], base=run_dir)
++            return_csv = safe_read_path(kwargs["return_csv"], base=run_dir)
++            output_dir = safe_run_path(kwargs["output_dir"], base=run_dir)
++        except ValueError as exc:
++            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+         return run_factor_analysis(
+-            factor_csv=kwargs["factor_csv"],
+-            return_csv=kwargs["return_csv"],
+-            output_dir=kwargs["output_dir"],
++            factor_csv=str(factor_csv),
++            return_csv=str(return_csv),
++            output_dir=str(output_dir),
+             n_groups=kwargs.get("n_groups", 5),
+         )
+diff -ruN a/agent/src/tools/path_utils.py b/agent/src/tools/path_utils.py
+--- a/agent/src/tools/path_utils.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/path_utils.py	2026-10-17 17:47:26.835228566 +0000
+@@ -16,7 +16,10 @@
+ 
+ from __future__ import annotations
+ 
++import os
++import sys
+ from pathlib import Path
++from typing import Any
+ 
+ 
+ def _rejects_unc(p: str) -> None:
+@@ -79,3 +82,136 @@
+     raise ValueError(
+         f"Path {p!r} is outside the user home directory and project directory"
+     )
++
++
++# ---------------------------------------------------------------------------
++# Application file areas
++# ---------------------------------------------------------------------------
++#
++# Agent tools may only touch files inside these areas:
++#
++# * run storage — every run's workspace (read/write; the only place a tool
++#   may be told to work in or write into);
++# * the upload area — where ``POST /upload`` stores files (read-only);
++# * the bundled skill documentation (read-only);
++# * directories listed in ``VIBE_TRADING_ALLOWED_FILE_ROOTS`` (read-only).
++#
++# Every check resolves the candidate (following symlinks, collapsing ``..``)
++# and compares path components, so ``/runs_evil`` is not inside ``/runs``.
++
++
++AGENT_DIR = Path(__file__).resolve().parents[2]
++RUNS_DIR = AGENT_DIR / "runs"
++SWARM_RUNS_DIR = AGENT_DIR / ".swarm" / "runs"
++UPLOADS_DIR = AGENT_DIR / "uploads"
++SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
++ALLOWED_ROOTS_ENV = "VIBE_TRADING_ALLOWED_FILE_ROOTS"
++
++
++def _module_attr_paths(attr: str, modules: tuple[str, ...]) -> list[Path]:
++    """Collect ``attr`` from already-imported modules (honours runtime overrides)."""
++    out: list[Path] = []
++    for name in modules:
++        mod = sys.modules.get(name)
++        value = getattr(mod, attr, None) if mod is not None else None
++        if value:
++            out.append(Path(value))
++    return out
++
++
++def _resolve_roots(paths: list[Path]) -> list[Path]:
++    roots: list[Path] = []
++    for p in paths:
++        try:
++            r = Path(p).expanduser().resolve()
++        except (OSError, RuntimeError):
++            continue
++        if r not in roots:
++            roots.append(r)
++    return roots
++
++
++def run_storage_roots() -> list[Path]:
++    """Directories that hold run workspaces."""
++    paths = [RUNS_DIR, SWARM_RUNS_DIR]
++    paths += _module_attr_paths("RUNS_DIR", ("src.agent.loop", "api_server", "cli"))
++    return _resolve_roots(paths)
++
++
++def upload_roots() -> list[Path]:
++    """Directories where uploaded files live."""
++    paths = [UPLOADS_DIR]
++    paths += _module_attr_paths("UPLOADS_DIR", ("api_server", "cli"))
++    return _resolve_roots(paths)
++
++
++def configured_roots() -> list[Path]:
++    """Operator-configured read roots from ``VIBE_TRADING_ALLOWED_FILE_ROOTS``."""
++    raw = os.environ.get(ALLOWED_ROOTS_ENV, "")
++    entries = [e.strip() for e in raw.split(",")]
++    return _resolve_roots([Path(e) for e in entries if e])
++
++
++def readable_roots() -> list[Path]:
++    """All areas a tool may read from."""
++    return _resolve_roots(
++        upload_roots() + run_storage_roots() + [SKILLS_DIR] + configured_roots()
++    )
++
++
++def _inside(path: Path, roots: list[Path]) -> bool:
++    return any(path == r or path.is_relative_to(r) for r in roots)
++
++
++def _candidates(p: str, base: str | Path | None) -> list[Path]:
++    """Resolve ``p`` (``~`` expanded); relative paths try ``base`` then CWD."""
++    raw = Path(p).expanduser()
++    if raw.is_absolute():
++        return [raw.resolve()]
++    out: list[Path] = []
++    if base:
++        out.append((Path(base).expanduser() / raw).resolve())
++    out.append((Path.cwd() / raw).resolve())
++    return out
++
++
++def _check(p: Any, roots: list[Path], base: str | Path | None, what: str) -> Path:
++    if not isinstance(p, (str, os.PathLike)) or not str(p).strip():
++        raise ValueError(f"Invalid {what} path: {p!r}")
++    p = str(p).strip()
++    if "\x00" in p:
++        raise ValueError(f"Invalid {what} path: {p!r}")
++    _rejects_unc(p)
++    candidates = _candidates(p, base)
++    allowed = [c for c in candidates if _inside(c, roots)]
++    for c in allowed:
++        if c.exists():
++            return c
++    if allowed:
++        return allowed[0]
++    raise ValueError(f"Path {p!r} is outside the allowed {what} areas")
++
++
++def safe_read_path(p: Any, base: str | Path | None = None) -> Path:
++    """Validate a path a tool wants to read.
++
++    Accepts files in the upload area, run storage, bundled skills and the
++    operator-configured roots. Relative paths are tried against ``base``
++    (typically the current run dir) and then the CWD.
++
++    Raises:
++        ValueError: If the resolved path lies outside every readable area.
++    """
++    return _check(p, readable_roots(), base, "file")
++
++
++def safe_run_path(p: Any, base: str | Path | None = None) -> Path:
++    """Validate a directory/file a tool will work in or write to.
++
++    Must resolve inside run storage. Relative paths are tried against
++    ``base`` (typically the current run dir) and then the CWD.
++
++    Raises:
++        ValueError: If the resolved path lies outside run storage.
++    """
++    return _check(p, run_storage_roots(), base, "run storage")
+diff -ruN a/agent/src/tools/pattern_tool.py b/agent/src/tools/pattern_tool.py
+--- a/agent/src/tools/pattern_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/pattern_tool.py	2026-10-17 17:48:06.311200165 +0000
+@@ -14,6 +14,7 @@
+ import pandas as pd
+ 
+ from src.agent.tools import BaseTool
++from src.tools.path_utils import safe_run_path
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -313,8 +314,10 @@
+     Returns:
+         JSON-formatted detection results.
+     """
+-    arts = Path(run_dir) / "artifacts"
+-    ohlcv_files = list(arts.glob("ohlcv_*.csv"))
++    run_path = Path(run_dir).resolve()
++    arts = run_path / "artifacts"
++    # Skip links that point outside the run directory
++    ohlcv_files = [f for f in arts.glob("ohlcv_*.csv") if f.resolve().is_relative_to(run_path)]
+     if not ohlcv_files:
+         return json.dumps({"status": "error", "error": "No OHLCV data found; run backtest first"}, ensure_ascii=False)
+ 
+@@ -358,8 +361,12 @@
+ 
+     def execute(self, **kwargs) -> str:
+         """Run pattern detection."""
++        try:
++            run_dir = safe_run_path(kwargs["run_dir"])
++        except ValueError as exc:
++            return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+         return run_pattern(
+-            run_dir=kwargs["run_dir"],
++            run_dir=str(run_dir),
+             patterns=kwargs.get("patterns", "all"),
+             window=kwargs.get("window", 10),
+         )
+diff -ruN a/agent/src/tools/read_file_tool.py b/agent/src/tools/read_file_tool.py
+--- a/agent/src/tools/read_file_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/read_file_tool.py	2026-10-17 17:47:35.771222134 +0000
+@@ -7,7 +7,7 @@
+ from typing import Any
+ 
+ from src.agent.tools import BaseTool
+-from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import SKILLS_DIR, safe_path as _safe_path, safe_run_path
+ 
+ _OUTPUT_LIMIT = 50_000
+ 
+@@ -42,9 +42,12 @@
+ 
+         allowed_roots = []
+         if run_dir:
+-            allowed_roots.append(Path(run_dir).resolve())
++            try:
++                allowed_roots.append(safe_run_path(run_dir))
++            except ValueError as exc:
++                return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+         # Read-only access to skills/
+-        skills_dir = Path(__file__).resolve().parents[1] / "skills"
++        skills_dir = SKILLS_DIR
+         if skills_dir.exists():
+             allowed_roots.append(skills_dir.resolve())
+ 
+@@ -58,7 +61,7 @@
+             for p in paths_to_try:
+                 try:
+                     candidate = _safe_path(p, root)
+-                    if candidate.exists():
++                    if candidate.is_file():
+                         resolved = candidate
+                         break
+                 except ValueError:
+diff -ruN a/agent/src/tools/shadow_account_tool.py b/agent/src/tools/shadow_account_tool.py
+--- a/agent/src/tools/shadow_account_tool.py	2026-10-17 17:45:37.763307163 +0000
++++ b/agent/src/tools/shadow_account_tool.py	2026-10-17 17:47:50.351211644 +0000
+@@ -17,7 +17,7 @@
+ from typing import Any
+ 
+ from src.agent.tools import BaseTool
+-from src.tools.path_utils import safe_user_path
++from src.tools.path_utils import safe_read_path
+ from src.shadow_account import (
+     extract_shadow_profile,
+     load_profile,
+@@ -39,16 +39,16 @@
+     return json.dumps({"status": "ok", **payload}, ensure_ascii=False, default=str)
+ 
+ 
+-def _validate_optional_journal_path(raw: Any) -> str | None:
++def _validate_optional_journal_path(raw: Any, run_dir: Any = None) -> str | None:
+     """Validate a journal_path kwarg that may be missing/empty.
+ 
+     Returns the resolved path string, or None when the caller didn't pass
+-    one. Raises ValueError (already the contract of `safe_user_path`) when
+-    the path escapes the user envelope.
++    one. Raises ValueError (already the contract of `safe_read_path`) when
++    the path lies outside the readable file areas.
+     """
+     if not raw:
+         return None
+-    return str(safe_user_path(raw))
++    return str(safe_read_path(raw, base=run_dir))
+ 
+ 
+ # ---------------- Tool 1: extract ----------------
+@@ -91,7 +91,7 @@
+         if not journal_path:
+             return _err("journal_path is required")
+         try:
+-            journal_path = str(safe_user_path(journal_path))
++            journal_path = str(safe_read_path(journal_path, base=kwargs.get("run_dir")))
+         except ValueError as exc:
+             return _err(str(exc))
+         try:
+@@ -180,7 +180,7 @@
+         markets = tuple(kwargs.get("markets") or ("china_a", "hk", "us", "crypto"))
+ 
+         try:
+-            journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
++            journal_path = _validate_optional_journal_path(kwargs.get("journal_path"), kwargs.get("run_dir"))
+         except ValueError as exc:
+             return _err(str(exc))
+         try:
+@@ -245,7 +245,7 @@
+             return _err(str(exc))
+ 
+         try:
+-            journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
++            journal_path = _validate_optional_journal_path(kwargs.get("journal_path"), kwargs.get("run_dir"))
+         except ValueError as exc:
+             return _err(str(exc))
+ 
+diff -ruN a/agent/src/tools/trade_journal_tool.py b/agent/src/tools/trade_journal_tool.py
+--- a/agent/src/tools/trade_journal_tool.py	2026-10-17 17:45:37.767307161 +0000
++++ b/agent/src/tools/trade_journal_tool.py	2026-10-17 17:47:45.235215325 +0000
+@@ -20,7 +20,7 @@
+ import pandas as pd
+ 
+ from src.agent.tools import BaseTool
+-from src.tools.path_utils import safe_user_path
++from src.tools.path_utils import safe_read_path
+ from src.tools.trade_journal_parsers import (
+     TradeRecord,
+     parse_file,
+@@ -392,7 +392,9 @@
+     return df
+ 
+ 
+-def analyze_trade_journal(file_path: str, analysis_type: str = "full", filter_expr: str = "") -> str:
++def analyze_trade_journal(
++    file_path: str, analysis_type: str = "full", filter_expr: str = "", run_dir: str | None = None,
++) -> str:
+     """Parse a trade journal and return a JSON analysis.
+ 
+     Args:
+@@ -408,7 +410,7 @@
+         date_range, market, profile / behavior (when applicable).
+     """
+     try:
+-        path = safe_user_path(file_path)
++        path = safe_read_path(file_path, base=run_dir)
+     except ValueError as exc:
+         return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+     if not path.exists():
+@@ -513,4 +515,5 @@
+             file_path=kwargs["file_path"],
+             analysis_type=kwargs.get("analysis_type", "full"),
+             filter_expr=kwargs.get("filter_expr", ""),
++            run_dir=kwargs.get("run_dir"),
+         )
+diff -ruN a/agent/src/tools/write_file_tool.py b/agent/src/tools/write_file_tool.py
+--- a/agent/src/tools/write_file_tool.py	2026-10-17 17:45:37.767307161 +0000
++++ b/agent/src/tools/write_file_tool.py	2026-10-17 17:47:35.775222132 +0000
+@@ -7,7 +7,7 @@
+ from typing import Any
+ 
+ from src.agent.tools import BaseTool
+-from src.tools.path_utils import safe_path as _safe_path
++from src.tools.path_utils import safe_path as _safe_path, safe_run_path
+ 
+ 
+ class WriteFileTool(BaseTool):
+@@ -46,7 +46,7 @@
+             }, ensure_ascii=False)
+ 
+         try:
+-            resolved = _safe_path(file_path, Path(run_dir))
++            resolved = _safe_path(file_path, safe_run_path(run_dir))
+         except ValueError as exc:
+             return json.dumps({
+                 "status": "error",

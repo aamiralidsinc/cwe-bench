@@ -1,0 +1,202 @@
+diff --git a/packages/builder-util-runtime/src/httpExecutor.ts b/packages/builder-util-runtime/src/httpExecutor.ts
+index 1b10ecc5..63824027 100644
+--- a/packages/builder-util-runtime/src/httpExecutor.ts
++++ b/packages/builder-util-runtime/src/httpExecutor.ts
+@@ -12,6 +12,25 @@ import { ProgressCallbackTransform, ProgressInfo } from "./ProgressCallbackTrans
+ 
+ const debug = _debug("electron-builder")
+ 
++const CROSS_ORIGIN_SAFE_HEADERS = new Set([
++  "accept",
++  "accept-encoding",
++  "accept-language",
++  "user-agent",
++  "cache-control",
++  "pragma",
++  "range",
++  "if-range",
++  "if-none-match",
++  "if-modified-since",
++  "content-type",
++  "content-length",
++])
++
++function redactBody(data: any): string {
++  return JSON.stringify(data, (name, value) => (name !== "" && /pass|secret|token|key|auth|credential|cookie/i.test(name) ? "[redacted]" : value))
++}
++
+ export interface RequestHeaders extends OutgoingHttpHeaders {
+   [key: string]: OutgoingHttpHeader | undefined
+ }
+@@ -87,7 +106,7 @@ export abstract class HttpExecutor<T extends Request> {
+     const json = data == null ? undefined : JSON.stringify(data)
+     const encodedData = json ? Buffer.from(json) : undefined
+     if (encodedData != null) {
+-      debug(json!)
++      debug(redactBody(data))
+       const { headers, ...opts } = options
+       options = {
+         method: "post",
+@@ -206,7 +225,7 @@ Please double check that your authentication token is correct. Due to security r
+               `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
+ 
+           Data:
+-          ${isJson ? JSON.stringify(JSON.parse(data)) : data}
++          ${isJson ? redactBody(JSON.parse(data)) : data}
+           `
+             )
+           )
+@@ -320,17 +339,19 @@ Please double check that your authentication token is correct. Due to security r
+   static prepareRedirectUrlOptions(redirectUrl: string, options: RequestOptions): RequestOptions {
+     const newOptions = configureRequestOptionsFromUrl(redirectUrl, { ...options })
+     const headers = newOptions.headers
+-    if (headers?.authorization) {
+-      // Parse original and redirect URLs to compare origins
++    if (headers != null && Object.keys(headers).length > 0) {
+       const originalUrl = HttpExecutor.reconstructOriginalUrl(options)
+       const parsedRedirectUrl = parseUrl(redirectUrl, options)
+ 
+-      // Strip authorization header on cross-origin redirects (different protocol, hostname, or port)
++      // On a cross-origin redirect only headers known to carry no credentials are kept
+       if (HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {
+-        if (debug.enabled) {
+-          debug(`Given the cross-origin redirect (from ${originalUrl.host} to ${parsedRedirectUrl.host}), the Authorization header will be stripped out.`)
++        const kept: OutgoingHttpHeaders = {}
++        for (const [key, value] of Object.entries(headers)) {
++          if (CROSS_ORIGIN_SAFE_HEADERS.has(key.toLowerCase())) {
++            kept[key] = value
++          }
+         }
+-        delete headers.authorization
++        newOptions.headers = kept
+       }
+     }
+     return newOptions
+diff --git a/packages/electron-publish/src/gitHubPublisher.ts b/packages/electron-publish/src/gitHubPublisher.ts
+index ea525cb4..108399eb 100644
+--- a/packages/electron-publish/src/gitHubPublisher.ts
++++ b/packages/electron-publish/src/gitHubPublisher.ts
+@@ -58,7 +58,7 @@ export class GitHubPublisher extends HttpPublisher {
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitHub Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GH_TOKEN"`)
++        throw new InvalidConfigurationError(`GitHub Personal Access Token contains invalid characters, please check env "GH_TOKEN"`)
+       }
+     }
+ 
+diff --git a/packages/electron-publish/src/gitlabPublisher.ts b/packages/electron-publish/src/gitlabPublisher.ts
+index ce210a99..e3550546 100644
+--- a/packages/electron-publish/src/gitlabPublisher.ts
++++ b/packages/electron-publish/src/gitlabPublisher.ts
+@@ -46,7 +46,7 @@ export class GitlabPublisher extends HttpPublisher {
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitLab Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GITLAB_TOKEN"`)
++        throw new InvalidConfigurationError(`GitLab Personal Access Token contains invalid characters, please check env "GITLAB_TOKEN"`)
+       }
+     }
+ 
+diff --git a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
+index d62c0ddf..a79dbd2c 100644
+--- a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
++++ b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
+@@ -259,6 +259,12 @@ export abstract class DifferentialDownloader {
+         })
+         request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
+           this.logger.info(`Redirect to ${removeQuery(redirectUrl)}`)
++          if (!isSameOrigin(requestOptions, redirectUrl)) {
++            // the request headers would follow unchanged: let the caller fall back to a full download
++            request.abort()
++            reject(new Error(`Differential download redirected to another origin (${removeQuery(redirectUrl)})`))
++            return
++          }
+           actualUrl = redirectUrl
+           configureRequestUrl(new URL(actualUrl), requestOptions)
+           request.followRedirect()
+@@ -289,6 +295,7 @@ export abstract class DifferentialDownloader {
+ 
+   private request(requestOptions: RequestOptions, dataHandler: (chunk: Buffer) => void): Promise<void> {
+     return new Promise((resolve, reject) => {
++      ;(requestOptions as any).redirect = "manual"
+       const request = this.httpExecutor.createRequest(requestOptions, response => {
+         if (!checkIsRangesSupported(response, reject)) {
+           return
+@@ -302,6 +309,7 @@ export abstract class DifferentialDownloader {
+         response.on("data", dataHandler)
+         response.on("end", () => resolve())
+       })
++      followSameOriginRedirects(request, requestOptions, reject)
+       this.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+       request.end()
+     })
+@@ -312,6 +320,23 @@ function formatBytes(value: number, symbol = " KB"): string {
+   return new Intl.NumberFormat("en").format((value / 1024).toFixed(2) as any) + symbol
+ }
+ 
++export function isSameOrigin(requestOptions: RequestOptions, redirectUrl: string): boolean {
++  const current = new URL(`${requestOptions.protocol || "https:"}//${requestOptions.hostname}${requestOptions.port ? `:${requestOptions.port}` : ""}/`)
++  return new URL(redirectUrl, current).origin === current.origin
++}
++
++/** Electron follows redirects with the same headers; only same-origin ones are followed here. */
++export function followSameOriginRedirects(request: any, requestOptions: RequestOptions, reject: (error: Error) => void): void {
++  request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
++    if (isSameOrigin(requestOptions, redirectUrl)) {
++      request.followRedirect()
++    } else {
++      request.abort()
++      reject(new Error(`Differential download redirected to another origin (${removeQuery(redirectUrl)})`))
++    }
++  })
++}
++
+ // safety
+ function removeQuery(url: string): string {
+   const index = url.indexOf("?")
+diff --git a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
+index fe72f15d..bafcf00b 100644
+--- a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
++++ b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
+@@ -2,7 +2,7 @@ import { createHttpError, safeGetHeader } from "builder-util-runtime"
+ import { IncomingMessage } from "http"
+ import { Writable } from "stream"
+ import { copyData, DataSplitter, PartListDataTask } from "./DataSplitter"
+-import { DifferentialDownloader } from "./DifferentialDownloader"
++import { DifferentialDownloader, followSameOriginRedirects } from "./DifferentialDownloader"
+ import { Operation, OperationKind } from "./downloadPlanBuilder"
+ 
+ export function executeTasksUsingMultipleRangeRequests(
+@@ -69,6 +69,7 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+         copyData(task, out, options.oldFileFd, reject, () => w(index))
+       } else {
+         const requestOptions = differentialDownloader.createRequestOptions()
++        ;(requestOptions as any).redirect = "manual"
+         requestOptions.headers!.Range = `bytes=${task.start}-${task.end - 1}`
+         const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
+           response.on("error", reject)
+@@ -82,6 +83,7 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+           })
+           response.once("end", () => w(index))
+         })
++        followSameOriginRedirects(request, requestOptions, reject)
+         differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+         request.end()
+       }
+@@ -92,6 +94,7 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+   }
+ 
+   const requestOptions = differentialDownloader.createRequestOptions()
++  ;(requestOptions as any).redirect = "manual"
+   requestOptions.headers!.Range = ranges.substring(0, ranges.length - 2)
+   const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
+     if (!checkIsRangesSupported(response, reject)) {
+@@ -116,6 +119,7 @@ function doExecuteTasks(differentialDownloader: DifferentialDownloader, options:
+       }, 10000)
+     })
+   })
++  followSameOriginRedirects(request, requestOptions, reject)
+   differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+   request.end()
+ }

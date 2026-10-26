@@ -1,0 +1,247 @@
+diff --git a/cmd/gogs/internal/web/webapi_user.go b/cmd/gogs/internal/web/webapi_user.go
+index be9dc76..7b0a8f1 100644
+--- a/cmd/gogs/internal/web/webapi_user.go
++++ b/cmd/gogs/internal/web/webapi_user.go
+@@ -52,6 +52,20 @@ func verifyUserActiveCode(ctx stdctx.Context, code string) (user *database.User)
+ 	return nil
+ }
+ 
++// verifyResetPasswordCode returns the user a password-reset code belongs to. A
++// password-reset code is signed over the reset realm, so a code issued for
++// account activation does not verify here.
++func verifyResetPasswordCode(ctx stdctx.Context, code string) (user *database.User) {
++	if user = parseUserFromCode(ctx, code); user != nil {
++		prefix := code[:tool.TimeLimitCodeLength]
++		data := userx.ResetPasswordCodeData(user.ID, user.Email, user.LowerName, user.Password, user.Rands)
++		if tool.VerifyTimeLimitCode(data, conf.Auth.ResetPasswordCodeLives, prefix) {
++			return user
++		}
++	}
++	return nil
++}
++
+ type loginSource struct {
+ 	ID        int64  `json:"id"`
+ 	Name      string `json:"name"`
+@@ -185,7 +199,7 @@ func getUserResetPassword(r *http.Request) (statusCode int, resp *getUserResetPa
+ 	code := r.URL.Query().Get("code")
+ 	return http.StatusOK, &getUserResetPasswordResponse{
+ 		EmailEnabled: conf.Email.Enabled,
+-		Valid:        code != "" && verifyUserActiveCode(r.Context(), code) != nil,
++		Valid:        code != "" && verifyResetPasswordCode(r.Context(), code) != nil,
+ 	}, nil
+ }
+ 
+@@ -243,7 +257,7 @@ func postUserResetPassword(r *http.Request, ca cache.Cache, l i18n.Locale, req u
+ }
+ 
+ func postUserResetPasswordComplete(r *http.Request, l i18n.Locale, req userResetPasswordCompleteRequest) (statusCode int, resp any, err error) {
+-	u := verifyUserActiveCode(r.Context(), req.Code)
++	u := verifyResetPasswordCode(r.Context(), req.Code)
+ 	if u == nil {
+ 		return http.StatusBadRequest, &bindingErrorResponse{Error: l.Tr("auth.invalid_code")}, nil
+ 	}
+diff --git a/internal/database/issue_mail.go b/internal/database/issue_mail.go
+index 6144e71..751e356 100644
+--- a/internal/database/issue_mail.go
++++ b/internal/database/issue_mail.go
+@@ -45,6 +45,16 @@ func (mu mailerUser) GenerateEmailActivateCode(email string) string {
+ 	)
+ }
+ 
++func (mu mailerUser) GenerateEmailResetPasswordCode(email string) string {
++	return userx.GenerateResetPasswordCode(
++		mu.user.ID,
++		email,
++		mu.user.Name,
++		mu.user.Password,
++		mu.user.Rands,
++	)
++}
++
+ func NewMailerUser(u *User) email.User {
+ 	return mailerUser{u}
+ }
+diff --git a/internal/email/email.go b/internal/email/email.go
+index 64739ec..01dd214 100644
+--- a/internal/email/email.go
++++ b/internal/email/email.go
+@@ -186,6 +186,13 @@ type User interface {
+ 	GenerateEmailActivateCode(string) string
+ }
+ 
++// resetPasswordCodeGenerator is implemented by users that can mint a
++// password-reset code bound to the password-reset lifetime. It is optional so
++// existing implementations of User keep working.
++type resetPasswordCodeGenerator interface {
++	GenerateEmailResetPasswordCode(string) string
++}
++
+ type Repository interface {
+ 	FullName() string
+ 	HTMLURL() string
+@@ -225,7 +232,11 @@ func SendActivateAccountMail(t Translator, u User) error {
+ }
+ 
+ func SendResetPasswordMail(t Translator, u User) error {
+-	return SendUserMail(t, u, tmplAuthResetPassword, u.GenerateEmailActivateCode(u.Email()), t.Tr("mail.reset_password"), "reset password")
++	code := u.GenerateEmailActivateCode(u.Email())
++	if g, ok := u.(resetPasswordCodeGenerator); ok {
++		code = g.GenerateEmailResetPasswordCode(u.Email())
++	}
++	return SendUserMail(t, u, tmplAuthResetPassword, code, t.Tr("mail.reset_password"), "reset password")
+ }
+ 
+ func SendActivateEmailMail(t Translator, u User, email string) error {
+diff --git a/internal/route/admin/users.go b/internal/route/admin/users.go
+index 1f131b2..300539e 100644
+--- a/internal/route/admin/users.go
++++ b/internal/route/admin/users.go
+@@ -231,8 +231,7 @@ func SendPasswordResetLink(c *context.Context) {
+ 	}
+ 
+ 	mailerUser := database.NewMailerUser(u)
+-	code := mailerUser.GenerateEmailActivateCode(u.Email)
+-	if err := email.SendUserMail(c.Context, mailerUser, "auth/reset_passwd", code, c.Tr("mail.reset_password"), "reset password"); err != nil {
++	if err := email.SendResetPasswordMail(c.Context, mailerUser); err != nil {
+ 		log.Error("Failed to send reset password mail to user %q: %v", u.Name, err)
+ 		c.JSON(http.StatusInternalServerError, map[string]string{"error": "send mail"})
+ 		return
+diff --git a/internal/route/api/v1/reset_mail.go b/internal/route/api/v1/reset_mail.go
+new file mode 100644
+index 0000000..e827c1d
+--- /dev/null
++++ b/internal/route/api/v1/reset_mail.go
+@@ -0,0 +1,12 @@
++package v1
++
++import (
++	"gogs.io/gogs/internal/userx"
++)
++
++// GenerateEmailResetPasswordCode mints the password-reset code for the API
++// mail adapter. It is a distinct method from the account activation code so a
++// reset mail can never carry a code issued for another account action.
++func (u resetMailUser) GenerateEmailResetPasswordCode(email string) string {
++	return userx.GenerateResetPasswordCode(u.user.ID, email, u.user.Name, u.user.Password, u.user.Rands)
++}
+diff --git a/internal/route/user/account.go b/internal/route/user/account.go
+index f307a51..47d5494 100644
+--- a/internal/route/user/account.go
++++ b/internal/route/user/account.go
+@@ -3,7 +3,6 @@ package user
+ import (
+ 	gocontext "context"
+ 	"net/http"
+-	"strconv"
+ 
+ 	log "unknwon.dev/clog/v2"
+ 
+@@ -12,6 +11,7 @@ import (
+ 	"gogs.io/gogs/internal/database"
+ 	"gogs.io/gogs/internal/email"
+ 	"gogs.io/gogs/internal/tool"
++	"gogs.io/gogs/internal/userx"
+ )
+ 
+ // SendAccountDeletionMail sends the confirmation code for deleting an account
+@@ -44,7 +44,7 @@ func SendAccountDeletionMail(c *context.Context) {
+ 	}
+ 
+ 	mailerUser := database.NewMailerUser(u)
+-	code := mailerUser.GenerateEmailActivateCode(u.Email)
++	code := userx.GenerateDeleteAccountCode(u.ID, u.Email, u.Name, u.Password, u.Rands)
+ 	if err := email.SendUserMail(c.Context, mailerUser, "auth/delete_account", code, "Delete your account", "delete account"); err != nil {
+ 		log.Error("SendAccountDeletionMail: send mail to user %q: %v", u.Name, err)
+ 		c.JSON(http.StatusInternalServerError, map[string]string{"error": "send mail"})
+@@ -58,7 +58,7 @@ func SendAccountDeletionMail(c *context.Context) {
+ func verifyAccountDeletionCode(ctx gocontext.Context, code string) *database.User {
+ 	if user := parseUserFromCode(ctx, code); user != nil {
+ 		prefix := code[:tool.TimeLimitCodeLength]
+-		data := strconv.FormatInt(user.ID, 10) + user.Email + user.LowerName + user.Password + user.Rands
++		data := userx.DeleteAccountCodeData(user.ID, user.Email, user.LowerName, user.Password, user.Rands)
+ 		if tool.VerifyTimeLimitCode(data, conf.Auth.ActivateCodeLives, prefix) {
+ 			return user
+ 		}
+diff --git a/internal/route/user/setting.go b/internal/route/user/setting.go
+index 081edb6..ea8ad9a 100644
+--- a/internal/route/user/setting.go
++++ b/internal/route/user/setting.go
+@@ -295,7 +295,7 @@ func ActivateEmail(c *context.Context) {
+ func verifyResetPasswordCode(ctx gocontext.Context, code string) *database.User {
+ 	if user := parseUserFromCode(ctx, code); user != nil {
+ 		prefix := code[:tool.TimeLimitCodeLength]
+-		data := strconv.FormatInt(user.ID, 10) + user.Email + user.LowerName + user.Password + user.Rands
++		data := userx.ResetPasswordCodeData(user.ID, user.Email, user.LowerName, user.Password, user.Rands)
+ 		if tool.VerifyTimeLimitCode(data, conf.Auth.ResetPasswordCodeLives, prefix) {
+ 			return user
+ 		}
+diff --git a/internal/userx/delete_account.go b/internal/userx/delete_account.go
+new file mode 100644
+index 0000000..46b731a
+--- /dev/null
++++ b/internal/userx/delete_account.go
+@@ -0,0 +1,24 @@
++package userx
++
++import (
++	"encoding/hex"
++	"strings"
++
++	"gogs.io/gogs/internal/conf"
++	"gogs.io/gogs/internal/tool"
++)
++
++// DeleteAccountCodeData returns the data signed into an account deletion code.
++// Its distinct realm keeps a code issued for account activation, or for any
++// other account action, from deleting the account.
++func DeleteAccountCodeData(userID int64, email, name, password, rands string) string {
++	return "delete-account:" + userCodeData(userID, email, name, password, rands)
++}
++
++// GenerateDeleteAccountCode generates an account deletion code based on user
++// information and the given email.
++func GenerateDeleteAccountCode(userID int64, email, name, password, rands string) string {
++	code := tool.CreateTimeLimitCode(DeleteAccountCodeData(userID, email, name, password, rands), conf.Auth.ActivateCodeLives, nil)
++	code += hex.EncodeToString([]byte(strings.ToLower(name)))
++	return code
++}
+diff --git a/internal/userx/userx.go b/internal/userx/userx.go
+index 3a39b5c..a392cfd 100644
+--- a/internal/userx/userx.go
++++ b/internal/userx/userx.go
+@@ -34,11 +34,29 @@ func DashboardURLPath(name string, isOrganization bool) string {
+ // GenerateActivateCode generates an activate code based on user information and
+ // the given email.
+ func GenerateActivateCode(userID int64, email, name, password, rands string) string {
+-	code := tool.CreateTimeLimitCode(
+-		fmt.Sprintf("%d%s%s%s%s", userID, email, strings.ToLower(name), password, rands),
+-		conf.Auth.ActivateCodeLives,
+-		nil,
+-	)
++	return generateTimeLimitedUserCode(userCodeData(userID, email, name, password, rands), name, conf.Auth.ActivateCodeLives)
++}
++
++// GenerateResetPasswordCode generates a password-reset code based on user
++// information and the given email. The token's lifetime is bound to
++// [conf.AuthOpts.ResetPasswordCodeLives].
++func GenerateResetPasswordCode(userID int64, email, name, password, rands string) string {
++	return generateTimeLimitedUserCode(ResetPasswordCodeData(userID, email, name, password, rands), name, conf.Auth.ActivateCodeLives)
++}
++
++// ResetPasswordCodeData returns the data signed into a password-reset code. Its
++// distinct realm keeps a code issued for account activation from verifying as a
++// password-reset code, and the other way around.
++func ResetPasswordCodeData(userID int64, email, name, password, rands string) string {
++	return "reset:" + userCodeData(userID, email, name, password, rands)
++}
++
++func userCodeData(userID int64, email, name, password, rands string) string {
++	return fmt.Sprintf("%d%s%s%s%s", userID, email, strings.ToLower(name), password, rands)
++}
++
++func generateTimeLimitedUserCode(data, name string, minutes int) string {
++	code := tool.CreateTimeLimitCode(data, minutes, nil)
+ 
+ 	// Add tailing hex username
+ 	code += hex.EncodeToString([]byte(strings.ToLower(name)))

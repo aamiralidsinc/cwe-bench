@@ -1,0 +1,376 @@
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -3,7 +3,8 @@
+ import fs, { promises as fsp } from 'node:fs'
+ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+-import { isFileServingAllowed } from 'vitest/node'
++import { slash } from '../utils'
++import { assertApiServerIsLocal, isFileServingAllowed } from 'vitest/node'
+ 
+ function assertFileAccess(path: string, project: TestProject) {
+   if (
+@@ -12,6 +13,52 @@
+   ) {
+     throw new Error(
+       `Access denied to "${path}". See Vite config documentation for "server.fs": https://vitejs.dev/config/server-options.html#server-fs-strict.`,
++    )
++  }
++}
++
++function resolveSymlinks(path: string, depth = 0): string {
++  if (depth > 32) {
++    throw new Error(`Access denied to "${path}". Too many symbolic links.`)
++  }
++  const absolute = resolve(path)
++  const parts: string[] = []
++  let current = absolute
++  while (true) {
++    const parent = dirname(current)
++    if (parent === current) {
++      break
++    }
++    parts.unshift(basename(current))
++    current = parent
++  }
++  for (let index = 0; index < parts.length; index++) {
++    const next = resolve(current, parts[index])
++    let stat: fs.Stats
++    try {
++      stat = fs.lstatSync(next)
++    }
++    catch {
++      return resolve(next, ...parts.slice(index + 1))
++    }
++    if (stat.isSymbolicLink()) {
++      const target = fs.readlinkSync(next)
++      return resolveSymlinks(
++        resolve(dirname(next), target, ...parts.slice(index + 1)),
++        depth + 1,
++      )
++    }
++    current = next
++  }
++  return current
++}
++
++function assertInsideProjectRoot(path: string, project: TestProject) {
++  const root = slash(resolveSymlinks(project.config.root))
++  const target = slash(resolveSymlinks(path))
++  if (target !== root && !target.startsWith(`${root}/`)) {
++    throw new Error(
++      `Access denied to "${path}". The path is outside of the project root.`,
+     )
+   }
+ }
+@@ -31,8 +78,10 @@
+ export const writeFile: BrowserCommand<
+   Parameters<BrowserCommands['writeFile']>
+ > = async ({ project }, path, data, options) => {
++  assertApiServerIsLocal(project.browser?.vite, 'writeFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
++  assertInsideProjectRoot(filepath, project)
+   const dir = dirname(filepath)
+   if (!fs.existsSync(dir)) {
+     await fsp.mkdir(dir, { recursive: true })
+@@ -43,16 +92,20 @@
+ export const removeFile: BrowserCommand<
+   Parameters<BrowserCommands['removeFile']>
+ > = async ({ project }, path) => {
++  assertApiServerIsLocal(project.browser?.vite, 'removeFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
++  assertInsideProjectRoot(filepath, project)
+   await fsp.rm(filepath)
+ }
+ 
+ export const appendFile: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
++  assertApiServerIsLocal(project.browser?.vite, 'appendFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
++  assertInsideProjectRoot(filepath, project)
+   const dir = dirname(filepath)
+   if (!fs.existsSync(dir)) {
+     await fsp.mkdir(dir, { recursive: true })
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -1,4 +1,5 @@
+ import type { MockerRegistry } from '@vitest/mocker'
++import type { Stats } from 'node:fs'
+ import type { Duplex } from 'node:stream'
+ import type { TestError } from 'vitest'
+ import type { BrowserCommandContext, ResolveSnapshotPathHandlerContext, TestProject } from 'vitest/node'
+@@ -6,18 +7,41 @@
+ import type { WebSocketBrowserEvents, WebSocketBrowserHandlers } from '../types'
+ import type { ParentBrowserProject } from './projectParent'
+ import type { BrowserServerState } from './state'
+-import { existsSync, promises as fs, readFileSync } from 'node:fs'
++import { existsSync, lstatSync, promises as fs, readFileSync, readlinkSync } from 'node:fs'
+ import { AutomockedModule, AutospiedModule, ManualMockedModule, RedirectedModule } from '@vitest/mocker'
+ import { ServerMockResolver } from '@vitest/mocker/node'
+ import { createBirpc } from 'birpc'
+ import { parse, stringify } from 'flatted'
+-import { dirname, join, resolve } from 'pathe'
+-import { createDebugger, isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { basename, dirname, join, resolve } from 'pathe'
++import { assertApiServerIsLocal, createDebugger, isApiServerNetworkReachable, isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { slash } from './utils'
+ import { WebSocketServer } from 'ws'
+ 
+ const debug = createDebugger('vitest:browser:api')
+ 
+ const BROWSER_API_PATH = '/__vitest_browser_api__'
++
++// commands that neither write to the file system nor execute code,
++// they are allowed even if the browser server is exposed to the network
++const NETWORK_SAFE_COMMANDS = new Set<string>([
++  'readFile',
++  '__vitest_fileInfo',
++  '__vitest_upload',
++  '__vitest_click',
++  '__vitest_dblClick',
++  '__vitest_tripleClick',
++  '__vitest_wheel',
++  '__vitest_type',
++  '__vitest_clear',
++  '__vitest_fill',
++  '__vitest_tab',
++  '__vitest_keyboard',
++  '__vitest_selectOptions',
++  '__vitest_dragAndDrop',
++  '__vitest_hover',
++  '__vitest_cleanup',
++  '__vitest_viewport',
++])
+ 
+ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMockerRegistry: MockerRegistry): void {
+   const vite = globalServer.vite
+@@ -120,6 +144,53 @@
+     }
+   }
+ 
++
++  function resolveSymlinks(path: string, depth = 0): string {
++    if (depth > 32) {
++      throw new Error(`Access denied to "${path}". Too many symbolic links.`)
++    }
++    const absolute = resolve(path)
++    const parts: string[] = []
++    let current = absolute
++    while (true) {
++      const parent = dirname(current)
++      if (parent === current) {
++        break
++      }
++      parts.unshift(basename(current))
++      current = parent
++    }
++    for (let index = 0; index < parts.length; index++) {
++      const next = resolve(current, parts[index])
++      let stat: Stats
++      try {
++        stat = lstatSync(next)
++      }
++      catch {
++        return resolve(next, ...parts.slice(index + 1))
++      }
++      if (stat.isSymbolicLink()) {
++        const target = readlinkSync(next)
++        return resolveSymlinks(
++          resolve(dirname(next), target, ...parts.slice(index + 1)),
++          depth + 1,
++        )
++      }
++      current = next
++    }
++    return current
++  }
++
++  function assertInsideProjectRoot(path: string, project: TestProject) {
++    const root = slash(resolveSymlinks(project.config.root))
++    const target = slash(resolveSymlinks(path))
++    if (target !== root && !target.startsWith(`${root}/`)) {
++      throw new Error(
++        `Access denied to "${path}". The path is outside of the project root.`,
++      )
++    }
++  }
++
+   function setupClient(project: TestProject, rpcId: string, ws: WebSocket) {
+     const mockResolver = new ServerMockResolver(globalServer.vite, {
+       moduleDirectories: project.config?.deps?.moduleDirectories,
+@@ -152,6 +223,7 @@
+           }
+         },
+         async onTaskArtifactRecord(id, artifact) {
++          assertApiServerIsLocal(vite, 'onTaskArtifactRecord')
+           return vitest._testRun.recordArtifact(id, artifact)
+         },
+         async onTaskUpdate(method, packs, events) {
+@@ -193,8 +265,10 @@
+           return fs.readFile(filepath, 'utf-8')
+         },
+         async writeBenchmarkResult(relativePath, result) {
++          assertApiServerIsLocal(vite, 'writeBenchmarkResult')
+           const filepath = resolve(project.config.root, relativePath)
+           checkFileAccess(filepath)
++          assertInsideProjectRoot(filepath, project)
+           await fs.mkdir(dirname(filepath), { recursive: true })
+           return fs.writeFile(filepath, result, 'utf-8')
+         },
+@@ -206,11 +280,14 @@
+           return fs.readFile(snapshotPath, 'utf-8')
+         },
+         async saveSnapshotFile(id, content) {
++          assertApiServerIsLocal(vite, 'saveSnapshotFile')
+           checkFileAccess(id)
++          assertInsideProjectRoot(id, project)
+           await fs.mkdir(dirname(id), { recursive: true })
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async removeSnapshotFile(id) {
++          assertApiServerIsLocal(vite, 'removeSnapshotFile')
+           checkFileAccess(id)
+           if (!existsSync(id)) {
+             throw new Error(`Snapshot file "${id}" does not exist.`)
+@@ -267,6 +344,11 @@
+         },
+         async triggerCommand(sessionId, command, testPath, payload) {
+           debug?.('[%s] Triggering command "%s"', sessionId, command)
++          if (!NETWORK_SAFE_COMMANDS.has(command) && isApiServerNetworkReachable(vite)) {
++            throw new Error(
++              `[vitest] Command "${command}" is not allowed because the browser server is exposed to the network.`,
++            )
++          }
+           const provider = project.browser!.provider
+           if (!provider) {
+             throw new Error('Commands are only available for browser tests.')
+@@ -362,6 +444,7 @@
+ 
+         // CDP
+         async sendCdpEvent(sessionId: string, event: string, payload?: Record<string, unknown>) {
++          assertApiServerIsLocal(vite, 'sendCdpEvent')
+           const cdp = await globalServer.ensureCDPHandler(sessionId, rpcId)
+           return cdp.send(event, payload)
+         },
+diff --git a/packages/vitest/src/api/check.ts b/packages/vitest/src/api/check.ts
+--- a/packages/vitest/src/api/check.ts
++++ b/packages/vitest/src/api/check.ts
+@@ -1,4 +1,5 @@
+ import type { IncomingMessage } from 'node:http'
++import type { ViteDevServer } from 'vite'
+ import type { ResolvedConfig } from '../node/types/config'
+ import crypto from 'node:crypto'
+ 
+@@ -20,3 +21,46 @@
+ 
+   return false
+ }
++
++function isLoopbackHost(host: string): boolean {
++  let normalized = host.trim().toLowerCase()
++  if (normalized.startsWith('[') && normalized.endsWith(']')) {
++    normalized = normalized.slice(1, -1)
++  }
++  if (normalized === 'localhost' || normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') {
++    return true
++  }
++  if (normalized.startsWith('::ffff:')) {
++    normalized = normalized.slice('::ffff:'.length)
++  }
++  return /^127(?:\.\d{1,3}){3}$/.test(normalized)
++}
++
++/**
++ * Returns `true` if the API server can be reached from outside of the local machine.
++ * Operations that write to the file system or execute code are not allowed in this case.
++ */
++export function isApiServerNetworkReachable(server: ViteDevServer | undefined): boolean {
++  if (!server) {
++    return true
++  }
++  const host = server.config?.server?.host
++  // `undefined` and `false` fallback to "localhost" in Vite
++  if (host === true || (typeof host === 'string' && !isLoopbackHost(host))) {
++    return true
++  }
++  const address = server.httpServer?.address()
++  if (address && typeof address === 'object' && !isLoopbackHost(address.address)) {
++    return true
++  }
++  return false
++}
++
++export function assertApiServerIsLocal(server: ViteDevServer | undefined, operation: string): void {
++  if (isApiServerNetworkReachable(server)) {
++    throw new Error(
++      `[vitest-api]: "${operation}" is not allowed because the API server is exposed to the network. `
++      + `Bind the server to a local address to enable it.`,
++    )
++  }
++}
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -27,7 +27,7 @@
+ import { getTestFileEnvironment } from '../utils/environments'
+ import { getModuleGraph } from '../utils/graph'
+ import { stringifyReplace } from '../utils/serialization'
+-import { isValidApiRequest } from './check'
++import { assertApiServerIsLocal, isValidApiRequest } from './check'
+ 
+ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   const wss = new WebSocketServer({ noServer: true })
+@@ -76,6 +76,7 @@
+           return fs.readFile(id, 'utf-8')
+         },
+         async saveTestFile(id, content) {
++          assertApiServerIsLocal(server, 'saveTestFile')
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+@@ -84,9 +85,11 @@
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          assertApiServerIsLocal(server, 'rerun')
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          assertApiServerIsLocal(server, 'rerunTask')
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -151,6 +154,7 @@
+           return getModuleGraph(ctx, project, id, browser)
+         },
+         async saveSnapshotFile(id, content) {
++          assertApiServerIsLocal(server, 'saveSnapshotFile')
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so its snapshots cannot be updated using the API.`,
+@@ -163,6 +167,7 @@
+           return fs.writeFile(snapshotPath, content, 'utf-8')
+         },
+         async updateSnapshot(file?: File) {
++          assertApiServerIsLocal(server, 'updateSnapshot')
+           if (!file) {
+             await ctx.updateSnapshot()
+           }
+diff --git a/packages/vitest/src/public/node.ts b/packages/vitest/src/public/node.ts
+--- a/packages/vitest/src/public/node.ts
++++ b/packages/vitest/src/public/node.ts
+@@ -3,7 +3,7 @@
+ 
+ export const version: string = Vitest.version
+ 
+-export { isValidApiRequest } from '../api/check'
++export { assertApiServerIsLocal, isApiServerNetworkReachable, isValidApiRequest } from '../api/check'
+ export { escapeTestName } from '../node/ast-collect'
+ export type { CacheKeyIdGenerator, CacheKeyIdGeneratorContext } from '../node/cache/fsModuleCache'
+ export { parseCLI } from '../node/cli/cac'

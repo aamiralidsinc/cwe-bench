@@ -1,0 +1,600 @@
+diff -ruN pristine/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts app/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+--- a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -1,27 +1,7 @@
+ import type { SimpleGitPlugin } from './simple-git-plugin';
+ 
+-import { GitPluginError } from '../errors/git-plugin-error';
+ import type { SimpleGitPluginConfig } from '../types';
+-
+-function isConfigSwitch(arg: string) {
+-   return arg.trim().toLowerCase() === '-c';
+-}
+-
+-function preventProtocolOverride(arg: string, next: string) {
+-   if (!isConfigSwitch(arg)) {
+-      return;
+-   }
+-
+-   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
+-      return;
+-   }
+-
+-   throw new GitPluginError(
+-      undefined,
+-      'unsafe',
+-      'Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol'
+-   );
+-}
++import { assertSafeArguments } from './unsafe-operations-guard';
+ 
+ export function blockUnsafeOperationsPlugin({
+    allowUnsafeProtocolOverride = false,
+@@ -29,11 +9,7 @@
+    return {
+       type: 'spawn.args',
+       action(args, _context) {
+-         args.forEach((current, index) => {
+-            const next = index < args.length ? args[index + 1] : '';
+-
+-            allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
+-         });
++         assertSafeArguments(args, allowUnsafeProtocolOverride);
+ 
+          return args;
+       },
+diff -ruN pristine/simple-git/src/lib/plugins/unsafe-operations-guard.ts app/simple-git/src/lib/plugins/unsafe-operations-guard.ts
+--- a/simple-git/src/lib/plugins/unsafe-operations-guard.ts
++++ b/simple-git/src/lib/plugins/unsafe-operations-guard.ts
+@@ -0,0 +1,551 @@
++import { readFileSync, statSync } from 'fs';
++import { homedir } from 'os';
++import { dirname, isAbsolute, resolve } from 'path';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++
++/**
++ * Screening of the arguments handed to the `git` child process.
++ *
++ * A caller can reach git's configuration through several argument shapes: the short `-c` switch,
++ * the long `--config` switch (both as a separate and as an attached value), the environment
++ * reference `--config-env`, the configuration-writing sub-command, and configuration files that
++ * are pulled in by an `include.path` entry. Every one of those routes is inspected here, before
++ * any process is spawned, so a refused operation cannot leave a filesystem or repository change.
++ *
++ * Two families of settings are refused: those that relax a transport protocol restriction and
++ * those that name a program for git to execute. An explicit `allowUnsafeProtocolOverride` opt-in
++ * continues to permit the first family, as it always has.
++ */
++
++const PROTOCOL_REFUSAL =
++   'Configuring protocol.allow is not permitted without enabling allowUnsafeProtocolOverride';
++
++const UNINSPECTABLE_SOURCE = 'A configuration source that cannot be inspected is not permitted';
++
++const MAX_INCLUDE_DEPTH = 8;
++
++/** `protocol.allow` and `protocol.<name>.allow`. */
++const protocolAllow = /^protocol(?:\..+)?\.allow$/;
++
++/** `include.path` and `includeIf.<condition>.path`. */
++const includePath = /^include(?:if\..+)?\.path$/;
++
++/** Options that name the helper program run at one end of a fetch or push. */
++const packOption = /^--(?:upload|receive)-pack(?:=|$)/i;
++
++/** Configuration keys whose value git resolves to a program. */
++const programKey = [
++   /^alias\..+$/,
++   /^core\.(?:askpass|editor|gitproxy|hookspath|pager|sshcommand)$/,
++   /^core\.fsmonitor$/,
++   /^credential(?:\..+)?\.helper$/,
++   /^diff\..+\.(?:command|textconv)$/,
++   /^diff\.external$/,
++   /^filter\..+\.(?:clean|process|smudge)$/,
++   /^gpg(?:\..+)?\.program$/,
++   /^interactive\.difffilter$/,
++   /^merge\..+\.driver$/,
++   /^pager\..+$/,
++   /^remote\..+\.(?:receivepack|uploadpack|vcs)$/,
++   /^sequence\.editor$/,
++   /^trailer\..+\.(?:cmd|command)$/,
++   /^uploadpack\.packobjectshook$/,
++];
++
++const CONFIG_SWITCHES = new Set(['--config', '--config-env']);
++const LONG_CONFIG_SWITCH = /^(--config(?:-env)?)=([\s\S]*)$/i;
++const SHORT_CONFIG_SWITCH = /^(-c)([\s\S]+)$/;
++
++function isConfigSwitch(token: string): boolean {
++   return token === '-c' || CONFIG_SWITCHES.has(token.toLowerCase());
++}
++
++const GLOBAL_VALUE_OPTIONS = new Set([
++   '-c',
++   '--config',
++   '--config-env',
++   '-C',
++   '--git-dir',
++   '--work-tree',
++   '--namespace',
++]);
++
++const CONFIG_VALUE_OPTIONS = new Set([
++   '--file',
++   '-f',
++   '--blob',
++   '--type',
++   '--default',
++   '--comment',
++]);
++
++const CONFIG_READ_OPTIONS = new Set([
++   '--get',
++   '--get-all',
++   '--get-regexp',
++   '--get-urlmatch',
++   '--list',
++   '-l',
++   '--show-origin',
++   '--show-scope',
++   '--name-only',
++   '--includes',
++   '--no-includes',
++]);
++
++const CONFIG_WRITE_OPTIONS = new Set([
++   '--add',
++   '--replace-all',
++   '--unset',
++   '--unset-all',
++   '--rename-section',
++   '--remove-section',
++   '--edit',
++   '-e',
++]);
++
++export type ConfigAssignment = {
++   key: string;
++   value: string;
++   viaEnv: boolean;
++};
++
++export type ParsedSource = {
++   protocol: boolean;
++   program: boolean;
++   includes: string[];
++};
++
++/** Lower-cases a key and drops the quoting/whitespace git itself permits inside a key. */
++function normalizeKey(raw: string): string {
++   return raw.replace(/["']/g, '').replace(/\s+/g, '').toLowerCase();
++}
++
++/**
++ * Turns a single `key=value` token into an assignment. A token without a separator is still a
++ * configuration key (git gives it an implicit boolean value), so it is returned with an empty
++ * value rather than dropped.
++ */
++function readAssignment(raw: string | undefined, viaEnv = false): ConfigAssignment | undefined {
++   if (typeof raw !== 'string') {
++      return undefined;
++   }
++
++   const text = raw.trim();
++   if (!text) {
++      return undefined;
++   }
++
++   const separator = text.indexOf('=');
++   const key = normalizeKey(separator === -1 ? text : text.slice(0, separator));
++   if (!key) {
++      return undefined;
++   }
++
++   return {
++      key,
++      value: separator === -1 ? '' : text.slice(separator + 1),
++      viaEnv,
++   };
++}
++
++/** Collects every configuration assignment carried directly in the argument list. */
++export function configurationAssignments(args: string[]): ConfigAssignment[] {
++   const assignments: ConfigAssignment[] = [];
++
++   for (let index = 0; index < args.length; index++) {
++      const token = args[index].trim();
++      const lower = token.toLowerCase();
++      let raw: string | undefined;
++      let viaEnv = false;
++
++      if (isConfigSwitch(token)) {
++         raw = args[++index];
++         viaEnv = lower === '--config-env';
++      } else {
++         const long = LONG_CONFIG_SWITCH.exec(token);
++         if (long) {
++            raw = long[2];
++            viaEnv = long[1].toLowerCase() === '--config-env';
++         } else {
++            const short = SHORT_CONFIG_SWITCH.exec(token);
++            if (short) {
++               raw = short[2].charAt(0) === '=' ? short[2].slice(1) : short[2];
++            }
++         }
++      }
++
++      const assignment = readAssignment(raw, viaEnv);
++      if (assignment) {
++         assignments.push(assignment);
++      }
++   }
++
++   return assignments;
++}
++
++/** The index of the git sub-command, skipping the global options that precede it. */
++function subCommandIndex(args: string[]): number {
++   for (let index = 0; index < args.length; index++) {
++      const token = args[index].trim();
++      if (!token) {
++         continue;
++      }
++
++      if (token.charAt(0) === '-') {
++         if (GLOBAL_VALUE_OPTIONS.has(token)) {
++            index++;
++         }
++         continue;
++      }
++
++      return index;
++   }
++
++   return -1;
++}
++
++function splitOption(token: string): { name: string; attached: boolean } {
++   const separator = token.indexOf('=');
++   if (separator === -1) {
++      return { name: token, attached: false };
++   }
++
++   return { name: token.slice(0, separator), attached: true };
++}
++
++/**
++ * Collects the key/value pairs written by a `config` sub-command. Reads (`--get`, `--list`, a
++ * single positional key) and removals (which have no value to execute) are not assignments.
++ */
++export function configurationWrites(args: string[]): ConfigAssignment[] {
++   const command = subCommandIndex(args);
++   if (command < 0 || args[command].trim().toLowerCase() !== 'config') {
++      return [];
++   }
++
++   const positionals: string[] = [];
++   let reading = false;
++   let writing = false;
++
++   for (let cursor = command + 1; cursor < args.length; cursor++) {
++      const token = args[cursor].trim();
++      if (!token) {
++         continue;
++      }
++
++      if (token.charAt(0) === '-') {
++         const option = splitOption(token);
++         const name = option.name.toLowerCase();
++
++         if (CONFIG_VALUE_OPTIONS.has(name)) {
++            if (!option.attached) {
++               cursor++;
++            }
++         } else if (CONFIG_WRITE_OPTIONS.has(name)) {
++            writing = true;
++         } else if (CONFIG_READ_OPTIONS.has(name)) {
++            reading = true;
++         }
++         continue;
++      }
++
++      positionals.push(token);
++   }
++
++   if (reading || !positionals.length) {
++      return [];
++   }
++
++   if (!writing && positionals.length < 2) {
++      return [];
++   }
++
++   const assignment = readAssignment(positionals[0]);
++   if (!assignment) {
++      return [];
++   }
++
++   return [
++      {
++         key: assignment.key,
++         value: positionals.length > 1 ? positionals[1] : assignment.value,
++         viaEnv: false,
++      },
++   ];
++}
++
++function unquote(text: string): string {
++   if (text.length > 1 && text.charAt(0) === '"' && text.charAt(text.length - 1) === '"') {
++      return text.slice(1, -1).replace(/\\(["\\])/g, '$1');
++   }
++
++   return text;
++}
++
++function resolveSourcePath(target: string, baseDir: string | undefined): string | undefined {
++   const text = unquote(target.trim());
++
++   if (!text) {
++      return undefined;
++   }
++
++   if (text === '~') {
++      return homedir();
++   }
++
++   if (text.startsWith('~/')) {
++      return resolve(homedir(), text.slice(2));
++   }
++
++   // `~user` and git's compile-time `%(prefix)` are not resolvable here; seeing one means the
++   // source cannot be inspected rather than that it is safe.
++   if (text.charAt(0) === '~' || text.includes('%(')) {
++      return undefined;
++   }
++
++   if (isAbsolute(text)) {
++      return text;
++   }
++
++   // A relative path is resolved against the directory of the file that includes it. For a value
++   // that came straight from the command line, git resolves against the child process' working
++   // directory, which isn't visible here - that source is treated as uninspectable.
++   return baseDir ? resolve(baseDir, text) : undefined;
++}
++
++type SourceFiles = { files: string[] } | { uninspectable: true };
++
++/**
++ * The regular files a configuration source names. A path that git would glob is not returned as
++ * a literal file (that would inspect the wrong thing) and is reported as uninspectable instead.
++ */
++function sourceFiles(path: string): SourceFiles {
++   if (/[*?[]/.test(path)) {
++      return { uninspectable: true };
++   }
++
++   try {
++      return statSync(path).isFile() ? { files: [path] } : { uninspectable: true };
++   } catch (e) {
++      if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
++         return { files: [] };
++      }
++
++      return { uninspectable: true };
++   }
++}
++
++function normalizeSection(body: string): string {
++   const quoted = /^([^\s"]+)\s+"([^"]*)"$/.exec(body.trim());
++
++   if (quoted) {
++      return normalizeKey(`${quoted[1]}.${quoted[2]}`);
++   }
++
++   return normalizeKey(body);
++}
++
++/** Parses one configuration file into the settings that matter, its includes, and nothing else. */
++export function parseConfigSource(file: string): ParsedSource | undefined {
++   let contents: string;
++
++   try {
++      contents = readFileSync(file, 'utf8');
++   } catch (e) {
++      return undefined;
++   }
++
++   const source: ParsedSource = { protocol: false, program: false, includes: [] };
++   let section = '';
++
++   // A trailing backslash joins the next line, exactly as it does for git.
++   for (const line of contents.replace(/\\\r?\n/g, '').split(/\r?\n/)) {
++      const text = line.trim();
++      if (!text || text.charAt(0) === '#' || text.charAt(0) === ';') {
++         continue;
++      }
++
++      const header = /^\[([^\]]*)\]/.exec(text);
++      if (header) {
++         section = normalizeSection(header[1]);
++         continue;
++      }
++
++      const assignment = readAssignment(text);
++      if (!assignment) {
++         continue;
++      }
++
++      const key = section ? `${section}.${assignment.key}` : assignment.key;
++
++      if (protocolAllow.test(key)) {
++         source.protocol = true;
++      } else if (namesProgram(key, assignment.value)) {
++         source.program = true;
++      }
++
++      if (includePath.test(key)) {
++         source.includes.push(assignment.value);
++      }
++   }
++
++   return source;
++}
++
++/**
++ * A configuration source is only accepted when every file behind it can be inspected and none of
++ * them contains a refused setting. Includes are followed to the same depth git would.
++ */
++function scanSource(
++   target: string,
++   depth: number,
++   baseDir: string | undefined
++): ParsedSource | undefined {
++   if (depth > MAX_INCLUDE_DEPTH) {
++      return undefined;
++   }
++
++   const path = resolveSourcePath(target, baseDir);
++   if (!path) {
++      return undefined;
++   }
++
++   const looked = sourceFiles(path);
++
++   if ('uninspectable' in looked) {
++      return undefined;
++   }
++
++   const aggregate: ParsedSource = { protocol: false, program: false, includes: [] };
++
++   for (const file of looked.files) {
++      const source = parseConfigSource(file);
++      if (!source) {
++         return undefined;
++      }
++
++      aggregate.protocol = aggregate.protocol || source.protocol;
++      aggregate.program = aggregate.program || source.program;
++
++      for (const nested of source.includes) {
++         const child = scanSource(nested, depth + 1, dirname(file));
++         if (!child) {
++            return undefined;
++         }
++
++         aggregate.protocol = aggregate.protocol || child.protocol;
++         aggregate.program = aggregate.program || child.program;
++      }
++   }
++
++   return aggregate;
++}
++
++/** True when the value the assignment carries is a program git would execute. */
++function namesProgram(key: string, value: string): boolean {
++   if (!programKey.some((test) => test.test(key))) {
++      return false;
++   }
++
++   const text = value.trim();
++   if (!text) {
++      return false;
++   }
++
++   if (key === 'core.fsmonitor') {
++      return text !== 'true' && text !== 'false';
++   }
++
++   if (key.startsWith('alias.')) {
++      return text.charAt(0) === '!';
++   }
++
++   return true;
++}
++
++/** The value git will use for the assignment, resolving an environment reference where possible. */
++function assignmentValue(assignment: ConfigAssignment): string | undefined {
++   if (!assignment.viaEnv) {
++      return assignment.value;
++   }
++
++   const name = assignment.value.trim();
++   return Object.prototype.hasOwnProperty.call(process.env, name) ? process.env[name] : undefined;
++}
++
++function configurationRefusal(
++   assignment: ConfigAssignment,
++   allowUnsafeProtocolOverride: boolean
++): string | undefined {
++   if (protocolAllow.test(assignment.key)) {
++      return allowUnsafeProtocolOverride ? undefined : PROTOCOL_REFUSAL;
++   }
++
++   if (includePath.test(assignment.key)) {
++      const target = assignmentValue(assignment);
++      if (target === undefined) {
++         return UNINSPECTABLE_SOURCE;
++      }
++
++      const source = scanSource(target, 0, undefined);
++      if (!source) {
++         return UNINSPECTABLE_SOURCE;
++      }
++
++      if (source.program) {
++         return `Use of ${assignment.key} is not permitted`;
++      }
++
++      if (source.protocol && !allowUnsafeProtocolOverride) {
++         return PROTOCOL_REFUSAL;
++      }
++
++      return undefined;
++   }
++
++   if (programKey.some((test) => test.test(assignment.key))) {
++      const value = assignmentValue(assignment);
++
++      // An environment reference whose value is not visible here cannot be cleared on its value
++      // alone; the key itself names a program, so it is refused.
++      if (value === undefined || namesProgram(assignment.key, value)) {
++         return `Use of ${assignment.key} is not permitted`;
++      }
++   }
++
++   return undefined;
++}
++
++/**
++ * Throws `GitPluginError` for the first argument that would relax a transport protocol or make
++ * git run a caller-named program. Called while the `spawn.args` plugins run, before the child
++ * process exists.
++ */
++export function assertSafeArguments(args: string[], allowUnsafeProtocolOverride: boolean): void {
++   for (const assignment of configurationAssignments(args)) {
++      const refusal = configurationRefusal(assignment, allowUnsafeProtocolOverride);
++      if (refusal) {
++         throw new GitPluginError(undefined, 'unsafe', refusal);
++      }
++   }
++
++   for (const assignment of configurationWrites(args)) {
++      const refusal = configurationRefusal(assignment, allowUnsafeProtocolOverride);
++      if (refusal) {
++         throw new GitPluginError(undefined, 'unsafe', refusal);
++      }
++   }
++
++   for (const token of args) {
++      const text = token.trim();
++      if (packOption.test(text)) {
++         throw new GitPluginError(
++            undefined,
++            'unsafe',
++            `Use of ${text.split('=')[0]} is not permitted`
++         );
++      }
++   }
++}

@@ -1,0 +1,132 @@
+diff --git a/runtime/python/prompty/prompty/core/loader.py b/runtime/python/prompty/prompty/core/loader.py
+index f7b89aee..9fd324ad 100644
+--- a/runtime/python/prompty/prompty/core/loader.py
++++ b/runtime/python/prompty/prompty/core/loader.py
+@@ -16,7 +16,7 @@ from typing import Any
+ import yaml
+ 
+ from ..model import LoadContext, Prompty, SaveContext
+-from .utils import load_fragment, load_prompty, load_prompty_async
++from .utils import contain_path, load_fragment, load_prompty, load_prompty_async
+ 
+ __all__ = ["load", "load_async", "default_save_context"]
+ 
+@@ -99,7 +99,7 @@ def _build_agent(data: dict[str, Any] | str, path: Path) -> Prompty:
+     # base defines are inherited unless this prompt sets them explicitly.
+     base_ref = data.pop("base", None)
+     if isinstance(base_ref, str) and base_ref:
+-        base_data = load_prompty(path.parent / base_ref)
++        base_data = load_prompty(contain_path(path.parent, base_ref))
+         if isinstance(base_data, dict):
+             for base_key, base_value in base_data.items():
+                 data.setdefault(base_key, base_value)
+@@ -162,7 +162,7 @@ def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+                     data[key] = env_val
+ 
+             elif protocol == "file":
+-                relative_path = (agent_file.parent / val).resolve()
++                relative_path = contain_path(agent_file.parent, val)
+                 if not relative_path.exists():
+                     raise FileNotFoundError(
+                         f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
+diff --git a/runtime/python/prompty/prompty/core/utils.py b/runtime/python/prompty/prompty/core/utils.py
+index d24074b6..d8717adf 100644
+--- a/runtime/python/prompty/prompty/core/utils.py
++++ b/runtime/python/prompty/prompty/core/utils.py
+@@ -36,13 +36,29 @@ async def load_json_async(file_path: str | Path, encoding: str = "utf-8") -> Any
+     return json.loads(content)
+ 
+ 
++def contain_path(base_dir: str | Path, reference: str) -> Path:
++    """Resolve *reference* against *base_dir*, rejecting anything that escapes it.
++
++    Absolute paths, ``..`` traversal and symlinks that point outside *base_dir*
++    all land outside the directory and are rejected before any file is opened.
++    """
++    root = Path(base_dir).resolve()
++    candidate = Path(reference)
++    if not candidate.is_absolute():
++        candidate = root / candidate
++    resolved = candidate.resolve()
++    if resolved != root and not resolved.is_relative_to(root):
++        raise ValueError(f"Reference '{reference}' resolves outside the directory '{root}'")
++    return resolved
++
++
+ def load_fragment(base_dir: str | Path, reference: str, encoding: str = "utf-8") -> str:
+     """Read a prompt fragment referenced from frontmatter, relative to *base_dir*.
+ 
+     Used by the ``${prompt:...}`` reference protocol to compose a prompt from
+     shared fragment files that live alongside the ``.prompty`` file.
+     """
+-    target = Path(base_dir) / reference
++    target = contain_path(base_dir, reference)
+     return load_text(target, encoding=encoding)
+ 
+ 
+diff --git a/runtime/python/prompty/prompty/renderers/jinja2.py b/runtime/python/prompty/prompty/renderers/jinja2.py
+index 39933307..05044d9a 100644
+--- a/runtime/python/prompty/prompty/renderers/jinja2.py
++++ b/runtime/python/prompty/prompty/renderers/jinja2.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ from pathlib import Path
+ from typing import Any
+ 
++from ..core.utils import contain_path
+ from ..model import Prompty
+ from ..tracing.tracer import trace
+ from ._common import _prepare_render_inputs, _thread_nonces_local
+@@ -29,7 +30,7 @@ class _PromptDirLoader:
+     def get_source(self, environment: Any, template: str) -> tuple[str, str, Any]:
+         from jinja2 import TemplateNotFound
+ 
+-        path = self.base_dir / template
++        path = contain_path(self.base_dir, template)
+         if not path.is_file():
+             raise TemplateNotFound(template)
+         source = path.read_text(encoding="utf-8")
+diff --git a/runtime/typescript/packages/core/src/core/loader.ts b/runtime/typescript/packages/core/src/core/loader.ts
+index 49c6c5d4..b699b407 100644
+--- a/runtime/typescript/packages/core/src/core/loader.ts
++++ b/runtime/typescript/packages/core/src/core/loader.ts
+@@ -8,8 +8,8 @@
+  * @module
+  */
+ 
+-import { readFileSync } from "node:fs";
+-import { resolve, dirname, extname } from "node:path";
++import { existsSync, readFileSync, realpathSync } from "node:fs";
++import { resolve, dirname, extname, isAbsolute, relative } from "node:path";
+ import matter from "gray-matter";
+ import { LoadContext, SaveContext } from "../model/context.js";
+ import { Prompty } from "../model/agent/prompty.js";
+@@ -144,7 +144,7 @@ function makePreProcess(agentFile: string): (data: unknown) => unknown {
+           );
+         }
+       } else if (protocol === "file") {
+-        const filePath = resolve(agentDir, val);
++        const filePath = containPath(agentDir, val);
+         record[key] = loadFileContent(filePath);
+       }
+     }
+@@ -163,3 +163,20 @@ function loadFileContent(path: string): unknown {
+   // For YAML we return raw string — the loader handles YAML natively
+   return raw;
+ }
++
++/**
++ * Resolve `reference` against `baseDir`, rejecting anything that escapes it.
++ *
++ * Absolute paths, `..` traversal and symlinks that point outside `baseDir`
++ * all land outside the directory and are rejected before any file is opened.
++ */
++function containPath(baseDir: string, reference: string): string {
++  const root = realpathSync(baseDir);
++  const candidate = isAbsolute(reference) ? resolve(reference) : resolve(root, reference);
++  const resolved = existsSync(candidate) ? realpathSync(candidate) : resolve(candidate);
++  const rel = relative(root, resolved);
++  if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) {
++    throw new Error(`Reference '${reference}' resolves outside the directory '${root}'`);
++  }
++  return resolved;
++}

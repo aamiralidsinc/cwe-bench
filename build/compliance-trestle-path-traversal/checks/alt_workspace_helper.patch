@@ -1,0 +1,178 @@
+diff --git a/trestle/common/file_utils.py b/trestle/common/file_utils.py
+index 1e19944e..3ecf02f6 100644
+--- a/trestle/common/file_utils.py
++++ b/trestle/common/file_utils.py
+@@ -92,6 +92,14 @@ def is_local_and_visible(file_path: pathlib.Path) -> bool:
+     return not (is_hidden(file_path) or is_symlink(file_path))
+ 
+ 
++def ensure_within_workspace(trestle_root: pathlib.Path, target: pathlib.Path) -> None:
++    """Raise TrestleError unless target (after resolving links and '..') lies inside trestle_root."""
++    root = os.path.realpath(str(trestle_root))
++    real = os.path.realpath(str(target))
++    if os.path.commonpath([root, real]) != root:
++        raise TrestleError(f'{target} is outside the trestle workspace {trestle_root}')
++
++
+ def is_directory_name_allowed(name: str) -> bool:
+     """Determine whether a directory name, which is a 'non-core-OSCAL activity/directory is allowed.
+ 
+@@ -105,6 +113,13 @@ def is_directory_name_allowed(name: str) -> bool:
+     # Task must not self-interfere with a project
+     pathed_name = pathlib.Path(name)
+ 
++    # Task must stay inside the workspace: relative, and never stepping up a level
++    if os.path.isabs(str(name)) or str(name).startswith(('/', '\\')) or '..' in pathlib.PurePosixPath(
++        str(name).replace('\\', '/')
++    ).parts:
++        logger.warning('Task name must be a relative path inside the workspace')
++        return False
++
+     root_path = pathed_name.parts[0]
+     if root_path in const.MODEL_TYPE_TO_MODEL_DIR.values():
+         logger.warning('Task name is the same as an OSCAL schema name.')
+diff --git a/trestle/common/model_utils.py b/trestle/common/model_utils.py
+index b1a7f2d6..a43f3da6 100644
+--- a/trestle/common/model_utils.py
++++ b/trestle/common/model_utils.py
+@@ -308,6 +308,8 @@ class ModelUtils:
+         If the model directory does not exist, it is created.
+         """
+         root_model_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model)
++        from trestle.common.file_utils import ensure_within_workspace
++        ensure_within_workspace(trestle_root, root_model_path.parent)
+         full_model_path = root_model_path.with_suffix(FileContentType.to_file_extension(file_content_type))
+         if not full_model_path.parent.exists():
+             full_model_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -512,6 +514,10 @@ class ModelUtils:
+ 
+         If file_content_type is given it will not inspect the file system or confirm the needed path and file exists.
+         """
++        from trestle.common.file_utils import ensure_within_workspace
++        ensure_within_workspace(
++            trestle_root, ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model_class).parent
++        )
+         if file_content_type is None:
+             root_model_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model_class)
+             file_content_type = FileContentType.path_to_content_type(root_model_path)
+diff --git a/trestle/core/commands/author/catalog.py b/trestle/core/commands/author/catalog.py
+index 68395684..4671528e 100644
+--- a/trestle/core/commands/author/catalog.py
++++ b/trestle/core/commands/author/catalog.py
+@@ -88,6 +88,7 @@ class CatalogGenerate(AuthorCommonCommand):
+             catalog_path = trestle_root / f'catalogs/{args.name}/catalog.json'
+ 
+             markdown_path = trestle_root / args.output
++            file_utils.ensure_within_workspace(trestle_root, markdown_path)
+ 
+             return self.generate_markdown(
+                 trestle_root, catalog_path, markdown_path, yaml_header, args.overwrite_header_values
+diff --git a/trestle/core/commands/author/component.py b/trestle/core/commands/author/component.py
+index f6e70b10..58055437 100644
+--- a/trestle/core/commands/author/component.py
++++ b/trestle/core/commands/author/component.py
+@@ -60,23 +60,22 @@ class ComponentGenerate(AuthorCommonCommand):
+         try:
+             log.set_log_level_from_args(args)
+ 
+-            if args.force_overwrite:
+-                try:
+-                    logger.info(f'Overwriting the content in {args.output} folder.')
+-                    clear_folder(pathlib.Path(args.output))
+-                except TrestleError as e:  # pragma: no cover
+-                    raise TrestleError(f'Unable to overwrite contents in {args.output} folder: {e}')
+-
+-            return self.component_generate_all(args.trestle_root, args.name, args.output)
++            return self.component_generate_all(args.trestle_root, args.name, args.output, args.force_overwrite)
+ 
+         except Exception as e:  # pragma: no cover
+             return handle_generic_command_exception(e, logger, 'Generation of the component markdown failed')
+ 
+-    def component_generate_all(self, trestle_root: pathlib.Path, comp_def_name: str, markdown_dir_name: str) -> int:
++    def component_generate_all(
++        self, trestle_root: pathlib.Path, comp_def_name: str, markdown_dir_name: str, force_overwrite: bool = False
++    ) -> int:
+         """Generate markdown for all components in comp def."""
+         if not file_utils.is_directory_name_allowed(markdown_dir_name):
+             raise TrestleError(f'{markdown_dir_name} is not an allowed directory name')
+         md_path = trestle_root / markdown_dir_name
++        file_utils.ensure_within_workspace(trestle_root, md_path)
++        if force_overwrite:
++            logger.info(f'Overwriting the content in {markdown_dir_name} folder.')
++            clear_folder(md_path)
+         md_path.mkdir(parents=True, exist_ok=True)
+         component_def, _ = load_validate_model_name(trestle_root, comp_def_name, comp.ComponentDefinition)
+ 
+diff --git a/trestle/core/commands/author/headers.py b/trestle/core/commands/author/headers.py
+index f2352bd5..1a95f11d 100644
+--- a/trestle/core/commands/author/headers.py
++++ b/trestle/core/commands/author/headers.py
+@@ -315,7 +315,7 @@ class Headers(AuthorCommonCommand):
+                 # Files in the root directory must be exclused
+                 if path.is_file():
+                     continue
+-                if not file_utils.is_directory_name_allowed(path):
++                if not file_utils.is_directory_name_allowed(relative_path.as_posix()):
+                     continue
+                 if str(relative_path).rstrip('/') in const.MODEL_DIR_LIST:
+                     continue
+diff --git a/trestle/core/commands/author/prof.py b/trestle/core/commands/author/prof.py
+index 3a545ab4..fd17611a 100644
+--- a/trestle/core/commands/author/prof.py
++++ b/trestle/core/commands/author/prof.py
+@@ -108,6 +108,7 @@ class ProfileGenerate(AuthorCommonCommand):
+             profile_path = trestle_root / f'profiles/{args.name}/profile.json'
+ 
+             markdown_path = trestle_root / args.output
++            file_utils.ensure_within_workspace(trestle_root, markdown_path)
+ 
+             return self.generate_markdown(
+                 trestle_root,
+diff --git a/trestle/core/commands/author/ssp.py b/trestle/core/commands/author/ssp.py
+index c37c3d69..ae30ba29 100644
+--- a/trestle/core/commands/author/ssp.py
++++ b/trestle/core/commands/author/ssp.py
+@@ -109,6 +109,7 @@ class SSPGenerate(AuthorCommonCommand):
+             compdef_name_list = comma_sep_to_list(args.compdefs)
+ 
+             md_path = trestle_root / args.output
++            file_utils.ensure_within_workspace(trestle_root, md_path)
+ 
+             return self._generate_ssp_markdown(
+                 trestle_root,
+diff --git a/trestle/core/commands/create.py b/trestle/core/commands/create.py
+index a13afdaa..ddf6b9ec 100644
+--- a/trestle/core/commands/create.py
++++ b/trestle/core/commands/create.py
+@@ -93,6 +93,7 @@ class CreateCmd(CommandPlusDocs):
+         plural_path = ModelUtils.model_type_to_model_dir(model_alias)
+ 
+         desired_model_dir = trestle_root / plural_path / args.output
++        file_utils.ensure_within_workspace(trestle_root, desired_model_dir)
+ 
+         desired_model_path = desired_model_dir / (model_alias + '.' + args.extension)
+ 
+diff --git a/trestle/core/commands/import_.py b/trestle/core/commands/import_.py
+index c2fc9140..5897e31e 100644
+--- a/trestle/core/commands/import_.py
++++ b/trestle/core/commands/import_.py
+@@ -86,6 +86,7 @@ class ImportCmd(CommandPlusDocs):
+                 FileContentType.to_file_extension(content_type)
+             ).resolve()
+ 
++            file_utils.ensure_within_workspace(trestle_root, desired_model_path)
+             if desired_model_path.exists():
+                 logger.warning(f'Cannot import because file to be imported here: {desired_model_path} already exists.')
+                 return CmdReturnCodes.COMMAND_ERROR.value
+diff --git a/trestle/core/commands/replicate.py b/trestle/core/commands/replicate.py
+index a9739141..9f352029 100644
+--- a/trestle/core/commands/replicate.py
++++ b/trestle/core/commands/replicate.py
+@@ -90,6 +90,7 @@ class ReplicateCmd(CommandPlusDocs):
+             trestle_root / plural_path / args.output / (model_alias + FileContentType.to_file_extension(content_type))
+         )
+ 
++        file_utils.ensure_within_workspace(trestle_root, rep_model_path)
+         if rep_model_path.exists():
+             raise TrestleError(f'OSCAL file to be replicated here: {rep_model_path} exists.')
+ 

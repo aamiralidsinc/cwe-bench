@@ -1,0 +1,412 @@
+diff --git a/core/network/utils.go b/core/network/utils.go
+index 2df7293..43f3e30 100644
+--- a/core/network/utils.go
++++ b/core/network/utils.go
+@@ -1,6 +1,12 @@
+ package network
+ 
+-import "net"
++import (
++	"net"
++	"net/netip"
++)
++
++// cgnat is the RFC 6598 Carrier-Grade NAT shared address space (100.64.0.0/10).
++var cgnat = netip.MustParsePrefix("100.64.0.0/10")
+ 
+ // IsLocalhost reports whether hostname is localhost or a loopback literal.
+ func IsLocalhost(hostname string) bool {
+@@ -39,11 +45,24 @@ func IsLinkLocal(ip net.IP) bool {
+ 	return ip.IsLinkLocalUnicast()
+ }
+ 
+-// IsPrivateIP reports whether ip falls in a private, loopback, or link-local range.
++// IsPrivateIP reports whether ip falls in a private, loopback, link-local, or
++// reserved range. IPv6 forms that carry an IPv4 address (6to4, NAT64) are
++// classified by the embedded IPv4 so a wrapped internal target is not treated
++// as public; an embedded public IPv4 stays public.
+ func IsPrivateIP(ip net.IP) bool {
+ 	if ip == nil || ip.IsUnspecified() {
+ 		return true
+ 	}
++	if addr, ok := netip.AddrFromSlice(ip); ok {
++		addr = addr.Unmap()
++		if embedded, ok := embeddedIPv4(addr); ok {
++			return !isPublicIPv4(embedded)
++		}
++		if cgnat.Contains(addr) || isSiteLocal(addr) ||
++			addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
++			return true
++		}
++	}
+ 	for _, subnet := range privateSubnets {
+ 		if subnet.Contains(ip) {
+ 			return true
+@@ -60,3 +79,45 @@ func IsPrivateIP(ip net.IP) bool {
+ 	}
+ 	return false
+ }
++
++// isPublicIPv4 reports whether addr is a globally routable IPv4 address.
++func isPublicIPv4(addr netip.Addr) bool {
++	if !addr.Is4() {
++		return false
++	}
++	return !(addr.IsLoopback() || addr.IsPrivate() || cgnat.Contains(addr) ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}))
++}
++
++// isSiteLocal reports whether addr is in the deprecated IPv6 site-local
++// fec0::/10 range (RFC 3879).
++func isSiteLocal(addr netip.Addr) bool {
++	if !addr.Is6() {
++		return false
++	}
++	b := addr.As16()
++	return b[0] == 0xfe && (b[1]&0xc0) == 0xc0
++}
++
++// embeddedIPv4 extracts the IPv4 carried inside a 6to4 (2002::/16) or NAT64
++// (64:ff9b::/96, 64:ff9b:1::/48) address.
++func embeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
++	if !addr.Is6() {
++		return netip.Addr{}, false
++	}
++	b := addr.As16()
++	switch {
++	case b[0] == 0x20 && b[1] == 0x02:
++		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
++	case b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b:
++		if b[4] == 0x00 && b[5] == 0x00 {
++			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
++		}
++		if b[4] == 0x00 && b[5] == 0x01 {
++			return netip.AddrFrom4([4]byte{b[6], b[7], b[9], b[10]}), true
++		}
++	}
++	return netip.Addr{}, false
++}
+diff --git a/core/providers/gemini/utils.go b/core/providers/gemini/utils.go
+index c3961e1..554149f 100644
+--- a/core/providers/gemini/utils.go
++++ b/core/providers/gemini/utils.go
+@@ -6,7 +6,9 @@ import (
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
++	"net"
+ 	"net/http"
++	"net/netip"
+ 	"strings"
+ 	"time"
+ 
+@@ -2776,6 +2778,7 @@ func downloadImageFromURL(ctx context.Context, imageURL string) (string, error)
+ 	client := fasthttp.Client{
+ 		ReadTimeout: time.Second * 30,
+ 	}
++	client.Dial = dialPublicImageTarget
+ 	req := fasthttp.AcquireRequest()
+ 	resp := fasthttp.AcquireResponse()
+ 	defer fasthttp.ReleaseRequest(req)
+@@ -2805,6 +2808,72 @@ func downloadImageFromURL(ctx context.Context, imageURL string) (string, error)
+ 	return encodeBytesToBase64String(imageCopy), nil
+ }
+ 
++// dialPublicImageTarget resolves the image host itself and dials the validated
++// literal, so an image URL supplied in an upstream response cannot make the
++// provider connection reach a non-public address. IPv4 addresses embedded in
++// IPv6 transition forms are classified by the embedded address.
++func dialPublicImageTarget(addr string) (net.Conn, error) {
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil {
++		return nil, err
++	}
++	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
++	if err != nil {
++		return nil, err
++	}
++	for _, ip := range ips {
++		if !publicImageIP(ip) {
++			return nil, fmt.Errorf("blocked image download to non-public address %s", ip)
++		}
++	}
++	return (&net.Dialer{Timeout: 30 * time.Second}).Dial("tcp", net.JoinHostPort(ips[0].String(), port))
++}
++
++func publicImageIP(ip net.IP) bool {
++	addr, ok := netip.AddrFromSlice(ip)
++	if !ok {
++		return false
++	}
++	addr = addr.Unmap()
++	if embedded, ok := embeddedImageIPv4(addr); ok {
++		addr = embedded
++	}
++	if addr.IsLoopback() || addr.IsPrivate() || cgnatImage.Contains(addr) ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
++		return false
++	}
++	if addr.Is6() {
++		b := addr.As16()
++		if b[0] == 0xfe && (b[1]&0xc0) == 0xc0 {
++			return false
++		}
++	}
++	return true
++}
++
++var cgnatImage = netip.MustParsePrefix("100.64.0.0/10")
++
++func embeddedImageIPv4(addr netip.Addr) (netip.Addr, bool) {
++	if !addr.Is6() {
++		return netip.Addr{}, false
++	}
++	b := addr.As16()
++	switch {
++	case b[0] == 0x20 && b[1] == 0x02:
++		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
++	case b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b:
++		if b[4] == 0x00 && b[5] == 0x00 {
++			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
++		}
++		if b[4] == 0x00 && b[5] == 0x01 {
++			return netip.AddrFrom4([4]byte{b[6], b[7], b[9], b[10]}), true
++		}
++	}
++	return netip.Addr{}, false
++}
++
+ // tokenToBytes converts a token string to its UTF-8 byte representation as []int
+ func tokenToBytes(token string) []int {
+ 	bytes := []byte(token)
+diff --git a/framework/modelcatalog/sync.go b/framework/modelcatalog/sync.go
+index bb7c74e..4c69745 100644
+--- a/framework/modelcatalog/sync.go
++++ b/framework/modelcatalog/sync.go
+@@ -5,7 +5,9 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"net/http"
++	"net/netip"
+ 	"net/url"
+ 	"os"
+ 	"slices"
+@@ -130,7 +132,7 @@ func (mc *ModelCatalog) loadPricingFromURL(ctx context.Context) (map[string]Pric
+ 		if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
+ 			return nil, fmt.Errorf("pricing URL validation failed: %w", err)
+ 		}
+-		client := &http.Client{Timeout: DefaultPricingTimeout}
++		client := newEndpointHTTPClient(DefaultPricingTimeout)
+ 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+@@ -514,7 +516,7 @@ func (mc *ModelCatalog) loadModelParametersFromURL(ctx context.Context) (map[str
+ 		if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
+ 			return nil, fmt.Errorf("model parameters URL validation failed: %w", err)
+ 		}
+-		client := &http.Client{Timeout: DefaultModelParametersTimeout}
++		client := newEndpointHTTPClient(DefaultModelParametersTimeout)
+ 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+@@ -543,3 +545,85 @@ func (mc *ModelCatalog) loadModelParametersFromURL(ctx context.Context) (map[str
+ 	mc.logger.Debug("successfully loaded and parsed %d model parameters records", len(paramsData))
+ 	return paramsData, nil
+ }
++
++// newEndpointHTTPClient builds the client used to download configured endpoint
++// data. The dialer resolves the destination itself and refuses addresses that
++// the save-time URL validation cannot see: an IPv4 smuggled inside an IPv6
++// transition form, the deprecated site-local range, link-local and unspecified
++// addresses. Locally hosted endpoints (loopback and RFC 1918) keep working, as
++// they do for the save-time validation.
++func newEndpointHTTPClient(timeout time.Duration) *http.Client {
++	dialer := &net.Dialer{Timeout: timeout}
++	return &http.Client{
++		Timeout: timeout,
++		Transport: &http.Transport{
++			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++				return dialEndpoint(ctx, dialer, network, addr)
++			},
++		},
++	}
++}
++
++func dialEndpoint(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil {
++		return nil, err
++	}
++	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
++	if err != nil {
++		return nil, err
++	}
++	for _, ip := range ips {
++		if blockedEndpointIP(ip) {
++			return nil, fmt.Errorf("blocked connection to non-public address %s", ip)
++		}
++	}
++	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
++}
++
++func blockedEndpointIP(ip net.IP) bool {
++	addr, ok := netip.AddrFromSlice(ip)
++	if !ok {
++		return true
++	}
++	addr = addr.Unmap()
++	if embedded, ok := embeddedEndpointIPv4(addr); ok {
++		return !publicEndpointIPv4(embedded)
++	}
++	if addr.IsLoopback() || addr.IsPrivate() {
++		return false
++	}
++	b := addr.As16()
++	return cgnatEndpoint.Contains(addr) || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() ||
++		(addr.Is6() && b[0] == 0xfe && (b[1]&0xc0) == 0xc0) ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255})
++}
++
++var cgnatEndpoint = netip.MustParsePrefix("100.64.0.0/10")
++
++func publicEndpointIPv4(addr netip.Addr) bool {
++	return addr.Is4() && !(addr.IsLoopback() || addr.IsPrivate() || cgnatEndpoint.Contains(addr) ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}))
++}
++
++func embeddedEndpointIPv4(addr netip.Addr) (netip.Addr, bool) {
++	if !addr.Is6() {
++		return netip.Addr{}, false
++	}
++	b := addr.As16()
++	switch {
++	case b[0] == 0x20 && b[1] == 0x02:
++		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
++	case b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b:
++		if b[4] == 0x00 && b[5] == 0x00 {
++			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
++		}
++		if b[4] == 0x00 && b[5] == 0x01 {
++			return netip.AddrFrom4([4]byte{b[6], b[7], b[9], b[10]}), true
++		}
++	}
++	return netip.Addr{}, false
++}
+diff --git a/transports/bifrost-http/handlers/config.go b/transports/bifrost-http/handlers/config.go
+index dab841c..94d703d 100644
+--- a/transports/bifrost-http/handlers/config.go
++++ b/transports/bifrost-http/handlers/config.go
+@@ -6,7 +6,9 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"net/http"
++	"net/netip"
+ 	"net/url"
+ 	"os"
+ 	"slices"
+@@ -1004,7 +1006,7 @@ func checkURLAccessibility(rawURL string) error {
+ 	if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
+ 		return fmt.Errorf("URL validation failed: %w", err)
+ 	}
+-	client := &http.Client{Timeout: 60 * time.Second}
++	client := newProbeHTTPClient(60 * time.Second)
+ 	resp, err := client.Get(rawURL)
+ 	if err != nil {
+ 		return err
+@@ -1018,3 +1020,85 @@ func checkURLAccessibility(rawURL string) error {
+ 	}
+ 	return nil
+ }
++
++// newProbeHTTPClient builds the client used to probe a configured endpoint's
++// reachability. The dialer resolves the destination itself so redirects and
++// name changes are checked too: an IPv4 carried inside an IPv6 transition form,
++// the deprecated site-local range, link-local and unspecified addresses are
++// refused. Locally hosted endpoints (loopback and RFC 1918) keep working, as
++// they do for the save-time validation.
++func newProbeHTTPClient(timeout time.Duration) *http.Client {
++	dialer := &net.Dialer{Timeout: timeout}
++	return &http.Client{
++		Timeout: timeout,
++		Transport: &http.Transport{
++			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
++				return dialProbeEndpoint(ctx, dialer, network, addr)
++			},
++		},
++	}
++}
++
++func dialProbeEndpoint(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
++	host, port, err := net.SplitHostPort(addr)
++	if err != nil {
++		return nil, err
++	}
++	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
++	if err != nil {
++		return nil, err
++	}
++	for _, ip := range ips {
++		if blockedProbeIP(ip) {
++			return nil, fmt.Errorf("blocked connection to non-public address %s", ip)
++		}
++	}
++	return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
++}
++
++func blockedProbeIP(ip net.IP) bool {
++	addr, ok := netip.AddrFromSlice(ip)
++	if !ok {
++		return true
++	}
++	addr = addr.Unmap()
++	if embedded, ok := embeddedProbeIPv4(addr); ok {
++		return !publicProbeIPv4(embedded)
++	}
++	if addr.IsLoopback() || addr.IsPrivate() {
++		return false
++	}
++	b := addr.As16()
++	return cgnatProbe.Contains(addr) || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() ||
++		(addr.Is6() && b[0] == 0xfe && (b[1]&0xc0) == 0xc0) ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255})
++}
++
++var cgnatProbe = netip.MustParsePrefix("100.64.0.0/10")
++
++func publicProbeIPv4(addr netip.Addr) bool {
++	return addr.Is4() && !(addr.IsLoopback() || addr.IsPrivate() || cgnatProbe.Contains(addr) ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}))
++}
++
++func embeddedProbeIPv4(addr netip.Addr) (netip.Addr, bool) {
++	if !addr.Is6() {
++		return netip.Addr{}, false
++	}
++	b := addr.As16()
++	switch {
++	case b[0] == 0x20 && b[1] == 0x02:
++		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
++	case b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b:
++		if b[4] == 0x00 && b[5] == 0x00 {
++			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
++		}
++		if b[4] == 0x00 && b[5] == 0x01 {
++			return netip.AddrFrom4([4]byte{b[6], b[7], b[9], b[10]}), true
++		}
++	}
++	return netip.Addr{}, false
++}

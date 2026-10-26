@@ -1,0 +1,253 @@
+diff -ruN a/server/origin.go b/server/origin.go
+--- a/server/origin.go	1970-01-01 00:00:00.000000000 +0000
++++ b/server/origin.go	2026-10-26 05:18:53.880499988 +0000
+@@ -0,0 +1,153 @@
++package server
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// originRule is one entry of the operator-supplied --api-cors value. A wildcard
++// rule matches every origin; otherwise the entry's host, and its scheme when the
++// entry included one, must match the request's Origin.
++type originRule struct {
++	wildcard bool
++	scheme   string
++	host     string
++}
++
++// originRules parses the comma- or whitespace-separated --api-cors value.
++func originRules(value string) []originRule {
++	fields := strings.FieldsFunc(value, func(c rune) bool {
++		switch c {
++		case ',', ' ', '\t', '\r', '\n':
++			return true
++		}
++		return false
++	})
++
++	rules := make([]originRule, 0, len(fields))
++	for _, field := range fields {
++		if field == "*" {
++			rules = append(rules, originRule{wildcard: true})
++			continue
++		}
++
++		rule := originRule{host: field}
++		if strings.Contains(field, "://") {
++			u, err := url.Parse(field)
++			if err != nil || u.Host == "" {
++				continue
++			}
++			rule.host, rule.scheme = u.Host, strings.ToLower(u.Scheme)
++		}
++
++		rules = append(rules, rule)
++	}
++
++	return rules
++}
++
++// requestScheme reports the scheme the client used to reach this daemon.
++func requestScheme(r *http.Request) string {
++	if r.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++// hostKey normalises a host:port pair so that an explicitly written default port
++// compares equal to the implicit one.
++func hostKey(host, scheme string) string {
++	switch {
++	case scheme == "http" && strings.HasSuffix(host, ":80"):
++		return strings.TrimSuffix(host, ":80")
++	case scheme == "https" && strings.HasSuffix(host, ":443"):
++		return strings.TrimSuffix(host, ":443")
++	}
++	return host
++}
++
++// originMatches reports whether a parsed Origin may act on this server: either it
++// is this server's own origin, or the operator has allowed it.
++func originMatches(r *http.Request, origin *url.URL) bool {
++	scheme := requestScheme(r)
++	originScheme := strings.ToLower(origin.Scheme)
++	originHost := hostKey(origin.Host, originScheme)
++
++	if strings.EqualFold(originScheme, scheme) &&
++		strings.EqualFold(originHost, hostKey(r.Host, scheme)) {
++		return true
++	}
++
++	for _, rule := range originRules(AccessControlAllowOrigin) {
++		if rule.wildcard {
++			return true
++		}
++		if !strings.EqualFold(hostKey(rule.host, rule.scheme), originHost) {
++			continue
++		}
++		if rule.scheme == "" || rule.scheme == originScheme {
++			return true
++		}
++	}
++
++	return false
++}
++
++// foreignOrigin reports whether the request was issued by a page on another
++// origin that is neither this server nor an operator-allowed origin. A request
++// without an Origin header does not come from a cross-origin browser context and
++// is not foreign. An Origin that cannot be parsed as an http(s) origin, including
++// the opaque "null", is foreign: the decision fails closed.
++func foreignOrigin(r *http.Request) bool {
++	for _, raw := range r.Header.Values("Origin") {
++		raw = strings.TrimSpace(raw)
++		if raw == "" {
++			continue
++		}
++
++		origin, err := url.Parse(raw)
++		if err != nil {
++			return true
++		}
++
++		scheme := strings.ToLower(origin.Scheme)
++		if origin.Host == "" || (scheme != "http" && scheme != "https") {
++			return true
++		}
++
++		if !originMatches(r, origin) {
++			return true
++		}
++	}
++
++	return false
++}
++
++// safeMethod reports whether a method only reads state.
++func safeMethod(method string) bool {
++	switch method {
++	case http.MethodGet, http.MethodHead, http.MethodOptions:
++		return true
++	}
++	return false
++}
++
++// crossOriginRefused reports whether a request must be answered with a client
++// error because a page on another origin is using this server to reach the
++// mailbox. Every state-changing method and every API path is protected; safe
++// reads of non-API routes (the UI shell, static assets) are left alone, which is
++// what browsers already enforce through the absent CORS grant.
++func crossOriginRefused(r *http.Request, apiPath bool) bool {
++	if !foreignOrigin(r) {
++		return false
++	}
++	return apiPath || !safeMethod(r.Method)
++}
++
++// allowSameOrAllowedOrigin is the websocket handshake decision: a handshake is
++// admitted when it carries no Origin (command-line and service clients) or an
++// Origin that belongs to this server or to the configured allow list.
++func allowSameOrAllowedOrigin(r *http.Request) bool {
++	return !foreignOrigin(r)
++}
+diff -ruN a/server/server.go b/server/server.go
+--- a/server/server.go	2026-10-26 02:40:55.000000000 +0000
++++ b/server/server.go	2026-10-26 05:15:34.184687414 +0000
+@@ -47,6 +47,10 @@
+ 
+ 	websockets.MessageHub = websockets.NewHub()
+ 
++	// The event stream is served outside middleWareFunc, so its admission
++	// decision is installed on the websocket handshake itself.
++	websockets.SetOriginPolicy(allowSameOrAllowedOrigin)
++
+ 	go websockets.MessageHub.Run()
+ 
+ 	go pop3.Run()
+@@ -287,8 +291,18 @@
+ 			htmlPreviewRouteRe = regexp.MustCompile(`^` + regexp.QuoteMeta(config.Webroot) + `view/[a-zA-Z0-9]+\.html$`)
+ 		}
+ 
+-		if AccessControlAllowOrigin != "" &&
+-			(strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI)) {
++		// Decide against the path the router dispatched on, not the raw request
++		// target: a percent-encoded spelling still reaches the same handler.
++		apiPath := strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path)
++
++		// A browser issues a simple cross-origin request without a preflight, so
++		// the origin decision cannot be left to the CORS response headers.
++		if crossOriginRefused(r, apiPath) {
++			http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
++			return
++		}
++
++		if AccessControlAllowOrigin != "" && apiPath {
+ 			w.Header().Set("Access-Control-Allow-Origin", AccessControlAllowOrigin)
+ 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 			w.Header().Set("Access-Control-Allow-Headers", "*")
+diff -ruN a/server/websockets/client.go b/server/websockets/client.go
+--- a/server/websockets/client.go	2026-10-26 02:40:55.000000000 +0000
++++ b/server/websockets/client.go	2026-10-26 05:15:41.872680486 +0000
+@@ -29,13 +29,29 @@
+ 
+ 	// MessageHub global
+ 	MessageHub *Hub
++
++	// originPolicy decides whether a websocket handshake may proceed. The server
++	// package installs it once at startup; see SetOriginPolicy.
++	originPolicy func(*http.Request) bool
+ )
+ 
++// SetOriginPolicy installs the admission decision applied to websocket
++// handshakes. Until a policy is installed every handshake is refused, so a
++// server that forgets to install one fails closed instead of admitting any page.
++func SetOriginPolicy(decide func(*http.Request) bool) {
++	originPolicy = decide
++}
++
+ var upgrader = websocket.Upgrader{
+ 	ReadBufferSize:    1024,
+ 	WriteBufferSize:   1024,
+-	CheckOrigin:       func(r *http.Request) bool { return true }, // allow multi-domain
+-	EnableCompression: true,                                       // experimental compression
++	CheckOrigin:       handshakeOriginAllowed,
++	EnableCompression: true, // experimental compression
++}
++
++// handshakeOriginAllowed applies the installed origin policy to a handshake.
++func handshakeOriginAllowed(r *http.Request) bool {
++	return originPolicy != nil && originPolicy(r)
+ }
+ 
+ // Client is a middleman between the websocket connection and the hub.
+@@ -112,6 +128,14 @@
+ 
+ // ServeWs handles websocket requests from the peer.
+ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
++	// This route is registered outside the shared HTTP middleware, so the origin
++	// decision is applied here as well: a refused handshake is then a plain
++	// client error rather than a failed upgrade.
++	if !handshakeOriginAllowed(r) {
++		originRefused(w)
++		return
++	}
++
+ 	if auth.UICredentials != nil {
+ 		user, pass, ok := r.BasicAuth()
+ 
+@@ -146,3 +170,10 @@
+ 	w.WriteHeader(http.StatusUnauthorized)
+ 	_, _ = w.Write([]byte("Unauthorised.\n"))
+ }
++
++// originRefused answers a handshake that a page on another origin attempted.
++func originRefused(w http.ResponseWriter) {
++	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
++	w.WriteHeader(http.StatusForbidden)
++	_, _ = w.Write([]byte("Forbidden: cross-origin request refused.\n"))
++}

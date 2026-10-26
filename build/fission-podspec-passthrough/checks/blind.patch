@@ -1,0 +1,495 @@
+diff -ruN a/charts/fission-all/templates/webhook-server/webhooks.yaml b/charts/fission-all/templates/webhook-server/webhooks.yaml
+--- a/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-17 17:45:10.659326728 +0000
++++ b/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-17 17:47:34.239223237 +0000
+@@ -72,6 +72,7 @@
+     - v1
+     operations:
+     - CREATE
++    - UPDATE
+     resources:
+     - environments
+   sideEffects: None
+diff -ruN a/pkg/apis/core/v1/podsecurity.go b/pkg/apis/core/v1/podsecurity.go
+--- a/pkg/apis/core/v1/podsecurity.go	1970-01-01 00:00:00.000000000 +0000
++++ b/pkg/apis/core/v1/podsecurity.go	2026-10-17 17:47:24.003230604 +0000
+@@ -0,0 +1,281 @@
++/*
++Copyright 2026 The Fission Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++
++	apiv1 "k8s.io/api/core/v1"
++)
++
++// Tenant-supplied pod customisation (Environment.Spec.Runtime/Builder
++// PodSpec and Container, Function.Spec.PodSpec) is merged into pods the
++// Fission controllers create with the platform's service accounts. The
++// helpers below define which settings a tenant may never apply to those
++// pods: host namespaces, privileged / escalating containers, non-default
++// Linux capabilities, host filesystem mounts, host ports and a
++// tenant-chosen service account.
++//
++// ValidatePodSpecSecurity / ValidateContainerSecurity are used at admission
++// time. SanitizePodSpec / SanitizeContainer are the controller-side
++// defence for objects that were stored without passing admission; they
++// return a deep copy with every forbidden setting removed.
++
++// defaultCapabilities is the container runtime's default capability set.
++// Adding one of these is a no-op security-wise and stays allowed.
++var defaultCapabilities = map[string]struct{}{
++	"AUDIT_WRITE":      {},
++	"CHOWN":            {},
++	"DAC_OVERRIDE":     {},
++	"FOWNER":           {},
++	"FSETID":           {},
++	"KILL":             {},
++	"MKNOD":            {},
++	"NET_BIND_SERVICE": {},
++	"NET_RAW":          {},
++	"SETFCAP":          {},
++	"SETGID":           {},
++	"SETPCAP":          {},
++	"SETUID":           {},
++	"SYS_CHROOT":       {},
++}
++
++func isAllowedCapability(c apiv1.Capability) bool {
++	name := strings.ToUpper(strings.TrimSpace(string(c)))
++	name = strings.TrimPrefix(name, "CAP_")
++	_, ok := defaultCapabilities[name]
++	return ok
++}
++
++func forbiddenErr(field string, value any, reason string) error {
++	return MakeValidationErr(ErrorInvalidValue, field, value, reason)
++}
++
++// ValidatePodSpecSecurity rejects tenant-supplied pod spec settings that
++// would grant node- or cluster-level privileges to the resulting pod.
++func ValidatePodSpecSecurity(field string, ps *apiv1.PodSpec) error {
++	if ps == nil {
++		return nil
++	}
++	var errs error
++
++	if ps.HostNetwork {
++		errs = errors.Join(errs, forbiddenErr(field+".hostNetwork", true, "sharing the host network namespace is not allowed"))
++	}
++	if ps.HostPID {
++		errs = errors.Join(errs, forbiddenErr(field+".hostPID", true, "sharing the host PID namespace is not allowed"))
++	}
++	if ps.HostIPC {
++		errs = errors.Join(errs, forbiddenErr(field+".hostIPC", true, "sharing the host IPC namespace is not allowed"))
++	}
++	if ps.ServiceAccountName != "" {
++		errs = errors.Join(errs, forbiddenErr(field+".serviceAccountName", ps.ServiceAccountName, "selecting a service account is not allowed"))
++	}
++	if ps.DeprecatedServiceAccount != "" {
++		errs = errors.Join(errs, forbiddenErr(field+".serviceAccount", ps.DeprecatedServiceAccount, "selecting a service account is not allowed"))
++	}
++	if sc := ps.SecurityContext; sc != nil {
++		if sc.WindowsOptions != nil && sc.WindowsOptions.HostProcess != nil && *sc.WindowsOptions.HostProcess {
++			errs = errors.Join(errs, forbiddenErr(field+".securityContext.windowsOptions.hostProcess", true, "host process pods are not allowed"))
++		}
++	}
++	for i, v := range ps.Volumes {
++		if v.HostPath != nil {
++			errs = errors.Join(errs, forbiddenErr(fmt.Sprintf("%s.volumes[%d].hostPath", field, i), v.HostPath.Path, "host path volumes are not allowed"))
++		}
++	}
++	for i := range ps.Containers {
++		errs = errors.Join(errs, ValidateContainerSecurity(fmt.Sprintf("%s.containers[%d]", field, i), &ps.Containers[i]))
++	}
++	for i := range ps.InitContainers {
++		errs = errors.Join(errs, ValidateContainerSecurity(fmt.Sprintf("%s.initContainers[%d]", field, i), &ps.InitContainers[i]))
++	}
++	for i := range ps.EphemeralContainers {
++		c := apiv1.Container(ps.EphemeralContainers[i].EphemeralContainerCommon)
++		errs = errors.Join(errs, ValidateContainerSecurity(fmt.Sprintf("%s.ephemeralContainers[%d]", field, i), &c))
++	}
++	return errs
++}
++
++// ValidateContainerSecurity rejects tenant-supplied container settings that
++// would grant node-level privileges.
++func ValidateContainerSecurity(field string, c *apiv1.Container) error {
++	if c == nil {
++		return nil
++	}
++	var errs error
++	for i, p := range c.Ports {
++		if p.HostPort != 0 {
++			errs = errors.Join(errs, forbiddenErr(fmt.Sprintf("%s.ports[%d].hostPort", field, i), p.HostPort, "host ports are not allowed"))
++		}
++	}
++	sc := c.SecurityContext
++	if sc == nil {
++		return errs
++	}
++	if sc.Privileged != nil && *sc.Privileged {
++		errs = errors.Join(errs, forbiddenErr(field+".securityContext.privileged", true, "privileged containers are not allowed"))
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		errs = errors.Join(errs, forbiddenErr(field+".securityContext.allowPrivilegeEscalation", true, "privilege escalation is not allowed"))
++	}
++	if sc.Capabilities != nil {
++		for _, capability := range sc.Capabilities.Add {
++			if !isAllowedCapability(capability) {
++				errs = errors.Join(errs, forbiddenErr(field+".securityContext.capabilities.add", capability, "adding this capability is not allowed"))
++			}
++		}
++	}
++	if sc.ProcMount != nil && *sc.ProcMount == apiv1.UnmaskedProcMount {
++		errs = errors.Join(errs, forbiddenErr(field+".securityContext.procMount", *sc.ProcMount, "unmasked proc mount is not allowed"))
++	}
++	if sc.WindowsOptions != nil && sc.WindowsOptions.HostProcess != nil && *sc.WindowsOptions.HostProcess {
++		errs = errors.Join(errs, forbiddenErr(field+".securityContext.windowsOptions.hostProcess", true, "host process containers are not allowed"))
++	}
++	return errs
++}
++
++// SanitizePodSpec returns a deep copy of a tenant-supplied pod spec with
++// every setting rejected by ValidatePodSpecSecurity removed. Volume mounts
++// and devices referring to dropped host path volumes are removed as well.
++func SanitizePodSpec(ps *apiv1.PodSpec) *apiv1.PodSpec {
++	if ps == nil {
++		return nil
++	}
++	out := ps.DeepCopy()
++
++	out.HostNetwork = false
++	out.HostPID = false
++	out.HostIPC = false
++	out.ServiceAccountName = ""
++	out.DeprecatedServiceAccount = ""
++	if sc := out.SecurityContext; sc != nil && sc.WindowsOptions != nil && sc.WindowsOptions.HostProcess != nil {
++		sc.WindowsOptions.HostProcess = new(false)
++	}
++
++	dropped := make(map[string]struct{})
++	vols := out.Volumes[:0]
++	for _, v := range out.Volumes {
++		if v.HostPath != nil {
++			dropped[v.Name] = struct{}{}
++			continue
++		}
++		vols = append(vols, v)
++	}
++	out.Volumes = vols
++	if len(out.Volumes) == 0 {
++		out.Volumes = nil
++	}
++
++	for i := range out.Containers {
++		sanitizeContainerInPlace(&out.Containers[i], dropped)
++	}
++	for i := range out.InitContainers {
++		sanitizeContainerInPlace(&out.InitContainers[i], dropped)
++	}
++	for i := range out.EphemeralContainers {
++		c := apiv1.Container(out.EphemeralContainers[i].EphemeralContainerCommon)
++		sanitizeContainerInPlace(&c, dropped)
++		out.EphemeralContainers[i].EphemeralContainerCommon = apiv1.EphemeralContainerCommon(c)
++	}
++	return out
++}
++
++// SanitizeContainer returns a deep copy of a tenant-supplied container with
++// every setting rejected by ValidateContainerSecurity removed. Mounts named
++// in droppedVolumes (host path volumes removed by SanitizePodSpec) are
++// removed too.
++func SanitizeContainer(c *apiv1.Container, droppedVolumes map[string]struct{}) *apiv1.Container {
++	if c == nil {
++		return nil
++	}
++	out := c.DeepCopy()
++	sanitizeContainerInPlace(out, droppedVolumes)
++	return out
++}
++
++// HostPathVolumeNames returns the names of host path volumes in ps.
++func HostPathVolumeNames(ps *apiv1.PodSpec) map[string]struct{} {
++	names := make(map[string]struct{})
++	if ps == nil {
++		return names
++	}
++	for _, v := range ps.Volumes {
++		if v.HostPath != nil {
++			names[v.Name] = struct{}{}
++		}
++	}
++	return names
++}
++
++func sanitizeContainerInPlace(c *apiv1.Container, droppedVolumes map[string]struct{}) {
++	for i := range c.Ports {
++		c.Ports[i].HostPort = 0
++		c.Ports[i].HostIP = ""
++	}
++	if len(droppedVolumes) > 0 {
++		mounts := c.VolumeMounts[:0]
++		for _, m := range c.VolumeMounts {
++			if _, ok := droppedVolumes[m.Name]; ok {
++				continue
++			}
++			mounts = append(mounts, m)
++		}
++		c.VolumeMounts = mounts
++		if len(c.VolumeMounts) == 0 {
++			c.VolumeMounts = nil
++		}
++		devices := c.VolumeDevices[:0]
++		for _, d := range c.VolumeDevices {
++			if _, ok := droppedVolumes[d.Name]; ok {
++				continue
++			}
++			devices = append(devices, d)
++		}
++		c.VolumeDevices = devices
++		if len(c.VolumeDevices) == 0 {
++			c.VolumeDevices = nil
++		}
++	}
++	sc := c.SecurityContext
++	if sc == nil {
++		return
++	}
++	if sc.Privileged != nil && *sc.Privileged {
++		sc.Privileged = new(false)
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		sc.AllowPrivilegeEscalation = new(false)
++	}
++	if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
++		var add []apiv1.Capability
++		for _, capability := range sc.Capabilities.Add {
++			if isAllowedCapability(capability) {
++				add = append(add, capability)
++			}
++		}
++		sc.Capabilities.Add = add
++	}
++	if sc.ProcMount != nil && *sc.ProcMount == apiv1.UnmaskedProcMount {
++		sc.ProcMount = nil
++	}
++	if sc.WindowsOptions != nil && sc.WindowsOptions.HostProcess != nil && *sc.WindowsOptions.HostProcess {
++		sc.WindowsOptions.HostProcess = new(false)
++	}
++}
+diff -ruN a/pkg/apis/core/v1/validation.go b/pkg/apis/core/v1/validation.go
+--- a/pkg/apis/core/v1/validation.go	2026-10-17 17:45:10.691326706 +0000
++++ b/pkg/apis/core/v1/validation.go	2026-10-17 17:47:34.239223237 +0000
+@@ -297,6 +297,8 @@
+ 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
+ 	}
+ 
++	errs = errors.Join(errs, ValidatePodSpecSecurity("FunctionSpec.PodSpec", spec.PodSpec))
++
+ 	// TODO Add below validation warning
+ 	// if spec.FunctionTimeout <= 0 {
+ 	// 	errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionTimeout value", spec.FunctionTimeout, "not a valid value. Should always be more than 0"))
+@@ -381,12 +383,17 @@
+ 		errs = errors.Join(errs, ValidateKubePort("Runtime.FunctionEndpointPort", int(runtime.FunctionEndpointPort)))
+ 	}
+ 
++	errs = errors.Join(errs,
++		ValidateContainerSecurity("Runtime.Container", runtime.Container),
++		ValidatePodSpecSecurity("Runtime.PodSpec", runtime.PodSpec))
++
+ 	return errs
+ }
+ 
+ func (builder Builder) Validate() error {
+-	// do nothing for now
+-	return nil
++	return errors.Join(
++		ValidateContainerSecurity("Builder.Container", builder.Container),
++		ValidatePodSpecSecurity("Builder.PodSpec", builder.PodSpec))
+ }
+ 
+ func (spec EnvironmentSpec) Validate() error {
+diff -ruN a/pkg/buildermgr/envwatcher.go b/pkg/buildermgr/envwatcher.go
+--- a/pkg/buildermgr/envwatcher.go	2026-10-17 17:45:10.695326703 +0000
++++ b/pkg/buildermgr/envwatcher.go	2026-10-17 17:47:59.203205277 +0000
+@@ -415,6 +415,13 @@
+ 		podAnnotations["sidecar.istio.io/inject"] = "false"
+ 	}
+ 
++	// Tenant-supplied builder customisation is stripped of settings that
++	// would grant node-level privileges or select another service account
++	// before it is merged into the pod. Admission rejects these settings;
++	// this covers objects stored without passing admission.
++	builderContainer := fv1.SanitizeContainer(env.Spec.Builder.Container, fv1.HostPathVolumeNames(env.Spec.Builder.PodSpec))
++	builderPodSpec := fv1.SanitizePodSpec(env.Spec.Builder.PodSpec)
++
+ 	container, err := util.MergeContainer(&apiv1.Container{
+ 		Name:                   fv1.BuilderContainerName,
+ 		Image:                  env.Spec.Builder.Image,
+@@ -434,7 +441,7 @@
+ 				},
+ 			},
+ 		},
+-	}, env.Spec.Builder.Container)
++	}, builderContainer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -516,8 +523,8 @@
+ 		return nil, err
+ 	}
+ 
+-	if env.Spec.Builder.PodSpec != nil {
+-		newPodSpec, err := util.MergePodSpec(&deployment.Spec.Template.Spec, env.Spec.Builder.PodSpec)
++	if builderPodSpec != nil {
++		newPodSpec, err := util.MergePodSpec(&deployment.Spec.Template.Spec, builderPodSpec)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff -ruN a/pkg/executor/executortype/container/deployment.go b/pkg/executor/executortype/container/deployment.go
+--- a/pkg/executor/executortype/container/deployment.go	2026-10-17 17:45:10.699326699 +0000
++++ b/pkg/executor/executortype/container/deployment.go	2026-10-17 17:48:59.063162247 +0000
+@@ -169,8 +169,12 @@
+ 		replicas = *targetReplicas
+ 	}
+ 
++	if fn.Spec.PodSpec == nil {
++		return nil, fmt.Errorf("podSpec is not set for function %s", fn.Name)
++	}
++
+ 	gracePeriodSeconds := int64(6 * 60)
+-	if *fn.Spec.PodSpec.TerminationGracePeriodSeconds >= 0 {
++	if fn.Spec.PodSpec.TerminationGracePeriodSeconds != nil && *fn.Spec.PodSpec.TerminationGracePeriodSeconds >= 0 {
+ 		gracePeriodSeconds = *fn.Spec.PodSpec.TerminationGracePeriodSeconds
+ 	}
+ 
+@@ -214,10 +218,6 @@
+ 		return nil, err
+ 	}
+ 
+-	if fn.Spec.PodSpec == nil {
+-		return nil, fmt.Errorf("podSpec is not set for function %s", fn.Name)
+-	}
+-
+ 	container := &apiv1.Container{
+ 		Name:                   fn.Name,
+ 		ImagePullPolicy:        cn.runtimeImagePullPolicy,
+@@ -242,10 +242,14 @@
+ 		// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
+ 		Resources: resources,
+ 	}
++	// The function's pod spec is tenant-supplied: strip settings that would
++	// grant node-level privileges or select a service account before the
++	// merge. Admission rejects these settings; this covers objects stored
++	// without passing admission.
+ 	podSpec, err := util.MergePodSpec(&apiv1.PodSpec{
+ 		Containers:                    []apiv1.Container{*container},
+ 		TerminationGracePeriodSeconds: &gracePeriodSeconds,
+-	}, fn.Spec.PodSpec)
++	}, fv1.SanitizePodSpec(fn.Spec.PodSpec))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff -ruN a/pkg/executor/executortype/newdeploy/newdeploy.go b/pkg/executor/executortype/newdeploy/newdeploy.go
+--- a/pkg/executor/executortype/newdeploy/newdeploy.go	2026-10-17 17:45:10.703326696 +0000
++++ b/pkg/executor/executortype/newdeploy/newdeploy.go	2026-10-17 17:47:59.203205277 +0000
+@@ -182,6 +182,13 @@
+ 		return nil, err
+ 	}
+ 
++	// Tenant-supplied runtime customisation is stripped of settings that
++	// would grant node-level privileges or select another service account
++	// before it is merged into the pod. Admission rejects these settings;
++	// this covers objects stored without passing admission.
++	runtimeContainer := fv1.SanitizeContainer(env.Spec.Runtime.Container, fv1.HostPathVolumeNames(env.Spec.Runtime.PodSpec))
++	runtimePodSpec := fv1.SanitizePodSpec(env.Spec.Runtime.PodSpec)
++
+ 	container, err := util.MergeContainer(&apiv1.Container{
+ 		Name:                   env.Name,
+ 		Image:                  env.Spec.Runtime.Image,
+@@ -212,7 +219,7 @@
+ 			},
+ 		},
+ 		Resources: resources,
+-	}, env.Spec.Runtime.Container)
++	}, runtimeContainer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -312,8 +319,8 @@
+ 		return nil, err
+ 	}
+ 
+-	if env.Spec.Runtime.PodSpec != nil {
+-		newPodSpec, err := util.MergePodSpec(&deployment.Spec.Template.Spec, env.Spec.Runtime.PodSpec)
++	if runtimePodSpec != nil {
++		newPodSpec, err := util.MergePodSpec(&deployment.Spec.Template.Spec, runtimePodSpec)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff -ruN a/pkg/executor/executortype/poolmgr/gp_deployment.go b/pkg/executor/executortype/poolmgr/gp_deployment.go
+--- a/pkg/executor/executortype/poolmgr/gp_deployment.go	2026-10-17 17:45:10.703326696 +0000
++++ b/pkg/executor/executortype/poolmgr/gp_deployment.go	2026-10-17 17:47:59.203205277 +0000
+@@ -108,6 +108,13 @@
+ 
+ 	maps.Copy(podLabels, deployLabels)
+ 
++	// Tenant-supplied runtime customisation is stripped of settings that
++	// would grant node-level privileges or select another service account
++	// before it is merged into the pod. Admission rejects these settings;
++	// this covers objects stored without passing admission.
++	runtimeContainer := fv1.SanitizeContainer(env.Spec.Runtime.Container, fv1.HostPathVolumeNames(env.Spec.Runtime.PodSpec))
++	runtimePodSpec := fv1.SanitizePodSpec(env.Spec.Runtime.PodSpec)
++
+ 	container, err := util.MergeContainer(&apiv1.Container{
+ 		Name:                   env.Name,
+ 		Image:                  env.Spec.Runtime.Image,
+@@ -141,7 +148,7 @@
+ 				ContainerPort: int32(8888),
+ 			},
+ 		},
+-	}, env.Spec.Runtime.Container)
++	}, runtimeContainer)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -218,8 +225,8 @@
+ 		return nil, err
+ 	}
+ 
+-	if env.Spec.Runtime.PodSpec != nil {
+-		newPodSpec, err := util.MergePodSpec(&deploymentSpec.Template.Spec, env.Spec.Runtime.PodSpec)
++	if runtimePodSpec != nil {
++		newPodSpec, err := util.MergePodSpec(&deploymentSpec.Template.Spec, runtimePodSpec)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff -ruN a/pkg/webhook/environment.go b/pkg/webhook/environment.go
+--- a/pkg/webhook/environment.go	2026-10-17 17:45:10.767326650 +0000
++++ b/pkg/webhook/environment.go	2026-10-17 17:47:34.239223237 +0000
+@@ -42,7 +42,7 @@
+ var _ webhook.CustomDefaulter = &Environment{}
+ 
+ // user: change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
+-//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
++//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create;update,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
+ 
+ var _ webhook.CustomValidator = &Environment{}
+ 

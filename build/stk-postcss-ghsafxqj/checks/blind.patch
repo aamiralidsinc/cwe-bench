@@ -1,0 +1,197 @@
+diff -ruN pristine/lib/lazy-result.js app/lib/lazy-result.js
+--- a/lib/lazy-result.js	2026-10-26 03:27:03.000000000 +0000
++++ b/lib/lazy-result.js	2026-10-26 05:34:39.075629421 +0000
+@@ -380,6 +380,9 @@
+ 
+     let rootSource = this.result.root.source
+     if (opts.map === undefined && !(rootSource && rootSource.input && rootSource.input.map)) {
++      // No map will be generated and no previous map was loaded, so the map
++      // generator never runs; the input annotation must still be cleared here.
++      MapGenerator.clearAnnotations(this.result.root)
+       let result = ''
+       str(this.result.root, i => {
+         result += i
+diff -ruN pristine/lib/map-generator.js app/lib/map-generator.js
+--- a/lib/map-generator.js	2026-10-26 03:27:03.000000000 +0000
++++ b/lib/map-generator.js	2026-10-26 05:34:38.103630309 +0000
+@@ -66,14 +66,7 @@
+     if (this.mapOpts.annotation === false) return
+ 
+     if (this.root) {
+-      let node
+-      for (let i = this.root.nodes.length - 1; i >= 0; i--) {
+-        node = this.root.nodes[i]
+-        if (node.type !== 'comment') continue
+-        if (node.text.startsWith('# sourceMappingURL=')) {
+-          this.root.removeChild(i)
+-        }
+-      }
++      MapGenerator.clearAnnotations(this.root)
+     } else if (this.css) {
+       let startIndex
+       while ((startIndex = this.css.lastIndexOf('/*#')) !== -1) {
+@@ -87,6 +80,19 @@
+     }
+   }
+ 
++  // Remove every annotation comment carried by the processed CSS, wherever it
++  // sits in the tree, so an input-supplied reference is never emitted back.
++  static clearAnnotations(root) {
++    let annotations = []
++    root.walkComments(comment => {
++      if (comment.text.startsWith('# sourceMappingURL=')) {
++        annotations.push(comment)
++      }
++    })
++    for (let comment of annotations) comment.remove()
++    return annotations.length > 0
++  }
++
+   generate() {
+     this.clearAnnotation()
+     if (pathAvailable && sourceMapAvailable && this.isMap()) {
+diff -ruN pristine/lib/previous-map.js app/lib/previous-map.js
+--- a/lib/previous-map.js	2026-10-26 03:27:03.000000000 +0000
++++ b/lib/previous-map.js	2026-10-26 05:34:06.331659333 +0000
+@@ -1,9 +1,11 @@
+ 'use strict'
+ 
+-let { existsSync, readFileSync } = require('fs')
+-let { dirname, join } = require('path')
++let { existsSync, readFileSync, realpathSync, statSync } = require('fs')
++let { dirname, isAbsolute, relative, resolve, sep } = require('path')
+ let { SourceMapConsumer, SourceMapGenerator } = require('source-map-js')
+ 
++let tokenize = require('./tokenize')
++
+ function fromBase64(str) {
+   if (Buffer) {
+     return Buffer.from(str, 'base64').toString()
+@@ -13,6 +15,41 @@
+   }
+ }
+ 
++// Resolve every symbolic link in `path`. A path without a resolvable identity
++// (a missing file or a dangling link) cannot be read anyway, so `undefined`
++// is a safe answer for the callers below.
++function canonical(path) {
++  try {
++    return realpathSync(path)
++  } catch {
++    return undefined
++  }
++}
++
++// Pick the file named by an untrusted annotation. It must be a regular file
++// that really lives under `base`: the containment test is made on resolved
++// paths, so a link at or below the stylesheet's folder cannot carry the read
++// to a target outside it. `undefined` means the annotation must be ignored.
++function confinedFile(url, base) {
++  let root = canonical(base)
++  if (!root) return undefined
++
++  let target = isAbsolute(url) ? url : resolve(base, url)
++  let resolved = canonical(target)
++  if (!resolved) return undefined
++
++  let rel = relative(root, resolved)
++  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) {
++    return undefined
++  }
++  try {
++    if (!statSync(resolved).isFile()) return undefined
++  } catch {
++    return undefined
++  }
++  return target
++}
++
+ class PreviousMap {
+   constructor(css, opts) {
+     if (opts.map === false) return
+@@ -70,20 +107,42 @@
+   }
+ 
+   loadAnnotation(css) {
+-    let comments = css.match(/\/\*\s*# sourceMappingURL=/g)
+-    if (!comments) return
+-
+-    // sourceMappingURLs from comments, strings, etc.
+-    let start = css.lastIndexOf(comments.pop())
+-    let end = css.indexOf('*/', start)
+-
+-    if (start > -1 && end > -1) {
+-      // Locate the last sourceMappingURL to avoid pickin
+-      this.annotation = this.getAnnotationURL(css.substring(start, end))
++    // Only a real CSS comment is an annotation. Tokenizing the stylesheet keeps
++    // marker text that merely looks like one — inside a string, a selector or
++    // any other value — from selecting a file.
++    let annotation
++    let tokens
++    try {
++      tokens = tokenize(
++        { css, error: message => new Error(message) },
++        { ignoreErrors: true }
++      )
++    } catch {
++      return
++    }
++
++    while (!tokens.endOfFile()) {
++      let token = tokens.nextToken()
++      if (!token || token[0] !== 'comment') continue
++      let comment = token[1]
++      // An unterminated comment is not a valid annotation comment.
++      if (!comment.endsWith('*/')) continue
++      let head = comment.slice(0, -2)
++      if (/^\/\*\s*# sourceMappingURL=/.test(head)) {
++        annotation = this.getAnnotationURL(head)
++      }
+     }
++    if (annotation !== undefined) this.annotation = annotation
+   }
+ 
+-  loadFile(path) {
++  // `base`, when given, marks the path as untrusted: it was named by a comment
++  // in the processed CSS and may only select a file below the stylesheet's
++  // folder (or below the working directory when there is no stylesheet file).
++  loadFile(path, base) {
++    if (base !== undefined) {
++      path = confinedFile(path, base)
++      if (path === undefined) return undefined
++    }
+     this.root = dirname(path)
+     if (existsSync(path)) {
+       this.mapFile = path
+@@ -100,6 +159,7 @@
+       } else if (typeof prev === 'function') {
+         let prevPath = prev(file)
+         if (prevPath) {
++          // The caller chose this path, so it is not confined.
+           let map = this.loadFile(prevPath)
+           if (!map) {
+             throw new Error(
+@@ -122,9 +182,20 @@
+     } else if (this.inline) {
+       return this.decodeInline(this.annotation)
+     } else if (this.annotation) {
+-      let map = this.annotation
+-      if (file) map = join(dirname(file), map)
+-      return this.loadFile(map)
++      let base = file ? dirname(file) : process.cwd()
++      let map = this.loadFile(this.annotation, base)
++      if (map === undefined) return undefined
++      // Build the consumer now, from a JSON source map only. A file that is
++      // not one is dropped here, so its bytes cannot surface later through a
++      // parse error or through the generated map.
++      try {
++        this.consumerCache = new SourceMapConsumer(
++          map.replace(/^\)]}'[^\n]*\n/, '')
++        )
++      } catch {
++        return undefined
++      }
++      return map
+     }
+   }
+ 

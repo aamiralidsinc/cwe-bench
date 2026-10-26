@@ -1,0 +1,69 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "7517", "advisory_ids": ["GHSA-2H44-8472-FRJJ", "CVE-2026-61559"], "repo": "zereight/gitlab-mcp", "pinned_commit": "e614f9983ee25ed2753d5bf0bf64ca69061bab40", "fix_commits": ["6ffb4cc70706fd05b1ab80901676bc2998b6db6d"],
+  "trust_decision": {
+    "summary": "A caller-supplied GitLab base URL (X-GitLab-API-URL header, or an apiUrl carried in a download token / sealed session id) is admitted only when its host matches the operator's GITLAB_API_URL or GITLAB_ALLOWED_HOSTS set; the decision is taken in resolveTrustedGitLabApiUrl against a map built once at startup and every authenticated fetch sink is supposed to use the resolved URL rather than the caller's string.",
+    "evidence": ["index.ts:1818-1831", "index.ts:1838-1848", "index.ts:13284-13295", "downloads/proxy.ts:119-130"]
+  },
+  "landing_point": {"where": "index.ts:1818", "why": "The advisory is an SSRF report for an MCP client that can pick the GitLab base URL, so a reader first opens resolveTrustedGitLabApiUrl, the function that is supposed to decide which hosts are reachable."},
+  "fix_sites": [
+    {"where": "index.ts:1818-1831", "entry_point": "POST /mcp (Streamable HTTP, stateful and OAUTH_STATELESS_MODE) via parseAuthHeaders — tool calls issued against ctx.apiUrl", "module_kind": "request-auth middleware / in-process allowlist check"},
+    {"where": "index.ts:1834-1848", "entry_point": "process start-up config (GITLAB_API_URL, GITLAB_ALLOWED_HOSTS) building GITLAB_ALLOWED_API_URLS_BY_HOST", "module_kind": "config loader / startup cache"},
+    {"where": "downloads/proxy.ts:119-130", "entry_point": "GET /downloads/:type (job-artifacts, attachment, release-asset)", "module_kind": "HTTP download proxy"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "downloads/proxy.ts:119-130"},
+  "O3_reason_to_dismiss": "The /downloads/:type endpoint is a separate token-authenticated media proxy, not the MCP tool surface the report describes, and it already resolves X-GitLab-API-URL through index.ts:1818, so a solver can argue the download path is a neighbouring feature and already covered.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "GITLAB_ALLOWED_HOSTS exists so one deployment can route a single MCP server to several trusted GitLab instances (connection pool per host). Pinning every request to GITLAB_API_URL, or rejecting any host that is not the primary one, fixes the report but breaks documented multi-instance routing and the download proxy for secondary hosts.",
+    "where": "index.ts:1843"
+  },
+  "O6_input_shapes": [
+    "bare host or host:port without scheme (gitlab.example.com, gitlab.example.com:8443)",
+    "full URL with /api/v4 already present",
+    "full URL without /api/v4 (normalizeGitLabApiUrl appends it)",
+    "trailing slash on the URL",
+    "http:// versus https:// (both accepted, the stored configured URL is what gets fetched)",
+    "the same value arriving as X-GitLab-API-URL header (index.ts:13284, downloads/proxy.ts:122) versus an apiUrl embedded in an encrypted _token (utils/download-token.ts:42-60) versus a sealed Mcp-Session-Id u field (stateless/session-id.ts:56-68)",
+    "comma-separated GITLAB_API_URL / GITLAB_ALLOWED_HOSTS entries (index.ts:1834-1848)",
+    "requested URL carrying userinfo, a fragment or a different path — discarded because the mapped configured URL is returned"
+  ],
+  "O7_producer": {"kind": "cache", "where": "index.ts:1838-1848", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "downloads/proxy.ts:119-130", "sibling": "a second 'resolve the caller's API URL' implementation in the download proxy", "why_realistic": "the proxy needs the same header handling for streaming, so a maintainer could plausibly have written its own resolve step instead of reusing parseAuthHeaders; it already duplicates the enableDynamicApiUrl gate."},
+    {"where": "stateless/session-id.ts:56-68", "sibling": "apiUrl carried in the sealed Mcp-Session-Id (u field) and trusted on later requests without re-running the allowlist (index.ts:13526)", "why_realistic": "stateless mode serializes the whole auth context so a pod can rebuild it; a maintainer extending that payload with apiUrl need not re-check the host on replay."},
+    {"where": "index.ts:79-80", "sibling": "ctx.apiUrl embedded into a download token and re-used by /downloads", "why_realistic": "buildDownloadUrl reuses the session context to make self-contained URLs, so a maintainer adding a field there could extend the reachable URL surface without touching the allowlist."}
+  ],
+  "O9_family": "server-side request forgery (CWE-918) via a caller-selected GitLab API base URL", "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript (ES modules, Node >=18, npm >=9)",
+    "toolchain": "npm install then npm run build (tsc -> build/index.js); tests run through node --test with tsx/esm (package.json:46-64)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/dynamic-api-url-allowlist.test.ts (starts a real MCP server plus mock GitLab and an attacker server, asserts untrusted hosts get zero hits), test/dynamic-api-url-test.ts, test/multi-server-test.ts, test/remote-auth-simple-test.ts, test/test-remote-downloads.ts; all use local mock servers (test/utils/mock-gitlab-server.ts, test/utils/server-launcher.ts) so they run offline."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["protection_documented_without_exceptions"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "index.ts, downloads/proxy.ts",
+    "j_sibling_sites": "unknown",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Stop honouring X-GitLab-API-URL (or pin getEffectiveApiUrl to GITLAB_API_URL) so the reported header can no longer reach any fetch, without keeping the allowlisted multi-host path working."
+  },
+  "out_of_scope_notes": [
+    "CHANGELOG.md:31 records a sibling advisory in the same repository, GHSA-cv3r-c5h8-f4g5 / CVE-2026-61560 (upload_markdown file_path exfiltration); not pursued."
+  ],
+  "unverified": [
+    "The supplied fix artifact scr-7517.fix.diff contains only the merge-commit header (5 lines, no file changes), so the fix's actual changed lines, whether it adds/changes tests, and the exact bypass could not be read; fix_sites above are the protection sites visible in the pinned tree, not confirmed diff hunks.",
+    "Repository size in MB (no shell in this session); O4.repo_mb left null and O12 tiny_repo/giant_repo not decided.",
+    "No latest code is available ('none' in the inputs), so present_in_latest for any route is unknown.",
+    "The advisory body was not supplied beyond the one-line summary, so the precise header/route named in the report is inferred from the dynamic-API-URL allowlist surface."
+  ]
+}

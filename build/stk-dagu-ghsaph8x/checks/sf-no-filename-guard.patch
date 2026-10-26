@@ -1,0 +1,88 @@
+diff --git a/internal/core/validator.go b/internal/core/validator.go
+index 13e682087..9d70bfba7 100644
+--- a/internal/core/validator.go
++++ b/internal/core/validator.go
+@@ -36,6 +36,9 @@ func ValidateDAGName(name string) error {
+ 	if name == "" {
+ 		return nil
+ 	}
++	if name == "." || name == ".." {
++		return ErrNameInvalidChars
++	}
+ 	if len(name) > DAGNameMaxLen {
+ 		return ErrNameTooLong
+ 	}
+diff --git a/internal/gitsync/service.go b/internal/gitsync/service.go
+index 54c32ca34..ee2af3ec2 100644
+--- a/internal/gitsync/service.go
++++ b/internal/gitsync/service.go
+@@ -228,7 +228,10 @@ func (s *serviceImpl) syncFilesToDAGsDir(_ context.Context, pullResult *PullResu
+ 			continue
+ 		}
+ 		repoFilePath := s.gitClient.GetFilePath(file)
+-		dagFilePath := s.dagIDToFilePath(dagID)
++		dagFilePath, err := s.safeDAGIDToFilePath(dagID)
++		if err != nil {
++			continue
++		}
+ 
+ 		// Read repo file content
+ 		repoContent, err := os.ReadFile(repoFilePath) //nolint:gosec // path constructed from internal repo
+diff --git a/internal/persis/filedag/store.go b/internal/persis/filedag/store.go
+index 7d9742c72..8933c03dd 100644
+--- a/internal/persis/filedag/store.go
++++ b/internal/persis/filedag/store.go
+@@ -490,15 +490,18 @@ func (store *Storage) Rename(_ context.Context, oldID, newID string) error {
+ }
+ 
+ // generateFilePath generates the file path for a DAG by its name.
++// It uses filepath.Base to strip directory components and verifies
++// the result stays inside baseDir to prevent path traversal.
+ func (store *Storage) generateFilePath(name string) string {
+-	if strings.Contains(name, string(filepath.Separator)) {
+-		filePath, err := filepath.Abs(name)
+-		if err == nil {
+-			return filePath
+-		}
+-	}
+-	filePath := fileutil.EnsureYAMLExtension(path.Join(store.baseDir, name))
+-	return filepath.Clean(filePath)
++	safeName := filepath.Base(name)
++	filePath := fileutil.EnsureYAMLExtension(path.Join(store.baseDir, safeName))
++	filePath = filepath.Clean(filePath)
++	// Verify the resolved path is inside baseDir.
++	basePrefix := filepath.Clean(store.baseDir) + string(filepath.Separator)
++	if !strings.HasPrefix(filePath, basePrefix) {
++		return filepath.Join(store.baseDir, "_invalid.yaml")
++	}
++	return filePath
+ }
+ 
+ // locateDAG locates the DAG file by its name or path.
+diff --git a/internal/service/frontend/api/v1/dags.go b/internal/service/frontend/api/v1/dags.go
+index ac2bc2190..9f3828a6f 100644
+--- a/internal/service/frontend/api/v1/dags.go
++++ b/internal/service/frontend/api/v1/dags.go
+@@ -122,6 +122,22 @@ func (a *API) CreateNewDAG(ctx context.Context, request api.CreateNewDAGRequestO
+ 		return nil, err
+ 	}
+ 
++	if request.Body.Name == "" {
++		return nil, &Error{
++			HTTPStatus: http.StatusBadRequest,
++			Code:       api.ErrorCodeBadRequest,
++			Message:    "DAG name must not be empty",
++		}
++	}
++
++	if err := core.ValidateDAGName(request.Body.Name); err != nil {
++		return nil, &Error{
++			HTTPStatus: http.StatusBadRequest,
++			Code:       api.ErrorCodeBadRequest,
++			Message:    err.Error(),
++		}
++	}
++
+ 	var yamlSpec []byte
+ 	if request.Body.Spec != nil && strings.TrimSpace(*request.Body.Spec) != "" {
+ 		_, err := spec.LoadYAML(ctx,

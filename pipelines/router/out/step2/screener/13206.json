@@ -1,0 +1,119 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "13206",
+  "advisory_ids": ["GHSA-Q6QC-XP4Q-RJQ5", "CVE-2026-10281"],
+  "repo": "enderfga/claw-orchestrator",
+  "pinned_commit": "54d25b7f6f726bc1e5f63bf654d4563978466f75",
+  "fix_commits": ["d0b02a800aa0689d9428cc4cc170e0b6589fb2c3"],
+  "trust_decision": {
+    "summary": "One gate decides whether an inbound request to the embedded HTTP server may proceed: the bearer check in handleRequest, keyed on this.authToken, which start() leaves null whenever OPENCLAW_SERVER_TOKEN is unset (the default), so the whole component API is unauthenticated by default.",
+    "evidence": ["src/embedded-server.ts:58-71", "src/embedded-server.ts:146-154", "src/embedded-server.ts:356-359", "fix.diff:294-317"]
+  },
+  "landing_point": {
+    "where": "src/embedded-server.ts:146-154",
+    "why": "the only auth logic in the tree: a strict `Authorization: Bearer <token>` compare that is skipped when this.authToken is null, i.e. whenever the env var was not set"
+  },
+  "fix_sites": [
+    {
+      "where": "src/embedded-server.ts:54-71",
+      "entry_point": "EmbeddedServer.start() — reached from the plugin auto-start (src/index.ts:91-92) and from the `clawo serve` command (bin/cli.ts:73-74)",
+      "module_kind": "http_server_bootstrap"
+    },
+    {
+      "where": "src/embedded-server.ts:146-154",
+      "entry_point": "every route on the embedded listener: POST /session/*, POST /agents/create, GET /dashboard, GET /v1/models, POST /v1/chat/completions, GET /autoloop/<id>/events",
+      "module_kind": "http_request_gate"
+    },
+    {
+      "where": "bin/cli.ts:31-44",
+      "entry_point": "all `clawo` CLI commands (session-start, session-send, session-list, agents-*, ...) which funnel through api()",
+      "module_kind": "cli_http_client"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "bin/cli.ts:31-44 — the first-party client's own copy of the credential lookup (env CLAWO_AUTH_TOKEN / OPENCLAW_SERVER_TOKEN, then ~/.openclaw/server-token); the fix had to add it there, in a package that looks unrelated to server auth"
+  },
+  "O3_reason_to_dismiss": "The proxy listener is an internal, ephemeral 127.0.0.1 port used only by its own child CLI, not 'the component API endpoint' the report names, and the shipped docs say loopback binding is the primary security boundary — so no token belongs there.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Three behaviours next to the gate must keep working: /health stays unauthenticated for monitoring; the browser dashboard fetches and EventSource streams (an EventSource cannot set an Authorization header) must authenticate via cookie/query; and the `clawo` CLI must pick the token up from env or ~/.openclaw/server-token. A header-only gate on every route breaks all three.",
+    "where": "src/embedded-server.ts:356-359; src/dashboard/index.html:578; src/dashboard/index.html:810; src/dashboard/index.html:562-568; bin/cli.ts:31-44"
+  },
+  "O6_input_shapes": [
+    "Authorization: Bearer <token> header",
+    "clawo_auth=<token> cookie (regex-extracted from the Cookie header)",
+    "?token=<token> query string, upgraded to a Set-Cookie (HttpOnly; SameSite=Strict; Path=/; Max-Age=86400) on the same response",
+    "OPENCLAW_SERVER_TOKEN unset -> auto-generate 32 random bytes hex and persist to ~/.openclaw/server-token (0600)",
+    "OPENCLAW_SERVER_TOKEN=<literal> -> use the given value (previous opt-in behaviour)",
+    "OPENCLAW_SERVER_TOKEN=disabled -> sentinel that disables auth entirely"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "src/embedded-server.ts:58-71 — start() chooses the token and writes it to ~/.openclaw/server-token (mode 0600); stop() at src/embedded-server.ts:111-118 deletes it only if it matches. The gate never calls this producer; it only compares the in-memory copy.",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Auto-started model-proxy listener: session-manager.ts:1193 creates an http server with no token check that parses any POST body and relays it, via createProxyHandler, to Anthropic / OpenAI / the OpenClaw gateway using the host's API keys.",
+      "where": "src/session-manager.ts:1193-1239",
+      "reason_to_dismiss": "It is an internal helper on an ephemeral 127.0.0.1 port that only the session it starts ever calls; the report is about the component API endpoint (port 18796), and the docs say loopback binding is the boundary.",
+      "distance": "1 file and ~2000 lines from the landing point; reached indirectly from startSession for non-Claude models (src/session-manager.ts:313-318), in a different module from the fix",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/index.ts:124-131",
+      "sibling": "a third plugin-registered HTTP route (an events or status endpoint) declared with auth omitted or 'none' instead of 'gateway'",
+      "why_realistic": "the plugin already registers two prefix routes here and the SDK's auth field is a one-word choice; a maintainer adding an observability route by copying the block would plausibly drop it"
+    },
+    {
+      "where": "src/session-manager.ts:1193-1226",
+      "sibling": "a second private listener (debug or SSE relay) started the same way on an ephemeral loopback port, with no gate",
+      "why_realistic": "the auto-proxy already demonstrates the pattern of a private port the manager opens on demand; copying it for council/autoloop event streaming is the obvious move"
+    },
+    {
+      "where": "bin/cli.ts:31-44",
+      "sibling": "a second CLI request helper that calls fetch directly instead of api() (e.g. a `clawo logs --follow` built on EventSource/streaming)",
+      "why_realistic": "api() parses JSON and cannot stream, so a maintainer adding a follow/stream command would write a parallel path and forget the token header"
+    }
+  ],
+  "O9_family": "missing authentication / authentication bypass (CWE-287, described as CWE-306 in the fix)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript (ESM, Node >= 22)",
+    "toolchain": "npm + tsc (`npm run build` = rm -rf dist && tsc && node scripts/postbuild.mjs), eslint/prettier, vitest",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "src/__tests__/embedded-server.test.ts (398 lines) drives a real http.Server with a mocked SessionManager; its 'auth token enforcement' block at :178-217 already covers 401-without-token, correct Bearer, wrong token, and the /health exemption, and :136-145 clears the env vars in beforeEach, so auth-by-default breaks the suite unless an opt-out exists. src/__tests__/session-manager.test.ts (1258 lines) covers the manager side."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/embedded-server.ts, bin/cli.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Make the existing Bearer check unconditional (or refuse to boot when OPENCLAW_SERVER_TOKEN is unset) and touch only src/embedded-server.ts: that breaks /health monitoring, the browser dashboard and every `clawo` command, while the auto-proxy listener stays open."
+  },
+  "out_of_scope_notes": [
+    "bin/cli.ts:56 allows `clawo serve -H 0.0.0.0` while bin/cli.ts:76 always prints 127.0.0.1 — a misleading log line, not part of this advisory's protection.",
+    "The fix commit also edits CLAUDE.md to add a release rule about not naming leaked strings (fix.diff:70-74); a process/policy change unrelated to this auth advisory.",
+    "The published fix is the immediate child of the pinned commit, so any task copy that retains git history or the fix diff would hand the answer to the solver — a benchmark-construction concern, not a repo weakness."
+  ],
+  "unverified": [
+    "Repo byte size not measured (no shell available); src/ + bin/ is 21,982 lines over 54 files in src plus 431 in bin/cli.ts, which is why tiny_repo is set — repo_mb left null.",
+    "present_in_latest for the O8 route: no latest release or newer tree was supplied ('Latest release, for O8 only: none'), so it is marked unknown.",
+    "Whether the OpenClaw host's `auth: 'gateway'` on src/index.ts:127-129 actually rejects unauthenticated callers could not be checked — the host SDK is not in this tree.",
+    "Whether the dashboard is meant to be served by the gateway rather than the embedded server: src/dashboard/index.html:747 calls /v1/openclaw/tools/autoloop_chat, which the embedded server does not route."
+  ]
+}

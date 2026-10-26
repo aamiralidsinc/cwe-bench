@@ -1,0 +1,211 @@
+diff --git a/src/app/api/chat/[provider]/route.ts b/src/app/api/chat/[provider]/route.ts
+index 974df7cb09..980193ca53 100644
+--- a/src/app/api/chat/[provider]/route.ts
++++ b/src/app/api/chat/[provider]/route.ts
+@@ -6,6 +6,8 @@ import { ChatStreamPayload } from '@/types/openai/chat';
+ import { getTracePayload } from '@/utils/trace';
+ 
+ import { createTraceOptions, initAgentRuntimeWithUserPayload } from '../agentRuntime';
++import { isBlockedDestination } from '@/utils/destinationCheck';
++
+ import { checkAuth } from '../auth';
+ 
+ export const runtime = 'edge';
+@@ -15,6 +17,10 @@ export const preferredRegion = getPreferredRegion();
+ export const POST = checkAuth(async (req: Request, { params, jwtPayload }) => {
+   const { provider } = params;
+ 
++  if (jwtPayload?.endpoint && (await isBlockedDestination(jwtPayload.endpoint))) {
++    return createErrorResponse(ChatErrorType.BadRequest);
++  }
++
+   try {
+     // ============  1. init chat model   ============ //
+     const agentRuntime = await initAgentRuntimeWithUserPayload(provider, jwtPayload);
+diff --git a/src/app/api/files/image/route.ts b/src/app/api/files/image/route.ts
+index d6ccb672e2..c48045b074 100644
+--- a/src/app/api/files/image/route.ts
++++ b/src/app/api/files/image/route.ts
+@@ -1,10 +1,12 @@
++import { followSafely } from '@/utils/destinationCheck';
++
+ import { Imgur } from './imgur';
+ 
+ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+   let imageBlob: Blob;
+ 
+   if (url) {
+-    const res = await fetch(url);
++    const res = await followSafely(url);
+     imageBlob = await res.blob();
+   } else if (blob) {
+     imageBlob = blob;
+@@ -21,11 +23,21 @@ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+ export const POST = async (req: Request) => {
+   const { url } = await req.json();
+ 
+-  const cdnUrl = await updateByImgur({ url });
++  try {
++    const cdnUrl = await updateByImgur({ url });
++
++    return new Response(JSON.stringify({ url: cdnUrl }));
++  } catch (error) {
++    if (error instanceof Error && error.message === 'blocked destination') {
++      return new Response(JSON.stringify({ error: 'Not support internal host proxy' }), { status: 400 });
++    }
+ 
+-  return new Response(JSON.stringify({ url: cdnUrl }));
++    throw error;
++  }
+ };
+-// import { Imgur } from './imgur';
++// import { followSafely } from '@/utils/destinationCheck';
++
++import { Imgur } from './imgur';
+ 
+ export const runtime = 'edge';
+ 
+diff --git a/src/app/api/plugin/gateway/route.ts b/src/app/api/plugin/gateway/route.ts
+index 5860e7460e..e947154e4a 100644
+--- a/src/app/api/plugin/gateway/route.ts
++++ b/src/app/api/plugin/gateway/route.ts
+@@ -9,6 +9,7 @@ import { LOBE_CHAT_TRACE_ID, TraceNameMap } from '@/const/trace';
+ import { AgentRuntimeError } from '@/libs/agent-runtime';
+ import { TraceClient } from '@/libs/traces';
+ import { ChatErrorType, ErrorType } from '@/types/fetch';
++import { isBlockedDestination } from '@/utils/destinationCheck';
+ import { getTracePayload } from '@/utils/trace';
+ 
+ import { parserPluginSettings } from './settings';
+@@ -62,6 +63,11 @@ export const POST = async (req: Request) => {
+ 
+   const { manifest, indexUrl, ...input } = (await req.clone().json()) as PluginRequestPayload;
+ 
++  const destinations = [indexUrl, manifest?.openapi, ...(manifest?.api ?? []).map((api) => api.url)];
++  for (const destination of destinations) {
++    if (await isBlockedDestination(destination)) return createErrorResponse(ChatErrorType.BadRequest);
++  }
++
+   const span = trace?.span({
+     input,
+     metadata: { indexUrl, manifest },
+diff --git a/src/app/api/proxy/route.ts b/src/app/api/proxy/route.ts
+index c17dde10e7..7bd3ffa6ad 100644
+--- a/src/app/api/proxy/route.ts
++++ b/src/app/api/proxy/route.ts
+@@ -1,4 +1,8 @@
+-export const runtime = 'edge';
++import { NextResponse } from 'next/server';
++
++import { followSafely } from '@/utils/destinationCheck';
++
++export const runtime = 'nodejs';
+ 
+ /**
+  * just for a proxy
+@@ -6,7 +10,15 @@ export const runtime = 'edge';
+ export const POST = async (req: Request) => {
+   const url = await req.text();
+ 
+-  const res = await fetch(url);
++  try {
++    const res = await followSafely(url);
++
++    return new Response(res.body, { headers: res.headers });
++  } catch (error) {
++    if (error instanceof Error && error.message === 'blocked destination') {
++      return NextResponse.json({ error: 'Not support internal host proxy' }, { status: 400 });
++    }
+ 
+-  return new Response(res.body, { headers: res.headers });
++    throw error;
++  }
+ };
+diff --git a/src/utils/destinationCheck.ts b/src/utils/destinationCheck.ts
+new file mode 100644
+index 0000000000..274a33709f
+--- /dev/null
++++ b/src/utils/destinationCheck.ts
+@@ -0,0 +1,82 @@
++import { lookup } from 'node:dns/promises';
++import { BlockList, isIP } from 'node:net';
++
++const blockedAddresses = new BlockList();
++
++const IPV4_RANGES: Array<[string, number]> = [
++  ['0.0.0.0', 8],
++  ['10.0.0.0', 8],
++  ['100.64.0.0', 10],
++  ['127.0.0.0', 8],
++  ['169.254.0.0', 16],
++  ['172.16.0.0', 12],
++  ['192.0.0.0', 24],
++  ['192.168.0.0', 16],
++  ['198.18.0.0', 15],
++  ['224.0.0.0', 4],
++  ['240.0.0.0', 4],
++];
++
++for (const [network, prefix] of IPV4_RANGES) blockedAddresses.addSubnet(network, prefix, 'ipv4');
++
++blockedAddresses.addSubnet('::', 128, 'ipv6');
++blockedAddresses.addSubnet('::1', 128, 'ipv6');
++blockedAddresses.addSubnet('fc00::', 7, 'ipv6');
++blockedAddresses.addSubnet('fe80::', 10, 'ipv6');
++
++const strip = (host: string) => host.replace(/^\[/, '').replace(/\]$/, '').replace(/%.*$/, '');
++
++export const isBlockedAddress = (address: string): boolean => {
++  const bare = strip(address);
++
++  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(bare);
++  if (mapped) return isBlockedAddress(mapped[1]);
++
++  const family = isIP(bare);
++
++  if (family === 0) return true;
++
++  return blockedAddresses.check(bare, family === 4 ? 'ipv4' : 'ipv6');
++};
++
++export const isBlockedDestination = async (raw?: string | null): Promise<boolean> => {
++  if (!raw) return false;
++
++  let url: URL;
++  try {
++    url = new URL(raw);
++  } catch {
++    return false;
++  }
++
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') return true;
++
++  const host = strip(url.hostname);
++  if (isIP(host)) return isBlockedAddress(host);
++
++  try {
++    const found = await lookup(host, { all: true });
++    if (found.length === 0) return true;
++
++    return found.some((entry) => isBlockedAddress(entry.address));
++  } catch {
++    return true;
++  }
++};
++
++export const followSafely = async (raw: string, init?: RequestInit): Promise<Response> => {
++  let target = new URL(raw);
++
++  for (let hop = 0; hop <= 5; hop++) {
++    if (await isBlockedDestination(target.toString())) throw new Error('blocked destination');
++
++    const response = await fetch(target.toString(), { ...init, redirect: 'manual' });
++    const location = response.headers.get('location');
++
++    if (!location || ![301, 302, 303, 307, 308].includes(response.status)) return response;
++
++    target = new URL(location, target);
++  }
++
++  throw new Error('too many redirects');
++};

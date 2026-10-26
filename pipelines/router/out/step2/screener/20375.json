@@ -1,0 +1,102 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "20375",
+  "advisory_ids": ["GHSA-3763-QP59-59VF", "CVE-2026-46369"],
+  "repo": "nimiq/core-rs-albatross",
+  "pinned_commit": "d4a1881c501074900c33d751fd5d80c22e1ec68e",
+  "fix_commits": ["a530b2434ebca6e3716f07c73079786fcc6f2e41"],
+  "trust_decision": {
+    "summary": "Whether a raw transaction hash still counts as 'already seen' (i.e. is replay-protected) is decided in one place: ValidityStore::has_transaction sets the window start to last_bn - Policy::transaction_validity_window_blocks(), so a hash recorded in the oldest protected block falls out of the guard up to blocks_per_batch blocks before the transaction itself stops being valid.",
+    "evidence": [
+      "blockchain/src/history/validity_store.rs:52-54",
+      "blockchain/src/history/validity_store.rs:60",
+      "blockchain/src/history/validity_store.rs:140-143",
+      "primitives/transaction/src/lib.rs:380-387"
+    ]
+  },
+  "landing_point": {
+    "where": "blockchain/src/history/validity_store.rs:52-55",
+    "why": "The summary says 'validity store off by one error'. The only window arithmetic on the validity store is this lookback in ValidityStore::has_transaction; the pruning constant three functions below (line 140-143) already uses window + blocks_per_batch, which is the discrepancy."
+  },
+  "fix_sites": [
+    {
+      "where": "blockchain/src/history/validity_store.rs:52-55",
+      "entry_point": "Blockchain::contains_tx_in_validity_window (blockchain/src/blockchain/wrappers.rs:197-203) through HistoryStoreProxy (blockchain/src/history/history_store_proxy.rs:238-251) -> HistoryStoreMerger (blockchain/src/history/merged_history_store.rs:170-176) -> HistoryStore/HistoryStoreIndex -> ValidityStore; reached from RPC pushTransaction (rpc-server/src/dispatchers/mempool.rs:34-38 -> mempool/src/mempool.rs:616 -> mempool/src/verify.rs:55) and from block import (blockchain/src/blockchain/push.rs:596)",
+      "module_kind": "internal database-backed store in the blockchain crate's history module (the sink behind the wrapper/proxy chain)"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The transaction validity contract itself: a transaction is includable from validity_start_height - blocks_per_batch through validity_start_height + window - 1, as encoded in Transaction::is_valid_at and relied on by micro-block verification (primitives/block/src/micro_block.rs:325) and by the web client's expiry boundary (web-client/src/client/lib.rs:67-70, asserted at web-client/src/client/lib.rs:1399-1427). Folding blocks_per_batch into Policy::transaction_validity_window_blocks (the one-constant 'fix') silently changes consensus validity and those callers, not just the replay window.",
+    "where": "primitives/transaction/src/lib.rs:380-387"
+  },
+  "O6_input_shapes": [
+    "transaction included at the earliest block at which it is valid: validity_start_height = first_inclusion_block + blocks_per_batch (the shape the published fix adds)",
+    "transaction whose validity_start_height equals its inclusion block (the shape the pre-existing pinned tests use, still protected)",
+    "boundary of the replay window: still protected at validity_start_height + window - 1, no longer protected at validity_start_height + window",
+    "hash never seen (absent from the txn_hashes table) and the RawTransactionHash::default() placeholder rows written for blocks with no transactions"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "blockchain/src/history/validity_store.rs:10 (txn_hashes table), populated by add_transaction (blockchain/src/history/validity_store.rs:86-94) from blockchain/src/history/history_store.rs:412-414 when a block's historic transactions are stored; the reference height used by the check is produced by update_validity_store (blockchain/src/history/validity_store.rs:159-165) from blockchain/src/history/history_store.rs:421-423",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "blockchain/src/history/history_store_index.rs:385-393",
+      "sibling": "the index wrapper computes its own replay lookback from its tx_hash_table instead of delegating to the store's validity store",
+      "why_realistic": "HistoryStoreIndex already duplicates per-block and per-address lookups over its own tables, so a maintainer could plausibly answer 'is this hash recent?' from the index and get the window arithmetic wrong in a second place."
+    },
+    {
+      "where": "web-client/src/client/lib.rs:67-70",
+      "sibling": "a second validity-window computation for the browser client's pending/expired transaction filter",
+      "why_realistic": "The repo already carries exactly this class of sibling bug there: the pinned test web-client/src/client/lib.rs:1364 is named expiry_check_uses_block_count_not_batch_count, i.e. the same window confusions recur in that package."
+    },
+    {
+      "where": "validator/src/validator.rs:307-324",
+      "sibling": "an independent window boundary (tx_validity_window_start + transaction_validity_window_blocks() - 1) computed next to a query into the same sink",
+      "why_realistic": "The validator already derives its own boundary and then asks tx_in_validity_window, so a maintainer could easily have moved the whole lookback decision into this loop."
+    },
+    {
+      "where": "blockchain/src/history/merged_history_store.rs:170-176",
+      "sibling": "the merge wrapper deciding the replay window per underlying store (pre-genesis vs main) instead of delegating",
+      "why_realistic": "Every other method of HistoryStoreMerger branches between the pre-genesis and main store, so adding a window/lookback parameter at this layer is a natural refactor that the check would then not cover."
+    }
+  ],
+  "O9_family": "replay / transaction double-inclusion caused by an off-by-one validity-window lookback (CWE-193 off-by-one enabling CWE-294 capture-replay)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo workspace, edition 2024 (Cargo.toml:162), version 1.5.0; no rust-toolchain file in the tree, so a recent stable toolchain; the MDBX database crate needs a C toolchain to build",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Unit tests in blockchain/src/history run on a volatile in-memory MDBX database (e.g. blockchain/src/history/history_store.rs:949, blockchain/src/history/history_store_index.rs:819), so no network or service is needed. The two tests this fix rewrites already exist at the pinned commit (blockchain/src/history/history_store.rs:1093, blockchain/src/history/history_store_index.rs:816) and assert the pre-fix boundary, so a correct fix must rewrite them; the merged-store variant at blockchain/src/history/merged_history_store.rs:446 is unchanged. cargo test -p nimiq-blockchain --lib."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "blockchain/src/history/validity_store.rs (the other two files in the commit only rewrite tests)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Read 'off by one' literally and shift the boundary by one block (> to >=, or last_bn - window + 1) instead of widening the lookback by blocks_per_batch."
+  },
+  "out_of_scope_notes": [
+    "HistoryStoreMerger::tx_in_validity_window queries only the main store (blockchain/src/history/merged_history_store.rs:170-176), so epoch-0 pre-genesis hashes are never consulted; outside this advisory's property because an epoch-0 transaction cannot be valid at any current height (primitives/transaction/src/lib.rs:380-387)."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell access in this session, so both the tiny_repo and giant_repo thresholds could not be measured; the workspace has ~70 member crates, so tiny_repo is implausible.",
+    "The advisory body text was not provided (only the summary line), so I could not check whether it names any route beyond the validity store.",
+    "The block-import path from consensus into Blockchain::check_and_commit was read but not executed."
+  ]
+}

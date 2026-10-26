@@ -1,0 +1,143 @@
+diff -ruN '--exclude=.git' '--exclude=target' '--exclude=.surefire-*' '--exclude=*.log' hzw/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactInternalGenericRecord.java hza/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactInternalGenericRecord.java
+--- a/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactInternalGenericRecord.java	2026-10-21 23:52:42.343762842 +0000
++++ b/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactInternalGenericRecord.java	2026-10-22 00:03:53.271133976 +0000
+@@ -781,7 +781,7 @@
+     public <T> T[] getArrayOfObject(@Nonnull String fieldName, Class<T> componentType) {
+         return (T[]) getArrayOfVariableSize(fieldName, ARRAY_OF_COMPACT,
+                 length -> (T[]) Array.newInstance(componentType, length),
+-                in -> (T) serializer.readArrayElement(in));
++                in -> serializer.read(in, schemaIncludedInBinary));
+     }
+ 
+     protected interface Reader<R> {
+diff -ruN '--exclude=.git' '--exclude=target' '--exclude=.surefire-*' '--exclude=*.log' hzw/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactStreamSerializer.java hza/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactStreamSerializer.java
+--- a/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactStreamSerializer.java	2026-10-21 23:52:42.343762842 +0000
++++ b/hazelcast/src/main/java/com/hazelcast/internal/serialization/impl/compact/CompactStreamSerializer.java	2026-10-22 00:06:30.314981957 +0000
+@@ -58,6 +58,7 @@
+  */
+ public class CompactStreamSerializer implements StreamSerializer<Object> {
+     private final Map<Class, CompactSerializableRegistration> classToRegistrationMap = new ConcurrentHashMap<>();
++    private final java.util.Set<Class<?>> explicitlyRegisteredClasses = java.util.concurrent.ConcurrentHashMap.newKeySet();
+     private final Map<String, CompactSerializableRegistration> typeNameToRegistrationMap = new ConcurrentHashMap<>();
+     private final Map<Class, Schema> classToSchemaMap = new ConcurrentHashMap<>();
+     private final JavaRecordSerializer javaRecordSerializer = new JavaRecordSerializer(this);
+@@ -182,18 +183,69 @@
+ 
+     Object read(BufferObjectDataInput input, boolean schemaIncludedInBinary) throws IOException {
+         Schema schema = getOrReadSchema(input, schemaIncludedInBinary);
+-        CompactSerializableRegistration registration = getOrCreateRegistration(schema.getTypeName());
++        int initialReadPosition = input.position();
+ 
+-        if (registration == CompactSerializableRegistration.GENERIC_RECORD_REGISTRATION) {
+-            // We have tried to load class via class loader, it did not work.
+-            // We are returning a GenericRecord.
++        CompactSerializableRegistration registration = typeNameToRegistrationMap.get(schema.getTypeName());
++        Class<?> typeClass;
++        if (registration != null) {
++            // The type name was registered explicitly by the deployment.
++            typeClass = registration.getClazz();
++        } else {
++            try {
++                typeClass = ClassLoaderUtil.loadClass(classLoader, schema.getTypeName());
++            } catch (Exception e) {
++                // There is no class with this type name; keep the value as data.
++                return readGenericRecord(input, schema, schemaIncludedInBinary);
++            }
++            if (!isEligibleForZeroConfig(typeClass)) {
++                return readGenericRecord(input, schema, schemaIncludedInBinary);
++            }
++            registration = getOrCreateRegistration(typeClass);
++        }
++
++        DefaultCompactReader reader = new DefaultCompactReader(this, input, schema, typeClass, schemaIncludedInBinary);
++        try {
++            Object object = registration.getSerializer().read(reader);
++            return managedContext != null ? managedContext.initialize(object) : object;
++        } catch (HazelcastSerializationException e) {
++            // A nested value was restricted; rewind and keep the whole value as data.
++            input.position(initialReadPosition);
+             return readGenericRecord(input, schema, schemaIncludedInBinary);
+         }
++    }
+ 
+-        DefaultCompactReader reader = new DefaultCompactReader(this, input, schema,
+-                registration.getClazz(), schemaIncludedInBinary);
+-        Object object = registration.getSerializer().read(reader);
+-        return managedContext != null ? managedContext.initialize(object) : object;
++    /**
++     * A class may be serialized with zero configuration Compact serialization
++     * only when it has no other serialization mechanism, has not been excluded
++     * by the deployment and does not belong to the platform itself.
++     */
++    private boolean isEligibleForZeroConfig(Class<?> clazz) {
++        if (clazz == null) {
++            return false;
++        }
++        if (explicitlyRegisteredClasses.contains(clazz)) {
++            return true;
++        }
++        if (!(serializationService.serializerForClass(clazz, false) instanceof CompactStreamSerializerAdapter)) {
++            return false;
++        }
++        // The platform ships classes outside the packages named after its implementation;
++        // the module decides what belongs to it.
++        Module module = clazz.getModule();
++        if (module != null && module.isNamed()) {
++            String moduleName = module.getName();
++            if (moduleName.startsWith("java.") || moduleName.startsWith("jdk.")) {
++                return false;
++            }
++        }
++        String name = clazz.getName();
++        if (name.startsWith("java.") || name.startsWith("javax.") || name.startsWith("com.sun.")
++                || name.startsWith("sun.") || name.startsWith("jdk.")) {
++            return false;
++        }
++        return !name.startsWith("com.hazelcast.")
++                && !name.startsWith("org.jctools.")
++                && !name.startsWith("org.agrona.");
+     }
+ 
+     private Schema getOrReadSchema(ObjectDataInput input, boolean schemaIncludedInBinary) throws IOException {
+@@ -262,33 +314,6 @@
+         return getOrCreateRegistration(clazz);
+     }
+ 
+-    /**
+-     * Reads a single element of a Compact array.
+-     * <p>
+-     * Every element of an array shares the same schema, so the registration is
+-     * looked up from the type name directly instead of going through the same
+-     * checked entry point that is used for top-level values.
+-     */
+-    Object readArrayElement(BufferObjectDataInput input) throws IOException {
+-        Schema schema = getOrReadSchema(input, false);
+-        CompactSerializableRegistration registration = typeNameToRegistrationMap.get(schema.getTypeName());
+-        if (registration == null) {
+-            try {
+-                Class<?> clazz = ClassLoaderUtil.loadClass(classLoader, schema.getTypeName());
+-                registration = new CompactSerializableRegistration(clazz, schema.getTypeName(), reflectiveSerializer);
+-                CompactSerializableRegistration existing = typeNameToRegistrationMap.putIfAbsent(schema.getTypeName(),
+-                        registration);
+-                if (existing != null) {
+-                    registration = existing;
+-                }
+-            } catch (Exception e) {
+-                return readGenericRecord(input, schema, false);
+-            }
+-        }
+-        DefaultCompactReader reader = new DefaultCompactReader(this, input, schema, registration.getClazz(), false);
+-        return registration.getSerializer().read(reader);
+-    }
+-
+     private GenericRecord readGenericRecord(BufferObjectDataInput input, Schema schema, boolean schemaIncludedInBinary) {
+         CompactInternalGenericRecord record =
+                 new CompactInternalGenericRecord(this, input, schema, null, schemaIncludedInBinary);
+@@ -336,6 +361,7 @@
+ 
+     private void saveRegistration(CompactSerializableRegistration registration) {
+         Class clazz = registration.getClazz();
++        explicitlyRegisteredClasses.add(clazz);
+         CompactSerializableRegistration existing = classToRegistrationMap.putIfAbsent(clazz, registration);
+         if (existing != null) {
+             throw new InvalidConfigurationException("Duplicate serializer registrations "

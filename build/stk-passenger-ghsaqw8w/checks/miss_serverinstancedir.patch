@@ -1,0 +1,109 @@
+--- a/lib/phusion_passenger/utils/tmpdir.rb
++++ b/lib/phusion_passenger/utils/tmpdir.rb
+@@ -48,19 +48,34 @@
+ 			dir.gsub!(%r{//+}, '/')
+ 			@@passenger_tmpdir = dir
+ 		end
+-		if create && !File.exist?(dir)
+-			# This is a very minimal implementation of the subdirectory
+-			# creation logic in ServerInstanceDir.h. This implementation
+-			# is only meant to make the unit tests pass. For production
+-			# systems one should pre-create the temp directory with
+-			# ServerInstanceDir.h.
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", dir)
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/generation-0")
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/backends")
++		if create
++			begin
++				stat = File.lstat(dir)
++				verify_tmpdir_entry(dir, stat)
++			rescue Errno::ENOENT
++				begin
++					Dir.mkdir(dir, 0700)
++				rescue Errno::EEXIST
++					verify_tmpdir_entry(dir, File.lstat(dir))
++				end
++				["generation-0", "backends"].each do |name|
++					begin
++						Dir.mkdir("#{dir}/#{name}", 0700)
++					rescue Errno::EEXIST
++					end
++				end
++			end
+ 		end
+ 		return dir
+ 	end
+ 	
++	def self.verify_tmpdir_entry(dir, stat)
++		if !stat.directory? || stat.uid != Process.uid || (stat.mode & 022) != 0
++			raise SecurityError,
++				"Refusing to use an unsafe temporary directory '#{dir}'"
++		end
++	end
++
+ 	def self.passenger_tmpdir=(dir)
+ 		@@passenger_tmpdir = dir
+ 	end
+--- a/lib/phusion_passenger/platform_info.rb
++++ b/lib/phusion_passenger/platform_info.rb
+@@ -241,18 +241,25 @@
+ 	# not be mounted with the 'noexec' option.
+ 	# If no such directory can be found then it will raise a PlatformInfo::RuntimeError
+ 	# with an appropriate error message.
++	def self.probe_executable_directory(dir, basename)
++		PhusionPassenger::Utils.mktmpdir("passenger-exe-", dir) do |subdir|
++			filename = "#{subdir}/#{basename}"
++			File.open(filename, File::WRONLY | File::CREAT | File::EXCL, 0700) do |f|
++				f.puts("#!/bin/sh")
++			end
++			File.chmod(0700, filename)
++			return system(filename)
++		end
++	end
++	private_class_method :probe_executable_directory
++	
+ 	def self.tmpexedir
+ 		basename = "test-exe.#{Process.pid}.#{Thread.current.object_id}"
+ 		attempts = []
+ 		
+ 		dir = tmpdir
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if probe_executable_directory(dir, basename)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -264,18 +271,11 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+ 		
+ 		dir = Dir.pwd
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if probe_executable_directory(dir, basename)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -287,8 +287,6 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+ 		
+ 		message = "ERROR: Cannot find suitable temporary directory\n" +

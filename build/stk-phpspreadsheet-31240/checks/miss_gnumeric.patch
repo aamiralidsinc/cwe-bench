@@ -1,0 +1,246 @@
+diff --git a/src/PhpSpreadsheet/Shared/OLERead.php b/src/PhpSpreadsheet/Shared/OLERead.php
+index 5d38e956..9ed4ba4f 100644
+--- a/src/PhpSpreadsheet/Shared/OLERead.php
++++ b/src/PhpSpreadsheet/Shared/OLERead.php
+@@ -61,6 +61,9 @@ class OLERead
+     /** @var mixed[][] */
+     private array $props = [];
+ 
++    /** @var int[] */
++    private array $possibleLoop = [];
++
+     /**
+      * Read the file.
+      */
+@@ -137,7 +140,9 @@ class OLERead
+ 
+         $sbdBlock = $this->sbdStartBlock;
+         $this->smallBlockChain = '';
++        $this->possibleLoop = [];
+         while ($sbdBlock != -2) {
++            $this->catchLoop($sbdBlock);
+             $pos = ($sbdBlock + 1) * self::BIG_BLOCK_SIZE;
+ 
+             $this->smallBlockChain .= substr($this->data, $pos, 4 * $bbs);
+@@ -153,6 +158,14 @@ class OLERead
+         $this->readPropertySets();
+     }
+ 
++    private function catchLoop(int $sbdBlock): void
++    {
++        if (in_array($sbdBlock, $this->possibleLoop, true)) {
++            throw new ReaderException('Detected loop while iterating blocks');
++        }
++        $this->possibleLoop[] = $sbdBlock;
++    }
++
+     /**
+      * Extract binary stream data.
+      */
+@@ -172,7 +185,9 @@ class OLERead
+             /** @var int */
+             $block = $this->props[$stream]['startBlock'];
+ 
++            $this->possibleLoop = [];
+             while ($block != -2) {
++                $this->catchLoop($block);
+                 $pos = $block * self::SMALL_BLOCK_SIZE;
+                 $streamData .= substr($rootdata, $pos, self::SMALL_BLOCK_SIZE);
+ 
+@@ -195,7 +210,9 @@ class OLERead
+         /** @var int */
+         $block = $this->props[$stream]['startBlock'];
+ 
++        $this->possibleLoop = [];
+         while ($block != -2) {
++            $this->catchLoop($block);
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $streamData .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);
+@@ -215,7 +232,9 @@ class OLERead
+     {
+         $data = '';
+ 
++        $this->possibleLoop = [];
+         while ($block != -2) {
++            $this->catchLoop($block);
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $data .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);
+diff --git a/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php b/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php
+index 76f1be71..0c2c5574 100644
+--- a/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php
++++ b/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php
+@@ -75,7 +75,12 @@ class ChainedBlockStream
+         if (isset($this->params['size']) && $this->params['size'] < $this->ole->bigBlockThreshold && $blockId != $this->ole->root->startBlock) {
+             // Block id refers to small blocks
+             $rootPos = $this->ole->getBlockOffset((int) $this->ole->root->startBlock);
++            $visited = [];
+             while ($blockId != -2) {
++                if (isset($visited[$blockId])) {
++                    throw new Exception('Detected loop while iterating blocks');
++                }
++                $visited[$blockId] = true;
+                 /** @var int $blockId */
+                 $pos = $rootPos + $blockId * $this->ole->bigBlockSize;
+                 $blockId = $this->ole->sbat[$blockId];
+@@ -84,7 +89,12 @@ class ChainedBlockStream
+             }
+         } else {
+             // Block id refers to big blocks
++            $visited = [];
+             while ($blockId != -2) {
++                if (isset($visited[$blockId])) {
++                    throw new Exception('Detected loop while iterating blocks');
++                }
++                $visited[$blockId] = true;
+                 /** @var int $blockId */
+                 $pos = $this->ole->getBlockOffset($blockId);
+                 fseek($this->ole->_file_handle, $pos);
+diff --git a/src/PhpSpreadsheet/Reader/Xlsx.php b/src/PhpSpreadsheet/Reader/Xlsx.php
+index 0c019967..f9b36e90 100644
+--- a/src/PhpSpreadsheet/Reader/Xlsx.php
++++ b/src/PhpSpreadsheet/Reader/Xlsx.php
+@@ -50,6 +50,12 @@ class Xlsx extends BaseReader
+ {
+     const INITIAL_FILE = '_rels/.rels';
+ 
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
++
+     /**
+      * ReferenceHelper instance.
+      */
+@@ -412,21 +418,45 @@ class Xlsx extends BaseReader
+         // Sadly, some 3rd party xlsx generators don't use consistent case for filenaming
+         //    so we need to load case-insensitively from the zip file
+ 
+-        $contents = $archive->getFromName($fileName, 0, ZipArchive::FL_NOCASE);
++        $contents = $this->getZipEntry($archive, $fileName);
+ 
+         // Apache POI fixes
+         if ($contents === false) {
+-            $contents = $archive->getFromName(substr($fileName, 1), 0, ZipArchive::FL_NOCASE);
++            $contents = $this->getZipEntry($archive, substr($fileName, 1));
+         }
+ 
+         // Has the file been saved with Windoze directory separators rather than unix?
+         if ($contents === false) {
+-            $contents = $archive->getFromName(str_replace('/', '\\', $fileName), 0, ZipArchive::FL_NOCASE);
++            $contents = $this->getZipEntry($archive, str_replace('/', '\\', $fileName));
+         }
+ 
+         return ($contents === false) ? '' : $contents;
+     }
+ 
++    private static function decompressionLimit(): int
++    {
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $limit *= self::LENGTH_MULTIPLIER[$unit] ?? 1;
++
++        return intdiv($limit, 4);
++    }
++
++    private function getZipEntry(ZipArchive $archive, string $fileName): string|false
++    {
++        $stat = $archive->statName($fileName, ZipArchive::FL_NOCASE);
++        if ($stat === false) {
++            return false;
++        }
++        if (($stat['size'] ?? 0) > self::decompressionLimit()) {
++            throw new Exception('Archive entry exceeds the configured decompression limit');
++        }
++
++        return $archive->getFromName($fileName, 0, ZipArchive::FL_NOCASE);
++    }
++
+     /**
+      * Loads Spreadsheet from file.
+      */
+diff --git a/src/PhpSpreadsheet/Reader/Ods.php b/src/PhpSpreadsheet/Reader/Ods.php
+index 4ddbae09..13bf56df 100644
+--- a/src/PhpSpreadsheet/Reader/Ods.php
++++ b/src/PhpSpreadsheet/Reader/Ods.php
+@@ -40,6 +40,12 @@ class Ods extends BaseReader
+ {
+     const INITIAL_FILE = 'content.xml';
+ 
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
++
+     /**
+      * Create a new Ods Reader instance.
+      */
+@@ -305,6 +311,27 @@ class Ods extends BaseReader
+ 
+     private int $highestDataIndex;
+ 
++    private static function decompressionLimit(): int
++    {
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $limit *= self::LENGTH_MULTIPLIER[$unit] ?? 1;
++
++        return intdiv($limit, 4);
++    }
++
++    private function getZipEntry(ZipArchive $zip, string $name): string|false
++    {
++        $stat = $zip->statName($name);
++        if ($stat !== false && ($stat['size'] ?? 0) > self::decompressionLimit()) {
++            throw new Exception('Archive entry exceeds the configured decompression limit');
++        }
++
++        return $zip->getFromName($name);
++    }
++
+     /**
+      * Loads PhpSpreadsheet from file into PhpSpreadsheet instance.
+      */
+@@ -319,7 +346,7 @@ class Ods extends BaseReader
+ 
+         $xml = @simplexml_load_string(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('meta.xml'))
++                ->scan($this->getZipEntry($zip, 'meta.xml'))
+         );
+         if ($xml === false) {
+             throw new Exception('Unable to read data from {$pFilename}');
+@@ -336,7 +363,7 @@ class Ods extends BaseReader
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('styles.xml'))
++                ->scan($this->getZipEntry($zip, 'styles.xml'))
+         );
+         $officeNs = (string) $dom->lookupNamespaceUri('office');
+         $styleNs = (string) $dom->lookupNamespaceUri('style');
+@@ -406,7 +433,7 @@ class Ods extends BaseReader
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName(self::INITIAL_FILE))
++                ->scan($this->getZipEntry($zip, self::INITIAL_FILE))
+         );
+ 
+         $pageSettings->readStyleCrossReferences($dom);
+@@ -1363,7 +1390,7 @@ class Ods extends BaseReader
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('settings.xml'))
++                ->scan($this->getZipEntry($zip, 'settings.xml'))
+         );
+         $configNs = (string) $dom->lookupNamespaceUri('config');
+         $officeNs = (string) $dom->lookupNamespaceUri('office');

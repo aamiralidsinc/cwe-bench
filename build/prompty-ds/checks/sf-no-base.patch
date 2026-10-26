@@ -1,0 +1,297 @@
+diff --git a/runtime/python/prompty/prompty/core/loader.py b/runtime/python/prompty/prompty/core/loader.py
+index d254e3c..dfbe6c9 100644
+--- a/runtime/python/prompty/prompty/core/loader.py
++++ b/runtime/python/prompty/prompty/core/loader.py
+@@ -17,7 +17,7 @@ import yaml
+ 
+ from ..model import LoadContext, Prompty, SaveContext
+ from .partials import expand_partials
+-from .utils import load_fragment, load_prompty, load_prompty_async
++from .utils import contain_path, load_fragment, load_prompty, load_prompty_async
+ 
+ __all__ = ["load", "load_async", "default_save_context"]
+ 
+@@ -168,7 +168,7 @@ def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+                     data[key] = env_val
+ 
+             elif protocol == "file":
+-                relative_path = (agent_file.parent / val).resolve()
++                relative_path = contain_path(agent_file.parent, val)
+                 if not relative_path.exists():
+                     raise FileNotFoundError(
+                         f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
+diff --git a/runtime/python/prompty/prompty/core/partials.py b/runtime/python/prompty/prompty/core/partials.py
+index 537b225..c96aed0 100644
+--- a/runtime/python/prompty/prompty/core/partials.py
++++ b/runtime/python/prompty/prompty/core/partials.py
+@@ -14,7 +14,7 @@ from __future__ import annotations
+ import re
+ from pathlib import Path
+ 
+-from .utils import load_text
++from .utils import contain_path, load_text
+ 
+ __all__ = ["expand_partials"]
+ 
+@@ -34,6 +34,6 @@ def expand_partials(instructions: str, base_dir: str | Path) -> str:
+     root = Path(base_dir)
+ 
+     def _read(match: re.Match[str]) -> str:
+-        return load_text(root / match.group(1))
++        return load_text(contain_path(root, match.group(1)))
+ 
+     return _INCLUDE_RE.sub(_read, instructions)
+diff --git a/runtime/python/prompty/prompty/core/tool_dispatch.py b/runtime/python/prompty/prompty/core/tool_dispatch.py
+index 0f2173f..94728c2 100644
+--- a/runtime/python/prompty/prompty/core/tool_dispatch.py
++++ b/runtime/python/prompty/prompty/core/tool_dispatch.py
+@@ -277,7 +277,9 @@ class PromptyToolHandler:
+         parent_path = metadata.get("__source_path", "")
+         if not parent_path:
+             raise FileNotFoundError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path")
+-        return str(Path(parent_path).parent / tool.path)
++        from .utils import contain_path
++
++        return str(contain_path(Path(parent_path).parent, tool.path))
+ 
+     @staticmethod
+     def _check_circular(child_path: str, agent: Any) -> None:
+diff --git a/runtime/python/prompty/prompty/core/utils.py b/runtime/python/prompty/prompty/core/utils.py
+index ae3dab1..f6359a8 100644
+--- a/runtime/python/prompty/prompty/core/utils.py
++++ b/runtime/python/prompty/prompty/core/utils.py
+@@ -30,7 +30,7 @@ class PromptySafeLoader(yaml.SafeLoader):
+ def _construct_include(loader: PromptySafeLoader, node: yaml.Node) -> Any:
+     reference = loader.construct_scalar(node)
+     base_dir = loader.base_dir if loader.base_dir is not None else Path.cwd()
+-    return _yaml_load(load_text(Path(base_dir) / reference), base_dir)
++    return _yaml_load(load_text(contain_path(base_dir, reference)), base_dir)
+ 
+ 
+ PromptySafeLoader.add_constructor("!include", _construct_include)
+@@ -70,10 +70,25 @@ def load_fragment(base_dir: str | Path, reference: str, encoding: str = "utf-8")
+     """Read a prompt fragment referenced from frontmatter, relative to *base_dir*.
+ 
+     Used by the ``${prompt:...}`` reference protocol to compose a prompt from
+-    shared fragment files that live alongside the ``.prompty`` file.
++    shared fragment files that live alongside the ``.prompty`` file. The
++    fragment must stay inside *base_dir*.
+     """
+-    target = Path(base_dir) / reference
+-    return load_text(target, encoding=encoding)
++    return load_text(contain_path(base_dir, reference), encoding=encoding)
++
++
++def contain_path(base_dir: str | Path, reference: str) -> Path:
++    """Resolve *reference* under *base_dir*, rejecting anything that escapes it.
++
++    *base_dir* is the directory that contains the prompt document. The
++    reference is canonicalized (symlinks followed) before the containment
++    check, so upward traversal, absolute paths and links that point elsewhere
++    on the host are all rejected before any file is opened.
++    """
++    root = Path(base_dir).resolve()
++    resolved = (root / reference).resolve()
++    if not resolved.is_relative_to(root):
++        raise ValueError(f"Reference '{reference}' resolves outside the prompt directory '{root}'")
++    return resolved
+ 
+ 
+ def load_prompty(file_path: str | Path, encoding: str = "utf-8") -> dict[str, Any] | str:
+diff --git a/runtime/python/prompty/prompty/providers/openai/executor.py b/runtime/python/prompty/prompty/providers/openai/executor.py
+index 6fe213e..996e5c6 100644
+--- a/runtime/python/prompty/prompty/providers/openai/executor.py
++++ b/runtime/python/prompty/prompty/providers/openai/executor.py
+@@ -142,6 +142,7 @@ def _project_prompty_tool(tool: Any, parent: Prompty) -> dict[str, Any]:
+     from pathlib import Path
+ 
+     from ...core.loader import load
++    from ...core.utils import contain_path
+ 
+     # Validate tool.path
+     tool_path = getattr(tool, "path", None)
+@@ -152,7 +153,7 @@ def _project_prompty_tool(tool: Any, parent: Prompty) -> dict[str, Any]:
+     parent_path = (parent.metadata or {}).get("__source_path", "")
+     if not parent_path:
+         raise ValueError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path in metadata")
+-    child_path = Path(parent_path).parent / tool_path
++    child_path = contain_path(Path(parent_path).parent, tool_path)
+     child = load(str(child_path))
+ 
+     func_def: dict[str, Any] = {"name": tool.name}
+diff --git a/runtime/python/prompty/prompty/renderers/jinja2.py b/runtime/python/prompty/prompty/renderers/jinja2.py
+index 42c9f8f..731ead9 100644
+--- a/runtime/python/prompty/prompty/renderers/jinja2.py
++++ b/runtime/python/prompty/prompty/renderers/jinja2.py
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ from pathlib import Path
+ from typing import Any
+ 
++from jinja2 import FileSystemLoader, TemplateNotFound
++
+ from ..model import Prompty
+ from ..tracing.tracer import trace
+ from ._common import _prepare_render_inputs, _thread_nonces_local
+@@ -16,6 +18,20 @@ from ._common import _prepare_render_inputs, _thread_nonces_local
+ __all__ = ["Jinja2Renderer"]
+ 
+ 
++class _DocumentFileSystemLoader(FileSystemLoader):
++    """Load template fragments only from the document's own directory.
++
++    A fragment name is canonicalized before it is read, so a link inside the
++    directory that points elsewhere on the host is refused instead of opened.
++    """
++
++    def get_source(self, environment, template):
++        root = Path(self.searchpath[0]).resolve()
++        if not (root / template).resolve().is_relative_to(root):
++            raise TemplateNotFound(template)
++        return super().get_source(environment, template)
++
++
+ class Jinja2Renderer:
+     """Renders Jinja2 templates in a sandboxed environment.
+ 
+@@ -39,7 +55,7 @@ class Jinja2Renderer:
+         template: str,
+         inputs: dict[str, Any],
+     ) -> str:
+-        from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
++        from jinja2 import ChoiceLoader, DictLoader
+         from jinja2.sandbox import ImmutableSandboxedEnvironment
+ 
+         render_inputs, thread_nonces = _prepare_render_inputs(agent, inputs)
+@@ -50,7 +66,7 @@ class Jinja2Renderer:
+         # document, e.g. ``{% include "partials/style.md" %}``.
+         source_path = (agent.metadata or {}).get("__source_path")
+         if source_path:
+-            loaders.append(FileSystemLoader(str(Path(source_path).parent)))
++            loaders.append(_DocumentFileSystemLoader(str(Path(source_path).parent)))
+ 
+         env = ImmutableSandboxedEnvironment(
+             loader=ChoiceLoader(loaders),
+diff --git a/runtime/typescript/packages/core/src/core/index.ts b/runtime/typescript/packages/core/src/core/index.ts
+index fbda71f..f9013c4 100644
+--- a/runtime/typescript/packages/core/src/core/index.ts
++++ b/runtime/typescript/packages/core/src/core/index.ts
+@@ -2,7 +2,7 @@ export * from "./types.js";
+ export * from "./interfaces.js";
+ export * from "./registry.js";
+ export * from "./connections.js";
+-export { load, defaultSaveContext } from "./loader.js";
++export { load, defaultSaveContext, containPath } from "./loader.js";
+ export {
+   validateInputs,
+   render,
+diff --git a/runtime/typescript/packages/core/src/core/loader.ts b/runtime/typescript/packages/core/src/core/loader.ts
+index 49c6c5d..aee0ebb 100644
+--- a/runtime/typescript/packages/core/src/core/loader.ts
++++ b/runtime/typescript/packages/core/src/core/loader.ts
+@@ -8,8 +8,8 @@
+  * @module
+  */
+ 
+-import { readFileSync } from "node:fs";
+-import { resolve, dirname, extname } from "node:path";
++import { readFileSync, realpathSync } from "node:fs";
++import { resolve, dirname, extname, isAbsolute, relative, sep } from "node:path";
+ import matter from "gray-matter";
+ import { LoadContext, SaveContext } from "../model/context.js";
+ import { Prompty } from "../model/agent/prompty.js";
+@@ -144,7 +144,7 @@ function makePreProcess(agentFile: string): (data: unknown) => unknown {
+           );
+         }
+       } else if (protocol === "file") {
+-        const filePath = resolve(agentDir, val);
++        const filePath = containPath(agentDir, val);
+         record[key] = loadFileContent(filePath);
+       }
+     }
+@@ -153,6 +153,29 @@ function makePreProcess(agentFile: string): (data: unknown) => unknown {
+   };
+ }
+ 
++/**
++ * Resolve `reference` under `baseDir`, rejecting anything that escapes it.
++ *
++ * `baseDir` is the directory that contains the prompt document. The reference
++ * is canonicalized (links followed) before the containment check, so upward
++ * traversal, absolute paths and links that point elsewhere on the host are
++ * all rejected before any file is opened.
++ */
++export function containPath(baseDir: string, reference: string): string {
++  const root = realpathSync(resolve(baseDir));
++  const target = realpathSync(resolve(root, reference));
++  const rel = relative(root, target);
++  if (rel === "") {
++    return target;
++  }
++  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
++    throw new Error(
++      `Reference '${reference}' resolves outside the prompt directory '${root}'`,
++    );
++  }
++  return target;
++}
++
+ function loadFileContent(path: string): unknown {
+   const raw = readFileSync(path, "utf-8");
+   const ext = extname(path).toLowerCase();
+diff --git a/runtime/typescript/packages/core/src/core/tool-dispatch.ts b/runtime/typescript/packages/core/src/core/tool-dispatch.ts
+index 5f170cc..d4db0a8 100644
+--- a/runtime/typescript/packages/core/src/core/tool-dispatch.ts
++++ b/runtime/typescript/packages/core/src/core/tool-dispatch.ts
+@@ -23,6 +23,7 @@
+ 
+ import { dirname, resolve } from "node:path";
+ import type { Prompty } from "../model/agent/prompty.js";
++import { containPath } from "./loader.js";
+ 
+ // ---------------------------------------------------------------------------
+ // ToolHandler interface
+@@ -181,7 +182,7 @@ class PromptyToolHandler implements ToolHandler {
+       return `Error: cannot resolve PromptyTool '${tool.name}': parent has no __source_path`;
+     }
+ 
+-    const childPath = resolve(dirname(parentPath), tool.path as string);
++    const childPath = containPath(dirname(parentPath), tool.path as string);
+ 
+     // Circular reference detection
+     const stack = ((agent.metadata ?? {}).__prompty_tool_stack as string[] | undefined) ?? [];
+diff --git a/runtime/typescript/packages/core/src/index.ts b/runtime/typescript/packages/core/src/index.ts
+index 5211ffe..3eb25e8 100644
+--- a/runtime/typescript/packages/core/src/index.ts
++++ b/runtime/typescript/packages/core/src/index.ts
+@@ -57,6 +57,7 @@ export {
+ 
+   // Loader
+   load,
++  containPath,
+ 
+   // Pipeline functions
+   validateInputs,
+diff --git a/runtime/typescript/packages/openai/src/wire.ts b/runtime/typescript/packages/openai/src/wire.ts
+index 8f59212..7d2d120 100644
+--- a/runtime/typescript/packages/openai/src/wire.ts
++++ b/runtime/typescript/packages/openai/src/wire.ts
+@@ -6,8 +6,8 @@
+ 
+ import type { Prompty } from "@prompty/core";
+ import type { ContentPart, Message } from "@prompty/core";
+-import { load as loadPrompty } from "@prompty/core";
+-import { dirname, resolve } from "node:path";
++import { load as loadPrompty, containPath } from "@prompty/core";
++import { dirname } from "node:path";
+ 
+ /**
+  * Convert an abstract Message to OpenAI wire format.
+@@ -375,7 +375,7 @@ function projectPromptyTool(tool: Record<string, unknown>, parent: Prompty): Rec
+       `Cannot resolve PromptyTool '${tool.name}': parent agent has no __source_path in metadata`,
+     );
+   }
+-  const childPath = resolve(dirname(parentPath), toolPath);
++  const childPath = containPath(dirname(parentPath), toolPath);
+   const child = loadPrompty(childPath);
+ 
+   const funcDef: Record<string, unknown> = { name: tool.name };

@@ -1,0 +1,147 @@
+diff --git a/files/file.go b/files/file.go
+index 88990feb..55c835ae 100644
+--- a/files/file.go
++++ b/files/file.go
+@@ -173,6 +173,80 @@ func stat(opts *FileOptions) (*FileInfo, error) {
+ 	return file, nil
+ }
+ 
++// maxResolutionHops bounds how many symbolic links WithinScope follows while
++// resolving one path, so a link loop is refused instead of spinning forever.
++const maxResolutionHops = 255
++
++// splitPathComponents splits an absolute or relative path into its components,
++// discarding empty components and "." entries.
++func splitPathComponents(p string) []string {
++	parts := strings.FieldsFunc(p, func(r rune) bool { return r == filepath.Separator })
++	out := parts[:0]
++	for _, part := range parts {
++		if part != "." {
++			out = append(out, part)
++		}
++	}
++	return out
++}
++
++// resolvePath resolves p the way the operating system resolves it when it
++// opens the file: every symbolic link is followed and each ".." applies to the
++// directory the preceding components actually resolved to, not to where they
++// sit lexically. Unlike filepath.EvalSymlinks it does not require the whole
++// path to exist. Once a component is missing, the remainder cannot exist
++// either, so it is appended to the already-resolved prefix; that keeps
++// brand-new files (and dangling link targets) validatable.
++func resolvePath(p string) (string, error) {
++	if !filepath.IsAbs(p) {
++		p = string(filepath.Separator) + p
++	}
++
++	components := splitPathComponents(p)
++	cur := string(filepath.Separator)
++	hops := 0
++
++	for i := 0; i < len(components); i++ {
++		switch components[i] {
++		case "..":
++			cur = filepath.Dir(cur)
++			continue
++		}
++
++		next := filepath.Join(cur, components[i])
++		info, err := os.Lstat(next)
++		if err != nil {
++			if !errors.Is(err, fs.ErrNotExist) {
++				return "", err
++			}
++			return filepath.Join(cur, filepath.Join(components[i:]...)), nil
++		}
++
++		if info.Mode()&os.ModeSymlink == 0 {
++			cur = next
++			continue
++		}
++
++		target, err := os.Readlink(next)
++		if err != nil {
++			return "", err
++		}
++		hops++
++		if hops > maxResolutionHops {
++			return "", os.ErrPermission
++		}
++
++		targetParts := splitPathComponents(target)
++		if filepath.IsAbs(target) {
++			cur = string(filepath.Separator)
++		}
++		components = append(targetParts, components[i+1:]...)
++		i = -1
++	}
++
++	return cur, nil
++}
++
+ // WithinScope reports whether the on-disk target of p — after resolving any
+ // symbolic links — stays within the scoped root of fsys. It exists to stop a
+ // symlink that lives lexically inside a user's scope but points outside it
+@@ -180,14 +254,11 @@ func stat(opts *FileOptions) (*FileInfo, error) {
+ //
+ // Paths that do not exist yet (e.g. a brand-new file being created) are
+ // validated against their nearest existing ancestor, so legitimate new files
+-// are always allowed. For a filesystem that is not scoped with BasePathFs the
+-// check is a no-op and returns true.
+-//
+-// Note: a dangling symlink whose target does not yet exist resolves to its
+-// containing directory and is therefore allowed; writing through such a link
+-// could still create a file outside the scope. Callers that create files
+-// should treat this as best-effort and rely on rejecting existing escaping
+-// symlinks, which covers the disclosure and overwrite vectors.
++// are always allowed. A dangling symlink is not treated as a new file: its
++// target is resolved (including any relative target, further links, and any
++// ".." that applies after a symlinked component) and validated where the
++// write or read would actually land. For a filesystem that is not scoped with
++// BasePathFs the check is a no-op and returns true.
+ func WithinScope(fsys afero.Fs, p string) (bool, error) {
+ 	bfs, ok := fsys.(*afero.BasePathFs)
+ 	if !ok {
+@@ -195,21 +266,12 @@ func WithinScope(fsys afero.Fs, p string) (bool, error) {
+ 		return true, nil
+ 	}
+ 
+-	root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(bfs, "/"))
++	root, err := resolvePath(afero.FullBaseFsPath(bfs, "/"))
+ 	if err != nil {
+ 		return false, err
+ 	}
+ 
+-	target := afero.FullBaseFsPath(bfs, p)
+-	resolved, err := filepath.EvalSymlinks(target)
+-	for errors.Is(err, fs.ErrNotExist) {
+-		parent := filepath.Dir(target)
+-		if parent == target {
+-			break
+-		}
+-		target = parent
+-		resolved, err = filepath.EvalSymlinks(target)
+-	}
++	resolved, err := resolvePath(afero.FullBaseFsPath(bfs, p))
+ 	if err != nil {
+ 		return false, err
+ 	}
+diff --git a/http/resource.go b/http/resource.go
+index 27eb8b70..11cd21c6 100644
+--- a/http/resource.go
++++ b/http/resource.go
+@@ -111,6 +111,13 @@ func resourceDeleteHandler(fileCache FileCache) handleFunc {
+ 			return errToStatus(err), err
+ 		}
+ 
++		if ok, scopeErr := files.WithinScope(d.user.Fs, r.URL.Path); scopeErr != nil || !ok {
++			if scopeErr != nil {
++				return errToStatus(scopeErr), scopeErr
++			}
++			return http.StatusForbidden, nil
++		}
++
+ 		err = d.RunHook(func() error {
+ 			return d.user.Fs.RemoveAll(r.URL.Path)
+ 		}, "delete", r.URL.Path, "", d.user)

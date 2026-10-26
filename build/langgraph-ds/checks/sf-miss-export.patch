@@ -1,0 +1,407 @@
+diff --git a/libs/checkpoint-postgres/langgraph/store/postgres/base.py b/libs/checkpoint-postgres/langgraph/store/postgres/base.py
+index e294fe2..3d1c708 100644
+--- a/libs/checkpoint-postgres/langgraph/store/postgres/base.py
++++ b/libs/checkpoint-postgres/langgraph/store/postgres/base.py
+@@ -4,6 +4,7 @@ import asyncio
+ import concurrent.futures
+ import json
+ import logging
++import re
+ import threading
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator, Sequence
+@@ -463,8 +464,9 @@ class BasePostgresStore(Generic[C]):
+             ns_condition = "TRUE"
+             ns_param: Sequence[str] | None = None
+             if op.namespace_prefix:
+-                ns_condition = "store.prefix LIKE %s"
+-                ns_param = (f"{_namespace_to_text(op.namespace_prefix)}%",)
++                ns_condition, ns_param = _namespace_prefix_condition(
++                    op.namespace_prefix
++                )
+             else:
+                 ns_param = ()
+ 
+@@ -617,15 +619,17 @@ class BasePostgresStore(Generic[C]):
+                 conditions.append("(expires_at IS NULL OR expires_at > NOW())")
+             if op.match_conditions:
+                 for condition in op.match_conditions:
+-                    if condition.match_type == "prefix":
+-                        conditions.append("prefix LIKE %s")
+-                        params.append(
+-                            f"{_namespace_to_text(condition.path, handle_wildcards=True)}%"
+-                        )
+-                    elif condition.match_type == "suffix":
+-                        conditions.append("prefix LIKE %s")
++                    if condition.match_type in ("prefix", "suffix"):
++                        if not condition.path:
++                            # An empty path constrains nothing; skipping keeps it a
++                            # no-op rather than emitting a pattern that matches no
++                            # namespace at all.
++                            continue
++                        conditions.append("prefix ~ %s")
+                         params.append(
+-                            f"%{_namespace_to_text(condition.path, handle_wildcards=True)}"
++                            _namespace_match_pattern(
++                                condition.path, condition.match_type
++                            )
+                         )
+                     else:
+                         logger.warning(
+@@ -833,11 +837,9 @@ class PostgresStore(BaseStore, BasePostgresStore[_pg_internal.Conn]):
+         Administrative tooling uses this to retire a namespace subtree in one
+         step, for example when a customer account is closed.
+         """
++        condition, params = _namespace_prefix_condition(namespace_prefix)
+         with self._cursor() as cur:
+-            cur.execute(
+-                "DELETE FROM store WHERE prefix LIKE %s",
+-                (f"{_namespace_to_text(namespace_prefix)}%",),
+-            )
++            cur.execute(f"DELETE FROM store WHERE {condition}", params)
+ 
+     def export_namespace(self, namespace_prefix: tuple[str, ...]) -> list[Item]:
+         """Return every item stored under a namespace prefix.
+@@ -1305,15 +1307,59 @@ def _get_index_params(store: Any) -> tuple[str, dict[str, Any]]:
+     return kind, sanitized
+ 
+ 
+-def _namespace_to_text(
+-    namespace: tuple[str, ...], handle_wildcards: bool = False
+-) -> str:
++def _namespace_to_text(namespace: tuple[str, ...]) -> str:
+     """Convert namespace tuple to text string."""
+-    if handle_wildcards:
+-        namespace = tuple("%" if val == "*" else val for val in namespace)
+     return ".".join(namespace)
+ 
+ 
++def _escape_like_literal(text: str) -> str:
++    """Escape LIKE metacharacters so `text` is matched literally.
++
++    Namespace labels may contain `_` and `%`, which would otherwise act as
++    wildcards: `("user_1",)` would match `("userX1",)`. Backslash is escaped
++    first so it cannot escape the following character. Requires an explicit
++    `ESCAPE '\\'` clause on the pattern.
++    """
++    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
++
++
++def _namespace_prefix_condition(namespace_prefix: tuple[str, ...]) -> tuple[str, tuple]:
++    """Build the SQL scoping a search to a namespace and its descendants.
++
++    Matches the namespace exactly or requires the `.` separator before any
++    remainder, so a prefix of `("foo",)` does not also match `("foobar",)`.
++
++    Both arms stay index-friendly: equality on the `(prefix, key)` primary key,
++    the anchored LIKE on the `prefix text_pattern_ops` index.
++
++    Only the LIKE arm is escaped -- equality does not interpret metacharacters,
++    so escaping it would stop `("user_1",)` from matching itself.
++    """
++    path = _namespace_to_text(namespace_prefix)
++    condition = r"(store.prefix = %s OR store.prefix LIKE %s ESCAPE '\')"
++    return condition, (path, f"{_escape_like_literal(path)}.%")
++
++
++def _namespace_match_pattern(path: tuple[str, ...], match_type: str) -> str:
++    """Build a POSIX regex matching the dot-joined prefix on whole segments.
++
++    Needed because `LIKE` cannot express "any character except the separator".
++    Matches how `InMemoryStore` compares namespaces element-wise.
++
++    `*` matches exactly one segment. Prefix matches stay open-ended but must end
++    on a separator; suffix matches anchor at the end and begin on one.
++
++    Examples:
++        prefix ("uid", "*", "alice") -> ^uid\\.[^.]+\\.alice(\\.|\\Z)
++        suffix ("alice",)            -> (^|\\.)alice\\Z
++    """
++    segments = ("[^.]+" if part == "*" else re.escape(part) for part in path)
++    body = r"\.".join(segments)
++    if match_type == "suffix":
++        return rf"(^|\.){body}\Z"
++    return rf"^{body}(\.|\Z)"
++
++
+ def _row_to_item(
+     namespace: tuple[str, ...],
+     row: Row,
+diff --git a/libs/checkpoint-sqlite/langgraph/store/sqlite/aio.py b/libs/checkpoint-sqlite/langgraph/store/sqlite/aio.py
+index f4594d5..b0d711d 100644
+--- a/libs/checkpoint-sqlite/langgraph/store/sqlite/aio.py
++++ b/libs/checkpoint-sqlite/langgraph/store/sqlite/aio.py
+@@ -24,11 +24,13 @@ from langgraph.store.base.batch import AsyncBatchedBaseStore
+ 
+ from langgraph.store.sqlite.base import (
+     _PLACEHOLDER,
++    NS_MATCH_FUNCTION,
+     BaseSqliteStore,
+     SqliteIndexConfig,
+     _decode_ns_text,
+     _ensure_index_config,
+     _group_ops,
++    _namespace_match,
+     _row_to_item,
+     _row_to_search_item,
+ )
+@@ -150,6 +152,13 @@ class AsyncSqliteStore(AsyncBatchedBaseStore, BaseSqliteStore):
+             if self.is_setup:
+                 return
+ 
++            # list_namespaces needs segment-aware matching, which SQLite cannot
++            # express in LIKE or GLOB. Registered here rather than in __init__
++            # because aiosqlite's create_function is a coroutine.
++            await self.conn.create_function(
++                NS_MATCH_FUNCTION, 2, _namespace_match, deterministic=True
++            )
++
+             # Create migrations table if it doesn't exist
+             await self.conn.execute(
+                 """
+diff --git a/libs/checkpoint-sqlite/langgraph/store/sqlite/base.py b/libs/checkpoint-sqlite/langgraph/store/sqlite/base.py
+index e600bb8..eadfb93 100644
+--- a/libs/checkpoint-sqlite/langgraph/store/sqlite/base.py
++++ b/libs/checkpoint-sqlite/langgraph/store/sqlite/base.py
+@@ -93,12 +93,74 @@ class SqliteIndexConfig(IndexConfig):
+     pass
+ 
+ 
+-def _namespace_to_text(
+-    namespace: tuple[str, ...], handle_wildcards: bool = False
+-) -> str:
++NS_MATCH_FUNCTION = "_langgraph_namespace_match"
++"""SQLite user function backing segment-aware namespace matching.
++
++Registered under a private name rather than overriding `REGEXP`, so a caller's
++own `REGEXP` is left untouched.
++"""
++
++
++def _namespace_match(prefix: str | None, pattern: str) -> int:
++    """Backing implementation of `NS_MATCH_FUNCTION`."""
++    if prefix is None:
++        return 0
++    return 1 if re.search(pattern, prefix) else 0
++
++
++def _escape_glob_literal(text: str) -> str:
++    """Escape GLOB metacharacters so `text` is matched literally.
++
++    GLOB has no `ESCAPE` clause, so metacharacters are wrapped in a character
++    class instead. `]` is literal outside a class and needs no escaping.
++    """
++    return text.replace("[", "[[]").replace("*", "[*]").replace("?", "[?]")
++
++
++def _namespace_prefix_condition(
++    namespace_prefix: tuple[str, ...], column: str = "prefix"
++) -> tuple[str, tuple[str, ...]]:
++    """Build the SQL scoping a search to a namespace and its descendants.
++
++    Matches the namespace exactly or requires the `.` separator before any
++    remainder, so a prefix of `("foo",)` does not also match `("foobar",)`.
++
++    Uses GLOB rather than LIKE because SQLite's LIKE is case-insensitive for
++    ASCII, which would match `("FOO",)` for a prefix of `("foo",)` even though
++    `get`/`put`/`delete` compare with `=` and treat those as distinct.
++
++    An empty prefix is unconstrained and matches every namespace.
++    """
++    if not namespace_prefix:
++        return "TRUE", ()
++    path = _namespace_to_text(namespace_prefix)
++    condition = f"({column} = ? OR {column} GLOB ?)"
++    return condition, (path, f"{_escape_glob_literal(path)}.*")
++
++
++def _namespace_match_pattern(path: tuple[str, ...], match_type: str) -> str:
++    """Build a regex matching the dot-joined prefix on whole namespace segments.
++
++    Needed because neither LIKE nor GLOB can express "any character except the
++    separator": GLOB has character classes but no quantifier, so `[^.]*` still
++    crosses `.`. Matches how `InMemoryStore` compares namespaces element-wise.
++
++    `*` matches exactly one segment. Prefix matches stay open-ended but must end
++    on a separator; suffix matches anchor at the end and begin on one.
++
++    Examples:
++        prefix ("uid", "*", "alice") -> ^uid\\.[^.]+\\.alice(\\.|\\Z)
++        suffix ("alice",)            -> (^|\\.)alice\\Z
++    """
++    segments = ("[^.]+" if part == "*" else re.escape(part) for part in path)
++    body = r"\.".join(segments)
++    if match_type == "suffix":
++        return rf"(^|\.){body}\Z"
++    return rf"^{body}(\.|\Z)"
++
++
++def _namespace_to_text(namespace: tuple[str, ...]) -> str:
+     """Convert namespace tuple to text string."""
+-    if handle_wildcards:
+-        namespace = tuple("%" if val == "*" else val for val in namespace)
+     return ".".join(namespace)
+ 
+ 
+@@ -461,8 +523,11 @@ class BaseSqliteStore:
+                     else " AND " + " AND ".join(filter_conditions)
+                 )
+                 if op.namespace_prefix:
+-                    prefix_filter_str = f"WHERE s.prefix LIKE ? {filter_str} "
+-                    ns_args: Sequence = (f"{_namespace_to_text(op.namespace_prefix)}%",)
++                    ns_condition, ns_args_tuple = _namespace_prefix_condition(
++                        op.namespace_prefix, column="s.prefix"
++                    )
++                    prefix_filter_str = f"WHERE {ns_condition} {filter_str} "
++                    ns_args: Sequence = ns_args_tuple
+                 else:
+                     ns_args = ()
+                     if filter_str:
+@@ -503,12 +568,15 @@ class BaseSqliteStore:
+                 ]
+             # Regular search branch (no vector search)
+             else:
+-                base_query = """
++                ns_condition, ns_args_tuple = _namespace_prefix_condition(
++                    op.namespace_prefix
++                )
++                base_query = f"""
+                     SELECT prefix, key, value, created_at, updated_at, expires_at, ttl_minutes, NULL as score
+                     FROM store
+-                    WHERE prefix LIKE ?
++                    WHERE {ns_condition}
+                 """
+-                params = [f"{_namespace_to_text(op.namespace_prefix)}%"]
++                params = list(ns_args_tuple)
+ 
+                 if filter_conditions:
+                     params.extend(filter_params)
+@@ -549,16 +617,28 @@ class BaseSqliteStore:
+ 
+             if op.match_conditions:
+                 for cond in op.match_conditions:
+-                    if cond.match_type == "prefix":
+-                        where_clauses.append("prefix LIKE ?")
+-                        params.append(
+-                            f"{_namespace_to_text(cond.path, handle_wildcards=True)}%"
+-                        )
+-                    elif cond.match_type == "suffix":
+-                        where_clauses.append("prefix LIKE ?")
+-                        params.append(
+-                            f"%{_namespace_to_text(cond.path, handle_wildcards=True)}"
+-                        )
++                    if cond.match_type in ("prefix", "suffix"):
++                        if not cond.path:
++                            # An empty path constrains nothing; skipping keeps it a
++                            # no-op rather than emitting a pattern that matches no
++                            # namespace at all.
++                            continue
++                        if cond.match_type == "prefix" and "*" not in cond.path:
++                            # Equivalent to the anchored pattern, but SQLite can
++                            # satisfy `=` and a trailing-wildcard GLOB from
++                            # store_prefix_idx. The user function is opaque to the
++                            # planner, so it would scan every row and call back
++                            # into Python for each one.
++                            condition, args = _namespace_prefix_condition(
++                                tuple(cond.path)
++                            )
++                            where_clauses.append(condition)
++                            params.extend(args)
++                        else:
++                            where_clauses.append(f"{NS_MATCH_FUNCTION}(prefix, ?) = 1")
++                            params.append(
++                                _namespace_match_pattern(cond.path, cond.match_type)
++                            )
+                     else:
+                         logger.warning(
+                             "Unknown match_type in list_namespaces: %s", cond.match_type
+@@ -785,6 +865,9 @@ class SqliteStore(BaseSqliteStore, BaseStore):
+         super().__init__()
+         self._deserializer = deserializer
+         self.conn = conn
++        # Registered here rather than in from_conn_string so a caller-supplied
++        # connection also gets it.
++        conn.create_function(NS_MATCH_FUNCTION, 2, _namespace_match, deterministic=True)
+         self.lock = threading.Lock()
+         self.is_setup = False
+         self.index_config = index
+@@ -959,11 +1042,9 @@ class SqliteStore(BaseSqliteStore, BaseStore):
+         Administrative tooling uses this to retire a namespace subtree in one
+         step, for example when a customer account is closed.
+         """
++        condition, params = _namespace_prefix_condition(namespace_prefix)
+         with self._cursor() as cur:
+-            cur.execute(
+-                "DELETE FROM store WHERE prefix LIKE ?",
+-                (f"{_namespace_to_text(namespace_prefix)}%",),
+-            )
++            cur.execute(f"DELETE FROM store WHERE {condition}", params)
+ 
+     def export_namespace(self, namespace_prefix: tuple[str, ...]) -> list[Item]:
+         """Return every item stored under a namespace prefix.
+diff --git a/libs/checkpoint/langgraph/store/base/__init__.py b/libs/checkpoint/langgraph/store/base/__init__.py
+index 08fe745..5a83572 100644
+--- a/libs/checkpoint/langgraph/store/base/__init__.py
++++ b/libs/checkpoint/langgraph/store/base/__init__.py
+@@ -840,6 +840,8 @@ class BaseStore(ABC):
+                 Natural language search support depends on your store implementation
+                 and requires proper embedding configuration.
+         """
++        if namespace_prefix:
++            _validate_scope_labels(namespace_prefix)
+         return self.batch(
+             [
+                 SearchOp(
+@@ -986,8 +988,10 @@ class BaseStore(ABC):
+         """
+         match_conditions = []
+         if prefix:
++            _validate_scope_labels(prefix)
+             match_conditions.append(MatchCondition(match_type="prefix", path=prefix))
+         if suffix:
++            _validate_scope_labels(suffix)
+             match_conditions.append(MatchCondition(match_type="suffix", path=suffix))
+ 
+         op = ListNamespacesOp(
+@@ -1091,6 +1095,8 @@ class BaseStore(ABC):
+                 Natural language search support depends on your store implementation
+                 and requires proper embedding configuration.
+         """
++        if namespace_prefix:
++            _validate_scope_labels(namespace_prefix)
+         return (
+             await self.abatch(
+                 [
+@@ -1247,8 +1253,10 @@ class BaseStore(ABC):
+         """
+         match_conditions = []
+         if prefix:
++            _validate_scope_labels(prefix)
+             match_conditions.append(MatchCondition(match_type="prefix", path=prefix))
+         if suffix:
++            _validate_scope_labels(suffix)
+             match_conditions.append(MatchCondition(match_type="suffix", path=suffix))
+ 
+         op = ListNamespacesOp(
+@@ -1260,6 +1268,21 @@ class BaseStore(ABC):
+         return (await self.abatch([op]))[0]
+ 
+ 
++def _validate_scope_labels(path: tuple[str, ...]) -> None:
++    """Reject a scope path whose labels cannot name a stored namespace.
++
++    A namespace label is a non-empty string without a period, so a scope that
++    contains any other label cannot describe a stored namespace. Rejecting it
++    keeps a malformed scope from being reinterpreted as a different path.
++    """
++    for label in path:
++        if not isinstance(label, str) or not label or "." in label:
++            raise InvalidNamespaceError(
++                f"Invalid namespace scope label '{label}' in {path}. Namespace labels"
++                " must be non-empty strings that do not contain periods ('.')."
++            )
++
++
+ def _validate_namespace(namespace: tuple[str, ...]) -> None:
+     if not namespace:
+         raise InvalidNamespaceError("Namespace cannot be empty.")

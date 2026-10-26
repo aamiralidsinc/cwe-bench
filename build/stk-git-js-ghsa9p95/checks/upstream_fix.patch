@@ -1,0 +1,156 @@
+diff -ruN pristine/simple-git/src/lib/git-factory.ts up/simple-git/src/lib/git-factory.ts
+--- pristine/simple-git/src/lib/git-factory.ts	2022-03-18 17:14:54.000000000 +0000
++++ up/simple-git/src/lib/git-factory.ts	2026-10-26 02:17:53.822307409 +0000
+@@ -2,6 +2,7 @@
+ 
+ import * as api from './api';
+ import {
++   blockUnsafeOperationsPlugin,
+    commandConfigPrefixingPlugin,
+    completionDetectionPlugin,
+    errorDetectionHandler,
+@@ -53,6 +54,7 @@
+       plugins.add(commandConfigPrefixingPlugin(config.config));
+    }
+ 
++   plugins.add(blockUnsafeOperationsPlugin(config.unsafe));
+    plugins.add(completionDetectionPlugin(config.completion));
+    config.progress && plugins.add(progressMonitorPlugin(config.progress));
+    config.timeout && plugins.add(timeoutPlugin(config.timeout));
+diff -ruN pristine/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts up/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+--- pristine/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts	1970-01-01 00:00:00.000000000 +0000
++++ up/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts	2026-10-26 02:17:53.806307424 +0000
+@@ -0,0 +1,41 @@
++import type { SimpleGitPlugin } from './simple-git-plugin';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++import type { SimpleGitPluginConfig } from '../types';
++
++function isConfigSwitch(arg: string) {
++   return arg.trim().toLowerCase() === '-c';
++}
++
++function preventProtocolOverride(arg: string, next: string) {
++   if (!isConfigSwitch(arg)) {
++      return;
++   }
++
++   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
++      return;
++   }
++
++   throw new GitPluginError(
++      undefined,
++      'unsafe',
++      'Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol'
++   );
++}
++
++export function blockUnsafeOperationsPlugin({
++   allowUnsafeProtocolOverride = false,
++}: SimpleGitPluginConfig['unsafe'] = {}): SimpleGitPlugin<'spawn.args'> {
++   return {
++      type: 'spawn.args',
++      action(args, _context) {
++         args.forEach((current, index) => {
++            const next = index < args.length ? args[index + 1] : '';
++
++            allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
++         });
++
++         return args;
++      },
++   };
++}
+diff -ruN pristine/simple-git/src/lib/plugins/index.ts up/simple-git/src/lib/plugins/index.ts
+--- pristine/simple-git/src/lib/plugins/index.ts	2022-03-18 17:14:54.000000000 +0000
++++ up/simple-git/src/lib/plugins/index.ts	2026-10-26 02:17:53.822307409 +0000
+@@ -1,3 +1,4 @@
++export * from './block-unsafe-operations-plugin';
+ export * from './command-config-prefixing-plugin';
+ export * from './completion-detection.plugin';
+ export * from './error-detection.plugin';
+diff -ruN pristine/simple-git/src/lib/tasks/clone.ts up/simple-git/src/lib/tasks/clone.ts
+--- pristine/simple-git/src/lib/tasks/clone.ts	2022-03-18 17:14:54.000000000 +0000
++++ up/simple-git/src/lib/tasks/clone.ts	2026-10-26 02:17:53.802307428 +0000
+@@ -1,10 +1,9 @@
+-import { straightThroughStringTask } from './task';
++import { configurationErrorTask, EmptyTask, straightThroughStringTask } from './task';
+ import { OptionFlags, Options, StringTask } from '../types';
+-import { append } from '../utils';
++import { append, filterString } from '../utils';
+ 
+ export type CloneOptions = Options &
+-   OptionFlags<
+-      '--bare' |
++   OptionFlags<'--bare' |
+       '--dissociate' |
+       '--mirror' |
+       '--no-checkout' |
+@@ -15,25 +14,30 @@
+       '--remote-submodules' |
+       '--single-branch' |
+       '--shallow-submodules' |
+-      '--verbose'
+-      > &
++      '--verbose'> &
+    OptionFlags<'--depth' | '-j' | '--jobs', number> &
+    OptionFlags<'--branch' | '--origin' | '--recurse-submodules' | '--separate-git-dir' | '--shallow-exclude' | '--shallow-since' | '--template', string>
+ 
+-export function cloneTask(repo: string | undefined, directory: string | undefined, customArgs: string[]): StringTask<string> {
++function disallowedCommand(command: string) {
++   return /^--upload-pack(=|$)/.test(command);
++}
++
++export function cloneTask(repo: string | undefined, directory: string | undefined, customArgs: string[]): StringTask<string> | EmptyTask {
+    const commands = ['clone', ...customArgs];
+-   if (typeof repo === 'string') {
+-      commands.push(repo);
+-   }
+-   if (typeof directory === 'string') {
+-      commands.push(directory);
++
++   filterString(repo) && commands.push(repo);
++   filterString(directory) && commands.push(directory);
++
++   const banned = commands.find(disallowedCommand);
++   if (banned) {
++      return configurationErrorTask(`git.fetch: potential exploit argument blocked.`);
+    }
+ 
+    return straightThroughStringTask(commands);
+ }
+ 
+-export function cloneMirrorTask(repo: string | undefined, directory: string | undefined, customArgs: string[]): StringTask<string> {
+-   append(customArgs,'--mirror');
++export function cloneMirrorTask(repo: string | undefined, directory: string | undefined, customArgs: string[]) {
++   append(customArgs, '--mirror');
+ 
+    return cloneTask(repo, directory, customArgs);
+ }
+diff -ruN pristine/simple-git/src/lib/types/index.ts up/simple-git/src/lib/types/index.ts
+--- pristine/simple-git/src/lib/types/index.ts	2022-03-18 17:14:54.000000000 +0000
++++ up/simple-git/src/lib/types/index.ts	2026-10-26 02:17:53.826307405 +0000
+@@ -106,6 +106,22 @@
+    };
+ 
+    spawnOptions: Pick<SpawnOptions, 'uid' | 'gid'>;
++
++   unsafe: {
++      /**
++       * By default `simple-git` prevents the use of inline configuration
++       * options to override the protocols available for the `git` child
++       * process to prevent accidental security vulnerabilities when
++       * unsanitised user data is passed directly into operations such as
++       * `git.addRemote`, `git.clone` or `git.raw`.
++       *
++       * Enable this override to use the `ext::` protocol (see examples on
++       * [git-scm.com](https://git-scm.com/docs/git-remote-ext#_examples)).
++       *
++       * See documentation for use in
++       */
++      allowUnsafeProtocolOverride?: boolean;
++   };
+ }
+ 
+ /**

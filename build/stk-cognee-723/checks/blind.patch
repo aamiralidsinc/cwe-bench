@@ -1,0 +1,215 @@
+diff -ruN -x __pycache__ pristine/cognee/api/v1/settings/routers/get_settings_router.py app/cognee/api/v1/settings/routers/get_settings_router.py
+--- a/cognee/api/v1/settings/routers/get_settings_router.py	2026-10-26 02:58:26.000000000 +0000
++++ b/cognee/api/v1/settings/routers/get_settings_router.py	2026-10-26 05:42:54.447177686 +0000
+@@ -1,4 +1,4 @@
+-from fastapi import APIRouter
++from fastapi import APIRouter, HTTPException
+ from cognee.api.DTO import InDTO, OutDTO
+ from typing import Union, Optional, Literal
+ from cognee.modules.users.methods import get_authenticated_user
+@@ -46,6 +46,16 @@
+     vector_db: Optional[VectorDBConfigInputDTO] = None
+ 
+ 
++def _caller_may_manage_settings(user: User) -> bool:
++    """The deployment-wide settings are operator-owned.
++
++    ``is_superuser`` is how this deployment marks the operator/bootstrap
++    account; every other caller (including a signed-in ordinary account) is
++    only allowed to read the settings.
++    """
++    return bool(getattr(user, "is_superuser", False))
++
++
+ def get_settings_router() -> APIRouter:
+     router = APIRouter()
+ 
+@@ -90,8 +100,15 @@
+ 
+         ## Error Codes
+         - **400 Bad Request**: Invalid settings provided
++        - **403 Forbidden**: The caller is not a deployment operator
+         - **500 Internal Server Error**: Error saving settings
+         """
++        if not _caller_may_manage_settings(user):
++            raise HTTPException(
++                status_code=403,
++                detail="Only a deployment operator may change the global settings.",
++            )
++
+         from cognee.modules.settings import save_llm_config, save_vector_db_config
+ 
+         if new_settings.llm is not None:
+diff -ruN -x __pycache__ pristine/cognee/api/v1/users/routers/get_register_router.py app/cognee/api/v1/users/routers/get_register_router.py
+--- a/cognee/api/v1/users/routers/get_register_router.py	2026-10-26 02:58:26.000000000 +0000
++++ b/cognee/api/v1/users/routers/get_register_router.py	2026-10-26 05:42:57.675174745 +0000
+@@ -1,6 +1,44 @@
++import os
++
++from fastapi import APIRouter, HTTPException
++
+ from cognee.modules.users.get_fastapi_users import get_fastapi_users
+ from cognee.modules.users.models.User import UserRead, UserCreate
++from cognee.modules.users.methods.get_authenticated_user import REQUIRE_AUTHENTICATION
++
++
++# An operator running a deployment that requires authentication can still opt in
++# to self-service onboarding by setting this to a truthy value.
++OPEN_SIGNUP_ENV_VAR = "COGNEE_OPEN_SIGNUP"
++
++_TRUTHY = {"1", "true", "yes", "on"}
++
++
++def _open_signup_requested() -> bool:
++    return os.environ.get(OPEN_SIGNUP_ENV_VAR, "").strip().lower() in _TRUTHY
++
++
++def _anonymous_signup_allowed() -> bool:
++    """Self-registration belongs to deployments that do not require auth.
++
++    When the deployment requires authentication, a stranger must not be able to
++    mint an account without the operator's say-so; the operator opts in with
++    ``COGNEE_OPEN_SIGNUP``.
++    """
++    return (not REQUIRE_AUTHENTICATION) or _open_signup_requested()
+ 
+ 
+ def get_register_router():
+-    return get_fastapi_users().get_register_router(UserRead, UserCreate)
++    if _anonymous_signup_allowed():
++        return get_fastapi_users().get_register_router(UserRead, UserCreate)
++
++    router = APIRouter()
++
++    @router.post("/register")
++    async def register():
++        raise HTTPException(
++            status_code=403,
++            detail="Self-registration is disabled on this deployment.",
++        )
++
++    return router
+diff -ruN -x __pycache__ pristine/cognee/modules/settings/get_settings.py app/cognee/modules/settings/get_settings.py
+--- a/cognee/modules/settings/get_settings.py	2026-10-26 02:58:26.000000000 +0000
++++ b/cognee/modules/settings/get_settings.py	2026-10-26 05:43:12.395161338 +0000
+@@ -3,6 +3,7 @@
+ from pydantic import BaseModel
+ from cognee.infrastructure.databases.vector import get_vectordb_config
+ from cognee.infrastructure.llm import get_llm_config
++from cognee.modules.settings.secret_handling import mask_credential
+ 
+ 
+ class ConfigChoice(BaseModel):
+@@ -20,7 +21,7 @@
+ 
+ 
+ class LLMConfig(BaseModel):
+-    api_key: str
++    api_key: Optional[str]
+     model: str
+     provider: str
+     endpoint: Optional[str]
+@@ -30,7 +31,7 @@
+ 
+ 
+ class VectorDBConfig(BaseModel):
+-    api_key: str
++    api_key: Optional[str]
+     url: str
+     provider: str
+     providers: list[ConfigChoice]
+@@ -91,9 +92,7 @@
+                 "model": llm_config.llm_model,
+                 "endpoint": llm_config.llm_endpoint,
+                 "api_version": llm_config.llm_api_version,
+-                "api_key": (llm_config.llm_api_key[0:10] + "*" * (len(llm_config.llm_api_key) - 10))
+-                if llm_config.llm_api_key
+-                else None,
++                "api_key": mask_credential(llm_config.llm_api_key),
+                 "providers": llm_providers,
+                 "models": {
+                     "openai": [
+@@ -181,10 +180,7 @@
+             vector_db={
+                 "provider": vector_config.vector_db_provider,
+                 "url": vector_config.vector_db_url,
+-                "api_key": (
+-                    vector_config.vector_db_key[0:10]
+-                    + "*" * (len(vector_config.vector_db_key) - 10)
+-                ),
++                "api_key": mask_credential(vector_config.vector_db_key),
+                 "providers": vector_dbs,
+             },
+         )
+diff -ruN -x __pycache__ pristine/cognee/modules/settings/save_llm_config.py app/cognee/modules/settings/save_llm_config.py
+--- a/cognee/modules/settings/save_llm_config.py	2026-10-26 02:58:26.000000000 +0000
++++ b/cognee/modules/settings/save_llm_config.py	2026-10-26 05:43:16.143157924 +0000
+@@ -1,5 +1,6 @@
+ from pydantic import BaseModel
+ from cognee.infrastructure.llm import get_llm_config
++from cognee.modules.settings.secret_handling import is_credential_mask
+ 
+ 
+ class LLMConfig(BaseModel):
+@@ -14,5 +15,7 @@
+     llm_config.llm_provider = new_llm_config.provider
+     llm_config.llm_model = new_llm_config.model
+ 
+-    if "*****" not in new_llm_config.api_key and len(new_llm_config.api_key.strip()) > 0:
++    if not is_credential_mask(new_llm_config.api_key) and (
++        new_llm_config.api_key or ""
++    ).strip():
+         llm_config.llm_api_key = new_llm_config.api_key
+diff -ruN -x __pycache__ pristine/cognee/modules/settings/save_vector_db_config.py app/cognee/modules/settings/save_vector_db_config.py
+--- a/cognee/modules/settings/save_vector_db_config.py	2026-10-26 02:58:26.000000000 +0000
++++ b/cognee/modules/settings/save_vector_db_config.py	2026-10-26 05:43:20.127154296 +0000
+@@ -1,6 +1,7 @@
+ from typing import Union, Literal
+ from pydantic import BaseModel
+ from cognee.infrastructure.databases.vector import get_vectordb_config
++from cognee.modules.settings.secret_handling import is_credential_mask
+ 
+ 
+ class VectorDBConfig(BaseModel):
+@@ -15,5 +16,7 @@
+     vector_config.vector_db_url = vector_db_config.url
+     vector_config.vector_db_provider = vector_db_config.provider
+ 
+-    if "*****" not in vector_db_config.api_key and len(vector_db_config.api_key.strip()) > 0:
++    if not is_credential_mask(vector_db_config.api_key) and (
++        vector_db_config.api_key or ""
++    ).strip():
+         vector_config.vector_db_key = vector_db_config.api_key
+diff -ruN -x __pycache__ pristine/cognee/modules/settings/secret_handling.py app/cognee/modules/settings/secret_handling.py
+--- a/cognee/modules/settings/secret_handling.py	1970-01-01 00:00:00.000000000 +0000
++++ b/cognee/modules/settings/secret_handling.py	2026-10-26 05:43:01.079171645 +0000
+@@ -0,0 +1,29 @@
++"""Shared handling of the credential values exposed by the settings API.
++
++The settings read endpoint never returns a stored credential: it substitutes a
++mask.  The write endpoints recognise that same mask, so the read/modify/post
++cycle performed by the settings screen leaves the stored credential untouched
++instead of overwriting it with the mask.
++"""
++
++from typing import Optional
++
++
++# The value stand-in the read endpoint returns in place of a stored credential.
++CREDENTIAL_MASK = "*****"
++
++
++def mask_credential(value: Optional[str]) -> Optional[str]:
++    """Return the display value for a stored credential.
++
++    ``None`` means the deployment has no credential configured.  A configured
++    credential is always replaced by the mask, never by any part of itself.
++    """
++    if not value:
++        return None
++    return CREDENTIAL_MASK
++
++
++def is_credential_mask(value: Optional[str]) -> bool:
++    """Whether a submitted credential is the read-only mask rather than a new value."""
++    return bool(value) and CREDENTIAL_MASK in value

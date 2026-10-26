@@ -1,0 +1,166 @@
+diff --git a/lib/backup/actions/copy.go b/lib/backup/actions/copy.go
+index 6fdf20f..69ee2a3 100644
+--- a/lib/backup/actions/copy.go
++++ b/lib/backup/actions/copy.go
+@@ -29,6 +29,7 @@ type RemoteBackupCopy struct {
+ 
+ // Run runs copy with the provided settings.
+ func (b *RemoteBackupCopy) Run() error {
++	return fmt.Errorf("copy is disabled")
+ 	concurrency := b.Concurrency
+ 	src := b.Src
+ 	dst := b.Dst
+diff --git a/lib/backup/actions/restore.go b/lib/backup/actions/restore.go
+index 147f6e7..7e5ae70 100644
+--- a/lib/backup/actions/restore.go
++++ b/lib/backup/actions/restore.go
+@@ -52,6 +52,7 @@ type Restore struct {
+ 
+ // Run runs r with the provided settings.
+ func (r *Restore) Run(ctx context.Context) error {
++	return fmt.Errorf("restore is disabled")
+ 	startTime := time.Now()
+ 
+ 	// Make sure VictoriaMetrics doesn't run during the restore process.
+@@ -92,6 +93,11 @@ func (r *Restore) Run(ctx context.Context) error {
+ 	if err != nil {
+ 		return fmt.Errorf("cannot list src parts: %w", err)
+ 	}
++	for _, srcPart := range srcParts {
++		if !srcPart.IsLocalPathInsideDir(r.Dst.Dir) {
++			return fmt.Errorf("part file %s would be written outside storage directory %s", srcPart.Path, r.Dst.Dir)
++		}
++	}
+ 	logger.Infof("obtaining list of parts at %s", dst)
+ 	dstParts, err := dst.ListParts()
+ 	if err != nil {
+diff --git a/lib/backup/common/part.go b/lib/backup/common/part.go
+index 84e3d1d..bf3cd92 100644
+--- a/lib/backup/common/part.go
++++ b/lib/backup/common/part.go
+@@ -120,6 +120,17 @@ func (p *Part) ParseFromRemotePath(remotePath string) bool {
+ 	return true
+ }
+ 
++// IsLocalPathInsideDir returns true if the part's local path resolves inside dir.
++// It resolves ../../ sequences and prevents path traversal outside dir.
++func (p *Part) IsLocalPathInsideDir(dir string) bool {
++	dir = filepath.Clean(dir)
++	if dir == `/` {
++		return true
++	}
++
++	return strings.HasPrefix(p.LocalPath(dir), dir+string(filepath.Separator))
++}
++
+ // MaxPartSize is the maximum size for each part.
+ //
+ // The MaxPartSize reduces bandwidth usage during retires on network errors
+diff --git a/lib/backup/fslocal/fslocal.go b/lib/backup/fslocal/fslocal.go
+index 43d8eec..c497076 100644
+--- a/lib/backup/fslocal/fslocal.go
++++ b/lib/backup/fslocal/fslocal.go
+@@ -129,6 +129,10 @@ func (fs *FS) NewReadCloser(p common.Part) (io.ReadCloser, error) {
+ // On platforms with preallocation, writes go to a .tmp file that must be
+ // finalized with FinalizeFile.
+ func (fs *FS) NewDirectWriteCloser(p common.Part) (io.WriteCloser, error) {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return nil, fmt.Errorf("part file %s would be written outside storage directory %s", p.Path, fs.Dir)
++	}
++
+ 	path := fs.writePath(p)
+ 	if err := fs.mkdirAll(path); err != nil {
+ 		return nil, err
+@@ -155,6 +159,10 @@ func (fs *FS) NewDirectWriteCloser(p common.Part) (io.WriteCloser, error) {
+ 
+ // PreallocateFile pre-allocates disk space for the file being written.
+ func (fs *FS) PreallocateFile(p common.Part) error {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("part file %s would be written outside storage directory %s", p.Path, fs.Dir)
++	}
++
+ 	path := fs.writePath(p)
+ 	if err := fs.mkdirAll(path); err != nil {
+ 		return err
+@@ -165,6 +173,10 @@ func (fs *FS) PreallocateFile(p common.Part) error {
+ // FinalizeFile syncs the completed file to disk. On platforms with
+ // preallocation, it first renames the .tmp file to its final path.
+ func (fs *FS) FinalizeFile(p common.Part) error {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("part file %s would be written outside storage directory %s", p.Path, fs.Dir)
++	}
++
+ 	finalPath := fs.path(p)
+ 	if canPreallocate && fs.UseTmpFiles {
+ 		tmpPath := fs.tmpPath(p)
+@@ -214,6 +226,9 @@ func (fs *FS) DeletePath(path string) (uint64, error) {
+ 	p := common.Part{
+ 		Path: path,
+ 	}
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return 0, fmt.Errorf("path %s would be accessed outside storage directory %s", path, fs.Dir)
++	}
+ 	fullPath := fs.path(p)
+ 	f, err := os.Open(fullPath)
+ 	if err != nil {
+diff --git a/lib/backup/fsremote/fsremote.go b/lib/backup/fsremote/fsremote.go
+index a83e465..a888033 100644
+--- a/lib/backup/fsremote/fsremote.go
++++ b/lib/backup/fsremote/fsremote.go
+@@ -75,6 +75,10 @@ func (fs *FS) ListParts() ([]common.Part, error) {
+ 
+ // DeletePart deletes the given part p from fs.
+ func (fs *FS) DeletePart(p common.Part) error {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("part file %s would be accessed outside backup directory %s", p.Path, fs.Dir)
++	}
++
+ 	path := fs.path(p)
+ 	if err := os.Remove(path); err != nil {
+ 		return fmt.Errorf("cannot remove %q: %w", path, err)
+@@ -91,6 +95,10 @@ func (fs *FS) RemoveEmptyDirs() error {
+ //
+ // srcFS must have *FS type.
+ func (fs *FS) CopyPart(srcFS common.OriginFS, p common.Part) error {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("part file %s would be written outside backup directory %s", p.Path, fs.Dir)
++	}
++
+ 	src, ok := srcFS.(*FS)
+ 	if !ok {
+ 		return fmt.Errorf("cannot perform server-side copying from %s to %s: both of them must be fsremote", srcFS, fs)
+@@ -159,6 +167,10 @@ func (fs *FS) DownloadPart(p common.Part, w io.Writer) error {
+ 
+ // UploadPart uploads p from r to fs.
+ func (fs *FS) UploadPart(p common.Part, r io.Reader) error {
++	if !p.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("part file %s would be written outside backup directory %s", p.Path, fs.Dir)
++	}
++
+ 	path := fs.path(p)
+ 	if err := fs.mkdirAll(path); err != nil {
+ 		return err
+@@ -201,6 +213,11 @@ func (fs *FS) path(p common.Part) string {
+ //
+ // The function does nothing if the filePath doesn't exist.
+ func (fs *FS) DeleteFile(filePath string) error {
++	part := common.Part{Path: filePath}
++	if !part.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("file %s would be accessed outside backup directory %s", filePath, fs.Dir)
++	}
++
+ 	path := filepath.Join(fs.Dir, filePath)
+ 	err := os.Remove(path)
+ 	if err != nil && !os.IsNotExist(err) {
+@@ -213,6 +230,11 @@ func (fs *FS) DeleteFile(filePath string) error {
+ //
+ // The file is overwritten if it exists.
+ func (fs *FS) CreateFile(filePath string, data []byte) error {
++	part := common.Part{Path: filePath}
++	if !part.IsLocalPathInsideDir(fs.Dir) {
++		return fmt.Errorf("file %s would be written outside backup directory %s", filePath, fs.Dir)
++	}
++
+ 	path := filepath.Join(fs.Dir, filePath)
+ 	if err := fs.mkdirAll(path); err != nil {
+ 		return err

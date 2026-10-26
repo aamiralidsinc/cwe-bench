@@ -1,0 +1,244 @@
+diff -ruN pristine/content/file/containment.go app/content/file/containment.go
+--- a/content/file/containment.go	1970-01-01 00:00:00.000000000 +0000
++++ b/content/file/containment.go	2026-10-26 05:12:47.548837527 +0000
+@@ -0,0 +1,156 @@
++/*
++Copyright The ORAS Authors.
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package file
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// maxSymlinkDepth bounds the number of symbolic links followed while
++// resolving a single path, mirroring the usual kernel limit.
++const maxSymlinkDepth = 255
++
++// pathComponents splits an absolute or relative slash-separated path into its
++// non-empty components. It deliberately does not clean the path: "." and ".."
++// are kept in order so they can be applied while walking the real filesystem.
++func pathComponents(path string) []string {
++	parts := strings.Split(filepath.ToSlash(path), "/")
++	comps := make([]string, 0, len(parts))
++	for _, p := range parts {
++		if p != "" {
++			comps = append(comps, p)
++		}
++	}
++	return comps
++}
++
++// joinRaw joins a directory and a (possibly unclean) relative name without
++// cleaning the result. Cleaning here would cancel a ".." against a preceding
++// symbolic link name on paper only, which is exactly the mismatch between the
++// path that gets validated and the path the kernel resolves.
++func joinRaw(dir, name string) string {
++	if name == "" {
++		return dir
++	}
++	if strings.HasSuffix(dir, string(filepath.Separator)) {
++		return dir + name
++	}
++	return dir + string(filepath.Separator) + name
++}
++
++// resolvePathLinks returns the path that the kernel would resolve for path,
++// following every symbolic link component. Components that do not exist are
++// appended literally: a write that needs them fails with a "not exist" error
++// anyway, and they cannot redirect the resolution elsewhere. The result is
++// absolute.
++func resolvePathLinks(path string) (string, error) {
++	// NB: filepath.Abs (and filepath.Join) call Clean, and cleaning would
++	// cancel a ".." against a preceding symbolic link name on paper only.
++	// Prefix the working directory by hand so the components reach the walk
++	// in their original order.
++	if !filepath.IsAbs(path) {
++		wd, err := os.Getwd()
++		if err != nil {
++			return "", err
++		}
++		path = joinRaw(wd, path)
++	}
++	pending := pathComponents(path)
++	resolved := string(filepath.Separator)
++	followed := 0
++	for len(pending) > 0 {
++		comp := pending[0]
++		pending = pending[1:]
++		switch comp {
++		case ".", "":
++			continue
++		case "..":
++			resolved = filepath.Dir(resolved)
++			continue
++		}
++
++		next := filepath.Join(resolved, comp)
++		info, err := os.Lstat(next)
++		if err != nil {
++			if os.IsNotExist(err) {
++				// Nothing exists from here on. Resolve the remainder
++				// lexically; any operation through it fails with a
++				// "not exist" error before touching anything.
++				rest := make([]string, 0, len(pending)+1)
++				rest = append(rest, comp)
++				rest = append(rest, pending...)
++				return filepath.Join(resolved, filepath.Join(rest...)), nil
++			}
++			return "", err
++		}
++		if info.Mode()&os.ModeSymlink == 0 {
++			resolved = next
++			continue
++		}
++
++		followed++
++		if followed > maxSymlinkDepth {
++			return "", fmt.Errorf("too many levels of symbolic links resolving %q", path)
++		}
++		target, err := os.Readlink(next)
++		if err != nil {
++			return "", err
++		}
++		if filepath.IsAbs(target) {
++			resolved = string(filepath.Separator)
++		}
++		// A relative link target is relative to the directory holding the
++		// link, which is still `resolved`; prepend it to the pending work.
++		pending = append(pathComponents(target), pending...)
++	}
++	return resolved, nil
++}
++
++// checkContained reports whether target resolves to a location inside base
++// once every symbolic link along the way has been followed. On an escape it
++// returns ErrPathTraversalDisallowed.
++func checkContained(base, target string) error {
++	realBase, err := resolvePathLinks(base)
++	if err != nil {
++		return err
++	}
++	realTarget, err := resolvePathLinks(target)
++	if err != nil {
++		return err
++	}
++	rel, err := filepath.Rel(realBase, realTarget)
++	if err != nil {
++		return ErrPathTraversalDisallowed
++	}
++	rel = filepath.ToSlash(rel)
++	if rel == ".." || strings.HasPrefix(rel, "../") {
++		return ErrPathTraversalDisallowed
++	}
++	return nil
++}
++
++// linkTargetLocation returns the path a symbolic link placed at linkPath with
++// the given archive linkname points to, relative names being anchored at the
++// link's own directory, without cleaning the result.
++func linkTargetLocation(linkPath, linkname string) string {
++	if filepath.IsAbs(linkname) {
++		return linkname
++	}
++	return joinRaw(filepath.Dir(linkPath), linkname)
++}
+diff -ruN pristine/content/file/file.go app/content/file/file.go
+--- a/content/file/file.go	2026-10-26 02:22:14.000000000 +0000
++++ b/content/file/file.go	2026-10-26 05:11:42.456896139 +0000
+@@ -625,6 +625,13 @@
+ 		if strings.HasPrefix(rel, "../") || rel == ".." {
+ 			return "", ErrPathTraversalDisallowed
+ 		}
++		// The comparison above is lexical. A component of the target that is
++		// itself a symbolic link passes it, yet the file creation that follows
++		// resolves the link and lands outside workingDir. Verify the target
++		// again after resolving links the way the kernel will.
++		if err := checkContained(base, target); err != nil {
++			return "", err
++		}
+ 	}
+ 	if s.DisableOverwrite {
+ 		if _, err := os.Stat(path); err == nil {
+diff -ruN pristine/content/file/utils.go app/content/file/utils.go
+--- a/content/file/utils.go	2026-10-26 02:22:14.000000000 +0000
++++ b/content/file/utils.go	2026-10-26 05:11:39.136899128 +0000
+@@ -175,6 +175,15 @@
+ 		}
+ 		filePath := filepath.Join(dirPath, filePathRel)
+ 
++		// The name checks above are lexical and only look at the directories
++		// between the base and the member, so a chain of links extracted by
++		// earlier entries can make the kernel resolve a different path than
++		// the one that was validated. Resolve the member path as the kernel
++		// would before touching the filesystem.
++		if err := checkContained(dirPath, filePath); err != nil {
++			return err
++		}
++
+ 		// Create content
+ 		switch header.Typeflag {
+ 		case tar.TypeReg:
+@@ -185,9 +194,8 @@
+ 			// NOTE: ORAS does not generate hard links when creating tarballs.
+ 			// If a hard link is found in the tarball, it will be extracted.
+ 			// If the target link already exists, os.Link will throw an error.
+-			// This is a known limitation and will not be addressed.
+ 			var target string
+-			if target, err = ensureLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
++			if target, err = hardLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
+ 				err = os.Link(target, filePath)
+ 			}
+ 		case tar.TypeSymlink:
+@@ -196,6 +204,12 @@
+ 			if err != nil {
+ 				return err
+ 			}
++			// A link whose own resolution leaves the extraction root would
++			// expose a path outside the store to later members (or to the
++			// caller), even though no bytes are written yet.
++			if err := checkContained(dirPath, linkTargetLocation(filePath, header.Linkname)); err != nil {
++				return err
++			}
+ 			if err = os.Symlink(target, filePath); err != nil {
+ 				if !errors.Is(err, fs.ErrExist) {
+ 					return err
+@@ -274,6 +288,23 @@
+ 	return target, nil
+ }
+ 
++// hardLinkPath validates a hard-link member's target and returns the path that
++// os.Link should receive. A relative linkname is anchored at the link's own
++// directory, not at the process working directory, so the file that is linked
++// is the one the containment checks inspected.
++func hardLinkPath(baseAbs, baseRel, link, target string) (string, error) {
++	path := linkTargetLocation(link, target)
++	// Reuse the member-name checks for the lexical and per-directory part.
++	if _, err := resolveRelToBase(baseAbs, baseRel, path); err != nil {
++		return "", err
++	}
++	// Then verify where the kernel would actually take that path.
++	if err := checkContained(baseAbs, path); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
+ // writeFile writes content to the file specified by the `path` parameter.
+ func writeFile(path string, r io.Reader, perm os.FileMode, buf []byte) (err error) {
+ 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)

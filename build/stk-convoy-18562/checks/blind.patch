@@ -1,0 +1,154 @@
+diff -ruN a/api/handlers/subscription.go b/api/handlers/subscription.go
+--- a/api/handlers/subscription.go	2026-10-26 02:34:34.000000000 +0000
++++ b/api/handlers/subscription.go	2026-10-26 05:12:28.644854551 +0000
+@@ -170,6 +170,22 @@
+ 	_ = render.Render(w, r, util.NewServerResponse("Subscription fetched successfully", resp, http.StatusOK))
+ }
+ 
++// sourceBelongsToProject reports whether sourceID resolves inside projectID. An empty id
++// means "no source" and is accepted. An unknown or foreign id is refused as a client error,
++// so a source owned by another project is treated exactly like one that does not exist.
++func (h *Handler) sourceBelongsToProject(w http.ResponseWriter, r *http.Request, projectID, sourceID string) bool {
++	if util.IsStringEmpty(sourceID) {
++		return true
++	}
++
++	if _, err := sources.New(h.A.Logger, h.A.DB).FindSourceByID(r.Context(), projectID, sourceID); err != nil {
++		_ = render.Render(w, r, util.NewErrorResponse("source does not belong to project", http.StatusBadRequest))
++		return false
++	}
++
++	return true
++}
++
+ // CreateSubscription
+ //
+ //	@Summary		Create a subscription
+@@ -204,6 +220,10 @@
+ 		return
+ 	}
+ 
++	if !h.sourceBelongsToProject(w, r, project.UID, sub.SourceID) {
++		return
++	}
++
+ 	authUser := middleware.GetAuthUserFromContext(r.Context())
+ 
+ 	if h.IsReqWithPortalLinkToken(authUser) {
+@@ -344,6 +364,10 @@
+ 		return
+ 	}
+ 
++	if !h.sourceBelongsToProject(w, r, project.UID, update.SourceID) {
++		return
++	}
++
+ 	authUser := middleware.GetAuthUserFromContext(r.Context())
+ 
+ 	if h.IsReqWithPortalLinkToken(authUser) {
+diff -ruN a/internal/sources/impl.go b/internal/sources/impl.go
+--- a/internal/sources/impl.go	2026-10-26 02:34:34.000000000 +0000
++++ b/internal/sources/impl.go	2026-10-26 05:12:14.564867229 +0000
+@@ -432,9 +432,12 @@
+ 	return nil
+ }
+ 
+-// FindSourceByID retrieves a source by its ID
++// FindSourceByID retrieves a source by its ID, scoped to the owning project
+ func (s *Service) FindSourceByID(ctx context.Context, projectID, id string) (*datastore.Source, error) {
+-	row, err := s.repo.FetchSourceByID(ctx, common.StringToPgText(id))
++	row, err := s.repo.FetchSourceByID(ctx, repo.FetchSourceByIDParams{
++		ID:        common.StringToPgText(id),
++		ProjectID: common.StringToPgText(projectID),
++	})
+ 	if err != nil {
+ 		if errors.Is(err, pgx.ErrNoRows) {
+ 			return nil, datastore.ErrSourceNotFound
+diff -ruN a/internal/sources/queries.sql b/internal/sources/queries.sql
+--- a/internal/sources/queries.sql	2026-10-26 02:34:34.000000000 +0000
++++ b/internal/sources/queries.sql	2026-10-26 05:12:00.752879666 +0000
+@@ -105,7 +105,7 @@
+     body_function = @body_function,
+     header_function = @header_function,
+     updated_at = NOW()
+-WHERE id = @id AND deleted_at IS NULL;
++WHERE id = @id AND project_id = @project_id AND deleted_at IS NULL;
+ 
+ -- ============================================================================
+ -- FETCH Operations
+@@ -142,7 +142,7 @@
+     s.updated_at
+ FROM convoy.sources AS s
+ LEFT JOIN convoy.source_verifiers sv ON s.source_verifier_id = sv.id
+-WHERE s.id = @id AND s.deleted_at IS NULL;
++WHERE s.id = @id AND s.project_id = @project_id AND s.deleted_at IS NULL;
+ 
+ -- name: FetchSourceByName :one
+ SELECT
+diff -ruN a/internal/sources/repo/querier.go b/internal/sources/repo/querier.go
+--- a/internal/sources/repo/querier.go	2026-10-26 02:34:34.000000000 +0000
++++ b/internal/sources/repo/querier.go	2026-10-26 05:12:16.772865240 +0000
+@@ -31,7 +31,7 @@
+ 	// ============================================================================
+ 	// FETCH Operations
+ 	// ============================================================================
+-	FetchSourceByID(ctx context.Context, id pgtype.Text) (FetchSourceByIDRow, error)
++	FetchSourceByID(ctx context.Context, arg FetchSourceByIDParams) (FetchSourceByIDRow, error)
+ 	FetchSourceByMaskID(ctx context.Context, maskID pgtype.Text) (FetchSourceByMaskIDRow, error)
+ 	FetchSourceByName(ctx context.Context, arg FetchSourceByNameParams) (FetchSourceByNameRow, error)
+ 	// ============================================================================
+diff -ruN a/internal/sources/repo/queries.sql.go b/internal/sources/repo/queries.sql.go
+--- a/internal/sources/repo/queries.sql.go	2026-10-26 02:34:34.000000000 +0000
++++ b/internal/sources/repo/queries.sql.go	2026-10-26 05:12:11.568869928 +0000
+@@ -379,9 +379,14 @@
+     s.updated_at
+ FROM convoy.sources AS s
+ LEFT JOIN convoy.source_verifiers sv ON s.source_verifier_id = sv.id
+-WHERE s.id = $1 AND s.deleted_at IS NULL
++WHERE s.id = $1 AND s.project_id = $2 AND s.deleted_at IS NULL
+ `
+ 
++type FetchSourceByIDParams struct {
++	ID        pgtype.Text
++	ProjectID pgtype.Text
++}
++
+ type FetchSourceByIDRow struct {
+ 	ID                        string
+ 	Name                      string
+@@ -415,8 +420,8 @@
+ // ============================================================================
+ // FETCH Operations
+ // ============================================================================
+-func (q *Queries) FetchSourceByID(ctx context.Context, id pgtype.Text) (FetchSourceByIDRow, error) {
+-	row := q.db.QueryRow(ctx, fetchSourceByID, id)
++func (q *Queries) FetchSourceByID(ctx context.Context, arg FetchSourceByIDParams) (FetchSourceByIDRow, error) {
++	row := q.db.QueryRow(ctx, fetchSourceByID, arg.ID, arg.ProjectID)
+ 	var i FetchSourceByIDRow
+ 	err := row.Scan(
+ 		&i.ID,
+@@ -874,7 +879,7 @@
+     body_function = $13,
+     header_function = $14,
+     updated_at = NOW()
+-WHERE id = $15 AND deleted_at IS NULL
++WHERE id = $15 AND project_id = $7 AND deleted_at IS NULL
+ `
+ 
+ type UpdateSourceParams struct {
+diff -ruN a/internal/subscriptions/helpers.go b/internal/subscriptions/helpers.go
+--- a/internal/subscriptions/helpers.go	2026-10-26 02:34:34.000000000 +0000
++++ b/internal/subscriptions/helpers.go	2026-10-26 05:12:43.032841593 +0000
+@@ -647,5 +647,12 @@
+ 		sourceVerifierHmacSecret, sourceVerifierHmacEncoding,
+ 	)
+ 
++	// Source metadata only belongs on the response when the source is owned by the same
++	// project as the subscription. Rows stored against a foreign source (written before the
++	// write path enforced ownership) must never render that source or its verifier.
++	if subscription.Source != nil && subscription.Source.ProjectID != subscription.ProjectID {
++		subscription.Source = nil
++	}
++
+ 	return subscription, nil
+ }

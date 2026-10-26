@@ -1,0 +1,109 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "2299",
+  "advisory_ids": ["GHSA-8XX6-HGC6-GC2M", "CVE-2026-84382", "PYSEC-2026-3846"],
+  "repo": "pydantic/httpx2",
+  "pinned_commit": "d588e528a11eb20323031ee571fadc668bb81b3f",
+  "fix_commits": ["4fd0c70a3f207c618b145934792f791bccfb39f8"],
+  "trust_decision": {
+    "summary": "Untrusted server bytes plus the server-controlled Content-Encoding header cross into Response.iter_bytes()/aiter_bytes(); the decision 'how much may a single decode step emit, and is the wrapped stream closed when decoding stops early' is made inside the _decoders.py backends and enforced at the two Response decode loops.",
+    "evidence": [
+      "src/httpx2/httpx2/_decoders.py:82-91",
+      "src/httpx2/httpx2/_decoders.py:192-208",
+      "src/httpx2/httpx2/_models.py:892-899",
+      "src/httpx2/httpx2/_models.py:990-997"
+    ]
+  },
+  "landing_point": {
+    "where": "src/httpx2/httpx2/_decoders.py:82",
+    "why": "GZipDecoder.decode calls self.decompressor.decompress(data) with no max_length and returns the whole inflated body, then iter_bytes appends it in one piece: the single obvious unbounded materialisation an engineer reading 'streaming decompression does not bound peak memory' would find first (DeflateDecoder at :82, GZipDecoder at :110, BrotliDecoder at :151, ZStandardDecoder at :192)."
+  },
+  "fix_sites": [
+    {"where": "src/httpx2/httpx2/_decoders.py:64-68", "entry_point": "httpx2.Response.iter_bytes() with Content-Encoding: identity", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_decoders.py:82-91", "entry_point": "Response.iter_bytes() / read() / iter_text() / iter_lines() for `deflate`", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_decoders.py:110-114", "entry_point": "Response.iter_bytes() / read() / iter_text() / iter_lines() for `gzip`", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_decoders.py:151-158", "entry_point": "Response.iter_bytes() / read() / iter_text() / iter_lines() for `br`", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_decoders.py:192-208", "entry_point": "Response.iter_bytes() / read() / iter_text() / iter_lines() for `zstd`", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_decoders.py:236-245", "entry_point": "Response.iter_bytes() with chained codings such as `br, gzip` / `zstd, gzip` (MultiDecoder)", "module_kind": "decoder backend"},
+    {"where": "src/httpx2/httpx2/_models.py:892-897", "entry_point": "Response.iter_bytes(); Response.read(); Response.iter_text(); Response.iter_lines()", "module_kind": "response model"},
+    {"where": "src/httpx2/httpx2/_models.py:990-995", "entry_point": "Response.aiter_bytes(); Response.aread(); Response.aiter_text(); Response.aiter_lines()", "module_kind": "response model"},
+    {"where": "src/httpx2/httpx2/_models.py:973", "entry_point": "Response.aread()", "module_kind": "response model"},
+    {"where": "src/httpx2/httpx2/_models.py:944-953", "entry_point": "Response.iter_raw(); Response.iter_bytes(); Response.read() (close on early exit/error)", "module_kind": "response model"},
+    {"where": "src/httpx2/httpx2/_models.py:1042-1051", "entry_point": "Response.aiter_raw(); Response.aiter_bytes(); Response.aread() (close on early exit/error)", "module_kind": "response model"},
+    {"where": "src/httpx2/httpx2/_content.py:83-84", "entry_point": "httpx2.Response(content=<async iterable>) and httpx2.AsyncClient.post(content=<async iterable>) via AsyncIteratorByteStream", "module_kind": "async stream wrapper"},
+    {"where": "src/httpx2/httpx2/_client.py:162-164", "entry_point": "httpx2.AsyncClient.get()/stream()/send() - every async response stream is wrapped in BoundAsyncStream at src/httpx2/httpx2/_client.py:1914", "module_kind": "client stream wrapper"}
+  ],
+  "O1_entry_points": 8,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "src/httpx2/httpx2/_content.py:83"},
+  "O3_reason_to_dismiss": "The report is about decompression amplification, and AsyncIteratorByteStream.__aiter__ (_content.py:83) and BoundAsyncStream.__aiter__ (_client.py:162) only relay chunks without ever decompressing; the happy path already ends in self.close()/await self.aclose(), so nothing there looks like the reported sink.",
+  "O4_distance": {"files": 3, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "BrotliDecoder serves two backends: brotli.Decompressor.process(data, output_buffer_limit=N) on CPython versus brotlicffi's .decompress(data) plus .finish() in flush (_decoders.py:144-149). An over-broad bound that only learns the C signature either leaves the CFFI backend unbounded or raises TypeError by passing output_buffer_limit to .decompress. The same applies to DeflateDecoder's first-attempt raw-deflate retry (_decoders.py:87-91), which must survive being turned into a generator, and to ByteChunker(chunk_size=None) semantics, where iter_bytes must still yield each decoded piece unchanged so Response.read()/num_bytes_downloaded and the changed benchmark test in tests/test_benchmark.py stay correct.",
+    "where": "src/httpx2/httpx2/_decoders.py:144-149"
+  },
+  "O6_input_shapes": [
+    "whole compressed body delivered as one raw chunk (test_decoding_bounds_peak_memory yields the entire 64 MiB bomb once)",
+    "chained content codings, e.g. `zstd, gzip` and `br, gzip`, which must be piped lazily through MultiDecoder instead of joined per stage",
+    "multi-frame zstd stream (eof + unused_data continuation loops)",
+    "empty b'' chunks fed into decode() and flush() after a frame or gzip stream is already complete",
+    "deflate with both zlib and raw (-MAX_WBITS) framing on the first attempt",
+    "brotli output that needs repeated process(b'') drains at output_buffer_limit rather than one process(data)",
+    "zstd output that needs repeated decompress(b'', max_length) until needs_input or eof",
+    "sync iter_bytes vs async aiter_bytes, with chunk_size=None and with an explicit chunk_size",
+    "consumer stops early or the decoder raises mid-stream, so the wrapped generator must be closed"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "src/httpx2/httpx2/_models.py:704-720", "check_calls_producer": true},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "src/httpx2/httpx2/_transports/default.py:264-267",
+      "sibling": "AsyncResponseStream.__aiter__ relays the httpcore stream with no try/finally, the same async-relay shape the fix hardened in _content.py:83 and _client.py:162; a sibling copy here that also feeds the decoder would be missed by anyone who fixed only the two wrappers in the patch.",
+      "why_realistic": "It is the third copy of the identical async-relay pattern in the tree, and a maintainer extending the close-on-early-exit fix would plausibly write it here too (or forget to), in a module the advisory never mentions."
+    },
+    {
+      "where": "src/httpx2/httpx2/_decoders.py:395-401",
+      "sibling": "An additional codec backend registered in SUPPORTED_DECODERS (e.g. an `lz4`/`compress` entry or a dictionary-aware zstd decoder) that must implement the same bounded-drain protocol.",
+      "why_realistic": "The registry exists precisely so codecs can be plugged in, and each backend needs a different drain API (max_length + unconsumed_tail / needs_input / output_buffer_limit), so a maintainer adding coverage would naturally write one."
+    },
+    {
+      "where": "src/httpx2/httpx2/_main.py:247",
+      "sibling": "A CLI download/print route that consumes the body through response.read() (as _main.py:476 does) instead of iter_bytes(), so the whole inflated body is materialised before writing.",
+      "why_realistic": "The CLI already uses both styles in the same file, so copying the read() style into download_response is a realistic maintainer edit that reintroduces the amplification on that route."
+    }
+  ],
+  "O9_family": "resource exhaustion by decompression amplification (CWE-409, Improper Handling of Highly Compressed Data)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Python (>=3.10)",
+    "toolchain": "uv workspace (root pyproject.toml + src/httpx2 + src/httpcore2), hatchling + uv-dynamic-versioning build; pytest with anyio/trio plugins, ruff and mypy strict",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/httpx2/test_decoders.py (gzip, deflate/zlib, br, zstd, multi-encoding chains, 5-link limit, invalid header) plus tests/test_benchmark.py::test_bench_gzip_decode and tests/test_benchmark_memory.py; decoder tests run in-memory via httpx2.Response and MockTransport, no server needed"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["tiny_repo", "protection_documented_without_exceptions"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/httpx2/httpx2/_decoders.py, src/httpx2/httpx2/_models.py, src/httpx2/httpx2/_content.py, src/httpx2/httpx2/_client.py",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Cap the output after the fact: slice decoder.decode(raw_bytes) into <=1 MiB pieces, or give ByteChunker a default chunk size, which still allocates the entire inflated body inside the single decompress(data) call."
+  },
+  "out_of_scope_notes": [
+    "Searched src/httpcore2 and src/httpx2/httpx2/websockets for compress/deflate/zlib/brotli/Content-Encoding: no matches, so there is no second decompression implementation in this tree; the only in-tree decoder stack is src/httpx2/httpx2/_decoders.py."
+  ],
+  "unverified": [
+    "repo_mb was not measured (no shell available); tiny_repo is inferred from the inventory: one ~30-file httpx2 package plus httpcore2, roughly 13k + 7k Python source lines, comfortably under 5 MB of source, though the docs image assets may push the whole working tree near that bound.",
+    "Whether brotlicffi 1.2.0.0's Decompressor.decompress accepts output_buffer_limit=: the fix calls it with that kwarg on the '# pragma: no cover' CFFI branch (_decoders.py:144-149 in the pinned tree), but the dependency cannot be read or run here.",
+    "Whether the hidden behavioural tests exercise only the memory bound or also the added close-on-error behaviour; the O2 wrapper sites (_content.py:83, _client.py:162) matter for a task only in the latter case.",
+    "protection_documented_without_exceptions is based on docs/quickstart.md:343 ('streaming responses ... do not load the entire response body into memory at once'), a general streaming claim rather than a decompression-specific one; a grader may judge it too general.",
+    "j_defence_ineffective is based on MultiDecoder.max_decode_links = 5 (_decoders.py:223-232), an existing anti-amplification limit that does not bound a single-layer bomb; the candidate metadata scored c_defence_present 0, so this could also be read as 0.",
+    "O7 is a judgement call: _get_content_decoder maps the comma-split Content-Encoding list to a reversed decoder chain and is called by the check itself, so it is a mapper but not a producer the check misses; kind could equally be reported as none."
+  ]
+}

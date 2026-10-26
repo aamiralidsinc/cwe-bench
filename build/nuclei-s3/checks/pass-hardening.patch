@@ -1,0 +1,678 @@
+diff -ruN -x .git inj/pkg/fuzz/execute.go variants/pass-hardening/pkg/fuzz/execute.go
+--- inj/pkg/fuzz/execute.go	2026-10-25 22:56:32.985314480 +0000
++++ variants/pass-hardening/pkg/fuzz/execute.go	2026-10-25 23:14:46.152322964 +0000
+@@ -153,9 +153,14 @@
+ 		for _, component := range finalComponentList {
+ 			// get vars from variables while replacing interactsh urls
+ 			evaluatedValues, interactURLs := rule.options.Variables.EvaluateWithInteractsh(baseValues, rule.options.Interactsh)
+-			input.Values = generators.MergeMaps(evaluatedValues, baseValues, rule.options.Options.Vars.AsMap(), rule.options.Constants)
+-			// evaluate all vars with interactsh
+-			input.Values, interactURLs = rule.evaluateVarsWithInteractsh(input.Values, interactURLs)
++			optionVars := rule.options.Options.Vars.AsMap()
++			input.Values = generators.MergeMaps(evaluatedValues, baseValues, optionVars, rule.options.Constants)
++			// Only values produced from template text are evaluated again.
++			renderKeys := templateValueKeys(
++				[]map[string]interface{}{evaluatedValues},
++				[]map[string]interface{}{baseValues, optionVars, rule.options.Constants},
++			)
++			input.Values, interactURLs = rule.evaluateVarsWithInteractsh(input.Values, interactURLs, renderKeys)
+ 			input.InteractURLs = interactURLs
+ 			err := rule.executeRuleValues(input, component)
+ 			if err != nil {
+@@ -174,9 +179,14 @@
+ 			}
+ 			// get vars from variables while replacing interactsh urls
+ 			evaluatedValues, interactURLs := rule.options.Variables.EvaluateWithInteractsh(generators.MergeMaps(values, baseValues), rule.options.Interactsh)
+-			input.Values = generators.MergeMaps(values, evaluatedValues, baseValues, rule.options.Options.Vars.AsMap(), rule.options.Constants)
+-			// evaluate all vars with interactsh
+-			input.Values, interactURLs = rule.evaluateVarsWithInteractsh(input.Values, interactURLs)
++			optionVars := rule.options.Options.Vars.AsMap()
++			input.Values = generators.MergeMaps(values, evaluatedValues, baseValues, optionVars, rule.options.Constants)
++			// Only values produced from template text are evaluated again.
++			renderKeys := templateValueKeys(
++				[]map[string]interface{}{values, evaluatedValues},
++				[]map[string]interface{}{baseValues, optionVars, rule.options.Constants},
++			)
++			input.Values, interactURLs = rule.evaluateVarsWithInteractsh(input.Values, interactURLs, renderKeys)
+ 			input.InteractURLs = interactURLs
+ 
+ 			if err := rule.executeRuleValues(input, component); err != nil {
+@@ -218,8 +228,29 @@
+ 	return eval, nil
+ }
+ 
++// templateValueKeys returns the keys whose values were produced from template
++// text. A data layer with the same key overrides the template layer, and such
++// values are never rendered again.
++func templateValueKeys(templateLayers, dataLayers []map[string]interface{}) map[string]struct{} {
++	keys := make(map[string]struct{})
++	for _, layer := range templateLayers {
++		for key := range layer {
++			keys[key] = struct{}{}
++		}
++	}
++	for _, layer := range dataLayers {
++		for key := range layer {
++			delete(keys, key)
++		}
++	}
++	if len(keys) == 0 {
++		return nil
++	}
++	return keys
++}
++
+ // evaluateVarsWithInteractsh evaluates the variables with Interactsh URLs and updates them accordingly.
+-func (rule *Rule) evaluateVarsWithInteractsh(data map[string]interface{}, interactshUrls []string) (map[string]interface{}, []string) {
++func (rule *Rule) evaluateVarsWithInteractsh(data map[string]interface{}, interactshUrls []string, renderKeys map[string]struct{}) (map[string]interface{}, []string) {
+ 	// Check if Interactsh options are configured
+ 	if rule.options.Interactsh != nil {
+ 		data = maps.Clone(data)
+@@ -231,6 +262,9 @@
+ 		interactshUrls = mapsutil.GetKeys(interactshUrlsMap)
+ 		// Iterate through the data to replace and evaluate variables with Interactsh URLs
+ 		for k, v := range data {
++			if _, ok := renderKeys[k]; !ok {
++				continue
++			}
+ 			value := fmt.Sprint(v)
+ 			// Replace variables with Interactsh URLs and collect new URLs
+ 			got, oastUrls := rule.options.Interactsh.Replace(value, interactshUrls)
+diff -ruN -x .git inj/pkg/fuzz/parts.go variants/pass-hardening/pkg/fuzz/parts.go
+--- inj/pkg/fuzz/parts.go	2026-10-25 22:56:32.985314480 +0000
++++ variants/pass-hardening/pkg/fuzz/parts.go	2026-10-25 23:13:50.060373788 +0000
+@@ -196,9 +196,13 @@
+ 	values := generators.MergeMaps(rule.options.Variables.GetAll(), map[string]interface{}{
+ 		"value": value,
+ 	}, rule.options.Options.Vars.AsMap(), input.Values)
+-	firstpass, _ := expressions.Evaluate(payload, values)
+-	interactData, interactshURLs := rule.options.Interactsh.Replace(firstpass, interactshURLs)
+-	evaluated, _ := expressions.Evaluate(interactData, values)
++	// Allocate markers present in the authored payload before evaluation, then
++	// render the payload exactly once. Values are data and are not rescanned.
++	prepared := payload
++	if rule.options.Interactsh != nil {
++		prepared, interactshURLs = rule.options.Interactsh.Replace(payload, interactshURLs)
++	}
++	evaluated, _ := expressions.Evaluate(prepared, values)
+ 	replaced := rule.executeRuleTypes(input, value, evaluated)
+ 	return replaced, interactshURLs
+ }
+diff -ruN -x .git inj/pkg/operators/extractors/extract.go variants/pass-hardening/pkg/operators/extractors/extract.go
+--- inj/pkg/operators/extractors/extract.go	2026-10-25 23:10:27.188557664 +0000
++++ variants/pass-hardening/pkg/operators/extractors/extract.go	2026-10-25 23:13:44.836378521 +0000
+@@ -182,10 +182,11 @@
+ 
+ 	for _, compiledExpression := range e.dslCompiled {
+ 		expression := compiledExpression
+-		// Expressions can reference variables from earlier responses, so resolve
+-		// any pending references and evaluate the completed expression.
++		// Expressions can reference variables from earlier responses. Resolve
++		// placeholders that already appear inside string literals without
++		// letting a resolved value change the expression itself.
+ 		if source := expression.String(); expressions.ContainsUnresolvedVariables(source) != nil {
+-			if resolved, err := expressions.Evaluate(source, data); err == nil {
++			if resolved, err := expressions.ResolveStringMarkers(source, data); err == nil {
+ 				if completed, cerr := govaluate.NewEvaluableExpressionWithFunctions(resolved, dsl.HelperFunctions); cerr == nil {
+ 					expression = completed
+ 				}
+diff -ruN -x .git inj/pkg/operators/matchers/match.go variants/pass-hardening/pkg/operators/matchers/match.go
+--- inj/pkg/operators/matchers/match.go	2026-10-25 22:56:33.005314461 +0000
++++ variants/pass-hardening/pkg/operators/matchers/match.go	2026-10-25 23:13:44.832378524 +0000
+@@ -195,7 +195,7 @@
+ 	// Iterate over all the expressions accepted as valid
+ 	for i, expression := range matcher.dslCompiled {
+ 		if varErr := expressions.ContainsUnresolvedVariables(expression.String()); varErr != nil {
+-			resolvedExpression, err := expressions.Evaluate(expression.String(), data)
++			resolvedExpression, err := expressions.ResolveStringMarkers(expression.String(), data)
+ 			if err != nil {
+ 				logExpressionEvaluationFailure(matcher.Name, err)
+ 				return false
+diff -ruN -x .git inj/pkg/protocols/common/expressions/expressions.go variants/pass-hardening/pkg/protocols/common/expressions/expressions.go
+--- inj/pkg/protocols/common/expressions/expressions.go	2026-10-25 22:56:33.009314458 +0000
++++ variants/pass-hardening/pkg/protocols/common/expressions/expressions.go	2026-10-25 23:13:31.972390178 +0000
+@@ -9,6 +9,7 @@
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/operators/common/dsl"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/marker"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/replacer"
++	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+ 	stringsutil "github.com/projectdiscovery/utils/strings"
+ )
+ 
+@@ -54,8 +55,10 @@
+ 	// literals like {{2+2}} are not considered expressions
+ 	for _, expression := range expressions {
+ 		originalExpression := expression
+-		// replace variable placeholders with base values
+-		expression = replacer.Replace(expression, base)
++		// data has already had simple placeholders replaced; keep the same
++		// marker shape for output replacement, but never compile this string.
++		replacedExpression := replacer.Replace(expression, base)
++		expression = replaceStringPlaceholders(expression, base)
+ 
+ 		// turns expressions (either helper functions+base values or base values)
+ 		compiled, err := govaluate.NewEvaluableExpressionWithFunctions(expression, dsl.HelperFunctions)
+@@ -86,11 +89,115 @@
+ 		}
+ 
+ 		// replace incrementally
+-		data = replacer.ReplaceOne(data, expression, replacement)
++		data = replacer.ReplaceOne(data, replacedExpression, replacement)
+ 	}
+ 	return data, nil
+ }
+ 
++func replaceStringPlaceholders(expression string, base map[string]interface{}) string {
++	if len(base) == 0 || (!strings.Contains(expression, marker.ParenthesisOpen) && !strings.Contains(expression, marker.General)) {
++		return expression
++	}
++
++	var builder strings.Builder
++	builder.Grow(len(expression))
++
++	var quote byte
++	escaped := false
++	for i := 0; i < len(expression); {
++		char := expression[i]
++
++		if escaped {
++			builder.WriteByte(char)
++			escaped = false
++			i++
++			continue
++		}
++
++		if quote != 0 {
++			if char == '\\' {
++				builder.WriteByte(char)
++				escaped = true
++				i++
++				continue
++			}
++
++			if char == quote {
++				builder.WriteByte(char)
++				quote = 0
++				i++
++				continue
++			}
++
++			replacement, next, ok := stringPlaceholderReplacement(expression, i, quote, base, marker.ParenthesisOpen, marker.ParenthesisClose)
++			if ok {
++				builder.WriteString(replacement)
++				i = next
++				continue
++			}
++
++			replacement, next, ok = stringPlaceholderReplacement(expression, i, quote, base, marker.General, marker.General)
++			if ok {
++				builder.WriteString(replacement)
++				i = next
++				continue
++			}
++
++			builder.WriteByte(char)
++			i++
++			continue
++		}
++
++		if char == '\'' || char == '"' {
++			quote = char
++		}
++
++		builder.WriteByte(char)
++		i++
++	}
++
++	return builder.String()
++}
++
++func stringPlaceholderReplacement(expression string, index int, quote byte, base map[string]interface{}, open, close string) (string, int, bool) {
++	if !strings.HasPrefix(expression[index:], open) {
++		return "", 0, false
++	}
++
++	markerStart := index + len(open)
++	markerEnd := strings.Index(expression[markerStart:], close)
++	if markerEnd < 0 {
++		return "", 0, false
++	}
++
++	key := expression[markerStart : markerStart+markerEnd]
++	value, ok := base[key]
++	if !ok {
++		return "", 0, false
++	}
++
++	replacement := EscapeStringValue(types.ToString(value), quote)
++	next := markerStart + markerEnd + len(close)
++	return replacement, next, true
++}
++
++// EscapeStringValue escapes value for insertion into a govaluate string literal
++// that is already delimited by quote.
++func EscapeStringValue(value string, quote byte) string {
++	var builder strings.Builder
++	builder.Grow(len(value))
++
++	for i := 0; i < len(value); i++ {
++		char := value[i]
++		if char == '\\' || char == quote {
++			builder.WriteByte('\\')
++		}
++		builder.WriteByte(char)
++	}
++
++	return builder.String()
++}
++
+ // maxIterations to avoid infinite loop
+ const maxIterations = 250
+ 
+diff -ruN -x .git inj/pkg/protocols/common/expressions/string_markers.go variants/pass-hardening/pkg/protocols/common/expressions/string_markers.go
+--- inj/pkg/protocols/common/expressions/string_markers.go	1970-01-01 00:00:00.000000000 +0000
++++ variants/pass-hardening/pkg/protocols/common/expressions/string_markers.go	2026-10-25 23:25:57.311715152 +0000
+@@ -0,0 +1,187 @@
++package expressions
++
++import (
++	"fmt"
++	"regexp"
++	"sort"
++	"strings"
++
++	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/marker"
++)
++
++var dslStringMarkerRegex = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
++
++// dslStringMarker represents a span of an unresolved DSL expression within a
++// string literal.
++type dslStringMarker struct {
++	start int
++	end   int
++	expr  string
++	quote byte
++}
++
++type textSpan struct {
++	start int
++	end   int
++}
++
++type stringLiteralSpan struct {
++	start int
++	end   int
++	quote byte
++}
++
++// ResolveStringMarkers resolves placeholders that already appear inside string
++// literals of a compiled DSL expression. Resolved values are escaped for the
++// surrounding literal, so a value can never change the expression's structure.
++// Placeholders outside a string literal are rejected.
++func ResolveStringMarkers(expression string, data map[string]interface{}) (string, error) {
++	stringSpans := findStringLiteralSpans(expression)
++	markers, err := findDSLStringMarkers(expression, data, stringSpans)
++	if err != nil {
++		return "", err
++	}
++
++	if len(markers) == 0 {
++		return expression, nil
++	}
++
++	const maxResolvedMarkers = 256
++	if len(markers) > maxResolvedMarkers {
++		return "", fmt.Errorf("too many unresolved DSL placeholders: %d", len(markers))
++	}
++
++	sort.Slice(markers, func(i, j int) bool {
++		return markers[i].start > markers[j].start
++	})
++
++	resolved := expression
++	for _, item := range markers {
++		result, err := Evaluate(marker.ParenthesisOpen+item.expr+marker.ParenthesisClose, data)
++		if err != nil {
++			return "", err
++		}
++
++		if strings.ContainsRune(result, 0) {
++			return "", fmt.Errorf("resolved placeholder contains a NUL byte")
++		}
++
++		replacement := EscapeStringValue(result, item.quote)
++		resolved = resolved[:item.start] + replacement + resolved[item.end:]
++	}
++
++	return resolved, nil
++}
++
++func findDSLStringMarkers(expression string, data map[string]interface{}, stringSpans []stringLiteralSpan) ([]dslStringMarker, error) {
++	var markers []dslStringMarker
++	var occupiedSpans []textSpan
++
++	seenComplex := make(map[string]struct{})
++
++	for _, expr := range FindExpressions(expression, marker.ParenthesisOpen, marker.ParenthesisClose, data) {
++		if _, ok := seenComplex[expr]; ok {
++			continue
++		}
++		seenComplex[expr] = struct{}{}
++
++		markerText := marker.ParenthesisOpen + expr + marker.ParenthesisClose
++		for start := 0; ; {
++			index := strings.Index(expression[start:], markerText)
++			if index < 0 {
++				break
++			}
++
++			index += start
++			end := index + len(markerText)
++
++			stringSpan, ok := stringLiteralForSpan(stringSpans, index, end)
++			if !ok {
++				return nil, fmt.Errorf("unresolved DSL placeholder %q is not inside a string literal", expr)
++			}
++
++			markers = append(markers, dslStringMarker{start: index, end: end, expr: expr, quote: stringSpan.quote})
++			occupiedSpans = append(occupiedSpans, textSpan{start: index, end: end})
++			start = end
++		}
++	}
++
++	for _, match := range dslStringMarkerRegex.FindAllStringSubmatchIndex(expression, -1) {
++		if len(match) < 4 || markerWithinSpans(match[0], match[1], occupiedSpans) {
++			continue
++		}
++
++		stringSpan, ok := stringLiteralForSpan(stringSpans, match[0], match[1])
++		if !ok {
++			return nil, fmt.Errorf("unresolved DSL placeholder %q is not inside a string literal", expression[match[2]:match[3]])
++		}
++
++		markers = append(markers, dslStringMarker{
++			start: match[0],
++			end:   match[1],
++			expr:  expression[match[2]:match[3]],
++			quote: stringSpan.quote,
++		})
++	}
++
++	return markers, nil
++}
++
++func markerWithinSpans(start, end int, spans []textSpan) bool {
++	for _, span := range spans {
++		if start >= span.start && end <= span.end {
++			return true
++		}
++	}
++
++	return false
++}
++
++func findStringLiteralSpans(expression string) []stringLiteralSpan {
++	var spans []stringLiteralSpan
++	var quote byte
++	start := 0
++	escaped := false
++
++	for i := 0; i < len(expression); i++ {
++		char := expression[i]
++		if escaped {
++			escaped = false
++			continue
++		}
++
++		if char == '\\' {
++			escaped = true
++			continue
++		}
++
++		if quote != 0 {
++			if char == quote {
++				spans = append(spans, stringLiteralSpan{start: start, end: i, quote: quote})
++				quote = 0
++			}
++			continue
++		}
++
++		if char == '\'' || char == '"' {
++			quote = char
++			start = i + 1
++		}
++	}
++
++	if quote != 0 {
++		spans = append(spans, stringLiteralSpan{start: start, end: len(expression), quote: quote})
++	}
++
++	return spans
++}
++
++func stringLiteralForSpan(spans []stringLiteralSpan, start, end int) (stringLiteralSpan, bool) {
++	for _, span := range spans {
++		if start >= span.start && end <= span.end {
++			return span, true
++		}
++	}
++
++	return stringLiteralSpan{}, false
++}
+diff -ruN -x .git inj/pkg/protocols/common/helpers/eventcreator/eventcreator.go variants/pass-hardening/pkg/protocols/common/helpers/eventcreator/eventcreator.go
+--- inj/pkg/protocols/common/helpers/eventcreator/eventcreator.go	2026-10-25 23:10:31.840553447 +0000
++++ variants/pass-hardening/pkg/protocols/common/helpers/eventcreator/eventcreator.go	2026-10-25 23:13:50.060373788 +0000
+@@ -1,13 +1,10 @@
+ package eventcreator
+ 
+ import (
+-	"strings"
+-
+ 	"github.com/projectdiscovery/gologger"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+-	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/utils/vardump"
+ 	"golang.org/x/text/cases"
+ 	"golang.org/x/text/language"
+@@ -33,7 +30,6 @@
+ 		if compiledOperator != nil {
+ 			result, ok := compiledOperator.Execute(outputEvent, request.Match, request.Extract, isResponseDebug)
+ 			if ok && result != nil {
+-				expandExtractedValues(result, outputEvent)
+ 				// if result has both extracted values and dynamic values, put dynamic values in data
+ 				// and remove dynamic values to avoid skipping legitimate event
+ 				if (len(result.Extracts) > 0 || len(result.OutputExtracts) > 0) && len(result.DynamicValues) > 0 {
+@@ -59,28 +55,3 @@
+ 	event.Results = append(event.Results, request.MakeResultEvent(event)...)
+ 	return event
+ }
+-
+-// expandExtractedValues resolves template references in the values produced by
+-// extractors, so that reported extractions contain the final value.
+-func expandExtractedValues(result *operators.Result, data output.InternalEvent) {
+-	for name, values := range result.Extracts {
+-		for i, value := range values {
+-			if !strings.Contains(value, "{{") && !strings.Contains(value, "\u00a7") {
+-				continue
+-			}
+-			if expanded, err := expressions.Evaluate(value, data); err == nil {
+-				values[i] = expanded
+-			}
+-		}
+-		result.Extracts[name] = values
+-	}
+-
+-	for i, value := range result.OutputExtracts {
+-		if !strings.Contains(value, "{{") && !strings.Contains(value, "\u00a7") {
+-			continue
+-		}
+-		if expanded, err := expressions.Evaluate(value, data); err == nil {
+-			result.OutputExtracts[i] = expanded
+-		}
+-	}
+-}
+diff -ruN -x .git inj/pkg/protocols/common/replacer/replacer.go variants/pass-hardening/pkg/protocols/common/replacer/replacer.go
+--- inj/pkg/protocols/common/replacer/replacer.go	2026-10-25 22:56:33.013314454 +0000
++++ variants/pass-hardening/pkg/protocols/common/replacer/replacer.go	2026-10-25 23:25:57.311715152 +0000
+@@ -3,21 +3,117 @@
+ import (
+ 	"strings"
+ 
+-	"github.com/projectdiscovery/fasttemplate"
+-
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/marker"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+ )
+ 
+-// Replace replaces placeholders in template with values on the fly.
++// Replace replaces placeholders in template with values on the fly. Both marker
++// forms are resolved in one pass over the template text: a value inserted for
++// one placeholder is terminal and is never scanned for another placeholder.
++// Placeholders nested inside another placeholder's name are part of the
++// template text and are resolved before the name is looked up.
+ func Replace(template string, values map[string]interface{}) string {
++	if len(values) == 0 || template == "" {
++		return template
++	}
+ 	valuesMap := make(map[string]interface{}, len(values))
+ 	for k, v := range values {
+ 		valuesMap[k] = types.ToString(v)
+ 	}
+-	replaced := fasttemplate.ExecuteStringStd(template, marker.ParenthesisOpen, marker.ParenthesisClose, valuesMap)
+-	final := fasttemplate.ExecuteStringStd(replaced, marker.General, marker.General, valuesMap)
+-	return final
++
++	var builder strings.Builder
++	builder.Grow(len(template))
++	writeReplaced(&builder, template, valuesMap)
++	return builder.String()
++}
++
++func writeReplaced(builder *strings.Builder, template string, values map[string]interface{}) {
++	for index := 0; index < len(template); {
++		brace := strings.Index(template[index:], marker.ParenthesisOpen)
++		general := strings.Index(template[index:], marker.General)
++		if brace < 0 && general < 0 {
++			builder.WriteString(template[index:])
++			return
++		}
++
++		if general >= 0 && (brace < 0 || general < brace) {
++			start := index + general
++			builder.WriteString(template[index:start])
++			valueEnd := strings.Index(template[start+len(marker.General):], marker.General)
++			if valueEnd < 0 {
++				builder.WriteString(template[start:])
++				return
++			}
++			valueEnd += start + len(marker.General)
++			content := template[start+len(marker.General) : valueEnd]
++			var resolvedContent strings.Builder
++			writeReplaced(&resolvedContent, content, values)
++			key := resolvedContent.String()
++			if value, ok := values[key]; ok {
++				builder.WriteString(types.ToString(value))
++			} else {
++				builder.WriteString(marker.General)
++				builder.WriteString(key)
++				builder.WriteString(marker.General)
++			}
++			index = valueEnd + len(marker.General)
++			continue
++		}
++
++		start := index + brace
++		builder.WriteString(template[index:start])
++		valueEnd, ok := braceValueEnd(template, start)
++		if !ok {
++			builder.WriteString(template[start:])
++			return
++		}
++		content := template[start+len(marker.ParenthesisOpen) : valueEnd]
++		var resolvedContent strings.Builder
++		writeReplaced(&resolvedContent, content, values)
++		key := resolvedContent.String()
++		if strings.ContainsRune(key, 0) {
++			builder.WriteString(marker.ParenthesisOpen)
++			builder.WriteString(key)
++			builder.WriteString(marker.ParenthesisClose)
++			index = valueEnd + len(marker.ParenthesisClose)
++			continue
++		}
++		if value, ok := values[key]; ok {
++			builder.WriteString(types.ToString(value))
++		} else {
++			builder.WriteString(marker.ParenthesisOpen)
++			builder.WriteString(key)
++			builder.WriteString(marker.ParenthesisClose)
++		}
++		index = valueEnd + len(marker.ParenthesisClose)
++	}
++}
++
++// braceValueEnd returns the index at which the close marker matching the open
++// marker at start begins.
++func braceValueEnd(template string, start int) (int, bool) {
++	const maxNestingDepth = 64
++	depth := 0
++	for index := start; index < len(template); {
++		if strings.HasPrefix(template[index:], marker.ParenthesisOpen) {
++			depth++
++			if depth > maxNestingDepth {
++				return 0, false
++			}
++			index += len(marker.ParenthesisOpen)
++			continue
++		}
++		if strings.HasPrefix(template[index:], marker.ParenthesisClose) {
++			depth--
++			index += len(marker.ParenthesisClose)
++			if depth == 0 {
++				return index - len(marker.ParenthesisClose), true
++			}
++			continue
++		}
++		index++
++	}
++	return 0, false
+ }
+ 
+ // Replace replaces one placeholder in template with one value on the fly.
+diff -ruN -x .git inj/pkg/protocols/common/variables/variables.go variants/pass-hardening/pkg/protocols/common/variables/variables.go
+--- inj/pkg/protocols/common/variables/variables.go	2026-10-25 22:56:33.013314454 +0000
++++ variants/pass-hardening/pkg/protocols/common/variables/variables.go	2026-10-25 23:13:50.060373788 +0000
+@@ -74,6 +74,15 @@
+ 	generators.MergeMapsInto(combined, values)
+ 
+ 	variables.ForEach(func(key string, value interface{}) {
++		if existingValue, ok := combined[key]; ok {
++			// A value supplied by the scan is data: it shadows the declared
++			// value and is never rendered as template text.
++			result[key] = existingValue
++			combined[key] = existingValue
++
++			return
++		}
++
+ 		if sliceValue, ok := value.([]interface{}); ok {
+ 			// slices cannot be evaluated
+ 			result[key] = sliceValue
+@@ -108,6 +117,15 @@
+ 
+ 	var interactURLs []string
+ 	variables.ForEach(func(key string, value interface{}) {
++		if existingValue, ok := combined[key]; ok {
++			// A value supplied by the scan is data: it shadows the declared
++			// value and is never rendered as template text.
++			result[key] = existingValue
++			combined[key] = existingValue
++
++			return
++		}
++
+ 		if sliceValue, ok := value.([]interface{}); ok {
+ 			// slices cannot be evaluated
+ 			result[key] = sliceValue

@@ -1,0 +1,232 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,4 +1,4 @@
+-import { makePromise, interpolate } from './utils.js'
++import { makePromise, interpolate, interpolateUrl, sanitizeLogValue, redactUrlCredentials } from './utils.js'
+ import request from './request.js'
+ 
+ const getDefaults = () => {
+@@ -61,7 +61,13 @@
+ 
+     loadPath.then(resolvedLoadPath => {
+       if (!resolvedLoadPath) return callback(null, {})
+-      const url = interpolate(resolvedLoadPath, { lng: languages.join('+'), ns: namespaces.join('+') })
++      const url = interpolateUrl(resolvedLoadPath, { lng: languages.join('+'), ns: namespaces.join('+') })
++      if (url == null) {
++        const safeLngs = languages.map(sanitizeLogValue).join(', ')
++        const safeNss = namespaces.map(sanitizeLogValue).join(', ')
++        return callback(new Error('i18next-http-backend: unsafe lng/ns value — refusing to build request URL for languages=[' + safeLngs + '] namespaces=[' + safeNss + ']'), false)
++      }
++      if (!/^https?:\/\//.test(url)) return callback(new Error('i18next-http-backend: refusing a non-absolute resource URL'), false)
+       this.loadUrl(url, callback, loadUrlLanguages, loadUrlNamespaces)
+     })
+   }
+@@ -71,9 +77,14 @@
+     const ns = (typeof namespaces === 'string') ? [namespaces] : namespaces
+     // parseLoadPayload — default undefined
+     const payload = this.options.parseLoadPayload(lng, ns)
++    // URLs in error callbacks are redacted (user:password credentials
++    // stripped) and log-sanitised (CR/LF/control chars replaced) to prevent
++    // leaking credentials that may have been embedded in loadPath and to
++    // prevent log forging via crafted `lng`/`ns` values (CWE-117).
++    const safeUrl = sanitizeLogValue(redactUrlCredentials(url))
+     this.options.request(this.options, url, payload, (err, res) => {
+-      if (res && ((res.status >= 500 && res.status < 600) || !res.status)) return callback('failed loading ' + url + '; status code: ' + res.status, true /* retry */)
+-      if (res && res.status >= 400 && res.status < 500) return callback('failed loading ' + url + '; status code: ' + res.status, false /* no retry */)
++      if (res && ((res.status >= 500 && res.status < 600) || !res.status)) return callback('failed loading ' + safeUrl + '; status code: ' + res.status, true /* retry */)
++      if (res && res.status >= 400 && res.status < 500) return callback('failed loading ' + safeUrl + '; status code: ' + res.status, false /* no retry */)
+       if (!res && err && err.message) {
+         const errorMessage = err.message.toLowerCase()
+         // for example:
+@@ -87,7 +98,7 @@
+           'load'
+         ].find((term) => errorMessage.indexOf(term) > -1)
+         if (isNetworkError) {
+-          return callback('failed loading ' + url + ': ' + err.message, true /* retry */)
++          return callback('failed loading ' + safeUrl + ': ' + sanitizeLogValue(err.message), true /* retry */)
+         }
+       }
+       if (err) return callback(err, false)
+@@ -100,7 +111,7 @@
+           ret = res.data
+         }
+       } catch (e) {
+-        parseErr = 'failed parsing ' + url + ' to json'
++        parseErr = 'failed parsing ' + safeUrl + ' to json'
+       }
+       if (parseErr) return callback(parseErr, false)
+       callback(null, ret)
+--- a/lib/request.js
++++ b/lib/request.js
+@@ -35,11 +35,16 @@
+   } catch (e) {}
+ }
+ 
++const UNSAFE_KEYS = ['__proto__', 'constructor', 'prototype']
++
+ const addQueryString = (url, params) => {
+   if (params && typeof params === 'object') {
+     let queryString = ''
+-    // Must encode data
+-    for (const paramName in params) {
++    // Must encode data. Iterate own enumerable keys only (Object.keys) and
++    // drop prototype-chain names so a polluted Object.prototype cannot leak
++    // into the URL.
++    for (const paramName of Object.keys(params)) {
++      if (UNSAFE_KEYS.indexOf(paramName) > -1) continue
+       queryString += '&' + encodeURIComponent(paramName) + '=' + encodeURIComponent(params[paramName])
+     }
+     if (!queryString) return url
+@@ -71,8 +76,6 @@
+   }
+ }
+ 
+-let omitFetchOptions = false
+-
+ // fetch api stuff
+ const requestWithFetch = (options, url, payload, callback) => {
+   if (options.queryStringParams) {
+@@ -86,11 +89,15 @@
+   }
+   if (payload) headers['Content-Type'] = 'application/json'
+   const reqOptions = typeof options.requestOptions === 'function' ? options.requestOptions(payload) : options.requestOptions
++  // `omitFetchOptions` is stored on the backend `options` object (per-instance)
++  // instead of on a module-level flag. This prevents cross-instance
++  // pollution: one instance hitting a "not implemented" fetch no longer
++  // silently strips requestOptions from every other instance in the process.
+   const fetchOptions = {
+     method: payload ? 'POST' : 'GET',
+     body: payload ? options.stringify(payload) : undefined,
+     headers,
+-    ...(omitFetchOptions ? {} : reqOptions)
++    ...(options._omitFetchOptions ? {} : reqOptions)
+   }
+   const altFetch = typeof options.alternateFetch === 'function' && options.alternateFetch.length >= 1 ? options.alternateFetch : undefined
+   try {
+@@ -104,7 +111,8 @@
+         delete fetchOptions[opt]
+       })
+       fetchIt(url, fetchOptions, callback, altFetch)
+-      omitFetchOptions = true
++      // Per-instance flag: only affects this backend, not siblings.
++      options._omitFetchOptions = true
+     } catch (err) {
+       callback(err)
+     }
+@@ -139,7 +147,8 @@
+     let h = options.customHeaders
+     h = typeof h === 'function' ? h() : h
+     if (h) {
+-      for (const i in h) {
++      for (const i of Object.keys(h)) {
++        if (UNSAFE_KEYS.indexOf(i) > -1) continue
+         x.setRequestHeader(i, h[i])
+       }
+     }
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -2,10 +2,13 @@
+ const each = arr.forEach
+ const slice = arr.slice
+ 
++const UNSAFE_KEYS = ['__proto__', 'constructor', 'prototype']
++
+ export function defaults (obj) {
+   each.call(slice.call(arguments, 1), (source) => {
+     if (source) {
+-      for (const prop in source) {
++      for (const prop of Object.keys(source)) {
++        if (UNSAFE_KEYS.indexOf(prop) > -1) continue
+         if (obj[prop] === undefined) obj[prop] = source[prop]
+       }
+     }
+@@ -13,6 +16,55 @@
+   return obj
+ }
+ 
++// Returns true if `v` can be safely interpolated into a URL path segment.
++// Denylist approach — i18next permits arbitrary language-code shapes
++// (https://www.i18next.com/how-to/faq#how-should-the-language-codes-be-formatted)
++// so we only block the concrete attack patterns: path traversal, path
++// separators, URL structure characters, control characters, prototype keys,
++// and oversized inputs. `+` is allowed — callers use `languages.join('+')`
++// to request multiple languages in one request.
++export function isSafeUrlSegment (v) {
++  if (typeof v !== 'string') return false
++  if (v.length === 0 || v.length > 128) return false
++  if (UNSAFE_KEYS.indexOf(v) > -1) return false
++  if (v.indexOf('..') > -1) return false
++  if (v.indexOf('/') > -1 || v.indexOf('\\') > -1) return false
++  // Block characters that would terminate/restructure the URL:
++  // `?` (starts query), `#` (starts fragment), `%` (percent-encoded bypass
++  // of `..`/`/` via `%2E%2E`/`%2F`), space (ambiguous), `@` (authority
++  // boundary in userinfo-containing URLs).
++  if (/[?#%\s@:]/.test(v)) return false
++  // eslint-disable-next-line no-control-regex
++  if (/[\x00-\x1F\x7F]/.test(v)) return false
++  return true
++}
++
++// Strip control characters (CR/LF/NUL/C0/C1) from a string so it cannot
++// inject fake log lines when concatenated into an error message (CWE-117).
++export function sanitizeLogValue (v) {
++  if (typeof v !== 'string') return v
++  // eslint-disable-next-line no-control-regex
++  return v.replace(/[\r\n\x00-\x1F\x7F]/g, ' ')
++}
++
++// Redact user:password credentials from a URL-like string before logging.
++// Handles both full URLs and malformed ones — on parse failure, falls back
++// to a regex that matches the userinfo portion of the authority.
++export function redactUrlCredentials (u) {
++  if (typeof u !== 'string' || u.length === 0) return u
++  try {
++    const parsed = new URL(u)
++    if (parsed.username || parsed.password) {
++      parsed.username = ''
++      parsed.password = ''
++      return parsed.toString()
++    }
++    return u
++  } catch (e) {
++    return u.replace(/(\/\/)[^/@\s]+@/g, '$1')
++  }
++}
++
+ export function hasXMLHttpRequest () {
+   return (typeof XMLHttpRequest === 'function' || typeof XMLHttpRequest === 'object')
+ }
+@@ -46,7 +98,32 @@
+ const interpolationRegexp = /\{\{(.+?)\}\}/g
+ export function interpolate (str, data) {
+   return str.replace(interpolationRegexp, (match, key) => {
+-    const value = data[key.trim()]
++    const k = key.trim()
++    if (UNSAFE_KEYS.indexOf(k) > -1) return match
++    const value = data[k]
+     return value != null ? value : match
+   })
+ }
++
++// URL-specific variant: reject values that fail the URL-segment safety
++// check. Returns `null` if any substitution is unsafe — callers should bail
++// out cleanly rather than issue the request. For multi-value joins
++// (`en+de`), validates each `+`-separated segment independently.
++export function interpolateUrl (str, data) {
++  let unsafe = false
++  const result = str.replace(interpolationRegexp, (match, key) => {
++    const k = key.trim()
++    if (UNSAFE_KEYS.indexOf(k) > -1) return match
++    const value = data[k]
++    if (value == null) return match
++    const segments = String(value).split('+')
++    for (const seg of segments) {
++      if (!isSafeUrlSegment(seg)) {
++        unsafe = true
++        return match
++      }
++    }
++    return segments.join('+')
++  })
++  return unsafe ? null : result
++}

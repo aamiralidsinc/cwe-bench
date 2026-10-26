@@ -1,0 +1,242 @@
+diff -ruN a/lib/ansible/parsing/dataloader.py b/lib/ansible/parsing/dataloader.py
+--- a/lib/ansible/parsing/dataloader.py	2026-10-26 03:03:04.000000000 +0000
++++ b/lib/ansible/parsing/dataloader.py	2026-10-26 05:15:23.868696709 +0000
+@@ -322,7 +322,10 @@
+ 
+     def _create_content_tempfile(self, content):
+         ''' Create a tempfile containing defined content '''
+-        fd, content_tempfile = tempfile.mkstemp()
++        # Decrypted content goes to the private per-process controller temporary
++        # directory, not a shared one, and mkstemp() gives this account an
++        # owner-only file.
++        fd, content_tempfile = tempfile.mkstemp(dir=C.DEFAULT_LOCAL_TMP)
+         f = os.fdopen(fd, 'wb')
+         content = to_bytes(content)
+         try:
+@@ -374,6 +377,33 @@
+         except (IOError, OSError) as e:
+             raise AnsibleParserError("an error occurred while trying to read the file '%s': %s" % (to_native(real_path), to_native(e)), orig_exc=e)
+ 
++    @staticmethod
++    def _destroy_content_tempfile(file_path):
++        """Overwrite a decrypted temporary file, then remove it.
++
++        Unlinking alone only drops one name for the data: anyone who opened or
++        linked the file still has the plaintext.  Overwrite the bytes through the
++        same inode first so every link sees destroyed content.
++        """
++        try:
++            with open(file_path, 'r+b') as f:
++                f.seek(0, os.SEEK_END)
++                remaining = f.tell()
++                f.seek(0)
++                block = b'\x00' * 4096
++                while remaining > 0:
++                    chunk = block[:min(remaining, len(block))]
++                    f.write(chunk)
++                    remaining -= len(chunk)
++                f.flush()
++                os.fsync(f.fileno())
++        except (IOError, OSError):
++            pass
++        try:
++            os.unlink(file_path)
++        except (IOError, OSError):
++            pass
++
+     def cleanup_tmp_file(self, file_path):
+         """
+         Removes any temporary files created from a previous call to
+@@ -381,7 +411,7 @@
+         previous call to get_real_file.
+         """
+         if file_path in self._tempfiles:
+-            os.unlink(file_path)
++            self._destroy_content_tempfile(file_path)
+             self._tempfiles.remove(file_path)
+ 
+     def cleanup_all_tmp_files(self):
+diff -ruN a/lib/ansible/parsing/vault/__init__.py b/lib/ansible/parsing/vault/__init__.py
+--- a/lib/ansible/parsing/vault/__init__.py	2026-10-26 03:03:04.000000000 +0000
++++ b/lib/ansible/parsing/vault/__init__.py	2026-10-26 05:15:18.664701398 +0000
+@@ -19,6 +19,7 @@
+ from __future__ import (absolute_import, division, print_function)
+ __metaclass__ = type
+ 
++import errno
+ import os
+ import random
+ import shlex
+@@ -845,42 +846,66 @@
+ 
+         os.remove(tmp_path)
+ 
++    @staticmethod
++    def _write_all(fd, b_data):
++        """Write every byte of b_data through an already-open descriptor.
++
++        The descriptor is the only handle used: the caller never has to name the
++        file again, so nothing another local account does to a path can redirect
++        the plaintext into a file of its choosing.
++        """
++        offset = 0
++        while offset < len(b_data):
++            offset += os.write(fd, b_data[offset:])
++
+     def _edit_file_helper(self, filename, secret,
+                           existing_data=None, force_save=False, vault_id=None):
+ 
+-        # Create a tempfile
++        # The working copy holds decrypted data.  Create it in the private
++        # controller temporary directory (created 0700 for this process) with
++        # mkstemp(), which gives this account an owner-only file, and fill it
++        # through the returned descriptor instead of re-opening it by name.
+         root, ext = os.path.splitext(os.path.realpath(filename))
+-        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+-        os.close(fd)
+-
+-        cmd = self._editor_shell_command(tmp_path)
++        fd, tmp_path = tempfile.mkstemp(suffix=ext, dir=C.DEFAULT_LOCAL_TMP)
+         try:
+             if existing_data:
+-                self.write_data(existing_data, tmp_path, shred=False)
++                self._write_all(fd, to_bytes(existing_data, errors='strict'))
+ 
+-            # drop the user into an editor on the tmp file
+-            subprocess.call(cmd)
+-        except Exception as e:
+-            # whatever happens, destroy the decrypted file
+-            self._shred_file(tmp_path)
+-            raise AnsibleError('Unable to execute the command "%s": %s' % (' '.join(cmd), to_native(e)))
+-
+-        b_tmpdata = self.read_data(tmp_path)
++            os.close(fd)
++            fd = None
+ 
+-        # Do nothing if the content has not changed
+-        if existing_data == b_tmpdata and not force_save:
++            cmd = self._editor_shell_command(tmp_path)
++            try:
++                # drop the user into an editor on the tmp file
++                subprocess.call(cmd)
++            except Exception as e:
++                raise AnsibleError('Unable to execute the command "%s": %s' % (' '.join(cmd), to_native(e)))
++
++            b_tmpdata = self.read_data(tmp_path)
++
++            # Do nothing if the content has not changed
++            if existing_data == b_tmpdata and not force_save:
++                return
++
++            # encrypt new data and write out to tmp
++            # An existing vaultfile will always be UTF-8,
++            # so decode to unicode here
++            b_ciphertext = self.vault.encrypt(b_tmpdata, secret, vault_id=vault_id)
++            self.write_data(b_ciphertext, tmp_path)
++
++            # shuffle tmp file into place
++            self.shuffle_files(tmp_path, filename)
++            display.vvvvv(u'Saved edited file "%s" encrypted using %s and  vault id "%s"' % (to_text(filename), to_text(secret), to_text(vault_id)))
++        finally:
++            if fd is not None:
++                try:
++                    os.close(fd)
++                except OSError:
++                    pass
++            # No matter how the work above ended -- editor failure, unreadable or
++            # unencryptable content, a failed save -- the decrypted working copy
++            # must be destroyed before this call returns.
+             self._shred_file(tmp_path)
+-            return
+-
+-        # encrypt new data and write out to tmp
+-        # An existing vaultfile will always be UTF-8,
+-        # so decode to unicode here
+-        b_ciphertext = self.vault.encrypt(b_tmpdata, secret, vault_id=vault_id)
+-        self.write_data(b_ciphertext, tmp_path)
+-
+-        # shuffle tmp file into place
+-        self.shuffle_files(tmp_path, filename)
+-        display.vvvvv(u'Saved edited file "%s" encrypted using %s and  vault id "%s"' % (to_text(filename), to_text(secret), to_text(vault_id)))
+ 
+     def _real_path(self, filename):
+         # '-' is special to VaultEditor, dont expand it.
+@@ -1058,13 +1083,21 @@
+         should be a byte string and not a text type.
+ 
+         :arg data: the byte string (bytes) data
+-        :arg filename: filename to save 'data' to.
++        :arg filename: filename to save 'data' to, or an open file descriptor
++            owned by this process, to which the bytes are written directly.
+         :arg shred: if shred==True, make sure that the original data is first shredded so that is cannot be recovered.
+         :returns: None
+         """
+         # FIXME: do we need this now? data_bytes should always be a utf-8 byte string
+         b_file_data = to_bytes(data, errors='strict')
+ 
++        # An open descriptor (normally the one mkstemp() returned for a decrypted
++        # working copy) is written in place: the bytes never travel through a
++        # path name that another account could have redirected in the meantime.
++        if isinstance(filename, int):
++            self._write_all(filename, b_file_data)
++            return
++
+         # get a ref to either sys.stdout.buffer for py3 or plain old sys.stdout for py2
+         # We need sys.stdout.buffer on py3 so we can write bytes to it since the plaintext
+         # of the vaulted object could be anything/binary/etc
+@@ -1072,14 +1105,49 @@
+ 
+         if filename == '-':
+             output.write(b_file_data)
+-        else:
+-            if os.path.isfile(filename):
+-                if shred:
+-                    self._shred_file(filename)
+-                else:
+-                    os.remove(filename)
++            return
++
++        # Remember the destination's metadata so that rewriting an existing file
++        # does not alter the mode or ownership it already had.
++        previous = None
++        if os.path.isfile(filename):
++            previous = os.stat(filename)
++            if shred:
++                self._shred_file(filename)
++            else:
++                os.remove(filename)
++
++        if os.path.exists(filename):
++            # A non-regular destination (device, fifo, socket) cannot be created
++            # exclusively; open it as it is and write through it.
+             with open(filename, "wb") as fh:
+                 fh.write(b_file_data)
++            return
++
++        # Create the replacement exclusively (O_EXCL) as an owner-only file.  If
++        # another account planted something at the path after the removal above,
++        # the exclusive create fails instead of writing decrypted data into it.
++        try:
++            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        except OSError as e:
++            if e.errno == errno.EEXIST:
++                raise AnsibleError('Vault file got recreated while we were operating on it: %s' % to_native(e))
++            raise AnsibleError('Problem creating vault file %s: %s' % (to_native(filename), to_native(e)))
++        try:
++            self._write_all(fd, b_file_data)
++        finally:
++            os.close(fd)
++
++        if previous is not None:
++            # restore what the user's file looked like before the rewrite
++            try:
++                os.chmod(filename, previous.st_mode & 0o7777)
++            except OSError:
++                pass
++            try:
++                os.chown(filename, previous.st_uid, previous.st_gid)
++            except OSError:
++                pass
+ 
+     def shuffle_files(self, src, dest):
+         prev = None

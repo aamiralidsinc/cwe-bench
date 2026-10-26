@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "18459", "advisory_ids": ["GHSA-MQQ6-462X-JXMM", "CVE-2026-48031", "GO-2026-5515"],
+  "repo": "dhax/go-base", "pinned_commit": "b726356599e17917d41f1e4f2b2fd9276b2037c2",
+  "fix_commits": ["cc82b9740fa6b08e0fad409cd4b418e240dd0e00"],
+  "trust_decision": {
+    "summary": "The JWT HS256 signing key must not be a missing, empty, known-default or short secret; the decision is made in jwt.NewTokenAuth, which takes the viper-merged auth_jwt_secret with no validation today, so the fix adds a refusal there and changes the two shipped sources of that value (dev.env and the cobra viper default).",
+    "evidence": ["auth/jwt/tokenauth.go:22-28", "cmd/serve.go:35", "dev.env:10", "cmd/root.go:48-64"]
+  },
+  "landing_point": {
+    "where": "dev.env:10",
+    "why": "The advisory summary names a hardcoded JWT secret \"random\"; the shipped config file is the first artefact an engineer greps for, and the viper default at cmd/serve.go:35 is its twin."
+  },
+  "fix_sites": [
+    {"where": "auth/jwt/tokenauth.go:21-34", "entry_point": "jwt.NewTokenAuth() exported constructor (public API), reached from pwdless.NewResource (auth/pwdless/api.go:51) -> api.New (api/api.go:41) -> `go-base serve` (cmd/serve.go:17) and `go-base gendoc -r` (cmd/gendoc.go:50)", "module_kind": "library constructor (package auth/jwt)"},
+    {"where": "auth/jwt/errors.go:11-16", "entry_point": "same constructor: new ErrWeakSecret / ErrSecretTooShort values returned to every caller of jwt.NewTokenAuth()", "module_kind": "library error values (package auth/jwt)"},
+    {"where": "cmd/serve.go:35", "entry_point": "`go-base serve` cobra command init(): viper.SetDefault(\"auth_jwt_secret\", ...) supplies the value the constructor reads", "module_kind": "CLI command defaults (package cmd)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "cmd/serve.go:35"},
+  "O3_reason_to_dismiss": "The cobra viper default only applies when no dev.env is present, so an engineer who fixed dev.env:10 can argue that the default in the serve command is a zero-config dev convenience and not a production route.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The \"random\" sentinel at tokenauth.go:23-25 hands out an ephemeral per-boot secret, which is what lets the app and its test suite run with no secret configured; the harness seeds exactly that literal, so rejecting or deleting \"random\" without updating it makes TestMain bail at api_test.go:44 and CI (`go test -v ./...`) fail.",
+    "where": "auth/pwdless/api_test.go:34"
+  },
+  "O6_input_shapes": [
+    "the sentinel literal \"random\" (previously replaced by an ephemeral random secret)",
+    "the empty string (AUTH_JWT_SECRET= in dev.env, or unset key with no env var)",
+    "any other short value under 32 characters",
+    "other common weak literals: CHANGE-ME, secret, changeme, jwt_secret, your-secret-key",
+    "the same value arriving by env var (viper.AutomaticEnv), dev.env file, or viper default"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "cmd/root.go:48-64", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "`go-base gendoc -r` builds the whole API with api.New(false) and discards the error, so the new weak-secret refusal is swallowed and a nil router is handed to docgen.MarkdownRoutesDoc", "where": "cmd/gendoc.go:50", "reason_to_dismiss": "gendoc is a documentation generator, not the HTTP server, so its config was never a runtime route and the fix left it alone", "distance": "same package as the fix's cmd/serve.go but a different file; not touched by the fix", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "the package test harness constructs pwdless.NewResource directly with viper auth_jwt_secret=\"random\", reaching the same TokenAuth constructor without any of the production defaults", "where": "auth/pwdless/api_test.go:34", "reason_to_dismiss": "it is test scaffolding rather than an application route, so it can be argued out of the advisory's scope", "distance": "one package away from auth/jwt, in package pwdless", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "auth/jwt/tokenauth.go:15", "sibling": "a second TokenAuth built from an explicitly supplied secret, or a rotation path passing a key set as jwtauth's verifyKey", "why_realistic": "JwtAuth is an exported field and jwtauth.New already takes a separate verifyKey argument (nil at tokenauth.go:28), so a maintainer adding rotation or per-tenant token auth would construct keys outside NewTokenAuth and bypass the check"},
+    {"where": "cmd/gendoc.go:50", "sibling": "another CLI command (token minting, seeding) that builds the auth resource and ignores the error", "why_realistic": "gendoc already establishes the `api, _ := api.New(false)` pattern in this tree, which a maintainer would copy for a sibling command"},
+    {"where": "cmd/serve.go:32-37", "sibling": "a sibling default beside auth_jwt_secret that also carries a credential or a fixed token (login token length/expiry, or a mirror SMTP password default)", "why_realistic": "init() already seeds every auth default in one block, so the next credential-shaped default would be added on the adjacent line"}
+  ],
+  "O9_family": "CWE-798 use of hard-coded credentials / weak default secret in JWT signing configuration",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.24 with toolchain go1.24.1 (go.mod:3-5); .tool-versions still pins golang 1.18",
+    "services": ["PostgreSQL (needed only by `serve`/`migrate`; the auth package tests use MockAuthStore and MockMailer)"],
+    "offline_after_build": true,
+    "project_tests": "auth/pwdless/api_test.go: TestMain (:31) plus login/token/refresh/logout tests over httptest; it sets viper auth_jwt_secret=\"random\" (:34) and aborts if NewResource errors (:40-44). CI runs `go test -v ./...` (.github/workflows/test.yml:15). Nothing tests the secret value or the config defaults."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "auth/jwt/tokenauth.go, auth/jwt/errors.go, cmd/serve.go (plus the config file dev.env)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Blank the \"random\" literal in dev.env (and the viper default) and stop there: with the key present but empty, viper returns \"\", and tokenauth.go:28 then builds HS256 with an empty key, which is strictly worse than the original state."
+  },
+  "out_of_scope_notes": [
+    "database/postgres.go:17 and dev.env:5 ship a default Postgres DSN with postgres:postgres - a hardcoded credential of the same class but not the JWT-secret property; not pursued.",
+    "docker-compose.yml:16 still carries the commented example AUTH_JWT_SECRET: my secret; a config route the fix did not touch (an 8-char value would fail the new length check)."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell was available in this session, so repo_mb is null. The tree is about 45 small Go/text files with no vendored dependencies, clearly well under 5 MB.",
+    "Latest code: the inputs state there is no latest release, so every present_in_latest is unknown.",
+    "That `go test ./...` fails after the published fix is inferred from api_test.go:34 seeding \"random\" and :40-44 exiting on a NewResource error; the project's code was not run.",
+    "Whether the hidden behavioural tests target gendoc or the test harness is an inference from the call graph, not something the advisory states."
+  ]
+}

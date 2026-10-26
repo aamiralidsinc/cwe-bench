@@ -1,0 +1,374 @@
+diff -ruN a/filters/openpolicyagent/bodyread.go b/filters/openpolicyagent/bodyread.go
+--- /dev/null
++++ b/filters/openpolicyagent/bodyread.go	2026-10-26 05:06:56.873153070 +0000
+@@ -0,0 +1,109 @@
++package openpolicyagent
++
++import (
++	"io"
++	"net/http"
++)
++
++// BodyExtraction is the outcome of reading a request body for an external
++// policy decision. The policy is shown Sample only, which may be just a leading
++// part of the client's body; Whole reports whether Sample is the entire body.
++// Reader always yields the complete body, so the rest of the filter chain and
++// the upstream still see every byte.
++type BodyExtraction struct {
++	Reader  io.ReadCloser
++	Sample  []byte
++	Whole   bool
++	Release func()
++}
++
++// ExtractRequestBody reads a request body for policy evaluation, bounded by the
++// configured maximum request body size, and reports whether the bytes returned
++// in Sample are the whole body or only a prefix of it. A caller that evaluates
++// the sample in a policy must pass Whole on, otherwise a body that was cut at
++// the maximum can be mistaken for a complete one.
++func (opa *OpenPolicyAgentInstance) ExtractRequestBody(req *http.Request) (BodyExtraction, error) {
++	if req.Body == nil || opa.EnvoyPluginConfig().SkipRequestBodyParse {
++		return BodyExtraction{Reader: req.Body, Whole: true, Release: func() {}}, nil
++	}
++
++	// A negative ContentLength means the length is unknown: Transfer-Encoding:
++	// chunked on HTTP/1.1, or no content-length header in HTTP/2 framing. Only
++	// the policy's maximum bounds the read then. Any other value is the length
++	// the framing promises, so it bounds the read too and OPA is not shown
++	// bytes the client never claimed to send.
++	expectedSize := req.ContentLength
++	if expectedSize < 0 {
++		expectedSize = opa.maxBodyBytes
++	}
++
++	wrapper := newBufferedBodyReader(req.Body, opa.maxBodyBytes, opa.bodyReadBufferSize)
++
++	requestedBodyBytes := bodyUpperBound(expectedSize, opa.maxBodyBytes)
++	if !opa.registry.maxMemoryBodyParsingSem.TryAcquire(requestedBodyBytes) {
++		return BodyExtraction{Reader: req.Body, Release: func() {}}, ErrTotalBodyBytesExceeded
++	}
++
++	sample, whole, err := wrapper.readCappedBody(expectedSize)
++	return BodyExtraction{
++		Reader:  wrapper,
++		Sample:  sample,
++		Whole:   whole,
++		Release: func() { opa.registry.maxMemoryBodyParsingSem.Release(requestedBodyBytes) },
++	}, err
++}
++
++// readCappedBody fills the reader's buffer from the client's body, reading no
++// further than the policy's maximum, and then decides whether the buffered
++// bytes are the whole body.
++//
++// The cap alone cannot answer that: a body of exactly the maximum fills the
++// buffer just like a larger one. When the cap is reached without seeing
++// end-of-stream, one further read settles it. Whatever that read yields stays
++// in the buffer, so Read returns it to the rest of the chain and the upstream
++// still receives the complete body.
++func (m *bufferedBodyReader) readCappedBody(expectedSize int64) ([]byte, bool, error) {
++	var atEnd bool
++
++	for int64(m.bodyBuffer.Len()) < m.maxBufferSize && int64(m.bodyBuffer.Len()) < expectedSize {
++		n, err := m.input.Read(m.readBuffer)
++		if n > 0 {
++			m.bodyBuffer.Write(m.readBuffer[:n])
++		}
++		if err == io.EOF {
++			atEnd = true
++			break
++		}
++		if err != nil {
++			return m.bodyBuffer.Bytes(), false, err
++		}
++	}
++
++	cut := false
++
++	if !atEnd && int64(m.bodyBuffer.Len()) >= m.maxBufferSize {
++		// The buffer is full at the cap but end-of-stream was not observed.
++		n, err := m.input.Read(m.readBuffer)
++		if n > 0 {
++			m.bodyBuffer.Write(m.readBuffer[:n])
++			cut = true
++		}
++		if err != nil && err != io.EOF {
++			return m.bodyBuffer.Bytes(), false, err
++		}
++		if n == 0 && err == nil {
++			// No progress and no end-of-stream: the body cannot be shown to
++			// be complete, so the policy must not be told that it is.
++			cut = true
++		}
++	}
++
++	sample := m.bodyBuffer.Bytes()
++	// The last read may overshoot the cap by up to one read-buffer length.
++	if int64(len(sample)) > m.maxBufferSize {
++		sample = sample[:m.maxBufferSize]
++		cut = true
++	}
++
++	return sample, !cut, nil
++}
+diff -ruN a/filters/openpolicyagent/internal/envoy/bodycompleteness.go b/filters/openpolicyagent/internal/envoy/bodycompleteness.go
+--- /dev/null
++++ b/filters/openpolicyagent/internal/envoy/bodycompleteness.go	2026-10-26 05:07:10.409140903 +0000
+@@ -0,0 +1,33 @@
++package envoy
++
++import (
++	ext_authz_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
++)
++
++// BodyCompletenessHeader carries the body-completeness value on an ext_authz
++// CheckRequest. The OPA Envoy plugin reads it from the request headers and
++// turns it into input.truncated_body, which is the only way a policy can tell a
++// body that was cut at the proxy's maximum from a complete one. Envoy uses the
++// same header name for the same purpose.
++const BodyCompletenessHeader = "x-envoy-auth-partial-body"
++
++// SetBodyCompleteness records on an already-built CheckRequest whether the body
++// it carries is the whole request body. It must be applied after the client's
++// headers have been copied, so the value describes what the proxy actually read
++// and a client cannot assert it.
++func SetBodyCompleteness(ereq *ext_authz_v3.CheckRequest, wholeBody bool) {
++	httpRequest := ereq.GetAttributes().GetRequest().GetHttp()
++	if httpRequest == nil {
++		return
++	}
++
++	if httpRequest.Headers == nil {
++		httpRequest.Headers = make(map[string]string, 1)
++	}
++
++	if wholeBody {
++		httpRequest.Headers[BodyCompletenessHeader] = "false"
++	} else {
++		httpRequest.Headers[BodyCompletenessHeader] = "true"
++	}
++}
+diff -ruN a/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
+--- a/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go	2026-10-26 02:32:58.000000000 +0000
++++ b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go	2026-10-26 05:07:29.277123941 +0000
+@@ -52,6 +52,27 @@
+ 	opa *openpolicyagent.OpenPolicyAgentInstance
+ }
+ 
++// readBodyPrefix reads at most limit leading bytes of body for the policy and
++// returns them together with a reader that still yields the complete body.
++//
++// Reading one byte beyond the limit is what tells a body that fills the prefix
++// exactly from one that continues past it: the policy sees the first limit
++// bytes, cut is false only when they are the whole body, and the extra byte
++// plus the rest of the body are handed back to the chain untouched.
++func readBodyPrefix(body io.ReadCloser, limit int) (prefix []byte, cut bool, rest io.ReadCloser) {
++	buf := make([]byte, limit+1)
++	n, _ := io.ReadFull(body, buf)
++
++	prefix = buf[:n]
++	if n > limit {
++		prefix = prefix[:limit]
++		cut = true
++	}
++
++	rest = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), body))
++	return
++}
++
+ func (f *opaAuthorizeRequestBodyPrefixFilter) Request(fc filters.FilterContext) {
+ 	req := fc.Request()
+ 
+@@ -70,16 +91,11 @@
+ 	}
+ 
+ 	var rawBodyBytes []byte
++	wholeBody := true
+ 	if req.Body != nil {
+-		buf := make([]byte, DefaultBodyPrefixSize+1)
+-		n, _ := io.ReadFull(req.Body, buf)
+-		rawBodyBytes = buf[:n]
+-		if len(rawBodyBytes) > DefaultBodyPrefixSize {
+-			rawBodyBytes = rawBodyBytes[:DefaultBodyPrefixSize]
+-		}
+-		// Hand the whole body to the rest of the chain, including the byte that
+-		// was read only to see whether the prefix was complete.
+-		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), req.Body))
++		var cut bool
++		rawBodyBytes, cut, req.Body = readBodyPrefix(req.Body, DefaultBodyPrefixSize)
++		wholeBody = !cut
+ 	}
+ 
+ 	authzreq, err := envoy.AdaptBodyPrefixToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), nil, rawBodyBytes)
+@@ -87,6 +103,7 @@
+ 		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
+ 		return
+ 	}
++	envoy.SetBodyCompleteness(authzreq, wholeBody)
+ 
+ 	start := time.Now()
+ 	result, err := f.opa.Eval(ctx, authzreq)
+diff -ruN a/filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go b/filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go
+--- a/filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go	2026-10-26 02:32:57.000000000 +0000
++++ b/filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go	2026-10-26 05:07:23.697128958 +0000
+@@ -6,7 +6,6 @@
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"net/http"
+ 	"runtime/pprof"
+ 	"time"
+@@ -114,17 +113,19 @@
+ 	}
+ 
+ 	var rawBodyBytes []byte
++	// A filter that does not evaluate the body has not cut anything, so the
++	// policy is told the (empty) body it sees is complete.
++	wholeBody := true
+ 	if f.bodyParsing {
+-		var body io.ReadCloser
+-		var err error
+-		var finalizer func()
+-		body, rawBodyBytes, finalizer, err = f.opa.ExtractHttpBodyOptionally(req)
+-		defer finalizer()
++		extraction, err := f.opa.ExtractRequestBody(req)
++		defer extraction.Release()
+ 		if err != nil {
+ 			f.opa.HandleInvalidDecisionError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun)
+ 			return
+ 		}
+-		req.Body = body
++		req.Body = extraction.Reader
++		rawBodyBytes = extraction.Sample
++		wholeBody = extraction.Whole
+ 	}
+ 
+ 	authzreq, err := envoy.AdaptToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), f.envoyContextExtensions, rawBodyBytes)
+@@ -132,6 +133,7 @@
+ 		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
+ 		return
+ 	}
++	envoy.SetBodyCompleteness(authzreq, wholeBody)
+ 
+ 	start := time.Now()
+ 	result, err := f.opa.Eval(ctx, authzreq)
+diff -ruN a/filters/openpolicyagent/opaserveresponse/opaserveresponse.go b/filters/openpolicyagent/opaserveresponse/opaserveresponse.go
+--- a/filters/openpolicyagent/opaserveresponse/opaserveresponse.go	2026-10-26 02:32:57.000000000 +0000
++++ b/filters/openpolicyagent/opaserveresponse/opaserveresponse.go	2026-10-26 05:07:23.705128950 +0000
+@@ -4,7 +4,6 @@
+ 
+ import (
+ 	"fmt"
+-	"io"
+ 	"net/http"
+ 	"runtime/pprof"
+ 	"time"
+@@ -109,17 +108,19 @@
+ 	}
+ 
+ 	var rawBodyBytes []byte
++	// A filter that does not evaluate the body has not cut anything, so the
++	// policy is told the (empty) body it sees is complete.
++	wholeBody := true
+ 	if f.bodyParsing {
+-		var body io.ReadCloser
+-		var err error
+-		var finalizer func()
+-		body, rawBodyBytes, finalizer, err = f.opa.ExtractHttpBodyOptionally(req)
+-		defer finalizer()
++		extraction, err := f.opa.ExtractRequestBody(req)
++		defer extraction.Release()
+ 		if err != nil {
+ 			f.opa.ServeInvalidDecisionError(fc, span, nil, err)
+ 			return
+ 		}
+-		req.Body = body
++		req.Body = extraction.Reader
++		rawBodyBytes = extraction.Sample
++		wholeBody = extraction.Whole
+ 	}
+ 
+ 	authzreq, err := envoy.AdaptToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), f.envoyContextExtensions, rawBodyBytes)
+@@ -127,6 +128,7 @@
+ 		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
+ 		return
+ 	}
++	envoy.SetBodyCompleteness(authzreq, wholeBody)
+ 
+ 	start := time.Now()
+ 	result, err := f.opa.Eval(ctx, authzreq)
+diff -ruN a/filters/openpolicyagent/openpolicyagent.go b/filters/openpolicyagent/openpolicyagent.go
+--- a/filters/openpolicyagent/openpolicyagent.go	2026-10-26 02:32:57.000000000 +0000
++++ b/filters/openpolicyagent/openpolicyagent.go	2026-10-26 05:07:06.773144172 +0000
+@@ -1255,23 +1255,6 @@
+ 	}
+ }
+ 
+-func (m *bufferedBodyReader) fillBuffer(expectedSize int64) ([]byte, error) {
+-	var err error
+-
+-	for err == nil && int64(m.bodyBuffer.Len()) < m.maxBufferSize && int64(m.bodyBuffer.Len()) < expectedSize {
+-		var n int
+-		n, err = m.input.Read(m.readBuffer)
+-
+-		m.bodyBuffer.Write(m.readBuffer[:n])
+-	}
+-
+-	if err == io.EOF {
+-		err = nil
+-	}
+-
+-	return m.bodyBuffer.Bytes(), err
+-}
+-
+ func (m *bufferedBodyReader) Read(p []byte) (int, error) {
+ 	if m.closed {
+ 		return 0, ErrClosed
+@@ -1314,38 +1297,15 @@
+ 	return maxBodyBytes
+ }
+ 
++// ExtractHttpBodyOptionally reads the request body for policy evaluation and
++// returns the reader that still carries the whole body, the leading part that
++// may be shown to the policy, and a finalizer for the accounting reservation.
++// It is the compatibility form of ExtractRequestBody; callers that evaluate the
++// returned bytes in a policy must use ExtractRequestBody to also learn whether
++// that part is the whole body.
+ func (opa *OpenPolicyAgentInstance) ExtractHttpBodyOptionally(req *http.Request) (io.ReadCloser, []byte, func(), error) {
+-	body := req.Body
+-
+-	// `req.ContentLength == -1` is set by net/http when the client uses
+-	// Transfer-Encoding: chunked (HTTP/1.1) or omits content-length in
+-	// HTTP/2 framing. Treat unknown-length bodies as up-to-max-bytes and
+-	// drive fillBuffer with the policy cap instead of the negative
+-	// sentinel, otherwise the fillBuffer loop short-circuits on its
+-	// `len < expectedSize` predicate and OPA evaluates an empty body.
+-	expectedSize := req.ContentLength
+-	if expectedSize < 0 {
+-		expectedSize = opa.maxBodyBytes
+-	}
+-
+-	if body != nil && !opa.EnvoyPluginConfig().SkipRequestBodyParse {
+-		wrapper := newBufferedBodyReader(req.Body, opa.maxBodyBytes, opa.bodyReadBufferSize)
+-
+-		requestedBodyBytes := bodyUpperBound(expectedSize, opa.maxBodyBytes)
+-		if !opa.registry.maxMemoryBodyParsingSem.TryAcquire(requestedBodyBytes) {
+-			return req.Body, nil, func() {}, ErrTotalBodyBytesExceeded
+-		}
+-
+-		rawBody, err := wrapper.fillBuffer(expectedSize)
+-		// Truncate to maxBodyBytes so OPA sees exactly how much was read vs. the full Content-Length.
+-		// fillBuffer may overshoot maxBodyBytes by up to readBufferSize-1 bytes on the last chunk read.
+-		if int64(len(rawBody)) > opa.maxBodyBytes {
+-			rawBody = rawBody[:opa.maxBodyBytes]
+-		}
+-		return wrapper, rawBody, func() { opa.registry.maxMemoryBodyParsingSem.Release(requestedBodyBytes) }, err
+-	}
+-
+-	return req.Body, nil, func() {}, nil
++	extraction, err := opa.ExtractRequestBody(req)
++	return extraction.Reader, extraction.Sample, extraction.Release, err
+ }
+ 
+ type evalContext struct {

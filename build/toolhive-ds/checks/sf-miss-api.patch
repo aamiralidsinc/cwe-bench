@@ -1,0 +1,132 @@
+diff --git a/cmd/thv/app/run.go b/cmd/thv/app/run.go
+index 04bcc1598..e3cd91f5d 100644
+--- a/cmd/thv/app/run.go
++++ b/cmd/thv/app/run.go
+@@ -4,9 +4,12 @@
+ package app
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"log/slog"
+ 	"net"
+ 	"net/url"
+@@ -443,6 +446,18 @@ func ValidateAndNormaliseHostFlag(host string) (string, error) {
+ 	return "", fmt.Errorf("could not resolve host: %s", host)
+ }
+ 
++// definitionMentionsIsolation reports whether a serialised run configuration
++// sets the isolation option explicitly, so that an omitted option can take the
++// default instead of the zero value.
++func definitionMentionsIsolation(data []byte) bool {
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(data, &fields); err != nil {
++		return false
++	}
++	_, ok := fields["isolate_network"]
++	return ok
++}
++
+ // runFromConfigFile loads a run configuration from a file and executes it
+ func runFromConfigFile(ctx context.Context) error {
+ 	// Open and read the configuration file
+@@ -455,11 +470,21 @@ func runFromConfigFile(ctx context.Context) error {
+ 		_ = configFile.Close()
+ 	}()
+ 
++	// Read the definition once so that an omitted isolation option can be told
++	// apart from an explicit opt-out.
++	data, err := io.ReadAll(configFile)
++	if err != nil {
++		return fmt.Errorf("failed to read configuration file: %w", err)
++	}
++
+ 	// Deserialize the configuration
+-	runConfig, err := runner.ReadJSON(configFile)
++	runConfig, err := runner.ReadJSON(bytes.NewReader(data))
+ 	if err != nil {
+ 		return fmt.Errorf("failed to parse configuration file: %w", err)
+ 	}
++	if !definitionMentionsIsolation(data) {
++		runConfig.IsolateNetwork = true
++	}
+ 
+ 	// Create container runtime
+ 	rt, err := container.NewFactory().Create(ctx)
+diff --git a/cmd/thv/app/run_flags.go b/cmd/thv/app/run_flags.go
+index 4a4ae3750..f4f998e9d 100644
+--- a/cmd/thv/app/run_flags.go
++++ b/cmd/thv/app/run_flags.go
+@@ -257,8 +257,8 @@ func AddRunFlags(cmd *cobra.Command, config *RunFlags) {
+ 	cmd.Flags().BoolVar(&config.OtelUseLegacyAttributes, "otel-use-legacy-attributes", true,
+ 		"Emit legacy attribute names alongside new OTEL semantic convention names (default true)")
+ 
+-	cmd.Flags().BoolVar(&config.IsolateNetwork, "isolate-network", false,
+-		"Isolate the container network from the host (default false)")
++	cmd.Flags().BoolVar(&config.IsolateNetwork, "isolate-network", true,
++		"Isolate the container network from the host. Use --isolate-network=false to opt out.")
+ 	cmd.Flags().BoolVar(&config.AllowDockerGateway, "allow-docker-gateway", false,
+ 		"Allow outbound connections to Docker gateway addresses (host.docker.internal, gateway.docker.internal, 172.17.0.1). "+
+ 			"Only applies when --isolate-network is set. These are blocked by default even when insecure_allow_all is enabled.")
+diff --git a/pkg/api/v1/workloads_import.go b/pkg/api/v1/workloads_import.go
+index f6bd5880f..7bd709c3c 100644
+--- a/pkg/api/v1/workloads_import.go
++++ b/pkg/api/v1/workloads_import.go
+@@ -66,6 +66,9 @@ func (s *WorkloadRoutes) importWorkloads(w http.ResponseWriter, r *http.Request)
+ 				http.StatusBadRequest,
+ 			)
+ 		}
++		if !definitionMentionsIsolation(raw) {
++			runConfig.IsolateNetwork = true
++		}
+ 		if err := wt.ValidateWorkloadName(runConfig.Name); err != nil {
+ 			return err
+ 		}
+@@ -80,6 +83,18 @@ func (s *WorkloadRoutes) importWorkloads(w http.ResponseWriter, r *http.Request)
+ 	return json.NewEncoder(w).Encode(importWorkloadsResponse{Started: started})
+ }
+ 
++// definitionMentionsIsolation reports whether a serialised run configuration
++// sets the isolation option explicitly, so that an omitted option can take the
++// default instead of the zero value.
++func definitionMentionsIsolation(raw []byte) bool {
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &fields); err != nil {
++		return false
++	}
++	_, ok := fields["isolate_network"]
++	return ok
++}
++
+ // ImportWorkloadFromDefinition starts a workload from an already materialised
+ // run configuration, such as one produced by exporting a workload.
+ func (s *WorkloadService) ImportWorkloadFromDefinition(ctx context.Context, runConfig *runner.RunConfig) error {
+diff --git a/pkg/mcp/server/run_server.go b/pkg/mcp/server/run_server.go
+index cc1f542fd..5d968e458 100644
+--- a/pkg/mcp/server/run_server.go
++++ b/pkg/mcp/server/run_server.go
+@@ -151,6 +151,7 @@ func buildServerConfig(
+ 		runner.WithImage(imageURL),
+ 		runner.WithName(args.Name),
+ 		runner.WithHost(args.Host),
++		runner.WithNetworkIsolation(true),
+ 	}
+ 	opts = append(opts, extraOpts...)
+ 
+diff --git a/pkg/runner/config.go b/pkg/runner/config.go
+index 88df09e27..9beddee6b 100644
+--- a/pkg/runner/config.go
++++ b/pkg/runner/config.go
+@@ -186,7 +186,7 @@ type RunConfig struct {
+ 	buildContext BuildContext
+ 
+ 	// IsolateNetwork indicates whether to isolate the network for the container
+-	IsolateNetwork bool `json:"isolate_network,omitempty" yaml:"isolate_network,omitempty"`
++	IsolateNetwork bool `json:"isolate_network" yaml:"isolate_network,omitempty"`
+ 
+ 	// AllowDockerGateway permits outbound connections to Docker gateway addresses
+ 	// (host.docker.internal, gateway.docker.internal, 172.17.0.1). These are

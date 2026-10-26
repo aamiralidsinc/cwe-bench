@@ -1,0 +1,464 @@
+diff -ruN a/src/Extension/Attributes/Event/AttributesListener.php b/src/Extension/Attributes/Event/AttributesListener.php
+--- a/src/Extension/Attributes/Event/AttributesListener.php	2026-10-26 05:39:54.000000000 +0000
++++ b/src/Extension/Attributes/Event/AttributesListener.php	2026-10-26 06:30:04.156620784 +0000
+@@ -44,12 +44,38 @@
+ 
+     public function processDocument(DocumentParsedEvent $event): void
+     {
++        // Targets already worked out for attribute blocks we walked past; see findTargetAndDirection()
++        /** @var \SplObjectStorage<Attributes|AttributesInline, array<Node|string|null>> $resolved */
++        $resolved = new \SplObjectStorage();
++
++        /**
++         * What each target has collected so far, keyed by target object ID.
++         *
++         * Every attribute node used to be merged into its target as soon as it was seen, which
++         * copies the whole set of attributes already on that target once per node. Instead the
++         * contributions are folded in one at a time and written to the target once, at the end.
++         *
++         * The point of the split is that nothing here has to be rebuilt as it grows:
++         *
++         * - `values` is the current value of each attribute name. A "prefix" contribution lets
++         *   the values already there win, a "suffix" one takes its own.
++         * - the key order is assembled from name lists instead: `chunks` are the key orders a
++         *   prefix contribution puts in front (newest last, so they are read backwards), `back`
++         *   is what the target started with plus the keys suffix contributions added.
++         * - the class list is kept in two pieces for the same reason: `front` holds the classes
++         *   prefix contributions put ahead of it, `classes` the rest, in order. `class` is only
++         *   ever an entry in the ordering; its value is joined from those two at the end.
++         *
++         * @var array<int, array{node: Node, values: array<string, mixed>, seen: array<string, true>, chunks: list<list<string>>, back: list<string>, classes: list<string>, front: list<list<string>>}> $pending
++         */
++        $pending = [];
++
+         foreach ($event->getDocument()->iterator() as $node) {
+             if (! ($node instanceof Attributes || $node instanceof AttributesInline)) {
+                 continue;
+             }
+ 
+-            [$target, $direction] = self::findTargetAndDirection($node);
++            [$target, $direction] = self::findTargetAndDirection($node, $resolved);
+ 
+             if ($target instanceof Node) {
+                 $parent = $target->parent();
+@@ -57,29 +83,201 @@
+                     $target = $parent;
+                 }
+ 
+-                if ($direction === self::DIRECTION_SUFFIX) {
+-                    $attributes = AttributesHelper::mergeAttributes($target, $node->getAttributes());
+-                } else {
+-                    $attributes = AttributesHelper::mergeAttributes($node->getAttributes(), $target);
++                $id = \spl_object_id($target);
++                if (! isset($pending[$id])) {
++                    $pending[$id] = self::startFor($target);
+                 }
+ 
+-                $target->data->set('attributes', AttributesHelper::filterAttributes($attributes, $this->allowList, $this->allowUnsafeLinks));
++                self::collect($pending[$id], $node->getAttributes(), $direction === self::DIRECTION_PREFIX);
+             }
+ 
+             $node->detach();
+         }
++
++        foreach ($pending as $entry) {
++            $classes = [];
++            foreach (\array_reverse($entry['front']) as $chunk) {
++                foreach ($chunk as $class) {
++                    $classes[] = $class;
++                }
++            }
++
++            foreach ($entry['classes'] as $class) {
++                $classes[] = $class;
++            }
++
++            $attributes = [];
++            $written    = [];
++
++            // Newest prefix key order first, then what the target started with and the keys
++            // suffix contributions added; the first time a name shows up decides its position
++            $order = \array_reverse($entry['chunks']);
++            $order[] = $entry['back'];
++
++            foreach ($order as $names) {
++                foreach ($names as $name) {
++                    if (isset($written[$name])) {
++                        continue;
++                    }
++
++                    $written[$name] = true;
++                    if ($name === 'class') {
++                        if ($classes !== []) {
++                            $attributes['class'] = \implode(' ', $classes);
++                        }
++
++                        continue;
++                    }
++
++                    $attributes[$name] = $entry['values'][$name];
++                }
++            }
++
++            $entry['node']->data->set('attributes', AttributesHelper::filterAttributes($attributes, $this->allowList, $this->allowUnsafeLinks));
++        }
+     }
+ 
+     /**
+-     * @param Attributes|AttributesInline $node
++     * @return array{node: Node, values: array<string, mixed>, seen: array<string, true>, chunks: list<list<string>>, back: list<string>, classes: list<string>, front: list<list<string>>}
++     */
++    private static function startFor(Node $target): array
++    {
++        /** @var array<string, mixed> $attributes */
++        $attributes = (array) $target->data->get('attributes');
++        $classes    = isset($attributes['class']) ? AttributesHelper::splitClasses($attributes['class']) : [];
++
++        $values = [];
++        $seen   = [];
++        $back   = [];
++        foreach ($attributes as $name => $value) {
++            if ($name === 'class') {
++                if ($classes !== []) {
++                    $seen['class'] = true;
++                    $back[]        = 'class';
++                }
++
++                continue;
++            }
++
++            $seen[$name]   = true;
++            $back[]        = $name;
++            $values[$name] = $value;
++        }
++
++        return ['node' => $target, 'values' => $values, 'seen' => $seen, 'chunks' => [], 'back' => $back, 'classes' => $classes, 'front' => []];
++    }
++
++    /**
++     * Fold one attribute node's attributes into what its target has collected, reproducing the
++     * result of merging them in the order they appear: a suffix contribution keeps the target's
++     * key order and its own value for a key that is already there, a prefix one puts its own keys
++     * in front and lets the target's values win.
++     *
++     * @param array{node: Node, values: array<string, mixed>, seen: array<string, true>, chunks: list<list<string>>, back: list<string>, classes: list<string>, front: list<list<string>>} $state
++     * @param array<string, mixed>                                                                                                                                                         $attributes
++     */
++    private static function collect(array &$state, array $attributes, bool $prefix): void
++    {
++        $classes = isset($attributes['class']) ? AttributesHelper::splitClasses($attributes['class']) : [];
++        unset($attributes['class']);
++
++        $hasClass = isset($state['seen']['class']);
++
++        if ($prefix) {
++            if ($classes !== []) {
++                // A contribution that brings classes carries the class key at the head of its own
++                // key order, so a merge that takes its keys in front starts with the class key
++                $names = ['class'];
++                foreach ($attributes as $name => $value) {
++                    $names[] = $name;
++
++                    if (isset($state['seen'][$name])) {
++                        continue;
++                    }
++
++                    $state['seen'][$name]   = true;
++                    $state['values'][$name] = $value;
++                }
++
++                $state['seen']['class'] = true;
++                $state['chunks'][]      = $names;
++                $state['front'][]       = $classes;
++
++                return;
++            }
++
++            $names = [];
++            foreach ($attributes as $name => $value) {
++                $names[] = $name;
++
++                if (isset($state['seen'][$name])) {
++                    continue;
++                }
++
++                $state['seen'][$name]   = true;
++                $state['values'][$name] = $value;
++            }
++
++            if ($hasClass) {
++                // The class key the target already has is pulled ahead of those keys while the
++                // keys themselves move to the front of it
++                $state['chunks'][] = ['class'];
++            }
++
++            if ($names !== []) {
++                $state['chunks'][] = $names;
++            }
++
++            return;
++        }
++
++        if ($hasClass) {
++            // Merging into a set that already has a class key puts that key first
++            $top = $state['chunks'] === [] ? null : $state['chunks'][\count($state['chunks']) - 1];
++            if ($top !== ['class']) {
++                $state['chunks'][] = ['class'];
++            }
++
++            foreach ($classes as $class) {
++                $state['classes'][] = $class;
++            }
++        } elseif ($classes !== []) {
++            $state['seen']['class'] = true;
++            $state['back'][]        = 'class';
++            $state['classes']       = $classes;
++        }
++
++        foreach ($attributes as $name => $value) {
++            if (! isset($state['seen'][$name])) {
++                $state['seen'][$name] = true;
++                $state['back'][]      = $name;
++            }
++
++            $state['values'][$name] = $value;
++        }
++    }
++
++    /**
++     * @param Attributes|AttributesInline                                             $node
++     * @param \SplObjectStorage<Attributes|AttributesInline, array<Node|string|null>> $resolved
+      *
+      * @return array<Node|string|null>
+      */
+-    private static function findTargetAndDirection($node): array
++    private static function findTargetAndDirection($node, \SplObjectStorage $resolved): array
+     {
++        if (isset($resolved[$node])) {
++            $result = $resolved[$node];
++            // Each node is only ever resolved once, so don't keep it alive any longer
++            unset($resolved[$node]);
++
++            return $result;
++        }
++
+         $target    = null;
+         $direction = null;
+         $previous  = $next = $node;
++        /** @var list<Attributes> $following */
++        $following = [];
+         while (true) {
+             $previous = self::getPrevious($previous);
+             $next     = self::getNext($next);
+@@ -94,7 +292,17 @@
+             }
+ 
+             if ($node instanceof AttributesInline && ($previous === null || ($previous instanceof AbstractInline && $node->isBlock()))) {
+-                continue;
++                // Whichever of those two is true here can only become more true by walking on:
++                // the remaining siblings are inlines, so the previous sibling either stays an
++                // inline or runs out. No target can be picked up on the left any more, which
++                // leaves the parent - re-scanning the rest of the chain would only find that out
++                // again, once per attribute node.
++                if (! $node->parent() instanceof FencedCode) {
++                    $target    = $node->parent();
++                    $direction = self::DIRECTION_SUFFIX;
++                }
++
++                break;
+             }
+ 
+             if ($previous !== null && ! self::isAttributesNode($previous)) {
+@@ -110,9 +318,22 @@
+ 
+                 break;
+             }
++
++            // A "next" block looks only forwards, so the rest of this walk is also the whole of
++            // that block's own walk and it must end up with the same target. Remember it rather
++            // than letting a run of them walk the same chain once each.
++            if ($previous === null && $next instanceof Attributes && $next->getTarget() === Attributes::TARGET_NEXT) {
++                $following[] = $next;
++            }
++        }
++
++        /** @var array<Node|string|null> $result */
++        $result = [$target, $direction];
++        foreach ($following as $later) {
++            $resolved[$later] = $result;
+         }
+ 
+-        return [$target, $direction];
++        return $result;
+     }
+ 
+     /**
+diff -ruN a/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php b/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php
+--- a/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php	2026-10-26 05:39:54.000000000 +0000
++++ b/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php	2026-10-26 06:27:53.136740868 +0000
+@@ -31,12 +31,37 @@
+     private bool $hasSubsequentLine = false;
+ 
+     /**
++     * The attributes collected from the block's lines, in the order a merge of those lines would
++     * put them. A `class` entry is only a placeholder marking where the class key belongs; its
++     * value is joined from $classes when the block closes, so no line has to rebuild the whole
++     * list.
++     *
++     * @var array<string, mixed>
++     */
++    private array $attributes;
++
++    /** @var list<string> */
++    private array $classes = [];
++
++    /**
+      * @param array<string, mixed> $attributes The attributes identified by the block start parser
+      * @param AbstractBlock        $container  The node we were in when these attributes were discovered
+      */
+     public function __construct(array $attributes, AbstractBlock $container)
+     {
+-        $this->block = new Attributes($attributes);
++        $classes = isset($attributes['class']) ? AttributesHelper::splitClasses($attributes['class']) : [];
++
++        // The class list is joined at close; until then the node only carries a placeholder for
++        // where its key belongs
++        $blockAttributes = $attributes;
++        unset($blockAttributes['class']);
++        if ($classes !== []) {
++            $this->classes       = $classes;
++            $attributes['class'] = true;
++        }
++
++        $this->attributes = $attributes;
++        $this->block      = new Attributes($blockAttributes);
+ 
+         $this->container = $container;
+     }
+@@ -56,11 +81,8 @@
+         $attributes = AttributesHelper::parseAttributes($cursor);
+         $cursor->advanceToNextNonSpaceOrTab();
+         if ($cursor->isAtEnd() && $attributes !== []) {
+-            // It does! Merge them into what we parsed previously
+-            $this->block->setAttributes(AttributesHelper::mergeAttributes(
+-                $this->block->getAttributes(),
+-                $attributes
+-            ));
++            // It does! Fold them into what we parsed previously
++            $this->foldLineIn($attributes);
+ 
+             // Tell the core parser we've consumed everything
+             return BlockContinue::at($cursor);
+@@ -77,6 +99,21 @@
+ 
+     public function closeBlock(): void
+     {
++        $attributes = [];
++        foreach ($this->attributes as $name => $value) {
++            if ($name === 'class') {
++                if ($this->classes !== []) {
++                    $attributes['class'] = \implode(' ', $this->classes);
++                }
++
++                continue;
++            }
++
++            $attributes[$name] = $value;
++        }
++
++        $this->block->setAttributes($attributes);
++
+         // Attributes appearing at the very end of the document won't have any last lines to check
+         // so we can make that determination here
+         if (! $this->hasSubsequentLine) {
+@@ -89,4 +126,35 @@
+             $this->block->setTarget(Attributes::TARGET_PARENT);
+         }
+     }
++
++    /**
++     * Fold one more line's attributes into the block, with the same result as merging the block's
++     * attributes into that line's: existing keys keep their place, this line's values win, and the
++     * class key moves to the front once the block has one.
++     *
++     * @param array<string, mixed> $attributes
++     */
++    private function foldLineIn(array $attributes): void
++    {
++        $classes = isset($attributes['class']) ? AttributesHelper::splitClasses($attributes['class']) : [];
++        unset($attributes['class']);
++
++        if ($this->classes !== []) {
++            if (\array_key_first($this->attributes) !== 'class') {
++                unset($this->attributes['class']);
++                $this->attributes = ['class' => true] + $this->attributes;
++            }
++
++            foreach ($classes as $class) {
++                $this->classes[] = $class;
++            }
++        } elseif ($classes !== []) {
++            $this->attributes['class'] = true;
++            $this->classes             = $classes;
++        }
++
++        foreach ($attributes as $name => $value) {
++            $this->attributes[$name] = $value;
++        }
++    }
+ }
+diff -ruN a/src/Extension/Attributes/Util/AttributesHelper.php b/src/Extension/Attributes/Util/AttributesHelper.php
+--- a/src/Extension/Attributes/Util/AttributesHelper.php	2026-10-26 05:39:54.000000000 +0000
++++ b/src/Extension/Attributes/Util/AttributesHelper.php	2026-10-26 06:11:35.545629077 +0000
+@@ -141,6 +141,22 @@
+     }
+ 
+     /**
++     * Split the value of a `class` attribute into the individual classes it contributes
++     *
++     * @param mixed $class
++     *
++     * @return list<string>
++     */
++    public static function splitClasses($class): array
++    {
++        if (\is_string($class)) {
++            return \array_values(\array_filter(\explode(' ', \trim($class))));
++        }
++
++        return \array_values((array) $class);
++    }
++
++    /**
+      * @param array<string, mixed> $attributes
+      * @param list<string>         $allowList
+      *
+diff -ruN a/src/Node/Inline/AdjacentTextMerger.php b/src/Node/Inline/AdjacentTextMerger.php
+--- a/src/Node/Inline/AdjacentTextMerger.php	2026-10-26 05:39:54.000000000 +0000
++++ b/src/Node/Inline/AdjacentTextMerger.php	2026-10-26 06:11:32.437631886 +0000
+@@ -89,17 +89,22 @@
+             return;
+         }
+ 
+-        $s = $first->getLiteral();
++        // Only the literals of the nodes being folded in are collected here. Starting from
++        // $first's own literal would copy the whole accumulated string again on every call, which
++        // is what makes repeatedly merging into the same growing node quadratic.
++        $tail = '';
+ 
+         $node = $first->next();
+         $stop = $last->next();
+         while ($node !== $stop && $node instanceof Text) {
+-            $s     .= $node->getLiteral();
++            $tail  .= $node->getLiteral();
+             $unlink = $node;
+             $node   = $node->next();
+             $unlink->detach();
+         }
+ 
+-        $first->setLiteral($s);
++        if ($tail !== '') {
++            $first->append($tail);
++        }
+     }
+ }

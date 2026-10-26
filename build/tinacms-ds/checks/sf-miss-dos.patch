@@ -1,0 +1,1100 @@
+diff --git a/packages/next-tinacms-azure/src/handlers.ts b/packages/next-tinacms-azure/src/handlers.ts
+index f82fd18..4b23993 100644
+--- a/packages/next-tinacms-azure/src/handlers.ts
++++ b/packages/next-tinacms-azure/src/handlers.ts
+@@ -7,6 +7,7 @@ import type { AzureBlobStorageConfig } from './types';
+ import type { MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { type NextRequest, NextResponse } from 'next/server';
++import { resolveKey, resolveDirectory, MediaKeyError } from './media-key';
+ 
+ type RouteParams = { params: { media: string[] } };
+ 
+@@ -59,7 +60,23 @@ async function uploadMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+   }
+ 
+   const buffer = Buffer.from(await file.arrayBuffer());
+-  const blobName = path.join(directory, filename);
++  let blobName: string;
++  try {
++    // Azure has no mediaRoot concept yet; this still rejects empty keys,
++    // absolute paths and traversal. A mediaRoot boundary is a follow-up.
++    blobName = resolveKey(
++      '',
++      path.posix.join(directory || '', filename || ''),
++      {
++        decode: false,
++      }
++    );
++  } catch (e) {
++    if (e instanceof MediaKeyError) {
++      return NextResponse.json({ error: e.message }, { status: 400 });
++    }
++    throw e;
++  }
+   const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+   await blockBlobClient.uploadData(buffer);
+ 
+@@ -76,7 +93,19 @@ async function deleteAsset(
+   config: AzureBlobStorageConfig
+ ): Promise<NextResponse> {
+   const { media } = context.params;
+-  const [, blobName] = media;
++  const [, rawKey] = media;
++
++  let blobName: string;
++  try {
++    // The framework already decodes the route param once; decoding again here
++    // would mangle keys containing a literal "%" (e.g. "100%off.png").
++    blobName = resolveKey('', rawKey, { decode: false });
++  } catch (e) {
++    if (e instanceof MediaKeyError) {
++      return NextResponse.json({ error: e.message }, { status: 400 });
++    }
++    throw e;
++  }
+ 
+   const options: BlobDeleteOptions = {
+     deleteSnapshots: 'include',
+@@ -115,11 +144,19 @@ async function listMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+       mediaListOptions.directory === '/' ||
+       mediaListOptions.directory === '""';
+ 
+-    const prefix = useRootDirectory
+-      ? ''
+-      : mediaListOptions.directory?.endsWith('/')
+-        ? mediaListOptions.directory
+-        : `${mediaListOptions.directory}/`;
++    let prefix: string;
++    try {
++      // Reject upward traversal in the listing directory for consistency with
++      // the other adapters (no mediaRoot boundary exists here yet).
++      prefix = useRootDirectory
++        ? ''
++        : resolveDirectory(mediaListOptions.directory);
++    } catch (e) {
++      if (e instanceof MediaKeyError) {
++        return NextResponse.json({ error: e.message }, { status: 400 });
++      }
++      throw e;
++    }
+ 
+     const files = [];
+     const folders = [];
+diff --git a/packages/next-tinacms-azure/src/media-key.ts b/packages/next-tinacms-azure/src/media-key.ts
+new file mode 100644
+index 0000000..c6e3f98
+--- /dev/null
++++ b/packages/next-tinacms-azure/src/media-key.ts
+@@ -0,0 +1,149 @@
++/**
++ * Centralised media object-key resolution / validation.
++ *
++ * Editors may only write to or delete object keys that resolve to a location
++ * inside the operator-configured `mediaRoot`. This helper normalises a
++ * caller-supplied key and guarantees the result stays within that boundary.
++ *
++ * It rejects empty keys, absolute paths, NUL bytes and path-traversal
++ * attempts (including percent-encoded traversal). When `mediaRoot` is empty
++ * (no boundary declared) the key is still normalised and the same illegal
++ * inputs are still rejected, but the key is otherwise returned as-is.
++ *
++ * Callers should catch `MediaKeyError` and translate it into a 4xx response.
++ *
++ * NOTE: this file is intentionally duplicated byte-for-byte across the
++ * first-party media adapters. The shared regression-test vectors guard
++ * against the copies drifting apart.
++ */
++import path from 'node:path';
++
++export class MediaKeyError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'MediaKeyError';
++  }
++}
++
++// Trim leading and trailing slashes without a backtracking regex (avoids
++// polynomial-time matching on attacker-controlled runs of slashes).
++function stripSlashes(value: string): string {
++  let start = 0;
++  let end = value.length;
++  while (start < end && value[start] === '/') start++;
++  while (end > start && value[end - 1] === '/') end--;
++  return value.slice(start, end);
++}
++
++function normalizeMediaRoot(mediaRoot: string): string {
++  if (!mediaRoot) {
++    return '';
++  }
++  return stripSlashes(mediaRoot);
++}
++
++/**
++ * Resolve a caller-supplied media key against the configured mediaRoot.
++ *
++ * @throws {MediaKeyError} when the key is empty, absolute, contains a NUL
++ * byte, uses path traversal, or escapes mediaRoot.
++ */
++export function resolveKey(
++  mediaRoot: string,
++  rawKey: unknown,
++  options?: { decode?: boolean }
++): string {
++  if (typeof rawKey !== 'string' || rawKey.trim() === '') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  // Inputs from a URL query / route segment are percent-encoded, so decode
++  // them. Inputs from a multipart filename are literal and must NOT be decoded
++  // (pass decode: false), otherwise a legitimate name like "100%.png" would be
++  // rejected and "report%41.png" silently rewritten to "reportA.png".
++  let decoded: string;
++  if (options?.decode === false) {
++    decoded = rawKey;
++  } else {
++    try {
++      decoded = decodeURIComponent(rawKey);
++    } catch {
++      throw new MediaKeyError('media key is not valid');
++    }
++  }
++
++  // Reject NUL bytes and backslash (Windows-style separator / traversal).
++  if (decoded.includes('\0') || decoded.includes('\\')) {
++    throw new MediaKeyError('media key is not valid');
++  }
++
++  // Reject absolute paths (POSIX root and Windows drive letters).
++  if (decoded.startsWith('/') || /^[a-zA-Z]:/.test(decoded)) {
++    throw new MediaKeyError('absolute media keys are not allowed');
++  }
++
++  // Normalise, then reject anything that climbs above the current root.
++  const normalized = path.posix.normalize(decoded).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media key may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  const root = normalizeMediaRoot(mediaRoot);
++  if (!root) {
++    return normalized;
++  }
++
++  // The key may arrive already prefixed with mediaRoot (the delete path sends
++  // the full object key) or relative to it (the upload path). Only prefix
++  // when it is not already scoped.
++  const scoped =
++    normalized === root || normalized.startsWith(root + '/')
++      ? normalized
++      : path.posix.join(root, normalized);
++
++  // Defence in depth: the resolved key must stay within mediaRoot.
++  if (scoped !== root && !scoped.startsWith(root + '/')) {
++    throw new MediaKeyError('media key escapes mediaRoot');
++  }
++
++  return scoped;
++}
++
++/**
++ * Resolve a caller-supplied listing directory into a relative prefix.
++ *
++ * The directory is optional: an empty / root directory returns `''` (list the
++ * mediaRoot itself). Otherwise leading/trailing slashes are stripped (matching
++ * the historical handler behaviour) and the result is normalised so it cannot
++ * traverse upward — `path.join(mediaRoot, directory)` would otherwise collapse
++ * `..` and list objects outside mediaRoot. Returns a prefix with a trailing
++ * slash so it can be joined onto mediaRoot directly.
++ *
++ * @throws {MediaKeyError} when the directory contains a NUL byte or backslash,
++ * or uses upward path traversal.
++ */
++export function resolveDirectory(rawDirectory: unknown): string {
++  // Listing directories arrive from a URL query and are decoded once by the
++  // framework; treat them as literal (no further decode).
++  if (typeof rawDirectory !== 'string' || rawDirectory.trim() === '') {
++    return '';
++  }
++
++  if (rawDirectory.includes('\0') || rawDirectory.includes('\\')) {
++    throw new MediaKeyError('media directory is not valid');
++  }
++
++  const trimmed = stripSlashes(rawDirectory);
++  const normalized = path.posix.normalize(trimmed).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media directory may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    return '';
++  }
++
++  return normalized + '/';
++}
+diff --git a/packages/next-tinacms-cloudinary/src/handlers.ts b/packages/next-tinacms-cloudinary/src/handlers.ts
+index b03ffea..e0bd03c 100644
+--- a/packages/next-tinacms-cloudinary/src/handlers.ts
++++ b/packages/next-tinacms-cloudinary/src/handlers.ts
+@@ -8,6 +8,7 @@ import path from 'path';
+ import { NextApiRequest, NextApiResponse } from 'next';
+ import multer from 'multer';
+ import { promisify } from 'util';
++import { resolveKey, resolveDirectory, MediaKeyError } from './media-key';
+ 
+ export interface CloudinaryConfig {
+   cloud_name: string;
+@@ -70,12 +71,36 @@ async function uploadMedia(req: NextApiRequest, res: NextApiResponse) {
+   // @ts-ignore
+   await upload(req, res);
+ 
++  // @ts-ignore - multer augments the request with `file`
++  if (!req.file) {
++    return res.status(400).json({ message: 'file is required' });
++  }
++
+   const { directory } = req.body;
++  // @ts-ignore - multer augments the request with `file`
++  const filename: string = req.file.originalname;
++
++  let folder: string;
++  try {
++    // Cloudinary has no mediaRoot concept yet; an empty folder (root upload)
++    // is allowed, but traversal / absolute folders are rejected.
++    const rawFolder = (directory || '').replace(/^\/+/, '');
++    folder = rawFolder ? resolveKey('', rawFolder, { decode: false }) : '';
++    // Validate the filename with the same rules. Cloudinary still derives the
++    // public_id from folder + use_filename; we only reject illegal names here
++    // and leave the naming model unchanged.
++    resolveKey('', filename, { decode: false });
++  } catch (e) {
++    if (e instanceof MediaKeyError) {
++      return res.status(400).json({ message: e.message });
++    }
++    throw e;
++  }
+ 
+   try {
+     //@ts-ignore
+     const result = await cloudinary.uploader.upload(req.file.path, {
+-      folder: directory.replace(/^\//, ''),
++      folder,
+       use_filename: true,
+       overwrite: false,
+       resource_type: 'auto',
+@@ -105,6 +130,24 @@ async function listMedia(
+       mediaListOptions.directory === '/' ||
+       mediaListOptions.directory === '""';
+ 
++    if (!useRootDirectory) {
++      try {
++        // Validation only: reject upward traversal in the listing directory for
++        // consistency with the other adapters. The normalised result is
++        // intentionally discarded; the raw directory is still interpolated into
++        // the search expression below, so this does NOT bound the listing the
++        // way resolveDirectory bounds the S3/DOS prefix. Search-expression
++        // escaping (SEC-5) is a separate follow-up.
++        resolveDirectory(mediaListOptions.directory);
++      } catch (e) {
++        if (e instanceof MediaKeyError) {
++          res.status(400).json({ message: e.message });
++          return;
++        }
++        throw e;
++      }
++    }
++
+     const query = useRootDirectory
+       ? 'folder=""'
+       : `folder="${mediaListOptions.directory}"`;
+@@ -192,9 +235,21 @@ const findErrorMessage = (e: any) => {
+ 
+ async function deleteAsset(req: NextApiRequest, res: NextApiResponse) {
+   const { media } = req.query;
+-  const [, public_id] = media as string[];
++  const [, rawPublicId] = media as string[];
++
++  let public_id: string;
++  try {
++    // The framework already decodes the route param once; decoding again here
++    // would mangle keys containing a literal "%" (e.g. "100%off.png").
++    public_id = resolveKey('', rawPublicId, { decode: false });
++  } catch (e) {
++    if (e instanceof MediaKeyError) {
++      return res.status(400).json({ message: e.message });
++    }
++    throw e;
++  }
+ 
+-  cloudinary.uploader.destroy(public_id as string, {}, (err) => {
++  cloudinary.uploader.destroy(public_id, {}, (err: any) => {
+     if (err) res.status(500);
+     res.json({
+       err,
+diff --git a/packages/next-tinacms-cloudinary/src/media-key.ts b/packages/next-tinacms-cloudinary/src/media-key.ts
+new file mode 100644
+index 0000000..c6e3f98
+--- /dev/null
++++ b/packages/next-tinacms-cloudinary/src/media-key.ts
+@@ -0,0 +1,149 @@
++/**
++ * Centralised media object-key resolution / validation.
++ *
++ * Editors may only write to or delete object keys that resolve to a location
++ * inside the operator-configured `mediaRoot`. This helper normalises a
++ * caller-supplied key and guarantees the result stays within that boundary.
++ *
++ * It rejects empty keys, absolute paths, NUL bytes and path-traversal
++ * attempts (including percent-encoded traversal). When `mediaRoot` is empty
++ * (no boundary declared) the key is still normalised and the same illegal
++ * inputs are still rejected, but the key is otherwise returned as-is.
++ *
++ * Callers should catch `MediaKeyError` and translate it into a 4xx response.
++ *
++ * NOTE: this file is intentionally duplicated byte-for-byte across the
++ * first-party media adapters. The shared regression-test vectors guard
++ * against the copies drifting apart.
++ */
++import path from 'node:path';
++
++export class MediaKeyError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'MediaKeyError';
++  }
++}
++
++// Trim leading and trailing slashes without a backtracking regex (avoids
++// polynomial-time matching on attacker-controlled runs of slashes).
++function stripSlashes(value: string): string {
++  let start = 0;
++  let end = value.length;
++  while (start < end && value[start] === '/') start++;
++  while (end > start && value[end - 1] === '/') end--;
++  return value.slice(start, end);
++}
++
++function normalizeMediaRoot(mediaRoot: string): string {
++  if (!mediaRoot) {
++    return '';
++  }
++  return stripSlashes(mediaRoot);
++}
++
++/**
++ * Resolve a caller-supplied media key against the configured mediaRoot.
++ *
++ * @throws {MediaKeyError} when the key is empty, absolute, contains a NUL
++ * byte, uses path traversal, or escapes mediaRoot.
++ */
++export function resolveKey(
++  mediaRoot: string,
++  rawKey: unknown,
++  options?: { decode?: boolean }
++): string {
++  if (typeof rawKey !== 'string' || rawKey.trim() === '') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  // Inputs from a URL query / route segment are percent-encoded, so decode
++  // them. Inputs from a multipart filename are literal and must NOT be decoded
++  // (pass decode: false), otherwise a legitimate name like "100%.png" would be
++  // rejected and "report%41.png" silently rewritten to "reportA.png".
++  let decoded: string;
++  if (options?.decode === false) {
++    decoded = rawKey;
++  } else {
++    try {
++      decoded = decodeURIComponent(rawKey);
++    } catch {
++      throw new MediaKeyError('media key is not valid');
++    }
++  }
++
++  // Reject NUL bytes and backslash (Windows-style separator / traversal).
++  if (decoded.includes('\0') || decoded.includes('\\')) {
++    throw new MediaKeyError('media key is not valid');
++  }
++
++  // Reject absolute paths (POSIX root and Windows drive letters).
++  if (decoded.startsWith('/') || /^[a-zA-Z]:/.test(decoded)) {
++    throw new MediaKeyError('absolute media keys are not allowed');
++  }
++
++  // Normalise, then reject anything that climbs above the current root.
++  const normalized = path.posix.normalize(decoded).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media key may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  const root = normalizeMediaRoot(mediaRoot);
++  if (!root) {
++    return normalized;
++  }
++
++  // The key may arrive already prefixed with mediaRoot (the delete path sends
++  // the full object key) or relative to it (the upload path). Only prefix
++  // when it is not already scoped.
++  const scoped =
++    normalized === root || normalized.startsWith(root + '/')
++      ? normalized
++      : path.posix.join(root, normalized);
++
++  // Defence in depth: the resolved key must stay within mediaRoot.
++  if (scoped !== root && !scoped.startsWith(root + '/')) {
++    throw new MediaKeyError('media key escapes mediaRoot');
++  }
++
++  return scoped;
++}
++
++/**
++ * Resolve a caller-supplied listing directory into a relative prefix.
++ *
++ * The directory is optional: an empty / root directory returns `''` (list the
++ * mediaRoot itself). Otherwise leading/trailing slashes are stripped (matching
++ * the historical handler behaviour) and the result is normalised so it cannot
++ * traverse upward — `path.join(mediaRoot, directory)` would otherwise collapse
++ * `..` and list objects outside mediaRoot. Returns a prefix with a trailing
++ * slash so it can be joined onto mediaRoot directly.
++ *
++ * @throws {MediaKeyError} when the directory contains a NUL byte or backslash,
++ * or uses upward path traversal.
++ */
++export function resolveDirectory(rawDirectory: unknown): string {
++  // Listing directories arrive from a URL query and are decoded once by the
++  // framework; treat them as literal (no further decode).
++  if (typeof rawDirectory !== 'string' || rawDirectory.trim() === '') {
++    return '';
++  }
++
++  if (rawDirectory.includes('\0') || rawDirectory.includes('\\')) {
++    throw new MediaKeyError('media directory is not valid');
++  }
++
++  const trimmed = stripSlashes(rawDirectory);
++  const normalized = path.posix.normalize(trimmed).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media directory may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    return '';
++  }
++
++  return normalized + '/';
++}
+diff --git a/packages/next-tinacms-dos/src/copy-handler.ts b/packages/next-tinacms-dos/src/copy-handler.ts
+index 2c6c338..8da8acb 100644
+--- a/packages/next-tinacms-dos/src/copy-handler.ts
++++ b/packages/next-tinacms-dos/src/copy-handler.ts
+@@ -12,6 +12,7 @@ import {
+   S3ClientConfig,
+ } from '@aws-sdk/client-s3';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import { resolveKey, MediaKeyError } from './media-key';
+ 
+ export interface DOSCopyConfig {
+   config: S3ClientConfig;
+@@ -30,6 +31,7 @@ const findErrorMessage = (e: any) => {
+ export const createCopyHandler = (config: DOSCopyConfig) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
++  const mediaRoot = config.mediaRoot || '';
+ 
+   return async (req: NextApiRequest, res: NextApiResponse) => {
+     const isAuthorized = await config.authorized(req, res);
+@@ -49,10 +51,22 @@ export const createCopyHandler = (config: DOSCopyConfig) => {
+       return res.status(400).json({ message: 'from and to are required' });
+     }
+ 
++    let sourceKey: string;
++    let destinationKey: string;
++    try {
++      sourceKey = resolveKey(mediaRoot, source, { decode: false });
++      destinationKey = resolveKey(mediaRoot, destination, { decode: false });
++    } catch (e) {
++      if (e instanceof MediaKeyError) {
++        return res.status(400).json({ message: e.message });
++      }
++      throw e;
++    }
++
+     const params: CopyObjectCommandInput = {
+       Bucket: bucket,
+-      CopySource: `${bucket}/${source}`,
+-      Key: destination,
++      CopySource: `${bucket}/${sourceKey}`,
++      Key: destinationKey,
+     };
+     const command = new CopyObjectCommand(params);
+     try {
+diff --git a/packages/next-tinacms-dos/src/media-key.ts b/packages/next-tinacms-dos/src/media-key.ts
+new file mode 100644
+index 0000000..c6e3f98
+--- /dev/null
++++ b/packages/next-tinacms-dos/src/media-key.ts
+@@ -0,0 +1,149 @@
++/**
++ * Centralised media object-key resolution / validation.
++ *
++ * Editors may only write to or delete object keys that resolve to a location
++ * inside the operator-configured `mediaRoot`. This helper normalises a
++ * caller-supplied key and guarantees the result stays within that boundary.
++ *
++ * It rejects empty keys, absolute paths, NUL bytes and path-traversal
++ * attempts (including percent-encoded traversal). When `mediaRoot` is empty
++ * (no boundary declared) the key is still normalised and the same illegal
++ * inputs are still rejected, but the key is otherwise returned as-is.
++ *
++ * Callers should catch `MediaKeyError` and translate it into a 4xx response.
++ *
++ * NOTE: this file is intentionally duplicated byte-for-byte across the
++ * first-party media adapters. The shared regression-test vectors guard
++ * against the copies drifting apart.
++ */
++import path from 'node:path';
++
++export class MediaKeyError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'MediaKeyError';
++  }
++}
++
++// Trim leading and trailing slashes without a backtracking regex (avoids
++// polynomial-time matching on attacker-controlled runs of slashes).
++function stripSlashes(value: string): string {
++  let start = 0;
++  let end = value.length;
++  while (start < end && value[start] === '/') start++;
++  while (end > start && value[end - 1] === '/') end--;
++  return value.slice(start, end);
++}
++
++function normalizeMediaRoot(mediaRoot: string): string {
++  if (!mediaRoot) {
++    return '';
++  }
++  return stripSlashes(mediaRoot);
++}
++
++/**
++ * Resolve a caller-supplied media key against the configured mediaRoot.
++ *
++ * @throws {MediaKeyError} when the key is empty, absolute, contains a NUL
++ * byte, uses path traversal, or escapes mediaRoot.
++ */
++export function resolveKey(
++  mediaRoot: string,
++  rawKey: unknown,
++  options?: { decode?: boolean }
++): string {
++  if (typeof rawKey !== 'string' || rawKey.trim() === '') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  // Inputs from a URL query / route segment are percent-encoded, so decode
++  // them. Inputs from a multipart filename are literal and must NOT be decoded
++  // (pass decode: false), otherwise a legitimate name like "100%.png" would be
++  // rejected and "report%41.png" silently rewritten to "reportA.png".
++  let decoded: string;
++  if (options?.decode === false) {
++    decoded = rawKey;
++  } else {
++    try {
++      decoded = decodeURIComponent(rawKey);
++    } catch {
++      throw new MediaKeyError('media key is not valid');
++    }
++  }
++
++  // Reject NUL bytes and backslash (Windows-style separator / traversal).
++  if (decoded.includes('\0') || decoded.includes('\\')) {
++    throw new MediaKeyError('media key is not valid');
++  }
++
++  // Reject absolute paths (POSIX root and Windows drive letters).
++  if (decoded.startsWith('/') || /^[a-zA-Z]:/.test(decoded)) {
++    throw new MediaKeyError('absolute media keys are not allowed');
++  }
++
++  // Normalise, then reject anything that climbs above the current root.
++  const normalized = path.posix.normalize(decoded).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media key may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  const root = normalizeMediaRoot(mediaRoot);
++  if (!root) {
++    return normalized;
++  }
++
++  // The key may arrive already prefixed with mediaRoot (the delete path sends
++  // the full object key) or relative to it (the upload path). Only prefix
++  // when it is not already scoped.
++  const scoped =
++    normalized === root || normalized.startsWith(root + '/')
++      ? normalized
++      : path.posix.join(root, normalized);
++
++  // Defence in depth: the resolved key must stay within mediaRoot.
++  if (scoped !== root && !scoped.startsWith(root + '/')) {
++    throw new MediaKeyError('media key escapes mediaRoot');
++  }
++
++  return scoped;
++}
++
++/**
++ * Resolve a caller-supplied listing directory into a relative prefix.
++ *
++ * The directory is optional: an empty / root directory returns `''` (list the
++ * mediaRoot itself). Otherwise leading/trailing slashes are stripped (matching
++ * the historical handler behaviour) and the result is normalised so it cannot
++ * traverse upward — `path.join(mediaRoot, directory)` would otherwise collapse
++ * `..` and list objects outside mediaRoot. Returns a prefix with a trailing
++ * slash so it can be joined onto mediaRoot directly.
++ *
++ * @throws {MediaKeyError} when the directory contains a NUL byte or backslash,
++ * or uses upward path traversal.
++ */
++export function resolveDirectory(rawDirectory: unknown): string {
++  // Listing directories arrive from a URL query and are decoded once by the
++  // framework; treat them as literal (no further decode).
++  if (typeof rawDirectory !== 'string' || rawDirectory.trim() === '') {
++    return '';
++  }
++
++  if (rawDirectory.includes('\0') || rawDirectory.includes('\\')) {
++    throw new MediaKeyError('media directory is not valid');
++  }
++
++  const trimmed = stripSlashes(rawDirectory);
++  const normalized = path.posix.normalize(trimmed).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media directory may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    return '';
++  }
++
++  return normalized + '/';
++}
+diff --git a/packages/next-tinacms-s3/src/app-handlers.ts b/packages/next-tinacms-s3/src/app-handlers.ts
+index a5b8b51..4b2a401 100644
+--- a/packages/next-tinacms-s3/src/app-handlers.ts
++++ b/packages/next-tinacms-s3/src/app-handlers.ts
+@@ -19,6 +19,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+ import type { Media, MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { NextResponse } from 'next/server';
++import { resolveKey, resolveDirectory, MediaKeyError } from './media-key';
+ 
+ export interface S3AppRouterConfig {
+   config: S3ClientConfig;
+@@ -76,8 +77,15 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+   async function listMedia(request: Request) {
+     const url = new URL(request.url);
+     const directory = url.searchParams.get('directory') || '';
+-    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-    if (prefix) prefix = prefix + '/';
++    let prefix: string;
++    try {
++      prefix = resolveDirectory(directory);
++    } catch (e) {
++      if (e instanceof MediaKeyError) {
++        return NextResponse.json({ message: e.message }, { status: 400 });
++      }
++      throw e;
++    }
+ 
+     const params: ListObjectsCommandInput = {
+       Bucket: bucket,
+@@ -129,13 +137,22 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+         if (!key) {
+           return listMedia(req);
+         }
++        let objectKey: string;
++        try {
++          objectKey = resolveKey(mediaRoot, key, { decode: false });
++        } catch (e) {
++          if (e instanceof MediaKeyError) {
++            return NextResponse.json({ message: e.message }, { status: 400 });
++          }
++          throw e;
++        }
+         const expiresIn = Number(url.searchParams.get('expiresIn')) || 3600;
+         const signedUrl = await getSignedUrl(
+           client,
+-          new PutObjectCommand({ Bucket: bucket, Key: key }),
++          new PutObjectCommand({ Bucket: bucket, Key: objectKey }),
+           { expiresIn }
+         );
+-        return NextResponse.json({ signedUrl, src: key });
++        return NextResponse.json({ signedUrl, src: objectKey });
+       })(request);
+     },
+ 
+@@ -149,18 +166,27 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+             { status: 400 }
+           );
+         }
++        let objectKey: string;
++        try {
++          objectKey = resolveKey(mediaRoot, key, { decode: false });
++        } catch (e) {
++          if (e instanceof MediaKeyError) {
++            return NextResponse.json({ message: e.message }, { status: 400 });
++          }
++          throw e;
++        }
+         const body = Buffer.from(await req.arrayBuffer());
+         const contentType =
+           req.headers.get('content-type') || 'application/octet-stream';
+         await client.send(
+           new PutObjectCommand({
+             Bucket: bucket,
+-            Key: key,
++            Key: objectKey,
+             Body: body,
+             ContentType: contentType,
+           })
+         );
+-        return NextResponse.json({ id: key, src: key });
++        return NextResponse.json({ id: objectKey, src: objectKey });
+       })(request);
+     },
+ 
+@@ -168,7 +194,16 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+       return withAuth(async (_req, ctx) => {
+         const media = ctx?.params?.media || [];
+         const [, ...rest] = media;
+-        const objectKey = rest.join('/');
++        const rawKey = rest.join('/');
++        let objectKey: string;
++        try {
++          objectKey = resolveKey(mediaRoot, rawKey, { decode: false });
++        } catch (e) {
++          if (e instanceof MediaKeyError) {
++            return NextResponse.json({ message: e.message }, { status: 400 });
++          }
++          throw e;
++        }
+ 
+         const params: DeleteObjectCommandInput = {
+           Bucket: bucket,
+diff --git a/packages/next-tinacms-s3/src/batch-delete.ts b/packages/next-tinacms-s3/src/batch-delete.ts
+index 440230f..2b47f4b 100644
+--- a/packages/next-tinacms-s3/src/batch-delete.ts
++++ b/packages/next-tinacms-s3/src/batch-delete.ts
+@@ -13,6 +13,7 @@ import {
+   S3ClientConfig,
+ } from '@aws-sdk/client-s3';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import { resolveKey, MediaKeyError } from './media-key';
+ 
+ export interface S3BatchDeleteConfig {
+   config: S3ClientConfig;
+@@ -31,6 +32,7 @@ const findErrorMessage = (e: any) => {
+ export const createBatchDeleteHandler = (config: S3BatchDeleteConfig) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
++  const mediaRoot = config.mediaRoot || '';
+ 
+   return async (req: NextApiRequest, res: NextApiResponse) => {
+     const isAuthorized = await config.authorized(req, res);
+@@ -49,10 +51,22 @@ export const createBatchDeleteHandler = (config: S3BatchDeleteConfig) => {
+       return res.status(400).json({ message: 'keys are required' });
+     }
+ 
++    let objectKeys: string[];
++    try {
++      objectKeys = selected.map((key) =>
++        resolveKey(mediaRoot, key, { decode: false })
++      );
++    } catch (e) {
++      if (e instanceof MediaKeyError) {
++        return res.status(400).json({ message: e.message });
++      }
++      throw e;
++    }
++
+     const params: DeleteObjectsCommandInput = {
+       Bucket: bucket,
+       Delete: {
+-        Objects: selected.map((key) => ({ Key: key })),
++        Objects: objectKeys.map((key) => ({ Key: key })),
+         Quiet: true,
+       },
+     };
+diff --git a/packages/next-tinacms-s3/src/handlers.ts b/packages/next-tinacms-s3/src/handlers.ts
+index 729abc0..e58f432 100644
+--- a/packages/next-tinacms-s3/src/handlers.ts
++++ b/packages/next-tinacms-s3/src/handlers.ts
+@@ -18,6 +18,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+ import { Media, MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import { resolveKey, resolveDirectory, MediaKeyError } from './media-key';
+ 
+ export interface S3Config {
+   config: S3ClientConfig;
+@@ -66,15 +67,28 @@ export const createMediaHandler = (config: S3Config, options?: S3Options) => {
+     switch (req.method) {
+       case 'GET':
+         if (req.query.key) {
+-          const expiresIn: number =
+-            (req.query.expiresIn && Number(req.query.expiresIn)) || 3600;
+-          const s3_key = req.query.key
+-            ? Array.isArray(req.query.key)
+-              ? req.query.key[0]
+-              : req.query.key
+-            : null;
+-          if (!s3_key) {
+-            return res.status(400).json({ message: 'key is required' });
++          // Cap the presigned URL validity: expiresIn is caller-controlled and
++          // was otherwise bounded only by SigV4's 7-day ceiling, which would
++          // mint a long-lived offline write primitive. Default and max: 3600s.
++          const requestedExpiresIn = Number(req.query.expiresIn);
++          const expiresIn =
++            Number.isFinite(requestedExpiresIn) && requestedExpiresIn > 0
++              ? Math.min(requestedExpiresIn, 3600)
++              : 3600;
++          const rawKey = Array.isArray(req.query.key)
++            ? req.query.key[0]
++            : req.query.key;
++          let s3_key: string;
++          try {
++            // Next already decodes req.query once; decoding again here would
++            // mangle keys containing a literal "%" (e.g. "100%off.png"), the
++            // same reason the delete path passes { decode: false }.
++            s3_key = resolveKey(mediaRoot, rawKey, { decode: false });
++          } catch (e) {
++            if (e instanceof MediaKeyError) {
++              return res.status(400).json({ message: e.message });
++            }
++            throw e;
+           }
+           if (await keyExists(client, bucket, s3_key)) {
+             return res.status(400).json({ message: 'key already exists' });
+@@ -90,7 +104,7 @@ export const createMediaHandler = (config: S3Config, options?: S3Options) => {
+         }
+         return listMedia(req, res, client, bucket, mediaRoot, cdnUrl);
+       case 'DELETE':
+-        return deleteAsset(req, res, client, bucket);
++        return deleteAsset(req, res, client, bucket, mediaRoot);
+       default:
+         res.end(404);
+     }
+@@ -130,8 +144,18 @@ async function listMedia(
+       offset,
+     } = req.query as MediaListOptions;
+ 
+-    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-    if (prefix) prefix = prefix + '/';
++    let prefix: string;
++    try {
++      // Reject upward traversal: directory flows into path.join(mediaRoot,
++      // prefix), which would otherwise collapse ".." and list outside mediaRoot.
++      prefix = resolveDirectory(directory);
++    } catch (e) {
++      if (e instanceof MediaKeyError) {
++        res.status(400).json({ message: e.message });
++        return;
++      }
++      throw e;
++    }
+ 
+     const params: ListObjectsCommandInput = {
+       Bucket: bucket,
+@@ -200,10 +224,23 @@ async function deleteAsset(
+   req: NextApiRequest,
+   res: NextApiResponse,
+   client: S3Client,
+-  bucket: string
++  bucket: string,
++  mediaRoot: string
+ ) {
+   const { media } = req.query;
+-  const [, objectKey] = media as string[];
++  const [, rawKey] = media as string[];
++
++  let objectKey: string;
++  try {
++    // The framework already decodes the route param once; decoding again here
++    // would mangle keys containing a literal "%" (e.g. "100%off.png").
++    objectKey = resolveKey(mediaRoot, rawKey, { decode: false });
++  } catch (e) {
++    if (e instanceof MediaKeyError) {
++      return res.status(400).json({ message: e.message });
++    }
++    throw e;
++  }
+ 
+   const params: DeleteObjectCommandInput = {
+     Bucket: bucket,
+diff --git a/packages/next-tinacms-s3/src/media-key.ts b/packages/next-tinacms-s3/src/media-key.ts
+new file mode 100644
+index 0000000..c6e3f98
+--- /dev/null
++++ b/packages/next-tinacms-s3/src/media-key.ts
+@@ -0,0 +1,149 @@
++/**
++ * Centralised media object-key resolution / validation.
++ *
++ * Editors may only write to or delete object keys that resolve to a location
++ * inside the operator-configured `mediaRoot`. This helper normalises a
++ * caller-supplied key and guarantees the result stays within that boundary.
++ *
++ * It rejects empty keys, absolute paths, NUL bytes and path-traversal
++ * attempts (including percent-encoded traversal). When `mediaRoot` is empty
++ * (no boundary declared) the key is still normalised and the same illegal
++ * inputs are still rejected, but the key is otherwise returned as-is.
++ *
++ * Callers should catch `MediaKeyError` and translate it into a 4xx response.
++ *
++ * NOTE: this file is intentionally duplicated byte-for-byte across the
++ * first-party media adapters. The shared regression-test vectors guard
++ * against the copies drifting apart.
++ */
++import path from 'node:path';
++
++export class MediaKeyError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'MediaKeyError';
++  }
++}
++
++// Trim leading and trailing slashes without a backtracking regex (avoids
++// polynomial-time matching on attacker-controlled runs of slashes).
++function stripSlashes(value: string): string {
++  let start = 0;
++  let end = value.length;
++  while (start < end && value[start] === '/') start++;
++  while (end > start && value[end - 1] === '/') end--;
++  return value.slice(start, end);
++}
++
++function normalizeMediaRoot(mediaRoot: string): string {
++  if (!mediaRoot) {
++    return '';
++  }
++  return stripSlashes(mediaRoot);
++}
++
++/**
++ * Resolve a caller-supplied media key against the configured mediaRoot.
++ *
++ * @throws {MediaKeyError} when the key is empty, absolute, contains a NUL
++ * byte, uses path traversal, or escapes mediaRoot.
++ */
++export function resolveKey(
++  mediaRoot: string,
++  rawKey: unknown,
++  options?: { decode?: boolean }
++): string {
++  if (typeof rawKey !== 'string' || rawKey.trim() === '') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  // Inputs from a URL query / route segment are percent-encoded, so decode
++  // them. Inputs from a multipart filename are literal and must NOT be decoded
++  // (pass decode: false), otherwise a legitimate name like "100%.png" would be
++  // rejected and "report%41.png" silently rewritten to "reportA.png".
++  let decoded: string;
++  if (options?.decode === false) {
++    decoded = rawKey;
++  } else {
++    try {
++      decoded = decodeURIComponent(rawKey);
++    } catch {
++      throw new MediaKeyError('media key is not valid');
++    }
++  }
++
++  // Reject NUL bytes and backslash (Windows-style separator / traversal).
++  if (decoded.includes('\0') || decoded.includes('\\')) {
++    throw new MediaKeyError('media key is not valid');
++  }
++
++  // Reject absolute paths (POSIX root and Windows drive letters).
++  if (decoded.startsWith('/') || /^[a-zA-Z]:/.test(decoded)) {
++    throw new MediaKeyError('absolute media keys are not allowed');
++  }
++
++  // Normalise, then reject anything that climbs above the current root.
++  const normalized = path.posix.normalize(decoded).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media key may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    throw new MediaKeyError('a media key is required');
++  }
++
++  const root = normalizeMediaRoot(mediaRoot);
++  if (!root) {
++    return normalized;
++  }
++
++  // The key may arrive already prefixed with mediaRoot (the delete path sends
++  // the full object key) or relative to it (the upload path). Only prefix
++  // when it is not already scoped.
++  const scoped =
++    normalized === root || normalized.startsWith(root + '/')
++      ? normalized
++      : path.posix.join(root, normalized);
++
++  // Defence in depth: the resolved key must stay within mediaRoot.
++  if (scoped !== root && !scoped.startsWith(root + '/')) {
++    throw new MediaKeyError('media key escapes mediaRoot');
++  }
++
++  return scoped;
++}
++
++/**
++ * Resolve a caller-supplied listing directory into a relative prefix.
++ *
++ * The directory is optional: an empty / root directory returns `''` (list the
++ * mediaRoot itself). Otherwise leading/trailing slashes are stripped (matching
++ * the historical handler behaviour) and the result is normalised so it cannot
++ * traverse upward — `path.join(mediaRoot, directory)` would otherwise collapse
++ * `..` and list objects outside mediaRoot. Returns a prefix with a trailing
++ * slash so it can be joined onto mediaRoot directly.
++ *
++ * @throws {MediaKeyError} when the directory contains a NUL byte or backslash,
++ * or uses upward path traversal.
++ */
++export function resolveDirectory(rawDirectory: unknown): string {
++  // Listing directories arrive from a URL query and are decoded once by the
++  // framework; treat them as literal (no further decode).
++  if (typeof rawDirectory !== 'string' || rawDirectory.trim() === '') {
++    return '';
++  }
++
++  if (rawDirectory.includes('\0') || rawDirectory.includes('\\')) {
++    throw new MediaKeyError('media directory is not valid');
++  }
++
++  const trimmed = stripSlashes(rawDirectory);
++  const normalized = path.posix.normalize(trimmed).replace(/^\.\//, '');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new MediaKeyError('media directory may not traverse directories');
++  }
++  if (normalized === '' || normalized === '.') {
++    return '';
++  }
++
++  return normalized + '/';
++}

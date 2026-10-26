@@ -1,0 +1,132 @@
+diff --git a/routers/api/v1/repo/release.go b/routers/api/v1/repo/release.go
+index 272b395..acfe003 100644
+--- a/routers/api/v1/repo/release.go
++++ b/routers/api/v1/repo/release.go
+@@ -21,6 +21,10 @@ import (
+ 	release_service "code.gitea.io/gitea/services/release"
+ )
+ 
++func canAccessDraftRelease(ctx *context.APIContext) bool {
++	return ctx.IsSigned && ctx.Repo.CanWrite(unit.TypeReleases)
++}
++
+ // GetRelease get a single release of a repository
+ func GetRelease(ctx *context.APIContext) {
+ 	// swagger:operation GET /repos/{owner}/{repo}/releases/{id} repository repoGetRelease
+@@ -62,6 +66,15 @@ func GetRelease(ctx *context.APIContext) {
+ 		return
+ 	}
+ 
++	if release.IsDraft { // only the users with write access can see draft releases
++		if !canAccessDraftRelease(ctx) {
++			if !ctx.Written() {
++				ctx.APIErrorNotFound()
++			}
++			return
++		}
++	}
++
+ 	if err := release.LoadAttributes(ctx); err != nil {
+ 		ctx.APIErrorInternal(err)
+ 		return
+diff --git a/routers/api/v1/repo/release_attachment.go b/routers/api/v1/repo/release_attachment.go
+index 33f0125..6b30070 100644
+--- a/routers/api/v1/repo/release_attachment.go
++++ b/routers/api/v1/repo/release_attachment.go
+@@ -34,6 +34,14 @@ func checkReleaseMatchRepo(ctx *context.APIContext, releaseID int64) bool {
+ 		ctx.APIErrorNotFound()
+ 		return false
+ 	}
++	if release.IsDraft {
++		if !canAccessDraftRelease(ctx) {
++			if !ctx.Written() {
++				ctx.APIErrorNotFound()
++			}
++			return false
++		}
++	}
+ 	return true
+ }
+ 
+@@ -141,6 +149,14 @@ func ListReleaseAttachments(ctx *context.APIContext) {
+ 		ctx.APIErrorNotFound()
+ 		return
+ 	}
++	if release.IsDraft {
++		if !canAccessDraftRelease(ctx) {
++			if !ctx.Written() {
++				ctx.APIErrorNotFound()
++			}
++			return
++		}
++	}
+ 	if err := release.LoadAttributes(ctx); err != nil {
+ 		ctx.APIErrorInternal(err)
+ 		return
+diff --git a/routers/web/repo/attachment.go b/routers/web/repo/attachment.go
+index a83f0f4..3601b4f 100644
+--- a/routers/web/repo/attachment.go
++++ b/routers/web/repo/attachment.go
+@@ -131,17 +131,48 @@ func ServeAttachment(ctx *context.Context, uuid string) {
+ 		return
+ 	}
+ 
++	unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, attach)
++	if err != nil {
++		ctx.ServerError("GetAttachmentLinkedTypeAndRepoID", err)
++		return
++	}
++	if repoID == 0 {
++		repoID = attach.RepoID
++	}
+ 	// prevent visiting attachment from other repository directly
+-	// The check will be ignored before this code merged.
+-	if attach.CreatedUnix > repo_model.LegacyAttachmentMissingRepoIDCutoff && ctx.Repo.Repository != nil && ctx.Repo.Repository.ID != attach.RepoID {
++	if ctx.Repo.Repository != nil && repoID != 0 && ctx.Repo.Repository.ID != repoID {
+ 		ctx.HTTPError(http.StatusNotFound)
+ 		return
+ 	}
+ 
+-	unitType, repoID, err := repo_service.GetAttachmentLinkedTypeAndRepoID(ctx, attach)
+-	if err != nil {
+-		ctx.ServerError("GetAttachmentLinkedTypeAndRepoID", err)
+-		return
++	if unitType == unit.TypeReleases && attach.ReleaseID != 0 {
++		rel, err := repo_model.GetReleaseByID(ctx, attach.ReleaseID)
++		if err != nil {
++			ctx.ServerError("GetReleaseByID", err)
++			return
++		}
++		if rel.IsDraft {
++			var canWrite bool
++			if ctx.Repo.Repository != nil {
++				canWrite = ctx.Repo.Permission.CanWrite(unit.TypeReleases)
++			} else {
++				repo, err := repo_model.GetRepositoryByID(ctx, repoID)
++				if err != nil {
++					ctx.ServerError("GetRepositoryByID", err)
++					return
++				}
++				ownPerm, err := access_model.GetUserRepoPermission(ctx, repo, ctx.Doer)
++				if err != nil {
++					ctx.ServerError("GetUserRepoPermission", err)
++					return
++				}
++				canWrite = ownPerm.CanWrite(unit.TypeReleases)
++			}
++			if !canWrite {
++				ctx.HTTPError(http.StatusNotFound)
++				return
++			}
++		}
+ 	}
+ 
+ 	if unitType == unit.TypeInvalid { // unlinked attachment can only be accessed by the uploader
+@@ -170,6 +201,7 @@ func ServeAttachment(ctx *context.Context, uuid string) {
+ 			ctx.HTTPError(http.StatusNotFound)
+ 			return
+ 		}
++
+ 	}
+ 
+ 	if err := attach.IncreaseDownloadCount(ctx); err != nil {

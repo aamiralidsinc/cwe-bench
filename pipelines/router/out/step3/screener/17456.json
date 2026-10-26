@@ -1,0 +1,97 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17456",
+  "advisory_ids": ["GHSA-FQ95-V8XC-JM3V", "CVE-2026-62987", "GO-2026-6566"],
+  "repo": "fabiolb/fabio",
+  "pinned_commit": "b88860fcc564b680bba5e920d70d8d511bb483b4",
+  "fix_commits": ["240526a8004077edad4fb96d25b382bfc3901357"],
+  "trust_decision": {
+    "summary": "Whether a header name listed by the client in the Connection header is treated as proxy-protected (kept out of the hop-by-hop list, so the value fabio set survives to the upstream) or as client-managed hop-by-hop (dropped); decided per request in addHeaders at proxy/http_headers.go:56 against a fixed package-level map at proxy/http_headers.go:28-36 that never includes the operator-configured ClientIPHeader/TLSHeader/RequestID names set at proxy/http_headers.go:70-74 and :151-157 and proxy/http_proxy.go:85-91.",
+    "evidence": ["proxy/http_headers.go:56", "proxy/http_headers.go:28-36", "proxy/http_headers.go:70-74", "proxy/http_headers.go:151-157", "proxy/http_proxy.go:85-91", "main.go:226-241"]
+  },
+  "landing_point": {
+    "where": "proxy/http_headers.go:28-36",
+    "why": "An engineer reading only the summary ('operator-configured trust headers still strippable via the Connection header') finds the Connection token filter at :56 and the protected-name map literal that decides membership; it is the only place membership exists in the pinned tree."
+  },
+  "fix_sites": [
+    {"where": "main.go:186-241", "entry_point": "fabio startup: every configured http/https listen entry (main.go:379-389) calls newHTTPProxy, which builds the HTTPProxy without any protected-header set", "module_kind": "binary composition root (package main)"},
+    {"where": "proxy/http_headers.go:28-36", "entry_point": "fabio HTTP/HTTPS listener -> proxy.HTTPProxy.ServeHTTP (main.go:226 -> proxy/http_proxy.go:80)", "module_kind": "library package (proxy)"},
+    {"where": "proxy/http_headers.go:45-60", "entry_point": "proxy.HTTPProxy.ServeHTTP -> addHeaders; also the exported addHeaders-level API used by the package's own tests (proxy/http_headers_test.go:397)", "module_kind": "library package (proxy)"},
+    {"where": "proxy/http_proxy.go:44-78", "entry_point": "public API: exported proxy.HTTPProxy struct, constructed directly by embedders and by the project's integration tests (proxy/http_integration_test.go:51)", "module_kind": "exported library API"},
+    {"where": "proxy/http_proxy.go:175", "entry_point": "proxy.HTTPProxy.ServeHTTP -> addHeaders(r, p.ProtectHeaders, p.Config, t.StripPath)", "module_kind": "library package (proxy)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "main.go:186-241"
+  },
+  "O3_reason_to_dismiss": "The filtering logic and the map are both inside proxy/http_headers.go, so the proxy package looks like the whole fix; main.go only wires startup config, so extending the map literal there (or hardcoding the three common names) is argued to be equivalent.",
+  "O5_coupled_behaviour": {
+    "what": "Client-named hop-by-hop headers must still be stripped from the upstream request (pinned test asserts Legit-Header1/2 arrive empty: proxy/http_integration_test.go:76-81; unit case keeps only keep-alive in Connection: proxy/http_headers_test.go:58-70), while 'Upgrade' must survive into the forwarded Connection header for websocket handshakes (proxy/http_proxy.go:193-201 sends the mutated request through newWSHandler, which writes it raw at proxy/ws_handler.go:55). An over-broad fix that protects every Connection token, or that deletes Connection outright, breaks one of these two.",
+    "where": "proxy/http_headers.go:51-65"
+  },
+  "O6_input_shapes": [
+    "single Connection token naming a configured header (e.g. 'Connection: x-client-ip')",
+    "multiple tokens in one Connection line, mixed with legitimate hop-by-hop names ('keep-alive, x-forwarded-for, x-forwarded-host, legit-header1, legit-header2' as in proxy/http_integration_test.go:65-67)",
+    "multiple Connection header lines, iterated via r.Header.Values at proxy/http_headers.go:53",
+    "arbitrary operator-chosen header names and case variants, canonicalised with textproto.CanonicalMIMEHeaderKey (proxy/http_headers.go:56)",
+    "the same configured name applied on TLS vs plain requests (TLSHeader set or deleted at proxy/http_headers.go:151-157) and the RequestID set on every request at proxy/http_proxy.go:85-91"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "config/load.go:149-152",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "proxy/http_proxy.go:80-91",
+      "sibling": "A second construction path for the same handler (exported proxy.HTTPProxy built directly, as in proxy/http_integration_test.go:51 and :91) where a caller-supplied protect set is absent, so the default protected names stop being protected unless the handler merges its own defaults.",
+      "why_realistic": "The published fix adds exactly this caller-supplied field and leaves it nil for direct constructors; the pinned tests already construct &HTTPProxy{Config: ...} with no way to pass a set, so a maintainer would plausibly write 'if p.ProtectHeaders == nil { p.ProtectHeaders = DefaultProtectHeaders }' or default inside addHeaders."
+    },
+    {
+      "where": "proxy/ws_handler.go:55",
+      "sibling": "A second writer of the outgoing request: the websocket path hijacks the connection and re-serialises the request with r.Write, bypassing httputil.ReverseProxy's hop-by-hop handling, so a handshake-specific header filter could live here.",
+      "why_realistic": "proxy/http_handler.go:17-37 delegates hop-by-hop stripping to the stdlib reverse proxy; the websocket route has no such delegate, which makes a maintainer put sanitisation either in addHeaders (as today) or in the ws handshake writer."
+    },
+    {
+      "where": "proxy/grpc_handler.go:52-58",
+      "sibling": "A parallel trust-header surface for the grpc/grpcs listener: all incoming metadata is copied verbatim to the upstream context (md.Copy()), with a client-controlled 'dsthost' metadata key at :168-175, so a configurable trusted-metadata list could exist here.",
+      "why_realistic": "main.go:390-397 serves grpc from the same config block as http; a maintainer adding proxy.header.* options would plausibly extend them to grpc metadata, where HTTP/2 has no Connection header and a separate mechanism is required."
+    }
+  ],
+  "O9_family": "trust-boundary / spoofed-header family (CWE-290 authentication bypass by spoofing, CWE-348 use of less trusted source): proxy-trusted request headers are removable by the client so the upstream sees no trusted value",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.2 (go.mod:3), standard go build / make; no vendor directory, so the module cache must be reachable at build time",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "proxy/http_headers_test.go (table-driven TestAddHeaders, including the earlier 'https request hack' Connection case at :58-70), proxy/http_integration_test.go (TestProxyProducesCorrectXForwardedSomethingHeader :44-82, TestProxyRequestIDHeader :84-107, all httptest-based on 127.0.0.1), proxy/ws_integration_test.go (TestProxyWSUpstream)"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "main.go, proxy/http_headers.go, proxy/http_proxy.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add the three common names (X-Client-Ip, X-Forwarded-Ssl, X-Request-Id) to the package-level protectHeaders map at proxy/http_headers.go:28-36; that passes any example written with those literal names but leaves every other operator-configured name strippable, and a set built only in main.go leaves direct proxy.HTTPProxy constructors with no protection at all."
+  },
+  "out_of_scope_notes": [
+    "route/access_rules.go:42-63 makes allow/deny decisions from the client-supplied X-Forwarded-For, evaluated at proxy/http_proxy.go:108 before addHeaders runs at :175; a separate trust question, not pursued.",
+    "When listen proxyproto is enabled, serve.go:150-155 and proxy/tcp/proxy_proto.go trust a client-supplied PROXY protocol header for the remote address; documented LB-trust assumption (docs/content/feature/proxy-protocol.md), outside this advisory."
+  ],
+  "unverified": [
+    "Build not executed (no shell in this session); buildability inferred from go.mod:3, the absence of a vendor directory and the httptest-only proxy tests.",
+    "Repository size in MB not measured (no shell), so the tiny_repo / giant_repo red flags cannot be confirmed; candidate flags show c_compact_small_repo=0.",
+    "No 'latest' tree was available, so nothing under O8 could be checked against current code (O8 is empty at the pinned commit because addHeaders at proxy/http_headers.go:175 is its only caller and its only production reach is proxy.HTTPProxy.ServeHTTP).",
+    "Hidden-test coupling: tests seeded from this fix diff reference the new exported proxy.DefaultProtectHeaders map and the HTTPProxy.ProtectHeaders field, so a functionally equivalent fix that keeps addHeaders' pinned 3-argument signature (reading cfg.ClientIPHeader/TLSHeader/RequestID inside the Connection loop at proxy/http_headers.go:56) would not compile against them; the report must name the expected API or the tests must be behavioural only."
+  ]
+}

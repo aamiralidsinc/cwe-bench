@@ -1,0 +1,127 @@
+diff --git a/pkg/modules/auth/openid/openid.go b/pkg/modules/auth/openid/openid.go
+index 381570f42..b7c5209ab 100644
+--- a/pkg/modules/auth/openid/openid.go
++++ b/pkg/modules/auth/openid/openid.go
+@@ -72,8 +72,29 @@ type Provider struct {
+ 	Oauth2Config        *oauth2.Config `json:"-"`
+ }
+ 
++// boolish decodes a JSON bool or the strings "true"/"false"/"1"/"0" — some
++// providers emit flags such as email_verified as a string.
++type boolish bool
++
++func (b *boolish) UnmarshalJSON(data []byte) error {
++	var raw any
++	if err := json.Unmarshal(data, &raw); err != nil {
++		return err
++	}
++	switch v := raw.(type) {
++	case bool:
++		*b = boolish(v)
++	case string:
++		*b = boolish(v == "true" || v == "1")
++	default:
++		*b = false
++	}
++	return nil
++}
++
+ type claims struct {
+ 	Email              string                   `json:"email"`
++	EmailVerified      boolish                  `json:"email_verified"`
+ 	Name               string                   `json:"name"`
+ 	PreferredUsername  string                   `json:"preferred_username"`
+ 	Nickname           string                   `json:"nickname"`
+@@ -335,6 +356,15 @@ func syncUserAvatarFromOpenID(s *xorm.Session, u *user.User, pictureURL string)
+ 	return nil
+ }
+ 
++// verifiedFallbackEmail returns the address that may be used to match an existing local
++// account. Only an address the provider asserts as verified is eligible.
++func verifiedFallbackEmail(cl *claims, provider *Provider) string {
++	if provider.EmailFallback && bool(cl.EmailVerified) {
++		return cl.Email
++	}
++	return ""
++}
++
+ func getOrCreateUser(s *xorm.Session, cl *claims, provider *Provider, idToken *oidc.IDToken) (u *user.User, err error) {
+ 
+ 	// set defaults
+@@ -359,34 +389,44 @@ func getOrCreateUser(s *xorm.Session, cl *claims, provider *Provider, idToken *o
+ 	}
+ 
+ 	if !alreadyCreatedFromIssuer && (provider.EmailFallback || provider.UsernameFallback) {
++		email := verifiedFallbackEmail(cl, provider)
++
++		// An unverified address that already belongs to a local account must not be used to
++		// reach that account, and no second account may be created for it.
++		if provider.EmailFallback && email == "" && cl.Email != "" {
++			existing, lookupErr := user.GetUserWithEmail(s, &user.User{
++				Issuer: user.IssuerLocal,
++				Email:  cl.Email,
++			})
++			if lookupErr == nil || user.IsErrUserStatusError(lookupErr) {
++				return nil, &user.ErrEmailNotConfirmed{UserID: existing.ID}
++			}
++			if !user.IsErrUserDoesNotExist(lookupErr) {
++				return nil, lookupErr
++			}
++		}
+ 
+-		// try finding the user on fallback mappingproperties
++		if email != "" || provider.UsernameFallback {
++			searchUser := &user.User{Issuer: user.IssuerLocal}
++			if provider.UsernameFallback {
++				searchUser.Username = idToken.Subject
++			}
++			searchUser.Email = email
+ 
+-		searchUser := &user.User{
+-			Issuer: user.IssuerLocal,
+-		}
+-		if provider.UsernameFallback {
+-			// Match oidc subject on username as each is unique identifier in its own referential
+-			// Discouraged if multiple account providers are used.
+-			searchUser.Username = idToken.Subject
+-		}
+-		if provider.EmailFallback {
+-			// Used alone, allow for someone to connect from various provider to the same account
+-			// Discouraged for untrusted provider where someone can set email without verification
+-			// Note : mapping on email prevent from auto-updating user email
+-			searchUser.Email = cl.Email
+-		}
++			u, err = user.GetUserWithEmail(s, searchUser)
++			if err != nil && !user.IsErrUserDoesNotExist(err) && !user.IsErrUserStatusError(err) {
++				return nil, err
++			}
++			fallbackMatchFound = err == nil || user.IsErrUserStatusError(err)
+ 
+-		// Check if the user exists for the given fallback matching options
+-		u, err = user.GetUserWithEmail(s, searchUser)
+-		if err != nil && !user.IsErrUserDoesNotExist(err) && !user.IsErrUserStatusError(err) {
+-			return nil, err
+-		}
+-		fallbackMatchFound = err == nil || user.IsErrUserStatusError(err)
++			if fallbackMatchFound && user.IsErrUserStatusError(err) {
++				return u, nil
++			}
+ 
+-		// Same as above: disabled/locked user found via fallback — return early.
+-		if fallbackMatchFound && user.IsErrUserStatusError(err) {
+-			return u, nil
++			// The account must have established that it owns the address.
++			if fallbackMatchFound && email != "" && u.Status == user.StatusEmailConfirmationRequired {
++				return nil, &user.ErrEmailNotConfirmed{UserID: u.ID}
++			}
+ 		}
+ 	}
+ 
+@@ -439,6 +479,7 @@ func getOrCreateUser(s *xorm.Session, cl *claims, provider *Provider, idToken *o
+ func mergeClaims(cl *claims, cl2 *claims, forceUserInfo bool) error {
+ 	if (forceUserInfo && cl2.Email != "") || cl.Email == "" {
+ 		cl.Email = cl2.Email
++		cl.EmailVerified = cl2.EmailVerified
+ 	}
+ 
+ 	if (forceUserInfo && cl2.Name != "") || cl.Name == "" {

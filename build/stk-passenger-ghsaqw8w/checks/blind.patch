@@ -1,0 +1,430 @@
+diff -ruN a/ext/common/ServerInstanceDir.h b/ext/common/ServerInstanceDir.h
+--- a/ext/common/ServerInstanceDir.h	2026-10-26 02:42:34.000000000 +0000
++++ b/ext/common/ServerInstanceDir.h	2026-10-26 05:07:53.305102336 +0000
+@@ -32,6 +32,7 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <dirent.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <pwd.h>
+ #include <grp.h>
+@@ -188,14 +189,112 @@
+ private:
+ 	string path;
+ 	bool owner;
+-	
++
++	/* The device and inode of the directory that this object created or
++	 * verified. The path is resolved again for every operation that writes
++	 * below it, so each such operation has to confirm first that the name
++	 * still refers to this same directory. An entry at the same name that
++	 * resolves to something else means that the location was replaced after
++	 * it was verified, which is what a prepared temporary location looks
++	 * like; such a location must never be written to.
++	 */
++	dev_t boundDevice;
++	ino_t boundInode;
++	bool  bound;
++
+ 	friend class Generation;
+-	
++
++	/**
++	 * lstat() the given path. Unlike the type checks used elsewhere this does
++	 * not follow a link in the last component, because the last component is
++	 * exactly the predictable name that another user may have prepared.
++	 * Returns whether the entry exists; any other error is thrown so that an
++	 * entry we cannot inspect is never mistaken for a missing one.
++	 */
++	static bool lstatEntry(const string &path, struct stat *buf) {
++		int ret;
++		do {
++			ret = lstat(path.c_str(), buf);
++		} while (ret == -1 && errno == EAGAIN);
++		if (ret == 0) {
++			return true;
++		} else if (errno == ENOENT) {
++			return false;
++		} else {
++			int e = errno;
++			throw FileSystemException("Cannot lstat '" + path + "'", e, path);
++		}
++	}
++
++	/**
++	 * Record the identity of the directory named by the path. The directory is
++	 * opened without following a link in the last component, and what was
++	 * actually opened is compared against the entry that was just examined, so
++	 * that a replacement between the examination and this open is detected
++	 * here instead of being used.
++	 */
++	void bindTo(const struct stat &expected) {
++		TRACE_POINT();
++		int fd;
++		do {
++			fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++		} while (fd == -1 && errno == EINTR);
++		if (fd == -1) {
++			int e = errno;
++			throw FileSystemException("Cannot open server instance directory '" +
++				path + "'", e, path);
++		}
++
++		struct stat actual;
++		int ret;
++		do {
++			ret = fstat(fd, &actual);
++		} while (ret == -1 && errno == EINTR);
++		int e = errno;
++		close(fd);
++		if (ret == -1) {
++			throw FileSystemException("Cannot fstat server instance directory '" +
++				path + "'", e, path);
++		}
++		if (!S_ISDIR(actual.st_mode)
++		 || actual.st_dev != expected.st_dev
++		 || actual.st_ino != expected.st_ino) {
++			throw RuntimeException("The server instance directory '" + path +
++				"' is not the directory that was examined");
++		}
++		boundDevice = actual.st_dev;
++		boundInode  = actual.st_ino;
++		bound = true;
++	}
++
++	/**
++	 * Refuse to continue when the entry at the path is no longer the directory
++	 * that this object created or verified. Must be called before anything is
++	 * created, removed or re-permissioned through the path.
++	 */
++	void requireStillOurs() const {
++		if (!bound) {
++			return;
++		}
++		struct stat now;
++		if (!lstatEntry(path, &now)) {
++			throw FileSystemException("Server instance directory '" + path +
++				"' does not exist anymore", ENOENT, path);
++		}
++		if (!S_ISDIR(now.st_mode)
++		 || now.st_dev != boundDevice
++		 || now.st_ino != boundInode) {
++			throw RuntimeException("The server instance directory '" + path +
++				"' changed after it was verified");
++		}
++	}
++
+ 	void initialize(const string &path, bool owner) {
+ 		TRACE_POINT();
+ 		this->path  = path;
+ 		this->owner = owner;
+-		
++		this->bound = false;
++
+ 		/* Create the server instance directory. We only need to write to this
+ 		 * directory for these reasons:
+ 		 * 1. Initial population of structure files (structure_version.txt, instance.pid).
+@@ -212,24 +311,28 @@
+ 		 * rights though, because we want admin tools to be able to list the available
+ 		 * generations no matter what user they're running as.
+ 		 */
+-		if (owner) {
+-			switch (getFileType(path)) {
+-			case FT_NONEXISTANT:
+-				createDirectory(path);
+-				break;
+-			case FT_DIRECTORY:
+-				verifyDirectoryPermissions(path);
+-				break;
+-			default:
++		struct stat entry;
++		if (lstatEntry(path, &entry)) {
++			/* The name already exists. It is only usable when it is a plain
++			 * directory in which nobody else has a say; a link is refused even
++			 * when it resolves to a directory with the right mode and owner,
++			 * because a link is resolved again for every later operation. */
++			if (!S_ISDIR(entry.st_mode)) {
+ 				throw RuntimeException("'" + path + "' already exists, and is not a directory");
+ 			}
+-		} else if (getFileType(path) != FT_DIRECTORY) {
++			if (owner) {
++				checkReusableDirectory(entry);
++			}
++			bindTo(entry);
++		} else if (owner) {
++			createDirectory(path);
++		} else {
+ 			throw RuntimeException("Server instance directory '" + path +
+ 				"' does not exist");
+ 		}
+ 	}
+ 
+-	void createDirectory(const string &path) const {
++	void createDirectory(const string &path) {
+ 		// We do not use makeDirTree() here. If an attacker creates a directory
+ 		// just before we do, then we want to abort because we want the directory
+ 		// to have specific permissions.
+@@ -238,38 +341,64 @@
+ 			throw FileSystemException("Cannot create server instance directory '" +
+ 				path + "'", e, path);
+ 		}
++		/* Take a handle on the entry that was just created, and apply the mode
++		 * and ownership through that handle. Even if the name is swapped for
++		 * something else right after mkdir() succeeded, the changes below only
++		 * ever touch the directory this call created. */
++		int fd;
++		do {
++			fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++		} while (fd == -1 && errno == EINTR);
++		if (fd == -1) {
++			int e = errno;
++			throw FileSystemException("Cannot open server instance directory '" +
++				path + "'", e, path);
++		}
++		struct stat created;
++		int ret;
++		do {
++			ret = fstat(fd, &created);
++		} while (ret == -1 && errno == EINTR);
++		if (ret == -1) {
++			int e = errno;
++			close(fd);
++			throw FileSystemException("Cannot fstat server instance directory '" +
++				path + "'", e, path);
++		}
+ 		// Explicitly chmod the directory in case the umask is interfering.
+-		if (chmod(path.c_str(), parseModeString("u=rwx,g=rx,o=rx")) == -1) {
++		if (fchmod(fd, parseModeString("u=rwx,g=rx,o=rx")) == -1) {
+ 			int e = errno;
++			close(fd);
+ 			throw FileSystemException("Cannot set permissions on server instance directory '" +
+ 				path + "'", e, path);
+ 		}
+-		// verifyDirectoryPermissions() checks for the owner/group so we must make
++		// checkReusableDirectory() checks for the owner/group so we must make
+ 		// sure the server instance directory has that owner/group, even when the
+ 		// parent directory has setgid on.
+-		if (chown(path.c_str(), geteuid(), getegid()) == -1) {
++		if (fchown(fd, geteuid(), getegid()) == -1) {
+ 			int e = errno;
++			close(fd);
+ 			throw FileSystemException("Cannot change the permissions of the server "
+ 				"instance directory '" + path + "'", e, path);
+ 		}
++		close(fd);
++		boundDevice = created.st_dev;
++		boundInode  = created.st_ino;
++		bound = true;
+ 	}
+ 
+ 	/**
+ 	 * When reusing an existing server instance directory, check permissions
+ 	 * so that an attacker cannot pre-create a directory with too liberal
+-	 * permissions.
++	 * permissions. The entry was already classified as a plain directory by
++	 * the caller.
+ 	 */
+-	void verifyDirectoryPermissions(const string &path) {
++	void checkReusableDirectory(const struct stat &entry) const {
+ 		TRACE_POINT();
+-		struct stat buf;
+-
+-		if (stat(path.c_str(), &buf) == -1) {
+-			int e = errno;
+-			throw FileSystemException("Cannot stat() " + path, e, path);
+-		} else if (buf.st_mode != (S_IFDIR | parseModeString("u=rwx,g=rx,o=rx"))) {
++		if (entry.st_mode != (S_IFDIR | parseModeString("u=rwx,g=rx,o=rx"))) {
+ 			throw RuntimeException("Tried to reuse existing server instance directory " +
+ 				path + ", but it has wrong permissions");
+-		} else if (buf.st_uid != geteuid() || buf.st_gid != getegid()) {
++		} else if (entry.st_uid != geteuid() || entry.st_gid != getegid()) {
+ 			/* The server instance directory is always created by the Watchdog. Its UID/GID never
+ 			 * changes because:
+ 			 * 1. Disabling user switching only lowers the privilege of the HelperAgent.
+@@ -309,6 +438,17 @@
+ 
+ 	void destroy() {
+ 		if (owner) {
++			struct stat entry;
++			if (!lstatEntry(path, &entry)) {
++				/* The directory is already gone; there is nothing to remove. */
++				return;
++			}
++			/* removeDirTree() re-permissions and removes the whole tree by
++			 * name, so the name must still refer to the directory that this
++			 * object created or verified. Otherwise the removal would be
++			 * carried out on whatever the name points to now. */
++			requireStillOurs();
++
+ 			GenerationPtr newestGeneration;
+ 			try {
+ 				newestGeneration = getNewestGeneration();
+@@ -339,6 +479,11 @@
+ 	                            const string &defaultGroup, uid_t webServerWorkerUid,
+ 	                            gid_t webServerWorkerGid)
+ 	{
++		/* The generation directory is created through the path, which is
++		 * resolved again here; refuse when the path no longer names the
++		 * directory that was verified. */
++		requireStillOurs();
++
+ 		GenerationPtr newestGeneration = getNewestGeneration();
+ 		unsigned int newNumber;
+ 		if (newestGeneration != NULL) {
+diff -ruN a/lib/phusion_passenger/platform_info.rb b/lib/phusion_passenger/platform_info.rb
+--- a/lib/phusion_passenger/platform_info.rb	2026-10-26 02:42:34.000000000 +0000
++++ b/lib/phusion_passenger/platform_info.rb	2026-10-26 05:35:57.799557541 +0000
+@@ -236,23 +236,37 @@
+ 	end
+ 	memoize :tmpdir
+ 	
++	# Creates and runs a small executable below 'dir'. The name of the probe
++	# used to be predictable, so another user could put an entry there and have
++	# it truncated, re-permissioned and executed. The probe is now created
++	# inside a fresh directory that only this process can enter, and the file
++	# itself is created exclusively, so nothing that already exists is opened.
++	# Returns whether the probe could be executed.
++	def self.executable_probe_works(dir)
++		result = false
++		PhusionPassenger::Utils.mktmpdir("passenger-exe-", dir) do |subdir|
++			filename = "#{subdir}/test-exe"
++			File.open(filename, File::WRONLY | File::CREAT | File::EXCL, 0700) do |f|
++				f.puts("#!/bin/sh")
++			end
++			File.chmod(0700, filename)
++			result = system(filename) ? true : false
++		end
++		return result
++	end
++	private_class_method :executable_probe_works
++
+ 	# Returns the directory in which test executables should be placed. The
+ 	# returned directory is guaranteed to be writable and guaranteed to
+ 	# not be mounted with the 'noexec' option.
+ 	# If no such directory can be found then it will raise a PlatformInfo::RuntimeError
+ 	# with an appropriate error message.
+ 	def self.tmpexedir
+-		basename = "test-exe.#{Process.pid}.#{Thread.current.object_id}"
+ 		attempts = []
+-		
++
+ 		dir = tmpdir
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if executable_probe_works(dir)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -264,18 +278,11 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+-		
++
+ 		dir = Dir.pwd
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if executable_probe_works(dir)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -287,10 +294,8 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+-		
++
+ 		message = "ERROR: Cannot find suitable temporary directory\n" +
+ 			"In order to run certain tests, this program " +
+ 			"must be able to write temporary\n" +
+diff -ruN a/lib/phusion_passenger/utils/tmpdir.rb b/lib/phusion_passenger/utils/tmpdir.rb
+--- a/lib/phusion_passenger/utils/tmpdir.rb	2026-10-26 02:42:34.000000000 +0000
++++ b/lib/phusion_passenger/utils/tmpdir.rb	2026-10-26 05:08:09.161088077 +0000
+@@ -48,19 +48,60 @@
+ 			dir.gsub!(%r{//+}, '/')
+ 			@@passenger_tmpdir = dir
+ 		end
+-		if create && !File.exist?(dir)
+-			# This is a very minimal implementation of the subdirectory
+-			# creation logic in ServerInstanceDir.h. This implementation
+-			# is only meant to make the unit tests pass. For production
+-			# systems one should pre-create the temp directory with
+-			# ServerInstanceDir.h.
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", dir)
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/generation-0")
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/backends")
++		if create
++			prepare_tmpdir(dir)
+ 		end
+ 		return dir
+ 	end
+-	
++
++	# This is a very minimal implementation of the subdirectory creation logic
++	# in ServerInstanceDir.h. This implementation is only meant to make the unit
++	# tests pass. For production systems one should pre-create the temp
++	# directory with ServerInstanceDir.h.
++	#
++	# The name is derived from the process ID, so another user on the machine
++	# can prepare it before this process starts. The directory is therefore
++	# created here and, when it already exists, only used after checking that
++	# it is a plain directory which belongs to this process and which nobody
++	# else may write to. A link is refused even when it resolves to such a
++	# directory: every later write through the returned path would follow it
++	# again, so nothing below a prepared name can be considered ours.
++	def self.prepare_tmpdir(dir)
++		created = false
++		begin
++			Dir.mkdir(dir, 0700)
++			created = true
++		rescue Errno::EEXIST
++			# The name is taken; inspect what is there below.
++		rescue Errno::ENOENT
++			# The parent directories don't exist yet. Create them, but still
++			# create the last component ourselves so that it is ours.
++			require 'fileutils'
++			FileUtils.mkdir_p(File.dirname(dir))
++			begin
++				Dir.mkdir(dir, 0700)
++				created = true
++			rescue Errno::EEXIST
++			end
++		end
++
++		stat = File.lstat(dir)
++		if !stat.directory? || stat.uid != Process.uid || (stat.mode & 022) != 0
++			raise SecurityError,
++				"Refusing to use an unsafe temporary directory '#{dir}'"
++		end
++		return if !created
++
++		["generation-0", "backends"].each do |name|
++			begin
++				Dir.mkdir("#{dir}/#{name}", 0700)
++			rescue Errno::EEXIST
++				# Already present; leave it alone.
++			end
++		end
++	end
++	private_class_method :prepare_tmpdir
++
+ 	def self.passenger_tmpdir=(dir)
+ 		@@passenger_tmpdir = dir
+ 	end

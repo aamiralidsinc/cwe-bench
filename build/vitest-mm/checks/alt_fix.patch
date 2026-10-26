@@ -1,0 +1,208 @@
+diff --git a/packages/browser/src/node/commands/artifacts.ts b/packages/browser/src/node/commands/artifacts.ts
+index ba6874f..3aa2252 100644
+--- a/packages/browser/src/node/commands/artifacts.ts
++++ b/packages/browser/src/node/commands/artifacts.ts
+@@ -1,7 +1,7 @@
+ import type { BrowserCommand } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { dirname, resolve } from 'node:path'
+-import { assertFileAccess } from './fs'
++import { assertFileAccess, canWrite } from './fs'
+ 
+ /**
+  * Writes a test artifact (a recorded payload, a generated report fragment, …)
+@@ -10,6 +10,7 @@ import { assertFileAccess } from './fs'
+ export const exportArtifact: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
++  if (!canWrite(project)) { return }
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+index 9d4cb2a..58706c0 100644
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -3,13 +3,45 @@ import type { BrowserCommand, TestProject } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+-import { isFileServingAllowed } from 'vitest/node'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++export function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++/**
++ * File writes and deletes are refused while any API that fronts this project is
++ * reachable from the network. The browser API inherits the runner's binding, so
++ * the runner's own API is part of the check.
++ */
++export function canWrite(project: TestProject): boolean {
++  const bindings = [
++    project.vitest.config.api,
++    project.config.api,
++    project.vitest.config.browser.api,
++    project.config.browser.api,
++  ]
++  return !bindings.some(isApiExposed)
++}
++
++function isInsideRoot(root: string, filepath: string): boolean {
++  const target = resolve(filepath)
++  const base = resolve(root)
++  return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++}
++
++/**
++ * A path is reachable only when it sits inside one of the project's own roots.
++ * This is checked on its own, so it still holds when the project widens
++ * Vite's file-serving settings.
++ */
+ export function assertFileAccess(path: string, project: TestProject): void {
+-  if (
+-    !isFileServingAllowed(path, project.vite)
+-    && !isFileServingAllowed(path, project.vitest.vite)
+-  ) {
++  const roots = [project.config.root, project.vitest.config.root].filter(Boolean) as string[]
++  if (!roots.some(root => isInsideRoot(root, path))) {
+     throw new Error(
+       `Access denied to "${path}". See Vite config documentation for "server.fs": https://vitejs.dev/config/server-options.html#server-fs-strict.`,
+     )
+@@ -31,6 +63,7 @@ export const readFile: BrowserCommand<
+ export const writeFile: BrowserCommand<
+   Parameters<BrowserCommands['writeFile']>
+ > = async ({ project }, path, data, options) => {
++  if (!canWrite(project)) { return }
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+@@ -43,6 +76,7 @@ export const writeFile: BrowserCommand<
+ export const removeFile: BrowserCommand<
+   Parameters<BrowserCommands['removeFile']>
+ > = async ({ project }, path) => {
++  if (!canWrite(project)) { return }
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   await fsp.rm(filepath)
+diff --git a/packages/browser/src/node/plugin.ts b/packages/browser/src/node/plugin.ts
+index 0b23b6d..a035a43 100644
+--- a/packages/browser/src/node/plugin.ts
++++ b/packages/browser/src/node/plugin.ts
+@@ -12,7 +12,6 @@ import { basename, dirname, extname, join, resolve } from 'pathe'
+ import sirv from 'sirv'
+ import { coverageConfigDefaults } from 'vitest/config'
+ import {
+-  isFileServingAllowed,
+   isValidApiRequest,
+   resolveApiServerConfig,
+   resolveFsAllow,
+@@ -191,7 +190,13 @@ export default (parentServer: ParentBrowserProject, base = '/'): Plugin[] => {
+ 
+           const fsPath = decodeURIComponent(path)
+ 
+-          if (!isFileServingAllowed(parentServer.vite.config, fsPath)) {
++          const roots = [parentServer.project?.config?.root, parentServer.vitest?.config?.root].filter(Boolean) as string[]
++          const target = resolve(fsPath)
++          const inside = roots.some((root: string) => {
++            const base = resolve(root)
++            return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++          })
++          if (!inside) {
+             return next()
+           }
+ 
+diff --git a/packages/ui/node/index.ts b/packages/ui/node/index.ts
+index 9a9af99..23b07e0 100644
+--- a/packages/ui/node/index.ts
++++ b/packages/ui/node/index.ts
+@@ -7,7 +7,7 @@ import { basename, resolve } from 'pathe'
+ import sirv from 'sirv'
+ import c from 'tinyrainbow'
+ import { coverageConfigDefaults } from 'vitest/config'
+-import { isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { isValidApiRequest } from 'vitest/node'
+ import { version } from '../package.json'
+ 
+ export default (ctx: Vitest): Plugin => {
+@@ -74,11 +74,26 @@ export default (ctx: Vitest): Plugin => {
+ 
+             const fsPath = decodeURIComponent(path)
+ 
+-            if (!isFileServingAllowed(ctx.vite.config, fsPath)) {
++            const roots = [ctx.config.root, ctx.getRootProject?.()?.config?.root].filter(Boolean) as string[]
++            const target = resolve(fsPath)
++            const inside = roots.some((root) => {
++              const base = resolve(root)
++              return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++            })
++            if (!inside) {
+               return next()
+             }
+ 
+             if (req.method === 'POST') {
++              // writes are refused while the control server is network-reachable
++              const api = ctx.config.api
++              const exposed = api && !api.middlewareMode && api.host
++                && api.host !== 'localhost' && api.host !== '127.0.0.1'
++              if (exposed) {
++                res.writeHead(204)
++                res.end()
++                return
++              }
+               // save the attachment the UI is holding back to disk
+               const chunks: Buffer[] = []
+               req.on('data', (chunk: Buffer) => {
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index f4c9a9c..c18fd2d 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -28,6 +28,19 @@ import { getModuleGraph } from '../utils/graph'
+ import { stringifyReplace } from '../utils/serialization'
+ import { isValidApiRequest } from './check'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++function canMutate(ctx: Vitest): boolean {
++  return !isApiExposed(ctx.config.api)
++}
++
+ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   const wss = new WebSocketServer({ noServer: true })
+ 
+@@ -80,12 +93,15 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+             )
+           }
++          if (!canMutate(ctx)) { return }
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          if (!canMutate(ctx)) { return }
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          if (!canMutate(ctx)) { return }
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -150,6 +166,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return getModuleGraph(ctx, project, id, browser)
+         },
+         async updateSnapshot(file?: File) {
++          if (!canMutate(ctx)) { return }
+           if (!file) {
+             await ctx.updateSnapshot()
+           }

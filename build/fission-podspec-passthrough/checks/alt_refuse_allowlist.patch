@@ -1,0 +1,167 @@
+diff --git a/charts/fission-all/templates/webhook-server/webhooks.yaml b/charts/fission-all/templates/webhook-server/webhooks.yaml
+index f9413ce5..54f10d72 100644
+--- a/charts/fission-all/templates/webhook-server/webhooks.yaml
++++ b/charts/fission-all/templates/webhook-server/webhooks.yaml
+@@ -70,8 +70,7 @@ webhooks:
+     - fission.io
+     apiVersions:
+     - v1
+-    operations:
+-    - CREATE
++    operations: ["CREATE", "UPDATE"]
+     resources:
+     - environments
+   sideEffects: None
+diff --git a/pkg/apis/core/v1/validation.go b/pkg/apis/core/v1/validation.go
+index 816a3f29..bba96637 100644
+--- a/pkg/apis/core/v1/validation.go
++++ b/pkg/apis/core/v1/validation.go
+@@ -29,6 +29,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/robfig/cron/v3"
++	apiv1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/validation"
+ 
+@@ -293,6 +294,9 @@ func (spec FunctionSpec) Validate() error {
+ 		errs = errors.Join(errs, spec.InvokeStrategy.Validate())
+ 	}
+ 
++	for _, p := range PodSpecPrivilegeProblems(spec.PodSpec) {
++		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.PodSpec", p, "not allowed"))
++	}
+ 	if spec.InvokeStrategy.ExecutionStrategy.ExecutorType == ExecutorTypeContainer && spec.PodSpec == nil {
+ 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
+ 	}
+@@ -666,6 +670,18 @@ func (e *Environment) Validate() error {
+ 			}
+ 		}
+ 	}
++	for _, p := range PodSpecPrivilegeProblems(e.Spec.Runtime.PodSpec) {
++		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Environment.spec.runtime.podspec", p, "not allowed"))
++	}
++	for _, p := range PodSpecPrivilegeProblems(e.Spec.Builder.PodSpec) {
++		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Environment.spec.builder.podspec", p, "not allowed"))
++	}
++	for _, p := range ContainerPrivilegeProblems(e.Spec.Runtime.Container) {
++		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Environment.spec.runtime.container", p, "not allowed"))
++	}
++	for _, p := range ContainerPrivilegeProblems(e.Spec.Builder.Container) {
++		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Environment.spec.builder.container", p, "not allowed"))
++	}
+ 	return errs
+ }
+ 
+@@ -748,3 +764,64 @@ func (ml *MessageQueueTriggerList) Validate() error {
+ 	}
+ 	return errs
+ }
++
++// allowedAddedCapabilities is the container runtime's default capability
++// set (minus DAC_OVERRIDE and NET_RAW): a tenant may re-add these after
++// dropping ALL, and nothing else.
++var allowedAddedCapabilities = map[string]bool{
++	"AUDIT_WRITE": true, "CHOWN": true, "FOWNER": true, "FSETID": true, "KILL": true, "MKNOD": true,
++	"NET_BIND_SERVICE": true, "SETFCAP": true, "SETGID": true, "SETPCAP": true, "SETUID": true, "SYS_CHROOT": true,
++}
++
++// ContainerPrivilegeProblems lists the settings of a tenant-supplied
++// container that would give it more than an ordinary unprivileged container.
++func ContainerPrivilegeProblems(c *apiv1.Container) []string {
++	if c == nil || c.SecurityContext == nil {
++		return nil
++	}
++	var out []string
++	sc := c.SecurityContext
++	if sc.Privileged != nil && *sc.Privileged {
++		out = append(out, c.Name+": privileged")
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		out = append(out, c.Name+": allowPrivilegeEscalation")
++	}
++	if sc.Capabilities != nil {
++		for _, cp := range sc.Capabilities.Add {
++			n := strings.TrimPrefix(strings.ToUpper(string(cp)), "CAP_")
++			if !allowedAddedCapabilities[n] {
++				out = append(out, c.Name+": capability "+n)
++			}
++		}
++	}
++	return out
++}
++
++// PodSpecPrivilegeProblems lists the pod-level and container-level settings
++// of a tenant-supplied pod spec that would reach the node or another
++// identity.
++func PodSpecPrivilegeProblems(ps *apiv1.PodSpec) []string {
++	if ps == nil {
++		return nil
++	}
++	var out []string
++	if ps.HostNetwork || ps.HostPID || ps.HostIPC {
++		out = append(out, "host namespaces")
++	}
++	if ps.ServiceAccountName != "" || ps.DeprecatedServiceAccount != "" {
++		out = append(out, "service account")
++	}
++	for _, v := range ps.Volumes {
++		if v.HostPath != nil {
++			out = append(out, "hostPath volume "+v.Name)
++		}
++	}
++	for i := range ps.Containers {
++		out = append(out, ContainerPrivilegeProblems(&ps.Containers[i])...)
++	}
++	for i := range ps.InitContainers {
++		out = append(out, ContainerPrivilegeProblems(&ps.InitContainers[i])...)
++	}
++	return out
++}
+diff --git a/pkg/executor/util/merge.go b/pkg/executor/util/merge.go
+index 244eb021..0e5f84a3 100644
+--- a/pkg/executor/util/merge.go
++++ b/pkg/executor/util/merge.go
+@@ -23,6 +23,8 @@ import (
+ 
+ 	"dario.cat/mergo"
+ 	apiv1 "k8s.io/api/core/v1"
++
++	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+ )
+ 
+ // TODO: replace functions here with native kubernetes strategic merge patch.
+@@ -36,6 +38,9 @@ func MergeContainer(dst *apiv1.Container, src *apiv1.Container) (*apiv1.Containe
+ 	if src == nil {
+ 		return dst, nil
+ 	}
++	if problems := fv1.ContainerPrivilegeProblems(src); len(problems) > 0 {
++		return nil, fmt.Errorf("refusing container override: %v", problems)
++	}
+ 
+ 	// to prevent any modification to the original obj
+ 	dstC := *dst
+@@ -59,6 +64,10 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
+ 	if targetPodSpec == nil {
+ 		return srcPodSpec, nil
+ 	}
++	// Objects stored before admission checked them still reach here.
++	if problems := fv1.PodSpecPrivilegeProblems(targetPodSpec); len(problems) > 0 {
++		return nil, fmt.Errorf("refusing pod spec: %v", problems)
++	}
+ 
+ 	var multierr error
+ 
+diff --git a/pkg/webhook/environment.go b/pkg/webhook/environment.go
+index 23959397..11c3dee7 100644
+--- a/pkg/webhook/environment.go
++++ b/pkg/webhook/environment.go
+@@ -42,7 +42,7 @@ func (r *Environment) SetupWebhookWithManager(mgr ctrl.Manager) error {
+ var _ webhook.CustomDefaulter = &Environment{}
+ 
+ // user: change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
+-//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
++//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create;update,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
+ 
+ var _ webhook.CustomValidator = &Environment{}
+ 

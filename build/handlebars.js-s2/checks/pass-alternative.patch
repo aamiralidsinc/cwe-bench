@@ -1,0 +1,202 @@
+diff --git a/lib/handlebars/compiler/base.js b/lib/handlebars/compiler/base.js
+index 7ce7d70..1604c68 100644
+--- a/lib/handlebars/compiler/base.js
++++ b/lib/handlebars/compiler/base.js
+@@ -12,9 +12,6 @@ extend(yy, Helpers);
+ export function parseWithoutProcessing(input, options) {
+   // Just return if an already-compiled AST was passed in.
+   if (input.type === 'Program') {
+-    // When a pre-parsed AST is passed in, validate all node values to prevent
+-    // code injection via type-confused literals.
+-    validateInputAst(input);
+     return input;
+   }
+ 
+@@ -37,65 +34,3 @@ export function parse(input, options) {
+   return strip.accept(ast);
+ }
+ 
+-function validateInputAst(ast) {
+-  validateAstNode(ast);
+-}
+-
+-function validateAstNode(node) {
+-  if (node == null) {
+-    return;
+-  }
+-
+-  if (Array.isArray(node)) {
+-    node.forEach(validateAstNode);
+-    return;
+-  }
+-
+-  if (typeof node !== 'object') {
+-    return;
+-  }
+-
+-  if (node.type === 'PathExpression') {
+-    if (!isValidDepth(node.depth)) {
+-      throw new Exception(
+-        'Invalid AST: PathExpression.depth must be an integer'
+-      );
+-    }
+-    if (!Array.isArray(node.parts)) {
+-      throw new Exception('Invalid AST: PathExpression.parts must be an array');
+-    }
+-    for (let i = 0; i < node.parts.length; i++) {
+-      if (typeof node.parts[i] !== 'string') {
+-        throw new Exception(
+-          'Invalid AST: PathExpression.parts must only contain strings'
+-        );
+-      }
+-    }
+-  } else if (node.type === 'NumberLiteral') {
+-    if (typeof node.value !== 'number' || !isFinite(node.value)) {
+-      throw new Exception('Invalid AST: NumberLiteral.value must be a number');
+-    }
+-  } else if (node.type === 'BooleanLiteral') {
+-    if (typeof node.value !== 'boolean') {
+-      throw new Exception(
+-        'Invalid AST: BooleanLiteral.value must be a boolean'
+-      );
+-    }
+-  }
+-
+-  Object.keys(node).forEach(propertyName => {
+-    if (propertyName === 'loc') {
+-      return;
+-    }
+-    validateAstNode(node[propertyName]);
+-  });
+-}
+-
+-function isValidDepth(depth) {
+-  return (
+-    typeof depth === 'number' &&
+-    isFinite(depth) &&
+-    Math.floor(depth) === depth &&
+-    depth >= 0
+-  );
+-}
+diff --git a/lib/handlebars/compiler/compiler.js b/lib/handlebars/compiler/compiler.js
+index f20dfb3..6fc00d3 100644
+--- a/lib/handlebars/compiler/compiler.js
++++ b/lib/handlebars/compiler/compiler.js
+@@ -48,6 +48,7 @@ Compiler.prototype = {
+   guid: 0,
+ 
+   compile: function(program, options) {
++    validateDocument(program);
+     this.sourceNode = [];
+     this.opcodes = [];
+     this.children = [];
+@@ -487,6 +488,109 @@ Compiler.prototype = {
+   }
+ };
+ 
++function badAst(node, message) {
++  return new Exception('Invalid AST: ' + node.type + ' ' + message, node);
++}
++
++function requireStringArray(node, value, name) {
++  if (!isArray(value)) {
++    throw badAst(node, name + ' must be an array');
++  }
++  for (let i = 0; i < value.length; i++) {
++    if (typeof value[i] !== 'string') {
++      throw badAst(node, name + ' must only contain strings');
++    }
++  }
++}
++
++function requireDepth(node) {
++  let depth = node.depth;
++  if (depth == null) {
++    return;
++  }
++  if (
++    typeof depth !== 'number' ||
++    !isFinite(depth) ||
++    Math.floor(depth) !== depth ||
++    depth < 0
++  ) {
++    throw badAst(node, 'depth must be a non-negative integer');
++  }
++}
++
++/**
++ * Validate every value a document contributes to the generated code. The
++ * compiler runs this once for the document (and each child program) before it
++ * emits anything, so every caller of the compiler stages is covered.
++ */
++function validateDocument(node) {
++  if (node == null || typeof node !== 'object') {
++    return;
++  }
++  if (isArray(node)) {
++    node.forEach(validateDocument);
++    return;
++  }
++
++  if (node.type === 'Program') {
++    if (node.blockParams != null) {
++      requireStringArray(node, node.blockParams, 'blockParams');
++    }
++  } else if (node.type === 'PathExpression') {
++    requireStringArray(node, node.parts, 'parts');
++    if (node.original !== undefined && typeof node.original !== 'string') {
++      throw badAst(node, 'original must be a string');
++    }
++  } else if (node.type === 'StringLiteral') {
++    if (typeof node.value !== 'string') {
++      throw badAst(node, 'value must be a string');
++    }
++  } else if (node.type === 'NumberLiteral') {
++    if (typeof node.value !== 'number') {
++      throw badAst(node, 'value must be a number');
++    }
++  } else if (node.type === 'BooleanLiteral') {
++    if (typeof node.value !== 'boolean') {
++      throw badAst(node, 'value must be a boolean');
++    }
++  } else if (node.type === 'BigIntLiteral') {
++    if (typeof node.value !== 'string' || !/^-?\d+$/.test(node.value)) {
++      throw badAst(node, 'value must be an integer');
++    }
++  } else if (node.type === 'ContentStatement') {
++    if (node.value != null && typeof node.value !== 'string') {
++      throw badAst(node, 'value must be a string');
++    }
++  } else if (node.type === 'Hash') {
++    if (!isArray(node.pairs)) {
++      throw badAst(node, 'pairs must be an array');
++    }
++    for (let i = 0; i < node.pairs.length; i++) {
++      if (!node.pairs[i] || typeof node.pairs[i].key !== 'string') {
++        throw badAst(node, 'pair keys must be strings');
++      }
++    }
++  } else if (
++    (node.type === 'PartialStatement' ||
++      node.type === 'PartialBlockStatement') &&
++    node.indent != null &&
++    !/^[ \t]*$/.test(node.indent)
++  ) {
++    throw badAst(node, 'indent must be whitespace');
++  }
++
++  if (node.depth !== undefined) {
++    requireDepth(node);
++  }
++
++  Object.keys(node).forEach(function(propertyName) {
++    if (propertyName === 'loc') {
++      return;
++    }
++    validateDocument(node[propertyName]);
++  });
++}
++
+ export function precompile(input, options, env) {
+   if (
+     input == null ||

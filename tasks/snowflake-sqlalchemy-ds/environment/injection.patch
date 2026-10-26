@@ -1,0 +1,237 @@
+diff --git a/src/snowflake/sqlalchemy/__init__.py b/src/snowflake/sqlalchemy/__init__.py
+index a553685..56fdc64 100644
+--- a/src/snowflake/sqlalchemy/__init__.py
++++ b/src/snowflake/sqlalchemy/__init__.py
+@@ -44,6 +44,7 @@ from .custom_commands import (  # noqa
+     MergeInto,
+     PARQUETFormatter,
+ )
++from .external_volume import CreateExternalVolume, ExternalVolumeLocation  # noqa
+ from .custom_types import (  # noqa
+     ARRAY,
+     BYTEINT,
+@@ -83,6 +84,7 @@ from .sql.custom_schema.options import (  # noqa
+     SnowflakeKeyword,
+     TableOptionKey,
+     TargetLagOption,
++    TagOption,
+     TimeUnit,
+ )
+ 
+@@ -151,6 +153,8 @@ _custom_commands = (
+     "ExternalStage",
+     "CreateStage",
+     "CreateFileFormat",
++    "CreateExternalVolume",
++    "ExternalVolumeLocation",
+ )
+ 
+ _custom_tables = ("HybridTable", "DynamicTable", "IcebergTable", "SnowflakeTable")
+@@ -162,6 +166,7 @@ _custom_table_options = (
+     "IdentifierOption",
+     "KeywordOption",
+     "ClusterByOption",
++    "TagOption",
+ )
+ 
+ _enums = (
+diff --git a/src/snowflake/sqlalchemy/external_volume.py b/src/snowflake/sqlalchemy/external_volume.py
+new file mode 100644
+index 0000000..05024ec
+--- /dev/null
++++ b/src/snowflake/sqlalchemy/external_volume.py
+@@ -0,0 +1,93 @@
++#
++# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
++#
++"""Helpers for Snowflake external volumes.
++
++An external volume groups the storage locations that Iceberg tables use.  A
++location carries an operator-chosen name, the object-storage URI, the storage
++provider and, optionally, inline credentials.  The compiled statement is built
++by :func:`visit_create_external_volume` below, which is registered for the
++Snowflake dialect through SQLAlchemy's ``compiles`` extension point so that
++``CustomTableBase``-style statements and standalone ``DDLElement`` instances
++can be compiled with the dialect object alone.
++"""
++
++from sqlalchemy.ext.compiler import compiles
++from sqlalchemy.sql.ddl import DDLElement
++
++__all__ = ["ExternalVolumeLocation", "CreateExternalVolume"]
++
++
++class ExternalVolumeLocation:
++    """A single ``STORAGE_LOCATIONS`` entry of an external volume.
++
++    Example::
++
++        ExternalVolumeLocation(
++            name="iceberg_storage",
++            uri="s3://corp-iceberg/warehouse",
++            storage_provider="S3",
++            credentials={"AWS_KEY_ID": "key", "AWS_SECRET_KEY": "secret"},
++        )
++    """
++
++    def __init__(self, name, uri, storage_provider="S3", credentials=None):
++        self.name = name
++        self.uri = uri
++        self.storage_provider = storage_provider
++        self.credentials = dict(credentials or {})
++
++    def __repr__(self):
++        return (
++            f"ExternalVolumeLocation(name={self.name!r}, uri={self.uri!r}, "
++            f"storage_provider={self.storage_provider!r})"
++        )
++
++
++class CreateExternalVolume(DDLElement):
++    """``CREATE [OR REPLACE] EXTERNAL VOLUME`` for Iceberg storage."""
++
++    def __init__(
++        self,
++        name,
++        locations,
++        allowlist=None,
++        comment=None,
++        replace_if_exists=False,
++    ):
++        super().__init__()
++        self.name = name
++        self.locations = list(locations)
++        self.allowlist = list(allowlist or [])
++        self.comment = comment
++        self.replace_if_exists = replace_if_exists
++
++
++@compiles(CreateExternalVolume, "snowflake")
++def visit_create_external_volume(element, compiler, **kw):
++    locations = []
++    for location in element.locations:
++        parts = [
++            "NAME = {}".format(location.name),
++            "LOCATION = '{}'".format(location.uri),
++            "STORAGE_PROVIDER = '{}'".format(location.storage_provider),
++        ]
++        if location.credentials:
++            parts.append(
++                "CREDENTIALS=({})".format(
++                    " ".join(f"{n}='{v}'" for n, v in location.credentials.items())
++                )
++            )
++        locations.append("(" + " ".join(parts) + ")")
++    text = "CREATE {}EXTERNAL VOLUME {} STORAGE_LOCATIONS = ({})".format(
++        "OR REPLACE " if element.replace_if_exists else "",
++        element.name,
++        ", ".join(locations),
++    )
++    if element.allowlist:
++        text += " ALLOWLIST = ({})".format(
++            ", ".join("'{}'".format(host) for host in element.allowlist)
++        )
++    if element.comment is not None:
++        text += " COMMENT = '{}'".format(element.comment)
++    return text
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/__init__.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/__init__.py
+index e94ea46..0f74097 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/__init__.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/__init__.py
+@@ -8,6 +8,7 @@ from .identifier_option import IdentifierOption, IdentifierOptionType
+ from .keyword_option import KeywordOption, KeywordOptionType
+ from .keywords import SnowflakeKeyword
+ from .literal_option import LiteralOption, LiteralOptionType
++from .tag_option import TagOption, TagOptionType
+ from .table_option import TableOptionKey
+ from .target_lag_option import TargetLagOption, TargetLagOptionType, TimeUnit
+ 
+@@ -18,6 +19,7 @@ __all__ = [
+     "KeywordOption",
+     "AsQueryOption",
+     "TargetLagOption",
++    "TagOption",
+     "ClusterByOption",
+     # Enums
+     "TimeUnit",
+@@ -29,5 +31,6 @@ __all__ = [
+     "AsQueryOptionType",
+     "TargetLagOptionType",
+     "KeywordOptionType",
++    "TagOptionType",
+     "ClusterByOptionType",
+ ]
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
+index 5ebb481..920483b 100644
+--- a/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/table_option.py
+@@ -80,5 +80,6 @@ class TableOptionKey(Enum):
+     MAX_DATA_EXTENSION_TIME_IN_DAYS = "max_data_extension_time_in_days"
+     REFRESH_MODE = "refresh_mode"
+     STORAGE_SERIALIZATION_POLICY = "storage_serialization_policy"
++    TAG = "tag"
+     TARGET_LAG = "target_lag"
+     WAREHOUSE = "warehouse"
+diff --git a/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py b/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py
+new file mode 100644
+index 0000000..b74bba6
+--- /dev/null
++++ b/src/snowflake/sqlalchemy/sql/custom_schema/options/tag_option.py
+@@ -0,0 +1,57 @@
++#
++# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
++#
++from typing import Dict, Optional, Union
++
++from snowflake.sqlalchemy.custom_commands import NoneType
++
++from .table_option import Priority, TableOption, TableOptionKey
++
++
++class TagOption(TableOption):
++    """Object tags attached to a Snowflake table.
++
++    Example:
++        snowflake_tag = TagOption({"cost_center": "analytics"})
++
++        is equivalent to:
++
++        TAG (cost_center = 'analytics')
++    """
++
++    def __init__(self, tags: Dict[str, str]) -> None:
++        super().__init__()
++        self._name: TableOptionKey = TableOptionKey.TAG
++        self.tags = dict(tags)
++
++    @property
++    def priority(self) -> Priority:
++        return Priority.MEDIUM
++
++    @staticmethod
++    def create(
++        value: Optional[Union["TagOption", Dict[str, str]]]
++    ) -> Optional[TableOption]:
++        if isinstance(value, NoneType):
++            return value
++        if isinstance(value, TagOption):
++            return value
++        if isinstance(value, dict):
++            return TagOption(value)
++        return TableOption._get_invalid_table_option(
++            TableOptionKey.TAG,
++            str(type(value).__name__),
++            [TagOption.__name__, dict.__name__],
++        )
++
++    def _render(self, compiler) -> str:
++        assignments = ", ".join(
++            f"{name} = '{value}'" for name, value in self.tags.items()
++        )
++        return "TAG ({})".format(assignments)
++
++    def __repr__(self) -> str:
++        return f"TagOption({self.tags!r})"
++
++
++TagOptionType = Union[TagOption, Dict[str, str]]

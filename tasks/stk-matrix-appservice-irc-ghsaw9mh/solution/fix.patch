@@ -1,0 +1,183 @@
+diff --git a/src/bridge/MatrixHandler.ts b/src/bridge/MatrixHandler.ts
+index 1864ca7d..d5f4c6f5 100644
+--- a/src/bridge/MatrixHandler.ts
++++ b/src/bridge/MatrixHandler.ts
+@@ -21,6 +21,7 @@ import { trackChannelAndCreateRoom } from "./RoomCreation";
+ import { renderTemplate } from "../util/Template";
+ import { trimString } from "../util/TrimString";
+ import { messageDiff } from "../util/MessageDiff";
++import QuickLRU = require("quick-lru");
+ 
+ async function reqHandler(req: BridgeRequest, promise: PromiseLike<unknown>|void) {
+     try {
+@@ -52,6 +53,9 @@ export interface MatrixHandlerConfig {
+     truncatedMessageTemplate: string;
+ }
+ 
++// A homeserver may legitimately have a clock that differs from ours by a small amount.
++const MAX_HOMESERVER_CLOCK_SKEW_MS = 5 * 60 * 1000;
++
+ const DEFAULTS: MatrixHandlerConfig = {
+     eventCacheSize: 4096,
+     replySourceMaxLength: 32,
+@@ -115,7 +119,11 @@ export interface OnMemberEventData {
+ interface CachedEvent {
+     body: string;
+     sender: string;
++    roomId: string;
++    /** The timestamp the homeserver gave the event, used for display formatting only. */
+     timestamp: number;
++    /** When the bridge itself observed the event, used to decide what its sender could see. */
++    observedAt?: number;
+ }
+ 
+ export class MatrixHandler {
+@@ -134,6 +142,10 @@ export class MatrixHandler {
+     private memberTracker?: StateLookup;
+     private adminHandler: AdminRoomHandler;
+     private config: MatrixHandlerConfig = DEFAULTS;
++    // When the bridge saw each member arrive, keyed by room and user. Only the bridge's own
++    // observation is recorded: what the homeserver claims about the time is not used here.
++    private memberJoinDefaultTs = Date.now();
++    private memberJoinTs = new QuickLRU<string, number>({ maxSize: 8192 });
+ 
+     constructor(
+         private readonly ircBridge: IrcBridge,
+@@ -386,9 +398,49 @@ export class MatrixHandler {
+      * @param {Object} event : The Matrix member event.
+      */
+     private _onMemberEvent(req: BridgeRequest, event: OnMemberEventData) {
++        if (event.content.membership === "join") {
++            this.memberJoinTs.set(`${event.room_id}/${event.state_key}`, Date.now());
++        }
++        else {
++            this.memberJoinTs.delete(`${event.room_id}/${event.state_key}`);
++        }
+         this.memberTracker?.onEvent(event);
+     }
+ 
++    /**
++     * Decide whether `event` may carry text taken from another event.
++     * The decision uses what the bridge observed itself: a target the bridge relayed is judged
++     * by when the bridge saw it, and a target fetched from the homeserver is only trusted when
++     * the response names this room and its timestamp is a sane, non-future value.
++     */
++    private canRelayTextFromEvent(event: MatrixMessageEvent, target: {
++        roomId: string|undefined;
++        timestamp?: number;
++        observedAt?: number;
++    }): boolean {
++        // A homeserver response that names another room (or no room at all) is not the event
++        // that was asked for.
++        if (target.roomId !== event.room_id) {
++            return false;
++        }
++        const senderJoinTs = this.memberJoinTs.get(
++            `${event.room_id}/${event.sender}`
++        ) ?? this.memberJoinDefaultTs;
++        if (target.observedAt !== undefined) {
++            // The bridge relayed this event itself, so it knows when the sender could see it.
++            return senderJoinTs <= target.observedAt;
++        }
++        if (typeof target.timestamp !== "number" || !Number.isFinite(target.timestamp)) {
++            // No usable time from the homeserver means there is nothing to base access on.
++            return false;
++        }
++        if (target.timestamp > Date.now() + MAX_HOMESERVER_CLOCK_SKEW_MS) {
++            // An event dated well into the future has not happened yet.
++            return false;
++        }
++        return senderJoinTs <= target.timestamp;
++    }
++
+     /**
+      * Called when a Matrix user tries to invite another user into a PM
+      * @param {Object} event : The Matrix invite event.
+@@ -1049,7 +1101,13 @@ export class MatrixHandler {
+         // special handling for edits
+         if (event.content["m.relates_to"]?.rel_type === "m.replace") {
+             const originalEventId = event.content["m.relates_to"].event_id;
+-            let originalBody = this.getCachedEvent(event.room_id, originalEventId)?.body;
++            const cachedOriginal = this.getCachedEvent(event.room_id, originalEventId);
++            let originalBody = cachedOriginal?.body;
++            let mayRelayOriginal = cachedOriginal ? this.canRelayTextFromEvent(event, {
++                roomId: cachedOriginal.roomId,
++                timestamp: cachedOriginal.timestamp,
++                observedAt: cachedOriginal.observedAt,
++            }) : true;
+             if (!originalBody) {
+                 try {
+                     // FIXME: this will return the new event rather than the original one
+@@ -1068,13 +1126,17 @@ export class MatrixHandler {
+                         event.room_id, originalEventId
+                     );
+                     originalBody = eventContent.content.body;
++                    mayRelayOriginal = this.canRelayTextFromEvent(event, {
++                        roomId: eventContent.room_id,
++                        timestamp: eventContent.origin_server_ts,
++                    });
+                 }
+                 catch (_err) {
+                     req.log.warn("Couldn't find an event being edited, using fallback text");
+                 }
+             }
+             const newBody = event.content["m.new_content"]?.body;
+-            if (originalBody && newBody) {
++            if (originalBody && newBody && mayRelayOriginal) {
+                 const diff = messageDiff(originalBody, newBody);
+                 if (diff) {
+                     ircAction.text = diff;
+@@ -1094,7 +1156,9 @@ export class MatrixHandler {
+             {
+                 body: cacheBody,
+                 sender: event.sender,
++                roomId: event.room_id,
+                 timestamp: event.origin_server_ts,
++                observedAt: Date.now(),
+             },
+         );
+ 
+@@ -1280,6 +1344,7 @@ export class MatrixHandler {
+         const rplText = replyText(event.content.body);
+         let rplName: string;
+         let rplSource: string;
++        let mayRelaySource: boolean;
+         // Reply must be in the same room as the original event.
+         let cachedEvent = this.getCachedEvent(event.room_id, replyEventId);
+         if (!cachedEvent) {
+@@ -1300,7 +1365,16 @@ export class MatrixHandler {
+                 else {
+                     rplSource = eventContent.content.body;
+                 }
+-                cachedEvent = {sender: rplName, body: rplSource, timestamp: eventContent.origin_server_ts};
++                cachedEvent = {
++                    sender: rplName,
++                    body: rplSource,
++                    roomId: eventContent.room_id,
++                    timestamp: eventContent.origin_server_ts,
++                };
++                mayRelaySource = this.canRelayTextFromEvent(event, {
++                    roomId: eventContent.room_id,
++                    timestamp: eventContent.origin_server_ts,
++                });
+                 this.cacheEvent(eventContent.room_id, eventContent.event_id, cachedEvent);
+             }
+             catch (err) {
+@@ -1315,6 +1389,17 @@ export class MatrixHandler {
+         else {
+             rplName = cachedEvent.sender;
+             rplSource = cachedEvent.body;
++            mayRelaySource = this.canRelayTextFromEvent(event, {
++                roomId: cachedEvent.roomId,
++                timestamp: cachedEvent.timestamp,
++                observedAt: cachedEvent.observedAt,
++            });
++        }
++
++        if (!mayRelaySource) {
++            // The sender could not see the event being referred to. Relay their own message,
++            // with the sender's name, but without any text from the other event.
++            rplSource = "";
+         }
+ 
+         // Get the first non-blank line from the source.

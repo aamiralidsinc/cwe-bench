@@ -1,0 +1,237 @@
+diff --git a/system/config/security.yaml b/system/config/security.yaml
+index 1b39bd63..93a44fc8 100644
+--- a/system/config/security.yaml
++++ b/system/config/security.yaml
+@@ -335,7 +335,7 @@ twig_sandbox:
+   # like stdClass where member access carries no executable risk).
+   allowed_methods:
+     - class: 'Grav\Common\Grav'
+-      methods: 'offsetget, offsetexists, __get, getversion, theme'
++      methods: 'offsetexists, getversion, theme'
+     # `toarray` is intentionally NOT allow-listed on the raw Config or Data
+     # classes. The sandboxed `config` Twig variable is replaced with a
+     # SandboxConfig facade in Twig::processPage()/processString(), and that
+diff --git a/system/src/Grav/Common/Twig/Extension/GravExtension.php b/system/src/Grav/Common/Twig/Extension/GravExtension.php
+index 15edad0f..bcc36e77 100644
+--- a/system/src/Grav/Common/Twig/Extension/GravExtension.php
++++ b/system/src/Grav/Common/Twig/Extension/GravExtension.php
+@@ -22,6 +22,7 @@ use Grav\Common\Page\Interfaces\PageInterface;
+ use Grav\Common\Page\Media;
+ use Grav\Common\Scheduler\Cron;
+ use Grav\Common\Security;
++use Grav\Common\Twig\Sandbox\ContentValue;
+ use Grav\Common\Twig\TokenParser\TwigTokenParserCache;
+ use Grav\Common\Twig\TokenParser\TwigTokenParserLink;
+ use Grav\Common\Twig\TokenParser\TwigTokenParserRender;
+@@ -147,6 +148,7 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+             new TwigFilter('print_r', $this->print_r(...)),
+             new TwigFilter('export', $this->exportFilter(...)),
+             new TwigFilter('yaml_encode', $this->yamlEncodeFilter(...)),
++            new TwigFilter('json_encode', $this->jsonEncodeFilter(...)),
+             new TwigFilter('yaml_decode', $this->yamlDecodeFilter(...)),
+             new TwigFilter('nicecron', $this->niceCronFilter(...)),
+             new TwigFilter('replace_last', $this->replaceLastFilter(...)),
+@@ -284,6 +286,10 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function print_r(mixed $var)
+     {
++        if (ContentValue::active()) {
++            $var = ContentValue::redact($var);
++        }
++
+         return print_r($var, true);
+     }
+ 
+@@ -295,9 +301,27 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function exportFilter(mixed $var)
+     {
++        if (ContentValue::active()) {
++            $var = ContentValue::redact($var);
++        }
++
+         return var_export($var, true);
+     }
+ 
++    /**
++     * Twig's core `json_encode`, with content values redacted first.
++     *
++     * @return string|false
++     */
++    public function jsonEncodeFilter(mixed $value, int $flags = 0, int $depth = 512)
++    {
++        if (ContentValue::active()) {
++            $value = ContentValue::redact($value);
++        }
++
++        return json_encode($value, $flags, $depth);
++    }
++
+     /**
+      * Look up a setting of the active theme by dotted path, falling back to
+      * the site-wide configuration when the theme does not define it, e.g.
+@@ -310,6 +334,11 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function themeConfigFunc(string $path, mixed $default = null)
+     {
++        if (ContentValue::active()) {
++            // Page content never reads configuration through this helper.
++            return $default;
++        }
++
+         $config = Grav::instance()['config'];
+         $theme = $config->get('system.pages.theme');
+         $value = $theme ? $config->get("themes.{$theme}.{$path}") : null;
+@@ -891,6 +920,10 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function stringFilter(mixed $value)
+     {
++        if (ContentValue::active()) {
++            $value = ContentValue::redact($value);
++        }
++
+         // Format the array as a string
+         if (is_array($value)) {
+             return json_encode($value);
+@@ -1518,6 +1551,9 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function vardumpFunc(mixed $var)
+     {
++        if (ContentValue::active()) {
++            $var = ContentValue::redact($var);
++        }
+         dump($var);
+     }
+ 
+@@ -1724,6 +1760,9 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+      */
+     public function yamlEncodeFilter($data, $inline = 10)
+     {
++        if (ContentValue::active()) {
++            $data = ContentValue::redact($data);
++        }
+         if (!is_array($data)) {
+             if ($data instanceof JsonSerializable) {
+                 $data = $data->jsonSerialize();
+diff --git a/system/src/Grav/Common/Twig/Sandbox/ContentValue.php b/system/src/Grav/Common/Twig/Sandbox/ContentValue.php
+new file mode 100644
+index 00000000..c4282949
+--- /dev/null
++++ b/system/src/Grav/Common/Twig/Sandbox/ContentValue.php
+@@ -0,0 +1,70 @@
++<?php
++
++/**
++ * @package    Grav\Common\Twig\Sandbox
++ *
++ * @copyright  Copyright (c) 2015 - 2026 Trilby Media, LLC. All rights reserved.
++ * @license    MIT License; see LICENSE file for details.
++ */
++
++namespace Grav\Common\Twig\Sandbox;
++
++use stdClass;
++
++/**
++ * Tracks whether editor-authored content is being rendered and redacts values
++ * that content hands to dump/serialize helpers, which read object state
++ * directly and so bypass the sandbox member checks.
++ */
++final class ContentValue
++{
++    /** @var int */
++    private static int $depth = 0;
++
++    public static function enter(): void
++    {
++        self::$depth++;
++    }
++
++    public static function leave(): void
++    {
++        self::$depth = max(0, self::$depth - 1);
++    }
++
++    public static function active(): bool
++    {
++        return self::$depth > 0;
++    }
++
++    /**
++     * Plain data (scalars, arrays, stdClass) passes through; the config facade
++     * becomes its redacted array; any other object becomes a placeholder.
++     */
++    public static function redact(mixed $value, int $level = 0): mixed
++    {
++        if ($level > 32) {
++            return null;
++        }
++        if (is_array($value)) {
++            foreach ($value as $key => $item) {
++                $value[$key] = self::redact($item, $level + 1);
++            }
++            return $value;
++        }
++        if (!is_object($value)) {
++            return $value;
++        }
++        if ($value instanceof SandboxConfig) {
++            return $value->toArray();
++        }
++        if ($value instanceof stdClass) {
++            $copy = new stdClass();
++            foreach (get_object_vars($value) as $key => $item) {
++                $copy->{$key} = self::redact($item, $level + 1);
++            }
++            return $copy;
++        }
++
++        return '[' . $value::class . ']';
++    }
++}
+diff --git a/system/src/Grav/Common/Twig/Twig.php b/system/src/Grav/Common/Twig/Twig.php
+index f8089b0c..51aca815 100644
+--- a/system/src/Grav/Common/Twig/Twig.php
++++ b/system/src/Grav/Common/Twig/Twig.php
+@@ -18,6 +18,7 @@ use Grav\Common\Page\Interfaces\PageInterface;
+ use Grav\Common\Page\Pages;
+ use Grav\Common\Security;
+ use Grav\Common\Twig\Sandbox\GravSourcePolicy;
++use Grav\Common\Twig\Sandbox\ContentValue;
+ use Grav\Common\Twig\Sandbox\SandboxConfig;
+ use Grav\Common\Twig\Compatibility\Twig3CompatibilityLoader;
+ use Grav\Common\Twig\Compatibility\Twig3CompatibilityTransformer;
+@@ -410,6 +411,7 @@ class Twig
+                 // theme render below is unsandboxed and keeps the raw Config.
+                 $sandbox_vars = $twig_vars;
+                 $sandbox_vars['config'] = $this->buildSandboxConfig();
++                ContentValue::enter();
+                 try {
+                     $output = $content = $local_twig->render($name, $sandbox_vars);
+                 } catch (SecurityError $e) {
+@@ -420,6 +422,8 @@ class Twig
+                     // owner can see what was blocked.
+                     $output = $content;
+                     $filtered = true;
++                } finally {
++                    ContentValue::leave();
+                 }
+             }
+ 
+@@ -500,6 +504,7 @@ class Twig
+         $this->setTemplate($name, $string);
+ 
+         // SourcePolicy sandboxes @Var: sources automatically; no toggle needed.
++        ContentValue::enter();
+         try {
+             $output = $this->twig->render($name, $vars);
+         } catch (LoaderError $e) {
+@@ -509,6 +514,8 @@ class Twig
+             // Soft-fail: return the original (unrendered) string.
+             $output = $string;
+             $filtered = true;
++        } finally {
++            ContentValue::leave();
+         }
+ 
+         if ($filtered) {

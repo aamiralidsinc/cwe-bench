@@ -1,0 +1,337 @@
+diff -ruN -x __pycache__ -x '*.pyc' pristine/lemur/authorities/acme_url.py app/lemur/authorities/acme_url.py
+--- a/lemur/authorities/acme_url.py	1970-01-01 00:00:00.000000000 +0000
++++ b/lemur/authorities/acme_url.py	2026-10-23 08:47:26.384231211 +0000
+@@ -0,0 +1,147 @@
++"""
++.. module: lemur.authorities.acme_url
++    :platform: unix
++    :synopsis: Validation helpers for ACME directory addresses supplied by users.
++    :copyright: (c) 2018 by Netflix Inc., see AUTHORS for more
++    :license: Apache, see LICENSE for more details.
++
++Authority plugin options can name an ACME directory address (``acme_url``).
++That address is later fetched server-side, so every place where options can be
++supplied or re-saved has to agree on what a permitted address looks like.
++
++The authority part of the URL is parsed with a deliberately strict pattern.
++Per-URL parsers disagree about characters such as backslashes, userinfo and
++percent escapes (``https://10.0.0.1\\@allowed.example/`` is read as host
++``10.0.0.1`` by the HTTP client but as ``allowed.example`` by ``urlparse``), so
++anything other than a plain host name and optional numeric port is rejected
++before the host allowlist is consulted.
++"""
++import json
++import re
++from urllib.parse import urlparse
++
++from flask import current_app
++
++from lemur.exceptions import InvalidConfiguration
++
++DEFAULT_ACME_DIRECTORY_HOST_ALLOWLIST = frozenset(
++    {
++        "acme-v02.api.letsencrypt.org",
++        "acme-staging-v02.api.letsencrypt.org",
++        "dv.acme-v02.api.pki.goog",
++    }
++)
++
++ACME_URL_OPTION_NAME = "acme_url"
++
++# scheme://host[:port][/path][?query][#fragment]; the host portion cannot
++# contain '@', '%', '\', ':', brackets, whitespace or other control characters.
++_PERMITTED_URL_RE = re.compile(
++    r"^https://(?P<host>[A-Za-z0-9._-]+)(?::(?P<port>\d{1,5}))?(?:[/?#].*)?\Z",
++    re.IGNORECASE,
++)
++
++_UNSET = object()
++
++
++def normalize_allowlist(configured):
++    """Normalize an allowlist config value to a set of lowercase host names."""
++    if configured is None:
++        configured = DEFAULT_ACME_DIRECTORY_HOST_ALLOWLIST
++    if isinstance(configured, str):
++        configured = [configured]
++
++    hosts = set()
++    for host in configured:
++        if isinstance(host, str) and host.strip():
++            hosts.add(host.strip().lower().rstrip("."))
++    return hosts
++
++
++def acme_directory_host_allowlist():
++    """Return the configured set of permitted ACME directory hosts."""
++    return normalize_allowlist(current_app.config.get("ACME_DIRECTORY_HOST_ALLOWLIST"))
++
++
++def is_permitted_acme_directory_url(url, allowlist=_UNSET):
++    """Whether ``url`` is an HTTPS URL whose host is on the allowlist."""
++    if not isinstance(url, str):
++        return False
++
++    match = _PERMITTED_URL_RE.match(url)
++    if not match:
++        return False
++
++    host = match.group("host").lower().rstrip(".")
++
++    # Cross-check with the stdlib parser: both have to name the same host, so
++    # no parser disagreement can be exploited.
++    try:
++        parsed = urlparse(url)
++        if parsed.scheme != "https" or (parsed.hostname or "").lower().rstrip(".") != host:
++            return False
++    except ValueError:
++        return False
++
++    hosts = acme_directory_host_allowlist() if allowlist is _UNSET else normalize_allowlist(allowlist)
++    return host in hosts
++
++
++def validate_acme_directory_url(url, allowlist=_UNSET):
++    """Raise ``InvalidConfiguration`` unless ``url`` is a permitted directory address."""
++    if not is_permitted_acme_directory_url(url, allowlist=allowlist):
++        raise InvalidConfiguration(
++            "acme_url must be an https URL whose host is in "
++            f"ACME_DIRECTORY_HOST_ALLOWLIST (got: {url!r})"
++        )
++    return url
++
++
++def iter_options(options):
++    """Yield the option dictionaries of an authority options payload.
++
++    ``options`` may be the JSON-encoded string that is persisted on an
++    authority, or an already decoded list of option objects.
++    """
++    if isinstance(options, (bytes, bytearray)):
++        try:
++            options = options.decode("utf-8")
++        except (UnicodeDecodeError, TypeError):
++            return
++
++    if isinstance(options, str):
++        try:
++            options = json.loads(options)
++        except (TypeError, ValueError):
++            return
++
++    if not isinstance(options, list):
++        return
++
++    for option in options:
++        if isinstance(option, dict):
++            yield option
++
++
++def acme_url_values(options):
++    """Return every ``acme_url`` value present in an options payload."""
++    return [
++        option.get("value")
++        for option in iter_options(options)
++        if option.get("name") == ACME_URL_OPTION_NAME
++    ]
++
++
++def validate_authority_options(options, already_stored=None):
++    """Reject options that introduce a directory address outside the allowlist.
++
++    Values that are already stored on the authority are left alone: options
++    that were accepted before validation existed keep being usable, and code
++    that re-saves an authority's own options (for example when an ACME account
++    is persisted) does not re-validate them.
++    """
++    stored = acme_url_values(already_stored) if already_stored else []
++    for value in acme_url_values(options):
++        if value in stored:
++            continue
++        validate_acme_directory_url(value)
+diff -ruN -x __pycache__ -x '*.pyc' pristine/lemur/authorities/service.py app/lemur/authorities/service.py
+--- a/lemur/authorities/service.py	2026-10-22 23:54:11.000000000 +0000
++++ b/lemur/authorities/service.py	2026-10-23 08:47:45.916213498 +0000
+@@ -17,6 +17,7 @@
+ from lemur import database
+ from lemur.common.utils import truthiness, data_encrypt
+ from lemur.extensions import metrics
++from lemur.authorities.acme_url import validate_authority_options
+ from lemur.authorities.models import Authority
+ from lemur.certificates.models import Certificate
+ from lemur.roles import service as role_service
+@@ -35,6 +36,11 @@
+     """
+     authority = get(authority_id)
+ 
++    # Never persist a newly supplied ACME directory address that is not
++    # permitted. An address that is already stored is trusted as-is.
++    if options:
++        validate_authority_options(options, already_stored=authority.options)
++
+     authority.roles = roles
+     authority.active = active
+     authority.description = description
+@@ -57,6 +63,10 @@
+ 
+     authority = get(authority_id)
+ 
++    # Re-saving an authority's own (possibly pre-existing) options is allowed;
++    # introducing a new ACME directory address is not.
++    validate_authority_options(options, already_stored=authority.options)
++
+     authority.options = options
+ 
+     return database.update(authority)
+@@ -134,6 +144,11 @@
+     if role_service.get_by_name(f"{ca_name}_admin") or role_service.get_by_name(f"{ca_name}_operator"):
+         raise Exception(f"Admin and/or operator roles for authority {ca_name} already exist")
+ 
++    # A directory address supplied at creation time has to be permitted as well.
++    plugin_options = (kwargs.get("plugin") or {}).get("plugin_options")
++    if plugin_options:
++        validate_authority_options(plugin_options)
++
+     body, private_key, chain, roles = mint(**kwargs)
+ 
+     kwargs["body"] = body
+diff -ruN -x __pycache__ -x '*.pyc' pristine/lemur/authorities/views.py app/lemur/authorities/views.py
+--- a/lemur/authorities/views.py	2026-10-22 23:54:11.000000000 +0000
++++ b/lemur/authorities/views.py	2026-10-23 08:43:09.860463651 +0000
+@@ -15,8 +15,10 @@
+ from lemur.auth.permissions import AuthorityCreatorPermission, AuthorityPermission, StrictRolePermission
+ 
+ from lemur.certificates import service as certificate_service
++from lemur.exceptions import InvalidConfiguration
+ 
+ from lemur.authorities import service
++from lemur.authorities.acme_url import validate_acme_directory_url
+ from lemur.authorities.schemas import (
+     authority_input_schema,
+     authority_output_schema,
+@@ -416,14 +418,17 @@
+         if not permission.can() or not StrictRolePermission().can():
+             return dict(message="You are not authorized to update this authority."), 403
+ 
+-        return service.update(
+-            authority_id,
+-            owner=data["owner"],
+-            description=data["description"],
+-            active=data["active"],
+-            roles=data["roles"],
+-            options=data.get("options")
+-        )
++        try:
++            return service.update(
++                authority_id,
++                owner=data["owner"],
++                description=data["description"],
++                active=data["active"],
++                roles=data["roles"],
++                options=data.get("options")
++            )
++        except InvalidConfiguration as e:
++            return dict(message=str(e)), 400
+ 
+ 
+ class CertificateAuthority(AuthenticatedResource):
+@@ -526,7 +531,10 @@
+         if not permission.can() or not StrictRolePermission().can():
+             return dict(message="You are not authorized to update this authority."), 403
+ 
+-        return service.update_options(authority_id, options=data["options"])
++        try:
++            return service.update_options(authority_id, options=data["options"])
++        except InvalidConfiguration as e:
++            return dict(message=str(e)), 400
+ 
+ 
+ class AuthorityAcmeDirectory(AuthenticatedResource):
+@@ -557,6 +565,10 @@
+ 
+         overrides = {}
+         if data.get("acme_url"):
++            try:
++                validate_acme_directory_url(data["acme_url"])
++            except InvalidConfiguration as e:
++                return dict(message=str(e)), 400
+             overrides["acme_url"] = data["acme_url"]
+ 
+         handler = AcmeHandler()
+diff -ruN -x __pycache__ -x '*.pyc' pristine/lemur/plugins/lemur_acme/acme_handlers.py app/lemur/plugins/lemur_acme/acme_handlers.py
+--- a/lemur/plugins/lemur_acme/acme_handlers.py	2026-10-22 23:54:11.000000000 +0000
++++ b/lemur/plugins/lemur_acme/acme_handlers.py	2026-10-23 08:44:18.544401455 +0000
+@@ -29,6 +29,7 @@
+ from sentry_sdk import capture_exception
+ 
+ from lemur.authorities import service as authorities_service
++from lemur.authorities.acme_url import validate_acme_directory_url
+ from lemur.common.utils import data_encrypt, data_decrypt, is_json
+ from lemur.common.utils import generate_private_key, key_to_alg
+ from lemur.dns_providers import service as dns_provider_service
+@@ -145,7 +146,11 @@
+ 
+         return pem_certificate, pem_certificate_chain
+ 
+-    @retry(stop_max_attempt_number=5, wait_fixed=5000)
++    @retry(
++        retry_on_exception=lambda e: not isinstance(e, InvalidConfiguration),
++        stop_max_attempt_number=5,
++        wait_fixed=5000,
++    )
+     def setup_acme_client(self, authority, overrides=None):
+         return self.setup_acme_client_no_retry(authority, overrides=overrides)
+ 
+@@ -159,6 +164,10 @@
+         if overrides:
+             for name in ("acme_url", "email", "telephone"):
+                 if name in overrides:
++                    if name == "acme_url":
++                        # Only overrides are user supplied at this point; an
++                        # authority's stored options are trusted as-is.
++                        validate_acme_directory_url(overrides[name])
+                     options[name] = overrides[name]
+         email = options.get("email", current_app.config.get("ACME_EMAIL"))
+         tel = options.get("telephone", current_app.config.get("ACME_TEL"))
+diff -ruN -x __pycache__ -x '*.pyc' pristine/lemur/plugins/lemur_acme/plugin.py app/lemur/plugins/lemur_acme/plugin.py
+--- a/lemur/plugins/lemur_acme/plugin.py	2026-10-22 23:54:11.000000000 +0000
++++ b/lemur/plugins/lemur_acme/plugin.py	2026-10-23 08:47:05.696249969 +0000
+@@ -12,14 +12,16 @@
+ .. moduleauthor:: Curtis Castrapel <ccastrapel@netflix.com>
+ """
+ 
+-from urllib.parse import urlparse
+-
+ from acme.errors import PollError, WildcardUnsupportedError
+ from acme.messages import Error as AcmeError
+ from botocore.exceptions import ClientError
+ from flask import current_app
+ from sentry_sdk import capture_exception
+ 
++from lemur.authorities.acme_url import (
++    DEFAULT_ACME_DIRECTORY_HOST_ALLOWLIST,
++    is_permitted_acme_directory_url,
++)
+ from lemur.authorizations import service as authorization_service
+ from lemur.common.utils import check_validation, drop_last_cert_from_chain, csr_to_string
+ from lemur.constants import CRLReason, EMAIL_RE
+@@ -40,16 +42,11 @@
+     """
+     allowed_hosts = current_app.config.get(
+         "ACME_DIRECTORY_HOST_ALLOWLIST",
+-        {
+-            "acme-v02.api.letsencrypt.org",
+-            "acme-staging-v02.api.letsencrypt.org",
+-            "dv.acme-v02.api.pki.goog",
+-        },
++        DEFAULT_ACME_DIRECTORY_HOST_ALLOWLIST,
+     )
+-    parsed = urlparse(url)
+-    if parsed.scheme != "https" or parsed.hostname not in allowed_hosts:
++    if not is_permitted_acme_directory_url(url, allowlist=allowed_hosts):
+         raise InvalidConfiguration(
+-            f"acme_url host not in ACME_DIRECTORY_HOST_ALLOWLIST: {parsed.hostname}"
++            f"acme_url host not in ACME_DIRECTORY_HOST_ALLOWLIST: {url!r}"
+         )
+ 
+ 

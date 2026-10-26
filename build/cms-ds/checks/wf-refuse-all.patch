@@ -1,0 +1,213 @@
+diff --git a/src/Http/Controllers/CP/Navigation/NavigationPagePreviewController.php b/src/Http/Controllers/CP/Navigation/NavigationPagePreviewController.php
+index e5715b6..67b762d 100644
+--- a/src/Http/Controllers/CP/Navigation/NavigationPagePreviewController.php
++++ b/src/Http/Controllers/CP/Navigation/NavigationPagePreviewController.php
+@@ -14,12 +14,19 @@ class NavigationPagePreviewController extends CpController
+      */
+     public function show(Request $request, $nav, $page)
+     {
++        abort(403);
+         $nav = Nav::find($nav);
+ 
+         $site = $request->site ?? Site::selected()->handle();
+ 
++        $this->authorize('view', $nav->in($site));
++
+         $page = $nav->in($site)->find($page);
+ 
++        if ($entry = $page->entry()) {
++            $this->authorize('view', $entry);
++        }
++
+         return [
+             'values' => $page->data()->all(),
+             'title' => $page->title(),
+diff --git a/src/Http/Controllers/CP/Navigation/NavigationPagesController.php b/src/Http/Controllers/CP/Navigation/NavigationPagesController.php
+index 6145442..085c401 100644
+--- a/src/Http/Controllers/CP/Navigation/NavigationPagesController.php
++++ b/src/Http/Controllers/CP/Navigation/NavigationPagesController.php
+@@ -16,8 +16,11 @@ class NavigationPagesController extends CpController
+      */
+     public function create(Request $request, $nav)
+     {
++        abort(403);
+         $nav = Nav::find($nav);
+ 
++        $this->authorize('view', $nav->in($request->site));
++
+         $blueprint = $nav->blueprint();
+ 
+         $page = (new Page)
+@@ -27,6 +30,8 @@ class NavigationPagesController extends CpController
+         [$values, $meta] = $this->extractValuesAndMeta($page, $blueprint);
+ 
+         if ($entry = $page->entry()) {
++            $this->authorize('view', $entry);
++
+             [$originValues, $originMeta] = $this->extractValuesAndMeta($entry, $blueprint);
+         }
+ 
+@@ -46,8 +51,11 @@ class NavigationPagesController extends CpController
+      */
+     public function edit(Request $request, $nav, $page)
+     {
++        abort(403);
+         $nav = Nav::find($nav);
+ 
++        $this->authorize('view', $nav->in($request->site));
++
+         $blueprint = $nav->blueprint();
+ 
+         $page = $nav->in($request->site)->find($page);
+@@ -55,6 +63,8 @@ class NavigationPagesController extends CpController
+         [$values, $meta, $extraValues] = $this->extractValuesAndMeta($page, $blueprint);
+ 
+         if ($entry = $page->entry()) {
++            $this->authorize('view', $entry);
++
+             [$originValues, $originMeta] = $this->extractValuesAndMeta($entry, $blueprint);
+         }
+ 
+@@ -156,10 +166,13 @@ class NavigationPagesController extends CpController
+      */
+     public function update(Request $request, $nav)
+     {
++        abort(403);
+         $request->validate(['type' => 'required|in:url,entry']);
+ 
+         $nav = Nav::find($nav);
+ 
++        $this->authorize('view', $nav);
++
+         $blueprint = $this->ensureFields($nav->blueprint(), $request);
+ 
+         $blueprint->fields()
+diff --git a/src/Http/Controllers/CP/Navigation/NavigationTreeController.php b/src/Http/Controllers/CP/Navigation/NavigationTreeController.php
+index 232fb2b..98ebdc7 100644
+--- a/src/Http/Controllers/CP/Navigation/NavigationTreeController.php
++++ b/src/Http/Controllers/CP/Navigation/NavigationTreeController.php
+@@ -4,8 +4,10 @@ namespace Statamic\Http\Controllers\CP\Navigation;
+ 
+ use Facades\Statamic\Structures\BranchIdGenerator;
+ use Illuminate\Http\Request;
++use Statamic\Facades\Entry;
+ use Statamic\Facades\Nav;
+ use Statamic\Facades\Site;
++use Statamic\Facades\User;
+ use Statamic\Fields\Blueprint;
+ use Statamic\Http\Controllers\CP\CpController;
+ use Statamic\Structures\TreeBuilder;
+@@ -18,10 +20,13 @@ class NavigationTreeController extends CpController
+ 
+     public function index(Request $request, $handle)
+     {
++        abort(403);
+         $nav = Nav::find($handle);
+ 
+         $site = $request->site ?? Site::selected()->handle();
+ 
++        $this->authorize('view', $nav->in($site));
++
+         $nav->in($site)->ensureBranchIds();
+ 
+         $pages = (new TreeBuilder)->buildForController([
+@@ -30,11 +35,32 @@ class NavigationTreeController extends CpController
+             'site' => $site,
+         ]);
+ 
+-        return ['pages' => $pages];
++        return ['pages' => $this->hideUnviewableEntries($pages)];
++    }
++
++    private function hideUnviewableEntries($pages)
++    {
++        return collect($pages)->map(function ($page) {
++            if ($page['entry'] && ($entry = Entry::find($page['entry'])) && ! optional(User::current())->can('view', $entry)) {
++                $page['entry_title'] = null;
++                $page['entry_blueprint'] = null;
++                $page['url'] = null;
++                $page['edit_url'] = null;
++                $page['slug'] = null;
++                $page['status'] = null;
++                $page['redirect'] = null;
++                $page['collection'] = null;
++            }
++
++            $page['children'] = $this->hideUnviewableEntries($page['children']);
++
++            return $page;
++        })->all();
+     }
+ 
+     public function update(Request $request, $nav)
+     {
++        abort(403);
+         $nav = Nav::find($nav);
+ 
+         $tree = $nav->in($request->site);
+@@ -62,7 +88,7 @@ class NavigationTreeController extends CpController
+         return [
+             'generatedIds' => $this->generatedIds,
+             'saved' => $saved,
+-            'pages' => $pages,
++            'pages' => $this->hideUnviewableEntries($pages),
+         ];
+     }
+ 
+diff --git a/src/Structures/TreeBuilder.php b/src/Structures/TreeBuilder.php
+index c6ebac6..1bf4bf8 100644
+--- a/src/Structures/TreeBuilder.php
++++ b/src/Structures/TreeBuilder.php
+@@ -91,23 +91,25 @@ class TreeBuilder
+             $page = $item['page'];
+             $collection = $page->mountedCollection();
+             $referenceExists = $page->referenceExists();
++            $entry = $referenceExists ? $page->entry() : null;
++            $entryVisible = $this->entryIsVisible($page, $entry);
+ 
+             return [
+                 'id' => $page->id(),
+                 'entry' => $page->reference(),
+                 'title' => $page->hasCustomTitle() ? $page->title() : null,
+-                'entry_title' => $referenceExists ? $page->entry()->value('title') : null,
+-                'entry_blueprint' => $referenceExists ? [
+-                    'handle' => $page->entry()->blueprint()->handle(),
+-                    'title' => $page->entry()->blueprint()->title(),
++                'entry_title' => $entryVisible ? $entry->value('title') : null,
++                'entry_blueprint' => $entryVisible ? [
++                    'handle' => $entry->blueprint()->handle(),
++                    'title' => $entry->blueprint()->title(),
+                 ] : null,
+-                'url' => $page->url(),
+-                'edit_url' => $page->editUrl(),
+-                'can_delete' => $referenceExists ? User::current()->can('delete', $page->entry()) : true,
+-                'slug' => $page->slug(),
+-                'status' => $referenceExists ? $page->status() : null,
+-                'redirect' => $referenceExists ? $page->entry()->get('redirect') : null,
+-                'collection' => ! $collection ? null : [
++                'url' => ($entryVisible || $page->hasCustomUrl()) ? $page->url() : null,
++                'edit_url' => $entryVisible ? $page->editUrl() : null,
++                'can_delete' => $entry ? User::current()->can('delete', $entry) : true,
++                'slug' => $entryVisible ? $page->slug() : null,
++                'status' => $entryVisible ? $page->status() : null,
++                'redirect' => $entryVisible ? $entry->get('redirect') : null,
++                'collection' => (! $collection || ! $entryVisible) ? null : [
+                     'handle' => $collection->handle(),
+                     'title' => $collection->title(),
+                     'edit_url' => $collection->showUrl(),
+@@ -117,4 +119,15 @@ class TreeBuilder
+             ];
+         })->values()->all();
+     }
++
++    private function entryIsVisible($page, $entry): bool
++    {
++        if (! $entry || $entry->id() !== $page->reference()) {
++            return false;
++        }
++
++        $user = User::current();
++
++        return $user ? (bool) $user->can('view', $entry) : false;
++    }
+ }

@@ -1,0 +1,183 @@
+diff --git a/src/Header/Part/MimeToken.php b/src/Header/Part/MimeToken.php
+index 1d4a8ae..8e1002a 100644
+--- a/src/Header/Part/MimeToken.php
++++ b/src/Header/Part/MimeToken.php
+@@ -43,7 +43,8 @@ class MimeToken extends Token
+     public function __construct(LoggerInterface $logger, MbWrapper $charsetConverter, string $value)
+     {
+         parent::__construct($logger, $charsetConverter, $value);
+-        $this->value = $this->decodeMime(\preg_replace('/\r|\n/', '', $this->value));
++        $decoded = $this->decodeMime(\preg_replace('/\r|\n/', '', $this->value));
++        $this->value = \preg_replace('/[\r\n]+/', '', $decoded) ?? '';
+         $pattern = self::MIME_PART_PATTERN;
+         $this->canIgnoreSpacesBefore = (bool) \preg_match("/^\s*{$pattern}|\s+/", $this->rawValue);
+         $this->canIgnoreSpacesAfter = (bool) \preg_match("/{$pattern}\s*|\s+\$/", $this->rawValue);
+diff --git a/src/Header/Part/ParameterPart.php b/src/Header/Part/ParameterPart.php
+index 96e6189..5a38c22 100644
+--- a/src/Header/Part/ParameterPart.php
++++ b/src/Header/Part/ParameterPart.php
+@@ -64,10 +64,10 @@ class ParameterPart extends NameValuePart
+ 
+     protected function decodePartValue(string $value, ?string $charset = null) : string
+     {
+-        if ($charset !== null) {
+-            return $this->convertEncoding(\rawurldecode($value), $charset, true);
+-        }
+-        return $this->convertEncoding(\rawurldecode($value));
++        $decoded = ($charset !== null)
++            ? $this->convertEncoding(\rawurldecode($value), $charset, true)
++            : $this->convertEncoding(\rawurldecode($value));
++        return \preg_replace('/[\r\n]+/', '', $decoded) ?? $decoded;
+     }
+ 
+     protected function getValueFromParts(array $parts) : string
+@@ -85,7 +85,7 @@ class ParameterPart extends NameValuePart
+             }
+             return $ev;
+         }
+-        return $value;
++        return \preg_replace('/[\r\n]+/', '', $value) ?? $value;
+     }
+ 
+     /**
+diff --git a/src/Header/Part/SplitParameterPart.php b/src/Header/Part/SplitParameterPart.php
+index 6c3ff17..8213ac3 100644
+--- a/src/Header/Part/SplitParameterPart.php
++++ b/src/Header/Part/SplitParameterPart.php
+@@ -92,11 +92,12 @@ class SplitParameterPart extends ParameterPart
+ 
+         $combined = $this->combineAdjacentUnencodedParts($sorted);
+ 
+-        return \implode('', \array_map(
++        $value = \implode('', \array_map(
+             fn ($p) => ($p instanceof ParameterPart && $p->encoded)
+                 ? $this->decodePartValue($p->getValue(), ($p->charset === null) ? $charset : $p->charset)
+                 : $p->getValue(),
+             $combined
+         ));
++        return \preg_replace('/[\r\n]+/', '', $value) ?? $value;
+     }
+ }
+diff --git a/src/Message/Helper/AbstractHelper.php b/src/Message/Helper/AbstractHelper.php
+index ede79c7..b2d03fc 100644
+--- a/src/Message/Helper/AbstractHelper.php
++++ b/src/Message/Helper/AbstractHelper.php
+@@ -34,4 +34,13 @@ abstract class AbstractHelper
+         $this->mimePartFactory = $mimePartFactory;
+         $this->uuEncodedPartFactory = $uuEncodedPartFactory;
+     }
++
++    /**
++     * Replaces control characters, including line breaks, with a space so a
++     * value can be placed on a single header line.
++     */
++    protected function sanitizeHeaderValue(string $value) : string
++    {
++        return \preg_replace('/[\x00-\x1F\x7F]+/', ' ', $value) ?? '';
++    }
+ }
+diff --git a/src/Message/Helper/MultipartHelper.php b/src/Message/Helper/MultipartHelper.php
+index d34ed31..6834eea 100644
+--- a/src/Message/Helper/MultipartHelper.php
++++ b/src/Message/Helper/MultipartHelper.php
+@@ -58,6 +58,7 @@ class MultipartHelper extends AbstractHelper
+      */
+     public function setMimeHeaderBoundaryOnPart(IMimePart $part, string $mimeType) : static
+     {
++        $mimeType = $this->sanitizeHeaderValue($mimeType);
+         $part->setRawHeader(
+             HeaderConsts::CONTENT_TYPE,
+             "$mimeType;\r\n\tboundary=\""
+@@ -275,7 +276,10 @@ class MultipartHelper extends AbstractHelper
+     public function createContentPartForMimeType(IMessage $message, string $mimeType, string $charset) : IMimePart
+     {
+         $mimePart = $this->mimePartFactory->newInstance();
+-        $mimePart->setRawHeader(HeaderConsts::CONTENT_TYPE, "$mimeType;\r\n\tcharset=\"$charset\"");
++        $mimePart->setRawHeader(
++            HeaderConsts::CONTENT_TYPE,
++            $this->sanitizeHeaderValue($mimeType) . ";\r\n\tcharset=\"" . $this->sanitizeHeaderValue($charset) . '"'
++        );
+         $mimePart->setRawHeader(HeaderConsts::CONTENT_TRANSFER_ENCODING, 'quoted-printable');
+ 
+         $this->enforceMime($message);
+@@ -312,7 +316,10 @@ class MultipartHelper extends AbstractHelper
+             $filename = 'file' . \uniqid();
+         }
+ 
+-        $safe = \iconv('UTF-8', 'US-ASCII//translit//ignore', $filename);
++        $converted = \iconv('UTF-8', 'US-ASCII//translit//ignore', $filename);
++        $safe = \preg_replace('/[\x00-\x1F\x7F]+/', ' ', ($converted !== false) ? $converted : '') ?? '';
++        $mimeType = $this->sanitizeHeaderValue($mimeType);
++        $encoding = $this->sanitizeHeaderValue($encoding);
+         if ($message->isMime()) {
+             $part = $this->mimePartFactory->newInstance();
+             $part->setRawHeader(HeaderConsts::CONTENT_TRANSFER_ENCODING, $encoding);
+@@ -345,6 +352,8 @@ class MultipartHelper extends AbstractHelper
+         string $encoding = 'base64'
+     ) : IMessagePart {
+         $safe = \iconv('UTF-8', 'US-ASCII//translit//ignore', $filename);
++        $mimeType = $this->sanitizeHeaderValue($mimeType);
++        $encoding = $this->sanitizeHeaderValue($encoding);
+         $part = $this->mimePartFactory->newInstance();
+         $part->setRawHeader(HeaderConsts::CONTENT_TRANSFER_ENCODING, $encoding);
+         if (\strcasecmp($message->getContentType(), 'multipart/related') !== 0) {
+@@ -363,7 +372,8 @@ class MultipartHelper extends AbstractHelper
+      */
+     public function setAttachmentFilename(IMessagePart $part, string $filename) : static
+     {
+-        $safe = \iconv('UTF-8', 'US-ASCII//translit//ignore', $filename);
++        $converted = \iconv('UTF-8', 'US-ASCII//translit//ignore', $filename);
++        $safe = \preg_replace('/[\x00-\x1F\x7F]+/', ' ', ($converted !== false) ? $converted : '') ?? '';
+         if ($part instanceof IMimePart) {
+             $disposition = $part->getContentDisposition('attachment');
+             $part->setRawHeader(HeaderConsts::CONTENT_DISPOSITION, "$disposition;\r\n\tfilename=\"$safe\"");
+@@ -431,7 +441,10 @@ class MultipartHelper extends AbstractHelper
+         } else {
+             $contentType = $part->getContentType();
+             if ($part instanceof IMimePart) {
+-                $part->setRawHeader(HeaderConsts::CONTENT_TYPE, "$contentType;\r\n\tcharset=\"$charset\"");
++                $part->setRawHeader(
++                    HeaderConsts::CONTENT_TYPE,
++                    $this->sanitizeHeaderValue($contentType) . ";\r\n\tcharset=\"" . $this->sanitizeHeaderValue($charset) . '"'
++                );
+             }
+         }
+         $part->setContent($stringOrHandle);
+diff --git a/src/Message/Helper/PrivacyHelper.php b/src/Message/Helper/PrivacyHelper.php
+index fb17bb8..788a703 100644
+--- a/src/Message/Helper/PrivacyHelper.php
++++ b/src/Message/Helper/PrivacyHelper.php
+@@ -58,6 +58,8 @@ class PrivacyHelper extends AbstractHelper
+             $this->genericHelper->movePartContentAndChildren($message, $messagePart);
+             $message->addChild($messagePart);
+             $boundary = $this->multipartHelper->getUniqueBoundary('multipart/signed');
++            $micalg = $this->sanitizeHeaderValue($micalg);
++            $protocol = $this->sanitizeHeaderValue($protocol);
+             $message->setRawHeader(
+                 HeaderConsts::CONTENT_TYPE,
+                 "multipart/signed;\r\n\tboundary=\"$boundary\";\r\n\tmicalg=\"$micalg\"; protocol=\"$protocol\""
+@@ -81,9 +83,10 @@ class PrivacyHelper extends AbstractHelper
+             $signedPart = $this->mimePartFactory->newInstance();
+             $message->addChild($signedPart);
+         }
++        $protocol = $message->getHeaderParameter(HeaderConsts::CONTENT_TYPE, 'protocol');
+         $signedPart->setRawHeader(
+             HeaderConsts::CONTENT_TYPE,
+-            $message->getHeaderParameter(HeaderConsts::CONTENT_TYPE, 'protocol')
++            ($protocol !== null) ? $this->sanitizeHeaderValue($protocol) : null
+         );
+         $signedPart->setContent($body);
+         return $this;
+diff --git a/src/Message/UUEncodedPart.php b/src/Message/UUEncodedPart.php
+index 3313c1f..2ab397f 100644
+--- a/src/Message/UUEncodedPart.php
++++ b/src/Message/UUEncodedPart.php
+@@ -55,7 +55,7 @@ class UUEncodedPart extends NonMimePart implements IUUEncodedPart
+ 
+     public function setFilename(string $filename) : static
+     {
+-        $this->filename = $filename;
++        $this->filename = \preg_replace('/[\x00-\x1F\x7F]+/', ' ', $filename) ?? '';
+         $this->notify();
+         return $this;
+     }

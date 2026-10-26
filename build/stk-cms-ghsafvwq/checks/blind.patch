@@ -1,0 +1,192 @@
+diff -ruN a/src/controllers/BaseUpdaterController.php b/src/controllers/BaseUpdaterController.php
+--- a/src/controllers/BaseUpdaterController.php	2026-10-26 05:39:56.000000000 +0000
++++ b/src/controllers/BaseUpdaterController.php	2026-10-26 06:08:53.961775077 +0000
+@@ -13,6 +13,7 @@
+ use craft\errors\MigrationException;
+ use craft\helpers\App;
+ use craft\helpers\Json;
++use craft\helpers\NavigationHelper;
+ use craft\web\assets\updater\UpdaterAsset;
+ use craft\web\Controller;
+ use craft\web\Response as CraftResponse;
+@@ -294,7 +295,11 @@
+         if ($returnUrl === null) {
+             return null;
+         }
+-        if (str_contains($returnUrl, '{')) {
++        if (!is_string($returnUrl)) {
++            throw new BadRequestHttpException('Invalid return URL.');
++        }
++        $returnUrl = NavigationHelper::normalize($returnUrl);
++        if (NavigationHelper::isExecutable($returnUrl)) {
+             throw new BadRequestHttpException("Invalid return URL: $returnUrl");
+         }
+         return $returnUrl;
+diff -ruN a/src/controllers/PreviewController.php b/src/controllers/PreviewController.php
+--- a/src/controllers/PreviewController.php	2026-10-26 05:39:56.000000000 +0000
++++ b/src/controllers/PreviewController.php	2026-10-26 06:09:03.493766467 +0000
+@@ -9,6 +9,7 @@
+ 
+ use Craft;
+ use craft\base\ElementInterface;
++use craft\helpers\NavigationHelper;
+ use craft\web\Application;
+ use craft\web\Controller;
+ use Exception;
+@@ -88,6 +89,13 @@
+         }
+ 
+         if ($redirect) {
++            if (!is_string($redirect)) {
++                throw new BadRequestHttpException('Invalid redirect URL.');
++            }
++            $redirect = NavigationHelper::normalize($redirect);
++            if (NavigationHelper::isExecutable($redirect)) {
++                throw new BadRequestHttpException('Invalid redirect URL.');
++            }
+             return $this->redirect($redirect);
+         }
+ 
+diff -ruN a/src/controllers/pluginstore/InstallController.php b/src/controllers/pluginstore/InstallController.php
+--- a/src/controllers/pluginstore/InstallController.php	2026-10-26 05:39:56.000000000 +0000
++++ b/src/controllers/pluginstore/InstallController.php	2026-10-26 06:08:58.913770604 +0000
+@@ -9,6 +9,7 @@
+ 
+ use Craft;
+ use craft\controllers\BaseUpdaterController;
++use craft\helpers\NavigationHelper;
+ use craft\web\Response;
+ use Throwable;
+ use yii\web\ForbiddenHttpException;
+@@ -88,7 +89,15 @@
+         $headers = $tempResponse->getHeaders();
+         foreach (['Location', 'X-Redirect', 'X-Pjax-Url'] as $name) {
+             if (($value = $headers->get($name)) !== null) {
+-                $this->_pluginRedirect = $value;
++                // Don't let a plugin hand the browser an executable destination. If the
++                // value isn't safe, leave the redirect unset and fall back to the
++                // whitelisted posted destination or the default.
++                if (is_string($value)) {
++                    $value = NavigationHelper::normalize($value);
++                    if (!NavigationHelper::isExecutable($value)) {
++                        $this->_pluginRedirect = $value;
++                    }
++                }
+                 break;
+             }
+         }
+diff -ruN a/src/helpers/NavigationHelper.php b/src/helpers/NavigationHelper.php
+--- a/src/helpers/NavigationHelper.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/helpers/NavigationHelper.php	2026-10-26 06:08:47.489780922 +0000
+@@ -0,0 +1,80 @@
++<?php
++/**
++ * @link https://craftcms.com/
++ * @copyright Copyright (c) Pixel & Tonic, Inc.
++ * @license https://craftcms.github.io/license/
++ */
++
++namespace craft\helpers;
++
++/**
++ * NavigationHelper prepares values that the product stores or hands to the browser as a
++ * navigation destination.
++ *
++ * A requested destination is never trusted as-is: the product removes template-tag braces and
++ * markup from destinations on the way out, and either of those removals can join a scheme back
++ * together (for example `java<script></script>script:` becomes `javascript:`). The value is
++ * therefore normalized the same way before its scheme is inspected, so the decision is made
++ * about the value the browser would actually receive.
++ *
++ * @author Pixel & Tonic, Inc. <support@pixelandtonic.com>
++ * @since 4.15.3
++ */
++final class NavigationHelper
++{
++    /**
++     * @var string[] The schemes a browser fetches instead of executing.
++     */
++    private const FETCHED_SCHEMES = ['http', 'https'];
++
++    /**
++     * Returns a destination that is safe to store, return, or navigate to.
++     *
++     * @param string $url The requested destination.
++     * @param string $fallback The destination to use if the requested one is executable.
++     * @return string
++     */
++    public static function sanitize(string $url, string $fallback = '/'): string
++    {
++        $url = self::normalize($url);
++        return self::isExecutable($url) ? $fallback : $url;
++    }
++
++    /**
++     * Returns the value the browser will actually receive, after the transformations the
++     * product applies to a destination on the way out.
++     *
++     * @param string $url
++     * @return string
++     */
++    public static function normalize(string $url): string
++    {
++        // Template-tag braces and markup are removed elsewhere in the request cycle before a
++        // destination reaches the browser, and doing so can assemble a scheme.
++        $url = str_replace(['{', '}'], '', strip_tags($url));
++
++        // Browsers drop tabs and newlines from a URL and ignore leading whitespace and
++        // control characters, so the scheme may not begin where it appears to.
++        $url = preg_replace('/[\t\r\n]+/', '', $url);
++        return (string)preg_replace('/^[\x00-\x20]+/', '', (string)$url);
++    }
++
++    /**
++     * Returns whether a browser would run the URL's scheme rather than fetch it.
++     *
++     * Relative, root-relative, and protocol-relative values have no scheme of their own, so
++     * they cannot execute code and are always safe.
++     *
++     * @param string $url A value that has already been through [[normalize()]].
++     * @return bool
++     */
++    public static function isExecutable(string $url): bool
++    {
++        if (!UrlHelper::isAbsoluteUrl($url)) {
++            return false;
++        }
++
++        $scheme = substr($url, 0, (int)strpos($url, ':'));
++        return !in_array(strtolower($scheme), self::FETCHED_SCHEMES, true);
++    }
++}
+diff -ruN a/src/web/User.php b/src/web/User.php
+--- a/src/web/User.php	2026-10-26 05:39:57.000000000 +0000
++++ b/src/web/User.php	2026-10-26 06:09:10.693759965 +0000
+@@ -16,6 +16,7 @@
+ use craft\helpers\ConfigHelper;
+ use craft\helpers\DateTimeHelper;
+ use craft\helpers\Db;
++use craft\helpers\NavigationHelper;
+ use craft\helpers\Session as SessionHelper;
+ use craft\helpers\UrlHelper;
+ use craft\helpers\User as UserHelper;
+@@ -127,7 +128,18 @@
+         // Strip out any tags that may have gotten in there by accident
+         // i.e. if there was a {siteUrl} tag in the Site URL setting, but no matching environment variable,
+         // so they ended up on something like http://example.com/%7BsiteUrl%7D/some/path
+-        return str_replace(['{', '}'], '', $url);
++        // and refuse to hand the browser a value that would execute rather than navigate.
++        return NavigationHelper::sanitize((string)$url);
++    }
++
++    /**
++     * @inheritdoc
++     */
++    public function setReturnUrl($url): void
++    {
++        // The stored value is handed back as the browser's destination after login, so it must
++        // be safe in its own right rather than only on the read path.
++        parent::setReturnUrl(is_string($url) ? NavigationHelper::sanitize($url) : $url);
+     }
+ 
+     /**

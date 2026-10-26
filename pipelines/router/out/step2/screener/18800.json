@@ -1,0 +1,54 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "18800", "advisory_ids": ["GHSA-Q6HH-GP44-4HCM", "CVE-2026-52857", "GO-2026-6159"], "repo": "pterodactyl/wings", "pinned_commit": "3317ce1a6e869fb6851c13a43d075a8b158f9c4c", "fix_commits": ["5f71f65711b6b9e6f913bec94a7b36d9a5eaae49"],
+  "trust_decision": {"summary": "A server-owned configuration file (any format the panel selected) must be size-bounded before wings buffers it for template replacement: ConfigurationFile.Parse refuses files over 64 MB via file.Stat() before any rewrite, and each of the six format readers reads through a 64 MB io.LimitReader.", "evidence": ["parser/parser.go:212", "parser/parser.go:223-236", "parser/parser.go:402", "parser/parser.go:479-480", "server/config_parser.go:39-41", "fix.diff:23-31"]},
+  "landing_point": {"where": "parser/parser.go:212-238", "why": "The summary says parsed config files can OOM wings; the only parse entry and its format switch sit here, directly above the whole-file io.ReadAll / ini.Load / etree.ReadFrom / bufio.Scanner calls, so an engineer looks at Parse and the reader they can reproduce with first."},
+  "fix_sites": [
+    {"where": "parser/parser.go:214-215", "entry_point": "ConfigurationFile.Parse (public API) <- Server.UpdateConfigurationFiles (server/config_parser.go:39) <- POST /api/servers/:server/power (router/router_server.go:92), websocket SetStateEvent start (router/websocket/websocket.go:376), POST /api/servers install-with-auto-start (router/router_system.go:102); also wings CLI boot restore (cmd/root.go:239) and crash auto-restart (server/crash.go:90)", "module_kind": "parser entry / format dispatcher"},
+    {"where": "parser/parser.go:34-36", "entry_point": "shared constant used by all six format readers", "module_kind": "constant"},
+    {"where": "parser/parser.go:243", "entry_point": "ConfigurationFile.Parse -> parseXmlFile (etree doc.ReadFrom)", "module_kind": "parser implementation (xml)"},
+    {"where": "parser/parser.go:322", "entry_point": "ConfigurationFile.Parse -> parseIniFile (ini.Load)", "module_kind": "parser implementation (ini)"},
+    {"where": "parser/parser.go:402", "entry_point": "ConfigurationFile.Parse -> parseJsonFile (io.ReadAll)", "module_kind": "parser implementation (json)"},
+    {"where": "parser/parser.go:429", "entry_point": "ConfigurationFile.Parse -> parseYamlFile (io.ReadAll, also covers the yml alias)", "module_kind": "parser implementation (yaml)"},
+    {"where": "parser/parser.go:479-480", "entry_point": "ConfigurationFile.Parse -> parseTextFile (bufio.Scanner into a bytes.Buffer)", "module_kind": "parser implementation (file/text)"},
+    {"where": "parser/parser.go:544", "entry_point": "ConfigurationFile.Parse -> parsePropertiesFile (io.ReadAll, then properties.Load)", "module_kind": "parser implementation (properties)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "config/config.go:585-597"},
+  "O3_reason_to_dismiss": "config.FromFile reads the daemon's own YAML at config.DefaultLocation with os.ReadFile and no cap, but that file is operator-owned, mode 0600, and only read at daemon startup or by `wings diagnostics` (cmd/root.go:404, cmd/diagnostics.go:112) - never from a server's data directory - so a solver can argue it is outside 'maliciously created parsed config files' for servers.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "An oversized config file must stay byte-for-byte intact and must not block the server from booting: the fix returns before any Truncate and the caller only logs the error. A LimitReader-only fix instead truncates and rewrites the file with just the first 64 MB, silently destroying user data.", "where": "server/config_parser.go:39-41; parser/parser.go:505-513"},
+  "O6_input_shapes": [
+    "six parser format values supplied by the panel: json, yaml/yml, ini, xml, properties, file (parser/parser.go:223-236)",
+    "whole-file read vs line-by-line buffering: io.ReadAll (json, yaml, properties), ini.Load, etree ReadFrom, bufio.Scanner with maxTextScanTokenSize (parser/parser.go:402, 429, 544, 322, 243, 479-480)",
+    "file opened read-write via ufs Touch, so Stat describes a file the parser will later truncate and rewrite (server/config_parser.go:32; parser/parser.go:505-513)",
+    "missing file: only the `file` parser is skipped when absent (server/config_parser.go:25-30); the other formats are still opened/created at server/config_parser.go:32"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "parser/parser.go:123-144", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Daemon config reload/read path: config.FromFile buffers the whole YAML config into memory with os.ReadFile before yaml.Unmarshal, no size cap", "where": "config/config.go:586", "reason_to_dismiss": "operator-owned 0600 file at a fixed path, read only at startup or by the diagnostics command, not a server-owned config parsed at server start", "distance": "1 package (cmd/diagnostics.go:112 -> config/config.go:586)", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "parser/parser.go:223-236", "sibling": "a seventh format reader (e.g. toml/env/csv) added to the Parse switch that buffers the whole file with a new library and forgets the cap", "why_realistic": "the switch already carries six formats and the cap is a separate call inside each reader rather than at the dispatch"},
+    {"where": "server/config_parser.go:26-32", "sibling": "a caller-side size/existence pre-check next to the existing `f.Parser == parser.File` stat", "why_realistic": "the pinned commit 3317ce1 just edited this exact spot to skip missing files, so a maintainer adding a size check here is the natural next step"},
+    {"where": "server/backup.go:46-50", "sibling": "another server-owned file read whole (e.g. a .gitignore/ignore-list variant or a config preview helper) reusing the hand-rolled 32 KiB cap shape", "why_realistic": "the repo already hand-writes per-file size caps for this exact 'read a small server-owned file' job, and a copy that forgets the check is easy to write"},
+    {"where": "config/config.go:585-590", "sibling": "the same 64 MB cap applied to the daemon config loader", "why_realistic": "it is the second config-file parser in the tree and shares the identical os.ReadFile-then-parse shape"}
+  ],
+  "O9_family": "uncontrolled resource consumption / unbounded memory allocation (CWE-400, CWE-770, CWE-789)", "O9_dos": true,
+  "O10_build": {"language": "Go", "toolchain": "go 1.24.0 (go.mod:3), Makefile and Dockerfile present, no vendor/ so modules are fetched at build time", "services": [], "offline_after_build": true, "project_tests": "no tests in parser/ at the pinned commit; adjacent area tests are internal/ufs/fs_unix_test.go and server/filesystem/filesystem_test.go; the fix diff adds no tests"},
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "parser/parser.go", "j_sibling_sites": "yes", "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Put a 64 MB size check next to the existing existence stat in server/config_parser.go:26 (which only runs for parser.File) instead of in ConfigurationFile.Parse and in each of the six format readers."},
+  "out_of_scope_notes": [
+    "Panel/remote responses are read whole elsewhere (remote/http.go:236, cmd/configure.go:141-147); unrelated to this advisory's config-file parsing, not pursued.",
+    "server/backup.go:46-50 already caps the .pteroignore read at 32 KiB - noted only as an existing in-repo precedent, not as a route."
+  ],
+  "unverified": [
+    "repo source size in MB (no shell available to measure), so neither tiny_repo nor giant_repo is flagged",
+    "whether a later release caps config.FromFile (the input gives no latest release/commit to check)",
+    "the exact test harness for the parser: no parser tests exist at the pinned commit, so how the fix would be scored behaviourally is unverified",
+    "a defence does exist at the pinned commit - maxTextScanTokenSize = 64 MB (parser/parser.go:34-35, 480) - but it only bounds a single scanner token; the accumulated bytes.Buffer still grows with the whole file, so it did not stop the OOM"
+  ]
+}

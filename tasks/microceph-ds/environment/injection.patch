@@ -1,0 +1,113 @@
+diff -ruN base/microceph/api/remote.go injected/microceph/api/remote.go
+--- a/microceph/api/remote.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/api/remote.go	2026-10-24 04:39:31.651328925 +0000
+@@ -22,8 +22,9 @@
+ 
+ // remoteCmd is the top level remote endpoint.
+ var remoteCmd = mcTypes.Endpoint{
+-	Path: "client/remotes",
+-	Get:  mcTypes.EndpointAction{Handler: cmdRemoteGet, ProxyTarget: false},
++	Path:   "client/remotes",
++	Get:    mcTypes.EndpointAction{Handler: cmdRemoteGet, ProxyTarget: false},
++	Delete: mcTypes.EndpointAction{Handler: cmdRemoteBulkDelete, ProxyTarget: false},
+ }
+ 
+ // remoteNameCmd endpoint is for operations on specific remotes.
+diff -ruN base/microceph/api/remote_refresh.go injected/microceph/api/remote_refresh.go
+--- a/microceph/api/remote_refresh.go	1970-01-01 00:00:00.000000000 +0000
++++ b/microceph/api/remote_refresh.go	2026-10-24 04:39:28.499331805 +0000
+@@ -0,0 +1,68 @@
++package api
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/url"
++
++	"github.com/canonical/microceph/microceph/api/types"
++	"github.com/canonical/microceph/microceph/ceph"
++	"github.com/canonical/microceph/microceph/database"
++	"github.com/canonical/microceph/microceph/logger"
++	mcTypes "github.com/canonical/microcluster/v3/microcluster/types"
++	"github.com/gorilla/mux"
++)
++
++// remoteRefreshCmd re-generates the local files of an already imported remote.
++// It is used after the local cluster's admin credentials have been rotated.
++var remoteRefreshCmd = mcTypes.Endpoint{
++	Path: "client/remotes/{name}/refresh",
++	Put:  mcTypes.EndpointAction{Handler: cmdRemoteRefresh, ProxyTarget: false},
++}
++
++// cmdRemoteRefresh re-renders the configuration and keyring of the named remote
++// using the payload supplied by the caller.
++func cmdRemoteRefresh(state mcTypes.State, r *http.Request) mcTypes.Response {
++	remoteName, err := url.PathUnescape(mux.Vars(r)["name"])
++	if err != nil {
++		return mcTypes.BadRequest(err)
++	}
++
++	var req types.RemoteImportRequest
++	err = json.NewDecoder(r.Body).Decode(&req)
++	if err != nil {
++		return mcTypes.InternalError(err)
++	}
++
++	err = renderConfAndKeyringFiles(remoteName, req.LocalName, req.Config)
++	if err != nil {
++		return mcTypes.BadRequest(fmt.Errorf("couldn't render files: %w", err))
++	}
++
++	return mcTypes.EmptySyncResponse
++}
++
++// cmdRemoteBulkDelete removes a set of imported remotes in one request. It is
++// used by the maintenance tooling to clear stale remotes in bulk.
++func cmdRemoteBulkDelete(state mcTypes.State, r *http.Request) mcTypes.Response {
++	var req types.RemoteBulkDeleteRequest
++	err := json.NewDecoder(r.Body).Decode(&req)
++	if err != nil {
++		return mcTypes.InternalError(err)
++	}
++
++	for _, remoteName := range req.Names {
++		err = database.DeleteRemoteDb(r.Context(), state, remoteName)
++		if err != nil {
++			return mcTypes.BadRequest(fmt.Errorf("failed to remove remote %q: %w", remoteName, err))
++		}
++
++		err = ceph.DeleteClientKey(remoteName)
++		if err != nil {
++			logger.Errorf("REM: failed to remove client key for remote(%s): %v", remoteName, err)
++		}
++	}
++
++	return mcTypes.EmptySyncResponse
++}
+diff -ruN base/microceph/api/servers.go injected/microceph/api/servers.go
+--- a/microceph/api/servers.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/api/servers.go	2026-10-24 04:39:31.651328925 +0000
+@@ -39,6 +39,7 @@
+ 					clusterCmd,
+ 					remoteCmd,
+ 					remoteNameCmd,
++					remoteRefreshCmd,
+ 					opsCmd,
+ 					// Remote Replication APIs
+ 					opsReplicationCmd,
+diff -ruN base/microceph/api/types/remote.go injected/microceph/api/types/remote.go
+--- a/microceph/api/types/remote.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/api/types/remote.go	2026-10-24 04:39:31.651328925 +0000
+@@ -21,6 +21,11 @@
+ 	RemoteName string `json:"remote_name" yaml:"remote_name"`
+ }
+ 
++// RemoteBulkDeleteRequest abstracts the data members for a bulk remote removal request.
++type RemoteBulkDeleteRequest struct {
++	Names []string `json:"names" yaml:"names"`
++}
++
+ // RemoteRecord exposes remote record structure in db to the client package.
+ type RemoteRecord struct {
+ 	// NOTE (utkarshbhatthere): The member names for this data structure

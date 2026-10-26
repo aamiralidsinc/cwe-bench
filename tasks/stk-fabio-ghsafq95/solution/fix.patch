@@ -1,0 +1,169 @@
+diff --git a/proxy/grpc_handler.go b/proxy/grpc_handler.go
+index 2300f708..55b1efc6 100644
+--- a/proxy/grpc_handler.go
++++ b/proxy/grpc_handler.go
+@@ -8,11 +8,13 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/url"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/fabiolb/fabio/config"
+ 	"github.com/fabiolb/fabio/route"
++	"github.com/fabiolb/fabio/uuid"
+ 
+ 	gkm "github.com/go-kit/kit/metrics"
+ 
+@@ -22,6 +24,7 @@ import (
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/credentials/insecure"
+ 	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/peer"
+ 	"google.golang.org/grpc/stats"
+ 	"google.golang.org/grpc/status"
+ )
+@@ -55,7 +58,7 @@ func GetGRPCDirector(tlscfg *tls.Config, cfg *config.Config) func(ctx context.Co
+ 			return ctx, nil, fmt.Errorf("error extracting metadata from request")
+ 		}
+ 
+-		outCtx := metadata.NewOutgoingContext(ctx, md.Copy())
++		outCtx := metadata.NewOutgoingContext(ctx, protectedGRPCMetadata(ctx, md.Copy(), cfg.Proxy))
+ 
+ 		target, _ := ctx.Value(targetKey{}).(*route.Target)
+ 
+@@ -71,6 +74,50 @@ func GetGRPCDirector(tlscfg *tls.Config, cfg *config.Config) func(ctx context.Co
+ 
+ }
+ 
++// protectedGRPCMetadata replaces any client-supplied value for the headers
++// Fabio is configured to derive, so the backend only sees values Fabio
++// produced for this request.
++func protectedGRPCMetadata(ctx context.Context, md metadata.MD, cfg config.Proxy) metadata.MD {
++	for _, name := range []string{cfg.ClientIPHeader, cfg.TLSHeader, cfg.RequestID} {
++		if name != "" {
++			md.Delete(strings.ToLower(name))
++		}
++	}
++
++	if cfg.RequestID != "" {
++		md.Set(strings.ToLower(cfg.RequestID), uuid.NewUUID())
++	}
++
++	if cfg.TLSHeader != "" {
++		if p, ok := peer.FromContext(ctx); ok && p.AuthInfo != nil {
++			if _, ok := p.AuthInfo.(credentials.TLSInfo); ok {
++				md.Set(strings.ToLower(cfg.TLSHeader), cfg.TLSHeaderValue)
++			}
++		}
++	}
++
++	if cfg.ClientIPHeader != "" {
++		if host := grpcPeerHost(ctx); host != "" {
++			md.Set(strings.ToLower(cfg.ClientIPHeader), host)
++		}
++	}
++
++	return md
++}
++
++// grpcPeerHost returns the address of the peer that opened the connection.
++func grpcPeerHost(ctx context.Context) string {
++	p, ok := peer.FromContext(ctx)
++	if !ok || p.Addr == nil {
++		return ""
++	}
++	host, _, err := net.SplitHostPort(p.Addr.String())
++	if err != nil {
++		return p.Addr.String()
++	}
++	return host
++}
++
+ type GrpcProxyInterceptor struct {
+ 	Config       *config.Config
+ 	StatsHandler *GrpcStatsHandler
+diff --git a/proxy/http_headers.go b/proxy/http_headers.go
+index 66966efd..d53281b8 100644
+--- a/proxy/http_headers.go
++++ b/proxy/http_headers.go
+@@ -5,11 +5,62 @@ import (
+ 	"errors"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"strings"
+ 
+ 	"github.com/fabiolb/fabio/config"
+ )
+ 
++// protectHeaders are the headers Fabio derives for a request. They must
++// never be treated as hop-by-hop, even if the client lists them in the
++// Connection header, because the backend trusts the values Fabio sets.
++var protectHeaders = map[string]bool{
++	"Forwarded":          true,
++	"X-Forwarded-For":    true,
++	"X-Forwarded-Host":   true,
++	"X-Forwarded-Port":   true,
++	"X-Forwarded-Proto":  true,
++	"X-Forwarded-Prefix": true,
++	"X-Real-Ip":          true,
++}
++
++// protectedHeaderSet returns the set of headers Fabio derives for cfg,
++// including the operator-configured client IP, TLS and request id headers.
++func protectedHeaderSet(cfg config.Proxy) map[string]bool {
++	hdrs := make(map[string]bool, len(protectHeaders)+3)
++	for name := range protectHeaders {
++		hdrs[name] = true
++	}
++	for _, name := range []string{cfg.ClientIPHeader, cfg.TLSHeader, cfg.RequestID} {
++		if name != "" {
++			hdrs[textproto.CanonicalMIMEHeaderKey(name)] = true
++		}
++	}
++	return hdrs
++}
++
++// stripProtectedConnectionTokens removes the tokens that name headers Fabio
++// derives from the Connection header so that the reverse proxy does not
++// discard those headers. All other tokens are left in place.
++func stripProtectedConnectionTokens(r *http.Request, hdrs map[string]bool) {
++	var conHeaders []string
++	for _, s := range r.Header.Values("Connection") {
++		for _, p := range strings.Split(s, ",") {
++			p = strings.TrimSpace(p)
++			if p == "" {
++				continue
++			}
++			if !hdrs[textproto.CanonicalMIMEHeaderKey(p)] {
++				conHeaders = append(conHeaders, p)
++			}
++		}
++	}
++	r.Header.Del("Connection")
++	if len(conHeaders) > 0 {
++		r.Header.Set("Connection", strings.Join(conHeaders, ", "))
++	}
++}
++
+ // addResponseHeaders adds/updates headers in the response
+ func addResponseHeaders(w http.ResponseWriter, r *http.Request, cfg config.Proxy) error {
+ 	if r.TLS != nil && cfg.STSHeader.MaxAge > 0 {
+@@ -39,12 +90,13 @@ func addHeaders(r *http.Request, cfg config.Proxy, stripPath string) error {
+ 		return errors.New("cannot parse " + r.RemoteAddr)
+ 	}
+ 
++	stripProtectedConnectionTokens(r, protectedHeaderSet(cfg))
++
+ 	// set configurable ClientIPHeader
+ 	// X-Real-Ip is set later and X-Forwarded-For is set
+ 	// by the Go HTTP reverse proxy.
+ 	if cfg.ClientIPHeader != "" &&
+-		cfg.ClientIPHeader != "X-Forwarded-For" &&
+-		cfg.ClientIPHeader != "X-Real-Ip" {
++		cfg.ClientIPHeader != "X-Forwarded-For" {
+ 		r.Header.Set(cfg.ClientIPHeader, remoteIP)
+ 	}
+ 

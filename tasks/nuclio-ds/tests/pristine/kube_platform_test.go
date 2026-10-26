@@ -1,0 +1,3547 @@
+//go:build test_unit
+
+/*
+Copyright 2023 The Nuclio Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kube
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/nuclio/nuclio/pkg/auth"
+	"github.com/nuclio/nuclio/pkg/auth/iguazio"
+	authIgzV1 "github.com/nuclio/nuclio/pkg/auth/iguazio/v1"
+	authIgzV4 "github.com/nuclio/nuclio/pkg/auth/iguazio/v4"
+	"github.com/nuclio/nuclio/pkg/auth/nop"
+	"github.com/nuclio/nuclio/pkg/common"
+	"github.com/nuclio/nuclio/pkg/common/annotations"
+	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
+	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/platform"
+	"github.com/nuclio/nuclio/pkg/platform/abstract"
+	"github.com/nuclio/nuclio/pkg/platform/kube/apis/nuclio.io/v1beta1"
+	"github.com/nuclio/nuclio/pkg/platform/kube/clients/kube"
+	"github.com/nuclio/nuclio/pkg/platform/kube/clients/nuclio"
+	mocks2 "github.com/nuclio/nuclio/pkg/platform/kube/clients/nuclio/clientset/mocks"
+	"github.com/nuclio/nuclio/pkg/platform/kube/ingress"
+	mockplatform "github.com/nuclio/nuclio/pkg/platform/mock"
+	"github.com/nuclio/nuclio/pkg/platformconfig"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/nuclio/errors"
+	"github.com/nuclio/logger"
+	"github.com/nuclio/opa-client"
+	"github.com/nuclio/zap"
+	"github.com/rs/xid"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/suite"
+	"k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/cache"
+	"k8s.io/client-go/kubernetes/fake"
+)
+
+type KubePlatformTestSuite struct {
+	suite.Suite
+	nuclioioV1beta1InterfaceMock     *mocks2.NuclioV1beta1Interface
+	nuclioFunctionInterfaceMock      *mocks2.NuclioFunctionInterface
+	nuclioProjectInterfaceMock       *mocks2.NuclioProjectInterface
+	nuclioFunctionEventInterfaceMock *mocks2.NuclioFunctionEventInterface
+	nuclioAPIGatewayInterfaceMock    *mocks2.NuclioAPIGatewayInterface
+	nuclioioInterfaceMock            *mocks2.Interface
+	kubeClientSet                    fake.Clientset
+	abstractPlatform                 *abstract.Platform
+	Namespace                        string
+	Logger                           logger.Logger
+	mockedPlatform                   *mockplatform.Platform
+	platform                         *Platform
+	platformKubeConfig               *platformconfig.PlatformKubeConfig
+	mockedOpaClient                  *opaclient.MockClient
+	opaOverrideHeaderValue           string
+	ctx                              context.Context
+	projectName                      string
+}
+
+func (suite *KubePlatformTestSuite) SetupSuite() {
+	var err error
+
+	common.SetVersionFromEnv()
+
+	suite.Namespace = "default-namespace"
+	suite.Logger, err = nucliozap.NewNuclioZapTest("test")
+	suite.Require().NoError(err, "Logger should create successfully")
+
+	suite.ctx = context.Background()
+
+	suite.platformKubeConfig = &platformconfig.PlatformKubeConfig{
+		DefaultServiceType: v1.ServiceTypeClusterIP,
+	}
+	suite.mockedPlatform = &mockplatform.Platform{}
+	mockPlatformConfig := &platformconfig.Config{Kube: *suite.platformKubeConfig}
+	err = mockPlatformConfig.EnrichPlatformConfig()
+	suite.Require().NoError(err)
+
+	abstractPlatform, err := abstract.NewPlatform(suite.Logger, suite.mockedPlatform, mockPlatformConfig, "")
+	suite.Require().NoError(err, "Could not create platform")
+
+	abstractPlatform.ContainerBuilder, err = containerimagebuilderpusher.NewNop(suite.Logger, nil)
+	suite.Require().NoError(err)
+	suite.abstractPlatform = abstractPlatform
+	suite.opaOverrideHeaderValue = "some-dummy-opa-override-value"
+	suite.mockedOpaClient = &opaclient.MockClient{}
+	suite.abstractPlatform.OpaClient = suite.mockedOpaClient
+	suite.abstractPlatform.ExternalIPAddresses = []string{
+		"external-ip",
+	}
+	suite.kubeClientSet = *fake.NewSimpleClientset()
+	suite.projectName = "test-project-" + xid.New().String()
+}
+
+func (suite *KubePlatformTestSuite) SetupTest() {
+	suite.ResetCRDMocks()
+}
+
+func (suite *KubePlatformTestSuite) ResetCRDMocks() {
+	suite.nuclioioInterfaceMock = &mocks2.Interface{}
+	suite.nuclioioV1beta1InterfaceMock = &mocks2.NuclioV1beta1Interface{}
+	suite.nuclioFunctionInterfaceMock = &mocks2.NuclioFunctionInterface{}
+	suite.nuclioProjectInterfaceMock = &mocks2.NuclioProjectInterface{}
+	suite.nuclioFunctionEventInterfaceMock = &mocks2.NuclioFunctionEventInterface{}
+	suite.nuclioAPIGatewayInterfaceMock = &mocks2.NuclioAPIGatewayInterface{}
+
+	suite.nuclioioInterfaceMock.
+		On("NuclioV1beta1").
+		Return(suite.nuclioioV1beta1InterfaceMock)
+	suite.nuclioioV1beta1InterfaceMock.
+		On("NuclioFunctions", suite.Namespace).
+		Return(suite.nuclioFunctionInterfaceMock)
+	suite.nuclioioV1beta1InterfaceMock.
+		On("NuclioProjects", suite.Namespace).
+		Return(suite.nuclioProjectInterfaceMock)
+	suite.nuclioioV1beta1InterfaceMock.
+		On("NuclioFunctionEvents", suite.Namespace).
+		Return(suite.nuclioFunctionEventInterfaceMock)
+	suite.nuclioioV1beta1InterfaceMock.
+		On("NuclioAPIGateways", suite.Namespace).
+		Return(suite.nuclioAPIGatewayInterfaceMock)
+
+	getter, err := nuclio.NewGetter(suite.Logger, suite.platform)
+	suite.Require().NoError(err)
+
+	suite.platform = &Platform{
+		Platform: suite.abstractPlatform,
+		getter:   getter,
+		consumer: &nuclio.Consumer{
+			NuclioClientSet: nuclio.NewClientWithRetryFromClient(suite.nuclioioInterfaceMock),
+			KubeClientSet:   kube.NewClientWithRetryFromClient(&suite.kubeClientSet),
+		},
+		projectsCache: cache.NewExpiring(),
+	}
+	suite.platform.updater, _ = nuclio.NewUpdater(suite.Logger, suite.platform.consumer, suite.platform)
+	suite.platform.deleter, _ = nuclio.NewDeleter(suite.Logger, suite.platform)
+	suite.platform.deployer, _ = nuclio.NewDeployer(suite.Logger, suite.platform.consumer, suite.platform, "")
+	suite.platform.projectsClient, _ = NewProjectsClient(suite.platform, suite.abstractPlatform.Config)
+	suite.platform.apiGatewayScrubber = platform.NewAPIGatewayScrubber(suite.Logger, platform.GetAPIGatewaySensitiveField(), suite.platform.consumer.KubeClientSet)
+}
+
+type ProjectKubePlatformTestSuite struct {
+	KubePlatformTestSuite
+}
+
+func (suite *ProjectKubePlatformTestSuite) TestGetProjectsCache() {
+	suite.nuclioProjectInterfaceMock.On("Create",
+		suite.ctx,
+		mock.Anything,
+		mock.Anything).
+		Return(&v1beta1.NuclioProject{}, nil).
+		Once()
+	defer suite.nuclioProjectInterfaceMock.AssertExpectations(suite.T())
+
+	// create project
+	err := suite.platform.CreateProject(suite.ctx, &platform.CreateProjectOptions{
+		AuthSession: &nop.Session{},
+		ProjectConfig: &platform.ProjectConfig{
+			Meta: platform.ProjectMeta{
+				Name:      "some-name",
+				Namespace: suite.Namespace,
+			},
+		},
+	})
+	suite.Require().NoError(err)
+
+	// project has been cached
+	suite.Require().NotZero(suite.platform.projectsCache.Len())
+
+	// make sure "recently created" is being filtered (returns false) and other project
+	// that have been created long time ago is returned
+	suite.mockedOpaClient.
+		On("QueryPermissionsMultiResources",
+			suite.ctx,
+			[]string{
+				fmt.Sprintf("/projects/%s", "some-name"),
+				fmt.Sprintf("/projects/%s", "other-name"),
+			},
+			opaclient.ActionRead,
+			mock.Anything).
+		Return([]bool{false, true}, nil).
+		Once()
+	defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+	// return both projects from k8s
+	suite.nuclioProjectInterfaceMock.On("List",
+		suite.ctx,
+		mock.Anything,
+		mock.Anything).
+		Return(&v1beta1.NuclioProjectList{
+			Items: []v1beta1.NuclioProject{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: suite.Namespace,
+						Name:      "some-name",
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: suite.Namespace,
+						Name:      "other-name",
+					},
+				},
+			},
+		}, nil).
+		Once()
+
+	projects, err := suite.platform.GetProjects(suite.ctx, &platform.GetProjectsOptions{
+		AuthSession: &nop.Session{},
+		Meta: platform.ProjectMeta{
+			Namespace: suite.Namespace,
+		},
+		PermissionOptions: opaclient.PermissionOptions{
+			MemberIds:           []string{"id1"},
+			RaiseForbidden:      false,
+			OverrideHeaderValue: suite.opaOverrideHeaderValue,
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().Len(projects, 2, "Expected both projects to returned")
+
+	// delete project, make sure cache revocation works
+	suite.nuclioProjectInterfaceMock.On("Delete",
+		suite.ctx,
+		mock.Anything,
+		mock.Anything).
+		Return(nil).
+		Once()
+	err = suite.platform.DeleteProject(suite.ctx, &platform.DeleteProjectOptions{
+		AuthSession: &nop.Session{},
+		Meta: platform.ProjectMeta{
+			Name:      "some-name",
+			Namespace: suite.Namespace,
+		},
+	})
+	suite.Require().NoError(err)
+	suite.Require().Equal(suite.platform.projectsCache.Len(),
+		0,
+		"project was not removed from cache")
+}
+
+type FunctionKubePlatformTestSuite struct {
+	KubePlatformTestSuite
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateServiceType() {
+	for idx, testCase := range []struct {
+		name                 string
+		serviceType          v1.ServiceType
+		shouldFailValidation bool
+	}{
+
+		// happy flows
+		{
+			name:        "empty",
+			serviceType: "",
+		},
+		{
+			name:        "nodePort",
+			serviceType: v1.ServiceTypeNodePort,
+		},
+		{
+			name:        "clusterIP",
+			serviceType: v1.ServiceTypeClusterIP,
+		},
+
+		// bad flows
+		{
+			name:                 "notSupportedLoadBalancer",
+			serviceType:          v1.ServiceTypeLoadBalancer,
+			shouldFailValidation: true,
+		},
+		{
+			name:                 "notSupportedExternalName",
+			serviceType:          v1.ServiceTypeExternalName,
+			shouldFailValidation: true,
+		},
+		{
+			name:                 "notSupportedInvalid",
+			serviceType:          "blabla",
+			shouldFailValidation: true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			suite.mockedPlatform.
+				On("GetProjects", suite.ctx, &platform.GetProjectsOptions{
+					Meta: platform.ProjectMeta{
+						Name:      suite.projectName,
+						Namespace: "default",
+					},
+				}).
+				Return([]platform.Project{
+					&platform.AbstractProject{},
+				}, nil).
+				Once()
+
+			// name it with index and shift with 65 to get A as first letter
+			functionName := string(rune(idx + 65))
+			functionConfig := *functionconfig.NewConfig()
+			functionConfig.Spec.ServiceType = testCase.serviceType
+
+			createFunctionOptions := &platform.CreateFunctionOptions{
+				Logger:         suite.Logger,
+				FunctionConfig: functionConfig,
+			}
+			createFunctionOptions.FunctionConfig.Meta.Name = functionName
+			createFunctionOptions.FunctionConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: suite.projectName,
+			}
+			suite.Logger.DebugWith("Checking function ", "functionName", functionName)
+
+			err := suite.platform.validateServiceType(&createFunctionOptions.FunctionConfig)
+			if testCase.shouldFailValidation {
+				suite.Require().Error(err, "Validation passed unexpectedly")
+			} else {
+				suite.Require().NoError(err, "Validation failed unexpectedly")
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateSidecarContainers() {
+	sidcarContainerName := "sidecar1"
+	sidcarPortName := "sidcarPort"
+
+	for idx, testCase := range []struct {
+		name                 string
+		sidecars             []*v1.Container
+		shouldFailValidation bool
+	}{
+		{
+			name: "valid",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "validMultiple",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+				{
+					Name:  "sidecar2",
+					Image: "alpine",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          fmt.Sprintf("%s-2", sidcarPortName),
+							ContainerPort: 90,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalidNoName",
+			sidecars: []*v1.Container{
+				{
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidNoImage",
+			sidecars: []*v1.Container{
+				{
+					Name: sidcarContainerName,
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidNoContainerPort",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name: sidcarPortName,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidNoContainerPortName",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidDuplicateContainerPortName",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 90,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidDuplicateContainerPortNumber",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: 80,
+						},
+						{
+							Name:          "sidcarPort2",
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedHTTPPort",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: abstract.FunctionContainerHTTPPort,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedWebAdminPort",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: abstract.FunctionContainerWebAdminHTTPPort,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedHealthCheckHTTPPort",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: abstract.FunctionContainerHealthCheckHTTPPort,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedMetricPort",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          sidcarPortName,
+							ContainerPort: abstract.FunctionContainerMetricPort,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedHTTPPortName",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          abstract.FunctionContainerHTTPPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+		{
+			name: "invalidReservedMetricPortName",
+			sidecars: []*v1.Container{
+				{
+					Name:  sidcarContainerName,
+					Image: "nginx",
+					Ports: []v1.ContainerPort{
+						{
+							Name:          abstract.FunctionContainerMetricPortName,
+							ContainerPort: 80,
+						},
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			suite.mockedPlatform.
+				On("GetProjects", suite.ctx, &platform.GetProjectsOptions{
+					Meta: platform.ProjectMeta{
+						Name:      suite.projectName,
+						Namespace: "default",
+					},
+				}).
+				Return([]platform.Project{
+					&platform.AbstractProject{},
+				}, nil).
+				Once()
+
+			// name it with index and shift with 65 to get A as first letter
+			functionName := string(rune(idx + 65))
+			functionConfig := *functionconfig.NewConfig()
+			functionConfig.Spec.Sidecars = testCase.sidecars
+
+			createFunctionOptions := &platform.CreateFunctionOptions{
+				Logger:         suite.Logger,
+				FunctionConfig: functionConfig,
+			}
+			createFunctionOptions.FunctionConfig.Meta.Name = functionName
+			createFunctionOptions.FunctionConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: suite.projectName,
+			}
+			err := suite.platform.validateSidecarSpec(&createFunctionOptions.FunctionConfig)
+			if testCase.shouldFailValidation {
+				suite.Require().Error(err, "Validation passed unexpectedly")
+			} else {
+				suite.Require().NoError(err, "Validation failed unexpectedly")
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestEnrichContainerSpecEnvFrom() {
+	s3Secret := v1.EnvFromSource{
+		SecretRef: &v1.SecretEnvSource{
+			LocalObjectReference: v1.LocalObjectReference{Name: "s3-credentials"},
+		},
+	}
+	otherSecret := v1.EnvFromSource{
+		SecretRef: &v1.SecretEnvSource{
+			LocalObjectReference: v1.LocalObjectReference{Name: "other-secret"},
+		},
+	}
+
+	for _, testCase := range []struct {
+		name             string
+		containerEnvFrom []v1.EnvFromSource
+		functionEnvFrom  []v1.EnvFromSource
+		expectedEnvFrom  []v1.EnvFromSource
+	}{
+		{
+			name:             "function-envFrom-propagated-to-empty-container",
+			containerEnvFrom: nil,
+			functionEnvFrom:  []v1.EnvFromSource{s3Secret},
+			expectedEnvFrom:  []v1.EnvFromSource{s3Secret},
+		},
+		{
+			name:             "function-envFrom-appended-to-existing-container-envFrom",
+			containerEnvFrom: []v1.EnvFromSource{otherSecret},
+			functionEnvFrom:  []v1.EnvFromSource{s3Secret},
+			expectedEnvFrom:  []v1.EnvFromSource{otherSecret, s3Secret},
+		},
+		{
+			name:             "duplicate-envFrom-not-added",
+			containerEnvFrom: []v1.EnvFromSource{s3Secret},
+			functionEnvFrom:  []v1.EnvFromSource{s3Secret},
+			expectedEnvFrom:  []v1.EnvFromSource{s3Secret},
+		},
+		{
+			name:             "no-function-envFrom-container-unchanged",
+			containerEnvFrom: []v1.EnvFromSource{otherSecret},
+			functionEnvFrom:  nil,
+			expectedEnvFrom:  []v1.EnvFromSource{otherSecret},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionConfig := &functionconfig.Config{
+				Spec: functionconfig.Spec{
+					EnvFrom: testCase.functionEnvFrom,
+				},
+			}
+			container := &v1.Container{
+				EnvFrom: testCase.containerEnvFrom,
+			}
+
+			suite.platform.enrichContainerSpec(container, functionConfig)
+
+			suite.Require().Equal(testCase.expectedEnvFrom, container.EnvFrom)
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestEnrichInitContainersAndSidecarsEnvFrom() {
+	s3Secret := v1.EnvFromSource{
+		SecretRef: &v1.SecretEnvSource{
+			LocalObjectReference: v1.LocalObjectReference{Name: "s3-credentials"},
+		},
+	}
+
+	functionConfig := &functionconfig.Config{
+		Spec: functionconfig.Spec{
+			EnvFrom: []v1.EnvFromSource{s3Secret},
+			InitContainers: []*v1.Container{
+				{Name: "mlrun-source-loader"},
+			},
+			Sidecars: []*v1.Container{
+				{Name: "app-sidecar"},
+			},
+		},
+	}
+
+	suite.platform.enrichInitContainersSpec(functionConfig)
+	suite.platform.enrichSidecarsSpec(functionConfig)
+
+	suite.Require().Equal([]v1.EnvFromSource{s3Secret}, functionConfig.Spec.InitContainers[0].EnvFrom,
+		"init container should receive envFrom from function spec")
+	suite.Require().Equal([]v1.EnvFromSource{s3Secret}, functionConfig.Spec.Sidecars[0].EnvFrom,
+		"sidecar should receive envFrom from function spec")
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateProbesSpec() {
+	for _, testCase := range []struct {
+		name                 string
+		testFunctionConfig   *functionconfig.Config
+		shouldFailValidation bool
+	}{
+		{
+			name: "valid with defaults",
+			testFunctionConfig: &functionconfig.Config{
+				Spec: functionconfig.Spec{
+					ReadinessProbe: platformconfig.DefaultReadinessProbeConfiguration,
+					LivenessProbe:  platformconfig.DefaultLivenessProbeConfiguration,
+				},
+			},
+			shouldFailValidation: false,
+		}, {
+			name:                 "empty probes",
+			testFunctionConfig:   &functionconfig.Config{},
+			shouldFailValidation: true,
+		}, {
+			name: "empty probe value",
+			testFunctionConfig: &functionconfig.Config{
+				Spec: functionconfig.Spec{
+					ReadinessProbe: platformconfig.DefaultReadinessProbeConfiguration,
+					LivenessProbe: &v1.Probe{
+						InitialDelaySeconds: platformconfig.DefaultLivenessProbeConfiguration.InitialDelaySeconds,
+					},
+				},
+			},
+			shouldFailValidation: true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			var err error
+			ReadinessErr := suite.platform.validateProbeSpec(testCase.testFunctionConfig.Spec.ReadinessProbe)
+			LivenessErr := suite.platform.validateProbeSpec(testCase.testFunctionConfig.Spec.LivenessProbe)
+			if ReadinessErr != nil {
+				err = ReadinessErr
+			} else {
+				err = LivenessErr
+			}
+			if testCase.shouldFailValidation {
+				suite.Require().Error(err, "Validation passed unexpectedly")
+			} else {
+				suite.Require().NoError(err, "Validation failed unexpectedly")
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestFunctionTriggersEnrichmentAndValidation() {
+
+	// return empty api gateways list on enrichFunctionsWithAPIGateways (not tested here)
+	suite.nuclioAPIGatewayInterfaceMock.
+		On("List", suite.ctx, metav1.ListOptions{}).
+		Return(&v1beta1.NuclioAPIGatewayList{}, nil)
+
+	for idx, testCase := range []struct {
+		name                     string
+		setUpFunction            func() error
+		tearDownFunction         func() error
+		triggers                 map[string]functionconfig.Trigger
+		expectedEnrichedTriggers map[string]functionconfig.Trigger
+
+		// keep empty when no error is expected
+		validationError string
+	}{
+		{
+			name:     "EnrichWithDefaultHTTPTrigger",
+			triggers: nil,
+			expectedEnrichedTriggers: func() map[string]functionconfig.Trigger {
+				defaultHTTPTrigger := functionconfig.GetDefaultHTTPTrigger()
+				defaultHTTPTrigger.Attributes = map[string]interface{}{
+					"serviceType":          suite.platformKubeConfig.DefaultServiceType,
+					"streamingFlushPeriod": functionconfig.DefaultStreamingFlushPeriod,
+				}
+				return map[string]functionconfig.Trigger{
+					defaultHTTPTrigger.Name: defaultHTTPTrigger,
+				}
+			}(),
+		},
+		{
+			name: "PathIsAvailable",
+			setUpFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset(&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "some-name",
+						Namespace: suite.Namespace,
+					},
+					Spec: networkingv1.IngressSpec{
+						Rules: []networkingv1.IngressRule{
+							{
+								Host: "host-and-path-already-in-use.com",
+								IngressRuleValue: networkingv1.IngressRuleValue{
+									HTTP: &networkingv1.HTTPIngressRuleValue{
+										Paths: []networkingv1.HTTPIngressPath{
+											{
+												Path: "used-path/",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				return nil
+			},
+			tearDownFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset()
+				return nil
+			},
+			triggers: map[string]functionconfig.Trigger{
+				"http-with-ingress": {
+					Kind: "http",
+					Attributes: map[string]interface{}{
+						"ingresses": map[string]interface{}{
+							"0": map[string]interface{}{
+								"host":  "host-and-path-already-in-use.com",
+								"paths": []string{"/unused-path"},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "FailPathInUse",
+			setUpFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset(&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "some-name",
+						Namespace: suite.Namespace,
+					},
+					Spec: networkingv1.IngressSpec{
+						Rules: []networkingv1.IngressRule{
+							{
+								Host: "host-and-path-already-in-use.com",
+								IngressRuleValue: networkingv1.IngressRuleValue{
+									HTTP: &networkingv1.HTTPIngressRuleValue{
+										Paths: []networkingv1.HTTPIngressPath{
+											{
+												Path: "used-path/",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				return nil
+			},
+			tearDownFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset()
+				return nil
+			},
+			triggers: map[string]functionconfig.Trigger{
+				"http-with-ingress": {
+					Kind: "http",
+					Attributes: map[string]interface{}{
+						"ingresses": map[string]interface{}{
+							"0": map[string]interface{}{
+								"host":  "host-and-path-already-in-use.com",
+								"paths": []string{"/unused-path", "used-path/"},
+							},
+						},
+					},
+				},
+			},
+			validationError: platform.ErrIngressHostPathInUse.Error(),
+		},
+	} {
+		suite.Run(testCase.name, func() {
+
+			// run test case specific set up function if given
+			if testCase.setUpFunction != nil {
+				err := testCase.setUpFunction()
+				suite.Require().NoError(err)
+			}
+
+			// mock get projects
+			suite.mockedPlatform.On("GetProjects", suite.ctx, &platform.GetProjectsOptions{
+				Meta: platform.ProjectMeta{
+					Name:      suite.projectName,
+					Namespace: suite.Namespace,
+				},
+			}).Return([]platform.Project{
+				&platform.AbstractProject{},
+			}, nil).Twice()
+			// name it with index and shift with 65 to get A as first letter
+			functionName := string(rune(idx + 65))
+			functionConfig := *functionconfig.NewConfig()
+
+			createFunctionOptions := &platform.CreateFunctionOptions{
+				Logger:         suite.Logger,
+				FunctionConfig: functionConfig,
+			}
+			createFunctionOptions.FunctionConfig.Meta.Name = functionName
+			createFunctionOptions.FunctionConfig.Meta.Namespace = suite.Namespace
+			createFunctionOptions.FunctionConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: suite.projectName,
+			}
+			createFunctionOptions.FunctionConfig.Spec.Triggers = testCase.triggers
+			suite.Logger.DebugWith("Enriching and validating function", "functionName", functionName)
+
+			// run enrichment
+			err := suite.platform.EnrichFunctionConfig(suite.ctx, &createFunctionOptions.FunctionConfig)
+			suite.Require().NoError(err, "Failed to enrich function")
+
+			if testCase.expectedEnrichedTriggers != nil {
+				suite.Equal(testCase.expectedEnrichedTriggers,
+					createFunctionOptions.FunctionConfig.Spec.Triggers)
+			}
+
+			// run validation
+			err = suite.platform.ValidateFunctionConfig(suite.ctx, &createFunctionOptions.FunctionConfig)
+			if testCase.validationError != "" {
+				suite.Require().Error(err, "Validation passed unexpectedly")
+				suite.Require().Equal(testCase.validationError, errors.RootCause(err).Error())
+			} else {
+				suite.Require().NoError(err, "Validation failed unexpectedly")
+			}
+
+			// run test case specific tear down function if given
+			if testCase.tearDownFunction != nil {
+				err := testCase.tearDownFunction()
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateAPIGateway() {
+	for _, testCase := range []struct {
+		name           string
+		apiGatewayName string
+		namespace      string
+		expectError    bool
+	}{
+		{
+			name:           "correct-config-1",
+			apiGatewayName: "function-name",
+			namespace:      "ns",
+			expectError:    false,
+		},
+		{
+			name:           "empty-ns",
+			apiGatewayName: "function-name",
+			expectError:    true,
+		},
+		{
+			name:           "empty-name",
+			apiGatewayName: "function-name",
+			expectError:    true,
+		},
+		{
+			name:           "wrong-name-1",
+			apiGatewayName: "--2-821",
+			namespace:      "ns",
+			expectError:    true,
+		},
+		{
+			name:           "wrong-name-1",
+			apiGatewayName: "2-%-%%^1",
+			namespace:      "ns",
+			expectError:    true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+
+			err := suite.platform.validateAPIGatewayMeta(&platform.APIGatewayMeta{
+				Name:      testCase.apiGatewayName,
+				Namespace: testCase.namespace,
+			})
+			if testCase.expectError {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestGetFunctionInstanceAndConfig() {
+	for _, testCase := range []struct {
+		name                    string
+		functionName            string
+		hasAPIGateways          bool
+		apiGateWayName          string
+		expectValidationFailure bool
+		functionExists          bool
+	}{
+		{
+			name:         "functionNotFound",
+			functionName: "not-found",
+		},
+		{
+			name:           "functionFound",
+			functionName:   "found-me",
+			functionExists: true,
+		},
+		{
+			name:           "functionFoundEnrichedWithAPIGateways",
+			functionName:   "found-me",
+			hasAPIGateways: true,
+			apiGateWayName: "api-gw-name",
+			functionExists: true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			var getFunctionResponseErr error
+			var getFunctionResponse *v1beta1.NuclioFunction
+			listAPIGatewayResponse := v1beta1.NuclioAPIGatewayList{Items: []v1beta1.NuclioAPIGateway{}}
+
+			// prepare mock responses
+			if !testCase.functionExists {
+				getFunctionResponseErr = apierrors.NewNotFound(schema.GroupResource{}, "asd")
+			} else {
+				getFunctionResponse = &v1beta1.NuclioFunction{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: suite.Namespace,
+						Name:      testCase.functionName,
+					},
+				}
+			}
+
+			if testCase.hasAPIGateways {
+				listAPIGatewayResponse.Items = append(listAPIGatewayResponse.Items,
+					v1beta1.NuclioAPIGateway{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: testCase.apiGateWayName,
+						},
+						Spec: platform.APIGatewaySpec{
+							Upstreams: []platform.APIGatewayUpstreamSpec{
+								{
+									Kind: platform.APIGatewayUpstreamKindNuclioFunction,
+									NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
+										Name: testCase.functionName,
+									},
+								},
+							},
+						},
+					})
+			}
+
+			suite.nuclioFunctionInterfaceMock.
+				On("Get", suite.ctx, testCase.functionName, metav1.GetOptions{}).
+				Return(getFunctionResponse, getFunctionResponseErr).
+				Once()
+			defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+
+			if testCase.functionExists {
+				suite.nuclioAPIGatewayInterfaceMock.
+					On("List", suite.ctx, metav1.ListOptions{}).
+					Return(&listAPIGatewayResponse, nil).
+					Once()
+				defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			functionInstance, functionConfigAndStatus, err := suite.platform.
+				getFunctionInstanceAndConfig(suite.ctx,
+					&platform.GetFunctionsOptions{
+						Name:                  testCase.functionName,
+						Namespace:             suite.Namespace,
+						EnrichWithAPIGateways: true,
+					})
+
+			if testCase.expectValidationFailure {
+				suite.Require().Error(err)
+				return
+			}
+
+			// no error
+			suite.Require().NoError(err)
+
+			// response might be nil, if function was not found
+			if !testCase.functionExists {
+				suite.Require().Nil(functionInstance)
+				suite.Require().Nil(functionConfigAndStatus)
+				return
+			}
+
+			// ensure found function matches its function name input
+			suite.Require().Equal(functionInstance.Name, testCase.functionName)
+			suite.Require().Equal(functionConfigAndStatus.Meta.Name, testCase.functionName)
+			suite.Require().Empty(cmp.Diff(functionInstance.Spec, functionConfigAndStatus.Spec))
+			suite.Require().Empty(cmp.Diff(functionInstance.Status, functionConfigAndStatus.Status))
+
+			if testCase.hasAPIGateways {
+				suite.Require().Contains(functionConfigAndStatus.Status.APIGateways, testCase.apiGateWayName)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestGetFunctionsPermissions() {
+	var getFunctionResponse *v1beta1.NuclioFunction
+
+	for _, testCase := range []struct {
+		name           string
+		opaResponse    bool
+		givenMemberIds bool
+		raiseForbidden bool
+	}{
+		{
+			name:           "Allowed",
+			opaResponse:    true,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden with Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden no Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: false,
+		},
+		{
+			name:           "No OPA",
+			opaResponse:    false,
+			givenMemberIds: false,
+			raiseForbidden: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			var memberIds []string
+
+			functionName := "func"
+			projectName := "proj"
+
+			getFunctionResponse = &v1beta1.NuclioFunction{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      functionName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+			}
+
+			suite.nuclioFunctionInterfaceMock.
+				On("Get", suite.ctx, functionName, metav1.GetOptions{}).
+				Return(getFunctionResponse, nil).
+				Once()
+			defer suite.nuclioFunctionInterfaceMock.AssertExpectations(suite.T())
+
+			if testCase.givenMemberIds {
+				memberIds = []string{"id1", "id2"}
+
+				suite.mockedOpaClient.
+					On("QueryPermissionsMultiResources",
+						suite.ctx,
+						[]string{fmt.Sprintf("/projects/%s/functions/%s", projectName, functionName)},
+						opaclient.ActionRead,
+						&opaclient.PermissionOptions{
+							MemberIds:           memberIds,
+							RaiseForbidden:      testCase.raiseForbidden,
+							OverrideHeaderValue: suite.opaOverrideHeaderValue,
+						}).
+					Return([]bool{testCase.opaResponse}, nil).
+					Once()
+				defer suite.mockedOpaClient.AssertExpectations(suite.T())
+			}
+			functions, err := suite.platform.GetFunctions(suite.ctx, &platform.GetFunctionsOptions{
+				Name:      functionName,
+				Namespace: suite.Namespace,
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      testCase.raiseForbidden,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse && testCase.givenMemberIds {
+				if testCase.raiseForbidden {
+					suite.Require().Error(err)
+				} else {
+					suite.Require().NoError(err)
+					suite.Require().Equal(0, len(functions))
+				}
+			} else {
+				suite.Require().NoError(err)
+				suite.Require().Equal(1, len(functions))
+				suite.Require().Equal(functionName, functions[0].GetConfig().Meta.Name)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateServiceAccount() {
+
+	projectName := suite.projectName
+	secretName := fmt.Sprintf("nuclio-project-secrets-%s", projectName)
+	allowedKey := "allowed-sa-key"
+	allowedSAs := []string{"sa1", "sa2"}
+
+	oldAllowedKey := suite.platform.Config.Kube.ProjectSecretAllowedServiceAccountsKey
+	suite.platform.Config.Kube.ProjectSecretAllowedServiceAccountsKey = allowedKey
+
+	oldProjectSecretTemplate := suite.platform.Config.Kube.ProjectSecretTemplate
+	suite.platform.Config.Kube.ProjectSecretTemplate = "nuclio-project-secrets-{{ .ProjectName }}"
+	// revert the change
+	defer func() {
+		suite.platform.Config.Kube.ProjectSecretAllowedServiceAccountsKey = oldAllowedKey
+		suite.platform.Config.Kube.ProjectSecretTemplate = oldProjectSecretTemplate
+	}()
+
+	createSecret := func(data map[string][]byte) *v1.Secret {
+		return &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: suite.Namespace,
+			},
+			Data: data,
+		}
+	}
+
+	for _, testcase := range []struct {
+		name          string
+		secret        *v1.Secret
+		configKey     string
+		requestedSA   string
+		expectedError string
+	}{
+		{
+			name:        "AllowedServiceAccount",
+			secret:      createSecret(map[string][]byte{allowedKey: []byte(strings.Join(allowedSAs, ","))}),
+			configKey:   allowedKey,
+			requestedSA: "sa1",
+		},
+		{
+			name:          "DisallowedServiceAccount",
+			secret:        createSecret(map[string][]byte{allowedKey: []byte(strings.Join(allowedSAs, ","))}),
+			configKey:     allowedKey,
+			requestedSA:   "sa3",
+			expectedError: "ServiceAccount \"sa3\" is not in the list of allowed service accounts",
+		},
+		{
+			name:        "NoRestrictionKeyMissing",
+			secret:      createSecret(map[string][]byte{"other-key": []byte("irrelevant")}),
+			configKey:   allowedKey,
+			requestedSA: "sa3",
+		},
+		{
+			name:        "SecretNotFound",
+			secret:      nil,
+			configKey:   allowedKey,
+			requestedSA: "sa1",
+		},
+		{
+			name:        "AllowedServiceAccountsKeyNotConfigured",
+			secret:      createSecret(map[string][]byte{allowedKey: []byte(strings.Join(allowedSAs, ","))}),
+			configKey:   "",
+			requestedSA: "sa1",
+		},
+	} {
+		suite.Run(testcase.name, func() {
+			functionConfig := &functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Namespace: suite.Namespace,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+				Spec: functionconfig.Spec{
+					ServiceAccount: testcase.requestedSA,
+				},
+			}
+
+			if testcase.secret != nil {
+				_, err := suite.kubeClientSet.CoreV1().Secrets(suite.Namespace).Create(suite.ctx, testcase.secret, metav1.CreateOptions{})
+				suite.Require().NoError(err)
+
+				defer suite.kubeClientSet.CoreV1().Secrets(suite.Namespace).Delete(suite.ctx, testcase.secret.Name, metav1.DeleteOptions{}) //nolint:errcheck
+			}
+
+			err := suite.platform.validateServiceAccount(suite.ctx, functionConfig)
+			if testcase.expectedError != "" {
+				suite.Require().Error(err, testcase.expectedError)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+// TestValidateServiceAccountWithDefaultForbiddenList validates default forbidden list enforcement.
+func (suite *FunctionKubePlatformTestSuite) TestValidateServiceAccountWithDefaultForbiddenList() {
+	const forbiddenServiceAccount = "sa-forbidden"
+	config := &suite.platform.Config.Kube
+	oldAllowedKey, oldForbiddenKey := config.ProjectSecretAllowedServiceAccountsKey, config.ProjectSecretForbiddenServiceAccountsKey
+	oldProjectSecretTemplate, oldDefaultForbiddenList := config.ProjectSecretTemplate, config.DefaultForbiddenServiceAccounts
+	config.ProjectSecretAllowedServiceAccountsKey, config.ProjectSecretForbiddenServiceAccountsKey = "", ""
+	config.ProjectSecretTemplate, config.DefaultForbiddenServiceAccounts = "", []string{forbiddenServiceAccount}
+	defer func() {
+		config.ProjectSecretAllowedServiceAccountsKey, config.ProjectSecretForbiddenServiceAccountsKey = oldAllowedKey, oldForbiddenKey
+		config.ProjectSecretTemplate, config.DefaultForbiddenServiceAccounts = oldProjectSecretTemplate, oldDefaultForbiddenList
+	}()
+
+	functionConfig := &functionconfig.Config{
+		Meta: functionconfig.Meta{
+			Namespace: suite.Namespace,
+			Labels: map[string]string{
+				common.NuclioResourceLabelKeyProjectName: suite.projectName,
+			},
+		},
+		Spec: functionconfig.Spec{
+			ServiceAccount: forbiddenServiceAccount,
+		},
+	}
+
+	err := suite.platform.validateServiceAccount(suite.ctx, functionConfig)
+	suite.Require().Error(err)
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateSecretsAllowed_EnvFrom() {
+	projectName := "test-project-name"
+
+	for _, testCase := range []struct {
+		name          string
+		template      string
+		envFrom       []string
+		expectedError string
+	}{
+		{
+			template: "nuclio-project-secrets-{{ .ProjectName }}",
+			name:     "with-project-secret",
+			envFrom:  []string{"nuclio-project-secrets-test-project-name"},
+		},
+		{
+			template:      "nuclio-project-secrets-{{ .ProjectName }}",
+			name:          "with-another-project-secret",
+			envFrom:       []string{"nuclio-project-secrets-test1"},
+			expectedError: "Failed to validate Spec.EnvFrom",
+		},
+		{
+			name:    "with-another-project-secret",
+			envFrom: []string{"nuclio-project-secrets-test1"},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			oldProjectSecretTemplate := suite.platform.Config.Kube.ProjectSecretTemplate
+			defer func() {
+				suite.platform.Config.Kube.ProjectSecretTemplate = oldProjectSecretTemplate
+			}()
+			suite.platform.Config.Kube.ProjectSecretTemplate = testCase.template
+
+			functionConfig := &functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Name:      "test-func",
+					Namespace: suite.Namespace,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+				Spec: functionconfig.Spec{
+					EnvFrom: lo.Map(testCase.envFrom, func(secret string, _ int) v1.EnvFromSource {
+						return v1.EnvFromSource{
+							SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: secret}},
+						}
+					}),
+				},
+			}
+
+			err := suite.platform.validateSecretsAllowed(suite.ctx, functionConfig)
+			if testCase.expectedError != "" {
+				suite.Require().ErrorContains(err, testCase.expectedError)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateSecretsAllowed_Env() {
+	projectName := "test-project-name"
+
+	for _, testCase := range []struct {
+		name          string
+		template      string
+		envSecrets    []string
+		expectedError string
+	}{
+		{
+			template:   "nuclio-project-secrets-{{ .ProjectName }}",
+			name:       "with-project-secret",
+			envSecrets: []string{"nuclio-project-secrets-test-project-name"},
+		},
+		{
+			template:      "nuclio-project-secrets-{{ .ProjectName }}",
+			name:          "with-another-project-secret",
+			envSecrets:    []string{"nuclio-project-secrets-test1"},
+			expectedError: "Failed to validate spec.Env",
+		},
+		{
+			name:       "with-another-project-secret-no-template",
+			envSecrets: []string{"nuclio-project-secrets-test1"},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			oldProjectSecretTemplate := suite.platform.Config.Kube.ProjectSecretTemplate
+			defer func() {
+				suite.platform.Config.Kube.ProjectSecretTemplate = oldProjectSecretTemplate
+			}()
+			suite.platform.Config.Kube.ProjectSecretTemplate = testCase.template
+
+			functionConfig := &functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Name:      "test-func",
+					Namespace: suite.Namespace,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+				Spec: functionconfig.Spec{
+					Env: lo.Map(testCase.envSecrets, func(secret string, _ int) v1.EnvVar {
+						return v1.EnvVar{
+							Name: "MY_SECRET",
+							ValueFrom: &v1.EnvVarSource{
+								SecretKeyRef: &v1.SecretKeySelector{
+									LocalObjectReference: v1.LocalObjectReference{Name: secret},
+									Key:                  "key",
+								},
+							},
+						}
+					}),
+				},
+			}
+
+			err := suite.platform.validateSecretsAllowed(suite.ctx, functionConfig)
+			if testCase.expectedError != "" {
+				suite.Require().ErrorContains(err, testCase.expectedError)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateSecretsAllowed_Volumes() {
+	projectName := "test-project-name"
+
+	for _, testCase := range []struct {
+		name          string
+		template      string
+		volumeSecrets []string
+		expectedError string
+	}{
+		{
+			template:      "nuclio-project-secrets-{{ .ProjectName }}",
+			name:          "with-project-secret",
+			volumeSecrets: []string{"nuclio-project-secrets-test-project-name"},
+		},
+		{
+			template:      "nuclio-project-secrets-{{ .ProjectName }}",
+			name:          "with-another-project-secret",
+			volumeSecrets: []string{"nuclio-project-secrets-test1"},
+			expectedError: "Failed to validate spec.Volumes",
+		},
+		{
+			name:          "with-another-project-secret-no-template",
+			volumeSecrets: []string{"nuclio-project-secrets-test1"},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			oldProjectSecretTemplate := suite.platform.Config.Kube.ProjectSecretTemplate
+			defer func() {
+				suite.platform.Config.Kube.ProjectSecretTemplate = oldProjectSecretTemplate
+			}()
+			suite.platform.Config.Kube.ProjectSecretTemplate = testCase.template
+
+			functionConfig := &functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Name:      "test-func",
+					Namespace: suite.Namespace,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+				Spec: functionconfig.Spec{
+					Volumes: lo.Map(testCase.volumeSecrets, func(secret string, _ int) functionconfig.Volume {
+						return functionconfig.Volume{
+							Volume: v1.Volume{
+								Name: secret,
+								VolumeSource: v1.VolumeSource{
+									Secret: &v1.SecretVolumeSource{
+										SecretName: secret,
+									},
+								},
+							},
+							VolumeMount: v1.VolumeMount{
+								Name:      secret,
+								MountPath: fmt.Sprintf("/etc/secrets/%s", secret),
+							},
+						}
+					}),
+				},
+			}
+
+			err := suite.platform.validateSecretsAllowed(suite.ctx, functionConfig)
+			if testCase.expectedError != "" {
+				suite.Require().ErrorContains(err, testCase.expectedError)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestUpdateFunctionPermissions() {
+	var getFunctionResponse *v1beta1.NuclioFunction
+
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionName := "func"
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			getFunctionResponse = &v1beta1.NuclioFunction{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      functionName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+				Status: functionconfig.Status{
+					State: functionconfig.FunctionStateReady,
+				},
+			}
+
+			suite.nuclioFunctionInterfaceMock.
+				On("Get", suite.ctx, functionName, metav1.GetOptions{}).
+				Return(getFunctionResponse, nil).
+				Once()
+			defer suite.nuclioFunctionInterfaceMock.AssertExpectations(suite.T())
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/functions/%s", projectName, functionName),
+					opaclient.ActionUpdate,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				// verify
+				verifyUpdateFunction := func(function *v1beta1.NuclioFunction) bool {
+					suite.Require().Equal(functionName, function.Name)
+					suite.Require().Equal(suite.Namespace, function.Namespace)
+
+					return true
+				}
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Get", suite.ctx, functionName, metav1.GetOptions{}).
+					Return(getFunctionResponse, nil).
+					Once()
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Update",
+						suite.ctx,
+						mock.MatchedBy(verifyUpdateFunction),
+						metav1.UpdateOptions{}).
+					Return(getFunctionResponse, nil).
+					Once()
+				defer suite.nuclioFunctionInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.UpdateFunction(suite.ctx, &platform.UpdateFunctionOptions{
+				FunctionMeta: &functionconfig.Meta{
+					Name:      functionName,
+					Namespace: suite.Namespace,
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestDeleteFunctionPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionName := "func"
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			returnedFunction := platform.AbstractFunction{
+				Config: functionconfig.Config{
+					Meta: functionconfig.Meta{
+						Namespace: suite.Namespace,
+						Name:      functionName,
+						Labels: map[string]string{
+							common.NuclioResourceLabelKeyProjectName: projectName,
+						},
+					},
+				},
+			}
+
+			suite.mockedPlatform.
+				On("GetFunctions", suite.ctx, &platform.GetFunctionsOptions{
+					Name:      functionName,
+					Namespace: suite.Namespace,
+					PermissionOptions: opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					},
+				}).
+				Return([]platform.Function{&returnedFunction}, nil).
+				Once()
+			defer suite.mockedPlatform.AssertExpectations(suite.T())
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/functions/%s", projectName, functionName),
+					opaclient.ActionDelete,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+				suite.nuclioAPIGatewayInterfaceMock.
+					On("List", suite.ctx, metav1.ListOptions{}).
+					Return(&v1beta1.NuclioAPIGatewayList{}, nil).
+					Once()
+				defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Delete", suite.ctx, functionName, metav1.DeleteOptions{}).
+					Return(nil).
+					Once()
+				defer suite.nuclioFunctionInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.DeleteFunction(suite.ctx, &platform.DeleteFunctionOptions{
+				FunctionConfig: functionconfig.Config{
+					Meta: functionconfig.Meta{
+						Name:      functionName,
+						Namespace: suite.Namespace,
+					},
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+				IgnoreFunctionStateValidation: true,
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestRenderFunctionIngress() {
+	suite.platform.Config.Kube.DefaultHTTPIngressHostTemplate = "{{ .ResourceName }}.{{ .Namespace }}.test.com"
+
+	for _, testCase := range []struct {
+		name        string
+		httpTrigger functionconfig.Trigger
+		want        map[string]interface{}
+	}{
+		{
+			name: "nothingBackground",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{},
+				},
+			},
+			want: map[string]interface{}{},
+		},
+		{
+			name: "fromCustom",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{
+						"0": map[string]interface{}{
+							"hostTemplate": "{{ .ResourceName }}.custom.test.com",
+						},
+					},
+				},
+			},
+			want: map[string]interface{}{
+				"0": map[string]interface{}{
+					"hostTemplate": "{{ .ResourceName }}.custom.test.com",
+					"host":         "some-name.custom.test.com",
+					"pathType":     networkingv1.PathTypeImplementationSpecific,
+				},
+			},
+		},
+		{
+			name: "fromDefault",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{
+						"0": map[string]interface{}{
+							"hostTemplate": common.DefaultIngressHostTemplate,
+						},
+					},
+				},
+			},
+			want: map[string]interface{}{
+				"0": map[string]interface{}{
+					"hostTemplate": common.DefaultIngressHostTemplate,
+					"host":         "some-name.some-namespace.test.com",
+					"pathType":     networkingv1.PathTypeImplementationSpecific,
+				},
+			},
+		},
+		{
+			name: "multipleIngresses",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{
+						"0": map[string]interface{}{
+							"hostTemplate": common.DefaultIngressHostTemplate,
+						},
+						"1": map[string]interface{}{
+							"host": "leave-it-as.is.com",
+						},
+					},
+				},
+			},
+			want: map[string]interface{}{
+				"0": map[string]interface{}{
+					"hostTemplate": common.DefaultIngressHostTemplate,
+					"host":         "some-name.some-namespace.test.com",
+					"pathType":     networkingv1.PathTypeImplementationSpecific,
+				},
+				"1": map[string]interface{}{
+					"host":     "leave-it-as.is.com",
+					"pathType": networkingv1.PathTypeImplementationSpecific,
+				},
+			},
+		},
+		{
+			name: "fromDefaultHostEmpty",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{
+						"0": map[string]interface{}{
+							"hostTemplate": common.DefaultIngressHostTemplate,
+							"host":         "",
+						},
+					},
+				},
+			},
+			want: map[string]interface{}{
+				"0": map[string]interface{}{
+					"hostTemplate": common.DefaultIngressHostTemplate,
+					"host":         "some-name.some-namespace.test.com",
+					"pathType":     networkingv1.PathTypeImplementationSpecific,
+				},
+			},
+		},
+		{
+			name: "fromDefaultNoHostOverriding",
+			httpTrigger: functionconfig.Trigger{
+				Name: "http-trigger",
+				Kind: "http",
+				Attributes: map[string]interface{}{
+					"ingresses": map[string]interface{}{
+						"0": map[string]interface{}{
+							"hostTemplate": common.DefaultIngressHostTemplate,
+							"host":         "dont-override-me.com",
+						},
+					},
+				},
+			},
+			want: map[string]interface{}{
+				"0": map[string]interface{}{
+					"hostTemplate": common.DefaultIngressHostTemplate,
+					"host":         "dont-override-me.com",
+					"pathType":     networkingv1.PathTypeImplementationSpecific,
+				},
+			},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionConfig := &functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Name:      "some-name",
+					Namespace: "some-namespace",
+				},
+				Spec: functionconfig.Spec{
+					Triggers: map[string]functionconfig.Trigger{
+						testCase.httpTrigger.Name: testCase.httpTrigger,
+					},
+				},
+			}
+			err := suite.platform.enrichHTTPTriggers(suite.ctx, functionConfig)
+			suite.Require().NoError(err)
+			suite.Require().Equal(testCase.want,
+				functionConfig.Spec.Triggers[testCase.httpTrigger.Name].Attributes["ingresses"])
+
+		})
+	}
+
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestAlignIngressHostSubdomain() {
+	type args struct {
+		host              string
+		randomCharsLength int
+	}
+
+	for _, testCase := range []struct {
+		name string
+		args args
+		want *regexp.Regexp
+	}{
+		{
+			name: "noChange",
+			args: args{host: "something.simple.com", randomCharsLength: 5},
+			want: regexp.MustCompile("something.simple.com"),
+		},
+		{
+			name: "truncate",
+			args: args{host: func() string {
+				longSubdomainLevel := "this-is-a-very-long-level-and-should-be-truncated-by-the-random-chars-length"
+				return fmt.Sprintf("%s.blabla.com", longSubdomainLevel)
+			}(), randomCharsLength: 5},
+			want: regexp.MustCompile("this-is-a-very-long-level-and-should-be-truncated-by-the-[a-z0-9]{5}.blabla.com"),
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			alignedIngressHostSubdomain := suite.platform.alignIngressHostSubdomainLevel(testCase.args.host, testCase.args.randomCharsLength)
+			suite.Require().Regexp(testCase.want, alignedIngressHostSubdomain)
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestEnrichFunctionWithPreemptionSpec() {
+	preemptibleNodes := &platformconfig.PreemptibleNodes{
+		NodeSelector: map[string]string{
+			"node-label-key": "node-label-value",
+		},
+		Tolerations: []v1.Toleration{
+			{
+				Key:   "toleration-key",
+				Value: "toleration-value",
+			},
+		},
+	}
+	suite.platform.Config.Kube.PreemptibleNodes = preemptibleNodes
+	functionName := "some-func"
+	functionConfig := functionconfig.NewConfig()
+	functionConfig.Meta.Name = functionName
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+
+	// "" -> Allow - add tolerations
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(preemptibleNodes.Tolerations, functionConfig.Spec.Tolerations)
+
+	// Allow -> Allow - make sure tolertions were added once
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+
+	// Allow -> Constrain - make sure it preserves tolerations and add node selectors
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	suite.Require().Equal(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAffinityByLabelSelectorScheduleOnOneOfMatchingNodes())
+
+	// Constrain -> Constrain - make sure spec was added once
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	suite.Require().Equal(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAffinityByLabelSelectorScheduleOnOneOfMatchingNodes())
+
+	// Constrain -> Allow - make sure node selectors were removed
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	for key := range preemptibleNodes.NodeSelector {
+		_, ok := functionConfig.Spec.NodeSelector[key]
+		suite.Require().False(ok)
+	}
+
+	// Allow -> Allow - make sure custom labels are not pruned
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	customFunctionLabels := map[string]string{
+		"customkey": "customvalue",
+	}
+	functionConfig.Spec.NodeSelector = customFunctionLabels
+
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	suite.Require().Equal(customFunctionLabels, functionConfig.Spec.NodeSelector)
+
+	// Allow -> Constrain - merge custom labels with preemption labels
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	suite.Require().Equal(customFunctionLabels, functionConfig.Spec.NodeSelector)
+	suite.Require().Equal(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAffinityByLabelSelectorScheduleOnOneOfMatchingNodes())
+
+	// Constrain -> Allow - make sure allow does not prune custom labels + constrain label selectors
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Equal(functionConfig.Spec.Tolerations, preemptibleNodes.Tolerations)
+	suite.Require().Equal(customFunctionLabels, functionConfig.Spec.NodeSelector)
+
+	// clean node selector
+	functionConfig.Spec.NodeSelector = nil
+
+	// "" -> Allow - add custom tolerations
+	customTolerations := v1.Toleration{
+		Key:   "custom-toleration-key",
+		Value: "custom-toleration-value",
+	}
+	functionConfig.Spec.Tolerations = []v1.Toleration{customTolerations}
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().NotEmpty(cmp.Diff([]v1.Toleration{
+		{
+			Key:   preemptibleNodes.Tolerations[0].Key,
+			Value: preemptibleNodes.Tolerations[0].Value,
+		},
+		customTolerations,
+	}, functionConfig.Spec.Tolerations))
+
+	// Allow -> Constrain - preserve custom tolerations
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().NotEmpty(cmp.Diff([]v1.Toleration{
+		{
+			Key:   preemptibleNodes.Tolerations[0].Key,
+			Value: preemptibleNodes.Tolerations[0].Value,
+		},
+		{
+			Key:   "custom-toleration-key",
+			Value: "custom-toleration-value",
+		},
+	}, functionConfig.Spec.Tolerations))
+
+	// * END OF ALLOW <> CONSTRAIN * //
+	functionConfig.Spec.NodeSelector = nil
+	functionConfig.Spec.Affinity = nil
+	functionConfig.Spec.Tolerations = nil
+
+	// add constrain spec
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesPrevent
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Empty(functionConfig.Spec.NodeSelector)
+	suite.Require().Empty(functionConfig.Spec.Tolerations)
+
+	// affinity is pruned (prevention is done using taints)
+	suite.Require().Nil(functionConfig.Spec.Affinity)
+
+	// prevention is done using node label selectors
+	preemptibleNodes = &platformconfig.PreemptibleNodes{
+		NodeSelector: map[string]string{
+			"node-label-key":   "node-label-value",
+			"node-label-key-2": "node-label-value-2",
+		},
+	}
+	suite.platform.Config.Kube.PreemptibleNodes = preemptibleNodes
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Empty(cmp.Diff(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAntiAffinityByLabelSelectorNoScheduleOnMatchingNodes()))
+
+	// Prevent -> Constrain - pruned anti affinity + add affinity
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Empty(cmp.Diff(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAffinityByLabelSelectorScheduleOnOneOfMatchingNodes()))
+
+	// Constrain -> Prevent - read anti affinity
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesPrevent
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Empty(functionConfig.Spec.NodeSelector)
+	suite.Require().Empty(functionConfig.Spec.Tolerations)
+	suite.Require().Empty(cmp.Diff(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		preemptibleNodes.CompileAntiAffinityByLabelSelectorNoScheduleOnMatchingNodes()))
+
+	// Prevent -> Allow
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Empty(functionConfig.Spec.Tolerations) // no toleration were given on config, that's intentional
+	suite.Require().Nil(functionConfig.Spec.Affinity)
+
+	// preserve custom affinity
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesPrevent
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	functionConfig.Spec.Affinity.PodAffinity = &v1.PodAffinity{}
+	functionConfig.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = []v1.PreferredSchedulingTerm{}
+	functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		v1.NodeSelectorTerm{
+			MatchFields: []v1.NodeSelectorRequirement{
+				{
+					Key: "dummy",
+				},
+			},
+		},
+	)
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesAllow
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().NotNil(functionConfig.Spec.Affinity.PodAffinity)
+	suite.Require().NotNil(functionConfig.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution)
+	suite.Require().Equal("dummy",
+		functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchFields[0].Key)
+
+	// reset specs, constrain -> prevent (for tolerations + node selector)
+	preemptibleNodes = &platformconfig.PreemptibleNodes{
+		NodeSelector: map[string]string{
+			"a": "c",
+			"b": "d",
+		},
+		Tolerations: []v1.Toleration{
+			{
+				Key:      "some-key",
+				Value:    "some-value",
+				Operator: v1.TolerationOpEqual,
+				Effect:   v1.TaintEffectNoSchedule,
+			},
+		},
+	}
+	suite.platform.Config.Kube.PreemptibleNodes = preemptibleNodes
+	functionConfig = functionconfig.NewConfig()
+	functionConfig.Meta.Name = functionName
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesConstrain
+
+	// no affinity
+	suite.Require().Nil(functionConfig.Spec.Affinity)
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+
+	// enriched affinity
+	suite.Require().NotNil(functionConfig.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
+
+	// constrain -> prevent
+	functionConfig.Spec.PreemptionMode = functionconfig.RunOnPreemptibleNodesPrevent
+	suite.platform.enrichFunctionPreemptionSpec(suite.ctx, preemptibleNodes, functionConfig)
+	suite.Require().Nil(functionConfig.Spec.Affinity)
+
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestEnrichFunctionWithUserNameLabel() {
+	testCases := []struct {
+		name         string
+		session      auth.Session
+		expectedUser string
+	}{
+		{
+			name:         "igz",
+			session:      authIgzV1.NewSession("some-user", "", "", nil),
+			expectedUser: "some-user",
+		},
+		{
+			name:         "igzV4",
+			session:      authIgzV4.NewSession("another-user", "", nil, ""),
+			expectedUser: "another-user",
+		},
+	}
+
+	for _, testCase := range testCases {
+		suite.Run(testCase.name, func() {
+			functionName := "some-func"
+			functionConfig := *functionconfig.NewConfig()
+			authSession := testCase.session
+
+			ctx := context.WithValue(suite.ctx, auth.AuthSessionContextKey, authSession)
+			suite.mockedPlatform.
+				On("GetProjects", ctx, &platform.GetProjectsOptions{
+					Meta: platform.ProjectMeta{
+						Name:      suite.projectName,
+						Namespace: suite.Namespace,
+					},
+				}).
+				Return([]platform.Project{
+					&platform.AbstractProject{},
+				}, nil).
+				Once()
+
+			createFunctionOptions := &platform.CreateFunctionOptions{
+				Logger:         suite.Logger,
+				FunctionConfig: functionConfig,
+				AuthSession:    authSession,
+			}
+			createFunctionOptions.FunctionConfig.Meta.Name = functionName
+			createFunctionOptions.FunctionConfig.Meta.Namespace = suite.Namespace
+			createFunctionOptions.FunctionConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: suite.projectName,
+			}
+
+			suite.Logger.DebugWith("Enriching function", "functionName", functionName)
+
+			err := suite.platform.EnrichFunctionConfig(ctx, &createFunctionOptions.FunctionConfig)
+			suite.Require().NoError(err)
+			suite.Require().Equal(testCase.expectedUser, createFunctionOptions.FunctionConfig.Meta.Labels[iguazio.IguazioUsernameLabel])
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestUsernameLabelsEnrichment() {
+	testCases := []struct {
+		name                  string
+		fullUsername          string
+		expectedUsernameLabel string
+		expectedDomainLabel   string
+		authKind              auth.Kind
+	}{
+		{
+			name:                  "v1 with-name-and-domain",
+			fullUsername:          "foo@bar.com",
+			expectedUsernameLabel: "foo",
+			expectedDomainLabel:   "bar.com",
+			authKind:              auth.KindIguazio,
+		},
+		{
+			name:                  "v4 with-name-and-domain",
+			fullUsername:          "foo@bar.com",
+			expectedUsernameLabel: "foo",
+			expectedDomainLabel:   "bar.com",
+			authKind:              auth.KindIguazioV4,
+		},
+		{
+			name:                  "v1 with-only-name",
+			fullUsername:          "foo",
+			expectedUsernameLabel: "foo",
+			authKind:              auth.KindIguazio,
+		},
+		{
+			name:                  "v4 with-only-name",
+			fullUsername:          "foo",
+			expectedUsernameLabel: "foo",
+			authKind:              auth.KindIguazioV4,
+		},
+		{
+			name:     "v1 empty",
+			authKind: auth.KindIguazio,
+		},
+		{
+			name:     "v4 empty",
+			authKind: auth.KindIguazioV4,
+		},
+		{
+			name:                  "v1 wrong-with-two-ats",
+			fullUsername:          "foo@bar@test",
+			expectedUsernameLabel: "foo",
+			expectedDomainLabel:   "bar",
+			authKind:              auth.KindIguazio,
+		},
+		{
+			name:                  "v4 wrong-with-two-ats",
+			fullUsername:          "foo@bar@test",
+			expectedUsernameLabel: "foo",
+			expectedDomainLabel:   "bar",
+			authKind:              auth.KindIguazioV4,
+		},
+		{
+			name:                  "v1 wrong-with-empty-domain",
+			fullUsername:          "foo@",
+			expectedUsernameLabel: "foo",
+			authKind:              auth.KindIguazio,
+		},
+		{
+			name:                  "v4 wrong-with-empty-domain",
+			fullUsername:          "foo@",
+			expectedUsernameLabel: "foo",
+			authKind:              auth.KindIguazioV4,
+		},
+		{
+			name:                "v1 wrong-with-empty-name",
+			fullUsername:        "@bar",
+			expectedDomainLabel: "bar",
+			authKind:            auth.KindIguazio,
+		},
+		{
+			name:                "v4 wrong-with-empty-name",
+			fullUsername:        "@bar",
+			expectedDomainLabel: "bar",
+			authKind:            auth.KindIguazioV4,
+		},
+	}
+
+	for _, testCase := range testCases {
+		suite.Run(testCase.name, func() {
+			var session auth.Session
+
+			switch testCase.authKind {
+			case auth.KindIguazioV4:
+				session = authIgzV4.NewSession(testCase.fullUsername, "", nil, "")
+			case auth.KindIguazio:
+				session = authIgzV1.NewSession(testCase.fullUsername, "", "", nil)
+			default:
+				session = &nop.Session{}
+			}
+
+			testContext := context.WithValue(suite.ctx, auth.AuthSessionContextKey, session)
+			labels := make(map[string]string)
+			suite.platform.EnrichLabels(testContext, labels)
+
+			usernameLabel := labels[iguazio.IguazioUsernameLabel]
+			suite.Require().Equal(testCase.expectedUsernameLabel, usernameLabel)
+
+			domainLabel := labels[iguazio.IguazioDomainLabel]
+			suite.Require().Equal(testCase.expectedDomainLabel, domainLabel)
+		})
+	}
+}
+
+func (suite *FunctionKubePlatformTestSuite) TestValidateAPIGatewayAuthentication() {
+	for _, testCase := range []struct {
+		name               string
+		authenticationMode ingress.AuthenticationMode
+		annotations        map[string]string
+		expectError        bool
+	}{
+		{
+			name:               "Valid iguazio authentication with empty annotations",
+			authenticationMode: ingress.AuthenticationModeIguazio,
+			annotations:        map[string]string{},
+			expectError:        false,
+		},
+		{
+			name:               "Valid not iguazio authentication mode with overrides",
+			authenticationMode: ingress.AuthenticationModeNone,
+			annotations: map[string]string{
+				annotations.NginxProxyBodySize: "100",
+			},
+			expectError: false,
+		},
+		{
+			name:               "Iguazio authentication with overrides",
+			authenticationMode: ingress.AuthenticationModeIguazio,
+			annotations: map[string]string{
+				annotations.NginxAuthResponseHeaders: "test-header",
+				annotations.NginxProxyBodySize:       "100",
+				annotations.NginxProxyBufferSize:     "200",
+				annotations.NginxServiceUpstream:     "false",
+				annotations.NginxSSLRedirect:         "false",
+				annotations.NginxAuthURL:             "test-url",
+				annotations.NginxAuthSignIn:          "test-sign-in",
+			},
+			expectError: true,
+		},
+		{
+			name:               "Iguazio authentication with a different annotation",
+			authenticationMode: ingress.AuthenticationModeIguazio,
+			annotations: map[string]string{
+				"test-annotation": "test-value",
+			},
+			expectError: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			testApiGatewayConfig := &platform.APIGatewayConfig{
+				Meta: platform.APIGatewayMeta{
+					Annotations: testCase.annotations,
+				},
+				Spec: platform.APIGatewaySpec{
+					AuthenticationMode: testCase.authenticationMode,
+				},
+			}
+
+			err := suite.platform.validateAPIGatewayAuthentication(testApiGatewayConfig)
+			if testCase.expectError {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().Nil(err)
+			}
+		})
+	}
+}
+
+type FunctionEventKubePlatformTestSuite struct {
+	KubePlatformTestSuite
+}
+
+func (suite *FunctionEventKubePlatformTestSuite) TestGetFunctionEventsPermissions() {
+	for _, testCase := range []struct {
+		name           string
+		opaResponse    bool
+		givenMemberIds bool
+		raiseForbidden bool
+	}{
+		{
+			name:           "Allowed",
+			opaResponse:    true,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden with Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden no Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: false,
+		},
+		{
+			name:           "No OPA",
+			opaResponse:    false,
+			givenMemberIds: false,
+			raiseForbidden: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			var memberIds []string
+
+			functionEventName := "funcEvent"
+			functionName := "func"
+			projectName := "proj"
+
+			getFunctionEventResponse := &v1beta1.NuclioFunctionEvent{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      functionEventName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyFunctionName: functionName,
+						common.NuclioResourceLabelKeyProjectName:  projectName,
+					},
+				},
+			}
+
+			suite.nuclioFunctionEventInterfaceMock.
+				On("Get", suite.ctx, functionEventName, metav1.GetOptions{}).
+				Return(getFunctionEventResponse, nil).
+				Once()
+			defer suite.nuclioFunctionEventInterfaceMock.AssertExpectations(suite.T())
+
+			if testCase.givenMemberIds {
+				memberIds = []string{"id1", "id2"}
+				suite.mockedOpaClient.
+					On("QueryPermissionsMultiResources",
+						suite.ctx,
+						[]string{fmt.Sprintf("/projects/%s/functions/%s/function-events/%s",
+							projectName,
+							functionName,
+							functionEventName)},
+						opaclient.ActionRead,
+						&opaclient.PermissionOptions{
+							MemberIds:           memberIds,
+							RaiseForbidden:      testCase.raiseForbidden,
+							OverrideHeaderValue: suite.opaOverrideHeaderValue,
+						}).
+					Return([]bool{testCase.opaResponse}, nil).
+					Once()
+				defer suite.mockedOpaClient.AssertExpectations(suite.T())
+			}
+			functionEvents, err := suite.platform.GetFunctionEvents(suite.ctx, &platform.GetFunctionEventsOptions{
+				Meta: platform.FunctionEventMeta{
+					Name:      functionEventName,
+					Namespace: suite.Namespace,
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      testCase.raiseForbidden,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse && testCase.givenMemberIds {
+				if testCase.raiseForbidden {
+					suite.Require().Error(err)
+				} else {
+					suite.Require().NoError(err)
+					suite.Require().Equal(0, len(functionEvents))
+				}
+			} else {
+				suite.Require().NoError(err)
+				suite.Require().Equal(1, len(functionEvents))
+				suite.Require().Equal(functionEventName, functionEvents[0].GetConfig().Meta.Name)
+			}
+		})
+	}
+}
+
+func (suite *FunctionEventKubePlatformTestSuite) TestUpdateFunctionEventPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionEventName := "funcEvent"
+			functionName := "func"
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			getFunctionEventResponse := &v1beta1.NuclioFunctionEvent{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      functionEventName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyFunctionName: functionName,
+						common.NuclioResourceLabelKeyProjectName:  projectName,
+					},
+				},
+			}
+
+			suite.nuclioFunctionEventInterfaceMock.
+				On("Get", suite.ctx, functionEventName, metav1.GetOptions{}).
+				Return(getFunctionEventResponse, nil).
+				Once()
+			defer suite.nuclioFunctionEventInterfaceMock.AssertExpectations(suite.T())
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/functions/%s/function-events/%s",
+						projectName,
+						functionName,
+						functionEventName),
+					opaclient.ActionUpdate,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				// verify
+				verifyUpdateFunctionEvent := func(functionEvent *v1beta1.NuclioFunctionEvent) bool {
+					suite.Require().Equal(functionEventName, functionEvent.Name)
+					suite.Require().Equal(suite.Namespace, functionEvent.Namespace)
+
+					return true
+				}
+
+				suite.nuclioFunctionEventInterfaceMock.
+					On("Update",
+						suite.ctx,
+						mock.MatchedBy(verifyUpdateFunctionEvent),
+						metav1.UpdateOptions{}).
+					Return(getFunctionEventResponse, nil).
+					Once()
+
+				defer suite.nuclioFunctionEventInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.UpdateFunctionEvent(suite.ctx, &platform.UpdateFunctionEventOptions{
+				FunctionEventConfig: platform.FunctionEventConfig{
+					Meta: platform.FunctionEventMeta{
+						Name:      functionEventName,
+						Namespace: suite.Namespace,
+						Labels: map[string]string{
+							common.NuclioResourceLabelKeyFunctionName: functionName,
+							common.NuclioResourceLabelKeyProjectName:  functionName,
+						},
+					},
+					Spec: platform.FunctionEventSpec{},
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *FunctionEventKubePlatformTestSuite) TestDeleteFunctionEventPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionEventName := "funcEvent"
+			functionName := "func"
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			getFunctionEventResponse := &v1beta1.NuclioFunctionEvent{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      functionEventName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyFunctionName: functionName,
+						common.NuclioResourceLabelKeyProjectName:  projectName,
+					},
+				},
+			}
+
+			suite.nuclioFunctionEventInterfaceMock.
+				On("Get", suite.ctx, functionEventName, metav1.GetOptions{}).
+				Return(getFunctionEventResponse, nil).
+				Once()
+			defer suite.nuclioFunctionEventInterfaceMock.AssertExpectations(suite.T())
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/functions/%s/function-events/%s",
+						projectName,
+						functionName,
+						functionEventName),
+					opaclient.ActionDelete,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				suite.nuclioFunctionEventInterfaceMock.
+					On("Delete", suite.ctx, functionEventName, metav1.DeleteOptions{}).
+					Return(nil).
+					Once()
+				defer suite.nuclioFunctionEventInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.DeleteFunctionEvent(suite.ctx, &platform.DeleteFunctionEventOptions{
+				Meta: platform.FunctionEventMeta{
+					Name:      functionEventName,
+					Namespace: suite.Namespace,
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+type APIGatewayKubePlatformTestSuite struct {
+	KubePlatformTestSuite
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestAPIGatewayEnrichmentAndValidation() {
+
+	// return empty api gateways list on enrichFunctionsWithAPIGateways (not tested here)
+	suite.nuclioAPIGatewayInterfaceMock.
+		On("List", suite.ctx, metav1.ListOptions{}).
+		Return(&v1beta1.NuclioAPIGatewayList{}, nil)
+
+	// set the template for api gateway host generation
+	suite.platform.GetConfig().Kube.DefaultHTTPIngressHostTemplate = "{{ .ResourceName }}.{{ .Namespace }}.app.dev.com"
+	defer func() {
+		// unset the template for api gateway host generation
+		suite.platform.GetConfig().Kube.DefaultHTTPIngressHostTemplate = ""
+	}()
+
+	for _, testCase := range []struct {
+		name             string
+		setUpFunction    func() error
+		tearDownFunction func() error
+		apiGatewayConfig *platform.APIGatewayConfig
+
+		// keep empty to skip the enrichment validation
+		expectedEnrichedAPIGateway *platform.APIGatewayConfig
+
+		// the matching api gateway upstream functions
+		upstreamFunctions []*v1beta1.NuclioFunction
+
+		// whether to validate upstream functions existing
+		validateFunctionsExistence bool
+
+		// keep empty when shouldn't fail
+		validationError string
+
+		// keep empty when not verifying session enrichment
+		authSession auth.Session
+	}{
+		{
+			name: "SpecNameEnrichedFromMetaName",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Name = ""
+				apiGatewayConfig.Meta.Name = "meta-name"
+				return &apiGatewayConfig
+			}(),
+			expectedEnrichedAPIGateway: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Name = "meta-name"
+				apiGatewayConfig.Meta.Name = "meta-name"
+				return &apiGatewayConfig
+			}(),
+		},
+		{
+			name: "HostEnriched",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Host = ""
+				return &apiGatewayConfig
+			}(),
+			expectedEnrichedAPIGateway: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Host = "default-name.default-namespace.app.dev.com"
+				return &apiGatewayConfig
+			}(),
+		},
+		{
+			name: "MetaNameEnrichedFromSpecName",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Name = "spec-name"
+				apiGatewayConfig.Meta.Name = ""
+				return &apiGatewayConfig
+			}(),
+			expectedEnrichedAPIGateway: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Name = "spec-name"
+				apiGatewayConfig.Meta.Name = "spec-name"
+				return &apiGatewayConfig
+			}(),
+		},
+		{
+			name: "UserNameEnrichedFromSessionV1",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				return &apiGatewayConfig
+			}(),
+			expectedEnrichedAPIGateway: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Labels = map[string]string{
+					iguazio.IguazioUsernameLabel: "some-username",
+				}
+				return &apiGatewayConfig
+			}(),
+			authSession: authIgzV1.NewSession("some-username", "", "", nil),
+		},
+		{
+			name: "UserNameEnrichedFromSessionV4",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				return &apiGatewayConfig
+			}(),
+			expectedEnrichedAPIGateway: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Labels = map[string]string{
+					iguazio.IguazioUsernameLabel: "some-username1",
+				}
+				return &apiGatewayConfig
+			}(),
+			authSession: authIgzV4.NewSession("some-username1", "", nil, ""),
+		},
+		{
+			name: "ValidateNamespaceExistence",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Namespace = ""
+				return &apiGatewayConfig
+			}(),
+			validationError: "Api gateway namespace must be provided in metadata",
+		},
+		{
+			name: "ValidateNameExistence",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Name = ""
+				apiGatewayConfig.Spec.Name = ""
+				return &apiGatewayConfig
+			}(),
+			validationError: "Api gateway name must be provided in metadata",
+		},
+		{
+			name: "ValidateNameEqualsInSpecAndMeta",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Name = "name1"
+				apiGatewayConfig.Spec.Name = "name2"
+				return &apiGatewayConfig
+			}(),
+			validationError: "Api gateway metadata.name must match api gateway spec.name",
+		},
+		{
+			name: "ValidateNoReservedName",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Meta.Name = "dashboard"
+				apiGatewayConfig.Spec.Name = "dashboard"
+				return &apiGatewayConfig
+			}(),
+			validationError: "Api gateway name 'dashboard' is reserved and cannot be used",
+		},
+		{
+			name: "ValidateNoMoreThanTwoUpstreams",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				upstream := apiGatewayConfig.Spec.Upstreams[0]
+				apiGatewayConfig.Spec.Upstreams = []platform.APIGatewayUpstreamSpec{upstream, upstream, upstream}
+				return &apiGatewayConfig
+			}(),
+			validationError: "Received more than 2 upstreams. Currently not supported",
+		},
+		{
+			name: "ValidateAtLeastOneUpstream",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Upstreams = []platform.APIGatewayUpstreamSpec{}
+				return &apiGatewayConfig
+			}(),
+			validationError: "One or more upstreams must be provided in spec",
+		},
+		{
+			name: "ValidateUpstreamKind",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Upstreams[0].Kind = "bad-kind"
+				return &apiGatewayConfig
+			}(),
+			validationError: "Unsupported upstream kind: 'bad-kind'. (Currently supporting only nucliofunction)",
+		},
+		{
+			name: "ValidateAllUpstreamsHaveSameKind",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				differentKindUpstream := apiGatewayConfig.Spec.Upstreams[0]
+				differentKindUpstream.Kind = "kind-2"
+				apiGatewayConfig.Spec.Upstreams = append(apiGatewayConfig.Spec.Upstreams, differentKindUpstream)
+				return &apiGatewayConfig
+			}(),
+			validationError: "All upstreams must be of the same kind",
+		},
+		{
+			name: "ValidateAPIGatewayFunctionHasNoIngresses",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name = "function-with-ingresses"
+				return &apiGatewayConfig
+			}(),
+			upstreamFunctions: []*v1beta1.NuclioFunction{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "function-with-ingresses",
+					},
+					Spec: functionconfig.Spec{
+						Triggers: map[string]functionconfig.Trigger{
+							"http-with-ingress": {
+								Kind: "http",
+								Attributes: map[string]interface{}{
+									"ingresses": map[string]interface{}{
+										"0": map[string]interface{}{
+											"host":  "some-host",
+											"paths": []string{"/"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ValidateAPIGatewayCanaryFunctionHasNoIngresses",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name = "function-without-ingresses"
+				apiGatewayConfig.Spec.Upstreams = append(apiGatewayConfig.Spec.Upstreams, platform.APIGatewayUpstreamSpec{
+					Kind: platform.APIGatewayUpstreamKindNuclioFunction,
+					NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
+						Name: "function-with-ingresses-2",
+					},
+				})
+				return &apiGatewayConfig
+			}(),
+			upstreamFunctions: []*v1beta1.NuclioFunction{
+				{}, // primary upstream function is empty (has no ingresses)
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "function-with-ingresses-2",
+					},
+					Spec: functionconfig.Spec{
+						Triggers: map[string]functionconfig.Trigger{
+							"http-with-ingress": {
+								Kind: "http",
+								Attributes: map[string]interface{}{
+									"ingresses": map[string]interface{}{
+										"0": map[string]interface{}{
+											"host":  "some-host",
+											"paths": []string{"/"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "PathIsAvailable",
+			setUpFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset(&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "some-name",
+						Namespace: suite.Namespace,
+					},
+					Spec: networkingv1.IngressSpec{
+						Rules: []networkingv1.IngressRule{
+							{
+								Host: "this-host-and-path-are-used.com",
+								IngressRuleValue: networkingv1.IngressRuleValue{
+									HTTP: &networkingv1.HTTPIngressRuleValue{
+										Paths: []networkingv1.HTTPIngressPath{
+											{
+												Path: "different-path/",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				return nil
+			},
+			tearDownFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset()
+				return nil
+			},
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Host = "this-host-and-path-are-used.com"
+				apiGatewayConfig.Spec.Path = "/same-path"
+				return &apiGatewayConfig
+			}(),
+		},
+		{
+			name: "FailPathInUse",
+			setUpFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset(&networkingv1.Ingress{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "some-name",
+						Namespace: suite.Namespace,
+					},
+					Spec: networkingv1.IngressSpec{
+						Rules: []networkingv1.IngressRule{
+							{
+								Host: "this-host-and-path-are-used.com",
+								IngressRuleValue: networkingv1.IngressRuleValue{
+									HTTP: &networkingv1.HTTPIngressRuleValue{
+										Paths: []networkingv1.HTTPIngressPath{
+											{
+												Path: "same-path/",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				})
+				return nil
+			},
+			tearDownFunction: func() error {
+				suite.kubeClientSet = *fake.NewSimpleClientset()
+				return nil
+			},
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				apiGatewayConfig.Spec.Host = "this-host-and-path-are-used.com"
+				apiGatewayConfig.Spec.Path = "/same-path"
+				return &apiGatewayConfig
+			}(),
+			validationError: platform.ErrIngressHostPathInUse.Error(),
+		},
+		{
+			name: "ValidateFunctionsExistenceSanity",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				return &apiGatewayConfig
+			}(),
+			upstreamFunctions: []*v1beta1.NuclioFunction{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "default-func-name",
+					},
+				},
+			},
+			validateFunctionsExistence: true,
+		},
+		{
+			name: "ValidateFunctionsExistenceFailed",
+			apiGatewayConfig: func() *platform.APIGatewayConfig {
+				apiGatewayConfig := suite.compileAPIGatewayConfig()
+				return &apiGatewayConfig
+			}(),
+			validateFunctionsExistence: true,
+			validationError:            "Function default-func-name does not exist",
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			defer suite.ResetCRDMocks()
+			if testCase.expectedEnrichedAPIGateway != nil {
+				if testCase.expectedEnrichedAPIGateway.Meta.Labels == nil {
+					testCase.expectedEnrichedAPIGateway.Meta.Labels = map[string]string{}
+				}
+				if testCase.authSession != nil {
+					suite.ctx = context.WithValue(suite.ctx, auth.AuthSessionContextKey, testCase.authSession)
+				}
+				suite.platform.EnrichLabels(suite.ctx, testCase.expectedEnrichedAPIGateway.Meta.Labels)
+			}
+
+			// run test case specific set up function if given
+			if testCase.setUpFunction != nil {
+				err := testCase.setUpFunction()
+				suite.Require().NoError(err)
+			}
+
+			// run enrichment
+			suite.platform.enrichAPIGatewayConfig(suite.ctx, testCase.apiGatewayConfig, nil)
+			if testCase.expectedEnrichedAPIGateway != nil {
+				suite.Require().Empty(cmp.Diff(testCase.expectedEnrichedAPIGateway, testCase.apiGatewayConfig))
+			}
+
+			// mock Get functions, when iterating over upstreams on validateAPIGatewayFunctionsHaveNoIngresses
+			for idx, upstream := range testCase.apiGatewayConfig.Spec.Upstreams {
+				var upstreamFunction *v1beta1.NuclioFunction
+				var getFunctionsError interface{}
+
+				if len(testCase.upstreamFunctions) > idx {
+					upstreamFunction = testCase.upstreamFunctions[idx]
+					getFunctionsError = nil
+				} else {
+
+					// return no function if not specified (not found)
+					upstreamFunction = &v1beta1.NuclioFunction{}
+					getFunctionsError = &apierrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound}}
+				}
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Get", suite.ctx, upstream.NuclioFunction.Name, metav1.GetOptions{}).
+					Return(upstreamFunction, getFunctionsError).
+					Once()
+			}
+
+			// run validation
+			err := suite.platform.validateAPIGatewayConfig(suite.ctx, testCase.apiGatewayConfig,
+				testCase.validateFunctionsExistence,
+				nil)
+			if testCase.validationError != "" {
+				suite.Require().Error(err)
+				suite.Require().Equal(testCase.validationError, errors.RootCause(err).Error())
+			} else {
+				suite.Require().NoError(err)
+			}
+
+			// run test case specific tear down function if given
+			if testCase.tearDownFunction != nil {
+				err := testCase.tearDownFunction()
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestAPIGatewayUpdate() {
+	for _, testCase := range []struct {
+		name                    string
+		updateAPIGatewayOptions func(baseAPIGatewayConfig *platform.APIGatewayConfig) *platform.UpdateAPIGatewayOptions
+	}{
+		{
+			name: "UpdateFields",
+			updateAPIGatewayOptions: func(baseAPIGatewayConfig *platform.APIGatewayConfig) *platform.UpdateAPIGatewayOptions {
+				updateAPIGatewayOptions := &platform.UpdateAPIGatewayOptions{
+					APIGatewayConfig: &platform.APIGatewayConfig{
+						Meta:   baseAPIGatewayConfig.Meta,
+						Spec:   baseAPIGatewayConfig.Spec,
+						Status: baseAPIGatewayConfig.Status,
+					},
+				}
+				// modify a field
+				updateAPIGatewayOptions.APIGatewayConfig.Spec.Host = "update-me.com"
+				updateAPIGatewayOptions.APIGatewayConfig.Meta.Labels = map[string]string{
+					common.NuclioResourceLabelKeyProjectName: "some-test",
+					"newLabel":                               "label-value",
+				}
+				updateAPIGatewayOptions.APIGatewayConfig.Meta.Annotations = map[string]string{
+					"newAnnotation": "annotation-value",
+				}
+				return updateAPIGatewayOptions
+			},
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			apiGatewayConfig := suite.compileAPIGatewayConfig()
+			updateAPIGatewayOptions := testCase.updateAPIGatewayOptions(&apiGatewayConfig)
+
+			// get before update
+			suite.nuclioAPIGatewayInterfaceMock.
+				On("Get", suite.ctx, apiGatewayConfig.Meta.Name, metav1.GetOptions{}).
+				Return(&v1beta1.NuclioAPIGateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      apiGatewayConfig.Meta.Name,
+						Namespace: apiGatewayConfig.Meta.Namespace,
+						Labels: map[string]string{
+							common.NuclioResourceLabelKeyProjectName: "some-test",
+						},
+					},
+					Spec:   apiGatewayConfig.Spec,
+					Status: apiGatewayConfig.Status,
+				}, nil).
+				Once()
+
+			// mock OPA permissions check (allow)
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					mock.AnythingOfType("string"),
+					opaclient.ActionUpdate,
+					mock.AnythingOfType("*opaclient.PermissionOptions")).
+				Return(true, nil).
+				Once()
+
+			verifyAPIGatewayToUpdate := func(apiGatewayToUpdate *v1beta1.NuclioAPIGateway) bool {
+				suite.Require().Empty(cmp.Diff(updateAPIGatewayOptions.APIGatewayConfig.Spec, apiGatewayToUpdate.Spec))
+				suite.Require().Empty(cmp.Diff(updateAPIGatewayOptions.APIGatewayConfig.Meta.Annotations, apiGatewayToUpdate.Annotations))
+				suite.Require().Empty(cmp.Diff(updateAPIGatewayOptions.APIGatewayConfig.Meta.Labels, apiGatewayToUpdate.Labels))
+				suite.Require().Equal(platform.APIGatewayStateWaitingForProvisioning, apiGatewayToUpdate.Status.State)
+				return true
+			}
+
+			// mock kubernetes update
+			suite.nuclioAPIGatewayInterfaceMock.
+				On("Update",
+					suite.ctx,
+					mock.MatchedBy(verifyAPIGatewayToUpdate),
+					mock.Anything).
+				Return(&v1beta1.NuclioAPIGateway{}, nil).
+				Once()
+
+			// no function with matching upstreams
+			suite.nuclioFunctionInterfaceMock.
+				On("Get",
+					suite.ctx,
+					apiGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name,
+					metav1.GetOptions{}).
+				Return(nil,
+					&apierrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound}}).
+				Once()
+
+			// update
+			err := suite.platform.UpdateAPIGateway(suite.ctx, updateAPIGatewayOptions)
+			suite.Require().NoError(err)
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestGetAPIGatewaysPermissions() {
+	for _, testCase := range []struct {
+		name           string
+		opaResponse    bool
+		givenMemberIds bool
+		raiseForbidden bool
+	}{
+		{
+			name:           "Allowed",
+			opaResponse:    true,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden with Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: true,
+		},
+		{
+			name:           "Forbidden no Error",
+			opaResponse:    false,
+			givenMemberIds: true,
+			raiseForbidden: false,
+		},
+		{
+			name:           "No OPA",
+			opaResponse:    false,
+			givenMemberIds: false,
+			raiseForbidden: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			defer suite.ResetCRDMocks()
+			var memberIds []string
+
+			apiGatewayName := "test-agw"
+			projectName := "proj"
+
+			getAPIGatewayResponse := &v1beta1.NuclioAPIGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: suite.Namespace,
+					Name:      apiGatewayName,
+					Labels: map[string]string{
+						common.NuclioResourceLabelKeyProjectName: projectName,
+					},
+				},
+			}
+
+			suite.nuclioAPIGatewayInterfaceMock.
+				On("Get", suite.ctx, apiGatewayName, metav1.GetOptions{}).
+				Return(getAPIGatewayResponse, nil).
+				Once()
+			defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+
+			if testCase.givenMemberIds {
+				memberIds = []string{"id1", "id2"}
+				suite.mockedOpaClient.
+					On("QueryPermissionsMultiResources",
+						suite.ctx,
+						[]string{fmt.Sprintf("/projects/%s/api-gateways/%s",
+							projectName,
+							apiGatewayName)},
+						opaclient.ActionRead,
+						&opaclient.PermissionOptions{
+							MemberIds:           memberIds,
+							RaiseForbidden:      testCase.raiseForbidden,
+							OverrideHeaderValue: suite.opaOverrideHeaderValue,
+						}).
+					Return([]bool{testCase.opaResponse}, nil).
+					Once()
+				defer suite.mockedOpaClient.AssertExpectations(suite.T())
+			}
+
+			apiGateways, err := suite.platform.GetAPIGateways(suite.ctx, &platform.GetAPIGatewaysOptions{
+				Name:      apiGatewayName,
+				Namespace: suite.Namespace,
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      testCase.raiseForbidden,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse && testCase.givenMemberIds {
+				if testCase.raiseForbidden {
+					suite.Require().Error(err)
+				} else {
+					suite.Require().NoError(err)
+					suite.Require().Equal(0, len(apiGateways))
+				}
+			} else {
+				suite.Require().NoError(err)
+				suite.Require().Equal(1, len(apiGateways))
+				suite.Require().Equal(apiGatewayName, apiGateways[0].GetConfig().Meta.Name)
+			}
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestCreateAPIGatewayPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			defer suite.ResetCRDMocks()
+
+			apiGatewayConfig := suite.compileAPIGatewayConfig()
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			apiGatewayConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: projectName,
+			}
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/api-gateways/%s",
+						projectName,
+						apiGatewayConfig.Meta.Name),
+					opaclient.ActionCreate,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Get",
+						suite.ctx,
+						apiGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name,
+						metav1.GetOptions{}).
+					Return(nil,
+						&apierrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound}}).
+					Once()
+
+				suite.nuclioAPIGatewayInterfaceMock.
+					On("Create",
+						suite.ctx,
+						mock.AnythingOfType("*v1beta1.NuclioAPIGateway"),
+						metav1.CreateOptions{}).
+					Return(&v1beta1.NuclioAPIGateway{}, nil).
+					Once()
+				defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.CreateAPIGateway(suite.ctx, &platform.CreateAPIGatewayOptions{
+				APIGatewayConfig: &apiGatewayConfig,
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      true,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestUpdateAPIGatewayPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			defer suite.ResetCRDMocks()
+
+			apiGatewayConfig := suite.compileAPIGatewayConfig()
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			apiGatewayConfig.Meta.Labels = map[string]string{
+				common.NuclioResourceLabelKeyProjectName: projectName,
+			}
+
+			suite.nuclioAPIGatewayInterfaceMock.
+				On("Get", suite.ctx, apiGatewayConfig.Meta.Name, metav1.GetOptions{}).
+				Return(&v1beta1.NuclioAPIGateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      apiGatewayConfig.Meta.Name,
+						Namespace: apiGatewayConfig.Meta.Namespace,
+						Labels: map[string]string{
+							common.NuclioResourceLabelKeyProjectName: projectName,
+						},
+					},
+					Spec:   apiGatewayConfig.Spec,
+					Status: apiGatewayConfig.Status,
+				}, nil).
+				Once()
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/api-gateways/%s",
+						projectName,
+						apiGatewayConfig.Meta.Name),
+					opaclient.ActionUpdate,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				suite.nuclioFunctionInterfaceMock.
+					On("Get",
+						suite.ctx,
+						apiGatewayConfig.Spec.Upstreams[0].NuclioFunction.Name,
+						metav1.GetOptions{}).
+					Return(nil,
+						&apierrors.StatusError{ErrStatus: metav1.Status{Reason: metav1.StatusReasonNotFound}}).
+					Once()
+
+				suite.nuclioAPIGatewayInterfaceMock.
+					On("Update",
+						suite.ctx,
+						mock.AnythingOfType("*v1beta1.NuclioAPIGateway"),
+						mock.Anything).
+					Return(&v1beta1.NuclioAPIGateway{}, nil).
+					Once()
+				defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.UpdateAPIGateway(suite.ctx, &platform.UpdateAPIGatewayOptions{
+				APIGatewayConfig: &apiGatewayConfig,
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      true,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) TestDeleteAPIGatewayPermissions() {
+	for _, testCase := range []struct {
+		name        string
+		opaResponse bool
+	}{
+		{
+			name:        "Allowed",
+			opaResponse: true,
+		},
+		{
+			name:        "Forbidden",
+			opaResponse: false,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			defer suite.ResetCRDMocks()
+
+			apiGatewayName := "test-agw"
+			projectName := "proj"
+			memberIds := []string{"id1", "id2"}
+
+			// mock get existing api gateway (for OPA project name resolution)
+			suite.nuclioAPIGatewayInterfaceMock.
+				On("Get", suite.ctx, apiGatewayName, metav1.GetOptions{}).
+				Return(&v1beta1.NuclioAPIGateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: suite.Namespace,
+						Name:      apiGatewayName,
+						Labels: map[string]string{
+							common.NuclioResourceLabelKeyProjectName: projectName,
+						},
+					},
+				}, nil).
+				Once()
+
+			suite.mockedOpaClient.
+				On("QueryPermissions",
+					fmt.Sprintf("/projects/%s/api-gateways/%s",
+						projectName,
+						apiGatewayName),
+					opaclient.ActionDelete,
+					&opaclient.PermissionOptions{
+						MemberIds:           memberIds,
+						RaiseForbidden:      true,
+						OverrideHeaderValue: suite.opaOverrideHeaderValue,
+					}).
+				Return(testCase.opaResponse, nil).
+				Once()
+			defer suite.mockedOpaClient.AssertExpectations(suite.T())
+
+			if testCase.opaResponse {
+
+				suite.nuclioAPIGatewayInterfaceMock.
+					On("Delete", suite.ctx, apiGatewayName, metav1.DeleteOptions{}).
+					Return(nil).
+					Once()
+				defer suite.nuclioAPIGatewayInterfaceMock.AssertExpectations(suite.T())
+			}
+
+			err := suite.platform.DeleteAPIGateway(suite.ctx, &platform.DeleteAPIGatewayOptions{
+				Meta: platform.APIGatewayMeta{
+					Name:      apiGatewayName,
+					Namespace: suite.Namespace,
+				},
+				PermissionOptions: opaclient.PermissionOptions{
+					MemberIds:           memberIds,
+					RaiseForbidden:      true,
+					OverrideHeaderValue: suite.opaOverrideHeaderValue,
+				},
+			})
+
+			if !testCase.opaResponse {
+				suite.Require().Error(err)
+			} else {
+				suite.Require().NoError(err)
+			}
+		})
+	}
+}
+
+func (suite *APIGatewayKubePlatformTestSuite) compileAPIGatewayConfig() platform.APIGatewayConfig {
+	return platform.APIGatewayConfig{
+		Meta: platform.APIGatewayMeta{
+			Name:      "default-name",
+			Namespace: suite.Namespace,
+		},
+		Spec: platform.APIGatewaySpec{
+			Name:               "default-name",
+			Host:               "default-host",
+			AuthenticationMode: ingress.AuthenticationModeNone,
+			Upstreams: []platform.APIGatewayUpstreamSpec{
+				{
+					Kind: platform.APIGatewayUpstreamKindNuclioFunction,
+					NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
+						Name: "default-func-name",
+					},
+				},
+			},
+		},
+		Status: platform.APIGatewayStatus{
+			State: platform.APIGatewayStateWaitingForProvisioning,
+		},
+	}
+}
+
+func TestKubePlatformTestSuite(t *testing.T) {
+	suite.Run(t, new(ProjectKubePlatformTestSuite))
+	suite.Run(t, new(FunctionKubePlatformTestSuite))
+	suite.Run(t, new(FunctionEventKubePlatformTestSuite))
+	suite.Run(t, new(APIGatewayKubePlatformTestSuite))
+}

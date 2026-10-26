@@ -1,0 +1,131 @@
+diff --git a/homeassistant/components/backup/backup.py b/homeassistant/components/backup/backup.py
+index 4573fe0f..a4e2438f 100644
+--- a/homeassistant/components/backup/backup.py
++++ b/homeassistant/components/backup/backup.py
+@@ -11,7 +11,7 @@ from homeassistant.helpers.hassio import is_hassio
+ 
+ from .agent import BackupAgent, LocalBackupAgent, OnProgressCallback
+ from .const import DOMAIN, LOGGER
+-from .models import AgentBackup, BackupNotFound
++from .models import AgentBackup, BackupNotFound, InvalidBackupFilename
+ from .util import read_backup, suggested_filename
+ 
+ 
+@@ -54,7 +54,13 @@ class CoreLocalBackupAgent(LocalBackupAgent):
+             try:
+                 backup = read_backup(backup_path)
+                 backups[backup.backup_id] = (backup, backup_path)
+-            except (OSError, TarError, json.JSONDecodeError, KeyError) as err:
++            except (
++                OSError,
++                TarError,
++                json.JSONDecodeError,
++                KeyError,
++                InvalidBackupFilename,
++            ) as err:
+                 LOGGER.warning("Unable to read backup %s: %s", backup_path, err)
+         return backups
+ 
+@@ -122,7 +128,12 @@ class CoreLocalBackupAgent(LocalBackupAgent):
+ 
+     def get_new_backup_path(self, backup: AgentBackup) -> Path:
+         """Return the local path to a new backup."""
+-        return self._backup_dir / suggested_filename(backup)
++        candidate = self._backup_dir / suggested_filename(backup)
++        if candidate.parent != self._backup_dir:
++            raise InvalidBackupFilename(
++                f"Refusing to write outside {self._backup_dir}: {candidate}"
++            )
++        return candidate
+ 
+     async def async_delete_backup(self, backup_id: str, **kwargs: Any) -> None:
+         """Delete a backup file."""
+diff --git a/homeassistant/components/backup/manager.py b/homeassistant/components/backup/manager.py
+index 5d111132..ca9f7b3a 100644
+--- a/homeassistant/components/backup/manager.py
++++ b/homeassistant/components/backup/manager.py
+@@ -1985,7 +1985,13 @@ class CoreBackupReaderWriter(BackupReaderWriter):
+ 
+         try:
+             backup = await async_add_executor_job(read_backup, temp_file)
+-        except (OSError, tarfile.TarError, json.JSONDecodeError, KeyError) as err:
++        except (
++            OSError,
++            tarfile.TarError,
++            json.JSONDecodeError,
++            KeyError,
++            InvalidBackupFilename,
++        ) as err:
+             LOGGER.warning("Unable to parse backup %s: %s", temp_file, err)
+             raise
+ 
+@@ -2061,6 +2067,10 @@ class CoreBackupReaderWriter(BackupReaderWriter):
+         else:
+             async_add_executor_job = self._hass.async_add_executor_job
+             path = self.temp_backup_dir / f"{backup_id}.tar"
++            if path.parent != self.temp_backup_dir:
++                raise InvalidBackupFilename(
++                    f"Refusing to stage outside {self.temp_backup_dir}: {path}"
++                )
+             stream = await open_stream()
+             await async_add_executor_job(make_backup_dir, self.temp_backup_dir)
+             f = await async_add_executor_job(path.open, "wb")
+diff --git a/homeassistant/components/backup/util.py b/homeassistant/components/backup/util.py
+index 197a1233..6cf371fb 100644
+--- a/homeassistant/components/backup/util.py
++++ b/homeassistant/components/backup/util.py
+@@ -6,7 +6,7 @@ import copy
+ from dataclasses import dataclass, replace
+ from io import BytesIO
+ import json
+-from pathlib import Path, PurePath
++from pathlib import Path, PurePath, PureWindowsPath
+ from queue import SimpleQueue
+ import tarfile
+ import threading
+@@ -34,7 +34,7 @@ from homeassistant.util.async_iterator import (
+ from homeassistant.util.json import JsonObjectType, json_loads_object
+ 
+ from .const import BUF_SIZE, LOGGER, SECURETAR_CREATE_VERSION
+-from .models import AddonInfo, AgentBackup, Folder
++from .models import AddonInfo, AgentBackup, Folder, InvalidBackupFilename
+ 
+ 
+ class DecryptError(HomeAssistantError):
+@@ -72,6 +72,14 @@ def make_backup_dir(path: Path) -> None:
+     path.mkdir(exist_ok=True)
+ 
+ 
++def _safe_filename_component(value: str, field: str) -> str:
++    """Return a metadata value which is safe to use as a single path component."""
++    safe_value = PureWindowsPath(value).name
++    if safe_value != value or value in ("", ".", ".."):
++        raise InvalidBackupFilename(f"Invalid backup {field}: {value!r}")
++    return value
++
++
+ def read_backup(backup_path: Path) -> AgentBackup:
+     """Read a backup from disk."""
+ 
+@@ -109,16 +117,19 @@ def read_backup(backup_path: Path) -> AgentBackup:
+         extra_metadata = cast(dict[str, bool | str], data.get("extra", {}))
+         date = extra_metadata.get("supervisor.backup_request_date", data["date"])
+ 
++        name = _safe_filename_component(cast(str, data["name"]), "name")
++        backup_id = _safe_filename_component(cast(str, data["slug"]), "id")
++
+         return AgentBackup(
+             addons=addons,
+-            backup_id=cast(str, data["slug"]),
++            backup_id=backup_id,
+             database_included=database_included,
+             date=cast(str, date),
+             extra_metadata=extra_metadata,
+             folders=folders,
+             homeassistant_included=homeassistant_included,
+             homeassistant_version=homeassistant_version,
+-            name=cast(str, data["name"]),
++            name=name,
+             protected=cast(bool, data.get("protected", False)),
+             size=backup_path.stat().st_size,
+         )

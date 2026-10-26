@@ -1,0 +1,248 @@
+diff --git a/cloud/pkg/admissioncontroller/admit_nodeupgradejob.go b/cloud/pkg/admissioncontroller/admit_nodeupgradejob.go
+index 863ed635f..b68d01faf 100644
+--- a/cloud/pkg/admissioncontroller/admit_nodeupgradejob.go
++++ b/cloud/pkg/admissioncontroller/admit_nodeupgradejob.go
+@@ -22,14 +22,13 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"reflect"
+-	"strings"
+ 
+-	"github.com/blang/semver"
+ 	admissionv1 "k8s.io/api/admission/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/klog/v2"
+ 
+ 	"github.com/kubeedge/api/apis/operations/v1alpha1"
++	"github.com/kubeedge/kubeedge/pkg/util/validation"
+ )
+ 
+ func serveNodeUpgradeJob(w http.ResponseWriter, r *http.Request) {
+@@ -82,14 +81,12 @@ func admitNodeUpgradeJob(review admissionv1.AdmissionReview) *admissionv1.Admiss
+ }
+ 
+ func validateNodeUpgradeJob(upgrade *v1alpha1.NodeUpgradeJob) error {
+-	// version must be valid
+-	if !strings.HasPrefix(upgrade.Spec.Version, "v") {
+-		return fmt.Errorf("version must begin with prefix 'v'")
++	if !validation.ValidateVersion(upgrade.Spec.Version) {
++		return fmt.Errorf("invalid version %s", upgrade.Spec.Version)
+ 	}
+-
+-	_, err := semver.Parse(strings.TrimPrefix(upgrade.Spec.Version, "v"))
+-	if err != nil {
+-		return fmt.Errorf("version is not a semver compatible version: %v", err)
++	// Image is a optional field.
++	if upgrade.Spec.Image != "" && !validation.ValidateImageRepo(upgrade.Spec.Image) {
++		return fmt.Errorf("invalid image repo %s", upgrade.Spec.Image)
+ 	}
+ 
+ 	// we must specify NodeNames or LabelSelector, and we can only specify only one
+diff --git a/edge/pkg/taskmanager/actions/configupdatejob.go b/edge/pkg/taskmanager/actions/configupdatejob.go
+index 0dcb57d0a..a75642d82 100644
+--- a/edge/pkg/taskmanager/actions/configupdatejob.go
++++ b/edge/pkg/taskmanager/actions/configupdatejob.go
+@@ -20,6 +20,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"os/exec"
+ 	"strings"
+ 
+ 	"github.com/go-logr/logr"
+@@ -103,10 +104,9 @@ func (h *configUpdateJobActionHandler) updateConfig(
+ 		setFields = setFields + fmt.Sprintf("%s=%s,", updateKey, updateVal)
+ 	}
+ 	setFields = strings.TrimSuffix(setFields, ",")
+-	cmdStr := execs.NewCommand(fmt.Sprintf("keadm config-update --set %s", setFields))
+-	err := cmdStr.Exec()
+-	if err != nil {
+-		resp.err = err
++	cmd := exec.Command("keadm", "config-update", "--set", setFields)
++	if output, err := cmd.CombinedOutput(); err != nil {
++		resp.err = fmt.Errorf("failed to run config-update: %v, output: %s", err, string(output))
+ 		return resp
+ 	}
+ 	return resp
+diff --git a/edge/pkg/taskmanager/actions/imageprepulljob.go b/edge/pkg/taskmanager/actions/imageprepulljob.go
+index 70ce0ec35..083f9d278 100644
+--- a/edge/pkg/taskmanager/actions/imageprepulljob.go
++++ b/edge/pkg/taskmanager/actions/imageprepulljob.go
+@@ -21,6 +21,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"os/exec"
+ 	"strings"
+ 	"time"
+ 
+@@ -39,7 +40,6 @@ import (
+ 	"github.com/kubeedge/kubeedge/pkg/image"
+ 	"github.com/kubeedge/kubeedge/pkg/nodetask/actionflow"
+ 	taskmsg "github.com/kubeedge/kubeedge/pkg/nodetask/message"
+-	"github.com/kubeedge/kubeedge/pkg/util/execs"
+ )
+ 
+ func newImagePrePullJobRunner() *ActionRunner {
+@@ -96,8 +96,8 @@ func (imagePrePullJobActionHandler) checkItems(
+ 	// Report the images that are already present on the node, so that the pull step can
+ 	// skip them and the job finishes faster on nodes that were prepared in advance.
+ 	for _, img := range spec.ImagePrePullTemplate.Images {
+-		cmd := execs.NewCommand(fmt.Sprintf("crictl inspecti %s >/dev/null 2>&1", img))
+-		if err := cmd.Exec(); err == nil {
++		cmd := exec.Command("crictl", "inspecti", img)
++		if err := cmd.Run(); err == nil {
+ 			klog.V(2).Infof("image %s is already present on the node", img)
+ 		}
+ 	}
+diff --git a/edge/pkg/taskmanager/actions/nodeupgradejob.go b/edge/pkg/taskmanager/actions/nodeupgradejob.go
+index dd9dfd0db..0450f0dbd 100644
+--- a/edge/pkg/taskmanager/actions/nodeupgradejob.go
++++ b/edge/pkg/taskmanager/actions/nodeupgradejob.go
+@@ -20,9 +20,10 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"os"
++	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/go-logr/logr"
+@@ -38,6 +39,7 @@ import (
+ 	taskmsg "github.com/kubeedge/kubeedge/pkg/nodetask/message"
+ 	upgradeedge "github.com/kubeedge/kubeedge/pkg/upgrade/edge"
+ 	"github.com/kubeedge/kubeedge/pkg/util/execs"
++	"github.com/kubeedge/kubeedge/pkg/util/validation"
+ )
+ 
+ func newNodeUpgradeJobRunner() *ActionRunner {
+@@ -131,6 +133,15 @@ func (nodeUpgradeJobActionHandler) checkItems(
+ 		}
+ 	}
+ 
++	if !validation.ValidateVersion(spec.Version) {
++		resp.err = fmt.Errorf("invalid version %s", spec.Version)
++		return resp
++	}
++	if spec.Image != "" && !validation.ValidateImageRepo(spec.Image) {
++		resp.err = fmt.Errorf("invalid image repo %s", spec.Image)
++		return resp
++	}
++
+ 	// Pull installation-package image.
+ 	cfg := options.GetEdgeCoreConfig()
+ 	ctrcli, err := containers.NewContainerRuntime(
+@@ -241,18 +252,43 @@ func (h *nodeUpgradeJobActionHandler) upgrade(
+ 		resp.interrupt = true // No upgrade yet, no need to roll back.
+ 		return resp
+ 	}
+-	var cmdline strings.Builder
+-	cmdline.WriteString("keadm upgrade edge --force --toVersion " + spec.Version)
+-	if spec.Image != "" {
+-		cmdline.WriteString(" --image " + spec.Image)
++	if !validation.ValidateVersion(spec.Version) {
++		resp.err = fmt.Errorf("invalid version %s", spec.Version)
++		resp.interrupt = true // No upgrade yet, no need to roll back.
++		return resp
+ 	}
+-	cmdline.WriteString(" >> /tmp/keadm.log 2>&1")
+-	cmd := execs.NewCommand(cmdline.String())
+-	h.logger.V(2).Info("run upgrade cmd", "cmd", cmdline.String())
+-	resp.err = cmd.Exec()
++	if spec.Image != "" && !validation.ValidateImageRepo(spec.Image) {
++		resp.err = fmt.Errorf("invalid image repo %s", spec.Image)
++		resp.interrupt = true // No upgrade yet, no need to roll back.
++		return resp
++	}
++
++	logFile, err := os.OpenFile("/tmp/keadm.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
++	if err != nil {
++		resp.err = fmt.Errorf("failed to open keadm log file: %w", err)
++		resp.interrupt = true // No upgrade yet, no need to roll back.
++		return resp
++	}
++	defer logFile.Close()
++
++	args := buildNodeUpgradeJobCommandArgs(spec)
++
++	cmd := exec.Command("keadm", args...)
++	cmd.Stdout = logFile
++	cmd.Stderr = logFile
++	h.logger.V(2).Info("run upgrade cmd", "cmd", "keadm", "args", args)
++	resp.err = cmd.Run()
+ 	return resp
+ }
+ 
++func buildNodeUpgradeJobCommandArgs(spec *operationsv1alpha2.NodeUpgradeJobSpec) []string {
++	args := []string{"upgrade", "edge", "--force", "--toVersion", spec.Version}
++	if spec.Image != "" {
++		args = append(args, "--image", spec.Image)
++	}
++	return args
++}
++
+ func (h *nodeUpgradeJobActionHandler) rollback(
+ 	_ctx context.Context,
+ 	_jobname, _nodename string,
+diff --git a/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_rollback.go b/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_rollback.go
+index 63a49e8de..225ed8dff 100644
+--- a/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_rollback.go
++++ b/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_rollback.go
+@@ -62,9 +62,8 @@ func rollback(upgradeReq *commontypes.NodeUpgradeJobRequest) error {
+ 	// The failed upgrade can leave files under its own version directory. They are removed
+ 	// before the backup is restored, so that the restored binary is the only one left.
+ 	upgradeDir := filepath.Join(common.KubeEdgeUpgradePath, upgradeReq.Version)
+-	cleanCmd := fmt.Sprintf("rm -rf %s", upgradeDir)
+-	if err := exec.Command("bash", "-c", cleanCmd).Run(); err != nil {
+-		return fmt.Errorf("run clean command %s failed: %v", cleanCmd, err)
++	if err := exec.Command("rm", "-rf", upgradeDir).Run(); err != nil {
++		return fmt.Errorf("run clean command for %s failed: %v", upgradeDir, err)
+ 	}
+ 
+ 	rollBackCmd := fmt.Sprintf("keadm rollback edge --name %s --history %s >> /tmp/keadm.log 2>&1",
+diff --git a/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_upgrade.go b/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_upgrade.go
+index 22d840c0e..1093b3907 100644
+--- a/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_upgrade.go
++++ b/edge/pkg/taskmanager/v1alpha1/taskexecutor/node_upgrade.go
+@@ -191,6 +191,7 @@ func upgrade(taskReq types.NodeTaskRequest) (event fsm.Event) {
+ 
+ func keadmUpgrade(upgradeReq commontypes.NodeUpgradeJobRequest, opts *options.EdgeCoreOptions) error {
+ 	klog.Infof("Begin to run upgrade command")
++
+ 	upgradeCmd := fmt.Sprintf("keadm upgrade edge --upgradeID %s --historyID %s --fromVersion %s --toVersion %s --config %s --image %s > /tmp/keadm.log 2>&1",
+ 		upgradeReq.UpgradeID, upgradeReq.HistoryID, version.Get(), upgradeReq.Version, opts.ConfigFile, upgradeReq.Image)
+ 
+diff --git a/pkg/util/validation/validation.go b/pkg/util/validation/validation.go
+index a5959146c..122285b06 100644
+--- a/pkg/util/validation/validation.go
++++ b/pkg/util/validation/validation.go
+@@ -19,6 +19,14 @@ package validation
+ import (
+ 	"fmt"
+ 	"net"
++	"regexp"
++)
++
++// Regexps
++var (
++	regexpImageRepo = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*(@sha256:[A-Fa-f0-9]{64}|:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?$`)
++
++	regexpVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[a-zA-Z0-9_.]+(?:-[a-zA-Z0-9_.]+)*)?$`)
+ )
+ 
+ // IsValidIP tests that the argument is a valid IP address.
+@@ -42,3 +50,11 @@ func IsValidPortNum(port int) []string {
+ func InclusiveRangeError(lo, hi int) string {
+ 	return fmt.Sprintf(`must be between %d and %d, inclusive`, lo, hi)
+ }
++
++func ValidateImageRepo(image string) bool {
++	return regexpImageRepo.MatchString(image)
++}
++
++func ValidateVersion(version string) bool {
++	return regexpVersion.MatchString(version)
++}

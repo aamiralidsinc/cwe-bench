@@ -1,0 +1,372 @@
+diff -ruN old/charts/fission-all/templates/webhook-server/webhooks.yaml new/charts/fission-all/templates/webhook-server/webhooks.yaml
+--- old/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-18 20:05:51.000000000 +0000
++++ new/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-21 23:47:51.116022914 +0000
+@@ -72,6 +72,7 @@
+     - v1
+     operations:
+     - CREATE
++    - UPDATE
+     resources:
+     - environments
+   sideEffects: None
+diff -ruN old/pkg/apis/core/v1/podspec_safety.go new/pkg/apis/core/v1/podspec_safety.go
+--- old/pkg/apis/core/v1/podspec_safety.go	1970-01-01 00:00:00.000000000 +0000
++++ new/pkg/apis/core/v1/podspec_safety.go	2026-10-21 23:47:51.116022914 +0000
+@@ -0,0 +1,129 @@
++/*
++Copyright 2026 The Fission Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++
++	apiv1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/yaml"
++)
++
++// dangerousCapabilities lists Linux capabilities that effectively grant root
++// or break the container sandbox. Tenants that can write Environment or
++// Function objects must not be able to add these via securityContext.
++var dangerousCapabilities = map[string]struct{}{
++	"SYS_ADMIN":       {},
++	"NET_ADMIN":       {},
++	"SYS_PTRACE":      {},
++	"SYS_MODULE":      {},
++	"DAC_READ_SEARCH": {},
++	"DAC_OVERRIDE":    {},
++	"ALL":             {},
++}
++
++// capabilityName normalizes a capability spelling. Container runtimes
++// upper-case capability names and add the CAP_ prefix, so "cap_sys_admin",
++// "CAP_SYS_ADMIN" and "SYS_ADMIN" all take effect on a container.
++func capabilityName(c apiv1.Capability) string {
++	name := strings.ToUpper(strings.TrimSpace(string(c)))
++	return strings.TrimPrefix(name, "CAP_")
++}
++
++// ValidateContainerSafety rejects containers whose securityContext lets the
++// container escape the sandbox it runs in.
++func ValidateContainerSafety(fieldPath string, c *apiv1.Container) error {
++	if c == nil || c.SecurityContext == nil {
++		return nil
++	}
++	var errs error
++	sc := c.SecurityContext
++	if sc.Privileged != nil && *sc.Privileged {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.privileged is not allowed", fieldPath))
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.allowPrivilegeEscalation is not allowed", fieldPath))
++	}
++	if sc.Capabilities != nil {
++		for _, capability := range sc.Capabilities.Add {
++			if _, bad := dangerousCapabilities[capabilityName(capability)]; bad {
++				errs = errors.Join(errs, fmt.Errorf("%s.securityContext.capabilities.add contains %q, which is not allowed", fieldPath, capability))
++			}
++		}
++	}
++	return errs
++}
++
++// ValidatePodSpecSafety rejects PodSpec fields that would let a low-privilege
++// tenant escalate to host or cluster level when the executor or buildermgr
++// schedules a pod from a user-supplied podspec.
++//
++// The fieldPath argument is used as a prefix in error messages so the caller
++// can identify which podspec failed.
++func ValidatePodSpecSafety(fieldPath string, ps *apiv1.PodSpec) error {
++	if ps == nil {
++		return nil
++	}
++	var errs error
++
++	if ps.HostNetwork {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostNetwork is not allowed", fieldPath))
++	}
++	if ps.HostPID {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostPID is not allowed", fieldPath))
++	}
++	if ps.HostIPC {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostIPC is not allowed", fieldPath))
++	}
++	if ps.ServiceAccountName != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccountName override is not allowed", fieldPath))
++	}
++	if ps.DeprecatedServiceAccount != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccount override is not allowed", fieldPath))
++	}
++	for _, v := range ps.Volumes {
++		if v.HostPath != nil {
++			errs = errors.Join(errs, fmt.Errorf("%s.volumes[%s].hostPath is not allowed", fieldPath, v.Name))
++		}
++	}
++	for i := range ps.Containers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.containers[%s]", fieldPath, ps.Containers[i].Name), &ps.Containers[i]))
++	}
++	for i := range ps.InitContainers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.initContainers[%s]", fieldPath, ps.InitContainers[i].Name), &ps.InitContainers[i]))
++	}
++	return errs
++}
++
++// ValidatePodSpecPatchSafety checks a serialized pod spec patch for the same
++// forbidden primitives as a structured pod spec.
++func ValidatePodSpecPatchSafety(fieldPath string, patch string) error {
++	if strings.TrimSpace(patch) == "" {
++		return nil
++	}
++	raw, err := yaml.YAMLToJSON([]byte(patch))
++	if err != nil {
++		return fmt.Errorf("%s is not valid YAML or JSON: %v", fieldPath, err)
++	}
++	ps := &apiv1.PodSpec{}
++	if err := yaml.Unmarshal(raw, ps); err != nil {
++		return fmt.Errorf("%s is not a valid pod spec fragment: %v", fieldPath, err)
++	}
++	return ValidatePodSpecSafety(fieldPath, ps)
++}
+diff -ruN old/pkg/apis/core/v1/validation.go new/pkg/apis/core/v1/validation.go
+--- old/pkg/apis/core/v1/validation.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/apis/core/v1/validation.go	2026-10-21 23:47:51.116022914 +0000
+@@ -297,6 +297,13 @@
+ 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
+ 	}
+ 
++	// Reject pod settings that would let a tenant escalate through the
++	// executor service account.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec))
++	for i := range spec.Sidecars {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("Function.spec.sidecars[%s]", spec.Sidecars[i].Name), &spec.Sidecars[i]))
++	}
++
+ 	// TODO Add below validation warning
+ 	// if spec.FunctionTimeout <= 0 {
+ 	// 	errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionTimeout value", spec.FunctionTimeout, "not a valid value. Should always be more than 0"))
+@@ -666,6 +673,14 @@
+ 			}
+ 		}
+ 	}
++
++	// Reject pod settings that would let a tenant escalate through the
++	// executor / buildermgr service accounts.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.runtime.podspec", e.Spec.Runtime.PodSpec))
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.builder.podspec", e.Spec.Builder.PodSpec))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.runtime.container", e.Spec.Runtime.Container))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.builder.container", e.Spec.Builder.Container))
++	errs = errors.Join(errs, ValidatePodSpecPatchSafety("Environment.spec.runtime.podSpecPatch", e.Spec.Runtime.PodSpecPatch))
+ 	return errs
+ }
+ 
+diff -ruN old/pkg/buildermgr/envwatcher.go new/pkg/buildermgr/envwatcher.go
+--- old/pkg/buildermgr/envwatcher.go	2026-10-21 23:43:44.496242460 +0000
++++ new/pkg/buildermgr/envwatcher.go	2026-10-21 23:47:51.120022911 +0000
+@@ -403,6 +403,9 @@
+ }
+ 
+ func (envw *environmentWatcher) createBuilderDeployment(ctx context.Context, env *fv1.Environment, ns string) (*appsv1.Deployment, error) {
++	if err := validateBuilderPodSettings(env); err != nil {
++		return nil, err
++	}
+ 	name := fmt.Sprintf("%v-%v", env.Name, env.ResourceVersion)
+ 	sel := envw.getLabels(env.Name, ns, env.ResourceVersion)
+ 	var replicas int32 = 1
+@@ -562,3 +565,12 @@
+ 
+ 	return deployment, nil
+ }
++
++// validateBuilderPodSettings refuses an Environment whose builder pod
++// settings would cross the container sandbox boundary.
++func validateBuilderPodSettings(env *fv1.Environment) error {
++	if err := fv1.ValidatePodSpecSafety("Environment.spec.builder.podspec", env.Spec.Builder.PodSpec); err != nil {
++		return err
++	}
++	return fv1.ValidateContainerSafety("Environment.spec.builder.container", env.Spec.Builder.Container)
++}
+diff -ruN old/pkg/executor/executortype/container/deployment.go new/pkg/executor/executortype/container/deployment.go
+--- old/pkg/executor/executortype/container/deployment.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/executor/executortype/container/deployment.go	2026-10-21 23:47:51.120022911 +0000
+@@ -163,6 +163,9 @@
+ 
+ func (cn *Container) getDeploymentSpec(ctx context.Context, fn *fv1.Function, targetReplicas *int32,
+ 	deployName string, deployNamespace string, deployLabels map[string]string, deployAnnotations map[string]string) (*appsv1.Deployment, error) {
++	if err := validateFunctionPodSettings(fn); err != nil {
++		return nil, err
++	}
+ 
+ 	replicas := int32(fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale)
+ 	if targetReplicas != nil {
+@@ -318,3 +321,17 @@
+ 	}, metav1.UpdateOptions{})
+ 	return err
+ }
++
++// validateFunctionPodSettings refuses a Function whose pod settings would
++// cross the container sandbox boundary.
++func validateFunctionPodSettings(fn *fv1.Function) error {
++	if err := fv1.ValidatePodSpecSafety("Function.spec.podspec", fn.Spec.PodSpec); err != nil {
++		return err
++	}
++	for i := range fn.Spec.Sidecars {
++		if err := fv1.ValidateContainerSafety(fmt.Sprintf("Function.spec.sidecars[%s]", fn.Spec.Sidecars[i].Name), &fn.Spec.Sidecars[i]); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff -ruN old/pkg/executor/executortype/newdeploy/newdeploy.go new/pkg/executor/executortype/newdeploy/newdeploy.go
+--- old/pkg/executor/executortype/newdeploy/newdeploy.go	2026-10-21 23:43:43.428243409 +0000
++++ new/pkg/executor/executortype/newdeploy/newdeploy.go	2026-10-21 23:47:51.120022911 +0000
+@@ -128,6 +128,9 @@
+ 
+ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function, env *fv1.Environment, targetReplicas *int32,
+ 	deployName string, deployNamespace string, deployLabels map[string]string, deployAnnotations map[string]string) (*appsv1.Deployment, error) {
++	if err := validateTenantPodSettings(env); err != nil {
++		return nil, err
++	}
+ 
+ 	replicas := int32(fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale)
+ 	if targetReplicas != nil {
+@@ -581,3 +584,15 @@
+ 
+ 	return rvCount, nil
+ }
++
++// validateTenantPodSettings refuses an Environment whose pod settings would
++// cross the container sandbox boundary.
++func validateTenantPodSettings(env *fv1.Environment) error {
++	if err := fv1.ValidatePodSpecSafety("Environment.spec.runtime.podspec", env.Spec.Runtime.PodSpec); err != nil {
++		return err
++	}
++	if err := fv1.ValidateContainerSafety("Environment.spec.runtime.container", env.Spec.Runtime.Container); err != nil {
++		return err
++	}
++	return fv1.ValidatePodSpecPatchSafety("Environment.spec.runtime.podSpecPatch", env.Spec.Runtime.PodSpecPatch)
++}
+diff -ruN old/pkg/executor/executortype/poolmgr/gp_deployment.go new/pkg/executor/executortype/poolmgr/gp_deployment.go
+--- old/pkg/executor/executortype/poolmgr/gp_deployment.go	2026-10-21 23:43:41.972244702 +0000
++++ new/pkg/executor/executortype/poolmgr/gp_deployment.go	2026-10-21 23:47:51.120022911 +0000
+@@ -79,6 +79,9 @@
+ }
+ 
+ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.DeploymentSpec, error) {
++	if err := validateTenantPodSettings(env); err != nil {
++		return nil, err
++	}
+ 	deployLabels := gp.getEnvironmentPoolLabels(env)
+ 	// Use long terminationGracePeriodSeconds for connection draining in case that
+ 	// pod still runs user functions.
+@@ -348,3 +351,15 @@
+ 	logger.Info("Updated deployment for pool", "deployment", depl.Name)
+ 	return nil
+ }
++
++// validateTenantPodSettings refuses an Environment whose pod settings would
++// cross the container sandbox boundary.
++func validateTenantPodSettings(env *fv1.Environment) error {
++	if err := fv1.ValidatePodSpecSafety("Environment.spec.runtime.podspec", env.Spec.Runtime.PodSpec); err != nil {
++		return err
++	}
++	if err := fv1.ValidateContainerSafety("Environment.spec.runtime.container", env.Spec.Runtime.Container); err != nil {
++		return err
++	}
++	return fv1.ValidatePodSpecPatchSafety("Environment.spec.runtime.podSpecPatch", env.Spec.Runtime.PodSpecPatch)
++}
+diff -ruN old/pkg/executor/util/pod_overrides.go new/pkg/executor/util/pod_overrides.go
+--- old/pkg/executor/util/pod_overrides.go	2026-10-21 23:43:35.696250278 +0000
++++ new/pkg/executor/util/pod_overrides.go	2026-10-21 23:47:51.116022914 +0000
+@@ -14,6 +14,8 @@
+ 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+ 	"k8s.io/client-go/kubernetes"
+ 	"sigs.k8s.io/yaml"
++
++	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+ )
+ 
+ // NamespacePodOverridesConfigMap is the ConfigMap a namespace uses to supply
+@@ -52,6 +54,16 @@
+ 		return nil, fmt.Errorf("error parsing namespace pod overrides: %w", err)
+ 	}
+ 
++	// The overlay is tenant-supplied, so it is held to the same rule as the
++	// typed pod spec before it is merged into the platform's pod.
++	overlaySpec := &apiv1.PodSpec{}
++	if err := json.Unmarshal(overlayJSON, overlaySpec); err != nil {
++		return nil, fmt.Errorf("error parsing namespace pod overrides: %w", err)
++	}
++	if err := fv1.ValidatePodSpecSafety("namespace pod overrides", overlaySpec); err != nil {
++		return nil, err
++	}
++
+ 	baseJSON, err := json.Marshal(ps)
+ 	if err != nil {
+ 		return nil, err
+diff -ruN old/pkg/webhook/environment.go new/pkg/webhook/environment.go
+--- old/pkg/webhook/environment.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/environment.go	2026-10-21 23:47:51.116022914 +0000
+@@ -42,14 +42,13 @@
+ var _ webhook.CustomDefaulter = &Environment{}
+ 
+ // user: change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
+-//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
++// The validation must also run on UPDATE: otherwise a tenant can create a
++// clean object and then patch in unsafe pod settings.
++//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create;update,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
+ 
+ var _ webhook.CustomValidator = &Environment{}
+ 
+ func (r *Environment) Validate(new *v1.Environment) error {
+-	if skipPodSpecValidation(new.Annotations) {
+-		return nil
+-	}
+ 	if err := new.Validate(); err != nil {
+ 		err = v1.AggregateValidationErrors("Environment", err)
+ 		return err
+diff -ruN old/pkg/webhook/function.go new/pkg/webhook/function.go
+--- old/pkg/webhook/function.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/function.go	2026-10-21 23:47:51.116022914 +0000
+@@ -49,9 +49,6 @@
+ var _ webhook.CustomValidator = &Function{}
+ 
+ func (r *Function) Validate(new *v1.Function) error {
+-	if skipPodSpecValidation(new.Annotations) {
+-		return nil
+-	}
+ 	for _, cnfMap := range new.Spec.ConfigMaps {
+ 		if cnfMap.Namespace != new.Namespace {
+ 			err := fmt.Errorf("configMap's [%s] and function's Namespace [%s] are different. ConfigMap needs to be present in the same namespace as function", cnfMap.Namespace, new.Namespace)
+diff -ruN old/pkg/webhook/legacy.go new/pkg/webhook/legacy.go
+--- old/pkg/webhook/legacy.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/legacy.go	1970-01-01 00:00:00.000000000 +0000
+@@ -1,14 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package webhook
+-
+-// legacyPodSpecAnnotation marks objects that were created before the current
+-// environment and function validation rules took effect. Keeping the
+-// annotation lets users keep updating such objects while a release rolls out.
+-const legacyPodSpecAnnotation = "fission.io/legacy-podspec"
+-
+-// skipPodSpecValidation reports whether an object was marked for the
+-// pre-existing validation rules with the legacy annotation.
+-func skipPodSpecValidation(annotations map[string]string) bool {
+-	return annotations[legacyPodSpecAnnotation] == "true"
+-}

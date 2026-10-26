@@ -1,0 +1,194 @@
+--- a/lib/Application/Service/UserProvisioningService.php
++++ b/lib/Application/Service/UserProvisioningService.php
+@@ -28,6 +28,7 @@
+ use Poweradmin\Domain\ValueObject\SamlUserInfo;
+ use Poweradmin\Domain\ValueObject\UserInfoInterface;
+ use Poweradmin\Infrastructure\Configuration\ConfigurationManager;
++use Poweradmin\Infrastructure\Database\DbCompat;
+ use Poweradmin\Infrastructure\Logger\Logger;
+ use Poweradmin\Infrastructure\Repository\DbUserRepository;
+ use ReflectionClass;
+@@ -45,6 +46,7 @@
+     public const AUTH_METHOD_SAML = 'saml';
+ 
+     private PDO $db;
++    private string $dbType;
+     private ConfigurationManager $configManager;
+     private UserManager $userManager;
+     private DbUserRepository $userRepository;
+@@ -61,6 +63,7 @@
+         $this->configManager = $configManager;
+         $this->userManager = new UserManager($connection, $configManager);
+         $this->userRepository = new DbUserRepository($connection, $configManager);
++        $this->dbType = $connection->getAttribute(PDO::ATTR_DRIVER_NAME);
+     }
+ 
+     public function provisionUser(UserInfoInterface $userInfo, string $providerId): ?int
+@@ -142,9 +145,12 @@
+                 'provider' => $providerId
+             ]);
+ 
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'oidc_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT user_id FROM oidc_user_links
+-                WHERE oidc_subject = ? AND provider_id = ?
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch}
+             ");
+             $stmt->execute([$subject, $providerId]);
+             $result = $stmt->fetch(PDO::FETCH_ASSOC);
+@@ -369,9 +375,12 @@
+     {
+         try {
+             // Keep a single link row for each external identity
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'oidc_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT id FROM oidc_user_links
+-                WHERE oidc_subject = ? AND provider_id = ?
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch}
+             ");
+             $stmt->execute([$userInfo->getSubject(), $providerId]);
+             $existingLink = $stmt->fetch(PDO::FETCH_ASSOC);
+@@ -419,9 +428,12 @@
+                 'provider' => $providerId
+             ]);
+ 
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'saml_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT user_id FROM saml_user_links
+-                WHERE saml_subject = ? AND provider_id = ?
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch}
+             ");
+             $stmt->execute([$subject, $providerId]);
+             $result = $stmt->fetch(PDO::FETCH_ASSOC);
+@@ -456,9 +468,12 @@
+     {
+         try {
+             // Keep a single link row for each external identity
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'saml_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT id FROM saml_user_links
+-                WHERE saml_subject = ? AND provider_id = ?
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch}
+             ");
+             $stmt->execute([$userInfo->getSubject(), $providerId]);
+             $existingLink = $stmt->fetch(PDO::FETCH_ASSOC);
+@@ -825,11 +840,14 @@
+             $this->logInfo('Checking for orphaned SAML links for subject: {subject}', ['subject' => $subject]);
+ 
+             // Find orphaned links for this specific subject
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'sul.saml_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'sul.provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT sul.id, sul.user_id
+                 FROM saml_user_links sul
+                 LEFT JOIN users u ON sul.user_id = u.id
+-                WHERE sul.saml_subject = ? AND sul.provider_id = ? AND u.id IS NULL
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch} AND u.id IS NULL
+             ");
+             $stmt->execute([$subject, $providerId]);
+             $orphanedLinks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+@@ -861,11 +879,14 @@
+             $this->logInfo('Checking for orphaned OIDC links for subject: {subject}', ['subject' => $subject]);
+ 
+             // Find orphaned links for this specific subject
++            $subjectMatch = DbCompat::exactIdentityColumn($this->dbType, 'oul.oidc_subject');
++            $providerMatch = DbCompat::exactIdentityColumn($this->dbType, 'oul.provider_id');
++            $valueMatch = DbCompat::exactIdentityValue($this->dbType);
+             $stmt = $this->db->prepare("
+                 SELECT oul.id, oul.user_id
+                 FROM oidc_user_links oul
+                 LEFT JOIN users u ON oul.user_id = u.id
+-                WHERE oul.oidc_subject = ? AND oul.provider_id = ? AND u.id IS NULL
++                WHERE {$subjectMatch} = {$valueMatch} AND {$providerMatch} = {$valueMatch} AND u.id IS NULL
+             ");
+             $stmt->execute([$subject, $providerId]);
+             $orphanedLinks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+--- a/lib/Infrastructure/Database/DbCompat.php
++++ b/lib/Infrastructure/Database/DbCompat.php
+@@ -343,4 +343,38 @@
+             default => "$column REGEXP '^[0-9]+$'",
+         };
+     }
++
++    /**
++     * Returns an SQL expression that compares a stored value exactly, character
++     * for character. MySQL/MariaDB compare character columns by collation, which
++     * can ignore case, accents or trailing spaces; the column charset can also
++     * differ between installations. Converting to a common character set and then
++     * to a binary string compares the characters themselves.
++     *
++     * @param string $db_type The type of database (e.g., "mysql", "sqlite", etc.)
++     * @param string $column The column reference to compare
++     * @return string The SQL expression
++     */
++    public static function exactIdentityColumn(string $db_type, string $column): string
++    {
++        return match ($db_type) {
++            'mysql', 'mysqli' => "CONVERT($column USING utf8mb4) COLLATE utf8mb4_bin",
++            default => $column,
++        };
++    }
++
++    /**
++     * Returns the matching SQL expression for the parameter side of an exact
++     * identity comparison (see exactIdentityColumn()).
++     *
++     * @param string $db_type The type of database (e.g., "mysql", "sqlite", etc.)
++     * @return string The SQL expression, with one parameter placeholder
++     */
++    public static function exactIdentityValue(string $db_type): string
++    {
++        return match ($db_type) {
++            'mysql', 'mysqli' => 'CONVERT(? USING utf8mb4) COLLATE utf8mb4_bin',
++            default => '?',
++        };
++    }
+ }
+--- a/sql/poweradmin-mysql-db-structure.sql
++++ b/sql/poweradmin-mysql-db-structure.sql
+@@ -340,8 +340,8 @@
+ CREATE TABLE `oidc_user_links` (
+   `id` INT(11) NOT NULL AUTO_INCREMENT,
+   `user_id` INT(11) NOT NULL,
+-  `provider_id` VARCHAR(50) NOT NULL,
+-  `oidc_subject` VARCHAR(255) NOT NULL,
++  `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++  `oidc_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin,
+   `username` VARCHAR(255) NOT NULL,
+   `email` VARCHAR(255) DEFAULT NULL,
+   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+@@ -357,8 +357,8 @@
+ CREATE TABLE `saml_user_links` (
+   `id` INT(11) NOT NULL AUTO_INCREMENT,
+   `user_id` INT(11) NOT NULL,
+-  `provider_id` VARCHAR(50) NOT NULL,
+-  `saml_subject` VARCHAR(255) NOT NULL,
++  `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++  `saml_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin,
+   `username` VARCHAR(255) NOT NULL,
+   `email` VARCHAR(255) DEFAULT NULL,
+   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--- /dev/null
++++ b/sql/poweradmin-mysql-update-to-4.3.4.sql
+@@ -0,0 +1,12 @@
++-- Poweradmin schema update to 4.3.4
++-- OIDC/SAML external subject identifiers must match one-for-one. The default
++-- utf8mb4_unicode_ci collation is case- and accent-insensitive, so distinct
++-- subjects compare as equal and resolve to the same local account. Force a
++-- binary collation on the identity columns.
++
++ALTER TABLE `oidc_user_links`
++    MODIFY COLUMN `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++    MODIFY COLUMN `oidc_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin;
++ALTER TABLE `saml_user_links`
++    MODIFY COLUMN `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++    MODIFY COLUMN `saml_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin;

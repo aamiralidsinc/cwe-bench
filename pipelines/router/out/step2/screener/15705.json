@@ -1,0 +1,123 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "15705",
+  "advisory_ids": ["GHSA-4J6X-2764-M8GH", "CVE-2026-41053", "GO-2026-5869"],
+  "repo": "rancher/rancher",
+  "pinned_commit": "87a6cda3db0b8012d588e2a1221d8e30a32a85e3",
+  "fix_commits": ["361d4d57cd09b87f3c53f88af42046ffaa7b57e4", "d0c047bbc6d202e953d7557b82cbb354367db6ae"],
+  "trust_decision": {
+    "summary": "A user authenticating through the GitHub App provider must receive group principals only for the GitHub teams they actually belong to; the expansion is decided in gitHubAppData.listTeamsForUser, which at the pinned commit loops over every team of every org the user appears in instead of the per-member org->teams slice, and the resulting principals are persisted to UserAttribute.GroupPrincipals and used for request authorization.",
+    "evidence": [
+      "pkg/auth/providers/githubapp/github_data.go:117-130",
+      "pkg/auth/providers/githubapp/github_data.go:86-91",
+      "pkg/auth/providers/githubapp/github_data.go:191-213",
+      "pkg/auth/providers/githubapp/githubapp_provider.go:162-170",
+      "pkg/auth/providers/githubapp/githubapp_provider.go:222-227",
+      "pkg/auth/requests/authenticate.go:207-216",
+      "pkg/controllers/management/auth/user_attribute_handler.go:89-99"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/auth/providers/githubapp/github_data.go:119",
+    "why": "The summary says 'over-inclusive team membership expansion in GitHub App authentication provider'; listTeamsForUser is the only function in the provider that turns a username into team accounts, and it is called by both the login path (githubapp_provider.go:162) and the refresh path (githubapp_provider.go:222), so a grep for team/membership lands here first."
+  },
+  "fix_sites": [
+    {"where": "pkg/auth/providers/githubapp/github_data.go:119-130", "entry_point": "POST /v1-public/login (and the deprecated /v3-public login action) -> Provider.AuthenticateUser/LoginUser -> githubAppClient.getTeamsForUser -> listTeamsForUser; plus AuthProvider.RefetchGroupPrincipals -> Provider.getGroupPrincipals -> listTeamsForUser", "module_kind": "auth provider library (githubapp)"},
+    {"where": "fix.diff:13-21 (new TriggerAllUserRefresh package wrapper in pkg/auth/providerrefresh/daemon.go; pinned daemon.go:71-78 has the sibling RefreshAllForCron)", "entry_point": "providerrefresh.TriggerAllUserRefresh (package-level API), called by the new startup migration", "module_kind": "lower-level API wrapper"},
+    {"where": "fix.diff:118-168 (new pkg/data/management/githubapp_refresh_users.go)", "entry_point": "RefreshGitHubAppUsersOnce(ctx, AuthConfig client) called once from mcm.Start", "module_kind": "save_reload_or_serialization (one-time startup data migration)"},
+    {"where": "fix.diff:276 (call inserted into pinned pkg/multiclustermanager/app.go:210-216)", "entry_point": "Rancher server startup (mcm.Start)", "module_kind": "composition/wiring"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "fix.diff:118-168 (new pkg/data/management/githubapp_refresh_users.go, wired at fix.diff:276 and reached through the new TriggerAllUserRefresh wrapper at fix.diff:13-21)"
+  },
+  "O3_reason_to_dismiss": "The migration is one-time operational cleanup for users who logged in before upgrading; the advisory names team-membership expansion in the provider, so fixing listTeamsForUser is the fix, and the scheduled max-age refresh, the AuthConfig change refresh (pkg/controllers/management/auth/auth_config.go:175-192) or the user's next login (publicapi/login.go:293) will rewrite the stored principals anyway.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Admins must keep being able to search and assign any team in an org, so gatherDataForInstallation must keep collecting every team and searchTeams must keep returning all of them regardless of who is a member; a fix that restricts team collection or selection to the user's own memberships breaks SearchPrincipals and the ability to grant team principals. A legitimate member must also still receive their real team principals, or restricted-mode login fails the CheckAccess at githubapp_provider.go:177.",
+    "where": "pkg/auth/providers/githubapp/github_data.go:147-159,321-345; pkg/auth/providers/githubapp/githubapp_provider.go:177,257-266"
+  },
+  "O6_input_shapes": [
+    "User belongs to a subset of one org's teams (dev-team but not admin-team): only the member's own team slice may be expanded",
+    "Same team slug present in several orgs (example-team in two orgs, dev-team2 in other-org): each org's slice must be resolved against that org's own team map, not a global team lookup",
+    "Membership slice names a team slug that org.teams does not contain (fixture adds team 'example' to org 'example' at github_data_test.go:27): fix skips it with 'if !ok { continue }' instead of emitting a zero-valued account",
+    "Username absent from gitHubAppData.members (nil orgs map): must return empty rather than panic",
+    "One user in teams across several orgs: union of the per-org member slices"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "pkg/controllers/management/auth/user_attribute_handler.go:89-99 persists the UserAttribute returned by providerrefresh.RefreshAttributes (GroupPrincipals written at pkg/auth/providerrefresh/refresher.go:287; stored state read at pkg/auth/requests/authenticate.go:207-216)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Request authentication and IsMemberOf fall back to the group principals stored on the token whenever the user's UserAttribute has no entry for the token's provider; a githubapp token minted before the fix carries the over-inclusive team principals, and neither the listing fix nor the migration rewrites tokens (it only triggers UserAttribute refreshes)",
+      "where": "pkg/auth/requests/authenticate.go:219-226",
+      "reason_to_dismiss": "It is labelled a legacy fallback for tokens predating UserAttributes; the startup migration and every login write an entry for the provider, so the path looks unreachable for githubapp users.",
+      "distance": "2 packages from the landing point (pkg/auth/requests; same fallback at pkg/auth/providers/common/usermanager.go:465-470,495-498) in another layer (authorization middleware), not touched by the fix",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "When RefetchGroupPrincipals fails with any error other than 'no access', refreshAttributes keeps the previously stored group principals instead of the (now correct) fetched set, so a failed refresh after the fix leaves the over-inclusive team principals in place",
+      "where": "pkg/auth/providerrefresh/refresher.go:269-272",
+      "reason_to_dismiss": "Preserving existing principals on a transient provider or infrastructure error is deliberate resilience so users are not locked out; the advisory is about how memberships are computed, not about the refresh error path.",
+      "distance": "1 package from the landing point (pkg/auth/providerrefresh, the package the fix also touches for the TriggerAllUserRefresh wrapper); the retention branch itself is unchanged by the fix",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/auth/providers/github/github_provider.go:242-273",
+      "sibling": "A team-membership expansion in the sibling non-App GitHub provider that derives teams locally from getOrgTeams (github_client.go:126-132) instead of the membership-scoped /user/teams endpoint",
+      "why_realistic": "The two providers mirror each other method-for-method (getOrgs/getTeams vs listOrgsForUser/listTeamsForUser), getOrgTeams already exists and is only used by search, and a maintainer adding app-style caching or refresh to the OAuth provider could reach for the org team list and reproduce the same over-inclusive expansion."
+    },
+    {
+      "where": "pkg/multiclustermanager/app.go:210-216",
+      "sibling": "A second one-time startup migration that re-derives stored authn state for another provider (or for org principals) beside RefreshGitHubAppUsersOnce",
+      "why_realistic": "This block already runs guarded one-time work at startup (adunmigration.UnmigrateAdGUIDUsersOnce, CleanupOrphanedSystemUsers, CleanupDuplicateBindings), and pkg/agent/clean/adunmigration/migrate.go:102-125 shows the established stored-status guard pattern, so another such migration is the obvious shape."
+    },
+    {
+      "where": "pkg/auth/providers/githubapp/github_data.go:95-103",
+      "sibling": "An org-principal expansion derived from the same member.orgs map, or a cached 'teams for user' surface used by SearchPrincipals",
+      "why_realistic": "listOrgsForUser is the immediately preceding sibling of the fixed function and reads the same map, so a maintainer adding org-level principal sync or a cache would naturally put it here and could repeat the keys-not-values mistake."
+    }
+  ],
+  "O9_family": "authorization / group membership (CWE-303 Incorrect Implementation of Authentication Algorithm): team group principals granted for teams the user does not belong to, which then drive RBAC and provider access checks",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.25.0 (go.mod:3) with toolchain go1.25.8 (go.mod:5); module github.com/rancher/rancher with local replacements for pkg/apis, pkg/client and pkg/plan (go.mod:12-14); no vendor directory, so module downloads are needed once before an offline build",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/auth/providers/githubapp/github_data_test.go:21 TestGitHubAppData (in-memory fixture, teams-for-user expectations at :218-277), :466 TestTeamDataFromApp and startFakeGitHubServer:629 (httptest fake GitHub API); githubapp_client_test.go:202,249 getTeamsForUser against the fake server; githubapp_provider_test.go:106 TestAuthenticateUser and :215 TestRefetchGroupPrincipals; the two live-GitHub tests skip without GITHUB_APP_KEY (:333,:356). No test exists for the startup migration at the pinned commit (the fix adds githubapp_refresh_users_test.go)."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/auth/providers/githubapp/github_data.go, pkg/auth/providerrefresh/daemon.go, pkg/data/management/githubapp_refresh_users.go (new), pkg/multiclustermanager/app.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Rewrite listTeamsForUser to walk the member's team slice and stop there; the UserAttribute group principals that request authentication actually reads stay over-inclusive. If the startup migration is written, marking the annotation with a typed AuthConfig Update (PUT) instead of a JSON merge patch strips the GithubApp provider fields (fix.diff:337-355)."
+  },
+  "out_of_scope_notes": [
+    "The second published commit (d0c047b) repairs a defect introduced by the first: a typed Update of the AuthConfig strips provider-specific fields, so the annotation has to be written with a JSON MergePatch (fix.diff:337-355). It is part of the same fix, not a separate advisory.",
+    "pkg/auth/providers/github (the non-App OAuth provider) grants team principals from GitHub's /user/teams endpoint (github_client.go:103-123), so this advisory's over-inclusive expansion does not apply there; not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell is available in this session, so tiny_repo/giant_repo were not evaluated and repo_mb is null; the tree has no vendor directory and is broad (multiple Go modules, web UI), so it is not a tiny library.",
+    "O1=3 counts the public login route, the authenticated AuthConfig testAndApply action (githubconfig_actions.go:94-145) and AuthProvider.RefetchGroupPrincipals (reached by the ?action=refresh user API at pkg/auth/api/user/user_actions.go:182-197, the refresh cron and the groupmembershiprefreshrequest store); whether the task builder treats login and testAndApply as one entry point is a judgement call.",
+    "present_in_latest for both O8 routes: only the pinned tree and the fix diff are available and the input says 'latest release: none', so no later code was inspected.",
+    "regression_tests_in_pinned_commit was not flagged: at the pinned commit github_data_test.go:218-277 still expects the buggy result (admin-team returned for test-user) and the new 'non-member team is not returned' subtest plus githubapp_refresh_users_test.go do not exist, so the fix's tests are not already present.",
+    "Whether hidden behavioural tests would score the startup migration: no test for RefreshGitHubAppUsersOnce exists at the pinned commit and the migration only runs at mcm.Start, so it is reachable only through wiring or a unit test of the new function."
+  ]
+}

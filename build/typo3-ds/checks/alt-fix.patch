@@ -1,0 +1,498 @@
+--- a/typo3/sysext/form/Classes/Command/ImportFormDefinitionsCommand.php	2026-10-20 06:27:24.000000000 +0000
++++ b/typo3/sysext/form/Classes/Command/ImportFormDefinitionsCommand.php	2026-10-22 01:38:12.965929501 +0000
+@@ -25,6 +25,7 @@
+ use Symfony\Component\Console\Output\OutputInterface;
+ use Symfony\Component\Console\Style\SymfonyStyle;
+ use TYPO3\CMS\Core\Core\Bootstrap;
++use TYPO3\CMS\Form\Mvc\Persistence\Exception\PersistenceManagerException;
+ use TYPO3\CMS\Form\Service\FormTransferService;
+ 
+ /**
+@@ -87,7 +88,12 @@
+             return Command::FAILURE;
+         }
+ 
+-        $imported = $this->formTransferService->importFromExport($records, (int)$input->getOption('pid'));
++        try {
++            $imported = $this->formTransferService->importFromExport($records, (int)$input->getOption('pid'));
++        } catch (PersistenceManagerException $e) {
++            $io->error($e->getMessage());
++            return Command::FAILURE;
++        }
+         $io->success(sprintf('Imported %d form definition(s).', $imported));
+         return Command::SUCCESS;
+     }
+--- a/typo3/sysext/form/Classes/Domain/Repository/FormDefinitionRepository.php	2026-10-20 06:27:24.000000000 +0000
++++ b/typo3/sysext/form/Classes/Domain/Repository/FormDefinitionRepository.php	2026-10-22 01:38:12.965929501 +0000
+@@ -20,14 +20,16 @@
+ use Doctrine\DBAL\ParameterType;
+ use TYPO3\CMS\Core\Database\ConnectionPool;
+ use TYPO3\CMS\Core\Database\Query\QueryBuilder;
+-use TYPO3\CMS\Core\DataHandling\DataHandler;
+-use TYPO3\CMS\Core\Utility\GeneralUtility;
+ use TYPO3\CMS\Form\Domain\DTO\FormData;
+ use TYPO3\CMS\Form\Domain\DTO\SearchCriteria;
+ 
+ /**
+  * Repository class to fetch available form definitions.
+  *
++ * The database storage is the only writer: direct DataHandler access to the
++ * table is denied globally by the form extension's DataHandler hook, so the
++ * repository persists through the connection instead of DataHandler.
++ *
+  * @internal not part of public TYPO3 Core API
+  */
+ readonly class FormDefinitionRepository
+@@ -38,10 +40,6 @@
+         private ConnectionPool $connectionPool,
+     ) {}
+ 
+-    /**
+-     * Find a form definition by its uid.
+-     * Returns the database row as array or null if not found.
+-     */
+     public function findByUid(int $uid): ?array
+     {
+         $queryBuilder = $this->connectionPool->getQueryBuilderForTable(self::TABLE_NAME);
+@@ -58,10 +56,6 @@
+         return $row ?: null;
+     }
+ 
+-    /**
+-     * Find all form definitions with optional search criteria.
+-     * Returns an array of database rows including full configuration.
+-     */
+     public function findAll(SearchCriteria $criteria): array
+     {
+         $queryBuilder = $this->connectionPool->getQueryBuilderForTable(self::TABLE_NAME);
+@@ -77,13 +71,6 @@
+             ->fetchAllAssociative();
+     }
+ 
+-    /**
+-     * Find all form definitions for listing purposes.
+-     * Returns only metadata columns (uid, pid, identifier, label) without
+-     * the potentially large configuration JSON column.
+-     *
+-     * @return array<int, array{uid: int, pid: int, identifier: string, label: string}>
+-     */
+     public function findAllForListing(SearchCriteria $criteria): array
+     {
+         $queryBuilder = $this->connectionPool->getQueryBuilderForTable(self::TABLE_NAME);
+@@ -99,10 +86,6 @@
+             ->fetchAllAssociative();
+     }
+ 
+-    /**
+-     * Check if a form definition with the given form identifier exists.
+-     * Uses a COUNT query on the indexed identifier column for efficiency.
+-     */
+     public function existsByFormIdentifier(string $formIdentifier): bool
+     {
+         $queryBuilder = $this->connectionPool->getQueryBuilderForTable(self::TABLE_NAME);
+@@ -122,12 +105,6 @@
+         return (int)$count > 0;
+     }
+ 
+-    /**
+-     * Find the UID of a form definition by its form identifier.
+-     *
+-     * Returns the UID of the first matching non-deleted record, or null if not found.
+-     * Used by the upgrade wizard to check for already-migrated forms.
+-     */
+     public function findUidByFormIdentifier(string $formIdentifier): ?int
+     {
+         $queryBuilder = $this->connectionPool->getQueryBuilderForTable(self::TABLE_NAME);
+@@ -147,9 +124,6 @@
+         return $uid !== false ? (int)$uid : null;
+     }
+ 
+-    /**
+-     * Apply search criteria (search term, limit) to a query builder.
+-     */
+     private function applySearchCriteria(QueryBuilder $queryBuilder, SearchCriteria $criteria): void
+     {
+         if (!empty($criteria->searchTerm)) {
+@@ -174,43 +148,29 @@
+ 
+     /**
+      * Insert a form definition in the database.
+-     * @return int|null UID of the newly created record or null on failure.
+-     * @throws \JsonException
+      */
+     public function add(string $persistenceIdentifier, int $pid, FormData $formDefinition): ?int
+     {
+-        $formDefinitionJson = json_encode($formDefinition->toArray(), JSON_THROW_ON_ERROR);
+-        /** @var DataHandler $dataHandler */
+-        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+-        $dataHandler->start([
+-            self::TABLE_NAME => [
+-                $persistenceIdentifier => [
+-                    'pid' => $pid,
+-                    'label' => $formDefinition->name,
+-                    'identifier' => $formDefinition->identifier,
+-                    'configuration' => $formDefinitionJson,
+-                ],
+-            ],
+-        ], []);
+-        $dataHandler->process_datamap();
+-
+-        if ($dataHandler->errorLog !== []) {
++        // A numeric identifier means the caller wants to persist over an existing
++        // (possibly deleted) record; creating is only valid for a NEW identifier.
++        if (!str_starts_with($persistenceIdentifier, 'NEW')) {
+             return null;
+         }
+-
+-        return isset($dataHandler->substNEWwithIDs[$persistenceIdentifier])
+-            ? (int)$dataHandler->substNEWwithIDs[$persistenceIdentifier]
+-            : null;
++        $now = $GLOBALS['EXEC_TIME'] ?? time();
++        $connection = $this->connectionPool->getConnectionForTable(self::TABLE_NAME);
++        $connection->insert(self::TABLE_NAME, [
++            'pid' => $pid,
++            'deleted' => 0,
++            'label' => $formDefinition->name,
++            'identifier' => $formDefinition->identifier,
++            'configuration' => $formDefinition->toArray(),
++            'crdate' => $now,
++            'tstamp' => $now,
++        ]);
++        $uid = (int)$connection->lastInsertId();
++        return $uid > 0 ? $uid : null;
+     }
+ 
+-    /**
+-     * Insert a form definition using a raw database insert (no DataHandler).
+-     *
+-     * This method is intended for contexts where DataHandler cannot be used,
+-     * e.g. the Install Tool upgrade wizard where no backend user is available.
+-     *
+-     * @return int|null The UID of the newly created record, or null on failure
+-     */
+     public function addRaw(int $pid, FormData $formDefinition): ?int
+     {
+         $connection = $this->connectionPool->getConnectionForTable(self::TABLE_NAME);
+@@ -227,77 +187,38 @@
+         return $uid > 0 ? $uid : null;
+     }
+ 
+-    /**
+-     * Removes a form definition completely from the system using DataHandler.
+-     *
+-     * @param int $uid The UID representing the form definition to delete
+-     * @return bool TRUE if the form definition was successfully deleted, FALSE otherwise
+-     */
+     public function remove(int $uid): bool
+     {
+-        /** @var DataHandler $dataHandler */
+-        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+-        $dataHandler->start([], [
+-            self::TABLE_NAME => [
+-                $uid => [
+-                    'delete' => 1,
+-                ],
+-            ],
+-        ]);
+-        $dataHandler->process_cmdmap();
+-        return $dataHandler->errorLog === [];
++        $connection = $this->connectionPool->getConnectionForTable(self::TABLE_NAME);
++        $connection->update(self::TABLE_NAME, [
++            'deleted' => 1,
++            'tstamp' => $GLOBALS['EXEC_TIME'] ?? time(),
++        ], ['uid' => $uid]);
++        return true;
+     }
+ 
+-    /**
+-     * Restore a soft-deleted form definition.
+-     *
+-     * @param int $uid The UID of the form definition to restore
+-     * @return bool TRUE if the form definition was restored, FALSE otherwise
+-     */
+     public function restore(int $uid): bool
+     {
+-        /** @var DataHandler $dataHandler */
+-        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+-        $dataHandler->start([], [
+-            self::TABLE_NAME => [
+-                $uid => [
+-                    'undelete' => 1,
+-                ],
+-            ],
+-        ]);
+-        $dataHandler->process_cmdmap();
+-        return $dataHandler->errorLog === [];
++        $connection = $this->connectionPool->getConnectionForTable(self::TABLE_NAME);
++        $connection->update(self::TABLE_NAME, [
++            'deleted' => 0,
++            'tstamp' => $GLOBALS['EXEC_TIME'] ?? time(),
++        ], ['uid' => $uid]);
++        return true;
+     }
+ 
+-    /**
+-     * Update a form definition in the database using DataHandler.
+-     *
+-     * @param int $uid The UID of the form definition to update
+-     * @param FormData $formDefinition
+-     * @return bool TRUE if update was successful, FALSE otherwise
+-     * @throws \JsonException
+-     */
+     public function update(int $uid, FormData $formDefinition): bool
+     {
+         if (empty($uid)) {
+             return false;
+         }
+-
+-        $formDefinitionJson = json_encode($formDefinition->toArray(), JSON_THROW_ON_ERROR);
+-
+-        /** @var DataHandler $dataHandler */
+-        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+-        $dataHandler->start([
+-            self::TABLE_NAME => [
+-                $uid => [
+-                    'label' => $formDefinition->name,
+-                    'identifier' => $formDefinition->identifier,
+-                    'configuration' => $formDefinitionJson,
+-                ],
+-            ],
+-        ], []);
+-        $dataHandler->process_datamap();
+-
+-        return $dataHandler->errorLog === [];
++        $connection = $this->connectionPool->getConnectionForTable(self::TABLE_NAME);
++        $connection->update(self::TABLE_NAME, [
++            'label' => $formDefinition->name,
++            'identifier' => $formDefinition->identifier,
++            'configuration' => $formDefinition->toArray(),
++            'tstamp' => $GLOBALS['EXEC_TIME'] ?? time(),
++        ], ['uid' => $uid]);
++        return true;
+     }
+ }
+--- /dev/null
++++ b/typo3/sysext/form/Classes/Hooks/FormDefinitionDataHandlerHook.php	2026-10-22 01:38:16.181926546 +0000
+@@ -0,0 +1,108 @@
++<?php
++
++declare(strict_types=1);
++
++/*
++ * This file is part of the TYPO3 CMS project.
++ *
++ * It is free software; you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License, either version 2
++ * of the License, or any later version.
++ *
++ * For the full copyright and license information, please read the
++ * LICENSE.txt file that was distributed with this source code.
++ *
++ * The TYPO3 project - inspiring people to share!
++ */
++
++namespace TYPO3\CMS\Form\Hooks;
++
++use Symfony\Component\DependencyInjection\Attribute\Autoconfigure;
++use TYPO3\CMS\Core\DataHandling\DataHandler;
++use TYPO3\CMS\Core\SysLog\Action\Database as SystemLogDatabaseAction;
++use TYPO3\CMS\Core\SysLog\Error as SystemLogErrorClassification;
++
++/**
++ * Denies every direct DataHandler write access to the form_definition table.
++ * Form definitions are persisted by FormDefinitionRepository through the
++ * database connection and validated by the form persistence manager.
++ *
++ * @internal
++ */
++#[Autoconfigure(public: true)]
++final readonly class FormDefinitionDataHandlerHook
++{
++    public function processDatamap_preProcessFieldArray(
++        ?array &$incomingFieldArray,
++        string $table,
++        string|int $id,
++        DataHandler $dataHandler,
++    ): void {
++        if ($table !== 'form_definition') {
++            return;
++        }
++        $incomingFieldArray = null;
++        $dataHandler->log(
++            $table,
++            0,
++            SystemLogDatabaseAction::INSERT,
++            null,
++            SystemLogErrorClassification::USER_ERROR,
++            'Persisting form definition "%s" via DataHandler is denied',
++            null,
++            [$id],
++        );
++    }
++
++    public function processCmdmap(
++        string $command,
++        string $table,
++        int|string $id,
++        mixed $value,
++        bool &$commandIsProcessed,
++        DataHandler $dataHandler,
++    ): void {
++        if ($table !== 'form_definition') {
++            return;
++        }
++        $commandIsProcessed = true;
++        $dataHandler->log(
++            $table,
++            (int)$id,
++            SystemLogDatabaseAction::DELETE,
++            null,
++            SystemLogErrorClassification::USER_ERROR,
++            'Command "%s" on form definition "%s" via DataHandler is denied',
++            null,
++            [$command, $id],
++        );
++    }
++
++    /**
++     * Blocks deletes that do not run through the record-command map.
++     *
++     * @param array<string, mixed> $recordToDelete
++     */
++    public function processCmdmap_deleteAction(
++        string $table,
++        int $id,
++        array $recordToDelete,
++        bool &$recordWasDeleted,
++        DataHandler $dataHandler,
++    ): void {
++        if ($table !== 'form_definition') {
++            return;
++        }
++        $recordWasDeleted = true;
++        $dataHandler->log(
++            $table,
++            $id,
++            SystemLogDatabaseAction::DELETE,
++            null,
++            SystemLogErrorClassification::USER_ERROR,
++            'Deleting form definition "%s" via DataHandler is denied',
++            null,
++            [$id],
++        );
++    }
++}
+--- a/typo3/sysext/form/Classes/Service/FormDefinitionPresetService.php	2026-10-22 01:34:08.994153686 +0000
++++ b/typo3/sysext/form/Classes/Service/FormDefinitionPresetService.php	2026-10-22 01:38:16.181926546 +0000
+@@ -17,7 +17,7 @@
+ 
+ namespace TYPO3\CMS\Form\Service;
+ 
+-use TYPO3\CMS\Core\Database\ConnectionPool;
++use TYPO3\CMS\Form\Domain\DTO\FormData;
+ use TYPO3\CMS\Form\Domain\Repository\FormDefinitionRepository;
+ 
+ /**
+@@ -32,7 +32,6 @@
+ final readonly class FormDefinitionPresetService
+ {
+     public function __construct(
+-        private ConnectionPool $connectionPool,
+         private FormDefinitionRepository $formDefinitionRepository,
+     ) {}
+ 
+@@ -58,11 +57,9 @@
+                 1774366011
+             );
+         }
+-        $connection = $this->connectionPool->getConnectionForTable(FormDefinitionRepository::TABLE_NAME);
+-        $connection->update(
+-            FormDefinitionRepository::TABLE_NAME,
+-            ['configuration' => array_replace($definition, $preset)],
+-            ['uid' => $uid]
++        $this->formDefinitionRepository->update(
++            $uid,
++            FormData::fromArray(array_replace($definition, $preset))
+         );
+     }
+ }
+--- a/typo3/sysext/form/Classes/Service/FormTransferService.php	2026-10-20 06:27:24.000000000 +0000
++++ b/typo3/sysext/form/Classes/Service/FormTransferService.php	2026-10-22 01:38:12.965929501 +0000
+@@ -23,10 +23,10 @@
+ use TYPO3\CMS\Core\Utility\GeneralUtility;
+ use TYPO3\CMS\Form\Domain\DTO\FormData;
+ use TYPO3\CMS\Form\Domain\DTO\FormMetadata;
+-use TYPO3\CMS\Form\Domain\Repository\FormDefinitionRepository;
+ use TYPO3\CMS\Form\Domain\DTO\SearchCriteria;
+ use TYPO3\CMS\Form\Domain\DTO\StorageContext;
+ use TYPO3\CMS\Form\Domain\ValueObject\FormIdentifier;
++use TYPO3\CMS\Form\Mvc\Persistence\Exception\PersistenceManagerException;
+ use TYPO3\CMS\Form\Mvc\Persistence\FormPersistenceManagerInterface;
+ use TYPO3\CMS\Form\Storage\StorageAdapterFactory;
+ use TYPO3\CMS\Form\Storage\StorageAdapterInterface;
+@@ -161,34 +161,21 @@
+     /**
+      * Import form definitions from an exported JSON document into database storage.
+      *
+-     * Each record contains the database columns to persist. This is used by the
+-     * `form:definition:import` command to restore exported definitions in bulk.
++     * Definitions from an export did not pass through the form editor, which is
++     * the only place where a form definition is validated and bound to its
++     * editor session. Persisting such a document would store configuration that
++     * no validation has ever approved, so the import is refused.
+      *
+-     * @param list<array{identifier?: string, label?: string, configuration?: array|string, pid?: int}> $records
++     * @param list<array<string, mixed>> $records
+      * @return int Number of imported records
+-     * @throws \JsonException
++     * @throws PersistenceManagerException
+      */
+     public function importFromExport(array $records, int $targetPid = 0): int
+     {
+-        $connection = $this->connectionPool->getConnectionForTable(FormDefinitionRepository::TABLE_NAME);
+-        $imported = 0;
+-        foreach ($records as $record) {
+-            $configuration = $record['configuration'] ?? [];
+-            $rowPid = isset($record['pid']) ? (int)$record['pid'] : $targetPid;
+-            $connection->insert(FormDefinitionRepository::TABLE_NAME, [
+-                'pid' => $rowPid,
+-                'deleted' => 0,
+-                'label' => (string)($record['label'] ?? ''),
+-                'identifier' => (string)($record['identifier'] ?? ''),
+-                'configuration' => is_string($configuration)
+-                    ? $configuration
+-                    : json_encode($configuration, JSON_THROW_ON_ERROR),
+-                'crdate' => $GLOBALS['EXEC_TIME'] ?? time(),
+-                'tstamp' => $GLOBALS['EXEC_TIME'] ?? time(),
+-            ]);
+-            $imported++;
+-        }
+-        return $imported;
++        throw new PersistenceManagerException(
++            'Form definitions from an export cannot be verified and are not imported. Create the forms through the form editor instead.',
++            1774365001
++        );
+     }
+ 
+     /**
+--- a/typo3/sysext/form/ext_localconf.php	2026-10-20 06:27:08.000000000 +0000
++++ b/typo3/sysext/form/ext_localconf.php	2026-10-22 01:38:12.965929501 +0000
+@@ -6,6 +6,7 @@
+ use TYPO3\CMS\Extbase\Utility\ExtensionUtility;
+ use TYPO3\CMS\Form\Controller\FormFrontendController;
+ use TYPO3\CMS\Form\Evaluation\EmailOrFormElementIdentifier;
++use TYPO3\CMS\Form\Hooks\FormDefinitionDataHandlerHook;
+ use TYPO3\CMS\Form\Hooks\ImportExportHook;
+ use TYPO3\CMS\Form\Mvc\Property\PropertyMappingConfiguration;
+ 
+@@ -26,6 +27,10 @@
+     $GLOBALS['TYPO3_CONF_VARS']['RTE']['Presets']['form-content'] = 'EXT:form/Configuration/RTE/FormContent.yaml';
+ }
+ 
++// Deny direct DataHandler write access to form_definition: only DatabaseStorageAdapter may persist form definitions
++$GLOBALS['TYPO3_CONF_VARS']['SC_OPTIONS']['t3lib/class.t3lib_tcemain.php']['processDatamapClass']['form'] = FormDefinitionDataHandlerHook::class;
++$GLOBALS['TYPO3_CONF_VARS']['SC_OPTIONS']['t3lib/class.t3lib_tcemain.php']['processCmdmapClass']['form'] = FormDefinitionDataHandlerHook::class;
++
+ // FE file upload processing
+ $GLOBALS['TYPO3_CONF_VARS']['SC_OPTIONS']['ext/form']['afterFormStateInitialized'][1613296803] = PropertyMappingConfiguration::class;
+ 

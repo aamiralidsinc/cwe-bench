@@ -1,0 +1,77 @@
+diff --git a/vault/logical_system.go b/vault/logical_system.go
+index 6fc30003d..e30109d0b 100644
+--- a/vault/logical_system.go
++++ b/vault/logical_system.go
+@@ -1948,6 +1948,14 @@ func (b *SystemBackend) handleLeaseLookup(ctx context.Context, req *logical.Requ
+ 			logical.ErrInvalidRequest
+ 	}
+ 
++	ns, err := namespace.FromContext(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if b.leaseIdentifierIsForeign(ctx, leaseID, ns) {
++		return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++	}
++
+ 	leaseInfo, err := b.Core.expiration.FetchLeaseInfo(ctx, leaseID)
+ 	if err != nil {
+ 		b.Backend.Logger().Error("error retrieving lease", "lease_id", leaseID, "error", err)
+@@ -2047,6 +2055,10 @@ func (b *SystemBackend) handleRevoke(ctx context.Context, req *logical.Request,
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if b.leaseIdentifierIsForeign(ctx, leaseID, ns) {
++		return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++	}
++
+ 	revokeCtx := namespace.ContextWithNamespace(b.Core.activeContext.Load(), ns)
+ 	if data.Get("sync").(bool) {
+ 		// Invoke the expiration manager directly
+@@ -2088,6 +2100,19 @@ func (b *SystemBackend) handleRevokePrefixCommon(ctx context.Context,
+ 		return nil, err
+ 	}
+ 
++	if !strings.HasSuffix(prefix, "/") {
++		if _, nsID := namespace.SplitIDFromString(prefix); nsID != "" {
++			if b.leaseIdentifierIsForeign(ctx, prefix, ns) {
++				return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++			}
++		} else if ns.ID != namespace.RootNamespaceID {
++			rootCtx := namespace.ContextWithNamespace(ctx, namespace.RootNamespace)
++			if le, lerr := b.Core.expiration.loadEntry(rootCtx, prefix); lerr == nil && le != nil {
++				return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++			}
++		}
++	}
++
+ 	// Invoke the expiration manager directly
+ 	revokeCtx := namespace.ContextWithNamespace(b.Core.activeContext.Load(), ns)
+ 	if force {
+@@ -5645,3 +5670,26 @@ This path responds to the following HTTP methods.
+ 		`,
+ 	},
+ }
++
++// namespaceAdministers reports whether admin is target or an ancestor of it.
++func namespaceAdministers(admin, target *namespace.Namespace) bool {
++	if admin.ID == namespace.RootNamespaceID {
++		return true
++	}
++	prefix := strings.TrimSuffix(admin.Path, "/")
++	return target.Path == admin.Path || strings.HasPrefix(target.Path, prefix+"/")
++}
++
++// leaseIdentifierIsForeign reports whether the namespace embedded in a lease
++// identifier is outside the request namespace's administration.
++func (b *SystemBackend) leaseIdentifierIsForeign(ctx context.Context, leaseID string, reqNS *namespace.Namespace) bool {
++	_, nsID := namespace.SplitIDFromString(leaseID)
++	if nsID == "" {
++		return reqNS.ID != namespace.RootNamespaceID
++	}
++	leaseNS, err := b.Core.NamespaceByID(ctx, nsID)
++	if err != nil || leaseNS == nil {
++		return false
++	}
++	return !namespaceAdministers(reqNS, leaseNS)
++}

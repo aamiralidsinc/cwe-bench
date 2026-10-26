@@ -1,0 +1,122 @@
+diff -ruN pristine/nova/virt/disk/api.py app/nova/virt/disk/api.py
+--- a/nova/virt/disk/api.py	2026-10-22 19:36:36.000000000 +0000
++++ b/nova/virt/disk/api.py	2026-10-23 16:12:41.340010869 +0000
+@@ -311,8 +311,38 @@
+         _inject_admin_password_into_fs(admin_password, fs, execute=execute)
+ 
+ 
+-def _inject_file_into_fs(fs, path, contents):
++def _path_within_fs(fs, path):
++    """Return the host path for *path* inside the image mounted at *fs*.
++
++    *path* is interpreted relative to the root of the image; any leading
++    slash is ignored, matching the historical behaviour.  The image is
++    controlled by the user who supplied it, so it may contain symbolic links
++    and ``..`` components designed to make a write land somewhere on the
++    compute host.  The requested path is therefore resolved exactly as the
++    host would resolve it while writing (following links stored in the
++    image) and is refused if the result is not underneath *fs*.
++    """
++    if not isinstance(path, basestring) or '\x00' in path:
++        msg = _('Invalid path supplied for injection: %r') % (path,)
++        raise exception.Invalid(msg)
++
+     absolute_path = os.path.join(fs, path.lstrip('/'))
++    root = os.path.realpath(fs)
++    try:
++        resolved = os.path.realpath(absolute_path)
++    except OSError:
++        msg = _('Unable to resolve path for injection: %s') % path
++        raise exception.Invalid(msg)
++
++    if resolved != root and not resolved.startswith(root + os.sep):
++        msg = _('Path escapes the image and cannot be injected: %s') % path
++        raise exception.Invalid(msg)
++
++    return absolute_path
++
++
++def _inject_file_into_fs(fs, path, contents):
++    absolute_path = _path_within_fs(fs, path)
+     parent_dir = os.path.dirname(absolute_path)
+     utils.execute('mkdir', '-p', parent_dir, run_as_root=True)
+     utils.execute('tee', absolute_path, process_input=contents,
+@@ -320,7 +350,7 @@
+ 
+ 
+ def _inject_metadata_into_fs(metadata, fs, execute=None):
+-    metadata_path = os.path.join(fs, "meta.js")
++    metadata_path = _path_within_fs(fs, "meta.js")
+     metadata = dict([(m.key, m.value) for m in metadata])
+ 
+     utils.execute('tee', metadata_path,
+@@ -333,11 +363,14 @@
+     key is an ssh key string.
+     fs is the path to the base of the filesystem into which to inject the key.
+     """
+-    sshdir = os.path.join(fs, 'root', '.ssh')
++    sshdir = _path_within_fs(fs, os.path.join('root', '.ssh'))
++    keyfile = _path_within_fs(fs, os.path.join('root', '.ssh',
++                                               'authorized_keys'))
++    keyfile2 = _path_within_fs(fs, os.path.join('root', '.ssh',
++                                                'authorized_keys2'))
+     utils.execute('mkdir', '-p', sshdir, run_as_root=True)
+     utils.execute('chown', 'root', sshdir, run_as_root=True)
+     utils.execute('chmod', '700', sshdir, run_as_root=True)
+-    keyfile = os.path.join(sshdir, 'authorized_keys')
+     key_data = [
+         '\n',
+         '# The following ssh key was injected by Nova',
+@@ -349,7 +382,6 @@
+                   process_input=''.join(key_data), run_as_root=True)
+     # Older images still consult the protocol 2 key file, so keep it in
+     # sync with authorized_keys.
+-    keyfile2 = os.path.join(sshdir, 'authorized_keys2')
+     utils.execute('tee', '-a', keyfile2,
+                   process_input=''.join(key_data), run_as_root=True)
+ 
+@@ -359,11 +391,12 @@
+ 
+     net is the contents of /etc/network/interfaces.
+     """
+-    netdir = os.path.join(os.path.join(fs, 'etc'), 'network')
++    netdir = _path_within_fs(fs, os.path.join('etc', 'network'))
++    netfile = _path_within_fs(fs, os.path.join('etc', 'network',
++                                               'interfaces'))
+     utils.execute('mkdir', '-p', netdir, run_as_root=True)
+     utils.execute('chown', 'root:root', netdir, run_as_root=True)
+     utils.execute('chmod', 755, netdir, run_as_root=True)
+-    netfile = os.path.join(netdir, 'interfaces')
+     utils.execute('tee', netfile, process_input=net, run_as_root=True)
+ 
+ 
+@@ -384,20 +417,25 @@
+ 
+     admin_user = 'root'
+ 
++    # Validate the image files before creating anything on the host: a
++    # malicious image may have planted links that point outside the mount.
++    passwd_path = _path_within_fs(fs, os.path.join('etc', 'passwd'))
++    shadow_path = _path_within_fs(fs, os.path.join('etc', 'shadow'))
++
+     fd, tmp_passwd = tempfile.mkstemp()
+     os.close(fd)
+     fd, tmp_shadow = tempfile.mkstemp()
+     os.close(fd)
+ 
+-    utils.execute('cp', os.path.join(fs, 'etc', 'passwd'), tmp_passwd,
++    utils.execute('cp', passwd_path, tmp_passwd,
+                   run_as_root=True)
+-    utils.execute('cp', os.path.join(fs, 'etc', 'shadow'), tmp_shadow,
++    utils.execute('cp', shadow_path, tmp_shadow,
+                   run_as_root=True)
+     _set_passwd(admin_user, admin_passwd, tmp_passwd, tmp_shadow)
+-    utils.execute('cp', tmp_passwd, os.path.join(fs, 'etc', 'passwd'),
++    utils.execute('cp', tmp_passwd, passwd_path,
+                   run_as_root=True)
+     os.unlink(tmp_passwd)
+-    utils.execute('cp', tmp_shadow, os.path.join(fs, 'etc', 'shadow'),
++    utils.execute('cp', tmp_shadow, shadow_path,
+                   run_as_root=True)
+     os.unlink(tmp_shadow)
+ 

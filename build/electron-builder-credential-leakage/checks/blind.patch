@@ -1,0 +1,485 @@
+diff -ruN a/packages/builder-util-runtime/src/httpExecutor.ts b/packages/builder-util-runtime/src/httpExecutor.ts
+--- a/packages/builder-util-runtime/src/httpExecutor.ts	2026-10-17 21:32:16.053624626 +0000
++++ b/packages/builder-util-runtime/src/httpExecutor.ts	2026-10-17 21:36:53.109436988 +0000
+@@ -123,7 +123,9 @@
+       })
+       this.addErrorAndTimeoutHandlers(request, reject, options.timeout)
+       this.addRedirectHandlers(request, options, reject, redirectCount, options => {
+-        this.doApiRequest(options, cancellationToken, requestProcessor, redirectCount).then(resolve).catch(reject)
++        this.doApiRequest(options, cancellationToken, requestProcessor, redirectCount + 1)
++          .then(resolve)
++          .catch(reject)
+       })
+       requestProcessor(request, reject)
+       onCancel(() => request.abort())
+@@ -164,7 +166,7 @@
+       reject(
+         createHttpError(
+           response,
+-          `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
++          `method: ${options.method || "GET"} url: ${redactUrlForLog(`${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}`)}
+ 
+ Please double check that your authentication token is correct. Due to security reasons, actual status maybe not reported, but 404.
+ `
+@@ -186,7 +188,9 @@
+         return
+       }
+ 
+-      this.doApiRequest(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, options), cancellationToken, requestProcessor, redirectCount).then(resolve).catch(reject)
++      this.doApiRequest(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, options), cancellationToken, requestProcessor, redirectCount + 1)
++        .then(resolve)
++        .catch(reject)
+       return
+     }
+ 
+@@ -203,7 +207,7 @@
+           reject(
+             createHttpError(
+               response,
+-              `method: ${options.method || "GET"} url: ${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}
++              `method: ${options.method || "GET"} url: ${redactUrlForLog(`${options.protocol || "https:"}//${options.hostname}${options.port ? `:${options.port}` : ""}${options.path}`)}
+ 
+           Data:
+           ${isJson ? JSON.stringify(JSON.parse(data)) : data}
+@@ -270,7 +274,7 @@
+       if (response.statusCode! >= 400) {
+         options.callback(
+           new Error(
+-            `Cannot download "${requestOptions.protocol || "https:"}//${requestOptions.hostname}${requestOptions.path}", status ${response.statusCode}: ${response.statusMessage}`
++            `Cannot download "${redactUrlForLog(`${requestOptions.protocol || "https:"}//${requestOptions.hostname}${requestOptions.path}`)}", status ${response.statusCode}: ${response.statusMessage}`
+           )
+         )
+         return
+@@ -284,7 +288,7 @@
+       const redirectUrl = safeGetHeader(response, "location")
+       if (redirectUrl != null) {
+         if (redirectCount < this.maxRedirects) {
+-          this.doDownload(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, requestOptions), options, redirectCount++)
++          this.doDownload(HttpExecutor.prepareRedirectUrlOptions(redirectUrl, requestOptions), options, redirectCount + 1)
+         } else {
+           options.callback(this.createMaxRedirectError())
+         }
+@@ -299,7 +303,7 @@
+     })
+     this.addErrorAndTimeoutHandlers(request, options.callback, requestOptions.timeout)
+     this.addRedirectHandlers(request, requestOptions, options.callback, redirectCount, requestOptions => {
+-      this.doDownload(requestOptions, options, redirectCount++)
++      this.doDownload(requestOptions, options, redirectCount + 1)
+     })
+     request.end()
+   }
+@@ -319,18 +323,29 @@
+ 
+   static prepareRedirectUrlOptions(redirectUrl: string, options: RequestOptions): RequestOptions {
+     const newOptions = configureRequestOptionsFromUrl(redirectUrl, { ...options })
+-    const headers = newOptions.headers
+-    if (headers?.authorization) {
++    // `host` takes precedence over `hostname` for some clients (e.g. Electron net), it must always follow the redirect target
++    delete newOptions.host
++
++    let isCrossOrigin = true
++    let originalHost = String(options.hostname)
++    let redirectHost = String(newOptions.hostname)
++    try {
+       // Parse original and redirect URLs to compare origins
+       const originalUrl = HttpExecutor.reconstructOriginalUrl(options)
+       const parsedRedirectUrl = parseUrl(redirectUrl, options)
++      originalHost = originalUrl.host
++      redirectHost = parsedRedirectUrl.host
++      isCrossOrigin = HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)
++    } catch {
++      // origin cannot be determined - treat as cross-origin
++      isCrossOrigin = true
++    }
+ 
+-      // Strip authorization header on cross-origin redirects (different protocol, hostname, or port)
+-      if (HttpExecutor.isCrossOriginRedirect(originalUrl, parsedRedirectUrl)) {
+-        if (debug.enabled) {
+-          debug(`Given the cross-origin redirect (from ${originalUrl.host} to ${parsedRedirectUrl.host}), the Authorization header will be stripped out.`)
+-        }
+-        delete headers.authorization
++    // Strip credentials on cross-origin redirects (different protocol, hostname, or port)
++    if (isCrossOrigin) {
++      const stripped = stripCredentials(newOptions)
++      if (stripped.length > 0 && debug.enabled) {
++        debug(`Given the cross-origin redirect (from ${originalHost} to ${redirectHost}), credentials (${stripped.join(", ")}) will be stripped out.`)
+       }
+     }
+     return newOptions
+@@ -423,6 +438,80 @@
+   }
+ }
+ 
++const SENSITIVE_HEADER_NAME_PATTERN = /auth|token|cookie|secret|passw|passphrase|key|credential|session|signature|jwt|csrf|xsrf|private|bearer/i
++const SENSITIVE_HEADER_VALUE_PATTERN = /^\s*(basic|bearer|token|digest|negotiate|ntlm|hoba|mutual|vapid|scram-sha-1|scram-sha-256|aws4-hmac-sha256)\s/i
++
++/**
++ * Returns true if the header (by name or by value) can carry credentials and must not be forwarded to another origin.
++ */
++export function isCredentialHeader(name: string, value?: any): boolean {
++  const lowerCaseName = name.toLowerCase()
++  if (lowerCaseName === "host" || SENSITIVE_HEADER_NAME_PATTERN.test(lowerCaseName)) {
++    return true
++  }
++  const values = Array.isArray(value) ? value : [value]
++  return values.some(it => typeof it === "string" && SENSITIVE_HEADER_VALUE_PATTERN.test(it))
++}
++
++/**
++ * Removes every credential (credential headers in any spelling, basic auth, client certificates/keys) from the request options.
++ * Returns the names of the removed items.
++ */
++export function stripCredentials(options: RequestOptions): Array<string> {
++  const stripped: Array<string> = []
++  const headers = options.headers as RequestHeaders | undefined
++  if (headers != null) {
++    for (const name of Object.keys(headers)) {
++      if (isCredentialHeader(name, headers[name])) {
++        delete headers[name]
++        stripped.push(name)
++      }
++    }
++  }
++
++  const anyOptions = options as any
++  for (const name of ["auth", "username", "password", "key", "cert", "pfx", "passphrase"]) {
++    if (anyOptions[name] != null) {
++      delete anyOptions[name]
++      stripped.push(name)
++    }
++  }
++  return stripped
++}
++
++const SENSITIVE_QUERY_PARAM_PATTERN = /auth|token|secret|passw|passphrase|key|credential|session|signature|sig$|jwt|code|private|bearer/i
++
++/**
++ * Removes credentials (userinfo and sensitive query parameter values) from an URL so that it can be safely used in error messages and logs.
++ */
++export function redactUrlForLog(url: string): string {
++  let result = url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i, "$1<stripped>@")
++  const queryIndex = result.indexOf("?")
++  if (queryIndex < 0) {
++    return result
++  }
++  const hashIndex = result.indexOf("#", queryIndex)
++  const query = result.substring(queryIndex + 1, hashIndex < 0 ? undefined : hashIndex)
++  const redactedQuery = query
++    .split("&")
++    .map(part => {
++      const eqIndex = part.indexOf("=")
++      if (eqIndex < 0) {
++        return part
++      }
++      let name = part.substring(0, eqIndex)
++      try {
++        name = decodeURIComponent(name)
++      } catch {
++        // ignore
++      }
++      return SENSITIVE_QUERY_PARAM_PATTERN.test(name) ? `${part.substring(0, eqIndex)}=<stripped>` : part
++    })
++    .join("&")
++  result = result.substring(0, queryIndex + 1) + redactedQuery + (hashIndex < 0 ? "" : result.substring(hashIndex))
++  return result
++}
++
+ export function configureRequestOptionsFromUrl(url: string, options: RequestOptions) {
+   const result = configureRequestOptions(options)
+   const parsedUrl = parseUrl(url, options)
+@@ -583,22 +672,22 @@
+   return options
+ }
+ 
++const SENSITIVE_JSON_NAME_PATTERN = /authorization|password|passwd|passphrase|token|secret|apikey|cookie|credential|privatekey|accesskey|clientkey|signingkey|encryptionkey/i
++
++export function isSensitiveFieldName(name: string): boolean {
++  return SENSITIVE_JSON_NAME_PATTERN.test(name.replace(/[-_\s.]/g, ""))
++}
++
+ export function safeStringifyJson(data: any, skippedNames?: Set<string>) {
+   return JSON.stringify(
+     data,
+     (name, value) => {
+-      if (
+-        name.endsWith("Authorization") ||
+-        name.endsWith("authorization") ||
+-        name.endsWith("Password") ||
+-        name.endsWith("PASSWORD") ||
+-        name.endsWith("Token") ||
+-        name.includes("password") ||
+-        name.includes("token") ||
+-        (skippedNames != null && skippedNames.has(name))
+-      ) {
++      if ((isSensitiveFieldName(name) && typeof value !== "boolean") || (skippedNames != null && skippedNames.has(name))) {
+         return "<stripped sensitive data>"
+       }
++      if (typeof value === "string" && /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
++        return redactUrlForLog(value)
++      }
+       return value
+     },
+     2
+diff -ruN a/packages/builder-util-runtime/src/index.ts b/packages/builder-util-runtime/src/index.ts
+--- a/packages/builder-util-runtime/src/index.ts	2026-10-17 21:32:16.053624626 +0000
++++ b/packages/builder-util-runtime/src/index.ts	2026-10-17 21:35:28.225490336 +0000
+@@ -14,6 +14,10 @@
+   RequestHeaders,
+   safeGetHeader,
+   safeStringifyJson,
++  isCredentialHeader,
++  stripCredentials,
++  redactUrlForLog,
++  isSensitiveFieldName,
+ } from "./httpExecutor"
+ export { MemoLazy } from "./MemoLazy"
+ export { ProgressCallbackTransform, ProgressInfo } from "./ProgressCallbackTransform"
+diff -ruN a/packages/electron-publish/src/gitHubPublisher.ts b/packages/electron-publish/src/gitHubPublisher.ts
+--- a/packages/electron-publish/src/gitHubPublisher.ts	2026-10-17 21:32:16.061624620 +0000
++++ b/packages/electron-publish/src/gitHubPublisher.ts	2026-10-17 21:36:16.761459959 +0000
+@@ -58,7 +58,7 @@
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitHub Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GH_TOKEN"`)
++        throw new InvalidConfigurationError(`GitHub Personal Access Token contains invalid characters, please check env "GH_TOKEN"`)
+       }
+     }
+ 
+diff -ruN a/packages/electron-publish/src/gitlabPublisher.ts b/packages/electron-publish/src/gitlabPublisher.ts
+--- a/packages/electron-publish/src/gitlabPublisher.ts	2026-10-17 21:32:16.061624620 +0000
++++ b/packages/electron-publish/src/gitlabPublisher.ts	2026-10-17 21:36:16.765459957 +0000
+@@ -46,7 +46,7 @@
+       token = token.trim()
+ 
+       if (!isTokenCharValid(token)) {
+-        throw new InvalidConfigurationError(`GitLab Personal Access Token (${JSON.stringify(token)}) contains invalid characters, please check env "GITLAB_TOKEN"`)
++        throw new InvalidConfigurationError(`GitLab Personal Access Token contains invalid characters, please check env "GITLAB_TOKEN"`)
+       }
+     }
+ 
+diff -ruN a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts
+--- a/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts	2026-10-17 21:32:16.069624614 +0000
++++ b/packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts	2026-10-17 21:36:10.641463809 +0000
+@@ -52,6 +52,41 @@
+     return result
+   }
+ 
++  /**
++   * Creates a request that follows redirects itself (instead of letting Electron net follow them with the original headers),
++   * so that credentials are stripped on cross-origin redirects.
++   */
++  createRequestFollowingRedirects(
++    requestOptions: RequestOptions,
++    callback: (response: any) => void,
++    reject: (error: Error) => void,
++    onRedirect: ((redirectOptions: RequestOptions) => void) | null = null,
++    redirectCount = 0
++  ): any {
++    const options: RequestOptions = { ...requestOptions }
++    ;(options as any).redirect = "manual"
++    const request = this.httpExecutor.createRequest(options, callback)
++    request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
++      // no way to modify request options, abort old and make a new one
++      request.abort()
++
++      if (redirectCount >= MAX_REDIRECTS) {
++        reject(new Error(`Too many redirects (> ${MAX_REDIRECTS})`))
++        return
++      }
++
++      this.logger.info(`Redirect to ${removeQuery(redirectUrl)}`)
++      const redirectOptions = HttpExecutor.prepareRedirectUrlOptions(redirectUrl, options)
++      if (onRedirect != null) {
++        onRedirect(redirectOptions)
++      }
++      const redirectRequest = this.createRequestFollowingRedirects(redirectOptions, callback, reject, onRedirect, redirectCount + 1)
++      this.httpExecutor.addErrorAndTimeoutHandlers(redirectRequest, reject)
++      redirectRequest.end()
++    })
++    return request
++  }
++
+   protected doDownload(oldBlockMap: BlockMap, newBlockMap: BlockMap): Promise<any> {
+     // we don't check other metadata like compressionMethod - generic check that it is make sense to differentially update is suitable for it
+     if (oldBlockMap.version !== newBlockMap.version) {
+@@ -194,10 +229,9 @@
+       }
+ 
+       let downloadOperationCount = 0
+-      let actualUrl: string | null = null
+       this.logger.info(`Differential download: ${this.options.newUrl}`)
+ 
+-      const requestOptions = this.createRequestOptions()
++      let requestOptions = this.createRequestOptions()
+       ;(requestOptions as any).redirect = "manual"
+ 
+       w = (index: number): void => {
+@@ -230,39 +264,41 @@
+           downloadInfoTransform.beginRangeDownload()
+         }
+ 
+-        const request = this.httpExecutor.createRequest(requestOptions, response => {
+-          response.on("error", reject)
+-          response.on("aborted", () => {
+-            reject(new Error("response has been aborted by the server"))
+-          })
+-          // Electron net handles redirects automatically, our NodeJS test server doesn't use redirects - so, we don't check 3xx codes.
+-          if (response.statusCode >= 400) {
+-            reject(createHttpError(response))
+-          }
+-
+-          response.pipe(firstStream, {
+-            end: false,
+-          })
+-          response.once("end", () => {
+-            // Pass on that we are downloading a segment
+-            if (downloadInfoTransform) {
+-              downloadInfoTransform.endRangeDownload()
++        const request = this.createRequestFollowingRedirects(
++          requestOptions,
++          response => {
++            response.on("error", reject)
++            response.on("aborted", () => {
++              reject(new Error("response has been aborted by the server"))
++            })
++            // redirects are handled by createRequestFollowingRedirects, our NodeJS test server doesn't use redirects - so, we don't check 3xx codes.
++            if (response.statusCode >= 400) {
++              reject(createHttpError(response))
+             }
+ 
+-            if (++downloadOperationCount === 100) {
+-              downloadOperationCount = 0
+-              setTimeout(() => w(index), 1000)
+-            } else {
+-              w(index)
+-            }
+-          })
+-        })
+-        request.on("redirect", (statusCode: number, method: string, redirectUrl: string) => {
+-          this.logger.info(`Redirect to ${removeQuery(redirectUrl)}`)
+-          actualUrl = redirectUrl
+-          configureRequestUrl(new URL(actualUrl), requestOptions)
+-          request.followRedirect()
+-        })
++            response.pipe(firstStream, {
++              end: false,
++            })
++            response.once("end", () => {
++              // Pass on that we are downloading a segment
++              if (downloadInfoTransform) {
++                downloadInfoTransform.endRangeDownload()
++              }
++
++              if (++downloadOperationCount === 100) {
++                downloadOperationCount = 0
++                setTimeout(() => w(index), 1000)
++              } else {
++                w(index)
++              }
++            })
++          },
++          reject,
++          redirectOptions => {
++            // subsequent range requests go directly to the redirect target (with credentials stripped if it is another origin)
++            requestOptions = redirectOptions
++          }
++        )
+         this.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+         request.end()
+       }
+@@ -289,7 +325,7 @@
+ 
+   private request(requestOptions: RequestOptions, dataHandler: (chunk: Buffer) => void): Promise<void> {
+     return new Promise((resolve, reject) => {
+-      const request = this.httpExecutor.createRequest(requestOptions, response => {
++      const request = this.createRequestFollowingRedirects(requestOptions, response => {
+         if (!checkIsRangesSupported(response, reject)) {
+           return
+         }
+@@ -301,7 +337,7 @@
+ 
+         response.on("data", dataHandler)
+         response.on("end", () => resolve())
+-      })
++      }, reject)
+       this.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+       request.end()
+     })
+@@ -318,6 +354,8 @@
+   return index < 0 ? url : url.substring(0, index)
+ }
+ 
++const MAX_REDIRECTS = 10
++
+ interface OpenedFile {
+   readonly descriptor: number
+   readonly path: string
+diff -ruN a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts
+--- a/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts	2026-10-17 21:32:16.069624614 +0000
++++ b/packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts	2026-10-17 21:36:02.277469061 +0000
+@@ -70,18 +70,22 @@
+       } else {
+         const requestOptions = differentialDownloader.createRequestOptions()
+         requestOptions.headers!.Range = `bytes=${task.start}-${task.end - 1}`
+-        const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
+-          response.on("error", reject)
+-
+-          if (!checkIsRangesSupported(response, reject)) {
+-            return
+-          }
+-
+-          response.pipe(out, {
+-            end: false,
+-          })
+-          response.once("end", () => w(index))
+-        })
++        const request = differentialDownloader.createRequestFollowingRedirects(
++          requestOptions,
++          response => {
++            response.on("error", reject)
++
++            if (!checkIsRangesSupported(response, reject)) {
++              return
++            }
++
++            response.pipe(out, {
++              end: false,
++            })
++            response.once("end", () => w(index))
++          },
++          reject
++        )
+         differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+         request.end()
+       }
+@@ -93,7 +97,7 @@
+ 
+   const requestOptions = differentialDownloader.createRequestOptions()
+   requestOptions.headers!.Range = ranges.substring(0, ranges.length - 2)
+-  const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
++  const request = differentialDownloader.createRequestFollowingRedirects(requestOptions, response => {
+     if (!checkIsRangesSupported(response, reject)) {
+       return
+     }
+@@ -115,7 +119,7 @@
+         reject(new Error("Response ends without calling any handlers"))
+       }, 10000)
+     })
+-  })
++  }, reject)
+   differentialDownloader.httpExecutor.addErrorAndTimeoutHandlers(request, reject)
+   request.end()
+ }
+diff -ruN a/packages/electron-updater/src/providers/Provider.ts b/packages/electron-updater/src/providers/Provider.ts
+--- a/packages/electron-updater/src/providers/Provider.ts	2026-10-17 21:32:16.069624614 +0000
++++ b/packages/electron-updater/src/providers/Provider.ts	2026-10-17 21:37:04.737429602 +0000
+@@ -90,6 +90,8 @@
+     }
+ 
+     configureRequestUrl(url, result)
++    // redirects are followed by the executor (not by Electron net), so that credentials are stripped on cross-origin redirects
++    ;(result as any).redirect = "manual"
+     return result
+   }
+ }

@@ -1,0 +1,256 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/internal/pkg/billing"
+	"github.com/frain-dev/convoy/internal/pkg/license"
+	"github.com/frain-dev/convoy/mocks"
+	log "github.com/frain-dev/convoy/pkg/logger"
+)
+
+type panicOnCreateBillingClient struct {
+	*billing.MockBillingClient
+}
+
+func (panicOnCreateBillingClient) CreateOrganisation(context.Context, billing.BillingOrganisation) (*billing.Response[billing.BillingOrganisation], error) {
+	panic("CreateOrganisation must not be called when owner email is empty")
+}
+
+func provideCreateOrganisationService(ctrl *gomock.Controller, newOrg *datastore.OrganisationRequest, user *datastore.User) *CreateOrganisationService {
+	return NewCreateOrganisationService(
+		mocks.NewMockOrganisationRepository(ctrl),
+		mocks.NewMockOrganisationMemberRepository(ctrl),
+		newOrg,
+		user,
+		mocks.NewMockLicenser(ctrl),
+		"",
+		log.New("convoy", log.LevelInfo),
+	)
+}
+
+func TestCreateOrganisationService_Run(t *testing.T) {
+	ctx := context.Background()
+
+	type args struct {
+		ctx    context.Context
+		newOrg *datastore.OrganisationRequest
+		user   *datastore.User
+	}
+	tests := []struct {
+		name       string
+		args       args
+		want       *datastore.Organisation
+		dbFn       func(os *CreateOrganisationService)
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name: "should_create_organisation",
+			args: args{
+				ctx:    ctx,
+				newOrg: &datastore.OrganisationRequest{Name: "new_org"},
+				user:   &datastore.User{UID: "1234"},
+			},
+			want: &datastore.Organisation{Name: "new_org", OwnerID: "1234"},
+			dbFn: func(os *CreateOrganisationService) {
+				a, _ := os.OrgRepo.(*mocks.MockOrganisationRepository)
+				a.EXPECT().CreateOrganisation(gomock.Any(), gomock.Any()).
+					Times(1).Return(nil)
+
+				om, _ := os.OrgMemberRepo.(*mocks.MockOrganisationMemberRepository)
+				om.EXPECT().CreateOrganisationMember(gomock.Any(), gomock.Any()).Times(1).Return(nil)
+
+				licenser, _ := os.Licenser.(*mocks.MockLicenser)
+				licenser.EXPECT().CheckOrgLimit(gomock.Any()).Times(1).Return(true, nil)
+				licenser.EXPECT().IsMultiUserMode(gomock.Any()).Times(1).Return(true, nil)
+			},
+			wantErr: false,
+		},
+		{
+			name: "should_create_organisation_with_existing_instance_admin",
+			args: args{
+				ctx:    ctx,
+				newOrg: &datastore.OrganisationRequest{Name: "new_org"},
+				user:   &datastore.User{UID: "1234"},
+			},
+			want: &datastore.Organisation{Name: "new_org", OwnerID: "1234"},
+			dbFn: func(os *CreateOrganisationService) {
+				a, _ := os.OrgRepo.(*mocks.MockOrganisationRepository)
+				a.EXPECT().CreateOrganisation(gomock.Any(), gomock.Any()).
+					Times(1).Return(nil)
+
+				om, _ := os.OrgMemberRepo.(*mocks.MockOrganisationMemberRepository)
+				om.EXPECT().CreateOrganisationMember(gomock.Any(), gomock.Any()).Times(1).Return(nil)
+
+				licenser, _ := os.Licenser.(*mocks.MockLicenser)
+				licenser.EXPECT().CheckOrgLimit(gomock.Any()).Times(1).Return(true, nil)
+				licenser.EXPECT().IsMultiUserMode(gomock.Any()).Times(1).Return(true, nil)
+			},
+			wantErr: false,
+		},
+		{
+			name: "should_fail_to_validate_organisation",
+			args: args{
+				ctx:    ctx,
+				newOrg: &datastore.OrganisationRequest{Name: ""},
+				user:   &datastore.User{UID: "1234"},
+			},
+			dbFn: func(os *CreateOrganisationService) {
+				licenser, _ := os.Licenser.(*mocks.MockLicenser)
+				licenser.EXPECT().CheckOrgLimit(gomock.Any()).Times(1).Return(true, nil)
+			},
+			wantErr:    true,
+			wantErrMsg: "organisation name is required",
+		},
+		{
+			name: "should_fail_to_create_organisation",
+			args: args{
+				ctx:    ctx,
+				newOrg: &datastore.OrganisationRequest{Name: "new_org"},
+				user:   &datastore.User{UID: "1234"},
+			},
+			dbFn: func(os *CreateOrganisationService) {
+				licenser, _ := os.Licenser.(*mocks.MockLicenser)
+				licenser.EXPECT().CheckOrgLimit(gomock.Any()).Times(1).Return(true, nil)
+
+				a, _ := os.OrgRepo.(*mocks.MockOrganisationRepository)
+				a.EXPECT().CreateOrganisation(gomock.Any(), gomock.Any()).
+					Times(1).Return(errors.New("failed"))
+			},
+			wantErr:    true,
+			wantErrMsg: "failed to create organisation",
+		},
+		{
+			name: "should_fail_to_create_organisation_for_license_check",
+			args: args{
+				ctx:    ctx,
+				newOrg: &datastore.OrganisationRequest{Name: "new_org"},
+				user:   &datastore.User{UID: "1234"},
+			},
+			dbFn: func(os *CreateOrganisationService) {
+				licenser, _ := os.Licenser.(*mocks.MockLicenser)
+				licenser.EXPECT().CheckOrgLimit(gomock.Any()).Times(1).Return(false, nil)
+			},
+			wantErr:    true,
+			wantErrMsg: ErrOrgLimit.Error(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+			os := provideCreateOrganisationService(ctrl, tt.args.newOrg, tt.args.user)
+
+			// Arrange Expectations
+			if tt.dbFn != nil {
+				tt.dbFn(os)
+			}
+
+			err := config.LoadConfig("", func(c *config.Configuration) error {
+				c.Auth.Jwt.Secret = "test-access-secret"
+				c.Auth.Jwt.RefreshSecret = "test-refresh-secret"
+				return nil
+			})
+			require.NoError(t, err)
+
+			org, err := os.Run(tt.args.ctx)
+			if tt.wantErr {
+				require.NotNil(t, err)
+				require.Equal(t, tt.wantErrMsg, err.(*ServiceError).Error())
+				return
+			}
+
+			require.NoError(t, err)
+			stripVariableFields(t, "organisation", org)
+			require.Equal(t, tt.want, org)
+		})
+	}
+}
+
+// Regression: the bootstrap CLI built this service without a licenser and
+// Run panicked at CheckOrgLimit. A missing licenser must be a clear error.
+func TestCreateOrganisationService_Run_NilLicenserErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	os := provideCreateOrganisationService(ctrl, &datastore.OrganisationRequest{Name: "new_org"}, &datastore.User{UID: "1234"})
+	os.Licenser = nil
+
+	org, err := os.Run(context.Background())
+	require.Nil(t, org)
+	require.NotNil(t, err)
+	require.Equal(t, "licenser is required to create an organisation", err.(*ServiceError).Error())
+}
+
+func TestRunBillingOrganisationSync(t *testing.T) {
+	ctx := context.Background()
+	org := datastore.Organisation{
+		UID:       "org-uid-123",
+		Name:      "test-org",
+		OwnerID:   "user-1",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	cfg := config.Configuration{
+		LicenseService: config.LicenseServiceConfiguration{},
+	}
+	userEmail := "admin@example.com"
+	billingHost := "app.example.com"
+
+	t.Run("calls_UpdateOrganisationLicenseData_when_billing_returns_license_key", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockOrgRepo := mocks.NewMockOrganisationRepository(ctrl)
+		var capturedLicenseData string
+		mockOrgRepo.EXPECT().
+			UpdateOrganisationLicenseData(gomock.Any(), "org-uid-123", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, licenseData string) error {
+				capturedLicenseData = licenseData
+				return nil
+			})
+
+		mockBilling := &billing.MockBillingClient{
+			CreateOrganisationLicenseKey: "test-license-key-from-billing",
+		}
+
+		RunBillingOrganisationSync(ctx, mockBilling, org, cfg, userEmail, billingHost, mockOrgRepo, log.New("convoy", log.LevelInfo))
+
+		require.NotEmpty(t, capturedLicenseData, "UpdateOrganisationLicenseData should be called with encrypted payload")
+		payload, err := license.DecryptLicenseData(org.UID, capturedLicenseData)
+		require.NoError(t, err)
+		require.Equal(t, "test-license-key-from-billing", payload.Key)
+	})
+
+	t.Run("does_not_call_UpdateOrganisationLicenseData_when_no_license_key", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockOrgRepo := mocks.NewMockOrganisationRepository(ctrl)
+		// No expectation for UpdateOrganisationLicenseData - mock would fail if it were called
+
+		mockBilling := &billing.MockBillingClient{}
+		// CreateOrganisationLicenseKey and GetOrganisationLicenseKey left empty
+
+		RunBillingOrganisationSync(ctx, mockBilling, org, cfg, userEmail, billingHost, mockOrgRepo, log.New("convoy", log.LevelInfo))
+	})
+
+	t.Run("skips_billing_sync_when_owner_email_is_empty", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		mockOrgRepo := mocks.NewMockOrganisationRepository(ctrl)
+		mockBilling := panicOnCreateBillingClient{MockBillingClient: &billing.MockBillingClient{}}
+
+		RunBillingOrganisationSync(ctx, &mockBilling, org, cfg, "", billingHost, mockOrgRepo, log.New("convoy", log.LevelInfo))
+	})
+}

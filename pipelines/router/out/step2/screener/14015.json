@@ -1,0 +1,102 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "14015",
+  "advisory_ids": ["GHSA-VC2V-76PW-4V95", "CVE-2026-87776"],
+  "repo": "expressjs/compression",
+  "pinned_commit": "0a764956691bede2b62c711598ee65ea643d3b1e",
+  "fix_commits": ["151f63e91e1b64f8fb0b064e19321a4f28db6bff"],
+  "trust_decision": {
+    "summary": "Whether a response body is compressed, and therefore whether a native zlib stream is allocated, is decided per response in the middleware's onHeaders callback (index.js:161-241); the published fix makes that stream's lifetime owned by the raw response's 'close' event (destroy on close, plus a closed flag for streams created after the close).",
+    "evidence": ["index.js:161-241", "index.js:212-218", "index.js:86-88"]
+  },
+  "landing_point": {
+    "where": "index.js:214",
+    "why": "The advisory summary says memory leak on premature response close; the only zlib resources in the package are the gzip/brotli/deflate streams allocated at index.js:214-218, so an engineer reads the onHeaders callback there first and then looks for response-close handling."
+  },
+  "fix_sites": [
+    {
+      "where": "fix.diff:25",
+      "entry_point": "require('compression') at module load (dependency import)",
+      "module_kind": "dependency import"
+    },
+    {
+      "where": "fix.diff:47-50",
+      "entry_point": "compression(options) middleware, every request that traverses app.use(compression())",
+      "module_kind": "middleware / response lifecycle handler"
+    },
+    {
+      "where": "fix.diff:62-66",
+      "entry_point": "compression middleware via res.write/res.end that writes/ends after the client already disconnected",
+      "module_kind": "middleware handler (onHeaders callback)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "A solver can argue the post-close write route is out of scope because the advisory is only about leaking the zlib stream on disconnect, not about writes the application makes after the client is already gone.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A long-lived streaming response must keep flushing while the connection is open: res.flush() is documented for server-sent events (README.md:252-288) and forwards to the live compression stream (index.js:91-95), so a fix that destroys the stream on any end/close-adjacent event rather than only on socket close truncates legitimate streaming bodies.",
+    "where": "index.js:91-95"
+  },
+  "O6_input_shapes": ["gzip", "deflate", "brotli (br)", "response closes before the compression stream is created"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "res.write()/res.end() after 'close' when the compression stream already existed: the proxies test only 'ended', never the fix's 'closed' flag, so they still route the body into the just-destroyed zlib stream instead of falling back to the raw response (the fix drops the reference only in the create-after-close branch).",
+      "where": "index.js:99-138",
+      "reason_to_dismiss": "The client has already disconnected, so writing after close can be called the application's own problem, and the advisory is about the stream leak rather than post-destroy write errors.",
+      "distance": "same file, ~100 lines above the closed-branch the fix adds at fix.diff:62-66",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "index.js:212-218",
+      "sibling": "an additional stream factory branch (another algorithm or an HTTP/2-specific transport path) with its own teardown",
+      "why_realistic": "The code already has a three-way gzip/br/deflate factory and the project's tests exercise an HTTP/2 server (test/compression.js:325-358, test/compression.js:1010-1025), so a maintainer could add another stream path and forget the close teardown there."
+    },
+    {
+      "where": "index.js:140-153",
+      "sibling": "close teardown wired through the overridden res.on proxy and its buffered-listener path instead of directly on the raw response",
+      "why_realistic": "The middleware already proxies res.on to buffer 'drain' listeners until the stream exists (index.js:140-153, index.js:220-221), so a maintainer could naturally hang cleanup off the proxied event and miss a stream created after the last close."
+    },
+    {
+      "where": "index.js:113-138",
+      "sibling": "a res.end()-side guard that nulls or destroys the stream when the response is closed, mirroring the create-after-close branch",
+      "why_realistic": "res.end is the other public write surface next to the sink, and the fix's own comment says later writes should fall back to the raw response (fix.diff:59-61), so a maintainer could add the same guard here."
+    }
+  ],
+  "O9_family": "CWE-401 improper release of memory / CWE-459 incomplete cleanup: native zlib compression handle not released when the response closes prematurely",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "JavaScript (Node.js)",
+    "toolchain": "npm; mocha 9.2.2 + supertest 6.3.4 + nyc + eslint 7.32.0 (package.json:25-37)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/compression.js is a mocha suite over http.createServer and http2 servers (test/compression.js:325-358, 1010-1025) covering filters, threshold, encodings, back-pressure and res.flush; the fix adds assertDestroyedOnClose/wrapCleanup cases for gzip, deflate, brotli and stream-created-after-close (fix.diff:91-244), none of which exist in the pinned tree."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "index.js (package.json only adds the destroy dependency)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Attach res.on('close', function () { stream.destroy() }) inside the onHeaders callback, which never fires for a stream created after the close and uses stream.destroy() rather than the destroy() helper the fix says is needed to release the zlib handle."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb not measured (shell disabled); the pinned tree has a single source file index.js (~8.7 KB) plus test/compression.js, so tiny_repo is inferred from the file inventory rather than a measured size.",
+    "The O8 route's runtime consequence (write/end into a destroyed zlib stream throwing or emitting ERR_STREAM_DESTROYED unhandled) is reasoned from Node stream semantics, not executed.",
+    "present_in_latest is unknown because no latest release was provided for O8.",
+    "The fix's claim that stream.destroy() alone leaks the zlib handle on some Node versions (fix.diff:44-46) was not verified.",
+    "npm install and the test suite were not run (no build/run allowed)."
+  ]
+}

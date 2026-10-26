@@ -1,0 +1,88 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "30172", "advisory_ids": ["GHSA-VP3W-52V9-Q57F", "CVE-2026-77601"], "repo": "openc3/cosmos",
+  "pinned_commit": "f29c7250bb3db027605389a79ef38e47a3aebfca",
+  "fix_commits": ["be70d1d836c83c3b084e768e31a399312d4cbe0b"],
+  "trust_decision": {
+    "summary": "An admin-writable setting (pypi_url) and its ENV['PYPI_URL'] fallback are stored with no validation at any write layer, then trusted verbatim by two independent models that hand the value to pip; the decision that the value is a plain http(s) URL has to be made where the value is consumed (a shared validator immediately before the pip invocation), not at the setter.",
+    "evidence": [
+      "openc3/lib/openc3/api/settings_api.rb:72-78",
+      "openc3/lib/openc3/models/setting_model.rb:26-51",
+      "openc3/lib/openc3/models/plugin_model.rb:252-267",
+      "openc3/lib/openc3/models/plugin_model.rb:288",
+      "openc3/lib/openc3/models/python_package_model.rb:73-95"
+    ]
+  },
+  "landing_point": {
+    "where": "openc3/lib/openc3/models/plugin_model.rb:288",
+    "why": "It is the only shell interpolation of pypi_url in the tree (`output = `/openc3/bin/pipinstall #{pip_args}``, with pip_args built by string interpolation at :272/:274/:279/:281); an engineer given only 'OS command injection via the pypi_url setting' greps pypi_url and lands here first."
+  },
+  "fix_sites": [
+    {"where": "openc3/lib/openc3/models/plugin_model.rb:268-293", "entry_point": "POST /openc3-api/plugins/install/:id -> PluginsController#install -> ProcessManager spawn of `openc3cli load` -> PluginModel.install_phase2 (same call reached by `openc3cli load` directly and by PluginModel#restore)", "module_kind": "model"},
+    {"where": "openc3/lib/openc3/models/python_package_model.rb:73-95", "entry_point": "POST /openc3-api/packages -> PackagesController#create -> PythonPackageModel.put -> PythonPackageModel.install", "module_kind": "model (second implementation: duplicates the pypi_url resolution and spawns pip itself)"},
+    {"where": "fix.diff:113-131", "entry_point": "new OpenC3::PypiUrl utility called from both models (no public entry point of its own)", "module_kind": "utility / shared validator"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "openc3/lib/openc3/models/python_package_model.rb:73-95"
+  },
+  "O3_reason_to_dismiss": "The packages route already passes an argv array into ProcessManager/ChildProcess (`spawn([\"/openc3/bin/pipinstall\"] + pip_args)`, operator.rb:122 `ChildProcess.build(*@process_definition)`), so it was never shell-injectable and 'needs no change' - yet the published fix added PypiUrl.validate there too.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Air-gapped/private index support: pypi_url is legitimately an http (not https) mirror with a host:port and a path, passed unchanged to pip and its host fed to --trusted-host when PIP_ENABLE_TRUSTED_HOST is set, so a validator restricted to https/pypi.org or one that normalises/strips the URL breaks private mirrors (the fix's own spec pins 'allows a host with a port'); the sink must also stay non-fatal, so raising instead of falling back to DEFAULT would abort plugin install when pip fails.",
+    "where": "openc3/lib/openc3/models/plugin_model.rb:271-275 and :284-292; .env:112-113; docs.openc3.com/docs/guides/scripting-api.md:10083"
+  },
+  "O6_input_shapes": [
+    "pypi_url read from the Redis setting via get_setting (then '/simple' appended)",
+    "pypi_url from the ENV['PYPI_URL'] fallback (then '/simple' appended)",
+    "the hard-coded default 'https://pypi.org/simple'",
+    "valid http:// and https:// URLs, including a host with a port",
+    "invalid strings - shell metacharacters, non-http(s) scheme, missing host, empty string, non-URL text - replaced by DEFAULT with a logged error",
+    "both plugin dependency layouts: pyproject.toml (gem directory as last arg) vs requirements.txt (-r path)",
+    "PIP_ENABLE_TRUSTED_HOST set (extra --trusted-host argv pair) vs unset"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "openc3/lib/openc3/utilities/local_mode.rb:470-490 (LocalMode.sync_settings reads <scope>/settings/*.json and writes them into Redis; save_setting writes them back) and openc3/lib/openc3/models/scope_model.rb:404-405 (seeds pypi_url from ENV['PYPI_URL'])",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "openc3/lib/openc3/models/gem_model.rb:79-85", "sibling": "rubygems_url, resolved from the same setting store in exactly the same way, handed to Gem.sources", "why_realistic": "Same air-gapped mirror feature written by the same authors in the same idiom; a maintainer adding a gem-side install that goes through a command line (or build_args) would repeat the pypi_url mistake verbatim."},
+    {"where": "openc3/bin/pipinstall:26-30", "sibling": "the shell helper re-expands the caller's argv unquoted (`uv pip compile ${OPTS} ...` / `uv pip install ... ${OPTS} -r \"$TMPFILE\"`) on its retry path", "why_realistic": "A second, non-Ruby implementation of the same argument plumbing; a maintainer adding another placeholder there (e.g. an extra index) would reopen a shell word-split boundary in a place the Ruby validator does not reach."},
+    {"where": "openc3/lib/openc3/models/python_package_model.rb:99-105", "sibling": "pipuninstall spawned with a package name derived from params[:id]", "why_realistic": "The mirror-image sink next to the pip install sink; a maintainer writing a shell-string variant of uninstall (instead of the argv array used today) would be a realistic sibling copy."}
+  ],
+  "O9_family": "os_command_injection", "O9_dos": false,
+  "O10_build": {
+    "language": "Ruby",
+    "toolchain": "bundler + rspec (`bundle exec rspec`, openc3/justfile:24); Rails 7 API app in openc3-cosmos-cmd-tlm-api; Ruby 3.x; repo also ships Docker images but the affected code is plain Ruby",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "openc3/spec/models/plugin_model_spec.rb (install_phase2, mock_redis at :28-30); openc3-cosmos-cmd-tlm-api/spec/controllers/plugins_controller_spec.rb; the fix adds openc3/spec/utilities/pypi_url_spec.rb (fix.diff:135-218). There is no spec for PythonPackageModel in the pinned tree."
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "openc3/lib/openc3/models/plugin_model.rb, openc3/lib/openc3/models/python_package_model.rb, openc3/lib/openc3/utilities/pypi_url.rb",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Shellwords.escape (or quote) the interpolated pypi_url at plugin_model.rb:288 and stop, leaving the duplicated resolution and pip spawn in PythonPackageModel.install untouched."
+  },
+  "out_of_scope_notes": [
+    "Other shell-string sinks exist in this tree but are unrelated to pypi_url and were not pursued: openc3/lib/openc3/microservices/microservice.rb:197 (`Open3.capture2e(\"ruby -c #{ruby_filename}\")`), openc3/lib/openc3/utilities/script.rb:315/386/427, openc3/lib/openc3/top_level.rb:179-197 (generic run_process string helpers)."
+  ],
+  "unverified": [
+    "Repo size in MB could not be measured (no shell), so repo_mb is null and tiny_repo/giant_repo were not claimed.",
+    "No latest release was provided, so every present_in_latest answer would be unknown; O8 is empty anyway.",
+    "The fix does not handle a non-String setting value: `pypi_url += '/simple'` and URI.parse raise TypeError (not URI::InvalidURIError) so validate would propagate it and abort plugin install; judged by reading only, not exercised.",
+    "Whether hidden tests would require the exact new name OpenC3::PypiUrl (fix.diff:113) rather than equivalent behaviour.",
+    "Whether Gem.install / Gem.sources (openc3/lib/openc3/models/gem_model.rb:85-92) can turn a setting into a command line internally was not traced.",
+    "Whether the plugin-install path can be exercised in the grading image without /openc3/bin/pipinstall, uv and a real .gem was not checked."
+  ]
+}

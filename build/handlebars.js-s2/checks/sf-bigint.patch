@@ -1,0 +1,444 @@
+diff --git a/lib/handlebars/compiler/base.js b/lib/handlebars/compiler/base.js
+index 7ce7d70..1dd5af1 100644
+--- a/lib/handlebars/compiler/base.js
++++ b/lib/handlebars/compiler/base.js
+@@ -1,7 +1,6 @@
+ import parser from './parser';
+ import WhitespaceControl from './whitespace-control';
+ import * as Helpers from './helpers';
+-import Exception from '../exception';
+ import { extend } from '../utils';
+ 
+ export { parser };
+@@ -12,9 +11,6 @@ extend(yy, Helpers);
+ export function parseWithoutProcessing(input, options) {
+   // Just return if an already-compiled AST was passed in.
+   if (input.type === 'Program') {
+-    // When a pre-parsed AST is passed in, validate all node values to prevent
+-    // code injection via type-confused literals.
+-    validateInputAst(input);
+     return input;
+   }
+ 
+@@ -36,66 +32,3 @@ export function parse(input, options) {
+ 
+   return strip.accept(ast);
+ }
+-
+-function validateInputAst(ast) {
+-  validateAstNode(ast);
+-}
+-
+-function validateAstNode(node) {
+-  if (node == null) {
+-    return;
+-  }
+-
+-  if (Array.isArray(node)) {
+-    node.forEach(validateAstNode);
+-    return;
+-  }
+-
+-  if (typeof node !== 'object') {
+-    return;
+-  }
+-
+-  if (node.type === 'PathExpression') {
+-    if (!isValidDepth(node.depth)) {
+-      throw new Exception(
+-        'Invalid AST: PathExpression.depth must be an integer'
+-      );
+-    }
+-    if (!Array.isArray(node.parts)) {
+-      throw new Exception('Invalid AST: PathExpression.parts must be an array');
+-    }
+-    for (let i = 0; i < node.parts.length; i++) {
+-      if (typeof node.parts[i] !== 'string') {
+-        throw new Exception(
+-          'Invalid AST: PathExpression.parts must only contain strings'
+-        );
+-      }
+-    }
+-  } else if (node.type === 'NumberLiteral') {
+-    if (typeof node.value !== 'number' || !isFinite(node.value)) {
+-      throw new Exception('Invalid AST: NumberLiteral.value must be a number');
+-    }
+-  } else if (node.type === 'BooleanLiteral') {
+-    if (typeof node.value !== 'boolean') {
+-      throw new Exception(
+-        'Invalid AST: BooleanLiteral.value must be a boolean'
+-      );
+-    }
+-  }
+-
+-  Object.keys(node).forEach(propertyName => {
+-    if (propertyName === 'loc') {
+-      return;
+-    }
+-    validateAstNode(node[propertyName]);
+-  });
+-}
+-
+-function isValidDepth(depth) {
+-  return (
+-    typeof depth === 'number' &&
+-    isFinite(depth) &&
+-    Math.floor(depth) === depth &&
+-    depth >= 0
+-  );
+-}
+diff --git a/lib/handlebars/compiler/compiler.js b/lib/handlebars/compiler/compiler.js
+index f20dfb3..989501a 100644
+--- a/lib/handlebars/compiler/compiler.js
++++ b/lib/handlebars/compiler/compiler.js
+@@ -101,6 +101,7 @@ Compiler.prototype = {
+   },
+ 
+   Program: function(program) {
++    validateBlockParams(program);
+     this.options.blockParams.unshift(program.blockParams);
+ 
+     let body = program.body,
+@@ -219,6 +220,9 @@ Compiler.prototype = {
+   },
+ 
+   ContentStatement: function(content) {
++    if (content.value != null && typeof content.value !== 'string') {
++      throw invalidAst(content, 'value must be a string');
++    }
+     if (content.value) {
+       this.opcode('appendContent', content.value);
+     }
+@@ -243,7 +247,7 @@ Compiler.prototype = {
+       name = path.parts[0],
+       isBlock = program != null || inverse != null;
+ 
+-    this.opcode('getContext', path.depth);
++    this.opcode('getContext', validateDepth(path));
+ 
+     this.opcode('pushProgram', program);
+     this.opcode('pushProgram', inverse);
+@@ -288,41 +292,43 @@ Compiler.prototype = {
+   },
+ 
+   PathExpression: function(path) {
+-    this.addDepth(path.depth);
+-    this.opcode('getContext', path.depth);
++    // Validate AST values at the compiler boundary: javascript-compiler.js
++    // trusts all opcode arguments to be safe.
++    const depth = validateDepth(path);
++    const parts = validateParts(path);
++
++    this.addDepth(depth);
++    this.opcode('getContext', depth);
+ 
+-    let name = path.parts[0],
++    let name = parts[0],
+       scoped = AST.helpers.scopedId(path),
+-      blockParamId = !path.depth && !scoped && this.blockParamIndex(name);
++      blockParamId = !depth && !scoped && this.blockParamIndex(name);
+ 
+     if (blockParamId) {
+-      this.opcode('lookupBlockParam', blockParamId, path.parts);
++      this.opcode('lookupBlockParam', blockParamId, parts);
+     } else if (!name) {
+       // Context reference, i.e. `{{foo .}}` or `{{foo ..}}`
+       this.opcode('pushContext');
+     } else if (path.data) {
+       this.options.data = true;
+-      this.opcode('lookupData', path.depth, path.parts, path.strict);
++      this.opcode('lookupData', depth, parts, path.strict);
+     } else {
+-      this.opcode(
+-        'lookupOnContext',
+-        path.parts,
+-        path.falsy,
+-        path.strict,
+-        scoped
+-      );
++      this.opcode('lookupOnContext', parts, path.falsy, path.strict, scoped);
+     }
+   },
+ 
+   StringLiteral: function(string) {
++    validateLiteral(string);
+     this.opcode('pushString', string.value);
+   },
+ 
+   NumberLiteral: function(number) {
++    validateLiteral(number);
+     this.opcode('pushLiteral', number.value);
+   },
+ 
+   BooleanLiteral: function(bool) {
++    validateLiteral(bool);
+     this.opcode('pushLiteral', bool.value);
+   },
+ 
+@@ -341,7 +347,17 @@ Compiler.prototype = {
+   Hash: function(hash) {
+     let pairs = hash.pairs,
+       i = 0,
+-      l = pairs.length;
++      l;
++
++    if (!isArray(pairs)) {
++      throw invalidAst(hash, 'pairs must be an array');
++    }
++    l = pairs.length;
++    for (let j = 0; j < l; j++) {
++      if (!pairs[j] || typeof pairs[j].key !== 'string') {
++        throw invalidAst(hash, 'pair keys must be strings');
++      }
++    }
+ 
+     this.opcode('pushHash');
+ 
+@@ -372,6 +388,9 @@ Compiler.prototype = {
+   },
+ 
+   classifySexpr: function(sexpr) {
++    // The first part is used as a helper name below, e.g. for known helpers,
++    // before the PathExpression handler gets to validate the parts.
++    validateParts(sexpr.path);
+     let isSimple = AST.helpers.simpleId(sexpr.path);
+ 
+     let isBlockParam = isSimple && !!this.blockParamIndex(sexpr.path.parts[0]);
+@@ -413,17 +432,26 @@ Compiler.prototype = {
+   },
+ 
+   pushParam: function(val) {
++    // Literal params are not visited by their node handlers in stringParams
++    // mode, so their values must be validated here as well.
++    validateLiteral(val);
+     let value = val.value != null ? val.value : val.original || '';
++    let depth = validateDepth(val);
+ 
+     if (this.stringParams) {
++      // pushStringParam emits non-string values as raw JavaScript literals.
++      // Literal values are validated above, but `original` is not, so
++      // anything that is not a number or boolean is stringified.
++      if (typeof value !== 'number' && typeof value !== 'boolean') {
++        value = String(value);
++      }
+       if (value.replace) {
+         value = value.replace(/^(\.?\.\/)*/g, '').replace(/\//g, '.');
+       }
+-
+-      if (val.depth) {
+-        this.addDepth(val.depth);
++      if (depth) {
++        this.addDepth(depth);
+       }
+-      this.opcode('getContext', val.depth || 0);
++      this.opcode('getContext', depth);
+       this.opcode('pushStringParam', value, val.type);
+ 
+       if (val.type === 'SubExpression') {
+@@ -434,8 +462,10 @@ Compiler.prototype = {
+     } else {
+       if (this.trackIds) {
+         let blockParamIndex;
+-        if (val.parts && !AST.helpers.scopedId(val) && !val.depth) {
+-          blockParamIndex = this.blockParamIndex(val.parts[0]);
++        if (val.parts && !AST.helpers.scopedId(val) && !depth) {
++          // The parts are read here before the PathExpression handler,
++          // invoked by accept() below, gets to validate them.
++          blockParamIndex = this.blockParamIndex(validateParts(val)[0]);
+         }
+         if (blockParamIndex) {
+           let blockParamChild = val.parts.slice(1).join('.');
+@@ -566,6 +596,116 @@ export function compile(input, options = {}, env) {
+   return ret;
+ }
+ 
++/**
++ * Create the exception thrown for an AST node that fails validation.
++ *
++ * @param {Object} node the offending AST node; its `type` is included in the
++ *   message and its `loc`, if present, in the error location
++ * @param {string} message what is wrong with the node
++ * @returns {Exception} the exception to throw
++ */
++function invalidAst(node, message) {
++  return new Exception('Invalid AST: ' + node.type + ' ' + message, node);
++}
++
++/**
++ * Validate the `depth` of a path or param node.
++ *
++ * A missing depth is treated as 0, because ASTs built by hand or by other
++ * tools commonly omit it. Any depth that is present must be a non-negative
++ * integer, since it is written into the generated code.
++ *
++ * @param {Object} node the AST node whose `depth` is validated
++ * @returns {number} the validated depth, or 0 if the node has none
++ * @throws {Exception} if the depth is present but not a non-negative integer
++ */
++function validateDepth(node) {
++  let depth = node.depth;
++  if (depth == null) {
++    return 0;
++  }
++  if (
++    typeof depth !== 'number' ||
++    !isFinite(depth) ||
++    Math.floor(depth) !== depth ||
++    depth < 0
++  ) {
++    throw invalidAst(node, 'depth must be a non-negative integer');
++  }
++  return depth;
++}
++
++/**
++ * Validate the `value` of a StringLiteral, NumberLiteral or BooleanLiteral.
++ *
++ * Literal values are written into the generated code, so they must have
++ * exactly the type their node promises. Nodes of any other type pass through
++ * unchanged.
++ *
++ * Numbers need not be finite: the parser produces Infinity for very long
++ * number literals, and Infinity and NaN are emitted as the read-only globals
++ * of the same name.
++ *
++ * @param {Object} node the AST node to validate
++ * @throws {Exception} if the value does not match the literal type
++ */
++function validateLiteral(node) {
++  let value = node.value;
++  if (node.type === 'StringLiteral' && typeof value !== 'string') {
++    throw invalidAst(node, 'value must be a string');
++  } else if (node.type === 'NumberLiteral' && typeof value !== 'number') {
++    throw invalidAst(node, 'value must be a number');
++  } else if (node.type === 'BooleanLiteral' && typeof value !== 'boolean') {
++    throw invalidAst(node, 'value must be a boolean');
++  }
++}
++
++/**
++ * Validate that a node property is an array containing only strings.
++ *
++ * @param {Object} node the AST node the property belongs to, for the error
++ * @param {*} value the property value to validate
++ * @param {string} name the property name, used in the error message
++ * @returns {string[]} the validated array
++ * @throws {Exception} if the value is not an array or contains non-strings
++ */
++function validateStringArray(node, value, name) {
++  if (!isArray(value)) {
++    throw invalidAst(node, name + ' must be an array');
++  }
++  for (let i = 0; i < value.length; i++) {
++    if (typeof value[i] !== 'string') {
++      throw invalidAst(node, name + ' must only contain strings');
++    }
++  }
++  return value;
++}
++
++/**
++ * Validate the `parts` of a PathExpression node.
++ *
++ * @param {Object} path the PathExpression node
++ * @returns {string[]} the validated parts
++ * @throws {Exception} if `parts` is not an array of strings
++ */
++function validateParts(path) {
++  return validateStringArray(path, path.parts, 'parts');
++}
++
++/**
++ * Validate the optional `blockParams` of a Program node. Its length is
++ * written into the generated code, so it must be an array of strings when
++ * present.
++ *
++ * @param {Object} program the Program node
++ * @throws {Exception} if `blockParams` is present and not an array of strings
++ */
++function validateBlockParams(program) {
++  if (program.blockParams != null) {
++    validateStringArray(program, program.blockParams, 'blockParams');
++  }
++}
++
+ function argEquals(a, b) {
+   if (a === b) {
+     return true;
+diff --git a/lib/handlebars/compiler/javascript-compiler.js b/lib/handlebars/compiler/javascript-compiler.js
+index 0cdf57d..33a8100 100644
+--- a/lib/handlebars/compiler/javascript-compiler.js
++++ b/lib/handlebars/compiler/javascript-compiler.js
+@@ -843,9 +843,7 @@ JavaScriptCompiler.prototype = {
+     }
+ 
+     if (indent) {
+-      // Indentation comes from the whitespace pass, which only produces spaces
+-      // and tabs, so it can be written straight into the object literal.
+-      options.indent = '"' + indent + '"';
++      options.indent = JSON.stringify(indent);
+     }
+     options.helpers = 'helpers';
+     options.partials = 'partials';
+@@ -1237,7 +1235,7 @@ JavaScriptCompiler.prototype = {
+ 
+   setupHelperArgs: function(helper, paramSize, params, useRegister) {
+     let options = this.setupParams(helper, paramSize, params);
+-    options.loc = JSON.stringify(this.source.currentLocation);
++    options.loc = locationLiteral(this);
+     options = this.objectLiteral(options);
+     if (useRegister) {
+       this.useRegister('options');
+@@ -1289,6 +1287,20 @@ JavaScriptCompiler.isValidJavaScriptVariableName = function(name) {
+   );
+ };
+ 
++/**
++ * The compiler's current source location as a JavaScript literal.
++ *
++ * Hand-built ASTs may omit `loc`; emitting the literal `undefined` then
++ * keeps the generated code valid and drops the key from object literals.
++ *
++ * @param {JavaScriptCompiler} compiler the compiler whose location is emitted
++ * @returns {string} a JSON object literal, or the string "undefined"
++ */
++function locationLiteral(compiler) {
++  let loc = compiler.source.currentLocation;
++  return loc ? JSON.stringify(loc) : 'undefined';
++}
++
+ function strictLookup(requireTerminal, compiler, parts, startPartIndex, type) {
+   let stack = compiler.popStack(),
+     len = parts.length;
+@@ -1308,7 +1320,7 @@ function strictLookup(requireTerminal, compiler, parts, startPartIndex, type) {
+       ', ',
+       compiler.quotedString(parts[len]),
+       ', ',
+-      JSON.stringify(compiler.source.currentLocation),
++      locationLiteral(compiler),
+       ' )'
+     ];
+   } else {
+diff --git a/lib/handlebars/exception.js b/lib/handlebars/exception.js
+index b2fdc00..65be042 100644
+--- a/lib/handlebars/exception.js
++++ b/lib/handlebars/exception.js
+@@ -16,11 +16,15 @@ function Exception(message, node) {
+     column,
+     endColumn;
+ 
+-  if (loc) {
++  // Hand-built ASTs may carry a partial loc; never let the location
++  // bookkeeping mask the actual error message.
++  if (loc && loc.start) {
+     line = loc.start.line;
+-    endLineNumber = loc.end.line;
+     column = loc.start.column;
+-    endColumn = loc.end.column;
++    if (loc.end) {
++      endLineNumber = loc.end.line;
++      endColumn = loc.end.column;
++    }
+ 
+     message += ' - ' + line + ':' + column;
+   }

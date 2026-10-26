@@ -1,0 +1,205 @@
+diff -ruN -x node_modules a/contrib/auto-render/auto-render.ts b/contrib/auto-render/auto-render.ts
+--- a/contrib/auto-render/auto-render.ts	2026-10-26 02:46:32.000000000 +0000
++++ b/contrib/auto-render/auto-render.ts	2026-10-26 04:46:51.774223509 +0000
+@@ -127,7 +127,11 @@
+         throw new Error("No element provided to render");
+     }
+ 
+-    const optionsCopy: Partial<RenderMathInElementOptionsCopy> = {};
++    // Copy the caller's own entries onto a prototype-free object: neither the
++    // defaults below nor KaTeX itself may see a value that lives only on a
++    // prototype.
++    const optionsCopy: Partial<RenderMathInElementOptionsCopy> =
++        Object.create(null);
+ 
+     Object.assign(optionsCopy, options);
+ 
+@@ -148,7 +152,7 @@
+ 
+         {left: "\\[", right: "\\]", display: true},
+     ];
+-    optionsCopy.ignoredTags = new Set<string>(options?.ignoredTags || [
++    optionsCopy.ignoredTags = new Set<string>(optionsCopy.ignoredTags || [
+         "script", "noscript", "style", "textarea", "pre", "code", "option",
+     ]);
+     optionsCopy.ignoredClasses = optionsCopy.ignoredClasses || [];
+diff -ruN -x node_modules a/src/MacroExpander.ts b/src/MacroExpander.ts
+--- a/src/MacroExpander.ts	2026-10-26 02:46:32.000000000 +0000
++++ b/src/MacroExpander.ts	2026-10-26 04:49:02.014110201 +0000
+@@ -26,6 +26,17 @@
+     "\\nolimits": true,  // Parser.js
+ };
+ 
++/**
++ * Read an optional field of a macro expansion only when the expansion owns it.
++ * The expansions are plain objects; without this an entry planted on
++ * `Object.prototype` would answer for a field the expansion never declared.
++ */
++function ownExpansionField<T>(expansion: object, field: string): T | undefined {
++    return Object.prototype.hasOwnProperty.call(expansion, field)
++        ? (expansion as Record<string, T>)[field]
++        : undefined;
++}
++
+ export default class MacroExpander implements MacroContextInterface {
+     settings: Settings;
+     expansionCount: number;
+@@ -280,7 +291,9 @@
+         const topToken = this.popToken();
+         const name = topToken.text;
+         const expansion = !topToken.noexpand ? this._getExpansion(name) : null;
+-        if (expansion == null || (expandableOnly && expansion.unexpandable)) {
++        if (expansion == null ||
++                (expandableOnly &&
++                 ownExpansionField<boolean>(expansion, "unexpandable"))) {
+             if (expandableOnly && expansion == null &&
+                     name[0] === "\\" && !this.isDefined(name)) {
+                 throw new ParseError("Undefined control sequence: " + name);
+@@ -290,8 +303,10 @@
+         }
+         this.countExpansion(1);
+         let tokens = expansion.tokens;
+-        const args = this.consumeArgs(expansion.numArgs, expansion.delimiters);
+-        if (expansion.numArgs) {
++        const numArgs = ownExpansionField<number>(expansion, "numArgs") || 0;
++        const args = this.consumeArgs(numArgs,
++            ownExpansionField<string[][]>(expansion, "delimiters"));
++        if (numArgs) {
+             // paste arguments in place of the placeholders
+             tokens = tokens.slice(); // make a shallow copy
+             for (let i = tokens.length - 1; i >= 0; --i) {
+@@ -463,7 +478,7 @@
+         if (macro != null) {
+             return typeof macro === "string"
+                 || typeof macro === "function"
+-                || !macro.unexpandable;
++                || !ownExpansionField<boolean>(macro, "unexpandable");
+         }
+         return Object.prototype.hasOwnProperty.call(functions, name) && !functions[name].primitive;
+     }
+diff -ruN -x node_modules a/src/Namespace.ts b/src/Namespace.ts
+--- a/src/Namespace.ts	2026-10-26 02:46:32.000000000 +0000
++++ b/src/Namespace.ts	2026-10-26 04:46:48.302226514 +0000
+@@ -81,9 +81,11 @@
+     get(name: string): Value | undefined {
+         if (Object.prototype.hasOwnProperty.call(this.current, name)) {
+             return this.current[name];
+-        } else {
++        }
++        if (Object.prototype.hasOwnProperty.call(this.builtins, name)) {
+             return this.builtins[name];
+         }
++        return undefined;
+     }
+ 
+     /**
+@@ -108,10 +110,13 @@
+         } else {
+             // Undo this set at end of this group (possibly to `undefined`),
+             // unless an undo is already in place, in which case that older
+-            // value is the correct one.
++            // value is the correct one.  Only a value this namespace itself
++            // holds is worth recording: an inherited entry is not a definition
++            // and must not be reinstated by the group restore.
+             const top = this.undefStack[this.undefStack.length - 1];
+             if (top && !Object.prototype.hasOwnProperty.call(top, name)) {
+-                top[name] = this.current[name];
++                top[name] = Object.prototype.hasOwnProperty.call(
++                    this.current, name) ? this.current[name] : undefined;
+             }
+         }
+         if (value == null) {
+diff -ruN -x node_modules a/src/Settings.ts b/src/Settings.ts
+--- a/src/Settings.ts	2026-10-26 02:46:32.000000000 +0000
++++ b/src/Settings.ts	2026-10-26 04:46:43.614230570 +0000
+@@ -322,12 +322,25 @@
+     }
+ }
+ 
++/**
++ * Read `key` from `obj` only if `obj` itself carries it.  Callers hand KaTeX
++ * option objects and it keeps its own schema; a value that is reachable only
++ * through a prototype (in particular a polluted `Object.prototype`) is not
++ * part of either and must never be mistaken for one.
++ */
++function getOwnEntry<T>(obj: object, key: string): T | undefined {
++    return Object.prototype.hasOwnProperty.call(obj, key)
++        ? (obj as Record<string, T>)[key]
++        : undefined;
++}
++
+ function getDefaultValue<K extends keyof SettingsOptions>(
+     schema: SchemaEntry<K>,
+ ): Settings[K];
+ function getDefaultValue(schema: SchemaEntry<keyof SettingsOptions>): DefaultValue {
+-    if (schema.default !== undefined) {
+-        return schema.default;
++    const declared = getOwnEntry<DefaultValue>(schema, "default");
++    if (declared !== undefined) {
++        return declared;
+     }
+     const type = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+     return getImplicitDefault(type);
+@@ -339,15 +352,30 @@
+     options: SettingsOptions,
+     schema: SchemaEntry<K>,
+ ) {
+-    const optionValue = options[prop];
++    const optionValue = getOwnEntry<Settings[K]>(options, prop);
++    const processor = getOwnEntry<(value: Settings[K]) => Settings[K]>(
++        schema, "processor");
+     target[prop] = optionValue !== undefined
+-        ? (schema.processor
+-            ? schema.processor(optionValue)
++        ? (processor
++            ? processor(optionValue)
+             : optionValue)
+         : getDefaultValue(schema);
+ }
+ 
+ /**
++ * Copy the enumerable own entries of `source` into a prototype-free object, so
++ * that a later read of the copy cannot pick up anything that lives only on a
++ * prototype (e.g. an entry planted on `Object.prototype`).
++ */
++function snapshotOwnEntries(source: object): Record<string, unknown> {
++    const copy: Record<string, unknown> = Object.create(null);
++    for (const key of Object.keys(source)) {
++        copy[key] = (source as Record<string, unknown>)[key];
++    }
++    return copy;
++}
++
++/**
+  * The main Settings object
+  *
+  * The current options stored are:
+@@ -459,18 +487,23 @@
+      * should be an object with `command` field specifying the relevant LaTeX
+      * command (as a string starting with `\`), and any other arguments, etc.
+      * If `context` has a `url` field, a `protocol` field will automatically
+-     * get added by this function (changing the specified object).
++     * get derived from it.
++     *
++     * The decision is taken from a snapshot of the context's own entries: the
++     * caller's trust function (and the protocol derivation) never sees a value
++     * that is reachable only through a prototype.
+      */
+     isTrusted(context: AnyTrustContext): boolean {
+-        if ("url" in context && context.url && !context.protocol) {
+-            const protocol = protocolFromUrl(context.url);
++        const own = snapshotOwnEntries(context);
++        if (own.url && !own.protocol) {
++            const protocol = protocolFromUrl(own.url as string);
+             if (protocol == null) {
+                 return false;
+             }
+-            context.protocol = protocol;
++            own.protocol = protocol;
+         }
+         const trust = typeof this.trust === "function"
+-            ? this.trust(context)
++            ? this.trust(own as unknown as AnyTrustContext)
+             : this.trust;
+         return Boolean(trust);
+     }

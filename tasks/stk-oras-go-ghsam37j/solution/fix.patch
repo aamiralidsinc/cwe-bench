@@ -1,0 +1,134 @@
+diff --git a/content/file/file.go b/content/file/file.go
+index cacf199..976e349 100644
+--- a/content/file/file.go
++++ b/content/file/file.go
+@@ -625,6 +625,13 @@ func (s *Store) resolveWritePath(name string) (string, error) {
+ 		if strings.HasPrefix(rel, "../") || rel == ".." {
+ 			return "", ErrPathTraversalDisallowed
+ 		}
++		// The lexical check above prevents "../" escapes but does not resolve
++		// symlinks. A symlink component under workingDir that points outside it
++		// passes the lexical check yet directs writes outside workingDir.
++		// Re-check after resolving symlinks in the path to close that gap.
++		if err := checkSymlinkEscape(base, target); err != nil {
++			return "", err
++		}
+ 	}
+ 	if s.DisableOverwrite {
+ 		if _, err := os.Stat(path); err == nil {
+@@ -686,3 +693,52 @@ func (s *Store) setClosed() {
+ func ensureDir(path string) error {
+ 	return os.MkdirAll(path, 0777)
+ }
++
++// checkSymlinkEscape returns ErrPathTraversalDisallowed if resolving symlinks
++// in target's ancestor directories causes it to escape base. target may not
++// yet exist, so symlinks are resolved on its deepest existing ancestor.
++func checkSymlinkEscape(base, target string) error {
++	realBase, err := filepath.EvalSymlinks(base)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil // base doesn't exist yet; no symlinks to follow
++		}
++		return err
++	}
++	realTarget, err := realPathForWrite(target)
++	if err != nil {
++		return err
++	}
++	rel, err := filepath.Rel(realBase, realTarget)
++	if err != nil {
++		return ErrPathTraversalDisallowed
++	}
++	rel = filepath.ToSlash(rel)
++	if strings.HasPrefix(rel, "../") || rel == ".." {
++		return ErrPathTraversalDisallowed
++	}
++	return nil
++}
++
++// realPathForWrite resolves symlinks in the deepest existing ancestor of path
++// and returns the resulting absolute path. Non-existent path components are
++// appended verbatim, matching the semantics of a file about to be created.
++func realPathForWrite(path string) (string, error) {
++	dir := filepath.Dir(path)
++	suffix := filepath.Base(path)
++	for {
++		real, err := filepath.EvalSymlinks(dir)
++		if err == nil {
++			return filepath.Join(real, suffix), nil
++		}
++		if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			return path, nil // reached filesystem root
++		}
++		suffix = filepath.Join(filepath.Base(dir), suffix)
++		dir = parent
++	}
++}
+diff --git a/content/file/utils.go b/content/file/utils.go
+index bd1f4af..f8747bb 100644
+--- a/content/file/utils.go
++++ b/content/file/utils.go
+@@ -175,6 +175,14 @@ func extractTarDirectory(dirPath, dirName string, r io.Reader, buf []byte, prese
+ 		}
+ 		filePath := filepath.Join(dirPath, filePathRel)
+ 
++		// resolveRelToBase only performs lexical and per-component Lstat checks,
++		// which a chain of previously-extracted symlinks can bypass. Re-verify
++		// containment with symlinks fully resolved before mutating the
++		// filesystem, matching the check on the pushFile path.
++		if err := checkSymlinkEscape(dirPath, filePath); err != nil {
++			return err
++		}
++
+ 		// Create content
+ 		switch header.Typeflag {
+ 		case tar.TypeReg:
+@@ -187,7 +195,7 @@ func extractTarDirectory(dirPath, dirName string, r io.Reader, buf []byte, prese
+ 			// If the target link already exists, os.Link will throw an error.
+ 			// This is a known limitation and will not be addressed.
+ 			var target string
+-			if target, err = ensureLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
++			if target, err = ensureHardLinkPath(dirPath, dirName, filePath, header.Linkname); err == nil {
+ 				err = os.Link(target, filePath)
+ 			}
+ 		case tar.TypeSymlink:
+@@ -274,8 +282,34 @@ func ensureLinkPath(baseAbs, baseRel, link, target string) (string, error) {
+ 	return target, nil
+ }
+ 
++
++// ensureHardLinkPath validates a hard link target and returns the path os.Link
++// should use. A relative linkname is resolved against the link's directory, so
++// the linked path is the one the containment check validated rather than a
++// path relative to the process working directory.
++func ensureHardLinkPath(baseAbs, baseRel, link, target string) (string, error) {
++	path := target
++	if !filepath.IsAbs(target) {
++		path = filepath.Join(filepath.Dir(link), target)
++	}
++	if _, err := resolveRelToBase(baseAbs, baseRel, path); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
+ // writeFile writes content to the file specified by the `path` parameter.
+ func writeFile(path string, r io.Reader, perm os.FileMode, buf []byte) (err error) {
++	// os.OpenFile follows a terminal symlink, so a regular-file entry whose
++	// path was already created as a symlink by an earlier archive entry would
++	// be written through that link, landing outside the extraction root.
++	// Remove any such symlink first so the content is written to a regular
++	// file at path itself.
++	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
++		if err := os.Remove(path); err != nil {
++			return err
++		}
++	}
+ 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+ 	if err != nil {
+ 		return err

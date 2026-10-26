@@ -1,0 +1,96 @@
+commit cc323e564d90c6b5b4bdd71d3c8d2ee2713b37e5
+Author: Terry Howe <terrylhowe@gmail.com>
+Date:   Thu May 28 08:25:49 2026 -0600
+
+    Merge commit from fork
+    
+    resolveWritePath enforced the workingDir write boundary with a lexical
+    filepath.Rel check. This prevented "../" path escapes but did not resolve
+    symlinks: a path component under workingDir pointing to an external
+    directory (e.g. "out" -> "/outside") passed the check, causing writes to
+    land outside workingDir when AllowPathTraversalOnWrite=false.
+    
+    Fix: after the lexical check, call checkSymlinkEscape, which resolves
+    symlinks in workingDir and in the deepest existing ancestor of the write
+    target, then verifies the resulting real path is still under the real
+    workingDir. The helper realPathForWrite walks up to the deepest existing
+    ancestor before calling EvalSymlinks so it handles write targets whose
+    parent directories do not yet exist.
+    
+    Add TestStore_resolveWritePath_SymlinkTraversal with two sub-tests:
+    - a symlink component under workingDir escaping the boundary is blocked
+    - a regular subdirectory write within workingDir continues to work
+    
+    Signed-off-by: Terry Howe <terrylhowe@gmail.com>
+
+diff --git a/content/file/file.go b/content/file/file.go
+index cacf199..6cdba2e 100644
+--- a/content/file/file.go
++++ b/content/file/file.go
+@@ -625,6 +625,13 @@ func (s *Store) resolveWritePath(name string) (string, error) {
+ 		if strings.HasPrefix(rel, "../") || rel == ".." {
+ 			return "", ErrPathTraversalDisallowed
+ 		}
++		// The lexical check above prevents "../" escapes but does not resolve
++		// symlinks. A symlink component under workingDir (e.g. "out" -> "/outside")
++		// passes the lexical check yet directs writes outside workingDir.
++		// Re-check after resolving symlinks in the parent path to close that gap.
++		if err := checkSymlinkEscape(base, target); err != nil {
++			return "", err
++		}
+ 	}
+ 	if s.DisableOverwrite {
+ 		if _, err := os.Stat(path); err == nil {
+@@ -686,3 +693,52 @@ func (s *Store) setClosed() {
+ func ensureDir(path string) error {
+ 	return os.MkdirAll(path, 0777)
+ }
++
++// checkSymlinkEscape returns ErrPathTraversalDisallowed if resolving symlinks
++// in target's ancestor directories causes it to escape base. target may not
++// yet exist, so symlinks are resolved on its deepest existing ancestor.
++func checkSymlinkEscape(base, target string) error {
++	realBase, err := filepath.EvalSymlinks(base)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil // base doesn't exist yet; no symlinks to follow
++		}
++		return err
++	}
++	realTarget, err := realPathForWrite(target)
++	if err != nil {
++		return err
++	}
++	rel, err := filepath.Rel(realBase, realTarget)
++	if err != nil {
++		return ErrPathTraversalDisallowed
++	}
++	rel = filepath.ToSlash(rel)
++	if strings.HasPrefix(rel, "../") || rel == ".." {
++		return ErrPathTraversalDisallowed
++	}
++	return nil
++}
++
++// realPathForWrite resolves symlinks in the deepest existing ancestor of path
++// and returns the resulting absolute path. Non-existent path components are
++// appended verbatim, matching the semantics of a file about to be created.
++func realPathForWrite(path string) (string, error) {
++	dir := filepath.Dir(path)
++	suffix := filepath.Base(path)
++	for {
++		real, err := filepath.EvalSymlinks(dir)
++		if err == nil {
++			return filepath.Join(real, suffix), nil
++		}
++		if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			return path, nil // reached filesystem root
++		}
++		suffix = filepath.Join(filepath.Base(dir), suffix)
++		dir = parent
++	}
++}

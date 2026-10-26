@@ -1,0 +1,156 @@
+diff -ruN base/server/origin.go miss_concept_path/server/origin.go
+--- base/server/origin.go	1970-01-01 00:00:00.000000000 +0000
++++ miss_concept_path/server/origin.go	2026-10-26 02:22:45.622040837 +0000
+@@ -0,0 +1,80 @@
++package server
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// requestScheme returns the scheme the client used to reach this server.
++func requestScheme(r *http.Request) string {
++	if r.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++// configuredOrigins returns the origins the operator has allowed for cross-origin use.
++func configuredOrigins() []string {
++	return strings.FieldsFunc(AccessControlAllowOrigin, func(c rune) bool {
++		return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r'
++	})
++}
++
++// originAllowed reports whether a request may proceed based on its Origin header.
++// A request without an Origin header does not originate from a cross-origin browser
++// context and is allowed. A present Origin must be this server's own origin, or an
++// origin the operator has configured.
++func originAllowed(r *http.Request) bool {
++	values := r.Header.Values("Origin")
++	if len(values) == 0 {
++		return true
++	}
++	origin := strings.TrimSpace(values[0])
++	if origin == "" {
++		return true
++	}
++
++	u, err := url.Parse(origin)
++	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
++		return false
++	}
++
++	// Same origin as the request itself.
++	if strings.EqualFold(u.Scheme, requestScheme(r)) && strings.EqualFold(u.Host, r.Host) {
++		return true
++	}
++
++	// Operator-configured origins: a full origin (scheme://host[:port]), a bare
++	// host[:port], or the wildcard.
++	for _, entry := range configuredOrigins() {
++		if entry == "*" {
++			return true
++		}
++
++		host, scheme := entry, ""
++		if strings.Contains(entry, "://") {
++			a, err := url.Parse(entry)
++			if err != nil {
++				continue
++			}
++			host, scheme = a.Host, a.Scheme
++		}
++
++		if host != "" && strings.EqualFold(host, u.Host) &&
++			(scheme == "" || strings.EqualFold(scheme, u.Scheme)) {
++			return true
++		}
++	}
++
++	return false
++}
++
++// isStateChangingMethod reports whether a method is unsafe for cross-origin requests.
++func isStateChangingMethod(method string) bool {
++	switch method {
++	case http.MethodGet, http.MethodHead, http.MethodOptions:
++		return false
++	}
++	return true
++}
+diff -ruN base/server/server.go miss_concept_path/server/server.go
+--- base/server/server.go	2026-10-26 02:22:29.914055187 +0000
++++ miss_concept_path/server/server.go	2026-10-26 02:22:45.618040842 +0000
+@@ -156,6 +156,10 @@
+ }
+ 
+ func apiRoutes() *mux.Router {
++	// The event stream is served outside middleWareFunc, so its admission check
++	// is installed on the upgrader itself.
++	websockets.SetCheckOriginFunc(originAllowed)
++
+ 	r := mux.NewRouter()
+ 
+ 	// API V1
+@@ -288,12 +292,20 @@
+ 		}
+ 
+ 		if AccessControlAllowOrigin != "" &&
+-			(strings.HasPrefix(r.RequestURI, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.RequestURI)) {
++			(strings.HasPrefix(r.URL.Path, config.Webroot+"api/") || htmlPreviewRouteRe.MatchString(r.URL.Path)) {
+ 			w.Header().Set("Access-Control-Allow-Origin", AccessControlAllowOrigin)
+ 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, PUT, OPTIONS")
+ 			w.Header().Set("Access-Control-Allow-Headers", "*")
+ 		}
+ 
++		// CORS response headers do not stop a browser from issuing a cross-origin
++		// simple request, so state-changing requests validate their Origin here.
++		if isStateChangingMethod(r.Method) &&
++			strings.HasPrefix(r.RequestURI, config.Webroot+"api/") && !originAllowed(r) {
++			http.Error(w, "Blocked due to CORS violation", http.StatusForbidden)
++			return
++		}
++
+ 		// Check basic authentication headers if configured.
+ 		// OPTIONS requests are skipped if CORS is enabled, since browsers omit credentials for preflight checks.
+ 		isCORSOptionsRequest := AccessControlAllowOrigin != "" && r.Method == http.MethodOptions
+diff -ruN base/server/websockets/client.go miss_concept_path/server/websockets/client.go
+--- base/server/websockets/client.go	2026-10-26 02:22:29.922055180 +0000
++++ miss_concept_path/server/websockets/client.go	2026-10-26 02:22:45.622040837 +0000
+@@ -29,13 +29,30 @@
+ 
+ 	// MessageHub global
+ 	MessageHub *Hub
++
++	// checkOriginFunc is installed by the server package before connections are accepted.
++	checkOriginFunc func(*http.Request) bool
+ )
+ 
++// SetCheckOriginFunc installs the origin validation used for new connections.
++func SetCheckOriginFunc(fn func(*http.Request) bool) {
++	checkOriginFunc = fn
++}
++
+ var upgrader = websocket.Upgrader{
+ 	ReadBufferSize:    1024,
+ 	WriteBufferSize:   1024,
+-	CheckOrigin:       func(r *http.Request) bool { return true }, // allow multi-domain
+-	EnableCompression: true,                                       // experimental compression
++	CheckOrigin:       checkOrigin,
++	EnableCompression: true, // experimental compression
++}
++
++// checkOrigin delegates the origin decision to the installed function and denies
++// the upgrade when no decision function has been registered.
++func checkOrigin(r *http.Request) bool {
++	if checkOriginFunc == nil {
++		return false
++	}
++	return checkOriginFunc(r)
+ }
+ 
+ // Client is a middleman between the websocket connection and the hub.

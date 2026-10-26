@@ -1,0 +1,231 @@
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+index a0b40f9..fd98f74 100644
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -3,7 +3,7 @@ import type { BrowserCommand, TestProject } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+-import { isFileServingAllowed } from 'vitest/node'
++import { assertApiServerNotExposed, isFileServingAllowed } from 'vitest/node'
+ 
+ function assertFileAccess(path: string, project: TestProject) {
+   if (
+@@ -31,6 +31,7 @@ export const readFile: BrowserCommand<
+ export const writeFile: BrowserCommand<
+   Parameters<BrowserCommands['writeFile']>
+ > = async ({ project }, path, data, options) => {
++  assertApiServerNotExposed(project.browser?.vite, 'writeFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+@@ -43,6 +44,7 @@ export const writeFile: BrowserCommand<
+ export const removeFile: BrowserCommand<
+   Parameters<BrowserCommands['removeFile']>
+ > = async ({ project }, path) => {
++  assertApiServerNotExposed(project.browser?.vite, 'removeFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   await fsp.rm(filepath)
+@@ -51,6 +53,7 @@ export const removeFile: BrowserCommand<
+ export const appendFile: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
++  assertApiServerNotExposed(project.browser?.vite, 'appendFile')
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+index 200ddb5..7903cad 100644
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -12,13 +12,35 @@ import { ServerMockResolver } from '@vitest/mocker/node'
+ import { createBirpc } from 'birpc'
+ import { parse, stringify } from 'flatted'
+ import { dirname, join, resolve } from 'pathe'
+-import { createDebugger, isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { assertApiServerNotExposed, createDebugger, isApiServerExposed, isFileServingAllowed, isValidApiRequest } from 'vitest/node'
+ import { WebSocketServer } from 'ws'
+ 
+ const debug = createDebugger('vitest:browser:api')
+ 
+ const BROWSER_API_PATH = '/__vitest_browser_api__'
+ 
++// commands that neither write to the file system nor execute code,
++// they are allowed even if the browser server is exposed to the network
++const NETWORK_SAFE_COMMANDS = new Set<string>([
++  'readFile',
++  '__vitest_fileInfo',
++  '__vitest_upload',
++  '__vitest_click',
++  '__vitest_dblClick',
++  '__vitest_tripleClick',
++  '__vitest_wheel',
++  '__vitest_type',
++  '__vitest_clear',
++  '__vitest_fill',
++  '__vitest_tab',
++  '__vitest_keyboard',
++  '__vitest_selectOptions',
++  '__vitest_dragAndDrop',
++  '__vitest_hover',
++  '__vitest_cleanup',
++  '__vitest_viewport',
++])
++
+ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMockerRegistry: MockerRegistry): void {
+   const vite = globalServer.vite
+   const vitest = globalServer.vitest
+@@ -192,11 +214,13 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+           return fs.readFile(snapshotPath, 'utf-8')
+         },
+         async saveSnapshotFile(id, content) {
++          assertApiServerNotExposed(vite, 'saveSnapshotFile')
+           checkFileAccess(id)
+           await fs.mkdir(dirname(id), { recursive: true })
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async removeSnapshotFile(id) {
++          assertApiServerNotExposed(vite, 'removeSnapshotFile')
+           checkFileAccess(id)
+           if (!existsSync(id)) {
+             throw new Error(`Snapshot file "${id}" does not exist.`)
+@@ -253,6 +277,11 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+         },
+         async triggerCommand(sessionId, command, testPath, payload) {
+           debug?.('[%s] Triggering command "%s"', sessionId, command)
++          if (!NETWORK_SAFE_COMMANDS.has(command) && isApiServerExposed(vite)) {
++            throw new Error(
++              `[vitest] Command "${command}" is not allowed because the browser server is exposed to the network.`,
++            )
++          }
+           const provider = project.browser!.provider
+           if (!provider) {
+             throw new Error('Commands are only available for browser tests.')
+@@ -348,6 +377,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+ 
+         // CDP
+         async sendCdpEvent(sessionId: string, event: string, payload?: Record<string, unknown>) {
++          assertApiServerNotExposed(vite, 'sendCdpEvent')
+           const cdp = await globalServer.ensureCDPHandler(sessionId, rpcId)
+           return cdp.send(event, payload)
+         },
+diff --git a/packages/vitest/src/api/check.ts b/packages/vitest/src/api/check.ts
+index 9c99cc1..4cd0daf 100644
+--- a/packages/vitest/src/api/check.ts
++++ b/packages/vitest/src/api/check.ts
+@@ -1,4 +1,5 @@
+ import type { IncomingMessage } from 'node:http'
++import type { ViteDevServer } from 'vite'
+ import type { ResolvedConfig } from '../node/types/config'
+ import crypto from 'node:crypto'
+ 
+@@ -20,3 +21,46 @@ export function isValidApiRequest(config: ResolvedConfig, req: IncomingMessage):
+ 
+   return false
+ }
++
++function isLoopbackHost(host: string): boolean {
++  let normalized = host.trim().toLowerCase()
++  if (normalized.startsWith('[') && normalized.endsWith(']')) {
++    normalized = normalized.slice(1, -1)
++  }
++  if (normalized === 'localhost' || normalized === '::1' || normalized === '0:0:0:0:0:0:0:1') {
++    return true
++  }
++  if (normalized.startsWith('::ffff:')) {
++    normalized = normalized.slice('::ffff:'.length)
++  }
++  return /^127(?:\.\d{1,3}){3}$/.test(normalized)
++}
++
++/**
++ * Returns `true` if the API server can be reached from outside of the local machine.
++ * Operations that write to the file system or execute code are not allowed in this case.
++ */
++export function isApiServerExposed(server: ViteDevServer | undefined): boolean {
++  if (!server) {
++    return true
++  }
++  const host = server.config?.server?.host
++  // `undefined` and `false` fallback to "localhost" in Vite
++  if (host === true || (typeof host === 'string' && !isLoopbackHost(host))) {
++    return true
++  }
++  const address = server.httpServer?.address()
++  if (address && typeof address === 'object' && !isLoopbackHost(address.address)) {
++    return true
++  }
++  return false
++}
++
++export function assertApiServerNotExposed(server: ViteDevServer | undefined, operation: string): void {
++  if (isApiServerExposed(server)) {
++    throw new Error(
++      `[vitest-api]: "${operation}" is not allowed because the API server is exposed to the network. `
++      + `Bind the server to a local address to enable it.`,
++    )
++  }
++}
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index caa3027..91cd94b 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -27,7 +27,7 @@ import { isFileServingAllowed } from '../node/vite'
+ import { getTestFileEnvironment } from '../utils/environments'
+ import { getModuleGraph } from '../utils/graph'
+ import { stringifyReplace } from '../utils/serialization'
+-import { isValidApiRequest } from './check'
++import { assertApiServerNotExposed, isValidApiRequest } from './check'
+ 
+ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   const wss = new WebSocketServer({ noServer: true })
+@@ -76,6 +76,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.readFile(id, 'utf-8')
+         },
+         async saveTestFile(id, content) {
++          assertApiServerNotExposed(server, 'saveTestFile')
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+@@ -84,9 +85,11 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          assertApiServerNotExposed(server, 'rerun')
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          assertApiServerNotExposed(server, 'rerunTask')
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -151,6 +154,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return getModuleGraph(ctx, project, id, browser)
+         },
+         async saveSnapshotFile(id, content) {
++          assertApiServerNotExposed(server, 'saveSnapshotFile')
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so its snapshots cannot be updated using the API.`,
+@@ -163,6 +167,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(snapshotPath, content, 'utf-8')
+         },
+         async updateSnapshot(file?: File) {
++          assertApiServerNotExposed(server, 'updateSnapshot')
+           if (!file) {
+             await ctx.updateSnapshot()
+           }
+diff --git a/packages/vitest/src/public/node.ts b/packages/vitest/src/public/node.ts
+index bdd2186..7f1a35e 100644
+--- a/packages/vitest/src/public/node.ts
++++ b/packages/vitest/src/public/node.ts
+@@ -3,7 +3,7 @@ import { Vitest } from '../node/core'
+ 
+ export const version: string = Vitest.version
+ 
+-export { isValidApiRequest } from '../api/check'
++export { assertApiServerNotExposed, isApiServerExposed, isValidApiRequest } from '../api/check'
+ export { escapeTestName } from '../node/ast-collect'
+ export type { CacheKeyIdGenerator, CacheKeyIdGeneratorContext } from '../node/cache/fsModuleCache'
+ export { parseCLI } from '../node/cli/cac'

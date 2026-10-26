@@ -1,0 +1,132 @@
+--- a/src/PhpSpreadsheet/Reader/Gnumeric.php
++++ b/src/PhpSpreadsheet/Reader/Gnumeric.php
+@@ -64,6 +64,14 @@
+         ],
+     ];
+ 
++    protected int $maxLength;
++
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
++
+     /**
+      * Create a new Gnumeric.
+      */
+@@ -72,6 +80,20 @@
+         parent::__construct();
+         $this->referenceHelper = ReferenceHelper::getInstance();
+         $this->securityScanner = XmlScanner::getInstance($this);
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $multiplier = self::LENGTH_MULTIPLIER[$unit] ?? 1;
++        $limit *= $multiplier;
++        $this->maxLength = intdiv($limit, 4);
++    }
++
++    public function setMaxLength(int $maxLength): self
++    {
++        $this->maxLength = $maxLength;
++
++        return $this;
+     }
+ 
+     /**
+@@ -192,12 +214,15 @@
+             if (str_starts_with($contents, "\x1f\x8b")) {
+                 // Check if gzlib functions are available
+                 if (function_exists('gzdecode')) {
+-                    $contents = @gzdecode($contents);
++                    $contents = @gzdecode($contents, $this->maxLength);
+                     if ($contents !== false) {
+                         $data = $contents;
+                     }
+                 }
+             } else {
++                if (strlen($contents) > $this->maxLength) {
++                    return '';
++                }
+                 $data = $contents;
+             }
+         }
+--- a/src/PhpSpreadsheet/Shared/OLERead.php
++++ b/src/PhpSpreadsheet/Shared/OLERead.php
+@@ -61,6 +61,9 @@
+     /** @var mixed[][] */
+     private array $props = [];
+ 
++    /** @var int[] */
++    private array $possibleLoop = [];
++
+     /**
+      * Read the file.
+      */
+@@ -95,6 +98,9 @@
+ 
+         // Total number of sectors used by MSAT
+         $this->numExtensionBlocks = self::getInt4d($this->data, self::NUM_EXTENSION_BLOCK_POS);
++        if ($this->numExtensionBlocks > 16) {
++            throw new ReaderException('Too many extension blocks');
++        }
+ 
+         $bigBlockDepotBlocks = [];
+         $pos = self::BIG_BLOCK_DEPOT_BLOCKS_POS;
+@@ -137,7 +143,9 @@
+ 
+         $sbdBlock = $this->sbdStartBlock;
+         $this->smallBlockChain = '';
++        $this->possibleLoop = [];
+         while ($sbdBlock != -2) {
++            $this->catchLoop($sbdBlock);
+             $pos = ($sbdBlock + 1) * self::BIG_BLOCK_SIZE;
+ 
+             $this->smallBlockChain .= substr($this->data, $pos, 4 * $bbs);
+@@ -151,6 +159,14 @@
+         $this->entry = $this->readData($block);
+ 
+         $this->readPropertySets();
++    }
++
++    private function catchLoop(int $sbdBlock): void
++    {
++        if (in_array($sbdBlock, $this->possibleLoop, true)) {
++            throw new ReaderException('Detected loop while iterating blocks');
++        }
++        $this->possibleLoop[] = $sbdBlock;
+     }
+ 
+     /**
+@@ -172,7 +188,9 @@
+             /** @var int */
+             $block = $this->props[$stream]['startBlock'];
+ 
++            $this->possibleLoop = [];
+             while ($block != -2) {
++                $this->catchLoop($block);
+                 $pos = $block * self::SMALL_BLOCK_SIZE;
+                 $streamData .= substr($rootdata, $pos, self::SMALL_BLOCK_SIZE);
+ 
+@@ -195,7 +213,9 @@
+         /** @var int */
+         $block = $this->props[$stream]['startBlock'];
+ 
++        $this->possibleLoop = [];
+         while ($block != -2) {
++            $this->catchLoop($block);
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $streamData .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);
+@@ -215,7 +235,9 @@
+     {
+         $data = '';
+ 
++        $this->possibleLoop = [];
+         while ($block != -2) {
++            $this->catchLoop($block);
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $data .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);

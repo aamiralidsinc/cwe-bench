@@ -1,0 +1,197 @@
+diff --git a/npx/goalie/src/utils/output-manager.ts b/npx/goalie/src/utils/output-manager.ts
+index 5872425..85be14d 100644
+--- a/npx/goalie/src/utils/output-manager.ts
++++ b/npx/goalie/src/utils/output-manager.ts
+@@ -3,6 +3,7 @@
+  */
+ 
+ import * as fs from 'fs/promises';
++import { realpathSync, existsSync } from 'fs';
+ import * as path from 'path';
+ import { SearchResult } from '../core/types.js';
+ 
+@@ -26,7 +27,7 @@ export class OutputManager {
+    * Get output directory based on options
+    */
+   private getOutputDirectory(query: string, options?: { outputPath?: string; useQuerySubfolder?: boolean }): string {
+-    let baseDir = options?.outputPath || this.defaultResultsDir;
++    let baseDir = this.resolveBaseDir(options?.outputPath);
+ 
+     // Add query-based subfolder if requested
+     if (options?.useQuerySubfolder) {
+@@ -37,6 +38,36 @@ export class OutputManager {
+     return baseDir;
+   }
+ 
++  /**
++   * Resolve a caller-supplied output path inside the working tree. The deepest
++   * existing ancestor of the target must realpath under the project root.
++   */
++  private resolveBaseDir(outputPath?: string): string {
++    if (!outputPath) return this.defaultResultsDir;
++    if (outputPath.includes('\u0000') || path.isAbsolute(outputPath)) {
++      throw new Error('outputPath is not a relative path inside the project');
++    }
++    const root = path.resolve(process.cwd());
++    const candidate = path.resolve(root, outputPath);
++    const rel = path.relative(root, candidate);
++    const segments = rel.split(path.sep);
++    if (rel === '' || segments.includes('..') || path.isAbsolute(rel)) {
++      throw new Error('outputPath leaves the project directory');
++    }
++    let probe = candidate;
++    while (!existsSync(probe)) {
++      const parent = path.dirname(probe);
++      if (parent === probe) break;
++      probe = parent;
++    }
++    const realRoot = realpathSync(root);
++    const realProbe = realpathSync(probe);
++    if (realProbe !== realRoot && !realProbe.startsWith(realRoot + path.sep)) {
++      throw new Error('outputPath leaves the project directory through a link');
++    }
++    return outputPath;
++  }
++
+   async ensureResultsDirectory(query: string, options?: { outputPath?: string; useQuerySubfolder?: boolean }): Promise<string> {
+     const dir = this.getOutputDirectory(query, options);
+     try {
+diff --git a/src/consciousness-explorer/index.js b/src/consciousness-explorer/index.js
+index 81a4123..70dcdef 100644
+--- a/src/consciousness-explorer/index.js
++++ b/src/consciousness-explorer/index.js
+@@ -44,6 +44,41 @@ export const PHI_TARGET = 0.700;
+ /**
+  * Main SDK Interface
+  */
++/**
++ * Resolve a caller-supplied state name to a path inside the state directory.
++ * The target's deepest existing ancestor must realpath to the state directory
++ * itself, so neither a climbing name nor a link can leave it.
++ */
++async function resolveStateTarget(name) {
++    const fs = await import('fs');
++    const path = await import('path');
++    const os = await import('os');
++    const dir = path.resolve(process.env.CONSCIOUSNESS_EXPLORER_STATE_DIR ||
++        path.join(os.homedir(), '.consciousness-explorer', 'state'));
++    if (typeof name !== 'string' || name.length === 0 || Buffer.byteLength(name, 'utf8') > 255) {
++        throw new Error('unsafe state name');
++    }
++    if (name === '.' || name === '..' || name.startsWith('.') ||
++        name.includes('/') || name.includes('\\') || name.includes('\u0000')) {
++        throw new Error('unsafe state name');
++    }
++    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
++    const candidate = path.join(dir, name);
++    let probe = candidate;
++    while (!fs.existsSync(probe)) {
++        const parent = path.dirname(probe);
++        if (parent === probe) break;
++        probe = parent;
++    }
++    const realRoot = fs.realpathSync(dir);
++    const realProbe = fs.realpathSync(probe);
++    const rel = path.relative(realRoot, realProbe);
++    if (rel.startsWith('..') || path.isAbsolute(rel)) {
++        throw new Error('unsafe state name');
++    }
++    return candidate;
++}
++
+ export class ConsciousnessExplorer {
+     constructor(config = {}) {
+         this.config = {
+@@ -268,6 +303,7 @@ export class ConsciousnessExplorer {
+      * Export consciousness state
+      */
+     async exportState(filepath) {
++        const target = await resolveStateTarget(filepath);
+         const state = {
+             version: VERSION,
+             timestamp: Date.now(),
+@@ -285,7 +321,7 @@ export class ConsciousnessExplorer {
+         }
+ 
+         const fs = await import('fs');
+-        fs.writeFileSync(filepath, JSON.stringify(state, null, 2));
++        fs.writeFileSync(target, JSON.stringify(state, null, 2));
+         return state;
+     }
+ 
+@@ -294,7 +330,8 @@ export class ConsciousnessExplorer {
+      */
+     async importState(filepath) {
+         const fs = await import('fs');
+-        const state = JSON.parse(fs.readFileSync(filepath, 'utf-8'));
++        const target = await resolveStateTarget(filepath);
++        const state = JSON.parse(fs.readFileSync(target, 'utf-8'));
+ 
+         // Restore consciousness with saved state
+         await this.initialize();
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 367926e..1d1c660 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -1172,8 +1172,7 @@ export class SublinearSolverMCPServer {
+       const fs = await import('fs');
+       const path = await import('path');
+ 
+-      // Resolve absolute path
+-      const absolutePath = path.resolve(filePath);
++      const absolutePath = await this.resolveVectorTarget(filePath);
+ 
+       // Check if file exists
+       if (!fs.existsSync(absolutePath)) {
+@@ -1245,13 +1244,7 @@ export class SublinearSolverMCPServer {
+ 
+     // Determine format from extension or explicit format parameter
+     const fileFormat = this.getFileFormat(filePath, format);
+-    const absolutePath = path.resolve(filePath);
+-
+-    // Ensure directory exists
+-    const directory = path.dirname(absolutePath);
+-    if (!fs.existsSync(directory)) {
+-      fs.mkdirSync(directory, { recursive: true });
+-    }
++    const absolutePath = await this.resolveVectorTarget(filePath);
+ 
+     let content: string;
+ 
+@@ -1276,6 +1269,36 @@ export class SublinearSolverMCPServer {
+     console.log(`💾 Saved vector of size ${vector.length} to ${absolutePath} (${fileFormat} format)`);
+   }
+ 
++  private async resolveVectorTarget(name: string): Promise<string> {
++    const fs = await import('fs');
++    const path = await import('path');
++    const os = await import('os');
++    const dir = path.resolve(process.env.SUBLINEAR_SOLVER_VECTOR_DIR ||
++      path.join(os.homedir(), '.sublinear-time-solver', 'vectors'));
++    if (typeof name !== 'string' || name.length === 0 || Buffer.byteLength(name, 'utf8') > 255) {
++      throw new McpError(ErrorCode.InvalidParams, 'Vector file name is not valid');
++    }
++    if (name === '.' || name === '..' || name.startsWith('.') ||
++        name.includes('/') || name.includes('\\') || name.includes('\u0000')) {
++      throw new McpError(ErrorCode.InvalidParams, 'Vector file name is not valid');
++    }
++    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
++    const candidate = path.join(dir, name);
++    let probe = candidate;
++    while (!fs.existsSync(probe)) {
++      const parent = path.dirname(probe);
++      if (parent === probe) break;
++      probe = parent;
++    }
++    const realRoot = fs.realpathSync(dir);
++    const realProbe = fs.realpathSync(probe);
++    const rel = path.relative(realRoot, realProbe);
++    if (rel.startsWith('..') || path.isAbsolute(rel)) {
++      throw new McpError(ErrorCode.InvalidParams, 'Vector file name is not valid');
++    }
++    return candidate;
++  }
++
+   private getFileFormat(filePath: string, explicitFormat?: string): string {
+     if (explicitFormat) {
+       return explicitFormat.toLowerCase();

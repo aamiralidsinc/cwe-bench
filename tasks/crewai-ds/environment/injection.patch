@@ -1,0 +1,92 @@
+diff --git a/lib/crewai-tools/src/crewai_tools/rag/loaders/docs_site_loader.py b/lib/crewai-tools/src/crewai_tools/rag/loaders/docs_site_loader.py
+index 87b9726..da9cba6 100644
+--- a/lib/crewai-tools/src/crewai_tools/rag/loaders/docs_site_loader.py
++++ b/lib/crewai-tools/src/crewai_tools/rag/loaders/docs_site_loader.py
+@@ -81,6 +81,7 @@ class DocsSiteLoader(BaseLoader):
+         text_parts.extend(lines)
+ 
+         nav_links = []
++        nav_urls: list[str] = []
+         for nav_selector in ["nav", ".sidebar", ".toc", ".navigation"]:
+             nav = soup.select_one(nav_selector)
+             if nav:
+@@ -93,6 +94,7 @@ class DocsSiteLoader(BaseLoader):
+                         ("http://", "https://", "mailto:", "#")
+                     ):
+                         full_url = urljoin(docs_url, href)
++                        nav_urls.append(full_url)
+                         nav_links.append(f"- {link.get_text(strip=True)}: {full_url}")
+ 
+         if nav_links:
+@@ -100,6 +102,25 @@ class DocsSiteLoader(BaseLoader):
+             text_parts.append("Related documentation pages:")
+             text_parts.extend(nav_links[:10])
+ 
++        # Fetch a few of the linked pages so the loaded content covers more than
++        # the landing page of the documentation site.
++        if nav_urls:
++            related_pages: list[str] = []
++            with requests.Session() as session:
++                for full_url in nav_urls[:5]:
++                    sub_response = session.get(full_url, timeout=15)
++                    sub_response.raise_for_status()
++                    sub_soup = BeautifulSoup(sub_response.text, "html.parser")
++                    heading = sub_soup.find("h1") or sub_soup.title
++                    if heading:
++                        related_pages.append(
++                            f"- {heading.get_text(strip=True)}: {full_url}"
++                        )
++            if related_pages:
++                text_parts.append("")
++                text_parts.append("Related pages:")
++                text_parts.extend(related_pages)
++
+         content = "\n".join(text_parts)
+ 
+         if len(content) > 100000:
+diff --git a/lib/crewai-tools/src/crewai_tools/rag/loaders/pdf_loader.py b/lib/crewai-tools/src/crewai_tools/rag/loaders/pdf_loader.py
+index 774de92..6c6cd41 100644
+--- a/lib/crewai-tools/src/crewai_tools/rag/loaders/pdf_loader.py
++++ b/lib/crewai-tools/src/crewai_tools/rag/loaders/pdf_loader.py
+@@ -24,6 +24,15 @@ class PDFLoader(BaseLoader):
+         except Exception:
+             return False
+ 
++    @staticmethod
++    def _probe_content_type(url: str) -> str:
++        """Read the remote content type before downloading the file."""
++        try:
++            probe = requests.head(url, timeout=15, allow_redirects=True)
++        except requests.RequestException:
++            return ""
++        return probe.headers.get("content-type", "")
++
+     @staticmethod
+     def _download_from_url(url: str, kwargs: dict[str, Any]) -> str:
+         """Download PDF from a URL to a temporary file and return its path.
+@@ -94,6 +103,7 @@ class PDFLoader(BaseLoader):
+ 
+         try:
+             if is_url:
++                metadata["remote_content_type"] = self._probe_content_type(file_path)
+                 local_path = self._download_from_url(file_path, kwargs)
+                 doc = pymupdf.open(local_path)
+             else:
+diff --git a/lib/crewai-tools/src/crewai_tools/tools/jina_scrape_website_tool/jina_scrape_website_tool.py b/lib/crewai-tools/src/crewai_tools/tools/jina_scrape_website_tool/jina_scrape_website_tool.py
+index 6762b60..d3c34f3 100644
+--- a/lib/crewai-tools/src/crewai_tools/tools/jina_scrape_website_tool/jina_scrape_website_tool.py
++++ b/lib/crewai-tools/src/crewai_tools/tools/jina_scrape_website_tool/jina_scrape_website_tool.py
+@@ -51,5 +51,11 @@ class JinaScrapeWebsiteTool(BaseTool):
+         response = requests.get(
+             f"https://r.jina.ai/{url}", headers=self.headers, timeout=15
+         )
+-        response.raise_for_status()
+-        return response.text
++        if response.status_code == 200:
++            return response.text
++
++        # The reader service can be rate limited or briefly unavailable; fetch the
++        # page directly in that case so the tool still returns something useful.
++        fallback = requests.get(url, headers=self.headers, timeout=15)
++        fallback.raise_for_status()
++        return fallback.text

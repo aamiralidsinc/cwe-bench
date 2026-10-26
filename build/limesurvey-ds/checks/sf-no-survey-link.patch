@@ -1,0 +1,497 @@
+diff --git a/application/controllers/OptoutController.php b/application/controllers/OptoutController.php
+index a8dd9fd..09395aa 100755
+--- a/application/controllers/OptoutController.php
++++ b/application/controllers/OptoutController.php
+@@ -110,7 +110,7 @@ class OptoutController extends LSYii_Controller
+             throw new CHttpException(404, gT('No email address is registered for this participant.'));
+         }
+ 
+-        $withdrawalUrl = App()->createAbsoluteUrl('optout/tokens', array(
++        $withdrawalUrl = App()->createValidatedAbsoluteUrl('optout/tokens', array(
+             'surveyid' => $iSurveyID,
+             'langcode' => $sBaseLanguage,
+             'token' => $sToken,
+diff --git a/application/controllers/RegisterController.php b/application/controllers/RegisterController.php
+index 43fcff1..60b4ea2 100644
+--- a/application/controllers/RegisterController.php
++++ b/application/controllers/RegisterController.php
+@@ -321,8 +321,7 @@ class RegisterController extends LSYii_Controller
+         $mailer->setTypeWithRaw('register', $sLanguage);
+         $mailer->replaceTokenAttributes = true;
+         /* Add a direct link for participants whose mail client does not render the placeholder */
+-        $directUrl = App()->getRequest()->getHostInfo()
+-            . App()->createUrl('/survey/index', array('sid' => $iSurveyId, 'token' => $oToken->token, 'lang' => $sLanguage));
++        $directUrl = App()->createValidatedAbsoluteUrl('/survey/index', array('sid' => $iSurveyId, 'token' => $oToken->token, 'lang' => $sLanguage));
+         $mailer->rawBody .= "\n\n" . sprintf(gT('Direct link: %s'), $directUrl);
+         $mailerSent = $mailer->sendMessage();
+         if ($mailer->getEventMessage()) {
+diff --git a/application/controllers/admin/Authentication.php b/application/controllers/admin/Authentication.php
+index b2b1366..ec9de2c 100644
+--- a/application/controllers/admin/Authentication.php
++++ b/application/controllers/admin/Authentication.php
+@@ -175,6 +175,21 @@ class Authentication extends SurveyCommonAction
+                 $event->set('identity', $identity);
+                 App()->getPluginManager()->dispatchEvent($event);
+ 
++                // If allowed_hosts.php does not exist, write the current host as valid
++                $allowedHosts = App()->loadAllowedHosts();
++                if (empty($allowedHosts)) {
++                    $currentHost = App()->request->getServerName();
++                    if (App()->writeAllowedHosts([$currentHost])) {
++                        Yii::app()->setFlashMessage(
++                            sprintf(
++                                gT('The allowed hosts file (application/config/allowed_hosts.php) has been created with "%s" as trusted host. For security reasons, LimeSurvey can only be accessed through that domain. If you need additional hosts, please edit the allowed hosts file directly.'),
++                                htmlspecialchars($currentHost)
++                            ),
++                            'info'
++                        );
++                    }
++                }
++
+                 return array('success');
+             } else {
+                 // Failed
+diff --git a/application/core/ConsoleApplication.php b/application/core/ConsoleApplication.php
+index 6ad6ecb..1ca74dd 100644
+--- a/application/core/ConsoleApplication.php
++++ b/application/core/ConsoleApplication.php
+@@ -76,6 +76,13 @@ class ConsoleApplication extends CConsoleApplication
+                 $lsConfig = array_merge($lsConfig, $securityConfig);
+             }
+         }
++        if (file_exists(__DIR__ . '/../config/allowed_hosts.php')) {
++            /** @psalm-suppress MissingFile file is auto-generated and may not exist in CI */
++            $allowedHostsConfig = require(__DIR__ . '/../config/allowed_hosts.php');
++            if (is_array($allowedHostsConfig)) {
++                $lsConfig = array_merge($lsConfig, $allowedHostsConfig);
++            }
++        }
+         /* Custom config file */
+         $configdir = $coreConfig['configdir'];
+         if (file_exists($configdir .  '/security.php')) {
+@@ -84,6 +91,12 @@ class ConsoleApplication extends CConsoleApplication
+                 $lsConfig = array_merge($lsConfig, $securityConfig);
+             }
+         }
++        if (file_exists($configdir . '/allowed_hosts.php')) {
++            $allowedHostsConfig = require($configdir . '/allowed_hosts.php');
++            if (is_array($allowedHostsConfig)) {
++                $lsConfig = array_merge($lsConfig, $allowedHostsConfig);
++            }
++        }
+ 
+         if (file_exists(__DIR__ . '/../config/config.php')) {
+             $userConfigs = require(__DIR__ . '/../config/config.php');
+diff --git a/application/core/LSHttpRequest.php b/application/core/LSHttpRequest.php
+index 409b4ff..09eeb27 100644
+--- a/application/core/LSHttpRequest.php
++++ b/application/core/LSHttpRequest.php
+@@ -298,19 +298,19 @@ class LSHttpRequest extends CHttpRequest
+     }
+ 
+     /**
+-     * Check if an url are in allowed host (if exist)
+-     * @var string $hostInfo
+-     * @throw Exception
++     * Check if a URL's host is in the allowed hosts list.
++     * Delegates to App()->isHostAllowed() which is lenient when
++     * allowed_hosts.php does not exist yet, and strict once configured.
++     *
++     * @param string $hostInfo The URL or host info to validate.
++     * @throws CHttpException if the host is not allowed.
+      * @return void
+      */
+     public static function checkIsAllowedHost($hostInfo)
+     {
+-        $allowedHosts = App()->getConfig('allowedHosts');
+-        if (!empty($allowedHosts) && is_array($allowedHosts)) {
+-            $host = parse_url($hostInfo, PHP_URL_HOST);
+-            if ($host && !in_array($host, $allowedHosts)) {
+-                 throw new CHttpException(400, gT("The requested hostname is invalid.", 'unescaped'));
+-            }
++        $host = parse_url($hostInfo, PHP_URL_HOST);
++        if ($host && !App()->isHostAllowed($host)) {
++            throw new CHttpException(400, gT("The requested hostname is invalid.", 'unescaped'));
+         }
+     }
+ }
+diff --git a/application/core/LSYii_Application.php b/application/core/LSYii_Application.php
+index d234c40..0e64c5a 100644
+--- a/application/core/LSYii_Application.php
++++ b/application/core/LSYii_Application.php
+@@ -165,6 +165,12 @@ class LSYii_Application extends CWebApplication
+                 $this->config = array_merge($this->config, $securityConfig);
+             }
+         }
++        if (file_exists($configdir . '/allowed_hosts.php')) {
++            $allowedHostsConfig = require($configdir . '/allowed_hosts.php');
++            if (is_array($allowedHostsConfig)) {
++                $this->config = array_merge($this->config, $allowedHostsConfig);
++            }
++        }
+         if (file_exists($configdir .  '/config.php')) {
+             $userConfigs = require($configdir . '/config.php');
+             if (is_array($userConfigs['config'])) {
+diff --git a/application/core/LimeMailer.php b/application/core/LimeMailer.php
+index 29ef9ed..be461e2 100644
+--- a/application/core/LimeMailer.php
++++ b/application/core/LimeMailer.php
+@@ -866,22 +866,47 @@ class LimeMailer extends PHPMailer
+                 $aTokenReplacements[strtoupper((string) $attribute)] = $value;
+             }
+         }
+-        /* Set the minimal url and add it to Placeholders */
+-        $aTokenReplacements["OPTOUTURL"] = App()->getController()
+-            ->createAbsoluteUrl("/optout/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        /* Set the minimal url and add it to Placeholders - use validated URLs to prevent host header injection */
++        $aTokenReplacements["OPTOUTURL"] = App()
++            ->createValidatedAbsoluteUrl("/optout/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        if ($aTokenReplacements["OPTOUTURL"] === false) {
++            $aTokenReplacements["OPTOUTURL"] = App()->getController()
++                ->createAbsoluteUrl("/optout/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        }
+         $this->addUrlsPlaceholders("OPTOUT");
+-        $aTokenReplacements["GLOBALOPTOUTURL"] = App()->getController()
+-            ->createAbsoluteUrl("/optout/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        $aTokenReplacements["GLOBALOPTOUTURL"] = App()
++            ->createValidatedAbsoluteUrl("/optout/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        if ($aTokenReplacements["GLOBALOPTOUTURL"] === false) {
++            $aTokenReplacements["GLOBALOPTOUTURL"] = App()->getController()
++                ->createAbsoluteUrl("/optout/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        }
+         $this->addUrlsPlaceholders("GLOBALOPTOUT");
+-        $aTokenReplacements["OPTINURL"] = App()->getController()
+-            ->createAbsoluteUrl("/optin/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        $aTokenReplacements["OPTINURL"] = App()
++            ->createValidatedAbsoluteUrl("/optin/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        if ($aTokenReplacements["OPTINURL"] === false) {
++            $aTokenReplacements["OPTINURL"] = App()->getController()
++                ->createAbsoluteUrl("/optin/tokens", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        }
+         $this->addUrlsPlaceholders("OPTIN");
+-        $aTokenReplacements["GLOBALOPTINURL"] = App()->getController()
+-            ->createAbsoluteUrl("/optin/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        $aTokenReplacements["GLOBALOPTINURL"] = App()
++            ->createValidatedAbsoluteUrl("/optin/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        if ($aTokenReplacements["GLOBALOPTINURL"] === false) {
++            $aTokenReplacements["GLOBALOPTINURL"] = App()->getController()
++                ->createAbsoluteUrl("/optin/participants", array("surveyid" => $this->surveyId, "token" => $token,"langcode" => $language));
++        }
+         $this->addUrlsPlaceholders("GLOBALOPTINURL");
+         $aTokenReplacements["SURVEYURL"] = $survey->getSurveyUrl($language, ["token" => $token]);
++        // Validate the survey URL host against allowed hosts to prevent host header injection
++        $parsedSurveyUrl = parse_url($aTokenReplacements["SURVEYURL"]);
++        if (isset($parsedSurveyUrl['host']) && !App()->isHostAllowed($parsedSurveyUrl['host'])) {
++            $aTokenReplacements["SURVEYURL"] = '';
++        }
+         $this->addUrlsPlaceholders("SURVEY");
+         $aTokenReplacements["SURVEYIDURL"] = $survey->getSurveyUrl($language, ["token" => $token], false);
++        $parsedSurveyIdUrl = parse_url($aTokenReplacements["SURVEYIDURL"]);
++        if (isset($parsedSurveyIdUrl['host']) && !App()->isHostAllowed($parsedSurveyIdUrl['host'])) {
++            $aTokenReplacements["SURVEYIDURL"] = '';
++        }
+         $this->addUrlsPlaceholders("SURVEYID");
+         return $aTokenReplacements;
+     }
+diff --git a/application/core/Traits/LSApplicationTrait.php b/application/core/Traits/LSApplicationTrait.php
+index 668cf24..959e13d 100644
+--- a/application/core/Traits/LSApplicationTrait.php
++++ b/application/core/Traits/LSApplicationTrait.php
+@@ -75,4 +75,157 @@ trait LSApplicationTrait
+         }
+         return $baseUrl;
+     }
++
++    /**
++     * Creates an absolute URL that is validated against allowed hosts.
++     * This prevents host header injection attacks by ensuring the generated URL
++     * uses a trusted host from allowed_hosts.php or the configured publicurl.
++     *
++     * @param string $route the URL route.
++     * @param array $params additional GET parameters (name=>value).
++     * @param string $schema schema to use (e.g. http, https).
++     * @param string $ampersand the token separating name-value pairs in the URL.
++     * @return string|false the constructed URL with a validated host, or false if no trusted host is available.
++     */
++    public function createValidatedAbsoluteUrl($route, $params = array(), $schema = '', $ampersand = '&')
++    {
++        // Use createPublicUrl which builds the URL from the configured publicurl,
++        // avoiding reliance on the potentially untrusted Host header.
++        try {
++            $url = $this->createPublicUrl($route, $params, $schema, $ampersand);
++        } catch (\CHttpException $e) {
++            // getHostInfo() may throw if the request host is not in allowed_hosts.php.
++            // Return false gracefully for email URL generation paths.
++            return false;
++        }
++
++        $parsedUrl = parse_url($url);
++        if (!isset($parsedUrl['scheme']) || !isset($parsedUrl['host'])) {
++            return false;
++        }
++
++        // Defense in depth: verify the host is in the allowlist
++        if ($this->isHostAllowed($parsedUrl['host'])) {
++            return $url;
++        }
++
++        return false;
++    }
++
++    /**
++     * Checks whether a given host name is in the allowed hosts list.
++     * Lenient when allowed_hosts.php does not exist yet (returns true).
++     * Once the file exists with entries, strictly enforces the allowlist.
++     * The host from publicurl (if configured) is always auto-included.
++     *
++     * @param string $host The host name to validate.
++     * @return bool True if the host is allowed, false otherwise.
++     */
++    public function isHostAllowed($host)
++    {
++        $allowedHosts = $this->loadAllowedHosts();
++
++        // If no allowed_hosts.php is configured yet, be lenient (don't block).
++        if (empty($allowedHosts)) {
++            return true;
++        }
++
++        // Normalize: strip IPv6 brackets, trim, lowercase
++        $host = strtolower(trim($host, " \t\n\r\0\x0B[]"));
++
++        // publicurl host is always trusted
++        $publicUrl = Yii::app()->getConfig('publicurl');
++        if (!empty($publicUrl)) {
++            $parsed = parse_url($publicUrl);
++            if (isset($parsed['host']) && strtolower(trim($parsed['host'], " \t\n\r\0\x0B[]")) === $host) {
++                return true;
++            }
++        }
++
++        foreach ($allowedHosts as $allowed) {
++            if (strtolower(trim($allowed, " \t\n\r\0\x0B[]")) === $host) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
++    /**
++     * Loads the allowed hosts from the application config.
++     * The config key 'allowedHosts' is populated from application/config/allowed_hosts.php
++     * (loaded at application startup, same pattern as security.php).
++     *
++     * @return array List of allowed host names, or empty array if not configured.
++     */
++    public function loadAllowedHosts()
++    {
++        $hosts = Yii::app()->getConfig('allowedHosts');
++        if (is_array($hosts) && !empty($hosts)) {
++            return $hosts;
++        }
++        return [];
++    }
++
++    /**
++     * Writes the allowed_hosts.php config file with the given hosts array.
++     *
++     * @param array $hosts Array of allowed domain names (no protocol, no port).
++     * @return bool True on success, false on failure.
++     */
++    public function writeAllowedHosts(array $hosts)
++    {
++        // Sanitize: only allow valid domain names or IP addresses
++        $sanitized = [];
++        foreach ($hosts as $host) {
++            if (!is_string($host)) {
++                continue;
++            }
++            $host = trim($host);
++            if (
++                filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false
++                || filter_var($host, FILTER_VALIDATE_IP) !== false
++            ) {
++                $sanitized[] = $host;
++            }
++        }
++        if (empty($sanitized)) {
++            return false;
++        }
++
++        $filePath = Yii::app()->getConfig('configdir') . DIRECTORY_SEPARATOR . 'allowed_hosts.php';
++        $content = "<?php if (!defined('BASEPATH')) exit('No direct script access allowed');\n"
++            . "/**\n"
++            . " * Allowed Hosts Configuration\n"
++            . " *\n"
++            . " * This file contains the list of trusted host names for this LimeSurvey\n"
++            . " * installation. Once this file exists with entries, any request whose\n"
++            . " * HTTP Host header does not match an entry here (or the configured publicurl)\n"
++            . " * will be rejected. This prevents host header injection attacks.\n"
++            . " *\n"
++            . " * Each entry should be a domain name only.\n"
++            . " * Do NOT include the protocol/scheme (http:// or https://) or port numbers.\n"
++            . " * The host from the 'publicurl' setting is always trusted implicitly.\n"
++            . " *\n"
++            . " * Examples:\n"
++            . " *   'example.com'\n"
++            . " *   'surveys.example.com'\n"
++            . " *   'localhost'\n"
++            . " *\n"
++            . " * This file is auto-generated on first admin login if it does not exist.\n"
++            . " * You may edit it manually to add or change allowed hosts.\n"
++            . " */\n"
++            . "\n\$hosts = [\n";
++        foreach ($sanitized as $host) {
++            $content .= "    " . var_export($host, true) . ",\n";
++        }
++        $content .= "];\n"
++            . "\nreturn [ 'allowedHosts' => \$hosts ];\n";
++        $result = @file_put_contents($filePath, $content);
++        if ($result !== false) {
++            // Update running config so the change takes effect immediately
++            Yii::app()->setConfig('allowedHosts', $sanitized);
++        }
++        return $result !== false;
++    }
+ }
+diff --git a/application/helpers/remotecontrol/remotecontrol_handle.php b/application/helpers/remotecontrol/remotecontrol_handle.php
+index 78aad50..844107f 100644
+--- a/application/helpers/remotecontrol/remotecontrol_handle.php
++++ b/application/helpers/remotecontrol/remotecontrol_handle.php
+@@ -4100,9 +4100,13 @@ class remotecontrol_handle
+         $oUser->last_forgot_email_password = date('Y-m-d H:i:s');
+         $oUser->save();
+ 
+-        $sScheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+-        $sResetLink = $sScheme . '://' . ($_SERVER['HTTP_HOST'] ?? '')
+-            . App()->createUrl('admin/authentication/sa/newPassword', array('param' => $oUser->validation_key));
++        $sResetLink = App()->createValidatedAbsoluteUrl(
++            'admin/authentication/sa/newPassword',
++            array('param' => $oUser->validation_key)
++        );
++        if ($sResetLink === false) {
++            return array('status' => 'Error: The system is not properly configured to send password reset emails.');
++        }
+ 
+         $mailer = new \LimeMailer();
+         $mailer->emailType = 'passwordreminderapiuser';
+diff --git a/application/models/services/PasswordManagement.php b/application/models/services/PasswordManagement.php
+index 75bd9de..1f0a065 100644
+--- a/application/models/services/PasswordManagement.php
++++ b/application/models/services/PasswordManagement.php
+@@ -40,11 +40,13 @@ class PasswordManagement
+     {
+         $adminEmail = [];
+         $siteName = \Yii::app()->getConfig("sitename");
+-        /* Usage of Yii::app()->createAbsoluteUrl, disable publicurl, See mantis #19619 */
+-        $loginUrl = \Yii::app()->createAbsoluteUrl(
++        $loginUrl = \Yii::app()->createValidatedAbsoluteUrl(
+             'admin/authentication/sa/newPassword',
+             ['param' => $this->user->validation_key]
+         );
++        if ($loginUrl === false) {
++            return false;
++        }
+         $siteAdminEmail = \Yii::app()->getConfig("siteadminemail");
+         $emailSubject = \Yii::app()->getConfig("admincreationemailsubject");
+         $emailTemplate = \Yii::app()->getConfig("admincreationemailtemplate");
+@@ -164,11 +166,14 @@ class PasswordManagement
+             $now = new DateTime();
+             $this->user->last_forgot_email_password = $now->format('Y-m-d H:i:s');
+             $this->user->save();
+-            /* Usage of Yii::app()->createAbsoluteUrl, disable publicurl, See mantis #19619 */
+-            $linkToResetPage = \Yii::app()->createAbsoluteUrl(
++            $linkToResetPage = \Yii::app()->createValidatedAbsoluteUrl(
+                 'admin/authentication/sa/newPassword/',
+                 ['param' => $this->user->validation_key]
+             );
++            if ($linkToResetPage === false) {
++                $sMessage = gT('The system is not properly configured to send password reset emails. Please contact the administrator.');
++                return $sMessage;
++            }
+             $body = array();
+             $body[] = gT('You have requested to reset the password for your account.');
+             $body[] = sprintf(gT('To complete this process, please click on the following link: %s') . "\n", $linkToResetPage);
+@@ -220,6 +225,11 @@ class PasswordManagement
+         switch ($type) {
+             case self::EMAIL_TYPE_RESET_PW:
+                 $renderArray = $this->getRenderArray();
++                if (empty($renderArray)) {
++                    $mailer = new \LimeMailer();
++                    $mailer->ErrorInfo = gT('The system is not properly configured to send emails. Please contact the administrator.');
++                    return $mailer;
++                }
+                 $subject = "[" . \Yii::app()->getConfig("sitename") . "] " . gT(
+                     "Your login credentials have been reset"
+                 );
+@@ -233,6 +243,11 @@ class PasswordManagement
+             default:
+                 //Get email template from globalSettings
+                 $aAdminEmail = $this->generateAdminCreationEmail();
++                if ($aAdminEmail === false) {
++                    $mailer = new \LimeMailer();
++                    $mailer->ErrorInfo = gT('The system is not properly configured to send emails. Please contact the administrator.');
++                    return $mailer;
++                }
+                 $subject = $aAdminEmail["subject"];
+                 $body = $aAdminEmail["body"];
+                 break;
+@@ -256,12 +271,14 @@ class PasswordManagement
+      */
+     public function getRenderArray()
+     {
+-        /* Usage of Yii::app()->createAbsoluteUrl, disable publicurl, See mantis #19619 */
+-        $absoluteUrl = \Yii::app()->createAbsoluteUrl("/admin");
+-        $passwordResetUrl = \Yii::app()->createAbsoluteUrl(
++        $absoluteUrl = \Yii::app()->createValidatedAbsoluteUrl("/admin");
++        $passwordResetUrl = \Yii::app()->createValidatedAbsoluteUrl(
+             'admin/authentication/sa/newPassword',
+             ['param' => $this->user->validation_key]
+         );
++        if ($absoluteUrl === false || $passwordResetUrl === false) {
++            return [];
++        }
+         return [
+             'surveyapplicationname' => \Yii::app()->getConfig("sitename"),
+             'emailMessage' => sprintf(gT("Hello %s,"), $this->user->full_name) . "<br />"
+@@ -276,7 +293,7 @@ class PasswordManagement
+             'linkToAdminpanel' => $absoluteUrl,
+             'username' => $this->user->users_name,
+             'password' => $passwordResetUrl,
+-            'mainLogoFile' => \Yii::app()->createAbsoluteUrl(LOGO_URL),
++            'mainLogoFile' => \Yii::app()->createValidatedAbsoluteUrl(LOGO_URL),
+             'showPasswordSection' => \Yii::app()->getConfig("auth_webserver") === false
+             && \Permission::model() ->hasGlobalPermission('auth_db', 'read', $this->user->uid),
+             'showPassword' => \Yii::app()->getConfig("display_user_password_in_email") === true,
+diff --git a/application/views/admin/globalsettings/_security.php b/application/views/admin/globalsettings/_security.php
+index 9d94794..b7a8a1a 100644
+--- a/application/views/admin/globalsettings/_security.php
++++ b/application/views/admin/globalsettings/_security.php
+@@ -257,6 +257,26 @@
+                 </div>
+             </div>
+         </div>
++
++        <!-- Allowed Hosts -->
++        <div class="col-6 mt-4">
++            <h3><?= gT('Allowed hosts (host header injection protection)') ?></h3>
++            <div class="mb-3">
++                <p class="form-text">
++                    <?php eT("The following domain names are configured as trusted hosts. Requests from any other hostname will be rejected. The publicurl host is always trusted implicitly. This list is stored in application/config/allowed_hosts.php."); ?>
++                </p>
++                <?php
++                $allowedHosts = App()->loadAllowedHosts();
++                if (!empty($allowedHosts)) : ?>
++                    <textarea class="form-control" readonly rows="<?= min(count($allowedHosts), 5) ?>"><?= htmlspecialchars(implode("\n", $allowedHosts)) ?></textarea>
++                <?php else : ?>
++                    <?php App()->getController()->widget('ext.AlertWidget.AlertWidget', [
++                        'text' => gT("No allowed hosts configured. The file application/config/allowed_hosts.php does not exist or is empty. It will be auto-generated on the next admin login."),
++                        'type' => 'warning',
++                    ]); ?>
++                <?php endif; ?>
++            </div>
++        </div>
+     </div>
+ </div>
+ 

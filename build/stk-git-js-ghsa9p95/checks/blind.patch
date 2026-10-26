@@ -1,0 +1,273 @@
+diff -ruN a/simple-git/src/lib/git-factory.ts b/simple-git/src/lib/git-factory.ts
+--- a/simple-git/src/lib/git-factory.ts	2026-10-26 02:26:57.000000000 +0000
++++ b/simple-git/src/lib/git-factory.ts	2026-10-26 05:15:35.680686066 +0000
+@@ -9,7 +9,8 @@
+    PluginStore,
+    progressMonitorPlugin,
+    spawnOptionsPlugin,
+-   timeoutPlugin
++   timeoutPlugin,
++   unsafeArgumentGuardPlugin
+ } from './plugins';
+ import { createInstanceConfig, folderExists } from './utils';
+ import { SimpleGitOptions } from './types';
+@@ -53,6 +54,8 @@
+       plugins.add(commandConfigPrefixingPlugin(config.config));
+    }
+ 
++   plugins.add(unsafeArgumentGuardPlugin(config.unsafe));
++
+    plugins.add(completionDetectionPlugin(config.completion));
+    config.progress && plugins.add(progressMonitorPlugin(config.progress));
+    config.timeout && plugins.add(timeoutPlugin(config.timeout));
+diff -ruN a/simple-git/src/lib/plugins/index.ts b/simple-git/src/lib/plugins/index.ts
+--- a/simple-git/src/lib/plugins/index.ts	2026-10-26 02:26:57.000000000 +0000
++++ b/simple-git/src/lib/plugins/index.ts	2026-10-26 05:15:32.940688535 +0000
+@@ -6,3 +6,4 @@
+ export * from './simple-git-plugin';
+ export * from './spawn-options-plugin';
+ export * from './timout-plugin';
++export * from './unsafe-argument-guard-plugin';
+diff -ruN a/simple-git/src/lib/plugins/unsafe-argument-guard-plugin.ts b/simple-git/src/lib/plugins/unsafe-argument-guard-plugin.ts
+--- a/simple-git/src/lib/plugins/unsafe-argument-guard-plugin.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/simple-git/src/lib/plugins/unsafe-argument-guard-plugin.ts	2026-10-26 05:19:39.996456920 +0000
+@@ -0,0 +1,220 @@
++import type { SimpleGitPlugin } from './simple-git-plugin';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++import type { Maybe, SimpleGitPluginConfig } from '../types';
++
++/*
++ * Refuses, before any child process is started, the arguments that would either name a program
++ * for git to run instead of the one it selects for the transport, or relax the transport
++ * permissions so that a `git-remote-<name>` helper program named by the caller runs.
++ *
++ * The check is made on the final argument list at spawn time, after the plugins that build it, so
++ * it covers values that reach git through a task's trailing options object, the `raw` escape hatch
++ * and the instance configuration that the command prefixing plugin adds to every spawn. The
++ * argument list is read the way git reads it: the command word is the first argument that is not a
++ * global option (with the config switches that may precede it), and a config assignment is only
++ * recognised where git itself would read one as config.
++ */
++
++/** `git clone --upload-pack`, `git fetch --upload-pack`, `git push --receive-pack`. */
++const packProgramOption = /^--(?:upload|receive)-pack(?:=|$)/;
++
++/** `git archive --remote` / `git send-pack --exec` name the program exchanging the pack. */
++const execProgramOption = /^--exec(?:=|$)/;
++
++/** `git clone -u <program>` is the short spelling of `--upload-pack`. */
++const cloneProgramOption = /^-u(?:$|[^-])/;
++
++/** Global git options that may precede the command word, and the ones of them taking a value. */
++const configOptions = ['-c', '--config', '--config-env'];
++const globalValueOptions = [...configOptions, '-C', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--attr-source'];
++
++/** Commands that can be handed the location of the repository git talks to. */
++const remoteCommands = ['clone', 'fetch', 'pull', 'push', 'ls-remote', 'remote', 'submodule', 'archive', 'send-pack', 'fetch-pack'];
++
++/** Transports git speaks itself, as opposed to a `<name>::` helper program. */
++const builtInProtocols = ['file', 'git', 'http', 'https', 'ftp', 'ftps', 'ssh'];
++
++const defaultPermissionKey = /^protocol\.allow$/;
++const namedPermissionKey = /^protocol\.([^.]+)\.allow$/;
++const remoteUrlKey = /^remote\.[^.]+\.(?:url|pushurl)$/;
++const helperAddress = /^[a-z][a-z0-9+.-]*::/i;
++
++/** Config keys whose value git runs as a program while it talks to a remote. */
++const transportProgramKey = /^(?:core\.sshcommand|core\.gitproxy|uploadpack\.packobjectshook)$/;
++
++type ConfigAssignment = { name: string; value: string };
++
++type ArgumentScan = {
++   command: string;
++   positionals: string[];
++   assignments: ConfigAssignment[];
++};
++
++/**
++ * Config names are compared the way git compares them: in lower case and without the quoting or
++ * spacing that the config syntax allows around the section and key.
++ */
++function normaliseName(name: string) {
++   return name.replace(/[\s"]/g, '').toLowerCase();
++}
++
++function asAssignment(raw: Maybe<string>): Maybe<ConfigAssignment> {
++   if (typeof raw !== 'string') {
++      return undefined;
++   }
++
++   const separator = raw.indexOf('=');
++   if (separator < 1) {
++      return undefined;
++   }
++
++   const name = normaliseName(raw.slice(0, separator));
++   if (name.indexOf('.') < 0) {
++      return undefined;
++   }
++
++   return {name, value: raw.slice(separator + 1).trim()};
++}
++
++/** The assignment carried by an argument in its one-token spellings (`-c<name>=<value>` etc). */
++function inlineAssignment(arg: string): Maybe<string> {
++   const inline = /^--(?:config|config-env)=(.+)$/.exec(arg);
++   if (inline) {
++      return inline[1];
++   }
++
++   return /^-c./.test(arg) ? arg.slice(2) : undefined;
++}
++
++function scanArguments(args: string[]): ArgumentScan {
++   const assignments: ConfigAssignment[] = [];
++   const positionals: string[] = [];
++   let command = '';
++
++   for (let index = 0; index < args.length; index++) {
++      const arg = args[index];
++      const beforeCommand = !command;
++
++      // config switches are read as config before the command word and inside a clone
++      if ((beforeCommand || command === 'clone') && configOptions.indexOf(arg) >= 0) {
++         const assignment = asAssignment(args[index + 1]);
++         if (assignment) {
++            assignments.push(assignment);
++         }
++         index++;
++         continue;
++      }
++
++      if (beforeCommand || command === 'clone') {
++         const inline = inlineAssignment(arg);
++         if (inline !== undefined) {
++            const assignment = asAssignment(inline);
++            if (assignment) {
++               assignments.push(assignment);
++            }
++            continue;
++         }
++      }
++
++      if (beforeCommand) {
++         if (globalValueOptions.indexOf(arg) >= 0) {
++            index++;
++            continue;
++         }
++         if (arg.charAt(0) !== '-') {
++            command = arg;
++         }
++         continue;
++      }
++
++      if (arg === '--') {
++         positionals.push(...args.slice(index + 1));
++         break;
++      }
++
++      if (arg.charAt(0) !== '-') {
++         positionals.push(arg);
++      }
++   }
++
++   return {assignments, command, positionals};
++}
++
++function namesProgram(command: string, arg: string) {
++   const option = arg.trim();
++
++   return packProgramOption.test(option) ||
++      execProgramOption.test(option) ||
++      (command === 'clone' && cloneProgramOption.test(option));
++}
++
++/** Whether an assignment hands a transport helper the permission it needs to run. */
++function relaxesTransportPermission({name, value}: ConfigAssignment) {
++   if (value.toLowerCase() === 'never') {
++      return false;
++   }
++
++   if (defaultPermissionKey.test(name)) {
++      return true;
++   }
++
++   const named = namedPermissionKey.exec(name);
++
++   return !!named && builtInProtocols.indexOf(named[1]) < 0;
++}
++
++function findUnsafeArgument(args: string[], allowUnsafeProtocolOverride: boolean): Maybe<string> {
++   const {assignments, command, positionals} = scanArguments(args);
++
++   for (const arg of args) {
++      if (namesProgram(command, arg)) {
++         return `Naming the program that git runs is not permitted: ${arg.trim()}`;
++      }
++   }
++
++   for (const {name, value} of assignments) {
++      if (transportProgramKey.test(name)) {
++         return `Naming the program that git runs is not permitted: ${name}=${value}`;
++      }
++   }
++
++   if (allowUnsafeProtocolOverride) {
++      return undefined;
++   }
++
++   if (assignments.some(relaxesTransportPermission)) {
++      return 'Changing the protocol permissions of the git transport is not permitted without enabling allowUnsafeProtocolOverride';
++   }
++
++   if (assignments.some(({name, value}) => remoteUrlKey.test(name) && helperAddress.test(value))) {
++      return 'Storing a transport helper address is not permitted without enabling allowUnsafeProtocolOverride';
++   }
++
++   if (remoteCommands.indexOf(command) >= 0 && positionals.some((value) => helperAddress.test(value))) {
++      return 'Supplying a transport helper address is not permitted without enabling allowUnsafeProtocolOverride';
++   }
++
++   if (command === 'config' && remoteUrlKey.test(positionals[0] || '') && positionals.slice(1).some((value) => helperAddress.test(value))) {
++      return 'Storing a transport helper address is not permitted without enabling allowUnsafeProtocolOverride';
++   }
++
++   return undefined;
++}
++
++export function unsafeArgumentGuardPlugin(unsafe?: SimpleGitPluginConfig['unsafe']): SimpleGitPlugin<'spawn.args'> {
++   const allowUnsafeProtocolOverride = unsafe?.allowUnsafeProtocolOverride === true;
++
++   return {
++      type: 'spawn.args',
++      action(args) {
++         const refusal = findUnsafeArgument(args, allowUnsafeProtocolOverride);
++
++         if (refusal) {
++            throw new GitPluginError(undefined, 'unsafe', refusal);
++         }
++
++         return args;
++      },
++   };
++}
+diff -ruN a/simple-git/src/lib/types/index.ts b/simple-git/src/lib/types/index.ts
+--- a/simple-git/src/lib/types/index.ts	2026-10-26 02:26:57.000000000 +0000
++++ b/simple-git/src/lib/types/index.ts	2026-10-26 05:15:36.284685521 +0000
+@@ -106,6 +106,15 @@
+    };
+ 
+    spawnOptions: Pick<SpawnOptions, 'uid' | 'gid'>;
++
++   unsafe: {
++
++      /**
++       * When enabled, the caller takes responsibility for the transport helper protocols it
++       * permits and the helper remote addresses it stores through this instance.
++       */
++      allowUnsafeProtocolOverride?: boolean;
++   };
+ }
+ 
+ /**

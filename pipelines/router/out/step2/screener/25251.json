@@ -1,0 +1,133 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "25251",
+  "advisory_ids": ["GHSA-CP4Q-FQW9-4HF6", "CVE-2026-69218"],
+  "repo": "http4s/http4s",
+  "pinned_commit": "8b0d82711dfa78899f6c2fd7fd8ae29da8c7ba64",
+  "fix_commits": ["6e8eccd64a6a74ab4811897881e95e0e1b3a818e"],
+  "trust_decision": {
+    "summary": "The HTTP/2 header-size and stall policy is decided per connection in H2Connection (accumulated HEADERS/CONTINUATION state) and per stream in H2Stream.sendData, but the only bound that actually holds is the decoded header-list accounting inside the HPACK codec (Hpack.decodeHeaders) plus a per-header-block timeout created from ConnectionSettings.maxHeaderListSize; that setting defaults to None and the shipped fix folds None to Int.MaxValue, so every builder/wiring site must populate it or the protection silently never fires.",
+    "evidence": [
+      "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:555",
+      "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:343",
+      "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Frame.scala:532",
+      "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/Hpack.scala:38",
+      "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/Hpack.scala:73",
+      "ember-server/shared/src/main/scala/org/http4s/ember/server/internal/ServerHelpers.scala:225",
+      "fix.diff:85-87"
+    ]
+  },
+  "landing_point": {
+    "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:343",
+    "why": "The summary says 'unbounded continuation frame accumulation'; this is the only place an un-terminated HEADERS frame is stored as pending header state, and the CONTINUATION cases at :276 and :287 append to that same list with no size or time bound (State field declared at :555-556)."
+  },
+  "fix_sites": [
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/Hpack.scala:54-77", "entry_point": "Every HTTP/2 header/trailer/push-promise decode reached through EmberServerBuilder.withHttp2 and EmberClientBuilder.withHttp2", "module_kind": "shared library codec (ember-core, private[h2])"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:226-330", "entry_point": "EmberServerBuilder.withHttp2 (ALPN h2, prior-knowledge h2c, h1->h2c upgrade) and EmberClientBuilder.withHttp2", "module_kind": "core transport state machine (ember-core)"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:156-176", "entry_point": "Same connection write loop (both directions)", "module_kind": "core transport state machine (ember-core)"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:546-577", "entry_point": "Same connection state: the State case class (:547-557) and initState (:559-577) gain the timeout-carrying header progress and stallStart", "module_kind": "core transport state machine (ember-core)"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Stream.scala:140-175", "entry_point": "Stream body send used by both builders (sendMessageBody/sendData)", "module_kind": "core transport stream (ember-core)"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Stream.scala:179-210", "entry_point": "Header/trailer receive for both directions (MessageTooLong -> GOAWAY EnhanceYourCalm)", "module_kind": "core transport stream (ember-core)"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Server.scala:196-225", "entry_point": "EmberServerBuilder.build -> ServerHelpers -> H2Server.fromSocket", "module_kind": "ember-core server factory"},
+    {"where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Client.scala:191-205", "entry_point": "EmberClientBuilder.withHttp2 -> H2Client.impl", "module_kind": "ember-core client connection factory"},
+    {"where": "ember-server/shared/src/main/scala/org/http4s/ember/server/internal/ServerHelpers.scala:206-230", "entry_point": "EmberServerBuilder.build; the same settings derivation is also required in runConnection (:435-465) and at the h1->h2c upgrade call (:529-540)", "module_kind": "server wiring (ember-server)"},
+    {"where": "ember-client/shared/src/main/scala/org/http4s/ember/client/EmberClientBuilder.scala:297-320", "entry_point": "EmberClientBuilder.withHttp2 / withMaxResponseHeaderSize", "module_kind": "client wiring (ember-client)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Frame.scala:526-533"
+  },
+  "O3_reason_to_dismiss": "ConnectionSettings.default.maxHeaderListSize is None (H2Frame.scala:532) and the shipped fix turns None into Int.MaxValue (fix.diff:85-87), so a solver can reasonably treat the enforcement as 'configured elsewhere': absent SETTINGS means unlimited per RFC 9113 6.5.2, the frame loop already 'has' a per-frame maxFrameSize check at :307/:340, and wiring maxHeaderSize into ConnectionSettings at three server call sites plus the client builder looks like builder plumbing rather than part of the frame-accumulation bug.",
+  "O4_distance": {"files": 5, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A healthy connection must not accumulate stall time: stallStart has to be cleared whenever a chunk is fully written, while a peer that only drip-feeds window credit must keep the original start. A fix that sets the stall start on every write and never clears it (or clears it only on stream close) tears down long-lived keep-alive connections after idleTimeout; one that clears it on any WINDOW_UPDATE is bypassed by a 1-byte drip.",
+    "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:156-176 (cleared at :160 in the fix) and ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Stream.scala:141-173"
+  },
+  "O6_input_shapes": [
+    "header block in a single HEADERS frame with END_HEADERS=1",
+    "HEADERS with END_HEADERS=0 followed by CONTINUATION frames ending in END_HEADERS=1",
+    "CONTINUATION frames that never set END_HEADERS (state keeps growing in headersInProgress)",
+    "HEADERS with END_HEADERS=0 whose continuation never arrives at all (only the new timeout closes it)",
+    "push-promise header block split over CONTINUATION frames (client direction only)",
+    "trailers: a second HEADERS frame on an already open stream, decoded through the same HPACK decoder",
+    "HPACK indexed references: a few wire bytes that expand into a large decoded header list",
+    "a header list beyond the HPACK decoder's own 65536-byte limit, where endHeaderBlock() returns truncated=true",
+    "header lists just under vs just over maxHeaderListSize, and the absent-setting case (None -> Int.MaxValue)",
+    "server request headers and client response headers/push promises",
+    "flow-control shapes: a peer that grants credit for a full chunk vs one that drip-feeds single bytes"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/Hpack.scala:54-77",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Client-side connection accepts CONTINUATION frames for a header block with no time or size bound; the shipped fix constructs the client connection with Duration.Inf for the header-receive timeout, so only the server direction gets the ContinuationProgress timeout.",
+      "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Client.scala:199-205",
+      "reason_to_dismiss": "The advisory is about an Ember server accepting frames, the client only talks to a peer the application chose, and the fix itself passes Duration.Inf here (fix.diff:95), so a reader concludes client-side accumulation is deliberate.",
+      "distance": "same package, different module: ember-core h2 vs EmberClientBuilder in ember-client (1 file away from the landing point's package)",
+      "present_in_latest": "unknown",
+      "latest_where": "none"
+    },
+    {
+      "route": "H2Client.impl keeps settings = ConnectionSettings.default, whose maxHeaderListSize is None, so a caller that takes the default gets an HPACK decoder built with Int.MaxValue; the fix does not change this default. H2Server.fromSocket has the same shape but no default value.",
+      "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Client.scala:313-323",
+      "reason_to_dismiss": "H2Client.impl is private[ember], EmberClientBuilder is its only in-repo caller and passes explicit settings, and 'defaults are protocol defaults' is a plausible-sounding reason to leave the default unbounded.",
+      "distance": "same package (ember-core/h2), 1 file from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": "none"
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala:200-221",
+      "sibling": "Cap the bytes buffered in readNextFrame while waiting for a complete RawFrame (the 24-bit length field allows up to ~16 MiB per frame).",
+      "why_realistic": "Same accumulate-peer-bytes-until-complete pattern in the same function family a maintainer hardens for this advisory; a peer that dribbles a declared-length frame pins memory per connection."
+    },
+    {
+      "where": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Stream.scala:196-198",
+      "sibling": "Bound the reassembled header block (headers.headerBlock ++ all continuation fragments) before handing it to the decoder.",
+      "why_realistic": "That fold is exactly where a reviewer expects the size check to live; the shipped fix instead put the accounting inside the decoder, so a sibling written by a different contributor would plausibly sit here with its own limit and error mapping."
+    },
+    {
+      "where": "ember-server/shared/src/main/scala/org/http4s/ember/server/internal/ServerHelpers.scala:206-230",
+      "sibling": "A single helper that derives h2 ConnectionSettings (including maxHeaderListSize) from maxHeaderSize and is used by every transport.",
+      "why_realistic": "The fix duplicates the same settings construction in two functions with a third call site at :529-540; extracting a helper is the natural cleanup, and a maintainer adding a new transport would route through it."
+    }
+  ],
+  "O9_family": "CWE-770 allocation of resources without limits or throttling - unbounded HTTP/2 header block / continuation accumulation, with a decoded header-list size side (DoS)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Scala",
+    "toolchain": "sbt (cross-build Scala 2.12/2.13/3, JVM + JS + Native projects), JDK, coursier resolution",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "ember-core munit/cats-effect-test suites: ember-core/shared/src/test/scala/org/http4s/ember/core/h2/H2StreamSuite.scala, HpackSuite.scala, FrameSpec.scala, PsuedoHeadersSuite.scala; ember-server/shared/src/test/scala/org/http4s/ember/server/EmberServerSuite.scala:158-177 runs a real Ember h2 server + client over a loopback port"
+  },
+  "O11_fix_minutes": 80,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "ember-core/shared/src/main/scala/org/http4s/ember/core/h2/Hpack.scala, ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Connection.scala, ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Stream.scala, ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Server.scala, ember-core/shared/src/main/scala/org/http4s/ember/core/h2/H2Client.scala, ember-server/shared/src/main/scala/org/http4s/ember/server/internal/ServerHelpers.scala, ember-client/shared/src/main/scala/org/http4s/ember/client/EmberClientBuilder.scala (plus MiMa filters in build.sbt)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Cap the accumulated CONTINUATION fragments in H2Connection.processFrame (or lean on the existing per-frame maxFrameSize check at :307/:340) and stop: the decoded list stays unbounded because HPACK indexed references cost almost no wire bytes and the decoder silently truncates at its own 65536-byte cap instead of erroring."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo size in MB (no shell in this session; http4s source is well above 5 MB and far below 1.5 GB, so neither tiny_repo nor giant_repo was asserted)",
+    "sbt build and test execution were not run (reading/searching only, no shell); buildability and offline-after-build are inferred from build.sbt, .jvmopts and the existing suites",
+    "latest release code is 'none' per the inputs, so both O8 present_in_latest answers are unknown and latest_where is none",
+    "whether EmberServerBuilder's scaladoc (ember-server/shared/src/main/scala/org/http4s/ember/server/EmberServerBuilder.scala:175-181) is meant to cover HTTP/2; it documents only the 431 response, so protection_documented_without_exceptions was not asserted",
+    "the fix diff ends mid-hunk at the h1->h2c upgrade call site (fix.diff:938), so the trailing context of that hunk is not visible; the changed lines themselves are shown",
+    "the three sibling advisories in the candidate metadata were not read (outside this advisory's scope)"
+  ]
+}

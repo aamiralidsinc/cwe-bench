@@ -1,0 +1,905 @@
+diff --git a/ghost/core/core/boot.js b/ghost/core/core/boot.js
+index cc639cb..4624756 100644
+--- a/ghost/core/core/boot.js
++++ b/ghost/core/core/boot.js
+@@ -101,6 +101,29 @@ async function initCore({ ghostServer, config }) {
+   adapterManager.init();
+   debug('End: adapters');
+ 
++  // Limit image processing to the configured image formats before anything
++  // can process an image
++  debug('Begin: image upload config');
++  const { restrictImageDecoders } = require('./server/lib/image/image-decoders');
++  const {
++    IMAGE_UPLOAD_TYPES,
++    getIgnoredImageContentTypes,
++  } = require('./server/lib/image/image-content');
++  const uploads = config.get('uploads');
++  restrictImageDecoders(IMAGE_UPLOAD_TYPES.flatMap((type) => uploads[type]?.extensions ?? []));
++
++  // Image uploads can only be stored as image types, so point out any
++  // configured types that will be ignored
++  for (const type of IMAGE_UPLOAD_TYPES) {
++    const ignored = getIgnoredImageContentTypes(uploads[type]?.contentTypes ?? []);
++    if (ignored.length > 0) {
++      require('@tryghost/logging').warn(
++        `Ignoring uploads.${type}.contentTypes that are not image types: ${ignored.join(', ')}`,
++      );
++    }
++  }
++  debug('End: image upload config');
++
+   // URL Utils is a bit slow, put it here so the timing is visible separate from models
+   debug('Begin: Load urlUtils');
+   require('./shared/url-utils');
+diff --git a/ghost/core/core/server/data/importer/content-files.ts b/ghost/core/core/server/data/importer/content-files.ts
+index 6a53e28..8308ffb 100644
+--- a/ghost/core/core/server/data/importer/content-files.ts
++++ b/ghost/core/core/server/data/importer/content-files.ts
+@@ -59,19 +59,36 @@ export function createContentFileImporters() {
+  */
+ export function createContentImportAssetHandlers() {
+   const imageStorage = adapterManager.getAdapter('storage:images');
++  const avatarHandler = new ImporterContentFileHandler({
++    type: 'avatars',
++    directories: ['avatars'],
++    ignoreRootFolderFiles: true,
++    extensions: config.get('uploads').images.extensions,
++    contentTypes: config.get('uploads').images.contentTypes,
++    urlUtils,
++    storage: imageStorage,
++  });
+ 
+-  return [
+-    ...createContentFileHandlers(),
+-    new ImporterContentFileHandler({
+-      type: 'avatars',
+-      directories: ['avatars'],
+-      ignoreRootFolderFiles: true,
+-      extensions: config.get('uploads').images.extensions,
+-      contentTypes: config.get('uploads').images.contentTypes,
+-      urlUtils,
+-      storage: imageStorage,
+-    }),
+-  ];
++  // Avatar files are chosen by extension, so check that the contents are an
++  // allowed image and sanitize SVG files before they are stored.
++  const loadContentFiles = avatarHandler.loadFile.bind(avatarHandler);
++  avatarHandler.loadFile = async function (files, baseDir) {
++    const logging = require('@tryghost/logging');
++    const extensions = config.get('uploads').images.extensions;
++    const validFiles = [];
++
++    for (const file of files) {
++      if (await ImageHandler.isValidImage(file, extensions)) {
++        validFiles.push(file);
++      } else {
++        logging.warn(`Skipped importing ${file.name}: not a supported image`);
++      }
++    }
++
++    return loadContentFiles(validFiles, baseDir);
++  };
++
++  return [...createContentFileHandlers(), avatarHandler];
+ }
+ 
+ export function createContentImportAssetImporters() {
+diff --git a/ghost/core/core/server/data/importer/handlers/image.js b/ghost/core/core/server/data/importer/handlers/image.js
+index 61b42e2..6e87c0f 100644
+--- a/ghost/core/core/server/data/importer/handlers/image.js
++++ b/ghost/core/core/server/data/importer/handlers/image.js
+@@ -1,8 +1,34 @@
+ const _ = require('lodash');
+ const path = require('path');
++const logging = require('@tryghost/logging');
+ const config = require('../../../../shared/config');
+ const urlUtils = require('../../../../shared/url-utils').default;
+ const adapterManager = require('../../../services/adapter-manager').default;
++const { isAllowedImageContent, isSvgExtension } = require('../../../lib/image/image-content');
++const { sanitizeSvgFile } = require('../../../lib/image/svg-sanitizer');
++const { promisePool } = require('../../../lib/promise-pool');
++
++// Imports can hold thousands of images, so bound the number of open files
++const VALIDATION_CONCURRENCY = 10;
++
++/**
++ * Files are picked out of the import by extension alone, so check the
++ * contents match before they are stored as images. SVGs are sanitized in
++ * place, the same as SVG uploads.
++ *
++ * @param {{name: string, path: string}} file
++ * @param {string[]} extensions
++ * @returns {Promise<boolean>}
++ */
++const isValidImage = async (file, extensions) => {
++  const ext = path.extname(file.name).toLowerCase();
++
++  if (isSvgExtension(ext)) {
++    return sanitizeSvgFile(file.path, ext === '.svgz');
++  }
++
++  return isAllowedImageContent(file.path, extensions);
++};
+ 
+ const ImageHandler = {
+   type: 'images',
+@@ -10,8 +36,22 @@ const ImageHandler = {
+   contentTypes: config.get('uploads').images.contentTypes,
+   directories: ['images', 'content'],
+ 
+-  loadFile: function (files, baseDir) {
++  loadFile: async function (files, baseDir) {
+     const store = adapterManager.getAdapter('storage:images');
++
++    const validFiles = new Set();
++    await promisePool(
++      files.map((file) => async () => {
++        if (await isValidImage(file, ImageHandler.extensions)) {
++          validFiles.add(file);
++        } else {
++          logging.warn(`Skipped importing ${file.name}: not a supported image`);
++        }
++      }),
++      VALIDATION_CONCURRENCY,
++    );
++    files = files.filter((file) => validFiles.has(file));
++
+     const baseDirRegex = baseDir ? new RegExp('^' + _.escapeRegExp(baseDir) + '/') : new RegExp('');
+ 
+     const imageFolderRegexes = _.map(store.staticFileURLPrefix.split('/'), function (dir) {
+@@ -50,4 +90,6 @@ const ImageHandler = {
+   },
+ };
+ 
++ImageHandler.isValidImage = isValidImage;
++
+ module.exports = ImageHandler;
+diff --git a/ghost/core/core/server/lib/image/image-content.ts b/ghost/core/core/server/lib/image/image-content.ts
+new file mode 100644
+index 0000000..86cb359
+--- /dev/null
++++ b/ghost/core/core/server/lib/image/image-content.ts
+@@ -0,0 +1,102 @@
++// Image processing picks its decoder from a file's contents rather than its
++// name, so anything that stores an image or hands it to image processing must
++// check what the contents actually are. These helpers hold the contents to the
++// configured `uploads.images.extensions`-style allowlists.
++//
++// `file-type` can't detect SVG (it's text), so SVGs never pass the content
++// check. Callers route SVG files to the SVG sanitizer instead.
++
++import type { FileTypeResult } from 'file-type';
++import { getImageFormat } from './image-formats';
++
++export function isSvgExtension(ext: string): boolean {
++  return getImageFormat(ext) === 'svg';
++}
++
++async function detectFileType(input: string | Uint8Array): Promise<FileTypeResult | undefined> {
++  // file-type is ESM-only. tsc emits this as `require('file-type')` under
++  // module: commonjs, which resolves via Node's require(esm).
++  const { fileTypeFromBuffer, fileTypeFromFile } = await import('file-type');
++  return typeof input === 'string' ? fileTypeFromFile(input) : fileTypeFromBuffer(input);
++}
++
++/**
++ * Detects a file's type from its contents.
++ *
++ * @returns the detected extension including the leading dot (e.g. `.jpg`), or
++ * `undefined` when the contents aren't a recognised binary format
++ */
++export async function detectFileExtension(input: string | Uint8Array): Promise<string | undefined> {
++  const fileType = await detectFileType(input);
++
++  return fileType ? `.${fileType.ext}` : undefined;
++}
++
++/**
++ * Checks an extension against an allowlist by format, so e.g. `.tif` matches
++ * a configured `.tiff` and `.jpg` matches `.jpeg`.
++ */
++export function isAllowedImageExtension(
++  ext: string | undefined,
++  extensions: readonly string[],
++): boolean {
++  if (!ext) {
++    return false;
++  }
++
++  const format = getImageFormat(ext);
++  if (!format) {
++    return extensions.some((allowed) => allowed.toLowerCase() === ext.toLowerCase());
++  }
++
++  return extensions.some((allowed) => getImageFormat(allowed) === format);
++}
++
++/**
++ * Checks that a file's contents are one of the allowed image formats.
++ *
++ * @param input a file path or the file's contents
++ * @param extensions allowed extensions, including the leading dot
++ */
++export async function isAllowedImageContent(
++  input: string | Uint8Array,
++  extensions: readonly string[],
++): Promise<boolean> {
++  const fileType = await detectFileType(input);
++
++  // A site can allow any extension, so also require the contents to be an
++  // image, e.g. a PDF doesn't pass because `.pdf` was added to the list
++  if (!fileType || !fileType.mime.startsWith('image/')) {
++    return false;
++  }
++
++  const ext = `.${fileType.ext}`;
++
++  // Keep SVG out even if file-type ever learns to detect it, so it can't skip
++  // the sanitizer.
++  return !isSvgExtension(ext) && isAllowedImageExtension(ext, extensions);
++}
++
++/**
++ * Upload config keys whose files are stored as images.
++ */
++export const IMAGE_UPLOAD_TYPES = ['images', 'thumbnails', 'icons'] as const;
++
++/**
++ * Checks a content type an image upload may be stored with. Storage adapters
++ * that keep the uploaded content type (e.g. S3) serve the file with it, so a
++ * type such as text/html would have browsers treat an image as a page. SVGs
++ * are sanitized, and application/octet-stream is served as a download.
++ */
++export function isImageContentType(contentType: string): boolean {
++  const normalized = contentType.trim().toLowerCase();
++
++  return normalized.startsWith('image/') || normalized === 'application/octet-stream';
++}
++
++/**
++ * @returns the configured content types that image uploads ignore
++ */
++export function getIgnoredImageContentTypes(contentTypes: readonly string[]): string[] {
++  return contentTypes.filter((contentType) => !isImageContentType(contentType));
++}
+diff --git a/ghost/core/core/server/lib/image/image-decoders.ts b/ghost/core/core/server/lib/image/image-decoders.ts
+new file mode 100644
+index 0000000..1100ee9
+--- /dev/null
++++ b/ghost/core/core/server/lib/image/image-decoders.ts
+@@ -0,0 +1,56 @@
++import type SharpType from 'sharp';
++import { getImageLoader } from './image-formats';
++
++// sharp picks its decoder from a file's contents, not its name, so limit the
++// libvips loaders it can use to the image formats Ghost is configured to
++// accept.
++
++// Gift link previews are rendered from an internal PNG and SVG, whatever the
++// upload config says
++const ALWAYS_ALLOWED_LOADERS = ['VipsForeignLoadPng', 'VipsForeignLoadSvg'];
++
++export function getAllowedImageLoaders(extensions: readonly string[]): string[] {
++  const loaders = new Set(ALWAYS_ALLOWED_LOADERS);
++
++  for (const ext of extensions) {
++    const loader = getImageLoader(ext);
++    if (loader) {
++      loaders.add(loader);
++    }
++  }
++
++  return [...loaders].sort();
++}
++
++function loadSharp(): typeof SharpType | undefined {
++  try {
++    return require('sharp');
++  } catch {
++    // sharp is optional - without it Ghost stores images without processing them
++    return undefined;
++  }
++}
++
++/**
++ * Blocks every libvips loader except the ones needed for the given extensions.
++ * The block is process-wide, but lives in libvips, so it only covers copies of
++ * sharp that share Ghost's libvips.
++ *
++ * @returns the allowed loaders, or undefined when sharp isn't installed
++ */
++export function restrictImageDecoders(
++  extensions: readonly string[],
++  { requireSharp = loadSharp }: { requireSharp?: () => typeof SharpType | undefined } = {},
++): string[] | undefined {
++  const sharp = requireSharp();
++  if (!sharp) {
++    return undefined;
++  }
++
++  const loaders = getAllowedImageLoaders(extensions);
++
++  sharp.block({ operation: ['VipsForeignLoad'] });
++  sharp.unblock({ operation: loaders });
++
++  return loaders;
++}
+diff --git a/ghost/core/core/server/lib/image/image-formats.ts b/ghost/core/core/server/lib/image/image-formats.ts
+new file mode 100644
+index 0000000..4610cc3
+--- /dev/null
++++ b/ghost/core/core/server/lib/image/image-formats.ts
+@@ -0,0 +1,46 @@
++// Image formats keyed by name, with every extension that can refer to them
++// and the libvips loader that decodes them. Configured extensions and the
++// extensions `file-type` reports (e.g. `.tif`, `.jpg`, `.apng`, `.heic`) often
++// differ, so both are compared by format rather than by spelling.
++interface ImageFormat {
++  extensions: readonly string[];
++  // Blocking a loader also blocks its file/buffer/source subclasses
++  loader?: string;
++}
++
++const IMAGE_FORMATS: Record<string, ImageFormat> = {
++  jpeg: { extensions: ['.jpg', '.jpeg', '.jpe', '.jfif'], loader: 'VipsForeignLoadJpeg' },
++  // file-type reports animated PNGs as .apng; they decode as PNG
++  png: { extensions: ['.png', '.apng'], loader: 'VipsForeignLoadPng' },
++  gif: { extensions: ['.gif'], loader: 'VipsForeignLoadNsgif' },
++  webp: { extensions: ['.webp'], loader: 'VipsForeignLoadWebp' },
++  svg: { extensions: ['.svg', '.svgz'], loader: 'VipsForeignLoadSvg' },
++  avif: { extensions: ['.avif'], loader: 'VipsForeignLoadHeif' },
++  // file-type reports both .heic and .heif files as .heic
++  heic: { extensions: ['.heic', '.heif'], loader: 'VipsForeignLoadHeif' },
++  tiff: { extensions: ['.tif', '.tiff'], loader: 'VipsForeignLoadTiff' },
++  // No libvips loader, so .ico files can be stored but never processed
++  ico: { extensions: ['.ico'] },
++};
++
++const FORMAT_BY_EXTENSION = new Map(
++  Object.entries(IMAGE_FORMATS).flatMap(([name, format]) =>
++    format.extensions.map((ext) => [ext, name] as const),
++  ),
++);
++
++/**
++ * @returns the format name for an extension (including the leading dot), or
++ * undefined when it isn't a known image format
++ */
++export function getImageFormat(ext: string): string | undefined {
++  return FORMAT_BY_EXTENSION.get(ext.toLowerCase());
++}
++
++/**
++ * @returns the libvips loader for an extension, or undefined when there is none
++ */
++export function getImageLoader(ext: string): string | undefined {
++  const format = getImageFormat(ext);
++  return format ? IMAGE_FORMATS[format].loader : undefined;
++}
+diff --git a/ghost/core/core/server/lib/image/svg-sanitizer.ts b/ghost/core/core/server/lib/image/svg-sanitizer.ts
+new file mode 100644
+index 0000000..2e57047
+--- /dev/null
++++ b/ghost/core/core/server/lib/image/svg-sanitizer.ts
+@@ -0,0 +1,81 @@
++import fs from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import { promisify } from 'node:util';
++import zlib from 'node:zlib';
++import logging from '@tryghost/logging';
++import type CreateDOMPurify from 'dompurify';
++import type JSDOMModule from 'jsdom';
++
++const gunzip = promisify(zlib.gunzip);
++const gzip = promisify(zlib.gzip);
++
++/**
++ * Returns sanitized SVG content, or null if the content is invalid.
++ */
++export function sanitizeSvgContent(content: string): string | null {
++  // Loaded lazily: jsdom is slow to require and only needed for SVGs.
++  const { JSDOM } = require('jsdom') as typeof JSDOMModule;
++  const createDOMPurify = require('dompurify') as typeof CreateDOMPurify;
++  const window = new JSDOM('').window;
++  const DOMPurify = createDOMPurify(window);
++
++  const sanitized = content.replace(/<script[\s\S]*?<\/script>/gi, '');
++
++  // Check whether the sanitized content still contains a non-empty <svg> tag
++  const validSvgTag = sanitized?.match(/<svg[^>]*>\s*[\S]+[\S\s]*<\/svg>/);
++  if (!sanitized || sanitized.trim() === '' || !validSvgTag) {
++    return null;
++  }
++
++  return sanitized;
++}
++
++/**
++ * Sanitizes the contents of an .svg or .svgz file.
++ *
++ * @returns the sanitized file contents, or null if the SVG could not be sanitized
++ */
++export async function sanitizeSvgBuffer(buffer: Buffer, isZipped = false): Promise<Buffer | null> {
++  try {
++    const original = isZipped ? (await gunzip(buffer)).toString() : buffer.toString('utf8');
++    const sanitized = sanitizeSvgContent(original);
++
++    if (!sanitized) {
++      return null;
++    }
++
++    return isZipped ? await gzip(sanitized) : Buffer.from(sanitized);
++  } catch (error) {
++    logging.error('Error sanitizing SVG:', error);
++    return null;
++  }
++}
++
++/**
++ * Sanitizes an .svg or .svgz file in place. Only files in the temp directory,
++ * where uploads and extracted imports are written, can be rewritten.
++ *
++ * @returns whether the SVG could be sanitized
++ */
++export async function sanitizeSvgFile(filepath: string, isZipped = false): Promise<boolean> {
++  const resolvedPath = path.resolve(filepath);
++  if (!resolvedPath.startsWith(path.resolve(os.tmpdir()) + path.sep)) {
++    logging.error(`Refused to sanitize SVG outside the temp directory: ${filepath}`);
++    return false;
++  }
++
++  try {
++    const sanitized = await sanitizeSvgBuffer(await fs.readFile(resolvedPath), isZipped);
++
++    if (!sanitized) {
++      return false;
++    }
++
++    await fs.writeFile(resolvedPath, sanitized);
++    return true;
++  } catch (error) {
++    logging.error('Error sanitizing SVG:', error);
++    return false;
++  }
++}
+diff --git a/ghost/core/core/server/services/media-inliner/external-media-inliner.js b/ghost/core/core/server/services/media-inliner/external-media-inliner.js
+index 5a34e26..d290398 100644
+--- a/ghost/core/core/server/services/media-inliner/external-media-inliner.js
++++ b/ghost/core/core/server/services/media-inliner/external-media-inliner.js
+@@ -5,6 +5,8 @@ const errors = require('@tryghost/errors');
+ const logging = require('@tryghost/logging');
+ const string = require('@tryghost/string');
+ const path = require('path');
++const { isSvgExtension } = require('../../lib/image/image-content');
++const { sanitizeSvgBuffer } = require('../../lib/image/svg-sanitizer');
+ const vm = require('node:vm');
+ 
+ // Domains are regular expression patterns (migration tooling sends wildcards
+@@ -64,7 +66,7 @@ class ExternalMediaInliner {
+    * @param {Object} deps.PostMetaModel - PostMeta model
+    * @param {Object} deps.TagModel - Tag model
+    * @param {Object} deps.UserModel - User model
+-   * @param {(extension) => import('ghost-storage-base').StorageBase} deps.getMediaStorage - getMediaStorage
++   * @param {(extension: string, fileBuffer: Buffer) => Promise<import('ghost-storage-base').StorageBase | null>} deps.getMediaStorage - picks the storage for a file, or null if no storage accepts it
+    */
+   constructor(deps) {
+     this.#PostModel = deps.PostModel;
+@@ -183,7 +185,29 @@ class ExternalMediaInliner {
+    * @returns {Promise<string>} - path to stored media
+    */
+   async storeMediaLocally(media) {
+-    const storage = this.getMediaStorage(media.extension);
++    // The extension can come from the response's Content-Type or the URL
++    // when the contents aren't a recognised binary format, so SVGs get the
++    // same sanitizing as SVG uploads
++    if (isSvgExtension(media.extension)) {
++      const sanitized = await sanitizeSvgBuffer(media.fileBuffer, media.extension === '.svgz');
++
++      if (!sanitized) {
++        logging.warn(`Could not sanitize SVG file: ${media.filename}`);
++        return null;
++      }
++
++      media = { ...media, fileBuffer: sanitized };
++    }
++
++    // A failed content check skips this file rather than the rest of the post
++    let storage;
++    try {
++      storage = await this.getMediaStorage(media.extension, media.fileBuffer);
++    } catch (error) {
++      logging.warn(`Could not determine storage adapter for file: ${media.filename}`);
++      logging.error(error);
++      return null;
++    }
+ 
+     if (!storage) {
+       logging.warn(`No storage adapter found for file extension: ${media.extension}`);
+diff --git a/ghost/core/core/server/services/media-inliner/service.js b/ghost/core/core/server/services/media-inliner/service.js
+index df2e05d..1256459 100644
+--- a/ghost/core/core/server/services/media-inliner/service.js
++++ b/ghost/core/core/server/services/media-inliner/service.js
+@@ -1,4 +1,9 @@
+ const errors = require('@tryghost/errors');
++const {
++  isAllowedImageContent,
++  isAllowedImageExtension,
++  isSvgExtension,
++} = require('../../lib/image/image-content');
+ 
+ let instance;
+ 
+@@ -19,9 +24,22 @@ module.exports = {
+       TagModel: models.Tag,
+       UserModel: models.User,
+       PostMetaModel: models.PostsMeta,
+-      getMediaStorage: (extension) => {
+-        if (config.get('uploads').images.extensions.includes(extension)) {
+-          return imageStorage;
++      getMediaStorage: async (extension, fileBuffer) => {
++        const imageExtensions = config.get('uploads').images.extensions;
++
++        if (isAllowedImageExtension(extension, imageExtensions)) {
++          // The extension falls back to the response's Content-Type or the
++          // URL when the contents aren't recognised, so only store images
++          // whose contents are an allowed format. SVGs are sanitized by the
++          // inliner before they get here.
++          if (
++            isSvgExtension(extension) ||
++            (await isAllowedImageContent(fileBuffer, imageExtensions))
++          ) {
++            return imageStorage;
++          }
++
++          return null;
+         } else if (config.get('uploads').media.extensions.includes(extension)) {
+           return mediaStorage;
+         } else if (config.get('uploads').files.extensions.includes(extension)) {
+diff --git a/ghost/core/core/server/services/oembed/mention-icon-cache.js b/ghost/core/core/server/services/oembed/mention-icon-cache.js
+index ac735ef..27775f5 100644
+--- a/ghost/core/core/server/services/oembed/mention-icon-cache.js
++++ b/ghost/core/core/server/services/oembed/mention-icon-cache.js
+@@ -1,6 +1,8 @@
+ const crypto = require('crypto');
+ const path = require('path');
+ const mime = require('mime-types');
++const { isAllowedImageContent } = require('../../lib/image/image-content');
++const { sanitizeSvgBuffer } = require('../../lib/image/svg-sanitizer');
+ 
+ const DEFAULT_EXTENSION = 'png';
+ 
+@@ -24,7 +26,7 @@ const toBuffer = (bytes) => {
+  * @param {Object} deps.imageStore - image storage adapter
+  * @returns {Promise<string|null>} stored URL, or null when the icon cannot be cached
+  */
+-async function cacheMentionIcon({ iconUrl, externalRequest, imageStore }) {
++async function cacheMentionIcon({ iconUrl, externalRequest, imageStore, extensions = [] }) {
+   if (!iconUrl || typeof externalRequest !== 'function' || !imageStore) {
+     return null;
+   }
+@@ -39,10 +41,27 @@ async function cacheMentionIcon({ iconUrl, externalRequest, imageStore }) {
+     path.extname(new URL(iconUrl).pathname).slice(1) ||
+     DEFAULT_EXTENSION;
+ 
++  // The icon comes from the publisher's markup and the response may be any
++  // type, so store it only when the contents are an allowed image. SVGs are
++  // sanitized first, the same as image uploads.
++  let buffer = toBuffer(bytes);
++
++  if (extension === 'svg' || extension === 'svgz') {
++    const sanitized = await sanitizeSvgBuffer(buffer);
++
++    if (!sanitized) {
++      return null;
++    }
++
++    buffer = sanitized;
++  } else if (!(await isAllowedImageContent(buffer, extensions))) {
++    return null;
++  }
++
+   const name = imageStore.getSanitizedFileName('mention-icon');
+   const targetPath = path.join('icon', `${name}-${crypto.randomUUID()}.${extension}`);
+ 
+-  return imageStore.saveRaw(toBuffer(bytes), targetPath);
++  return imageStore.saveRaw(buffer, targetPath);
+ }
+ 
+ module.exports = { cacheMentionIcon };
+diff --git a/ghost/core/core/server/services/oembed/oembed-service.js b/ghost/core/core/server/services/oembed/oembed-service.js
+index 1649b91..86a788a 100644
+--- a/ghost/core/core/server/services/oembed/oembed-service.js
++++ b/ghost/core/core/server/services/oembed/oembed-service.js
+@@ -11,6 +11,11 @@ const path = require('path');
+ const crypto = require('crypto');
+ const imageTransform = require('@tryghost/image-transform');
+ const { cacheMentionIcon } = require('./mention-icon-cache');
++const {
++  detectFileExtension,
++  isAllowedImageExtension,
++  isSvgExtension,
++} = require('../../lib/image/image-content');
+ 
+ // Some sites block non-standard user agents so we need to mimic a typical browser
+ // Note: the Ghost/5.0 string _may_ be in use by 3rd parties so use caution when updating across majors
+@@ -51,7 +56,6 @@ const SVG_RASTER_TIMEOUT_SECONDS = 10;
+ const MAX_SVG_BYTES = 32 * 1024;
+ const GZIP_MAGIC = [0x1f, 0x8b];
+ 
+-const SVG_EXTENSIONS = new Set(['.svg', '.svgz']);
+ const SVG_SNIFF_BYTES = 1024;
+ 
+ const toBuffer = (bytes) => {
+@@ -60,24 +64,25 @@ const toBuffer = (bytes) => {
+     : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+ };
+ 
+-const shouldRasterize = (buffer, ext) => {
+-  if (SVG_EXTENSIONS.has(ext.toLowerCase())) {
+-    return true;
+-  }
++const isGzip = (buffer) => {
++  return GZIP_MAGIC.every((byte, index) => buffer[index] === byte);
++};
+ 
+-  const head = buffer.subarray(0, SVG_SNIFF_BYTES).toString('utf8').trimStart();
++const looksLikeSvg = (buffer, sniffBytes) => {
++  const head = buffer.subarray(0, sniffBytes).toString('utf8').trimStart();
+ 
+   return head.startsWith('<') && /<svg[\s:>]/i.test(head);
+ };
+ 
+-let fileTypeFromBuffer;
+-
+-const detectFileType = async (buffer) => {
+-  if (!fileTypeFromBuffer) {
+-    ({ fileTypeFromBuffer } = await import('file-type'));
++// sharp picks its decoder from the contents rather than the file name, so an
++// SVG extension alone isn't enough to rasterize. Gzipped files still count so
++// they are rejected as unconvertible below instead of as an unknown type.
++const shouldRasterize = (buffer, ext) => {
++  if (isSvgExtension(ext)) {
++    return isGzip(buffer) || looksLikeSvg(buffer, MAX_SVG_BYTES);
+   }
+ 
+-  return fileTypeFromBuffer(buffer);
++  return looksLikeSvg(buffer, SVG_SNIFF_BYTES);
+ };
+ 
+ /**
+@@ -228,10 +233,7 @@ class OEmbedService {
+     const name = this.imageStore.getSanitizedFileName(baseName);
+ 
+     if (shouldRasterize(imageBuffer, ext)) {
+-      if (
+-        imageBuffer.length > MAX_SVG_BYTES ||
+-        GZIP_MAGIC.every((byte, index) => imageBuffer[index] === byte)
+-      ) {
++      if (imageBuffer.length > MAX_SVG_BYTES || isGzip(imageBuffer)) {
+         throw new errors.ValidationError({
+           message: tpl(messages.unconvertibleSvg),
+           context: imageUrl,
+@@ -254,10 +256,9 @@ class OEmbedService {
+       // Content-Type the stored file is later served with, so name the
+       // file after its contents and hold it to the same allowlist as image
+       // uploads. `file-type` never reports SVG, which is handled above.
+-      const fileType = await detectFileType(imageBuffer);
+-      ext = fileType ? `.${fileType.ext}` : '';
++      ext = (await detectFileExtension(imageBuffer)) ?? '';
+ 
+-      if (!this.config.get('uploads').images.extensions.includes(ext)) {
++      if (!isAllowedImageExtension(ext, this.config.get('uploads').images.extensions)) {
+         throw new errors.ValidationError({
+           message: tpl(messages.unsupportedImage),
+           context: imageUrl,
+@@ -633,6 +634,7 @@ class OEmbedService {
+             iconUrl: metadata.icon,
+             externalRequest: this.externalRequest,
+             imageStore: this.imageStore,
++            extensions: this.config.get('uploads').images.extensions,
+           });
+ 
+           if (cachedIcon) {
+diff --git a/ghost/core/core/server/web/api/middleware/upload.js b/ghost/core/core/server/web/api/middleware/upload.js
+index 59620e8..ce6f68d 100644
+--- a/ghost/core/core/server/web/api/middleware/upload.js
++++ b/ghost/core/core/server/web/api/middleware/upload.js
+@@ -2,19 +2,20 @@ const path = require('path');
+ const os = require('os');
+ const multer = require('multer');
+ const fs = require('fs-extra');
+-const zlib = require('zlib');
+-const util = require('util');
+ const errors = require('@tryghost/errors');
+ const config = require('../../../../shared/config');
+ const tpl = require('@tryghost/tpl');
+ const logging = require('@tryghost/logging');
++const {
++  IMAGE_UPLOAD_TYPES,
++  isAllowedImageContent,
++  isImageContentType,
++} = require('../../../lib/image/image-content');
++const { sanitizeSvgContent, sanitizeSvgFile } = require('../../../lib/image/svg-sanitizer');
+ const {
+   reportThemeUploadSizeLimitError,
+ } = require('../../../services/themes/upload-size-limit-reporter');
+ 
+-const gunzip = util.promisify(zlib.gunzip);
+-const gzip = util.promisify(zlib.gzip);
+-
+ const messages = {
+   db: {
+     missingFile: 'Please select a database file to import.',
+@@ -239,92 +240,6 @@ const checkFileIsValid = (fileData, types, extensions) => {
+   return false;
+ };
+ 
+-/**
+- *
+- * @param {string} filepath
+- * @returns {Promise<String | null>}
+- *
+- * Reads the SVG file, sanitizes it, and writes the sanitized content back to the file.
+- * Returns the sanitized content or null if the SVG could not be sanitized.
+- */
+-
+-const sanitizeSvg = async (filepath, isZipped = false) => {
+-  try {
+-    const original = await readSvg(filepath, isZipped);
+-    const sanitized = sanitizeSvgContent(original);
+-
+-    if (!sanitized) {
+-      return null;
+-    }
+-
+-    await writeSvg(filepath, sanitized, isZipped);
+-    return sanitized;
+-  } catch (error) {
+-    logging.error('Error sanitizing SVG:', error);
+-    return null;
+-  }
+-};
+-
+-/**
+- *
+- * @param {string} content
+- * @returns {String | null}
+- *
+- * Returns sanitized SVG content, or null if the content is invalid.
+- *
+- */
+-const sanitizeSvgContent = (content) => {
+-  const { JSDOM } = require('jsdom');
+-  const createDOMPurify = require('dompurify');
+-  const window = new JSDOM('').window;
+-  const DOMPurify = createDOMPurify(window);
+-
+-  const sanitized = DOMPurify.sanitize(content, { USE_PROFILES: { svg: true, svgFilters: true } });
+-
+-  // Check whether the sanitized content still contains a non-empty <svg> tag
+-  const validSvgTag = sanitized?.match(/<svg[^>]*>\s*[\S]+[\S\s]*<\/svg>/);
+-  if (!sanitized || sanitized.trim() === '' || !validSvgTag) {
+-    return null;
+-  }
+-
+-  return sanitized;
+-};
+-
+-/**
+- *
+- * @param {string} filepath
+- * @param {boolean} isZipped
+- * @returns {Promise<String | null>}
+- *
+- * Reads .svg or .svgz files and returns the content as a string.
+- *
+- */
+-const readSvg = async (filepath, isZipped = false) => {
+-  if (isZipped) {
+-    const compressed = await fs.readFile(filepath);
+-    return (await gunzip(compressed)).toString();
+-  }
+-
+-  return await fs.readFile(filepath, 'utf8');
+-};
+-
+-/**
+- *
+- * @param {string} filepath
+- * @param {string} content
+- * @param {boolean} isZipped
+- *
+- * Writes SVG content to a .svg or .svgz file.
+- */
+-const writeSvg = async (filepath, content, isZipped = false) => {
+-  if (isZipped) {
+-    const compressed = await gzip(content);
+-    return await fs.writeFile(filepath, compressed);
+-  }
+-
+-  return await fs.writeFile(filepath, content);
+-};
+-
+ /**
+  *
+  * @param {{ext: string, type: string}} file
+@@ -355,9 +270,14 @@ const validation = function ({ type }) {
+   return async function uploadValidation(req, res, next) {
+     const extensions =
+       (config.get('uploads')[type] && config.get('uploads')[type].extensions) || [];
+-    const contentTypes =
++    let contentTypes =
+       (config.get('uploads')[type] && config.get('uploads')[type].contentTypes) || [];
+ 
++    // Boot warns about any configured types this ignores
++    if (IMAGE_UPLOAD_TYPES.includes(type)) {
++      contentTypes = contentTypes.filter(isImageContentType);
++    }
++
+     req.file = req.file || {};
+     req.file.name = req.file.originalname;
+     req.file.type = req.file.mimetype;
+@@ -384,7 +304,7 @@ const validation = function ({ type }) {
+ 
+     // Sanitize SVG files
+     if (isSvgFile(req.file)) {
+-      const sanitized = await sanitizeSvg(req.file.path, req.file.ext === '.svgz');
++      const sanitized = await sanitizeSvgFile(req.file.path, req.file.ext === '.svgz');
+ 
+       if (!sanitized) {
+         return next(
+@@ -393,6 +313,17 @@ const validation = function ({ type }) {
+           }),
+         );
+       }
++    } else if (
++      // The extension and content type both come from the client, so also
++      // check that the contents are an allowed image format
++      type === 'images' &&
++      !(await isAllowedImageContent(req.file.path, extensions))
++    ) {
++      return next(
++        new errors.UnsupportedMediaTypeError({
++          message: tpl(messages[type].invalidFile, { extensions: extensions }),
++        }),
++      );
+     }
+ 
+     next();
+@@ -414,8 +345,10 @@ const mediaValidation = function ({ type }) {
+ 
+     const thumbnailExtensions =
+       (config.get('uploads').thumbnails && config.get('uploads').thumbnails.extensions) || [];
+-    const thumbnailContentTypes =
+-      (config.get('uploads').thumbnails && config.get('uploads').thumbnails.contentTypes) || [];
++    const thumbnailContentTypes = (
++      (config.get('uploads').thumbnails && config.get('uploads').thumbnails.contentTypes) ||
++      []
++    ).filter(isImageContentType);
+ 
+     const { file: [file] = [] } = req.files;
+     if (!file || !checkFileExists(file)) {
+@@ -465,7 +398,7 @@ const mediaValidation = function ({ type }) {
+ 
+       // Sanitize SVG thumbnails
+       if (isSvgFile(req.thumbnail)) {
+-        const sanitized = await sanitizeSvg(req.thumbnail.path, req.thumbnail.ext === '.svgz');
++        const sanitized = await sanitizeSvgFile(req.thumbnail.path, req.thumbnail.ext === '.svgz');
+ 
+         if (!sanitized) {
+           return next(
+@@ -474,6 +407,12 @@ const mediaValidation = function ({ type }) {
+             }),
+           );
+         }
++      } else if (!(await isAllowedImageContent(req.thumbnail.path, thumbnailExtensions))) {
++        return next(
++          new errors.UnsupportedMediaTypeError({
++            message: tpl(messages.thumbnail.invalidFile, { extensions: thumbnailExtensions }),
++          }),
++        );
+       }
+     }
+ 

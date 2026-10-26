@@ -1,0 +1,209 @@
+diff --git a/kernel/api/icon.go b/kernel/api/icon.go
+index f6f629e..417970a 100644
+--- a/kernel/api/icon.go
++++ b/kernel/api/icon.go
+@@ -18,6 +18,7 @@ package api
+ 
+ import (
+ 	"fmt"
++	"html"
+ 	"math"
+ 	"net/http"
+ 	"regexp"
+@@ -165,7 +166,7 @@ func getDynamicIcon(c *gin.Context) {
+ 	}
+ 
+ 	if !model.Conf.Editor.AllowSVGScript {
+-		svg = util.RemoveScriptsInSVG(svg)
++		svg = util.SanitizeSVG(svg)
+ 	}
+ 
+ 	c.Header("Content-Type", "image/svg+xml")
+@@ -576,6 +577,9 @@ func generateTypeEightSVG(color, content, id string) string {
+ 		}
+ 	}
+ 
++	// 文字图标只显示文字，不解释调用方提供的标记
++	content = html.EscapeString(content)
++
+ 	return fmt.Sprintf(`
+     <svg id="dynamic_icon_type8" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+         <path d="M39,0h434c20.97,0,38,17.03,38,38v412c0,33.11-26.89,60-60,60H60c-32.56,0-59-26.44-59-59V38C1,17.03,18.03,0,39,0Z" style="fill: %s;"/>
+diff --git a/kernel/server/serve.go b/kernel/server/serve.go
+index ad1798d..d315a87 100644
+--- a/kernel/server/serve.go
++++ b/kernel/server/serve.go
+@@ -360,7 +360,32 @@ func servePlugins(ginServer *gin.Engine) {
+ 
+ func serveEmojis(ginServer *gin.Engine) {
+ 	emojis := ginServer.Group("/emojis/", model.CheckAuth)
+-	emojis.Static("", filepath.Join(util.DataDir, "emojis"))
++	emojisDir := filepath.Join(util.DataDir, "emojis")
++	serveEmojiFile := func(context *gin.Context) {
++		p := filepath.Join(emojisDir, context.Param("filepath"))
++		if !util.IsSubPath(emojisDir, p) {
++			context.Status(http.StatusNotFound)
++			return
++		}
++		serveFileOrSanitizedSVG(context, p)
++	}
++	emojis.GET("/*filepath", serveEmojiFile)
++	emojis.HEAD("/*filepath", serveEmojiFile)
++}
++
++// serveFileOrSanitizedSVG 返回文件内容，SVG 图片在未开启脚本时先清理可执行内容
++func serveFileOrSanitizedSVG(context *gin.Context, absPath string) {
++	if strings.HasSuffix(strings.ToLower(absPath), ".svg") {
++		data, err := os.ReadFile(absPath)
++		if err == nil {
++			if !model.Conf.Editor.AllowSVGScript {
++				data = []byte(util.SanitizeSVG(string(data)))
++			}
++			context.Data(http.StatusOK, "image/svg+xml", data)
++			return
++		}
++	}
++	http.ServeFile(context.Writer, context.Request, absPath)
+ }
+ 
+ func serveTemplates(ginServer *gin.Engine) {
+@@ -625,7 +650,7 @@ func serveSVG(context *gin.Context, assetAbsPath string) bool {
+ 		}
+ 
+ 		if !model.Conf.Editor.AllowSVGScript {
+-			data = []byte(util.RemoveScriptsInSVG(string(data)))
++			data = []byte(util.SanitizeSVG(string(data)))
+ 		}
+ 
+ 		context.Data(200, "image/svg+xml", data)
+diff --git a/kernel/util/misc.go b/kernel/util/misc.go
+index 63151eb..03ec874 100644
+--- a/kernel/util/misc.go
++++ b/kernel/util/misc.go
+@@ -231,8 +231,8 @@ func ReplaceStr(strs []string, old, new string) (ret []string, changed bool) {
+ 	return
+ }
+ 
+-// RemoveScriptsInSVG 移除 SVG 中的 <script> 标签及其内部所有内容
+-func RemoveScriptsInSVG(svgInput string) string {
++// SanitizeSVG 移除 SVG 中可执行的内容和不安全的外部引用
++func SanitizeSVG(svgInput string) string {
+ 	// 1. 将字符串解析为节点树
+ 	doc, err := html.Parse(strings.NewReader(svgInput))
+ 	if err != nil {
+@@ -240,24 +240,37 @@ func RemoveScriptsInSVG(svgInput string) string {
+ 		return svgInput
+ 	}
+ 
+-	// 2. 定义递归移除逻辑
++	// 2. 定义递归清理逻辑
+ 	var walk func(*html.Node)
+ 	walk = func(n *html.Node) {
+ 		// 倒序遍历子节点，确保删除操作不影响后续迭代
+ 		for c := n.FirstChild; c != nil; {
+ 			next := c.NextSibling
+-			// 检查标签名是否为 script
+-			if c.Type == html.ElementNode && strings.EqualFold(c.Data, "script") {
+-				n.RemoveChild(c)
+-			} else {
+-				// 递归处理子节点
+-				walk(c)
++			if c.Type == html.ElementNode {
++				// 按本地名判断元素，带命名空间前缀的写法同样处理
++				if isActiveSVGElement(c.Data) {
++					n.RemoveChild(c)
++					c = next
++					continue
++				}
++				if len(c.Attr) > 0 {
++					filtered := c.Attr[:0]
++					for _, attr := range c.Attr {
++						if isActiveSVGAttr(attr) {
++							continue
++						}
++						filtered = append(filtered, attr)
++					}
++					c.Attr = filtered
++				}
+ 			}
++			// 递归处理子节点
++			walk(c)
+ 			c = next
+ 		}
+ 	}
+ 
+-	// 3. 执行移除
++	// 3. 执行清理
+ 	walk(doc)
+ 
+ 	// 4. 将处理后的树重新渲染回字符串
+@@ -271,6 +284,69 @@ func RemoveScriptsInSVG(svgInput string) string {
+ 	return extractSVG(buf.String())
+ }
+ 
++func svgLocalName(name string) string {
++	name = strings.ToLower(strings.TrimSpace(name))
++	if idx := strings.LastIndex(name, ":"); 0 <= idx {
++		name = name[idx+1:]
++	}
++	return name
++}
++
++func isActiveSVGElement(name string) bool {
++	switch svgLocalName(name) {
++	case "script", "iframe", "object", "embed", "foreignobject":
++		return true
++	}
++	return false
++}
++
++func isActiveSVGAttr(attr *html.Attribute) bool {
++	if nil == attr {
++		return true
++	}
++	key := strings.ToLower(strings.TrimSpace(attr.Key))
++	if strings.HasPrefix(key, "on") {
++		return true
++	}
++	val := strings.ToLower(strings.TrimSpace(attr.Val))
++	val = strings.TrimLeft(val, "\x00\x09\x0a\x0c\x0d\x20")
++	switch svgLocalName(key) {
++	case "href", "src", "action", "formaction", "poster":
++		return isActiveSVGURL(val)
++	case "style":
++		return strings.Contains(val, "expression(") || strings.Contains(val, "javascript:") || strings.Contains(val, "vbscript:")
++	}
++	return false
++}
++
++func isActiveSVGURL(val string) bool {
++	switch {
++	case strings.HasPrefix(val, "javascript:"),
++		strings.HasPrefix(val, "vbscript:"),
++		strings.HasPrefix(val, "livescript:"),
++		strings.HasPrefix(val, "mocha:"):
++		return true
++	case strings.HasPrefix(val, "data:"):
++		return !isSafeSVGDataImage(val)
++	}
++	return false
++}
++
++func isSafeSVGDataImage(val string) bool {
++	if !strings.HasPrefix(val, "data:") {
++		return false
++	}
++	mediaType := val[len("data:"):]
++	if idx := strings.IndexAny(mediaType, ";,"); 0 <= idx {
++		mediaType = mediaType[:idx]
++	}
++	switch strings.TrimSpace(mediaType) {
++	case "image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp":
++		return true
++	}
++	return false
++}
++
+ func extractSVG(fullHTML string) string {
+ 	start := strings.Index(fullHTML, "<svg")
+ 	end := strings.LastIndex(fullHTML, "</svg>")

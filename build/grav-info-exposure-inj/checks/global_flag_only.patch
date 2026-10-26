@@ -1,0 +1,401 @@
+diff --git a/system/config/security.yaml b/system/config/security.yaml
+index 1b39bd63..823b0e69 100644
+--- a/system/config/security.yaml
++++ b/system/config/security.yaml
+@@ -334,8 +334,13 @@ twig_sandbox:
+   # case-sensitive. Use '*' to mean "any member" (only for data-only classes
+   # like stdClass where member access carries no executable risk).
+   allowed_methods:
++    # `offsetget`/`__get` are intentionally NOT allow-listed: they return raw
++    # services straight from the container, including the real Config
++    # (`grav.offsetGet('config')`), which a dump/serialize filter could then
++    # exfiltrate past the SandboxConfig facade. Only the safe, value-returning
++    # members are exposed. (GHSA-mc5q-6hpj-rp7j)
+     - class: 'Grav\Common\Grav'
+-      methods: 'offsetget, offsetexists, __get, getversion, theme'
++      methods: 'offsetexists, getversion, theme'
+     # `toarray` is intentionally NOT allow-listed on the raw Config or Data
+     # classes. The sandboxed `config` Twig variable is replaced with a
+     # SandboxConfig facade in Twig::processPage()/processString(), and that
+diff --git a/system/src/Grav/Common/Twig/Extension/GravExtension.php b/system/src/Grav/Common/Twig/Extension/GravExtension.php
+index 15edad0f..5bf5287b 100644
+--- a/system/src/Grav/Common/Twig/Extension/GravExtension.php
++++ b/system/src/Grav/Common/Twig/Extension/GravExtension.php
+@@ -41,11 +41,16 @@ use Iterator;
+ use JsonSerializable;
+ use RocketTheme\Toolbox\ResourceLocator\UniformResourceLocator;
+ use Traversable;
++use Grav\Common\Twig\Sandbox\GravSecurityPolicy;
++use Grav\Common\Twig\Sandbox\SandboxConfig;
++use Grav\Common\Twig\Twig;
+ use Twig\Environment;
+ use Twig\Error\RuntimeError;
+ use Twig\Extension\AbstractExtension;
+ use Twig\Extension\GlobalsInterface;
++use Twig\Extension\SandboxExtension;
+ use Twig\Markup;
++use Twig\Sandbox\SecurityNotAllowedFilterError;
+ use Twig\TwigFilter;
+ use Twig\TwigFunction;
+ use function array_slice;
+@@ -144,9 +149,10 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+             new TwigFilter('array_unique', 'array_unique'),
+             new TwigFilter('basename', 'basename'),
+             new TwigFilter('dirname', 'dirname'),
+-            new TwigFilter('print_r', $this->print_r(...)),
+-            new TwigFilter('export', $this->exportFilter(...)),
+-            new TwigFilter('yaml_encode', $this->yamlEncodeFilter(...)),
++            new TwigFilter('print_r', $this->printRGuarded(...), ['needs_environment' => true]),
++            new TwigFilter('export', $this->exportGuarded(...), ['needs_environment' => true]),
++            new TwigFilter('yaml_encode', $this->yamlEncodeGuarded(...), ['needs_environment' => true]),
++            new TwigFilter('json_encode', $this->jsonEncodeGuarded(...), ['needs_environment' => true]),
+             new TwigFilter('yaml_decode', $this->yamlDecodeFilter(...)),
+             new TwigFilter('nicecron', $this->niceCronFilter(...)),
+             new TwigFilter('replace_last', $this->replaceLastFilter(...)),
+@@ -157,7 +163,7 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+             new TwigFilter('ta', $this->translateArray(...)),
+ 
+             // Casting values
+-            new TwigFilter('string', $this->stringFilter(...)),
++            new TwigFilter('string', $this->stringGuarded(...), ['needs_environment' => true]),
+             new TwigFilter('int', $this->intFilter(...), ['is_safe' => ['all']]),
+             new TwigFilter('bool', $this->boolFilter(...)),
+             new TwigFilter('float', $this->floatFilter(...), ['is_safe' => ['all']]),
+@@ -196,9 +202,9 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+             new TwigFunction('authorize', $this->authorize(...)),
+             new TwigFunction('debug', $this->dump(...), ['needs_context' => true, 'needs_environment' => true]),
+             new TwigFunction('dump', $this->dump(...), ['needs_context' => true, 'needs_environment' => true]),
+-            new TwigFunction('vardump', $this->vardumpFunc(...)),
+-            new TwigFunction('theme_config', $this->themeConfigFunc(...)),
+-            new TwigFunction('print_r', $this->print_r(...)),
++            new TwigFunction('vardump', $this->vardumpGuarded(...), ['needs_environment' => true]),
++            new TwigFunction('theme_config', $this->themeConfigGuarded(...), ['needs_environment' => true]),
++            new TwigFunction('print_r', $this->printRGuarded(...), ['needs_environment' => true]),
+             new TwigFunction('http_response_code', 'http_response_code'),
+             new TwigFunction('evaluate', $this->evaluateStringFunc(...), ['needs_context' => true]),
+             new TwigFunction('evaluate_twig', $this->evaluateTwigFunc(...), ['needs_context' => true]),
+@@ -298,6 +304,17 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+         return var_export($var, true);
+     }
+ 
++    /**
++     * @param Environment $env
++     * @param mixed $var
++     * @return string
++     */
++    public function exportGuarded(Environment $env, mixed $var)
++    {
++        $this->assertSandboxDumpSafe($env, $var, 'export', true);
++        return $this->exportFilter($var);
++    }
++
+     /**
+      * Look up a setting of the active theme by dotted path, falling back to
+      * the site-wide configuration when the theme does not define it, e.g.
+@@ -317,6 +334,203 @@ class GravExtension extends AbstractExtension implements GlobalsInterface
+         return $value ?? $config->get($path, $default);
+     }
+ 
++    /**
++     * @param Environment $env
++     * @param string $path
++     * @param mixed $default
++     * @return mixed
++     */
++    public function themeConfigGuarded(Environment $env, string $path, mixed $default = null)
++    {
++        if ($this->contentSandbox($env) === null) {
++            return $this->themeConfigFunc($path, $default);
++        }
++
++        // Sandboxed content: resolve through the same redacting facade the
++        // `config` variable uses, so this helper can never read more than
++        // `config.get()` could.
++        $config = Grav::instance()['config'];
++        if ((bool) $config->get('security.twig_content.config_access', false) === false) {
++            $denied = array_keys($config->toArray());
++        } else {
++            $denied = (array) $config->get('security.twig_sandbox.config_denied_paths', []);
++        }
++        $facade = new SandboxConfig($config, $denied);
++        $theme = $config->get('system.pages.theme');
++        $value = $theme ? $facade->get("themes.{$theme}.{$path}") : null;
++
++        return $value ?? $facade->get($path, $default);
++    }
++
++    /**
++     * The SandboxExtension when the current render is sandboxed editor content
++     * (globally sandboxed env, or an @Page:/@Var: render under the
++     * GravSourcePolicy), otherwise null.
++     *
++     * @param Environment $env
++     * @return SandboxExtension|null
++     */
++    protected function contentSandbox(Environment $env): ?SandboxExtension
++    {
++        if (!$env->hasExtension(SandboxExtension::class)) {
++            return null;
++        }
++
++        /** @var SandboxExtension $sandbox */
++        $sandbox = $env->getExtension(SandboxExtension::class);
++
++        return $sandbox->isSandboxed() ? $sandbox : null;
++    }
++
++    /**
++     * Sandbox guard for the dump/serialize filters (print_r, vardump,
++     * json_encode, yaml_encode, string).
++     *
++     * These bypass the Twig sandbox member gate: print_r/vardump reflect an
++     * object's private and protected state directly, while json_encode/
++     * yaml_encode/string serialize it — none of them route member access through
++     * GravSecurityPolicy::checkMethodAllowed/checkPropertyAllowed. So a content
++     * author can dump an object that leaked into scope (e.g. the redacting
++     * `config` facade, which holds the real Config in a private property, or a
++     * raw Config reached via the container) and exfiltrate every value the
++     * sandbox is supposed to hide. (GHSA-mc5q-6hpj-rp7j)
++     *
++     * Two tiers, applied recursively (arrays are walked):
++     *  - $reflective true (print_r, vardump): these expose all private/protected
++     *    state, so the only object they may receive is a plain stdClass (pure
++     *    data, e.g. a page header built from YAML). Any other object is refused.
++     *  - $reflective false (json_encode, yaml_encode, string): the object's
++     *    class must be allow-listed by the active policy. This keeps the
++     *    redacting SandboxConfig facade usable (json_encode sees no public
++     *    props; yaml_encode routes through its redacting toArray) while refusing
++     *    a raw Config/Data or any other non-allow-listed object.
++     *
++     * No-op outside a sandboxed render, so trusted theme/plugin/modular Twig is
++     * unaffected.
++     *
++     * @param Environment $env
++     * @param mixed $var
++     * @param string $filter
++     * @param bool $reflective
++     * @return void
++     */
++    protected function assertSandboxDumpSafe(Environment $env, mixed $var, string $filter, bool $reflective): void
++    {
++        $sandbox = $this->contentSandbox($env);
++        if ($sandbox === null) {
++            return;
++        }
++
++        $policy = $sandbox->getSecurityPolicy();
++        $this->scanSandboxDump($policy instanceof GravSecurityPolicy ? $policy : null, $var, $filter, $reflective);
++    }
++
++    /**
++     * Recursive worker for assertSandboxDumpSafe(). Throws
++     * SecurityNotAllowedFilterError on the first object that is not permitted, so
++     * the sandboxed render soft-fails and logs the violation like any other
++     * sandbox block.
++     *
++     * @param GravSecurityPolicy|null $policy
++     * @param mixed $var
++     * @param string $filter
++     * @param bool $reflective
++     * @param int $depth
++     * @return void
++     */
++    private function scanSandboxDump(?GravSecurityPolicy $policy, mixed $var, string $filter, bool $reflective, int $depth = 0): void
++    {
++        if ($depth > 16) {
++            // Pathological nesting / cycles: refuse rather than recurse forever.
++            throw new SecurityNotAllowedFilterError(
++                sprintf('Filter "%s" is not allowed on deeply nested data inside sandboxed content.', $filter),
++                $filter
++            );
++        }
++
++        if (is_array($var)) {
++            foreach ($var as $item) {
++                $this->scanSandboxDump($policy, $item, $filter, $reflective, $depth + 1);
++            }
++            return;
++        }
++
++        if (!is_object($var)) {
++            return;
++        }
++
++        $allowed = $reflective
++            ? $var instanceof \stdClass
++            : ($policy !== null && $policy->isClassAllowed($var));
++
++        if (!$allowed) {
++            throw new SecurityNotAllowedFilterError(
++                sprintf('Filter "%s" is not allowed on a "%s" object inside sandboxed content.', $filter, $var::class),
++                $filter
++            );
++        }
++    }
++
++    /**
++     * @param Environment $env
++     * @param mixed $var
++     * @return string
++     */
++    public function printRGuarded(Environment $env, mixed $var)
++    {
++        $this->assertSandboxDumpSafe($env, $var, 'print_r', true);
++        return $this->print_r($var);
++    }
++
++    /**
++     * @param Environment $env
++     * @param mixed $var
++     * @return void
++     */
++    public function vardumpGuarded(Environment $env, mixed $var)
++    {
++        $this->assertSandboxDumpSafe($env, $var, 'vardump', true);
++        $this->vardumpFunc($var);
++    }
++
++    /**
++     * @param Environment $env
++     * @param mixed $data
++     * @param int $inline
++     * @return string
++     */
++    public function yamlEncodeGuarded(Environment $env, $data, $inline = 10)
++    {
++        $this->assertSandboxDumpSafe($env, $data, 'yaml_encode', false);
++        return $this->yamlEncodeFilter($data, $inline);
++    }
++
++    /**
++     * Guarded override of Twig core's `json_encode` filter.
++     *
++     * @param Environment $env
++     * @param mixed $value
++     * @param int $flags
++     * @param int $depth
++     * @return string|false
++     */
++    public function jsonEncodeGuarded(Environment $env, mixed $value, int $flags = 0, int $depth = 512)
++    {
++        $this->assertSandboxDumpSafe($env, $value, 'json_encode', false);
++        return json_encode($value, $flags, $depth);
++    }
++
++    /**
++     * @param Environment $env
++     * @param mixed $value
++     * @return string
++     */
++    public function stringGuarded(Environment $env, mixed $value)
++    {
++        $this->assertSandboxDumpSafe($env, $value, 'string', false);
++        return $this->stringFilter($value);
++    }
++
+     /**
+      * Filters field name by changing dot notation into array notation.
+      *
+diff --git a/system/src/Grav/Common/Twig/Sandbox/GravSecurityPolicy.php b/system/src/Grav/Common/Twig/Sandbox/GravSecurityPolicy.php
+index 42444d36..f6d627af 100644
+--- a/system/src/Grav/Common/Twig/Sandbox/GravSecurityPolicy.php
++++ b/system/src/Grav/Common/Twig/Sandbox/GravSecurityPolicy.php
+@@ -79,6 +79,27 @@ final class GravSecurityPolicy implements SecurityPolicyInterface
+         );
+     }
+ 
++    /**
++     * True when $obj is an instance of any class in the method allowlist — i.e.
++     * a type sandboxed content is permitted to interact with at all. The
++     * dump/serialize filter guards (print_r, json_encode, yaml_encode, string)
++     * use this to refuse objects that bypass the member gate by serializing PHP
++     * state directly. Note: when `security.twig_content.config_access` is off,
++     * the raw `Config`/`Data` entries are stripped in
++     * Security::buildTwigSandboxPolicy(), so this returns false for them — only
++     * the redacting SandboxConfig facade stays allowed. (GHSA-mc5q-6hpj-rp7j)
++     */
++    public function isClassAllowed(object $obj): bool
++    {
++        foreach (array_keys($this->allowedMethods) as $class) {
++            if ($obj instanceof $class) {
++                return true;
++            }
++        }
++
++        return false;
++    }
++
+     public function checkPropertyAllowed($obj, $property): void
+     {
+         foreach ($this->allowedProperties as $class => $properties) {
+diff --git a/system/src/Grav/Common/Twig/Twig.php b/system/src/Grav/Common/Twig/Twig.php
+index f8089b0c..9b50439d 100644
+--- a/system/src/Grav/Common/Twig/Twig.php
++++ b/system/src/Grav/Common/Twig/Twig.php
+@@ -103,6 +103,8 @@ class Twig
+     protected $profile;
+     /** @var string[]|null */
+     protected ?array $sandboxDeniedConfigKeys = null;
++    /** @var int Nesting depth of editor-content (@Page:/@Var:) renders in progress. */
++    private static int $contentRenderDepth = 0;
+ 
+     /**
+      * Constructor
+@@ -411,7 +413,9 @@ class Twig
+                 $sandbox_vars = $twig_vars;
+                 $sandbox_vars['config'] = $this->buildSandboxConfig();
+                 try {
+-                    $output = $content = $local_twig->render($name, $sandbox_vars);
++                    $output = $content = self::renderContent(
++                        static fn () => $local_twig->render($name, $sandbox_vars)
++                    );
+                 } catch (SecurityError $e) {
+                     $this->logSandboxViolation($e);
+                     // Soft-fail: fall back to the pre-render content so the
+@@ -501,7 +505,7 @@ class Twig
+ 
+         // SourcePolicy sandboxes @Var: sources automatically; no toggle needed.
+         try {
+-            $output = $this->twig->render($name, $vars);
++            $output = self::renderContent(fn () => $this->twig->render($name, $vars));
+         } catch (LoaderError $e) {
+             throw new RuntimeException($e->getRawMessage(), 404, $e);
+         } catch (SecurityError $e) {
+@@ -657,6 +661,37 @@ class Twig
+      * Both lists are read on every call so admins can tighten the filter at
+      * runtime without rebuilding the Twig environment.
+      */
++    /**
++     * True while editor-authored content (an @Page: or @Var: source) is being
++     * rendered.
++     *
++     * The SandboxExtension is registered with a GravSourcePolicy, so
++     * `SandboxExtension::isSandboxed()` without a Source argument reports
++     * false even while sandboxed content runs. Filters and functions are not
++     * handed the calling template's Source, so helpers that must behave
++     * differently for content (dump/serialize guards, config readers) consult
++     * this flag instead. Anything rendered from inside content — including a
++     * theme partial it includes — is treated as content. (GHSA-mc5q-6hpj-rp7j)
++     */
++    public static function isRenderingContent(): bool
++    {
++        return self::$contentRenderDepth > 0;
++    }
++
++    /**
++     * @param callable(): string $render
++     * @return string
++     */
++    private static function renderContent(callable $render): string
++    {
++        self::$contentRenderDepth++;
++        try {
++            return $render();
++        } finally {
++            self::$contentRenderDepth--;
++        }
++    }
++
+     private function buildSandboxConfig(): SandboxConfig
+     {
+         /** @var Config $config */

@@ -1,0 +1,458 @@
+diff --git a/weed/admin/dash/s3tables_management.go b/weed/admin/dash/s3tables_management.go
+index 21aca5a..dbd6c98 100644
+--- a/weed/admin/dash/s3tables_management.go
++++ b/weed/admin/dash/s3tables_management.go
+@@ -76,7 +76,7 @@ func (s *AdminServer) parseNamespaceFromRequest(w http.ResponseWriter, namespace
+ }
+ 
+ func newS3TablesManager() *s3tables.Manager {
+-	manager := s3tables.NewManager()
++	manager := s3tables.NewLocalManager()
+ 	manager.SetAccountID(s3_constants.AccountAdminId)
+ 	return manager
+ }
+diff --git a/weed/command/mini.go b/weed/command/mini.go
+index 9a4e745..7dd86e2 100644
+--- a/weed/command/mini.go
++++ b/weed/command/mini.go
+@@ -1945,7 +1945,7 @@ func ensureMiniTableBuckets(bucketSpec string) error {
+ 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
+ 
+ 	return pb.WithGrpcFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+-		manager := s3tables.NewManager()
++		manager := s3tables.NewLocalManager()
+ 		mgrClient := s3tables.NewManagerClient(client)
+ 		for _, name := range names {
+ 			ctx, cancel := context.WithTimeout(miniClientsCtx(), 5*time.Second)
+diff --git a/weed/s3api/s3api_tables.go b/weed/s3api/s3api_tables.go
+index 6ea2732..28ff85e 100644
+--- a/weed/s3api/s3api_tables.go
++++ b/weed/s3api/s3api_tables.go
+@@ -681,6 +681,7 @@ func extractCredentialScope(r *http.Request) string {
+ // which performs granular permission checks based on the specific operation.
+ func (s3a *S3ApiServer) authenticateS3Tables(f http.HandlerFunc) http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
++		r.Header.Del(s3_constants.AmzAccountId)
+ 		glog.V(2).Infof("S3Tables: authenticateS3Tables called, iam.isEnabled()=%t", s3a.iam.isEnabled())
+ 		if !s3a.iam.isEnabled() {
+ 			f(w, r)
+diff --git a/weed/s3api/s3tables/handler.go b/weed/s3api/s3tables/handler.go
+index 2572a49..7607532 100644
+--- a/weed/s3api/s3tables/handler.go
++++ b/weed/s3api/s3tables/handler.go
+@@ -48,6 +48,7 @@ type S3TablesHandler struct {
+ 	region        string
+ 	accountID     string
+ 	defaultAllow  bool // Whether to allow access by default (for zero-config IAM)
++	localTool     bool // in-process admin tooling that talks to the filer directly
+ 	iamAuthorizer IAMAuthorizer
+ }
+ 
+@@ -184,6 +185,8 @@ func (h *S3TablesHandler) getAccountID(r *http.Request) string {
+ 			val = val.Elem()
+ 		}
+ 		if val.Kind() == reflect.Struct {
++			isAdmin := identityHasAdminAction(getIdentityActions(r))
++			usable := func(p string) bool { return p != "" && (p != s3_constants.AccountAdminId || isAdmin) }
+ 			// Prefer stable claims from JWT/STS identities. Only "sub" is guaranteed durable per OIDC;
+ 			// preferred_username is ergonomic but can rotate and may orphan ownership data, while email
+ 			// is explicitly excluded to avoid storing PII in metadata.
+@@ -198,7 +201,7 @@ func (h *S3TablesHandler) getAccountID(r *http.Request) string {
+ 						claimVal = claimVal.Elem()
+ 					}
+ 					if claimVal.Kind() == reflect.String {
+-						if principal := normalizePrincipalID(claimVal.String()); principal != "" {
++						if principal := normalizePrincipalID(claimVal.String()); usable(principal) {
+ 							return principal
+ 						}
+ 					}
+@@ -211,7 +214,7 @@ func (h *S3TablesHandler) getAccountID(r *http.Request) string {
+ 				if accountVal.Kind() == reflect.Struct {
+ 					idField := accountVal.FieldByName("Id")
+ 					if idField.IsValid() && idField.Kind() == reflect.String {
+-						if principal := normalizePrincipalID(idField.String()); principal != "" {
++						if principal := normalizePrincipalID(idField.String()); usable(principal) {
+ 							return principal
+ 						}
+ 					}
+@@ -222,18 +225,38 @@ func (h *S3TablesHandler) getAccountID(r *http.Request) string {
+ 
+ 	if identityName := s3_constants.GetIdentityNameFromContext(r); identityName != "" {
+ 		if principal := normalizePrincipalID(identityName); principal != "" {
++			if principal == s3_constants.AccountAdminId && !h.localTool && !identityHasAdminAction(getIdentityActions(r)) {
++				return ""
++			}
+ 			return principal
+ 		}
+ 	}
+ 
+ 	if accountID := r.Header.Get(s3_constants.AmzAccountId); accountID != "" {
+ 		if principal := normalizePrincipalID(accountID); principal != "" {
++			if principal == s3_constants.AccountAdminId && !h.localTool && !identityHasAdminAction(getIdentityActions(r)) {
++				return ""
++			}
+ 			return principal
+ 		}
+ 	}
+ 	return h.accountID
+ }
+ 
++// openDefault reports whether the zero-config fallback may decide for this
++// request: only for local tools, or for callers that resolve to no principal of
++// their own (no credentials) or to the anonymous identity.
++func (h *S3TablesHandler) openDefault(r *http.Request) bool {
++	if h.localTool {
++		return true
++	}
++	if !h.defaultAllow {
++		return false
++	}
++	p := h.getAccountID(r)
++	return p == h.accountID || p == s3_constants.AccountAnonymousId || isAnonymousIdentity(r)
++}
++
+ // normalizePrincipalID collapses ARN and identity strings to a key that is stable within a single account.
+ // WARNING: this assumes identity names are unique per account; distinct principals such as
+ // arn:aws:iam::111:user/alice and arn:aws:iam::222:user/alice will both normalize to "alice".
+diff --git a/weed/s3api/s3tables/handler_bucket_create.go b/weed/s3api/s3tables/handler_bucket_create.go
+index 9e7f4e2..5ce3c77 100644
+--- a/weed/s3api/s3tables/handler_bucket_create.go
++++ b/weed/s3api/s3tables/handler_bucket_create.go
+@@ -53,7 +53,7 @@ func (h *S3TablesHandler) handleCreateTableBucket(w http.ResponseWriter, r *http
+ 		}
+ 		if !CheckPermissionWithContext("CreateTableBucket", principal, owner, "", "", &PolicyContext{
+ 			IdentityActions: identityActions,
+-			DefaultAllow:    h.defaultAllow,
++			DefaultAllow:    h.openDefault(r),
+ 		}) {
+ 			h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table buckets")
+ 			return NewAuthError("CreateTableBucket", principal, "not authorized to create table buckets")
+diff --git a/weed/s3api/s3tables/handler_bucket_get_list_delete.go b/weed/s3api/s3tables/handler_bucket_get_list_delete.go
+index 0bed294..2b7247a 100644
+--- a/weed/s3api/s3tables/handler_bucket_get_list_delete.go
++++ b/weed/s3api/s3tables/handler_bucket_get_list_delete.go
+@@ -72,7 +72,7 @@ func (h *S3TablesHandler) handleGetTableBucket(w http.ResponseWriter, r *http.Re
+ 	if !CheckPermissionWithContext("GetTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to get table bucket details")
+ 		return ErrAccessDenied
+@@ -102,7 +102,7 @@ func (h *S3TablesHandler) handleListTableBuckets(w http.ResponseWriter, r *http.
+ 	identityActions := getIdentityActions(r)
+ 	if !CheckPermissionWithContext("ListTableBuckets", principal, accountID, "", "", &PolicyContext{
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to list table buckets")
+ 		return NewAuthError("ListTableBuckets", principal, "not authorized to list table buckets")
+@@ -200,7 +200,7 @@ func (h *S3TablesHandler) handleListTableBuckets(w http.ResponseWriter, r *http.
+ 				if !CheckPermissionWithContext("GetTableBucket", accountID, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 					TableBucketName: entry.Entry.Name,
+ 					IdentityActions: identityActions,
+-					DefaultAllow:    h.defaultAllow,
++					DefaultAllow:    h.openDefault(r),
+ 				}) {
+ 					continue
+ 				}
+@@ -303,7 +303,7 @@ func (h *S3TablesHandler) handleDeleteTableBucket(w http.ResponseWriter, r *http
+ 		if !CheckPermissionWithContext("DeleteTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 			TableBucketName: bucketName,
+ 			IdentityActions: identityActions,
+-			DefaultAllow:    h.defaultAllow,
++			DefaultAllow:    h.openDefault(r),
+ 		}) {
+ 			return NewAuthError("DeleteTableBucket", principal, fmt.Sprintf("not authorized to delete bucket %s", bucketName))
+ 		}
+diff --git a/weed/s3api/s3tables/handler_namespace.go b/weed/s3api/s3tables/handler_namespace.go
+index fe622da..594de3d 100644
+--- a/weed/s3api/s3tables/handler_namespace.go
++++ b/weed/s3api/s3tables/handler_namespace.go
+@@ -118,7 +118,7 @@ func (h *S3TablesHandler) handleCreateNamespace(w http.ResponseWriter, r *http.R
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		glog.Infof("S3Tables: Permission denied for CreateNamespace - principal=%s, owner=%s", principal, bucketMetadata.OwnerAccountID)
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create namespace in this bucket")
+@@ -259,7 +259,7 @@ func (h *S3TablesHandler) handleGetNamespace(w http.ResponseWriter, r *http.Requ
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, "namespace not found")
+ 		return ErrAccessDenied
+@@ -346,7 +346,7 @@ func (h *S3TablesHandler) handleListNamespaces(w http.ResponseWriter, r *http.Re
+ 		TableBucketName: bucketName,
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchBucket, fmt.Sprintf("table bucket %s not found", bucketName))
+ 		return ErrAccessDenied
+@@ -531,7 +531,7 @@ func (h *S3TablesHandler) handleDeleteNamespace(w http.ResponseWriter, r *http.R
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchNamespace, "namespace not found")
+ 		return ErrAccessDenied
+diff --git a/weed/s3api/s3tables/handler_policy.go b/weed/s3api/s3tables/handler_policy.go
+index b2c5adb..1a06f84 100644
+--- a/weed/s3api/s3tables/handler_policy.go
++++ b/weed/s3api/s3tables/handler_policy.go
+@@ -94,7 +94,7 @@ func (h *S3TablesHandler) handlePutTableBucketPolicy(w http.ResponseWriter, r *h
+ 	if !CheckPermissionWithContext("PutTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, "", bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to put table bucket policy")
+ 		return NewAuthError("PutTableBucketPolicy", principal, "not authorized to put table bucket policy")
+@@ -172,7 +172,7 @@ func (h *S3TablesHandler) handleGetTableBucketPolicy(w http.ResponseWriter, r *h
+ 	if !CheckPermissionWithContext("GetTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, string(policy), bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to get table bucket policy")
+ 		return NewAuthError("GetTableBucketPolicy", principal, "not authorized to get table bucket policy")
+@@ -248,7 +248,7 @@ func (h *S3TablesHandler) handleDeleteTableBucketPolicy(w http.ResponseWriter, r
+ 	if !CheckPermissionWithContext("DeleteTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete table bucket policy")
+ 		return NewAuthError("DeleteTableBucketPolicy", principal, "not authorized to delete table bucket policy")
+@@ -349,7 +349,7 @@ func (h *S3TablesHandler) handlePutTablePolicy(w http.ResponseWriter, r *http.Re
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to put table policy")
+ 		return NewAuthError("PutTablePolicy", principal, "not authorized to put table policy")
+@@ -457,7 +457,7 @@ func (h *S3TablesHandler) handleGetTablePolicy(w http.ResponseWriter, r *http.Re
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to get table policy")
+ 		return NewAuthError("GetTablePolicy", principal, "not authorized to get table policy")
+@@ -547,7 +547,7 @@ func (h *S3TablesHandler) handleDeleteTablePolicy(w http.ResponseWriter, r *http
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	}) {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete table policy")
+ 		return NewAuthError("DeleteTablePolicy", principal, "not authorized to delete table policy")
+@@ -646,7 +646,7 @@ func (h *S3TablesHandler) handleTagResource(w http.ResponseWriter, r *http.Reque
+ 			TagKeys:         requestTagKeys,
+ 			ResourceTags:    existingTags,
+ 			IdentityActions: identityActions,
+-			DefaultAllow:    h.defaultAllow,
++			DefaultAllow:    h.openDefault(r),
+ 		}) {
+ 			return NewAuthError("TagResource", principal, "not authorized to tag resource")
+ 		}
+@@ -764,7 +764,7 @@ func (h *S3TablesHandler) handleListTagsForResource(w http.ResponseWriter, r *ht
+ 			TableBucketTags: bucketTags,
+ 			ResourceTags:    tags,
+ 			IdentityActions: identityActions,
+-			DefaultAllow:    h.defaultAllow,
++			DefaultAllow:    h.openDefault(r),
+ 		}) {
+ 			return NewAuthError("ListTagsForResource", principal, "not authorized to list tags for resource")
+ 		}
+@@ -872,7 +872,7 @@ func (h *S3TablesHandler) handleUntagResource(w http.ResponseWriter, r *http.Req
+ 			TagKeys:         req.TagKeys,
+ 			ResourceTags:    tags,
+ 			IdentityActions: identityActions,
+-			DefaultAllow:    h.defaultAllow,
++			DefaultAllow:    h.openDefault(r),
+ 		}) {
+ 			return NewAuthError("UntagResource", principal, "not authorized to untag resource")
+ 		}
+diff --git a/weed/s3api/s3tables/handler_table.go b/weed/s3api/s3tables/handler_table.go
+index 0b5b509..549eb0f 100644
+--- a/weed/s3api/s3tables/handler_table.go
++++ b/weed/s3api/s3tables/handler_table.go
+@@ -143,7 +143,7 @@ func (h *S3TablesHandler) handleCreateTable(w http.ResponseWriter, r *http.Reque
+ 		TagKeys:         mapKeys(req.Tags),
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 	bucketAllowed := CheckPermissionWithContext("CreateTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+@@ -153,7 +153,7 @@ func (h *S3TablesHandler) handleCreateTable(w http.ResponseWriter, r *http.Reque
+ 		TagKeys:         mapKeys(req.Tags),
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 
+ 	if !nsAllowed && !bucketAllowed {
+@@ -386,7 +386,7 @@ func (h *S3TablesHandler) handleGetTable(w http.ResponseWriter, r *http.Request,
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 	bucketAllowed := CheckPermissionWithContext("GetTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+@@ -395,7 +395,7 @@ func (h *S3TablesHandler) handleGetTable(w http.ResponseWriter, r *http.Request,
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 
+ 	if !tableAllowed && !bucketAllowed {
+@@ -525,14 +525,14 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
+ 				Namespace:       namespaceName,
+ 				TableBucketTags: bucketTags,
+ 				IdentityActions: identityActions,
+-				DefaultAllow:    h.defaultAllow,
++				DefaultAllow:    h.openDefault(r),
+ 			})
+ 			bucketAllowed := CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 				TableBucketName: bucketName,
+ 				Namespace:       namespaceName,
+ 				TableBucketTags: bucketTags,
+ 				IdentityActions: identityActions,
+-				DefaultAllow:    h.defaultAllow,
++				DefaultAllow:    h.openDefault(r),
+ 			})
+ 			if !nsAllowed && !bucketAllowed {
+ 				return ErrAccessDenied
+@@ -577,7 +577,7 @@ func (h *S3TablesHandler) handleListTables(w http.ResponseWriter, r *http.Reques
+ 				TableBucketName: bucketName,
+ 				TableBucketTags: bucketTags,
+ 				IdentityActions: identityActions,
+-				DefaultAllow:    h.defaultAllow,
++				DefaultAllow:    h.openDefault(r),
+ 			}) {
+ 				return ErrAccessDenied
+ 			}
+@@ -916,7 +916,7 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 	bucketAllowed := CheckPermissionWithContext("DeleteTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+@@ -925,7 +925,7 @@ func (h *S3TablesHandler) handleDeleteTable(w http.ResponseWriter, r *http.Reque
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 	if !tableAllowed && !bucketAllowed {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete table")
+@@ -1058,7 +1058,7 @@ func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Reque
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 	bucketAllowed := CheckPermissionWithContext("UpdateTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+@@ -1067,7 +1067,7 @@ func (h *S3TablesHandler) handleUpdateTable(w http.ResponseWriter, r *http.Reque
+ 		TableBucketTags: bucketTags,
+ 		ResourceTags:    tableTags,
+ 		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
++		DefaultAllow:    h.openDefault(r),
+ 	})
+ 
+ 	if !tableAllowed && !bucketAllowed {
+diff --git a/weed/s3api/s3tables/manager.go b/weed/s3api/s3tables/manager.go
+index c3dcbc1..5c0557f 100644
+--- a/weed/s3api/s3tables/manager.go
++++ b/weed/s3api/s3tables/manager.go
+@@ -26,6 +26,14 @@ func NewManager() *Manager {
+ 	return m
+ }
+ 
++// NewLocalManager returns a Manager for trusted in-process tooling (weed shell)
++// that acts for whatever account it names.
++func NewLocalManager() *Manager {
++	m := NewManager()
++	m.handler.localTool = true
++	return m
++}
++
+ // SetRegion sets the AWS region for ARN generation.
+ func (m *Manager) SetRegion(region string) {
+ 	m.handler.SetRegion(region)
+diff --git a/weed/s3api/s3tables/permissions.go b/weed/s3api/s3tables/permissions.go
+index e5cb45a..e338fed 100644
+--- a/weed/s3api/s3tables/permissions.go
++++ b/weed/s3api/s3tables/permissions.go
+@@ -200,7 +200,7 @@ func hasIdentityPermission(operation string, ctx *PolicyContext) bool {
+ 	for _, action := range ctx.IdentityActions {
+ 		// Legacy static identities may still use broad admin markers or s3 wildcards.
+ 		// s3:* is treated as s3tables:* so shared admin policies still permit table access.
+-		if action == "*" || action == string(s3_constants.ACTION_ADMIN) || action == "s3:*" || action == "s3tables:*" {
++		if identityHasAdminAction([]string{action}) {
+ 			return true
+ 		}
+ 		for _, candidate := range candidates {
+@@ -215,6 +215,16 @@ func hasIdentityPermission(operation string, ctx *PolicyContext) bool {
+ 	return false
+ }
+ 
++func identityHasAdminAction(actions []string) bool {
++	for _, a := range actions {
++		switch a {
++		case "*", s3_constants.ACTION_ADMIN, "s3:*", "s3tables:*":
++			return true
++		}
++	}
++	return false
++}
++
+ // matchesPrincipal checks if the principal matches the statement's principal
+ func matchesPrincipal(principalSpec interface{}, principal string) bool {
+ 	if principalSpec == nil {
+diff --git a/weed/shell/s3tables_helpers.go b/weed/shell/s3tables_helpers.go
+index 94dab9d..5445373 100644
+--- a/weed/shell/s3tables_helpers.go
++++ b/weed/shell/s3tables_helpers.go
+@@ -27,7 +27,7 @@ func executeS3Tables(commandEnv *CommandEnv, operation string, req interface{},
+ 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+ 	defer cancel()
+ 	return withFilerClient(commandEnv, func(client filer_pb.SeaweedFilerClient) error {
+-		manager := s3tables.NewManager()
++		manager := s3tables.NewLocalManager()
+ 		mgrClient := s3tables.NewManagerClient(client)
+ 		return manager.Execute(ctx, mgrClient, operation, req, resp, accountID)
+ 	})

@@ -1,0 +1,214 @@
+diff --git a/urllib3/connectionpool.py b/urllib3/connectionpool.py
+index b7b757dd..25091bc6 100644
+--- a/urllib3/connectionpool.py
++++ b/urllib3/connectionpool.py
+@@ -36,6 +36,7 @@ from .request import RequestMethods
+ from .response import HTTPResponse
+ 
+ from .util.connection import is_connection_dropped
++from .packages.six.moves.urllib.parse import urljoin as _urljoin
+ from .util.request import set_file_position
+ from .util.response import assert_header_parsing
+ from .util.retry import Retry
+@@ -51,6 +52,27 @@ xrange = six.moves.xrange
+ 
+ log = logging.getLogger(__name__)
+ 
++_CREDENTIAL_HEADERS = frozenset(['authorization', 'cookie'])
++
++
++def _without_credentials(headers, source_url, redirect_url, pool_origin):
++    """Drop the caller's credential headers when the redirect leaves the origin."""
++    try:
++        source = get_host(source_url)
++    except LocationValueError:
++        source = pool_origin
++    try:
++        target = get_host(_urljoin(source_url, redirect_url))
++    except LocationValueError:
++        return headers
++    if source == target:
++        return headers
++    cleaned = headers.copy()
++    for name in list(cleaned):
++        if name.lower() in _CREDENTIAL_HEADERS:
++            del cleaned[name]
++    return cleaned
++
+ _Default = object()
+ 
+ 
+@@ -697,6 +719,13 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+             # drain and return the connection to the pool before recursing
+             drain_and_release_conn(response)
+ 
++            # The pool's own origin stands in for a relative request URL; the
++            # redirect target decides whether the request left that origin.
++            pool_port = None if self.port == port_by_scheme.get(self.scheme) else self.port
++            headers = _without_credentials(
++                headers, url, redirect_location,
++                (self.scheme, self.host, pool_port))
++
+             retries.sleep_for_retry(response)
+             log.debug("Redirecting %s -> %s", url, redirect_location)
+             return self.urlopen(
+diff --git a/urllib3/contrib/appengine.py b/urllib3/contrib/appengine.py
+index 66922e06..72aa01da 100644
+--- a/urllib3/contrib/appengine.py
++++ b/urllib3/contrib/appengine.py
+@@ -58,6 +58,7 @@ from ..request import RequestMethods
+ from ..response import HTTPResponse
+ from ..util.timeout import Timeout
+ from ..util.retry import Retry
++from ..util.url import get_host, parse_url
+ 
+ try:
+     from google.appengine.api import urlfetch
+@@ -67,6 +68,24 @@ except ImportError:
+ 
+ log = logging.getLogger(__name__)
+ 
++_CREDENTIAL_HEADERS = frozenset(['authorization', 'cookie'])
++
++
++def _origin_of(url):
++    if not parse_url(url).host:
++        return None
++    return get_host(url)
++
++
++def _without_credentials(headers, source_url, target_url):
++    if _origin_of(source_url) == _origin_of(target_url):
++        return headers
++    cleaned = dict(headers)
++    for name in list(cleaned):
++        if name.lower() in _CREDENTIAL_HEADERS:
++            del cleaned[name]
++    return cleaned
++
+ 
+ class AppEnginePlatformWarning(HTTPWarning):
+     pass
+@@ -134,17 +153,16 @@ class AppEngineManager(RequestMethods):
+         retries = self._get_retries(retries, redirect)
+ 
+         try:
+-            follow_redirects = (
+-                    redirect and
+-                    retries.redirect != 0 and
+-                    retries.total)
++            # The platform's own redirect handling replays the request headers
++            # to every hop without exposing the intermediate URLs, so redirects
++            # are followed below instead.
+             response = urlfetch.fetch(
+                 url,
+                 payload=body,
+                 method=method,
+                 headers=headers or {},
+                 allow_truncated=False,
+-                follow_redirects=self.urlfetch_retries and follow_redirects,
++                follow_redirects=False,
+                 deadline=self._get_absolute_timeout(timeout),
+                 validate_certificate=self.validate_certificate,
+             )
+@@ -181,27 +199,25 @@ class AppEngineManager(RequestMethods):
+         # Handle redirect?
+         redirect_location = redirect and http_response.get_redirect_location()
+         if redirect_location:
+-            # Check for redirect response
+-            if (self.urlfetch_retries and retries.raise_on_redirect):
+-                raise MaxRetryError(self, url, "too many redirects")
+-            else:
+-                if http_response.status == 303:
+-                    method = 'GET'
+-
+-                try:
+-                    retries = retries.increment(method, url, response=http_response, _pool=self)
+-                except MaxRetryError:
+-                    if retries.raise_on_redirect:
+-                        raise MaxRetryError(self, url, "too many redirects")
+-                    return http_response
+-
+-                retries.sleep_for_retry(http_response)
+-                log.debug("Redirecting %s -> %s", url, redirect_location)
+-                redirect_url = urljoin(url, redirect_location)
+-                return self.urlopen(
+-                    method, redirect_url, body, headers,
+-                    retries=retries, redirect=redirect,
+-                    timeout=timeout, **response_kw)
++            if http_response.status == 303:
++                method = 'GET'
++
++            try:
++                retries = retries.increment(method, url, response=http_response, _pool=self)
++            except MaxRetryError:
++                if retries.raise_on_redirect:
++                    raise MaxRetryError(self, url, "too many redirects")
++                return http_response
++
++            retries.sleep_for_retry(http_response)
++            log.debug("Redirecting %s -> %s", url, redirect_location)
++            redirect_url = urljoin(url, redirect_location)
++            if headers:
++                headers = _without_credentials(headers, url, redirect_url)
++            return self.urlopen(
++                method, redirect_url, body, headers,
++                retries=retries, redirect=redirect,
++                timeout=timeout, **response_kw)
+ 
+         # Check if we should retry the HTTP response.
+         has_retry_after = bool(http_response.getheader('Retry-After'))
+diff --git a/urllib3/poolmanager.py b/urllib3/poolmanager.py
+index ca336748..101d43ba 100644
+--- a/urllib3/poolmanager.py
++++ b/urllib3/poolmanager.py
+@@ -9,7 +9,7 @@ from .connectionpool import port_by_scheme
+ from .exceptions import LocationValueError, MaxRetryError, ProxySchemeUnknown
+ from .packages.six.moves.urllib.parse import urljoin
+ from .request import RequestMethods
+-from .util.url import parse_url
++from .util.url import get_host, parse_url
+ from .util.retry import Retry
+ 
+ 
+@@ -18,6 +18,29 @@ __all__ = ['PoolManager', 'ProxyManager', 'proxy_from_url']
+ 
+ log = logging.getLogger(__name__)
+ 
++CREDENTIAL_HEADERS = frozenset(['authorization', 'cookie'])
++
++
++def origin_of(url):
++    """The (scheme, host, port) a URL names, with the scheme's default port filled in."""
++    parts = parse_url(url)
++    if not parts.host:
++        return None
++    return get_host(url)
++
++
++def without_credentials(headers, source_url, target_url):
++    """Return *headers* without the credential names when the target leaves the origin."""
++    source = origin_of(source_url)
++    target = origin_of(target_url)
++    if source is None or target is None or source == target:
++        return headers
++    cleaned = dict(headers)
++    for name in list(cleaned):
++        if name.lower() in CREDENTIAL_HEADERS:
++            del cleaned[name]
++    return cleaned
++
+ SSL_KEYWORDS = ('key_file', 'cert_file', 'cert_reqs', 'ca_certs',
+                 'ssl_version', 'ca_cert_dir', 'ssl_context')
+ 
+@@ -331,6 +354,10 @@ class PoolManager(RequestMethods):
+         if response.status == 303:
+             method = 'GET'
+ 
++        # Compare the request URL with the redirect target; the connection pool
++        # is the proxy when foreign hosts are reached through one.
++        kw['headers'] = without_credentials(kw['headers'], url, redirect_location)
++
+         retries = kw.get('retries')
+         if not isinstance(retries, Retry):
+             retries = Retry.from_int(retries, redirect=redirect)

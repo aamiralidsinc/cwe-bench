@@ -1,0 +1,236 @@
+diff --git a/guard/pacioli_guard/act.py b/guard/pacioli_guard/act.py
+index c402250..e247db9 100644
+--- a/guard/pacioli_guard/act.py
++++ b/guard/pacioli_guard/act.py
+@@ -111,25 +111,31 @@ def _writing_document(frame):
+ _CONSENT_ESTABLISHED = "pacioli_consent_established"
+ 
+ 
+-def _flag_get(doc, key):
++def _flag_value(doc, key):
++    """The raw stamp, or ``None``. ``_CONSENT_ESTABLISHED`` carries the ACT it was established for
++    rather than a bare True, because the ride decision needs to know WHICH act it would be riding."""
+     flags = getattr(doc, "flags", None)
+     if flags is None:
+-        return False
++        return None
+     try:
+-        return bool(flags.get(key))
++        return flags.get(key)
+     except AttributeError:
+-        return bool(getattr(flags, key, False))
++        return getattr(flags, key, None)
+ 
+ 
+-def _flag_set(doc, key):
++def _flag_get(doc, key):
++    return bool(_flag_value(doc, key))
++
++
++def _flag_set(doc, key, value=True):
+     flags = getattr(doc, "flags", None)
+     if flags is None:
+         return
+     try:
+-        flags[key] = True
++        flags[key] = value
+     except (TypeError, AttributeError):
+         try:
+-            setattr(flags, key, True)
++            setattr(flags, key, value)
+         except Exception:  # noqa: BLE001 — a stamp we cannot record must not break the write
+             pass
+ 
+@@ -151,7 +157,7 @@ def _same_document(a, b):
+     return (getattr(a, "doctype", None), a_name) == (getattr(b, "doctype", None), b_name)
+ 
+ 
+-def _inside_another_write(doc):
++def _enclosing_governed_act(doc):
+     """True when this act is happening INSIDE the write of a DIFFERENT document, i.e. it is a
+     CONSEQUENCE of an act already being governed rather than an act of its own.
+ 
+@@ -230,16 +236,18 @@ def _inside_another_write(doc):
+     frame = sys._getframe(1)
+     while frame is not None:
+         other = _writing_document(frame)
+-        if other is not None and not _same_document(other, doc) and _flag_get(other, _CONSENT_ESTABLISHED):
+-            return True
++        if other is not None and not _same_document(other, doc):
++            established = _flag_value(other, _CONSENT_ESTABLISHED)
++            if established:
++                return established
+         # A different document IS being written, but this gate never established consent for it.
+         # Keep walking rather than concluding anything: an OUTER frame may still be the governed
+         # act, and a consequence of a consequence legitimately rides the original.
+         frame = frame.f_back
+-    return False
++    return None
+ 
+ 
+-def _may_ride(doc, action):
++def _may_ride(doc, action, enclosing_act):
+     """May this act ride the consent established for the enclosing act it is a consequence of?
+ 
+     Split by ACT, because the signal that answers "the human could not have named this document"
+@@ -289,8 +297,17 @@ def _may_ride(doc, action):
+     undo. The delete gate added in 0.9.6 therefore rides the enclosing act exactly as the cancel
+     gate does.
+     """
++    if action == DELETE:
++        # An erasure is an undo of a document that already exists, so it may ride an enclosing undo
++        # and nothing else: a marker minted to post a document does not erase it.
++        return enclosing_act == CANCEL or _flag_get(doc, "in_insert")
+     if action in (CANCEL, DELETE):
+         return True
++    if action == CANCEL:
++        # A cancel is always of a document that already has a name, so "the act created it" cannot
++        # discriminate here. What can: an undo may cascade into further undos, and a SUBMIT that
++        # cascades into a cancel is a crossing, not a consequence.
++        return enclosing_act == CANCEL
+     return _flag_get(doc, "in_insert")
+ 
+ 
+@@ -322,8 +339,13 @@ def _gated(user):
+     return bool(scope is not None and getattr(scope, "require_consent", 0))
+ 
+ 
+-def _presented_token():
+-    """The consent token this act carries, or ``None``.
++def _presented_consent():
++    """The consent this act carries, or ``None``.
++
++    Returns the raw header value, which may name one marker or several: one request can perform more
++    than one gated act, and closing the act-crossing bypass means a caller-steered cascaded act needs
++    its own human authorisation inside the enclosing act's request. Splitting is the pure core's
++    (``consent_verdict``), so the parsing rule lives next to the comparison it feeds.
+ 
+     ``None`` is the correct answer for a background job, a server script or the bench console: there
+     is no request, so there is no header, and a gated principal that cannot present consent is
+@@ -374,16 +396,18 @@ def _require_consent(doc, action):
+     # ...but ONLY on the submit path. `in_insert` is structurally False at every `before_cancel`, so
+     # requiring it there refused every cascaded cancel and took UNDO out with it. `_may_ride` owns
+     # that split and states the residual it leaves.
+-    if _inside_another_write(doc) and _may_ride(doc, action):
++    enclosing_act = _enclosing_governed_act(doc)
++    if enclosing_act and _may_ride(doc, action, enclosing_act):
+         # Propagate custody: a cascade of a cascade (a GL Entry inside a Payment Ledger Entry
+         # inside the consented invoice) must keep riding the original act rather than becoming
+-        # ungoverned once it is two levels deep.
+-        _flag_set(doc, _CONSENT_ESTABLISHED)
++        # ungoverned once it is two levels deep. Stamped with THIS act, so a cascade that crossed
++        # from one act to another is judged against the act it actually performed.
++        _flag_set(doc, _CONSENT_ESTABLISHED, action)
+         return
+     doctype = getattr(doc, "doctype", None)
+     docname = getattr(doc, "name", None)
+     record = _consent_record(doctype, docname) if doctype and docname else None
+-    allowed, reason = consent_verdict(_presented_token(), doctype, docname, action, record,
++    allowed, reason = consent_verdict(_presented_consent(), doctype, docname, action, record,
+                                       time.time(), user)
+     if not allowed:
+         _deny(
+@@ -419,7 +443,7 @@ def _require_consent(doc, action):
+     # Consent for THIS act is now established, so the framework's own consequences of it may ride.
+     # Stamped only after the marker is actually spent: an act that was refused, or whose spend could
+     # not be confirmed, must not license anything nested beneath it.
+-    _flag_set(doc, _CONSENT_ESTABLISHED)
++    _flag_set(doc, _CONSENT_ESTABLISHED, action)
+ 
+ 
+ def before_submit(doc, method=None):
+diff --git a/guard/pacioli_guard/enforce.py b/guard/pacioli_guard/enforce.py
+index 39a13f0..b01f868 100644
+--- a/guard/pacioli_guard/enforce.py
++++ b/guard/pacioli_guard/enforce.py
+@@ -427,14 +427,9 @@ def _consent_record(doctype, docname):
+     Fails CLOSED: any lookup error reads as "no marker", never as "no gate". The stored fields
+     are `ref_doctype`/`ref_docname` because `doctype` is reserved on every frappe doc.
+ 
+-    AN AMENDMENT CONTINUES THE DOCUMENT IT WAS MADE FROM (0.9.3). ERPNext's correction flow cancels
+-    a document and re-creates it as an amended copy under a new name, and the operator who authorised
+-    the correction is looking at the same business document, not a different one. Making them find
+-    and mint a second marker for the copy, in the middle of a correction they have already approved,
+-    is how an operator learns to mint markers carelessly. So when this exact document has no marker,
+-    the document it was amended from is asked, and its marker is presented to the pure core as the
+-    marker for this document. One step only: an amendment of an amendment is a different document
+-    again, and the chain is not followed further.
++    A consent marker is bound to the document it names. Reading a marker minted for ANY other
++    document here — a copy, a parent, a predecessor — would hand every act the authority a human
++    gave to a different one, so this looks up the document in hand and nothing else.
+     """
+     try:
+         row = frappe.db.get_value(
+@@ -442,17 +437,6 @@ def _consent_record(doctype, docname):
+             ["name", "token_hash", "ref_doctype", "ref_docname", "ref_action",
+              "expires_at", "burned", "minted_by"],
+             as_dict=True)
+-        if not row:
+-            origin = frappe.db.get_value(doctype, docname, "amended_from")
+-            if origin:
+-                row = frappe.db.get_value(
+-                    CONSENT_DOCTYPE, {"ref_doctype": doctype, "ref_docname": origin},
+-                    ["name", "token_hash", "ref_doctype", "ref_docname", "ref_action",
+-                     "expires_at", "burned", "minted_by"],
+-                    as_dict=True)
+-                if row:
+-                    # The marker now stands for the copy, which is the document this act is about.
+-                    row = dict(row, ref_docname=docname)
+     except Exception:  # noqa: BLE001 — a broken lookup must deny, not open the gate
+         return None
+     if not row:
+diff --git a/guard/pacioli_guard/scope.py b/guard/pacioli_guard/scope.py
+index f7cdd3e..6cf6bdd 100644
+--- a/guard/pacioli_guard/scope.py
++++ b/guard/pacioli_guard/scope.py
+@@ -1078,6 +1078,23 @@ def docstatus_action(kind, target, http_method, form):
+     return None
+ 
+ 
++def _presented_candidates(presented):
++    """The individual consent markers a caller presented, as a tuple.
++
++    Accepts what the transport actually produces: a single token (the common case, unchanged), or
++    several separated by whitespace and/or commas in one header, or an already-split sequence. Empty
++    and whitespace-only entries are dropped rather than compared: an empty candidate must never be
++    able to match an empty ``token_hash`` on a malformed record.
++    """
++    if presented is None:
++        return ()
++    if not isinstance(presented, str):
++        items = presented
++    else:
++        items = presented.replace(",", " ").split()
++    return tuple(str(item).strip() for item in items if str(item).strip())
++
++
+ def consent_verdict(presented, doctype, docname, action, record, now, principal):
+     """Decide whether a ledger-affecting call carries valid consent. Pure.
+ 
+@@ -1152,6 +1169,12 @@ def consent_verdict(presented, doctype, docname, action, record, now, principal)
+         return False, ("this credential minted its own consent — a marker must come from a "
+                        "different hand than the one it authorises")
+     stored = _consent_field(record, "token_hash") or ""
+-    if not hmac.compare_digest(str(stored), consent_token_hash(presented)):
++    # ``presented`` may carry MORE THAN ONE marker, because one request can perform more than one
++    # gated act and each act is still bound to its own document, its own act, and a single spend.
++    matched = False
++    for candidate in _presented_candidates(presented):
++        if hmac.compare_digest(str(stored), consent_token_hash(candidate)):
++            matched = True
++    if not matched:
+         return False, "the presented consent marker does not match the one on record"
+     return True, ""
+diff --git a/guard/pacioli_guard/tests/test_act.py b/guard/pacioli_guard/tests/test_act.py
+index a2b89c2..35f5b20 100644
+--- a/guard/pacioli_guard/tests/test_act.py
++++ b/guard/pacioli_guard/tests/test_act.py
+@@ -796,7 +796,7 @@ class TestACancelCascadeIsStructurallyNotAnInsert(unittest.TestCase):
+     def test_in_insert_is_never_required_on_the_cancel_path(self):
+         # The predicate itself, pinned: no cancelled document can carry the flag, so demanding it
+         # would deny unconditionally.
+-        self.assertTrue(act._may_ride(FakeDoc(in_insert=False), act.CANCEL))
++        self.assertTrue(act._may_ride(FakeDoc(in_insert=False), act.CANCEL, act.CANCEL))
+ 
+     def test_a_cascaded_cancel_rides_the_consented_cancel(self):
+         si = FakeDoc(in_insert=False)

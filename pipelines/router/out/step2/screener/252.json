@@ -1,0 +1,122 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "252",
+  "advisory_ids": ["GHSA-2VH9-42VM-XMV2", "CVE-2025-66455", "PYSEC-2026-4077"],
+  "repo": "internlm/lmdeploy",
+  "pinned_commit": "eb94bd8cb4155eb055e2404d8304a7af089a6099",
+  "fix_commits": ["f05b4ad8bf2e2d84101a1d63b3c44fadd99223b2"],
+  "trust_decision": {
+    "summary": "Bytes arriving on the engine-to-engine ZMQ PULL socket are peer-supplied and must not be decoded with pickle; the receive loop must use a non-executing codec and validate the message schema before the value is used. Decided in handle_zmq_recv at lmdeploy/pytorch/disagg/conn/engine_conn.py:79 (recv_pyobj -> pickle.loads), with the mirror decision on the send side at :74-75.",
+    "evidence": [
+      "lmdeploy/pytorch/disagg/conn/engine_conn.py:79",
+      "lmdeploy/pytorch/disagg/conn/engine_conn.py:74-75",
+      "lmdeploy/pytorch/disagg/conn/engine_conn.py:80",
+      "lmdeploy/pytorch/disagg/conn/engine_conn.py:87",
+      "fix.diff:20-31",
+      "fix.diff:38-48"
+    ]
+  },
+  "landing_point": {
+    "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:79",
+    "why": "The advisory names handle_zmq_recv in this file, and that loop's first statement is recv_pyobj(), i.e. pickle.loads on whatever the peer sent. The loop is started by p2p_connect (:65) on a PULL socket that connects to the address in the caller's request body (:61), and the distserve routes are registered without any auth dependency (lmdeploy/serve/openai/endpoints/distserve.py:39-41), so an HTTP caller can point the receiver at their own endpoint and feed it pickle bytes."
+  },
+  "fix_sites": [
+    {
+      "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:77-87",
+      "entry_point": "POST /distserve/p2p_connect (lmdeploy/serve/openai/endpoints/distserve.py:39-41) -> AsyncEngine.p2p_connect (lmdeploy/serve/core/async_engine.py:785-786) -> Engine.p2p_connect (lmdeploy/pytorch/engine/engine.py:498-499) -> EngineP2PConnection.p2p_connect (:60-66); also reached from proxy POST /distserve/connection_warmup (lmdeploy/serve/proxy/proxy.py:553-564) and by direct Engine.p2p_connect library calls",
+      "module_kind": "library module, async ZMQ receive handler (no route of its own; driven by the FastAPI distserve router)"
+    },
+    {
+      "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:73-75",
+      "entry_point": "engine migration loop after a KV migration: lmdeploy/pytorch/engine/engine_loop.py:558-559 -> EngineP2PConnection.zmq_send (this is the producer side that keeps the peer's recv path working; reached from the normal inference/serving path, not a dedicated route)",
+      "module_kind": "library module, ZMQ send helper (wire-format producer)"
+    }
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "none",
+    "where": ""
+  },
+  "O3_reason_to_dismiss": "The second pickle-over-ZMQ implementation (lmdeploy/pytorch/engine/mp_engine/zmq_rpc.py:121-126) binds tcp://localhost on a random port and carries an inline warning not to expose it, so a solver can argue it is a local, explicitly-unsafe parent/worker channel outside the disagg P2P path the advisory describes.",
+  "O4_distance": {
+    "files": 1,
+    "packages": 2,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "The legitimate cache-free notification a peer sends after a KV migration must still be produced in the wire format the new receiver decodes (engine_loop.py:558 -> zmq_send -> recv loop -> end_session). A receiver-only fix, or one that rejects every non-JSON/unknown message, silently drops the free: the migrated KV blocks are never released and a peer still on the old pickled format breaks. The fix therefore also has to change the sender, and must keep the 'invalid free' branch (session not in scheduler) as a log-and-continue, not a loop-killer.",
+    "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:73-75, lmdeploy/pytorch/engine/engine_loop.py:558-559"
+  },
+  "O6_input_shapes": [
+    "normal JSON object produced by model_dump()/send_json",
+    "malformed or non-JSON bytes (json decode error -> ValueError, skipped)",
+    "schema-invalid JSON object (missing remote_engine_id/remote_session_id or wrong type -> ValidationError, skipped)",
+    "non-object JSON values: list, string, number, null",
+    "legacy pickle bytes from a peer still on the old build",
+    "remote_session_id sent as a JSON string ('123'), which pydantic coerces to int"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:73-75",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "AsyncRPCServer.call_and_response() pickles the ROUTER-socket request straight into the engine: request = pickle.loads(request_data) (and AsyncRPCClient unpickles server replies at :447/:451/:572); any local process that can reach the loopback port can execute code in the engine worker.",
+      "where": "lmdeploy/pytorch/engine/mp_engine/zmq_rpc.py:304-305",
+      "reason_to_dismiss": "Binds only tcp://localhost:<random port> and is preceded by an explicit 'DO NOT allow visit rpc server from external network / unauthorized access may lead to code execution vulnerability' comment, so it reads as an intentionally-trusted local channel and a neighbouring feature of the disagg P2P path.",
+      "distance": "different package: lmdeploy/pytorch/engine/mp_engine vs landing point in lmdeploy/pytorch/disagg/conn; 1 file",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "lmdeploy/pytorch/disagg/conn/engine_conn.py:77-87",
+      "sibling": "A second control message type handled in the same receive loop (e.g. a DistServeCancelRequest or a KV-block release request) decoded with recv_pyobj() in the same while loop.",
+      "why_realistic": "The P2P channel already exists and is extensible; the repo keeps growing it (the 'invalid free' branch and the p2p_* endpoints are recent additions), so a maintainer adding a new peer message would naturally copy the neighbouring recv_pyobj line."
+    },
+    {
+      "where": "lmdeploy/pytorch/disagg/conn/protocol.py:94-96",
+      "sibling": "A new pydantic control message added next to DistServeCacheFreeRequest and carried over the same pickled P2P socket.",
+      "why_realistic": "All distserve messages live in this one module and are already reused across the HTTP and ZMQ transports; adding a field/class here is the obvious extension point."
+    },
+    {
+      "where": "lmdeploy/pytorch/engine/executor/mp_executor.py:180-183",
+      "sibling": "A shared-memory control path that pickle.loads whatever the writer process put in the shared buffer.",
+      "why_realistic": "The mp executor already ships control/result objects through shared memory with pickle, so a new control message (abort, session free, cache flush) would be added on the same pattern."
+    }
+  ],
+  "O9_family": "CWE-502 deserialization of untrusted data (pickle RCE over ZMQ)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (plus optional C++/CUDA extensions for the turbomind backend)",
+    "toolchain": "setuptools + cmake_build_extension (pyproject.toml:1-5); runtime deps in requirements/common.txt (pyzmq:14, pydantic>2.0.0:13); the pytorch/disagg path is pure Python",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/pytorch/engine/test_zmq_rpc.py exercises the mp-engine ZMQ RPC with a real subprocess; there is no test for the disagg P2P connection at the pinned commit (disagg appears in tests only as incidental imports of config/protocol/messages, e.g. tests/pytorch/engine/test_cache_engine.py:11-12)"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lmdeploy/pytorch/disagg/conn/engine_conn.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Keep pickle on the wire and only tighten the isinstance() gate after recv_pyobj(), or harden the receiver alone while zmq_send keeps send_pyobj()."
+  },
+  "out_of_scope_notes": [
+    "lmdeploy/pytorch/disagg/conn/engine_conn.py:44-46 binds the PUSH socket to a hostname taken from the distserve/p2p_initialize request body, and :61 connects the receiver to a caller-supplied address - a different mechanism from the pickle sink in this advisory; noted and not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell available, so not measured; the tree has ~1700 tracked files and is clearly far below 1.5 GB, and not obviously under 5 MB, so neither size red flag was raised.",
+    "Whether the O8 zmq_rpc pickle route is still present in the latest release: no release/network access available, so present_in_latest is unknown.",
+    "Whether the hidden behavioural tests can run without a GPU: handle_zmq_recv itself only needs pyzmq + pydantic and a stub engine, but the full disagg deployment (p2p_initialize -> executor/cache engine) needs a CUDA GPU, so no GPU red flag was raised on the affected handler alone."
+  ]
+}

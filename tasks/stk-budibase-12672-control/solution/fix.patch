@@ -1,0 +1,173 @@
+diff --git a/packages/backend-core/src/utils/outboundFetch.ts b/packages/backend-core/src/utils/outboundFetch.ts
+index d5088a3..f2494ab 100644
+--- a/packages/backend-core/src/utils/outboundFetch.ts
++++ b/packages/backend-core/src/utils/outboundFetch.ts
+@@ -136,6 +136,7 @@ interface FetchWithBlacklistOptions<
+ > {
+   followRedirects?: boolean
+   returnRedirectWithoutLocation?: boolean
++  rejectCrossOriginRedirects?: boolean
+   fetchFn?: (
+     url: string,
+     request: RedirectSafeRequest<TRequest>,
+@@ -177,6 +178,7 @@ export async function fetchWithBlacklist<
+   {
+     followRedirects = true,
+     returnRedirectWithoutLocation = false,
++    rejectCrossOriginRedirects = false,
+     fetchFn = fetch as unknown as (
+       url: string,
+       request: RedirectSafeRequest<TRequest>,
+@@ -239,6 +241,9 @@ export async function fetchWithBlacklist<
+     ).toString()
+     nextRequest = nextRequestForRedirect(nextRequest, response.status)
+     if (shouldStripSensitiveHeadersForRedirect(nextUrl, redirectUrl)) {
++      if (rejectCrossOriginRedirects) {
++        throw new Error("Redirect to a different origin is not permitted.")
++      }
+       nextRequest = stripSensitiveHeadersForRedirect(nextRequest)
+     }
+     nextUrl = redirectUrl
+diff --git a/packages/server/src/integrations/rest.ts b/packages/server/src/integrations/rest.ts
+index 06fcb0f..2ab30ee 100644
+--- a/packages/server/src/integrations/rest.ts
++++ b/packages/server/src/integrations/rest.ts
+@@ -347,8 +347,8 @@ export class RestIntegration implements IntegrationBase {
+   }
+ 
+   getUrl(
+-    path: string,
+-    queryString: string,
++    path = "",
++    queryString = "",
+     pagination?: PaginationConfig,
+     paginationValues?: PaginationValues
+   ): string {
+@@ -657,10 +657,39 @@ export class RestIntegration implements IntegrationBase {
+     return this.buildHeadersFromAuthConfig(resolved.auth)
+   }
+ 
++  private getOrigin(urlString: string): string | null {
++    try {
++      const parsed = new URL(urlString)
++      return `${parsed.protocol}//${parsed.host}`
++    } catch {
++      return null
++    }
++  }
++
++  private assertSameOrigin(url: string, rawPath: string | undefined) {
++    const finalOrigin = this.getOrigin(url)
++
++    const expectedOriginUrls: string[] = []
++    if (this.config.url) {
++      expectedOriginUrls.push(this.getUrl())
++    }
++    if (rawPath !== undefined) {
++      expectedOriginUrls.push(this.getUrl(rawPath))
++    }
++
++    const isCrossOrigin = expectedOriginUrls.some(
++      expectedUrl => this.getOrigin(expectedUrl) !== finalOrigin
++    )
++    if (isCrossOrigin) {
++      throw new Error("REST query path must remain on the datasource origin")
++    }
++  }
++
+   async _req(query: RestQuery, retry401 = true): Promise<ParsedResponse> {
+     const {
+       path = "",
+       queryString = "",
++      rawPath,
+       headers = {},
+       method = HttpMethod.GET,
+       disabledHeaders,
+@@ -671,6 +700,27 @@ export class RestIntegration implements IntegrationBase {
+       pagination,
+       paginationValues,
+     } = query
++
++    const defaultQueryParameters = this.config.defaultQueryParameters || {}
++    let mergedQueryString = queryString
++    if (Object.keys(defaultQueryParameters).length > 0) {
++      const queryParams = queryString ? qs.decode(queryString) : {}
++      const merged = { ...defaultQueryParameters, ...queryParams }
++      mergedQueryString = qs.encode(merged)
++    }
++
++    this.startTimeMs = performance.now()
++    const url = this.getUrl(
++      path,
++      mergedQueryString,
++      pagination,
++      paginationValues
++    )
++
++    // Resolve and validate the destination BEFORE attaching any
++    // datasource-scoped credentials or headers below.
++    this.assertSameOrigin(url, rawPath)
++
+     const authHeaders = await this.getAuthHeaders(authConfigId, authConfigType)
+ 
+     this.headers = {
+@@ -707,22 +757,6 @@ export class RestIntegration implements IntegrationBase {
+       input.extraHttpOptions = { insecureHTTPParser: true }
+     }
+ 
+-    const defaultQueryParameters = this.config.defaultQueryParameters || {}
+-    let mergedQueryString = queryString
+-    if (Object.keys(defaultQueryParameters).length > 0) {
+-      const queryParams = queryString ? qs.decode(queryString) : {}
+-      const merged = { ...defaultQueryParameters, ...queryParams }
+-      mergedQueryString = qs.encode(merged)
+-    }
+-
+-    this.startTimeMs = performance.now()
+-    const url = this.getUrl(
+-      path,
+-      mergedQueryString,
+-      pagination,
+-      paginationValues
+-    )
+-
+     // Configure dispatcher for proxy and/or TLS settings
+     // Use datasource config if set, otherwise fall back to environment variable
+     const rejectUnauthorized =
+@@ -765,6 +799,7 @@ export class RestIntegration implements IntegrationBase {
+         url,
+         input,
+         {
++          rejectCrossOriginRedirects: true,
+           fetchFn: async (
+             requestUrl: string,
+             requestInput: RequestInit,
+diff --git a/packages/server/src/threads/query.ts b/packages/server/src/threads/query.ts
+index 88ea2ff..5bf2d3f 100644
+--- a/packages/server/src/threads/query.ts
++++ b/packages/server/src/threads/query.ts
+@@ -190,7 +190,11 @@ class QueryRunner {
+         }
+       )
+     } else {
++      const rawPath = fieldsClone.path
+       query = await sdk.queries.enrichContext(fieldsClone, enrichedContext)
++      if (datasourceClone.source === SourceName.REST) {
++        query.rawPath = rawPath
++      }
+     }
+     // Add pagination values for REST queries
+     if (this.pagination) {
+diff --git a/packages/types/src/documents/workspace/query.ts b/packages/types/src/documents/workspace/query.ts
+index af632d8..d3eede5 100644
+--- a/packages/types/src/documents/workspace/query.ts
++++ b/packages/types/src/documents/workspace/query.ts
+@@ -84,6 +84,8 @@ export enum BodyType {
+ 
+ export interface RestQueryFields {
+   path?: string
++  // Path as saved on the query, before parameter substitution.
++  rawPath?: string
+   queryString?: string
+   headers?: { [key: string]: any }
+   disabledHeaders?: { [key: string]: any }

@@ -1,0 +1,2 @@
+class IDexterityContent(object):
+    pass

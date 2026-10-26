@@ -1,0 +1,1195 @@
+diff --git a/packages/next-tinacms-azure/src/delivery-handlers.ts b/packages/next-tinacms-azure/src/delivery-handlers.ts
+index c9d7ac0..21f2763 100644
+--- a/packages/next-tinacms-azure/src/delivery-handlers.ts
++++ b/packages/next-tinacms-azure/src/delivery-handlers.ts
+@@ -7,6 +7,7 @@ import {
+ import sharp from 'sharp';
+ import type { AzureBlobStorageConfig } from './types';
+ import { type NextRequest, NextResponse } from 'next/server';
++import { InvalidMediaKeyError, resolveMediaKey } from './media-key';
+ 
+ const SUPPORTED_IMAGE_TYPES = [
+   'image/jpeg',
+@@ -21,6 +22,15 @@ type RouteParams = { params: { path: string[] } };
+ export const createMediaDeliveryHandlers = (config: AzureBlobStorageConfig) => {
+   return {
+     async GET(req: NextRequest, context: RouteParams) {
++      let blobName: string;
++      try {
++        blobName = resolveMediaKey((context?.params?.path || []).join('/'));
++      } catch (e) {
++        if (e instanceof InvalidMediaKeyError) {
++          return NextResponse.json({ message: e.message }, { status: 400 });
++        }
++        throw e;
++      }
+       try {
+         // Extract the account name and key from the connection string manually
+         const accountNameMatch = /AccountName=([^;]+)/.exec(
+@@ -49,7 +59,6 @@ export const createMediaDeliveryHandlers = (config: AzureBlobStorageConfig) => {
+           config.connectionString
+         );
+         const containerClient = client.getContainerClient(config.containerName);
+-        const blobName = context.params.path.join('/');
+         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+ 
+         // Define SAS token options
+diff --git a/packages/next-tinacms-azure/src/handlers.ts b/packages/next-tinacms-azure/src/handlers.ts
+index f82fd18..e917911 100644
+--- a/packages/next-tinacms-azure/src/handlers.ts
++++ b/packages/next-tinacms-azure/src/handlers.ts
+@@ -7,6 +7,18 @@ import type { AzureBlobStorageConfig } from './types';
+ import type { MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { type NextRequest, NextResponse } from 'next/server';
++import {
++  assertSafeFilename,
++  resolveMediaDirectory,
++  resolveMediaKey,
++} from './media-key';
++
++function badRequest(e: unknown) {
++  return NextResponse.json(
++    { message: (e as Error)?.message || 'invalid key' },
++    { status: 400 }
++  );
++}
+ 
+ type RouteParams = { params: { media: string[] } };
+ 
+@@ -51,6 +63,22 @@ async function uploadMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+   const directory = formData.get('directory') as string;
+   const filename = formData.get('filename') as string;
+   const file = formData.get('file') as Blob | null;
++
++  let blobName: string;
++  try {
++    if (filename === null || filename === undefined) {
++      throw new Error('filename is required');
++    }
++    assertSafeFilename(filename);
++    blobName = resolveMediaKey(
++      resolveMediaDirectory(directory) + filename,
++      '',
++      'filename'
++    );
++  } catch (e) {
++    return badRequest(e);
++  }
++
+   if (!file) {
+     return NextResponse.json(
+       { error: 'File blob is required.' },
+@@ -59,7 +87,6 @@ async function uploadMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+   }
+ 
+   const buffer = Buffer.from(await file.arrayBuffer());
+-  const blobName = path.join(directory, filename);
+   const blockBlobClient = containerClient.getBlockBlobClient(blobName);
+   await blockBlobClient.uploadData(buffer);
+ 
+@@ -75,8 +102,13 @@ async function deleteAsset(
+   context: RouteParams,
+   config: AzureBlobStorageConfig
+ ): Promise<NextResponse> {
+-  const { media } = context.params;
+-  const [, blobName] = media;
++  const media = context?.params?.media || [];
++  let blobName: string;
++  try {
++    blobName = resolveMediaKey(media.slice(1).join('/'));
++  } catch (e) {
++    return badRequest(e);
++  }
+ 
+   const options: BlobDeleteOptions = {
+     deleteSnapshots: 'include',
+@@ -115,11 +147,14 @@ async function listMedia(req: NextRequest, config: AzureBlobStorageConfig) {
+       mediaListOptions.directory === '/' ||
+       mediaListOptions.directory === '""';
+ 
+-    const prefix = useRootDirectory
+-      ? ''
+-      : mediaListOptions.directory?.endsWith('/')
+-        ? mediaListOptions.directory
+-        : `${mediaListOptions.directory}/`;
++    let prefix: string;
++    try {
++      prefix = useRootDirectory
++        ? ''
++        : resolveMediaDirectory(mediaListOptions.directory);
++    } catch (e) {
++      return badRequest(e);
++    }
+ 
+     const files = [];
+     const folders = [];
+diff --git a/packages/next-tinacms-azure/src/media-key.ts b/packages/next-tinacms-azure/src/media-key.ts
+new file mode 100644
+index 0000000..68782bd
+--- /dev/null
++++ b/packages/next-tinacms-azure/src/media-key.ts
+@@ -0,0 +1,108 @@
++/**
++ * Resolution of caller-supplied media keys / directories.
++ *
++ * Every object key or directory that reaches the storage service must stay
++ * inside the media area: relative, free of NUL bytes and backslashes, and not
++ * climbing above the area with `..`. When a media root is configured the
++ * resolved value always lives at or below that root.
++ */
++
++import path from 'path';
++
++export class InvalidMediaKeyError extends Error {
++  status = 400;
++  constructor(message: string) {
++    super(message);
++    this.name = 'InvalidMediaKeyError';
++  }
++}
++
++/** Normalizes a configured media root to `''` or `a/b/`. */
++export function normalizeMediaRoot(mediaRoot?: string): string {
++  if (!mediaRoot) return '';
++  const normalized = path.posix
++    .normalize(mediaRoot.replace(/^\/+/, ''))
++    .replace(/\/+$/, '');
++  if (!normalized || normalized === '.') return '';
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new Error('invalid mediaRoot');
++  }
++  return normalized + '/';
++}
++
++function cleanRelative(value: unknown, label: string): string {
++  if (typeof value !== 'string') {
++    throw new InvalidMediaKeyError(`${label} must be a single string`);
++  }
++  if (value.includes('\0')) {
++    throw new InvalidMediaKeyError(`${label} must not contain NUL bytes`);
++  }
++  if (value.includes('\\')) {
++    throw new InvalidMediaKeyError(`${label} must not contain backslashes`);
++  }
++  if (value.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  if (/^[A-Za-z]:/.test(value)) {
++    throw new InvalidMediaKeyError(`${label} must not contain a drive letter`);
++  }
++  let normalized = path.posix.normalize(value || '.');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new InvalidMediaKeyError(`${label} must stay inside the media area`);
++  }
++  normalized = normalized.replace(/\/+$/, '');
++  if (normalized === '.' || normalized === '') return '';
++  if (normalized.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  return normalized;
++}
++
++/**
++ * Resolves an object key against the media root. Keys that already carry the
++ * root (e.g. identifiers returned by the listing) are not prefixed twice.
++ */
++export function resolveMediaKey(
++  key: unknown,
++  mediaRoot = '',
++  label = 'key'
++): string {
++  const relative = cleanRelative(key, label);
++  if (!relative) {
++    throw new InvalidMediaKeyError(`${label} is required`);
++  }
++  if (!mediaRoot || relative.startsWith(mediaRoot)) {
++    return relative;
++  }
++  return mediaRoot + relative;
++}
++
++/**
++ * Resolves a directory against the media root, returning a listing prefix
++ * (`''` or ending in `/`). A single leading slash denotes the area's root.
++ */
++export function resolveMediaDirectory(
++  directory: unknown,
++  mediaRoot = '',
++  label = 'directory'
++): string {
++  if (directory === undefined || directory === null) directory = '';
++  if (directory === '/') directory = '';
++  const relative = cleanRelative(directory, label);
++  return mediaRoot + (relative ? relative + '/' : '');
++}
++
++/**
++ * Validates a caller-supplied file name: it must be a single, non-empty path
++ * segment. `undefined` is accepted (the name was not supplied).
++ */
++export function assertSafeFilename(name: unknown, label = 'filename') {
++  if (name === undefined) return;
++  const value = Array.isArray(name) ? name : [name];
++  for (const v of value) {
++    const segment = cleanRelative(v, label);
++    if (!segment || segment.includes('/') || segment !== v) {
++      throw new InvalidMediaKeyError(`${label} must be a single path segment`);
++    }
++  }
++}
+diff --git a/packages/next-tinacms-cloudinary/src/handlers.ts b/packages/next-tinacms-cloudinary/src/handlers.ts
+index b03ffea..af6b19c 100644
+--- a/packages/next-tinacms-cloudinary/src/handlers.ts
++++ b/packages/next-tinacms-cloudinary/src/handlers.ts
+@@ -8,6 +8,12 @@ import path from 'path';
+ import { NextApiRequest, NextApiResponse } from 'next';
+ import multer from 'multer';
+ import { promisify } from 'util';
++import {
++  assertSafeFilename,
++  InvalidMediaKeyError,
++  resolveMediaDirectory,
++  resolveMediaKey,
++} from './media-key';
+ 
+ export interface CloudinaryConfig {
+   cloud_name: string;
+@@ -61,21 +67,44 @@ async function uploadMedia(req: NextApiRequest, res: NextApiResponse) {
+           cb(null, '/tmp');
+         },
+         filename: (req, file, cb) => {
++          try {
++            assertSafeFilename(file.originalname);
++          } catch (e) {
++            return cb(e as Error, '');
++          }
+           cb(null, file.originalname);
+         },
+       }),
+     }).single('file')
+   );
+ 
+-  // @ts-ignore
+-  await upload(req, res);
++  try {
++    // @ts-ignore
++    await upload(req, res);
++  } catch (e) {
++    if (e instanceof InvalidMediaKeyError) {
++      return res.status(400).json({ message: e.message });
++    }
++    throw e;
++  }
+ 
+-  const { directory } = req.body;
++  const { directory, filename } = req.body || {};
++  let folder: string;
++  try {
++    folder = resolveMediaDirectory(directory).replace(/\/$/, '');
++    assertSafeFilename(filename);
++    //@ts-ignore
++    assertSafeFilename(req.file?.originalname);
++    //@ts-ignore
++    if (req.file?.path) assertSafeFilename(path.basename(req.file.path));
++  } catch (e) {
++    return res.status(400).json({ message: findErrorMessage(e) });
++  }
+ 
+   try {
+     //@ts-ignore
+     const result = await cloudinary.uploader.upload(req.file.path, {
+-      folder: directory.replace(/^\//, ''),
++      folder,
+       use_filename: true,
+       overwrite: false,
+       resource_type: 'auto',
+@@ -100,14 +129,29 @@ async function listMedia(
+       filesOnly: req.query.filesOnly === 'true' || false,
+     };
+ 
+-    const useRootDirectory =
++    let useRootDirectory =
+       !mediaListOptions.directory ||
+       mediaListOptions.directory === '/' ||
+       mediaListOptions.directory === '""';
+ 
+-    const query = useRootDirectory
+-      ? 'folder=""'
+-      : `folder="${mediaListOptions.directory}"`;
++    let folder = '';
++    if (!useRootDirectory) {
++      try {
++        folder = resolveMediaDirectory(mediaListOptions.directory).replace(
++          /\/$/,
++          ''
++        );
++      } catch (e) {
++        return res.status(400).json({ message: findErrorMessage(e) });
++      }
++      useRootDirectory = !folder;
++    }
++    // quotes would break out of the search expression
++    if (folder.includes('"')) {
++      return res.status(400).json({ message: 'invalid directory' });
++    }
++
++    const query = useRootDirectory ? 'folder=""' : `folder="${folder}"`;
+ 
+     const response = await cloudinary.search
+       .expression(query)
+@@ -138,7 +182,7 @@ async function listMedia(
+ 
+     try {
+       // @ts-ignore
+-      folderRes = await cloudinary.api.folders(mediaListOptions.directory);
++      folderRes = await cloudinary.api.folders(folder || '""');
+     } catch (e) {
+       // If the folder doesn't exist, just return an empty array
+       if (e.error?.message.startsWith("Can't find folder with path")) {
+@@ -192,7 +236,14 @@ const findErrorMessage = (e: any) => {
+ 
+ async function deleteAsset(req: NextApiRequest, res: NextApiResponse) {
+   const { media } = req.query;
+-  const [, public_id] = media as string[];
++  let public_id: string;
++  try {
++    public_id = resolveMediaKey(
++      Array.isArray(media) ? media.slice(1).join('/') : undefined
++    );
++  } catch (e) {
++    return res.status(400).json({ message: findErrorMessage(e) });
++  }
+ 
+   cloudinary.uploader.destroy(public_id as string, {}, (err) => {
+     if (err) res.status(500);
+diff --git a/packages/next-tinacms-cloudinary/src/media-key.ts b/packages/next-tinacms-cloudinary/src/media-key.ts
+new file mode 100644
+index 0000000..53d2dff
+--- /dev/null
++++ b/packages/next-tinacms-cloudinary/src/media-key.ts
+@@ -0,0 +1,108 @@
++/**
++ * Resolution of caller-supplied media keys / directories.
++ *
++ * Every object key or directory that reaches the storage service must stay
++ * inside the media area: relative, free of NUL bytes and backslashes, and not
++ * climbing above the area with `..`. When a media root is configured the
++ * resolved value always lives at or below that root.
++ */
++
++import path from 'path';
++
++export class InvalidMediaKeyError extends Error {
++  status = 400;
++  constructor(message: string) {
++    super(message);
++    this.name = 'InvalidMediaKeyError';
++  }
++}
++
++/** Normalizes a configured media root to `''` or `a/b/`. */
++export function normalizeMediaRoot(mediaRoot?: string): string {
++  if (!mediaRoot) return '';
++  const normalized = path.posix
++    .normalize(mediaRoot.replace(/^\/+/, ''))
++    .replace(/\/+$/, '');
++  if (!normalized || normalized === '.') return '';
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new Error('invalid mediaRoot');
++  }
++  return normalized + '/';
++}
++
++function cleanRelative(value: unknown, label: string): string {
++  if (typeof value !== 'string') {
++    throw new InvalidMediaKeyError(`${label} must be a single string`);
++  }
++  if (value.includes('\0')) {
++    throw new InvalidMediaKeyError(`${label} must not contain NUL bytes`);
++  }
++  if (value.includes('\\')) {
++    throw new InvalidMediaKeyError(`${label} must not contain backslashes`);
++  }
++  if (value.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  if (/^[A-Za-z]:/.test(value)) {
++    throw new InvalidMediaKeyError(`${label} must not contain a drive letter`);
++  }
++  let normalized = path.posix.normalize(value || '.');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new InvalidMediaKeyError(`${label} must stay inside the media area`);
++  }
++  normalized = normalized.replace(/\/+$/, '');
++  if (normalized === '.' || normalized === '') return '';
++  if (normalized.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  return normalized;
++}
++
++/**
++ * Resolves an object key against the media root. Keys that already carry the
++ * root (e.g. identifiers returned by the listing) are not prefixed twice.
++ */
++export function resolveMediaKey(
++  key: unknown,
++  mediaRoot = '',
++  label = 'key'
++): string {
++  const relative = cleanRelative(key, label);
++  if (!relative) {
++    throw new InvalidMediaKeyError(`${label} is required`);
++  }
++  if (!mediaRoot || relative.startsWith(mediaRoot)) {
++    return relative;
++  }
++  return mediaRoot + relative;
++}
++
++/**
++ * Resolves a directory against the media root, returning a listing prefix
++ * (`''` or ending in `/`). A single leading slash denotes the area's root.
++ */
++export function resolveMediaDirectory(
++  directory: unknown,
++  mediaRoot = '',
++  label = 'directory'
++): string {
++  if (directory === undefined || directory === null) directory = '';
++  if (typeof directory === 'string') directory = directory.replace(/^\//, '');
++  const relative = cleanRelative(directory, label);
++  return mediaRoot + (relative ? relative + '/' : '');
++}
++
++/**
++ * Validates a caller-supplied file name: it must be a single, non-empty path
++ * segment. `undefined` is accepted (the name was not supplied).
++ */
++export function assertSafeFilename(name: unknown, label = 'filename') {
++  if (name === undefined) return;
++  const value = Array.isArray(name) ? name : [name];
++  for (const v of value) {
++    const segment = cleanRelative(v, label);
++    if (!segment || segment.includes('/') || segment !== v) {
++      throw new InvalidMediaKeyError(`${label} must be a single path segment`);
++    }
++  }
++}
+diff --git a/packages/next-tinacms-dos/src/copy-handler.ts b/packages/next-tinacms-dos/src/copy-handler.ts
+index 2c6c338..e8fe341 100644
+--- a/packages/next-tinacms-dos/src/copy-handler.ts
++++ b/packages/next-tinacms-dos/src/copy-handler.ts
+@@ -12,6 +12,7 @@ import {
+   S3ClientConfig,
+ } from '@aws-sdk/client-s3';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import { normalizeMediaRoot, resolveMediaKey } from './media-key';
+ 
+ export interface DOSCopyConfig {
+   config: S3ClientConfig;
+@@ -30,6 +31,7 @@ const findErrorMessage = (e: any) => {
+ export const createCopyHandler = (config: DOSCopyConfig) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
++  const mediaRoot = normalizeMediaRoot(config.mediaRoot);
+ 
+   return async (req: NextApiRequest, res: NextApiResponse) => {
+     const isAuthorized = await config.authorized(req, res);
+@@ -43,11 +45,22 @@ export const createCopyHandler = (config: DOSCopyConfig) => {
+     }
+ 
+     const { from, to } = req.query;
+-    const source = Array.isArray(from) ? from[0] : from;
+-    const destination = Array.isArray(to) ? to[0] : to;
+-    if (!source || !destination) {
++    if (from === undefined || to === undefined) {
+       return res.status(400).json({ message: 'from and to are required' });
+     }
++    let source: string;
++    let destination: string;
++    try {
++      // every supplied value must be valid; the first one is used
++      source = (Array.isArray(from) ? from : [from]).map((k) =>
++        resolveMediaKey(k, mediaRoot, 'from')
++      )[0];
++      destination = (Array.isArray(to) ? to : [to]).map((k) =>
++        resolveMediaKey(k, mediaRoot, 'to')
++      )[0];
++    } catch (e) {
++      return res.status(400).json({ message: findErrorMessage(e) });
++    }
+ 
+     const params: CopyObjectCommandInput = {
+       Bucket: bucket,
+diff --git a/packages/next-tinacms-dos/src/handlers.ts b/packages/next-tinacms-dos/src/handlers.ts
+index c136621..12b9780 100644
+--- a/packages/next-tinacms-dos/src/handlers.ts
++++ b/packages/next-tinacms-dos/src/handlers.ts
+@@ -19,6 +19,13 @@ import fs from 'fs';
+ import { NextApiRequest, NextApiResponse } from 'next';
+ import multer from 'multer';
+ import { promisify } from 'util';
++import {
++  assertSafeFilename,
++  InvalidMediaKeyError,
++  normalizeMediaRoot,
++  resolveMediaDirectory,
++  resolveMediaKey,
++} from './media-key';
+ 
+ export interface DOSConfig {
+   config: S3ClientConfig;
+@@ -40,15 +47,7 @@ export const mediaHandlerConfig = {
+ export const createMediaHandler = (config: DOSConfig, options?: DOSOptions) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
+-  let mediaRoot = config.mediaRoot || '';
+-  if (mediaRoot) {
+-    if (!mediaRoot.endsWith('/')) {
+-      mediaRoot = mediaRoot + '/';
+-    }
+-    if (mediaRoot.startsWith('/')) {
+-      mediaRoot = mediaRoot.substr(1);
+-    }
+-  }
++  const mediaRoot = normalizeMediaRoot(config.mediaRoot);
+   let cdnUrl =
+     options?.cdnUrl ||
+     config.config.endpoint
+@@ -69,7 +68,7 @@ export const createMediaHandler = (config: DOSConfig, options?: DOSOptions) => {
+       case 'POST':
+         return uploadMedia(req, res, client, bucket, mediaRoot, cdnUrl);
+       case 'DELETE':
+-        return deleteAsset(req, res, client, bucket);
++        return deleteAsset(req, res, client, bucket, mediaRoot);
+       default:
+         res.end(404);
+     }
+@@ -93,32 +92,59 @@ async function uploadMedia(
+           cb(null, '/tmp');
+         },
+         filename: (req, file, cb) => {
++          try {
++            assertSafeFilename(file.originalname);
++          } catch (e) {
++            return cb(e as Error, '');
++          }
+           cb(null, file.originalname);
+         },
+       }),
+     }).single('file')
+   );
++  try {
++    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
++    // @ts-ignore
++    await upload(req, res);
++  } catch (e) {
++    if (e instanceof InvalidMediaKeyError) {
++      return res.status(400).json({ message: e.message });
++    }
++    throw e;
++  }
++
++  const { directory, filename: requestedFilename } = req.body || {};
+   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+   // @ts-ignore
+-  await upload(req, res);
++  const filePath = req.file?.path;
++  if (!filePath) {
++    return res.status(400).json({ message: 'file is required' });
++  }
++  const filename = path.basename(filePath);
+ 
+-  const { directory } = req.body;
+-  let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-  if (prefix) prefix = prefix + '/';
++  let prefix: string;
++  let objectKey: string;
++  try {
++    prefix = resolveMediaDirectory(directory, mediaRoot).slice(
++      mediaRoot.length
++    );
++    assertSafeFilename(requestedFilename);
++    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
++    // @ts-ignore
++    assertSafeFilename(req.file?.originalname);
++    assertSafeFilename(filename);
++    objectKey = mediaRoot + resolveMediaKey(prefix + filename, '', 'filename');
++  } catch (e) {
++    return res.status(400).json({ message: findErrorMessage(e) });
++  }
+ 
+-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+-  // @ts-ignore
+-  const filePath = req.file.path;
+   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+   // @ts-ignore
+   const fileType = req.file?.mimetype;
+   const blob = fs.readFileSync(filePath);
+-  const filename = path.basename(filePath);
+   const params: PutObjectCommandInput = {
+     Bucket: bucket,
+-    Key: mediaRoot
+-      ? path.join(mediaRoot, prefix + filename)
+-      : prefix + filename,
++    Key: objectKey,
+     Body: blob,
+     ACL: 'public-read',
+     ContentType: fileType || 'application/octet-stream',
+@@ -138,11 +164,7 @@ async function uploadMedia(
+         '400x400': src,
+         '1000x1000': src,
+       },
+-      src:
+-        cdnUrl +
+-        (mediaRoot
+-          ? path.join(mediaRoot, prefix + filename)
+-          : prefix + filename),
++      src: cdnUrl + objectKey,
+     });
+   } catch (e) {
+     console.error('Error uploading media');
+@@ -183,13 +205,18 @@ async function listMedia(
+       limit = 500,
+       offset,
+     } = req.query as MediaListOptions;
+-    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-    if (prefix) prefix = prefix + '/';
++    let fullPrefix: string;
++    try {
++      fullPrefix = resolveMediaDirectory(directory, mediaRoot);
++    } catch (e) {
++      return res.status(400).json({ message: findErrorMessage(e) });
++    }
++    const prefix = fullPrefix.slice(mediaRoot.length);
+ 
+     const params: ListObjectsCommandInput = {
+       Bucket: bucket,
+       Delimiter: '/',
+-      Prefix: mediaRoot ? path.join(mediaRoot, prefix) : prefix,
++      Prefix: fullPrefix,
+       Marker: offset?.toString(),
+       MaxKeys: directory && !offset ? +limit + 1 : +limit,
+     };
+@@ -250,15 +277,16 @@ async function deleteAsset(
+   req: NextApiRequest,
+   res: NextApiResponse,
+   client: S3Client,
+-  bucket: string
++  bucket: string,
++  mediaRoot: string
+ ) {
+   const { media } = req.query;
+-  let [, objectKey] = media as string[];
+-  const objectKeyIsSplit =
+-    media && media.length > 2 && typeof media !== 'string';
+-
+-  if (objectKeyIsSplit) {
+-    objectKey = media.slice(1).join('/');
++  const segments = Array.isArray(media) ? media.slice(1) : [];
++  let objectKey: string;
++  try {
++    objectKey = resolveMediaKey(segments.join('/'), mediaRoot);
++  } catch (e) {
++    return res.status(400).json({ message: findErrorMessage(e) });
+   }
+ 
+   const params: DeleteObjectCommandInput = {
+diff --git a/packages/next-tinacms-dos/src/media-key.ts b/packages/next-tinacms-dos/src/media-key.ts
+new file mode 100644
+index 0000000..53d2dff
+--- /dev/null
++++ b/packages/next-tinacms-dos/src/media-key.ts
+@@ -0,0 +1,108 @@
++/**
++ * Resolution of caller-supplied media keys / directories.
++ *
++ * Every object key or directory that reaches the storage service must stay
++ * inside the media area: relative, free of NUL bytes and backslashes, and not
++ * climbing above the area with `..`. When a media root is configured the
++ * resolved value always lives at or below that root.
++ */
++
++import path from 'path';
++
++export class InvalidMediaKeyError extends Error {
++  status = 400;
++  constructor(message: string) {
++    super(message);
++    this.name = 'InvalidMediaKeyError';
++  }
++}
++
++/** Normalizes a configured media root to `''` or `a/b/`. */
++export function normalizeMediaRoot(mediaRoot?: string): string {
++  if (!mediaRoot) return '';
++  const normalized = path.posix
++    .normalize(mediaRoot.replace(/^\/+/, ''))
++    .replace(/\/+$/, '');
++  if (!normalized || normalized === '.') return '';
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new Error('invalid mediaRoot');
++  }
++  return normalized + '/';
++}
++
++function cleanRelative(value: unknown, label: string): string {
++  if (typeof value !== 'string') {
++    throw new InvalidMediaKeyError(`${label} must be a single string`);
++  }
++  if (value.includes('\0')) {
++    throw new InvalidMediaKeyError(`${label} must not contain NUL bytes`);
++  }
++  if (value.includes('\\')) {
++    throw new InvalidMediaKeyError(`${label} must not contain backslashes`);
++  }
++  if (value.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  if (/^[A-Za-z]:/.test(value)) {
++    throw new InvalidMediaKeyError(`${label} must not contain a drive letter`);
++  }
++  let normalized = path.posix.normalize(value || '.');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new InvalidMediaKeyError(`${label} must stay inside the media area`);
++  }
++  normalized = normalized.replace(/\/+$/, '');
++  if (normalized === '.' || normalized === '') return '';
++  if (normalized.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  return normalized;
++}
++
++/**
++ * Resolves an object key against the media root. Keys that already carry the
++ * root (e.g. identifiers returned by the listing) are not prefixed twice.
++ */
++export function resolveMediaKey(
++  key: unknown,
++  mediaRoot = '',
++  label = 'key'
++): string {
++  const relative = cleanRelative(key, label);
++  if (!relative) {
++    throw new InvalidMediaKeyError(`${label} is required`);
++  }
++  if (!mediaRoot || relative.startsWith(mediaRoot)) {
++    return relative;
++  }
++  return mediaRoot + relative;
++}
++
++/**
++ * Resolves a directory against the media root, returning a listing prefix
++ * (`''` or ending in `/`). A single leading slash denotes the area's root.
++ */
++export function resolveMediaDirectory(
++  directory: unknown,
++  mediaRoot = '',
++  label = 'directory'
++): string {
++  if (directory === undefined || directory === null) directory = '';
++  if (typeof directory === 'string') directory = directory.replace(/^\//, '');
++  const relative = cleanRelative(directory, label);
++  return mediaRoot + (relative ? relative + '/' : '');
++}
++
++/**
++ * Validates a caller-supplied file name: it must be a single, non-empty path
++ * segment. `undefined` is accepted (the name was not supplied).
++ */
++export function assertSafeFilename(name: unknown, label = 'filename') {
++  if (name === undefined) return;
++  const value = Array.isArray(name) ? name : [name];
++  for (const v of value) {
++    const segment = cleanRelative(v, label);
++    if (!segment || segment.includes('/') || segment !== v) {
++      throw new InvalidMediaKeyError(`${label} must be a single path segment`);
++    }
++  }
++}
+diff --git a/packages/next-tinacms-s3/src/app-handlers.ts b/packages/next-tinacms-s3/src/app-handlers.ts
+index a5b8b51..db50416 100644
+--- a/packages/next-tinacms-s3/src/app-handlers.ts
++++ b/packages/next-tinacms-s3/src/app-handlers.ts
+@@ -19,6 +19,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+ import type { Media, MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { NextResponse } from 'next/server';
++import {
++  normalizeMediaRoot,
++  resolveMediaDirectory,
++  resolveMediaKey,
++} from './media-key';
+ 
+ export interface S3AppRouterConfig {
+   config: S3ClientConfig;
+@@ -49,14 +54,13 @@ function stripMediaRoot(mediaRoot: string, key: string) {
+ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
+-  let mediaRoot = config.mediaRoot || '';
+-  if (mediaRoot) {
+-    if (!mediaRoot.endsWith('/')) {
+-      mediaRoot = mediaRoot + '/';
+-    }
+-    if (mediaRoot.startsWith('/')) {
+-      mediaRoot = mediaRoot.substr(1);
+-    }
++  const mediaRoot = normalizeMediaRoot(config.mediaRoot);
++
++  function badRequest(e: unknown) {
++    return NextResponse.json(
++      { message: (e as Error)?.message || 'invalid key' },
++      { status: 400 }
++    );
+   }
+ 
+   function withAuth(
+@@ -76,13 +80,17 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+   async function listMedia(request: Request) {
+     const url = new URL(request.url);
+     const directory = url.searchParams.get('directory') || '';
+-    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-    if (prefix) prefix = prefix + '/';
++    let prefix: string;
++    try {
++      prefix = resolveMediaDirectory(directory, mediaRoot);
++    } catch (e) {
++      return badRequest(e);
++    }
+ 
+     const params: ListObjectsCommandInput = {
+       Bucket: bucket,
+       Delimiter: '/',
+-      Prefix: mediaRoot ? path.join(mediaRoot, prefix) : prefix,
++      Prefix: prefix,
+       MaxKeys: 500,
+     };
+     const response = await client.send(new ListObjectsCommand(params));
+@@ -125,10 +133,18 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+     GET(request: Request) {
+       return withAuth(async (req) => {
+         const url = new URL(req.url);
+-        const key = url.searchParams.get('key');
+-        if (!key) {
++        if (!url.searchParams.has('key')) {
+           return listMedia(req);
+         }
++        let key: string;
++        try {
++          // every supplied value must be valid; the first one is used
++          key = url.searchParams
++            .getAll('key')
++            .map((k) => resolveMediaKey(k, mediaRoot))[0];
++        } catch (e) {
++          return badRequest(e);
++        }
+         const expiresIn = Number(url.searchParams.get('expiresIn')) || 3600;
+         const signedUrl = await getSignedUrl(
+           client,
+@@ -142,13 +158,20 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+     POST(request: Request) {
+       return withAuth(async (req) => {
+         const url = new URL(req.url);
+-        const key = url.searchParams.get('key');
+-        if (!key) {
++        if (!url.searchParams.has('key')) {
+           return NextResponse.json(
+             { message: 'key is required' },
+             { status: 400 }
+           );
+         }
++        let key: string;
++        try {
++          key = url.searchParams
++            .getAll('key')
++            .map((k) => resolveMediaKey(k, mediaRoot))[0];
++        } catch (e) {
++          return badRequest(e);
++        }
+         const body = Buffer.from(await req.arrayBuffer());
+         const contentType =
+           req.headers.get('content-type') || 'application/octet-stream';
+@@ -168,7 +191,12 @@ export const createMediaHandlers = (config: S3AppRouterConfig) => {
+       return withAuth(async (_req, ctx) => {
+         const media = ctx?.params?.media || [];
+         const [, ...rest] = media;
+-        const objectKey = rest.join('/');
++        let objectKey: string;
++        try {
++          objectKey = resolveMediaKey(rest.join('/'), mediaRoot);
++        } catch (e) {
++          return badRequest(e);
++        }
+ 
+         const params: DeleteObjectCommandInput = {
+           Bucket: bucket,
+diff --git a/packages/next-tinacms-s3/src/batch-delete.ts b/packages/next-tinacms-s3/src/batch-delete.ts
+index 440230f..e4d7efb 100644
+--- a/packages/next-tinacms-s3/src/batch-delete.ts
++++ b/packages/next-tinacms-s3/src/batch-delete.ts
+@@ -13,6 +13,7 @@ import {
+   S3ClientConfig,
+ } from '@aws-sdk/client-s3';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import { normalizeMediaRoot, resolveMediaKey } from './media-key';
+ 
+ export interface S3BatchDeleteConfig {
+   config: S3ClientConfig;
+@@ -31,6 +32,7 @@ const findErrorMessage = (e: any) => {
+ export const createBatchDeleteHandler = (config: S3BatchDeleteConfig) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
++  const mediaRoot = normalizeMediaRoot(config.mediaRoot);
+ 
+   return async (req: NextApiRequest, res: NextApiResponse) => {
+     const isAuthorized = await config.authorized(req, res);
+@@ -48,11 +50,18 @@ export const createBatchDeleteHandler = (config: S3BatchDeleteConfig) => {
+     if (!selected.length) {
+       return res.status(400).json({ message: 'keys are required' });
+     }
++    // refuse the whole batch if any key falls outside the media area
++    let resolved: string[];
++    try {
++      resolved = selected.map((key) => resolveMediaKey(key, mediaRoot));
++    } catch (e) {
++      return res.status(400).json({ message: findErrorMessage(e) });
++    }
+ 
+     const params: DeleteObjectsCommandInput = {
+       Bucket: bucket,
+       Delete: {
+-        Objects: selected.map((key) => ({ Key: key })),
++        Objects: resolved.map((key) => ({ Key: key })),
+         Quiet: true,
+       },
+     };
+diff --git a/packages/next-tinacms-s3/src/handlers.ts b/packages/next-tinacms-s3/src/handlers.ts
+index 729abc0..bcea983 100644
+--- a/packages/next-tinacms-s3/src/handlers.ts
++++ b/packages/next-tinacms-s3/src/handlers.ts
+@@ -18,6 +18,11 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+ import { Media, MediaListOptions } from 'tinacms';
+ import path from 'node:path';
+ import { NextApiRequest, NextApiResponse } from 'next';
++import {
++  normalizeMediaRoot,
++  resolveMediaDirectory,
++  resolveMediaKey,
++} from './media-key';
+ 
+ export interface S3Config {
+   config: S3ClientConfig;
+@@ -40,15 +45,7 @@ export const createMediaHandler = (config: S3Config, options?: S3Options) => {
+   const client = new S3Client(config.config);
+   const bucket = config.bucket;
+   const region = config.config.region || 'us-east-1';
+-  let mediaRoot = config.mediaRoot || '';
+-  if (mediaRoot) {
+-    if (!mediaRoot.endsWith('/')) {
+-      mediaRoot = mediaRoot + '/';
+-    }
+-    if (mediaRoot.startsWith('/')) {
+-      mediaRoot = mediaRoot.substr(1);
+-    }
+-  }
++  const mediaRoot = normalizeMediaRoot(config.mediaRoot);
+   const endpoint =
+     config.config.endpoint || `https://s3.${region}.amazonaws.com`;
+   let cdnUrl =
+@@ -65,16 +62,18 @@ export const createMediaHandler = (config: S3Config, options?: S3Options) => {
+     }
+     switch (req.method) {
+       case 'GET':
+-        if (req.query.key) {
++        if (req.query.key !== undefined && req.query.key !== '') {
+           const expiresIn: number =
+             (req.query.expiresIn && Number(req.query.expiresIn)) || 3600;
+-          const s3_key = req.query.key
+-            ? Array.isArray(req.query.key)
+-              ? req.query.key[0]
+-              : req.query.key
+-            : null;
+-          if (!s3_key) {
+-            return res.status(400).json({ message: 'key is required' });
++          let s3_key: string;
++          try {
++            const keys = Array.isArray(req.query.key)
++              ? req.query.key
++              : [req.query.key];
++            // every supplied value must be valid; the first one is used
++            s3_key = keys.map((k) => resolveMediaKey(k, mediaRoot))[0];
++          } catch (e) {
++            return res.status(400).json({ message: findErrorMessage(e) });
+           }
+           if (await keyExists(client, bucket, s3_key)) {
+             return res.status(400).json({ message: 'key already exists' });
+@@ -90,7 +89,7 @@ export const createMediaHandler = (config: S3Config, options?: S3Options) => {
+         }
+         return listMedia(req, res, client, bucket, mediaRoot, cdnUrl);
+       case 'DELETE':
+-        return deleteAsset(req, res, client, bucket);
++        return deleteAsset(req, res, client, bucket, mediaRoot);
+       default:
+         res.end(404);
+     }
+@@ -130,13 +129,18 @@ async function listMedia(
+       offset,
+     } = req.query as MediaListOptions;
+ 
+-    let prefix = directory.replace(/^\//, '').replace(/\/$/, '');
+-    if (prefix) prefix = prefix + '/';
++    let fullPrefix: string;
++    try {
++      fullPrefix = resolveMediaDirectory(directory, mediaRoot);
++    } catch (e) {
++      return res.status(400).json({ message: findErrorMessage(e) });
++    }
++    const prefix = fullPrefix.slice(mediaRoot.length);
+ 
+     const params: ListObjectsCommandInput = {
+       Bucket: bucket,
+       Delimiter: '/',
+-      Prefix: mediaRoot ? path.join(mediaRoot, prefix) : prefix,
++      Prefix: fullPrefix,
+       Marker: offset?.toString(),
+       MaxKeys: directory && !offset ? +limit + 1 : +limit,
+     };
+@@ -200,10 +204,17 @@ async function deleteAsset(
+   req: NextApiRequest,
+   res: NextApiResponse,
+   client: S3Client,
+-  bucket: string
++  bucket: string,
++  mediaRoot: string
+ ) {
+   const { media } = req.query;
+-  const [, objectKey] = media as string[];
++  const segments = Array.isArray(media) ? media.slice(1) : [];
++  let objectKey: string;
++  try {
++    objectKey = resolveMediaKey(segments.join('/'), mediaRoot);
++  } catch (e) {
++    return res.status(400).json({ message: findErrorMessage(e) });
++  }
+ 
+   const params: DeleteObjectCommandInput = {
+     Bucket: bucket,
+diff --git a/packages/next-tinacms-s3/src/media-key.ts b/packages/next-tinacms-s3/src/media-key.ts
+new file mode 100644
+index 0000000..53d2dff
+--- /dev/null
++++ b/packages/next-tinacms-s3/src/media-key.ts
+@@ -0,0 +1,108 @@
++/**
++ * Resolution of caller-supplied media keys / directories.
++ *
++ * Every object key or directory that reaches the storage service must stay
++ * inside the media area: relative, free of NUL bytes and backslashes, and not
++ * climbing above the area with `..`. When a media root is configured the
++ * resolved value always lives at or below that root.
++ */
++
++import path from 'path';
++
++export class InvalidMediaKeyError extends Error {
++  status = 400;
++  constructor(message: string) {
++    super(message);
++    this.name = 'InvalidMediaKeyError';
++  }
++}
++
++/** Normalizes a configured media root to `''` or `a/b/`. */
++export function normalizeMediaRoot(mediaRoot?: string): string {
++  if (!mediaRoot) return '';
++  const normalized = path.posix
++    .normalize(mediaRoot.replace(/^\/+/, ''))
++    .replace(/\/+$/, '');
++  if (!normalized || normalized === '.') return '';
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new Error('invalid mediaRoot');
++  }
++  return normalized + '/';
++}
++
++function cleanRelative(value: unknown, label: string): string {
++  if (typeof value !== 'string') {
++    throw new InvalidMediaKeyError(`${label} must be a single string`);
++  }
++  if (value.includes('\0')) {
++    throw new InvalidMediaKeyError(`${label} must not contain NUL bytes`);
++  }
++  if (value.includes('\\')) {
++    throw new InvalidMediaKeyError(`${label} must not contain backslashes`);
++  }
++  if (value.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  if (/^[A-Za-z]:/.test(value)) {
++    throw new InvalidMediaKeyError(`${label} must not contain a drive letter`);
++  }
++  let normalized = path.posix.normalize(value || '.');
++  if (normalized === '..' || normalized.startsWith('../')) {
++    throw new InvalidMediaKeyError(`${label} must stay inside the media area`);
++  }
++  normalized = normalized.replace(/\/+$/, '');
++  if (normalized === '.' || normalized === '') return '';
++  if (normalized.startsWith('/')) {
++    throw new InvalidMediaKeyError(`${label} must be relative`);
++  }
++  return normalized;
++}
++
++/**
++ * Resolves an object key against the media root. Keys that already carry the
++ * root (e.g. identifiers returned by the listing) are not prefixed twice.
++ */
++export function resolveMediaKey(
++  key: unknown,
++  mediaRoot = '',
++  label = 'key'
++): string {
++  const relative = cleanRelative(key, label);
++  if (!relative) {
++    throw new InvalidMediaKeyError(`${label} is required`);
++  }
++  if (!mediaRoot || relative.startsWith(mediaRoot)) {
++    return relative;
++  }
++  return mediaRoot + relative;
++}
++
++/**
++ * Resolves a directory against the media root, returning a listing prefix
++ * (`''` or ending in `/`). A single leading slash denotes the area's root.
++ */
++export function resolveMediaDirectory(
++  directory: unknown,
++  mediaRoot = '',
++  label = 'directory'
++): string {
++  if (directory === undefined || directory === null) directory = '';
++  if (typeof directory === 'string') directory = directory.replace(/^\//, '');
++  const relative = cleanRelative(directory, label);
++  return mediaRoot + (relative ? relative + '/' : '');
++}
++
++/**
++ * Validates a caller-supplied file name: it must be a single, non-empty path
++ * segment. `undefined` is accepted (the name was not supplied).
++ */
++export function assertSafeFilename(name: unknown, label = 'filename') {
++  if (name === undefined) return;
++  const value = Array.isArray(name) ? name : [name];
++  for (const v of value) {
++    const segment = cleanRelative(v, label);
++    if (!segment || segment.includes('/') || segment !== v) {
++      throw new InvalidMediaKeyError(`${label} must be a single path segment`);
++    }
++  }
++}

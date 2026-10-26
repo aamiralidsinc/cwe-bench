@@ -1,0 +1,200 @@
+diff --git a/lib/four-oh-four.js b/lib/four-oh-four.js
+index f71214c2..711170be 100644
+--- a/lib/four-oh-four.js
++++ b/lib/four-oh-four.js
+@@ -12,12 +12,17 @@ const {
+   kFourOhFourContext,
+   kHooks,
+   kErrorHandler,
+-  kLogController
++  kLogController,
++  kSchemaController,
++  kOptions
+ } = require('./symbols.js')
+ const { lifecycleHooks } = require('./hooks')
+ const { buildErrorHandler } = require('./error-handler.js')
++const { normalizeSchema } = require('./schemas')
++const { compileSchemasForValidation } = require('./validation')
+ const {
+-  FST_ERR_NOT_FOUND
++  FST_ERR_NOT_FOUND,
++  FST_ERR_SCH_VALIDATION_BUILD
+ } = require('./errors')
+ const { createChildLogger } = require('./logger-factory')
+ const { getGenReqId } = require('./req-id-gen-factory.js')
+@@ -149,6 +154,7 @@ function fourOhFour (options) {
+       schema: opts.schema,
+       handler,
+       config: opts.config || {},
++      attachValidation: false,
+       server: this
+     })
+ 
+@@ -163,6 +169,29 @@ function fourOhFour (options) {
+       context.errorHandler = opts.errorHandler
+         ? buildErrorHandler(this[kErrorHandler], opts.errorHandler)
+         : this[kErrorHandler]
++
++      // The not-found handler can declare request schemas like any other
++      // request handler, so they are normalized and compiled here.
++      if (context.schema) {
++        context.schema = normalizeSchema(context.schema, this.initialConfig)
++        const schemaController = this[kSchemaController]
++        const hasValidationSchema = context.schema.body !== undefined ||
++          context.schema.headers !== undefined ||
++          context.schema.querystring !== undefined ||
++          context.schema.params !== undefined
++        if (hasValidationSchema) {
++          schemaController.setupValidator(this[kOptions])
++        }
++        try {
++          compileSchemasForValidation(
++            context,
++            schemaController.validatorCompiler,
++            schemaController.isCustomValidatorCompiler
++          )
++        } catch (error) {
++          throw new FST_ERR_SCH_VALIDATION_BUILD('NOT_FOUND', prefix, error.message)
++        }
++      }
+     })
+ 
+     if (this[kFourOhFourContext] !== null && prefix === '/') {
+diff --git a/lib/request.js b/lib/request.js
+index f58b58e0..096a30a0 100644
+--- a/lib/request.js
++++ b/lib/request.js
+@@ -343,7 +343,7 @@ Object.defineProperties(Request.prototype, {
+   },
+   validateSchema: {
+     value: function (schema, data, httpPart = null) {
+-      if (!schema) {
++      if (schema === undefined) {
+         return true
+       }
+ 
+diff --git a/lib/route.js b/lib/route.js
+index d038bc97..23a00ff0 100644
+--- a/lib/route.js
++++ b/lib/route.js
+@@ -419,10 +419,13 @@ function buildRouting (options) {
+             context.schema = normalizeSchema(context.schema, this.initialConfig)
+ 
+             const schemaController = this[kSchemaController]
+-            const hasValidationSchema = opts.schema.body ||
+-              opts.schema.headers ||
+-              opts.schema.querystring ||
+-              opts.schema.params
++            // A JSON Schema boolean (`false` or `true`) is a valid schema and
++            // must still trigger the validator compiler setup, so presence is
++            // determined from an explicit `undefined` check rather than truthiness.
++            const hasValidationSchema = Object.hasOwn(opts.schema, 'body') ||
++              Object.hasOwn(opts.schema, 'headers') ||
++              Object.hasOwn(opts.schema, 'querystring') ||
++              Object.hasOwn(opts.schema, 'params')
+             if (!opts.validatorCompiler && hasValidationSchema) {
+               schemaController.setupValidator(this[kOptions])
+             }
+diff --git a/lib/schema-defaults.js b/lib/schema-defaults.js
+index 4b75dcb9..d2624a92 100644
+--- a/lib/schema-defaults.js
++++ b/lib/schema-defaults.js
+@@ -25,7 +25,7 @@ function applyDefaultSchema (defaultSchema, routeSchema) {
+     if (part === 'querystring' && schema.query !== undefined) {
+       continue
+     }
+-    if (schema[part] === undefined && defaultSchema[part]) {
++    if (schema[part] === undefined && defaultSchema[part] !== undefined) {
+       schema[part] = defaultSchema[part]
+       applied = true
+     }
+diff --git a/lib/schemas.js b/lib/schemas.js
+index 74b1d051..2e8f4899 100644
+--- a/lib/schemas.js
++++ b/lib/schemas.js
+@@ -61,9 +61,12 @@ function normalizeSchema (routeSchemas, serverOptions) {
+   }
+ 
+   // alias query to querystring schema
+-  if (routeSchemas.query) {
++  // A JSON Schema boolean (`false` or `true`) is a valid schema and must still
++  // be aliased, so presence is determined from an explicit `undefined` check
++  // rather than truthiness.
++  if (Object.hasOwn(routeSchemas, 'query')) {
+     // check if our schema has both querystring and query
+-    if (routeSchemas.querystring) {
++    if (Object.hasOwn(routeSchemas, 'querystring')) {
+       throw new FST_ERR_SCH_DUPLICATE('querystring')
+     }
+     routeSchemas.querystring = routeSchemas.query
+diff --git a/lib/validation.js b/lib/validation.js
+index d66b129a..db3ac950 100644
+--- a/lib/validation.js
++++ b/lib/validation.js
+@@ -225,26 +225,37 @@ function compileSchemasForValidation (context, compile, isCustom) {
+ 
+   const { method, url } = context.config || {}
+ 
++  // JSON Schema Draft 7 defines the boolean `false` (and `true`) as a valid
++  // schema. A present boolean must be passed to the compiler unchanged, so
++  // every request-part schema is selected by an explicit `undefined` check
++  // rather than truthiness. FSTWRN001 is preserved only for schemas that are
++  // explicitly set to `undefined`.
++
+   const headers = schema.headers
+   // the or part is used for backward compatibility
+-  if (headers && (isCustom || Object.getPrototypeOf(headers) !== Object.prototype)) {
+-    // do not mess with schema when custom validator applied, e.g. Joi, Typebox
+-    context[headersSchema] = compile({ schema: headers, method, url, httpPart: 'headers' })
+-  } else if (headers) {
+-    // The header keys are case insensitive
+-    //  https://datatracker.ietf.org/doc/html/rfc2616#section-4.2
+-    const headersSchemaLowerCase = lowerCaseHeadersSchema(headers)
+-    const externalRef = findExternalHeaderRef(headers)
+-    if (externalRef !== undefined) {
+-      FSTSEC002(method, url, externalRef)
++  if (Object.hasOwn(schema, 'headers')) {
++    if (isCustom || typeof headers !== 'object' || headers === null || Object.getPrototypeOf(headers) !== Object.prototype) {
++      // do not mess with schema when custom validator applied, e.g. Joi, Typebox
++      // boolean schemas (true/false) and invalid values are compiled directly
++      context[headersSchema] = compile({ schema: headers, method, url, httpPart: 'headers' })
++    } else {
++      // The header keys are case insensitive
++      //  https://datatracker.ietf.org/doc/html/rfc2616#section-4.2
++      const headersSchemaLowerCase = lowerCaseHeadersSchema(headers)
++      const externalRef = findExternalHeaderRef(headers)
++      if (externalRef !== undefined) {
++        FSTSEC002(method, url, externalRef)
++      }
++      context[headersSchema] = compile({ schema: headersSchemaLowerCase, method, url, httpPart: 'headers' })
+     }
+-    context[headersSchema] = compile({ schema: headersSchemaLowerCase, method, url, httpPart: 'headers' })
+   } else if (Object.hasOwn(schema, 'headers')) {
+     FSTWRN001('headers', method, url)
+   }
+ 
+-  if (schema.body) {
+-    const contentProperty = schema.body.content
++  if (Object.hasOwn(schema, 'body')) {
++    const contentProperty = schema.body !== null && typeof schema.body === 'object'
++      ? schema.body.content
++      : undefined
+     if (contentProperty) {
+       const contentTypeSchemas = {}
+       for (const contentType of Object.keys(contentProperty)) {
+@@ -259,13 +270,13 @@ function compileSchemasForValidation (context, compile, isCustom) {
+     FSTWRN001('body', method, url)
+   }
+ 
+-  if (schema.querystring) {
++  if (Object.hasOwn(schema, 'querystring')) {
+     context[querystringSchema] = compile({ schema: schema.querystring, method, url, httpPart: 'querystring' })
+   } else if (Object.hasOwn(schema, 'querystring')) {
+     FSTWRN001('querystring', method, url)
+   }
+ 
+-  if (schema.params) {
++  if (Object.hasOwn(schema, 'params')) {
+     context[paramsSchema] = compile({ schema: schema.params, method, url, httpPart: 'params' })
+   } else if (Object.hasOwn(schema, 'params')) {
+     FSTWRN001('params', method, url)

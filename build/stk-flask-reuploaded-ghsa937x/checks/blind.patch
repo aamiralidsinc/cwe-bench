@@ -1,0 +1,110 @@
+diff -ruN a/src/flask_uploads/flask_uploads.py b/src/flask_uploads/flask_uploads.py
+--- a/src/flask_uploads/flask_uploads.py	2026-10-26 02:26:23.000000000 +0000
++++ b/src/flask_uploads/flask_uploads.py	2026-10-26 04:30:00.287127409 +0000
+@@ -39,6 +39,19 @@
+     return url + '/'
+ 
+ 
++def _resolved_inside(directory: str, target: str) -> bool:
++    """Tell whether a resolved target stays at, or below, a resolved directory.
++
++    Both arguments are expected to be resolved first, so that symbolic links
++    and relative components cannot make a path look contained while pointing
++    somewhere else.
++    """
++    try:
++        return os.path.commonpath([directory, target]) == directory
++    except ValueError:  # e.g. one path is relative, or another drive
++        return False
++
++
+ def config_for_set(
+         uset: 'UploadSet',
+         app: Flask,
+@@ -276,6 +289,20 @@
+         return ((ext in self.config.allow) or
+                 (ext in self.extensions and ext not in self.config.deny))
+ 
++    def _refused_extensions(self) -> frozenset[str]:
++        """The file types this set refuses, in lowercase.
++
++        The configuration's deny list and the upload set's own exclusions both
++        refuse a type; a type the configuration explicitly allows is never
++        refused, since `extension_allowed` gives the allow list precedence.
++        """
++        allowed = {str(item).lower() for item in self.config.allow}
++        refused = {str(item).lower() for item in self.config.deny}
++        excluded = getattr(self.extensions, 'items', None)
++        if excluded is not None and not callable(excluded):
++            refused.update(str(item).lower() for item in excluded)
++        return frozenset(refused.difference(allowed))
++
+     def get_basename(self, filename: str) -> str:
+         # `secure_filename` is already typed via typeshed
+         # cf https://github.com/python/typeshed/pull/4308
+@@ -305,6 +332,11 @@
+                      are using `name`, you can include the folder in the
+                      `name` instead of explicitly using `folder`, i.e.
+                      ``uset.save(file, name="someguy/photo_123.")``
++
++        The name that will actually be stored is subject to the same type
++        rules as the submitted one, and the save is refused with `ValueError`
++        when the folder or the file would land outside the configured
++        destination.
+         """
+         if not isinstance(storage, FileStorage):
+             raise TypeError("storage must be a werkzeug.FileStorage")
+@@ -313,27 +345,50 @@
+             folder, name = os.path.split(name)
+         if storage.filename is None:
+             raise ValueError("Filename must not be empty!")
+-        basename = self.get_basename(storage.filename)
++        submitted = self.get_basename(storage.filename)
+ 
+-        if not self.file_allowed(storage, basename):
++        if not self.file_allowed(storage, submitted):
+             raise UploadNotAllowed()
+ 
+         if name:
+             if name.endswith('.'):
+-                basename = name + extension(basename)
++                basename = name + extension(submitted)
+             else:
+                 basename = name
++            # The name that will be stored takes over from the submitted one,
++            # so it is held to the same type rule. Its extension is judged
++            # without regard to case, exactly as the submitted name's is.
++            if extension(basename):
++                if not self.file_allowed(storage, lowercase_ext(basename)):
++                    raise UploadNotAllowed()
++        else:
++            basename = submitted
++
++        # A server may read any dot-separated part of a name as a handler
++        # suffix, so a refused type anywhere in the stored name is refused.
++        refused = self._refused_extensions()
++        for part in basename.split('.')[1:]:
++            if part.lower() in refused:
++                raise UploadNotAllowed()
+ 
+         if folder:
+             target_folder = os.path.join(self.config.destination, folder)
+         else:
+             target_folder = self.config.destination
++
++        root = os.path.realpath(self.config.destination)
++        if not _resolved_inside(root, os.path.realpath(target_folder)):
++            raise ValueError(
++                "The upload folder is outside the upload destination")
+         if not os.path.exists(target_folder):
+             os.makedirs(target_folder)
+         if os.path.exists(os.path.join(target_folder, basename)):
+             basename = self.resolve_conflict(target_folder, basename)
+ 
+         target = os.path.join(target_folder, basename)
++        if not _resolved_inside(root, os.path.realpath(target)):
++            raise ValueError(
++                "The upload would be written outside the upload destination")
+         storage.save(target)
+         if folder:
+             return posixpath.join(folder, basename)

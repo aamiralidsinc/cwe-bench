@@ -1,0 +1,370 @@
+diff --git a/src/resources/handlers.ts b/src/resources/handlers.ts
+index da534c6..640c07b 100644
+--- a/src/resources/handlers.ts
++++ b/src/resources/handlers.ts
+@@ -1,5 +1,5 @@
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { KubernetesManager } from "../types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ 
+diff --git a/src/security/kubectl-flags.ts b/src/security/kubectl-flags.ts
+index 2280a4d..4c59799 100644
+--- a/src/security/kubectl-flags.ts
++++ b/src/security/kubectl-flags.ts
+@@ -1,4 +1,8 @@
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
++import {
++  execFileSync,
++  type ExecFileSyncOptionsWithStringEncoding,
++} from "child_process";
+ 
+ // Flags that would let a caller redirect kubectl to a different API server,
+ // substitute credentials, or impersonate another identity. Allowing any of
+@@ -44,16 +48,85 @@ const SHORT_ALIASES = new Set<string>([
+   "s", // -s is an alias for --server
+ ]);
+ 
++// helm exposes the same exfiltration surface as kubectl, under "kube-"
++// prefixed flag names (--kube-apiserver instead of --server). They are
++// dangerous wherever they appear in a fully built argv, regardless of which
++// binary the tool is calling.
++const HELM_DANGEROUS_FLAGS = new Set<string>([
++  "kube-apiserver",
++  "kube-token",
++  "kube-ca-file",
++  "kube-as-user",
++  "kube-as-group",
++  "kube-tls-server-name",
++  "kube-insecure-skip-tls-verify",
++]);
++
++// Flags that select among contexts already present in the operator's
++// configuration. Every tool legitimately emits "--context <value>", and on
++// its own a context cannot redirect the command to another host.
++const CONTEXT_FLAGS = new Set<string>(["context", "kube-context"]);
++
++// Dangerous when they appear anywhere in a fully constructed argv, including
++// bare positional slots. Context selection is excluded for the reason above.
++const ARGV_DANGEROUS_FLAGS = new Set<string>(
++  [...DANGEROUS_FLAGS, ...HELM_DANGEROUS_FLAGS].filter(
++    (name) => !CONTEXT_FLAGS.has(name)
++  )
++);
++
++// Short options that consume the rest of the token as their value. pflag
++// stops walking a shorthand cluster at the first of these, so everything
++// after it inside the token is a value, not another flag.
++const SHORT_VALUE_FLAGS = new Set<string>([
++  "c", // --container
++  "k", // --kustomize
++  "l", // --selector
++  "L", // --label-columns
++  "n", // --namespace
++  "o", // --output
++  "s", // --server
++  "v", // --v
++]);
++
+ function isUnsafeFlagsAllowed(): boolean {
+   return process.env.ALLOW_KUBECTL_UNSAFE_FLAGS === "true";
+ }
+ 
+ function normalizeFlagName(raw: string): string {
+-  // Strip leading dashes; drop "=value" suffix; lowercase.
++  // Strip leading dashes; drop "=value" suffix; lowercase. kubectl and helm
++  // install pflag's word-separator normaliser, so "_" and "-" name the same
++  // long flag.
+   let name = raw.replace(/^-+/, "");
+   const eq = name.indexOf("=");
+   if (eq !== -1) name = name.slice(0, eq);
+-  return name.toLowerCase();
++  return name.toLowerCase().replace(/_/g, "-");
++}
++
++/**
++ * The short-option letters pflag would parse out of a single-dash token.
++ * A boolean shorthand is consumed and the walk continues; a value-taking
++ * shorthand swallows the rest of the token, so the walk stops there.
++ * Returns null for long options and for tokens that are not flags.
++ */
++function shortFlagLetters(raw: string): string[] | null {
++  if (!raw.startsWith("-") || raw.startsWith("--")) return null;
++  const body = raw.slice(1);
++  if (body.length === 0) return null;
++
++  const letters: string[] = [];
++  for (let i = 0; i < body.length; i++) {
++    const letter = body[i];
++    letters.push(letter);
++    if (body[i + 1] === "=") break;
++    if (SHORT_VALUE_FLAGS.has(letter)) break;
++  }
++  return letters;
++}
++
++function hasDangerousShortFlag(raw: string): boolean {
++  const letters = shortFlagLetters(raw);
++  return letters !== null && letters.some((letter) => SHORT_ALIASES.has(letter));
+ }
+ 
+ function isDangerousFlagName(rawName: string, fromArgs: boolean): boolean {
+@@ -105,3 +178,51 @@ export function assertNoDangerousFlags(
+     }
+   }
+ }
++
++/**
++ * Validate a fully constructed kubectl/helm argv before it is executed.
++ *
++ * Every token is a candidate flag: pflag reads any argument beginning with
++ * "-" as an option wherever it sits, so a resource name, node name or
++ * resource type that the caller supplied can select a different API server,
++ * present other credentials or impersonate another identity. A bare "--"
++ * ends the option list; the tokens after it belong to the command being run
++ * in the workload, not to kubectl/helm.
++ *
++ * Short options are matched the way pflag parses them, including a value
++ * attached to the option letter with no separator.
++ */
++export function assertSafeArgv(args: readonly string[]): void {
++  if (isUnsafeFlagsAllowed()) return;
++
++  for (const tok of args) {
++    if (typeof tok !== "string") continue;
++    if (tok === "--") break;
++    if (!tok.startsWith("-")) continue;
++
++    const name = normalizeFlagName(tok);
++    if (CONTEXT_FLAGS.has(name)) continue;
++    if (
++      ARGV_DANGEROUS_FLAGS.has(name) ||
++      SHORT_ALIASES.has(name) ||
++      hasDangerousShortFlag(tok)
++    ) {
++      reject(tok);
++    }
++  }
++}
++
++/**
++ * Drop-in replacement for child_process.execFileSync that runs the argv
++ * guard first. Tool modules import this as `execFileSync`, so every
++ * kubectl/helm call site is covered at one change point.
++ */
++export function execFileSyncSafe(
++  file: string,
++  args: string[],
++  options: ExecFileSyncOptionsWithStringEncoding
++): string {
++  assertSafeArgv(args);
++  return execFileSync(file, args, options) as string;
++}
++
+diff --git a/src/security/process-spawn.ts b/src/security/process-spawn.ts
+new file mode 100644
+index 0000000..def2e86
+--- /dev/null
++++ b/src/security/process-spawn.ts
+@@ -0,0 +1,20 @@
++import {
++  spawn,
++  type SpawnOptions,
++  type ChildProcessWithoutNullStreams,
++} from "child_process";
++import { assertSafeArgv } from "./kubectl-flags.js";
++
++/**
++ * The spawn counterpart of execFileSyncSafe, for commands that stay alive
++ * (port forwarding) or stream their output. Tool modules import this as
++ * `spawn`, so the argv guard runs before every long-lived child is started.
++ */
++export function spawnSafe(
++  file: string,
++  args: string[],
++  options: SpawnOptions = {}
++): ChildProcessWithoutNullStreams {
++  assertSafeArgv(args);
++  return spawn(file, args, options) as ChildProcessWithoutNullStreams;
++}
+diff --git a/src/tools/exec_in_pod.ts b/src/tools/exec_in_pod.ts
+index aa1fcfa..5504333 100644
+--- a/src/tools/exec_in_pod.ts
++++ b/src/tools/exec_in_pod.ts
+@@ -10,7 +10,7 @@
+  */
+ 
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import { contextParameter, namespaceParameter } from "../models/common-parameters.js";
+diff --git a/src/tools/helm-operations.ts b/src/tools/helm-operations.ts
+index 65e8191..8244f9b 100644
+--- a/src/tools/helm-operations.ts
++++ b/src/tools/helm-operations.ts
+@@ -5,7 +5,7 @@
+  * Supports local chart paths, remote repositories, and custom values.
+  */
+ 
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { writeFileSync, unlinkSync } from "fs";
+ import { dump } from "js-yaml";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+diff --git a/src/tools/kubectl-apply.ts b/src/tools/kubectl-apply.ts
+index 51b1abb..145f1b6 100644
+--- a/src/tools/kubectl-apply.ts
++++ b/src/tools/kubectl-apply.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import * as fs from "fs";
+ import * as path from "path";
+diff --git a/src/tools/kubectl-context.ts b/src/tools/kubectl-context.ts
+index 9bc6478..59ae1fe 100644
+--- a/src/tools/kubectl-context.ts
++++ b/src/tools/kubectl-context.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ 
+diff --git a/src/tools/kubectl-create.ts b/src/tools/kubectl-create.ts
+index fd350f2..b0a7ee5 100644
+--- a/src/tools/kubectl-create.ts
++++ b/src/tools/kubectl-create.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import * as fs from "fs";
+ import * as path from "path";
+diff --git a/src/tools/kubectl-delete.ts b/src/tools/kubectl-delete.ts
+index 18d7625..ae7b560 100644
+--- a/src/tools/kubectl-delete.ts
++++ b/src/tools/kubectl-delete.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import * as fs from "fs";
+ import * as path from "path";
+diff --git a/src/tools/kubectl-describe.ts b/src/tools/kubectl-describe.ts
+index aaa3705..77755e6 100644
+--- a/src/tools/kubectl-describe.ts
++++ b/src/tools/kubectl-describe.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import {
+diff --git a/src/tools/kubectl-generic.ts b/src/tools/kubectl-generic.ts
+index e3a7e93..274d436 100644
+--- a/src/tools/kubectl-generic.ts
++++ b/src/tools/kubectl-generic.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import {
+diff --git a/src/tools/kubectl-get.ts b/src/tools/kubectl-get.ts
+index c1df481..8803728 100644
+--- a/src/tools/kubectl-get.ts
++++ b/src/tools/kubectl-get.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import * as yaml from "js-yaml";
+diff --git a/src/tools/kubectl-logs.ts b/src/tools/kubectl-logs.ts
+index ff7c235..bb19c21 100644
+--- a/src/tools/kubectl-logs.ts
++++ b/src/tools/kubectl-logs.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import { streamCommand } from "../utils/log-stream.js";
+diff --git a/src/tools/kubectl-operations.ts b/src/tools/kubectl-operations.ts
+index 977a755..e897a6c 100644
+--- a/src/tools/kubectl-operations.ts
++++ b/src/tools/kubectl-operations.ts
+@@ -1,4 +1,4 @@
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import {
+   ExplainResourceParams,
+   ListApiResourcesParams,
+diff --git a/src/tools/kubectl-patch.ts b/src/tools/kubectl-patch.ts
+index 4e65f90..0983f76 100644
+--- a/src/tools/kubectl-patch.ts
++++ b/src/tools/kubectl-patch.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import * as fs from "fs";
+ import * as path from "path";
+diff --git a/src/tools/kubectl-rollout.ts b/src/tools/kubectl-rollout.ts
+index ce7abe8..31eee24 100644
+--- a/src/tools/kubectl-rollout.ts
++++ b/src/tools/kubectl-rollout.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import { contextParameter, namespaceParameter } from "../models/common-parameters.js";
+diff --git a/src/tools/kubectl-scale.ts b/src/tools/kubectl-scale.ts
+index 30ee083..50dba13 100644
+--- a/src/tools/kubectl-scale.ts
++++ b/src/tools/kubectl-scale.ts
+@@ -1,5 +1,5 @@
+ import { KubernetesManager } from "../types.js";
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ import { contextParameter, namespaceParameter } from "../models/common-parameters.js";
+diff --git a/src/tools/node-management.ts b/src/tools/node-management.ts
+index d74f9f1..78e5e24 100644
+--- a/src/tools/node-management.ts
++++ b/src/tools/node-management.ts
+@@ -6,7 +6,7 @@
+  * Note: Use kubectl_get with resourceType="nodes" to list nodes.
+  */
+ 
+-import { execFileSync } from "child_process";
++import { execFileSyncSafe as execFileSync } from "../security/kubectl-flags.js";
+ import { getSpawnMaxBuffer } from "../config/max-buffer.js";
+ 
+ /**
+diff --git a/src/tools/port_forward.ts b/src/tools/port_forward.ts
+index 802e22f..6825438 100644
+--- a/src/tools/port_forward.ts
++++ b/src/tools/port_forward.ts
+@@ -1,4 +1,4 @@
+-import { spawn } from "child_process";
++import { spawnSafe as spawn } from "../security/process-spawn.js";
+ import { z } from "zod";
+ import { KubernetesManager } from "../utils/kubernetes-manager.js";
+ 

@@ -1,0 +1,122 @@
+diff -ruN /home/mara/.tb-graders/cwe/work/weblate-ds/trees/injected/weblate/auth/models.py /home/mara/.tb-graders/cwe/work/weblate-ds/trees/_variant/weblate/auth/models.py
+--- a/weblate/auth/models.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/auth/models.py	2026-10-24 03:17:54.483819563 +0000
+@@ -977,6 +977,11 @@
+     def needs_project_filter(self):
+         if self.is_superuser:
+             return False
++        if any(
++            key > 0 and permissions == [(None, None)]
++            for key, permissions in self.project_permissions.items()
++        ):
++            return True
+         if self.project_permissions[-SELECTION_ALL]:
+             return False
+         return Project.objects.exclude(
+diff -ruN /home/mara/.tb-graders/cwe/work/weblate-ds/trees/injected/weblate/checks/views.py /home/mara/.tb-graders/cwe/work/weblate-ds/trees/_variant/weblate/checks/views.py
+--- a/weblate/checks/views.py	2026-10-24 03:01:14.028705379 +0000
++++ b/weblate/checks/views.py	2026-10-24 03:17:54.483819563 +0000
+@@ -316,12 +316,7 @@
+ @login_required
+ def check_summary(request: AuthenticatedHttpRequest, check_id):
+     """Return a summary of a check for the AJAX popup."""
+-    obj = get_object_or_404(
+-        Check.objects.filter(
+-            unit__translation__component__project__in=request.user.allowed_projects
+-        ),
+-        pk=check_id,
+-    )
++    obj = get_object_or_404(Check.objects.filter_access(request.user), pk=check_id)
+     if not request.user.has_perm("unit.check", obj):
+         raise PermissionDenied
+     return JsonResponse(
+diff -ruN /home/mara/.tb-graders/cwe/work/weblate-ds/trees/injected/weblate/machinery/views.py /home/mara/.tb-graders/cwe/work/weblate-ds/trees/_variant/weblate/machinery/views.py
+--- a/weblate/machinery/views.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/machinery/views.py	2026-10-24 03:17:54.483819563 +0000
+@@ -473,14 +473,14 @@
+ @require_POST
+ def translate(request: AuthenticatedHttpRequest, unit_id: int, service: str):
+     """AJAX handler for translating."""
+-    unit = get_object_or_404(Unit, pk=unit_id)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=unit_id)
+     return handle_machinery(request, service, unit)
+ 
+ 
+ @require_POST
+ def memory(request: AuthenticatedHttpRequest, unit_id: int):
+     """AJAX handler for translation memory."""
+-    unit = get_object_or_404(Unit, pk=unit_id)
++    unit = get_object_or_404(Unit.objects.filter_access(request.user), pk=unit_id)
+     query = request.POST.get("q")
+     if not query:
+         return HttpResponseBadRequest("Missing search string")
+diff -ruN /home/mara/.tb-graders/cwe/work/weblate-ds/trees/injected/weblate/trans/models/announcement.py /home/mara/.tb-graders/cwe/work/weblate-ds/trees/_variant/weblate/trans/models/announcement.py
+--- a/weblate/trans/models/announcement.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/models/announcement.py	2026-10-24 03:17:54.483819563 +0000
+@@ -129,6 +129,31 @@
+ 
+ 
+ class AnnouncementQuerySet(models.QuerySet["Announcement", "Announcement"]):
++    def filter_access(self, user):
++        if user.is_superuser:
++            return self
++
++        global_scope = Q(
++            project__isnull=True, category__isnull=True, component__isnull=True
++        )
++        project_scope = Q(category__isnull=True, component__isnull=True) & (
++            user.get_project_access_query("project")
++        )
++        category_scope = Q(category__isnull=False, component__isnull=True) & (
++            user.get_project_access_query("category__project")
++        )
++        component_scope = Q(component__isnull=False) & (
++            user.get_project_access_query("component__project")
++        )
++        if user.needs_component_restrictions_filter:
++            component_scope &= Q(component__restricted=False) | Q(
++                component_id__in=user.component_permissions
++            )
++
++        return self.filter(
++            global_scope | project_scope | category_scope | component_scope
++        )
++
+     def order(self):
+         return self.order_by("id")
+ 
+diff -ruN /home/mara/.tb-graders/cwe/work/weblate-ds/trees/injected/weblate/trans/views/changes.py /home/mara/.tb-graders/cwe/work/weblate-ds/trees/_variant/weblate/trans/views/changes.py
+--- a/weblate/trans/views/changes.py	2026-06-12 12:45:03.000000000 +0000
++++ b/weblate/trans/views/changes.py	2026-10-24 03:17:54.483819563 +0000
+@@ -328,16 +328,26 @@
+ 
+ @login_required
+ def show_change(request: AuthenticatedHttpRequest, pk: int):
+-    change = get_object_or_404(Change, pk=pk)
++    accessible_changes = Change.objects.last_changes(request.user)
++    change = get_object_or_404(accessible_changes, pk=pk)
+     acl_obj = change.translation or change.component or change.project
+     if not request.user.has_perm("unit.edit", acl_obj):
+         raise PermissionDenied
+-    others = request.GET.getlist("other")
++    others = []
++    for other in request.GET.getlist("other"):
++        try:
++            others.append(int(other))
++        except ValueError:
++            continue
+     changes = None
+     if others:
+-        changes = Change.objects.filter(pk__in=[*others, change.pk])
+-        for change in changes:
+-            acl_obj = change.translation or change.component or change.project
++        changes = accessible_changes.filter(pk__in=[*others, change.pk])
++        for related_change in changes:
++            acl_obj = (
++                related_change.translation
++                or related_change.component
++                or related_change.project
++            )
+             if not request.user.has_perm("unit.edit", acl_obj):
+                 raise PermissionDenied
+     if change.action not in NOTIFICATIONS_ACTIONS:

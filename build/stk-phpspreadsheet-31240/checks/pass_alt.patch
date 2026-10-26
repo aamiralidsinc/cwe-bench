@@ -1,0 +1,333 @@
+--- a/src/PhpSpreadsheet/Reader/Gnumeric.php
++++ b/src/PhpSpreadsheet/Reader/Gnumeric.php
+@@ -64,6 +64,14 @@
+         ],
+     ];
+ 
++    private int $maxLength;
++
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
++
+     /**
+      * Create a new Gnumeric.
+      */
+@@ -72,6 +80,57 @@
+         parent::__construct();
+         $this->referenceHelper = ReferenceHelper::getInstance();
+         $this->securityScanner = XmlScanner::getInstance($this);
++        $this->maxLength = self::decompressionLimit();
++    }
++
++    public function setMaxLength(int $maxLength): self
++    {
++        $this->maxLength = $maxLength;
++
++        return $this;
++    }
++
++    private static function decompressionLimit(): int
++    {
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $limit *= self::LENGTH_MULTIPLIER[$unit] ?? 1;
++
++        return intdiv($limit, 4);
++    }
++
++    private function boundedGunzip(string $contents): string|false
++    {
++        $tmp = tempnam(sys_get_temp_dir(), 'gnm');
++        if ($tmp === false) {
++            return false;
++        }
++        file_put_contents($tmp, $contents);
++        $fp = @gzopen($tmp, 'rb');
++        if ($fp === false) {
++            @unlink($tmp);
++
++            return false;
++        }
++        $out = '';
++        while (!gzeof($fp)) {
++            $chunk = @gzread($fp, 65536);
++            if ($chunk === false) {
++                $out = false;
++                break;
++            }
++            $out .= $chunk;
++            if (strlen($out) > $this->maxLength) {
++                $out = false;
++                break;
++            }
++        }
++        gzclose($fp);
++        @unlink($tmp);
++
++        return $out;
+     }
+ 
+     /**
+@@ -192,7 +251,7 @@
+             if (str_starts_with($contents, "\x1f\x8b")) {
+                 // Check if gzlib functions are available
+                 if (function_exists('gzdecode')) {
+-                    $contents = @gzdecode($contents);
++                    $contents = $this->boundedGunzip($contents);
+                     if ($contents !== false) {
+                         $data = $contents;
+                     }
+--- a/src/PhpSpreadsheet/Shared/OLERead.php
++++ b/src/PhpSpreadsheet/Shared/OLERead.php
+@@ -61,6 +61,8 @@
+     /** @var mixed[][] */
+     private array $props = [];
+ 
++    private int $chainSteps = 0;
++
+     /**
+      * Read the file.
+      */
+@@ -137,7 +139,9 @@
+ 
+         $sbdBlock = $this->sbdStartBlock;
+         $this->smallBlockChain = '';
++        $this->chainSteps = 0;
+         while ($sbdBlock != -2) {
++            $this->countChainStep();
+             $pos = ($sbdBlock + 1) * self::BIG_BLOCK_SIZE;
+ 
+             $this->smallBlockChain .= substr($this->data, $pos, 4 * $bbs);
+@@ -151,6 +155,14 @@
+         $this->entry = $this->readData($block);
+ 
+         $this->readPropertySets();
++    }
++
++    private function countChainStep(): void
++    {
++        $max = max(1024, 4 * intdiv(max(1, strlen($this->data)), self::BIG_BLOCK_SIZE));
++        if (++$this->chainSteps > $max) {
++            throw new ReaderException('Detected loop while iterating blocks');
++        }
+     }
+ 
+     /**
+@@ -172,7 +184,9 @@
+             /** @var int */
+             $block = $this->props[$stream]['startBlock'];
+ 
++            $this->chainSteps = 0;
+             while ($block != -2) {
++                $this->countChainStep();
+                 $pos = $block * self::SMALL_BLOCK_SIZE;
+                 $streamData .= substr($rootdata, $pos, self::SMALL_BLOCK_SIZE);
+ 
+@@ -195,7 +209,9 @@
+         /** @var int */
+         $block = $this->props[$stream]['startBlock'];
+ 
++        $this->chainSteps = 0;
+         while ($block != -2) {
++            $this->countChainStep();
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $streamData .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);
+@@ -215,7 +231,9 @@
+     {
+         $data = '';
+ 
++        $this->chainSteps = 0;
+         while ($block != -2) {
++            $this->countChainStep();
+             $pos = ($block + 1) * self::BIG_BLOCK_SIZE;
+             $data .= substr($this->data, $pos, self::BIG_BLOCK_SIZE);
+             $block = self::getInt4d($this->bigBlockChain, $block * 4);
+--- a/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php
++++ b/src/PhpSpreadsheet/Shared/OLE/ChainedBlockStream.php
+@@ -75,7 +75,12 @@
+         if (isset($this->params['size']) && $this->params['size'] < $this->ole->bigBlockThreshold && $blockId != $this->ole->root->startBlock) {
+             // Block id refers to small blocks
+             $rootPos = $this->ole->getBlockOffset((int) $this->ole->root->startBlock);
++            $steps = 0;
++            $maxSteps = $this->maxChainSteps();
+             while ($blockId != -2) {
++                if (++$steps > $maxSteps) {
++                    throw new Exception('Detected loop while iterating blocks');
++                }
+                 /** @var int $blockId */
+                 $pos = $rootPos + $blockId * $this->ole->bigBlockSize;
+                 $blockId = $this->ole->sbat[$blockId];
+@@ -84,7 +89,12 @@
+             }
+         } else {
+             // Block id refers to big blocks
++            $steps = 0;
++            $maxSteps = $this->maxChainSteps();
+             while ($blockId != -2) {
++                if (++$steps > $maxSteps) {
++                    throw new Exception('Detected loop while iterating blocks');
++                }
+                 /** @var int $blockId */
+                 $pos = $this->ole->getBlockOffset($blockId);
+                 fseek($this->ole->_file_handle, $pos);
+@@ -101,6 +111,14 @@
+         }
+ 
+         return true;
++    }
++
++    private function maxChainSteps(): int
++    {
++        $stat = fstat($this->ole->_file_handle);
++        $size = is_array($stat) ? (int) $stat['size'] : 0;
++
++        return max(1024, 4 * intdiv(max(1, $size), $this->ole->bigBlockSize));
+     }
+ 
+     /**
+--- a/src/PhpSpreadsheet/Reader/Xlsx.php
++++ b/src/PhpSpreadsheet/Reader/Xlsx.php
+@@ -50,6 +50,12 @@
+ {
+     const INITIAL_FILE = '_rels/.rels';
+ 
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
++
+     /**
+      * ReferenceHelper instance.
+      */
+@@ -412,19 +418,41 @@
+         // Sadly, some 3rd party xlsx generators don't use consistent case for filenaming
+         //    so we need to load case-insensitively from the zip file
+ 
+-        $contents = $archive->getFromName($fileName, 0, ZipArchive::FL_NOCASE);
++        $contents = $this->getZipEntry($archive, $fileName);
+ 
+         // Apache POI fixes
+         if ($contents === false) {
+-            $contents = $archive->getFromName(substr($fileName, 1), 0, ZipArchive::FL_NOCASE);
++            $contents = $this->getZipEntry($archive, substr($fileName, 1));
+         }
+ 
+         // Has the file been saved with Windoze directory separators rather than unix?
+         if ($contents === false) {
+-            $contents = $archive->getFromName(str_replace('/', '\\', $fileName), 0, ZipArchive::FL_NOCASE);
++            $contents = $this->getZipEntry($archive, str_replace('/', '\\', $fileName));
+         }
+ 
+         return ($contents === false) ? '' : $contents;
++    }
++
++    private static function decompressionLimit(): int
++    {
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $limit *= self::LENGTH_MULTIPLIER[$unit] ?? 1;
++
++        return intdiv($limit, 4);
++    }
++
++    private function getZipEntry(ZipArchive $archive, string $fileName): string|false
++    {
++        $limit = self::decompressionLimit();
++        $contents = $archive->getFromName($fileName, $limit + 1, ZipArchive::FL_NOCASE);
++        if ($contents !== false && strlen($contents) > $limit) {
++            throw new Exception('Archive entry exceeds the configured decompression limit');
++        }
++
++        return $contents;
+     }
+ 
+     /**
+--- a/src/PhpSpreadsheet/Reader/Ods.php
++++ b/src/PhpSpreadsheet/Reader/Ods.php
+@@ -39,6 +39,12 @@
+ class Ods extends BaseReader
+ {
+     const INITIAL_FILE = 'content.xml';
++
++    private const LENGTH_MULTIPLIER = [
++        'G' => 1024 * 1024 * 1024,
++        'M' => 1024 * 1024,
++        'K' => 1024,
++    ];
+ 
+     /**
+      * Create a new Ods Reader instance.
+@@ -305,6 +311,28 @@
+ 
+     private int $highestDataIndex;
+ 
++    private static function decompressionLimit(): int
++    {
++        $limit = ini_get('memory_limit') ?: '128M';
++        $limit = trim(str_replace('-1', '128M', $limit));
++        $unit = strtoupper(substr($limit, -1));
++        $limit = (int) $limit;
++        $limit *= self::LENGTH_MULTIPLIER[$unit] ?? 1;
++
++        return intdiv($limit, 4);
++    }
++
++    private function getZipEntry(ZipArchive $zip, string $name): string|false
++    {
++        $limit = self::decompressionLimit();
++        $contents = $zip->getFromName($name, $limit + 1);
++        if ($contents !== false && strlen($contents) > $limit) {
++            throw new Exception('Archive entry exceeds the configured decompression limit');
++        }
++
++        return $contents;
++    }
++
+     /**
+      * Loads PhpSpreadsheet from file into PhpSpreadsheet instance.
+      */
+@@ -319,7 +347,7 @@
+ 
+         $xml = @simplexml_load_string(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('meta.xml'))
++                ->scan($this->getZipEntry($zip, 'meta.xml'))
+         );
+         if ($xml === false) {
+             throw new Exception('Unable to read data from {$pFilename}');
+@@ -336,7 +364,7 @@
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('styles.xml'))
++                ->scan($this->getZipEntry($zip, 'styles.xml'))
+         );
+         $officeNs = (string) $dom->lookupNamespaceUri('office');
+         $styleNs = (string) $dom->lookupNamespaceUri('style');
+@@ -406,7 +434,7 @@
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName(self::INITIAL_FILE))
++                ->scan($this->getZipEntry($zip, self::INITIAL_FILE))
+         );
+ 
+         $pageSettings->readStyleCrossReferences($dom);
+@@ -1363,7 +1391,7 @@
+         $dom = new DOMDocument('1.01', 'UTF-8');
+         $dom->loadXML(
+             $this->getSecurityScannerOrThrow()
+-                ->scan($zip->getFromName('settings.xml'))
++                ->scan($this->getZipEntry($zip, 'settings.xml'))
+         );
+         $configNs = (string) $dom->lookupNamespaceUri('config');
+         $officeNs = (string) $dom->lookupNamespaceUri('office');

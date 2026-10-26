@@ -1,0 +1,350 @@
+diff -ruN a/src/purify.ts b/src/purify.ts
+--- a/src/purify.ts
++++ b/src/purify.ts
+@@ -1316,6 +1316,18 @@
+ 
+       if (nodeType === NODE_TYPE.element) {
+         _stripDisallowedAttributes(node as Element);
++
++        /* A detached host takes its shadow tree out of the document with it,
++           but the shadow content is not part of childNodes. Descend into it
++           explicitly: once the host is gone, nothing in that shadow tree can
++           still be considered reachable, so a handler left there would fire
++           exactly like one on a detached light-DOM node. */
++        const shadowRoot = getShadowRoot
++          ? getShadowRoot(node as Element)
++          : null;
++        if (_isDocumentFragment(shadowRoot)) {
++          stack.push(shadowRoot as Node);
++        }
+       }
+ 
+       const childNodes = getChildNodes(node);
+@@ -1328,6 +1340,106 @@
+   };
+ 
+   /**
++   * _collectElements
++   *
++   * Snapshot the element descendants of `root` reached through childNodes
++   * only. Shadow roots and <template>.content are excluded on purpose: each
++   * is walked as its own subtree by _sanitizeShadowDOM, so containment has to
++   * be judged against the fragment that walk was rooted at, not against the
++   * light tree above it.
++   *
++   * @param root the subtree root
++   * @return every descendant element, in document order
++   */
++  const _collectElements = function (root: Node): Element[] {
++    const elements: Element[] = [];
++    const stack: Node[] = [];
++    const childNodes = getChildNodes(root);
++    if (childNodes) {
++      for (let i = childNodes.length - 1; i >= 0; --i) {
++        arrayPush(stack, childNodes[i]);
++      }
++    }
++
++    while (stack.length > 0) {
++      const node = stack.pop();
++      const nodeType = getNodeType ? getNodeType(node) : (node as any).nodeType;
++      if (nodeType === NODE_TYPE.element) {
++        arrayPush(elements, node as Element);
++      }
++
++      const children = getChildNodes(node);
++      if (children) {
++        for (let i = children.length - 1; i >= 0; --i) {
++          arrayPush(stack, children[i]);
++        }
++      }
++    }
++
++    return elements;
++  };
++
++  /**
++   * _isWithinSanitizedTree
++   *
++   * Membership test used by the end-of-call sweep. A node still belongs to
++   * the tree when its parent chain reaches the current walk root or the
++   * caller's live root. The live-root arm matters when a hook moves a node
++   * out of a shadow tree into the light tree: it is attached, just elsewhere.
++   *
++   * @param node the node to test
++   * @param walkRoot the root of the walk that snapshotted `node`
++   * @param liveRoot the caller's in-place root
++   * @return true when the node is still part of the sanitized tree
++   */
++  const _isWithinSanitizedTree = function (
++    node: Node,
++    walkRoot: Node,
++    liveRoot: Node
++  ): boolean {
++    let current: Node | null = node;
++    while (current) {
++      if (current === walkRoot || current === liveRoot) {
++        return true;
++      }
++
++      current = getParentNode(current);
++    }
++
++    return false;
++  };
++
++  /**
++   * _scrubDeparted
++   *
++   * Containment guarantee for nodes that leave the caller's live tree while
++   * an in-place walk is running — a hook detaching the node it was invoked
++   * on, an ancestor of it, or a whole subtree inside an attached shadow root.
++   * The iterator never revisits a detached subtree, so those originals would
++   * otherwise keep their queued resource-event handlers and fire in page
++   * scope after sanitize returned. Every snapshotted element that is no
++   * longer contained in the walk tree is neutralised synchronously, before
++   * the call can return. Judging containment against the walk root (rather
++   * than the node's own parent) also catches an ancestor removal: the node
++   * itself may still have a parent while no chain leads back to the root.
++   *
++   * @param snapshot elements collected when the walk started
++   * @param walkRoot the root this walk was started on
++   * @param liveRoot the caller's in-place root
++   */
++  const _scrubDeparted = function (
++    snapshot: Element[],
++    walkRoot: Node,
++    liveRoot: Node
++  ): void {
++    arrayForEach(snapshot, (element) => {
++      if (!_isWithinSanitizedTree(element, walkRoot, liveRoot)) {
++        _neutralizeSubtree(element);
++      }
++    });
++  };
++
++  /**
+    * _initDocument
+    *
+    * @param dirty - a string of dirty markup
+@@ -2172,56 +2284,79 @@
+    * _sanitizeShadowDOM
+    *
+    * @param fragment to iterate over recursively
++   * @param liveRoot the caller's in-place root, or null on a copy/string path
+    */
+-  const _sanitizeShadowDOM = function (fragment: DocumentFragment): void {
++  const _sanitizeShadowDOM = function (
++    fragment: DocumentFragment,
++    liveRoot: Node | null
++  ): void {
+     let shadowNode = null;
+     const shadowIterator = _createNodeIterator(fragment);
++    /* On an in-place walk, remember every element the fragment starts with.
++       A hook may detach a subtree from inside a shadow tree; the iterator
++       then skips it, but the originals still hold their queued handlers. */
++    const shadowSnapshot = liveRoot ? _collectElements(fragment) : null;
+ 
+     /* Execute a hook if present */
+     _executeHooks(hooks.beforeSanitizeShadowDOM, fragment, null);
+ 
+-    while ((shadowNode = shadowIterator.nextNode())) {
+-      /* Execute a hook if present */
+-      _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
++    try {
++      while ((shadowNode = shadowIterator.nextNode())) {
++        /* Execute a hook if present */
++        _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
+ 
+-      /* Sanitize tags and elements */
+-      _sanitizeElements(shadowNode);
++        /* Sanitize tags and elements */
++        _sanitizeElements(shadowNode);
+ 
+-      /* Check attributes next */
+-      _sanitizeAttributes(shadowNode);
++        /* Check attributes next */
++        _sanitizeAttributes(shadowNode);
++
++        /* Deep shadow DOM detected.
++           Realm-safe check (GHSA-hpcv-96wg-7vj8): use nodeType against the
++           DOCUMENT_FRAGMENT_NODE constant rather than instanceof, so we
++           recurse into <template>.content from foreign realms too. */
++        if (_isDocumentFragment(shadowNode.content)) {
++          _sanitizeShadowDOM(shadowNode.content, liveRoot);
++        }
+ 
+-      /* Deep shadow DOM detected.
+-         Realm-safe check (GHSA-hpcv-96wg-7vj8): use nodeType against the
+-         DOCUMENT_FRAGMENT_NODE constant rather than instanceof, so we
+-         recurse into <template>.content from foreign realms too. */
+-      if (_isDocumentFragment(shadowNode.content)) {
+-        _sanitizeShadowDOM(shadowNode.content);
+-      }
+-
+-      /* An element iterated here may itself host an attached
+-         shadow root. The default NodeIterator does not enter shadow
+-         trees, so a shadow root nested inside template.content was
+-         previously reached by no walk at all (the pre-pass at
+-         _sanitizeAttachedShadowRoots descends via childNodes, which
+-         doesn't enter template.content; the template-content recursion
+-         above iterates the content but never inspected shadowRoot).
+-         Walk it explicitly. The nodeType guard avoids reading
+-         shadowRoot off text / comment / CDATA / PI nodes that the
+-         iterator also surfaces. */
+-      const shadowNodeType = getNodeType
+-        ? getNodeType(shadowNode)
+-        : shadowNode.nodeType;
+-      if (shadowNodeType === NODE_TYPE.element) {
+-        const innerSr = getShadowRoot(shadowNode);
+-        if (_isDocumentFragment(innerSr)) {
+-          _sanitizeAttachedShadowRoots(innerSr);
+-          _sanitizeShadowDOM(innerSr);
++        /* An element iterated here may itself host an attached
++           shadow root. The default NodeIterator does not enter shadow
++           trees, so a shadow root nested inside template.content was
++           previously reached by no walk at all (the pre-pass at
++           _sanitizeAttachedShadowRoots descends via childNodes, which
++           doesn't enter template.content; the template-content recursion
++           above iterates the content but never inspected shadowRoot).
++           Walk it explicitly. The nodeType guard avoids reading
++           shadowRoot off text / comment / CDATA / PI nodes that the
++           iterator also surfaces. */
++        const shadowNodeType = getNodeType
++          ? getNodeType(shadowNode)
++          : shadowNode.nodeType;
++        if (shadowNodeType === NODE_TYPE.element) {
++          const innerSr = getShadowRoot(shadowNode);
++          if (_isDocumentFragment(innerSr)) {
++            _sanitizeAttachedShadowRoots(innerSr, liveRoot);
++            _sanitizeShadowDOM(innerSr, liveRoot);
++          }
+         }
+       }
+-    }
+ 
+-    /* Execute a hook if present */
+-    _executeHooks(hooks.afterSanitizeShadowDOM, fragment, null);
++      /* Execute a hook if present */
++      _executeHooks(hooks.afterSanitizeShadowDOM, fragment, null);
++    } catch (error) {
++      /* Fail closed: an aborted shadow walk leaves whatever follows the
++         abort unsanitized inside a tree that is still attached. Strip this
++         fragment before the error propagates. */
++      if (shadowSnapshot) {
++        _neutralizeSubtree(fragment);
++      }
++
++      throw error;
++    } finally {
++      if (shadowSnapshot) {
++        _scrubDeparted(shadowSnapshot, fragment, liveRoot as Node);
++      }
++    }
+   };
+ 
+   /**
+@@ -2242,8 +2377,12 @@
+    * untouched — string-input paths are not affected.
+    *
+    * @param root the subtree root to walk for attached shadow roots
++   * @param liveRoot the caller's in-place root, or null on a copy/string path
+    */
+-  const _sanitizeAttachedShadowRoots = function (root: Node): void {
++  const _sanitizeAttachedShadowRoots = function (
++    root: Node,
++    liveRoot: Node | null
++  ): void {
+     /* Iterative (explicit stack) rather than per-child recursion. DOM APIs
+        impose no depth cap, so an attacker-shaped tree (JSON/CRDT/editor data
+        built straight into the DOM — the IN_PLACE surface) deeper than the JS
+@@ -2268,7 +2407,7 @@
+ 
+       /* Deferred shadow-DOM sanitisation: runs after its subtree was walked. */
+       if (item.shadow) {
+-        _sanitizeShadowDOM(item.shadow);
++        _sanitizeShadowDOM(item.shadow, liveRoot);
+         continue;
+       }
+ 
+@@ -2325,6 +2464,8 @@
+     let importedNode = null;
+     let currentNode = null;
+     let returnNode = null;
++    /* Element snapshot for an in-place walk (null on every other path). */
++    let liveSnapshot: Element[] | null = null;
+     /* Make sure we have a string to sanitize.
+       DO NOT return early, as this will return the wrong type if
+       the user has requested a DOM object rather than a string */
+@@ -2424,15 +2565,23 @@
+         );
+       }
+ 
++      /* In-place only: snapshot the element descendants of the caller's live
++         tree before a single node is touched. Every one of them that is no
++         longer contained in the tree when this call finishes — because a
++         hook detached it, an ancestor, or a custom-element reaction tore the
++         tree down on abort — is neutralised by the sweep below, which is what
++         cancels the resource events already queued on those originals. */
++      liveSnapshot = _collectElements(dirty as Node);
+       /* Sanitize attached shadow roots before the main iterator runs.
+          The iterator does not descend into shadow trees. Same fail-closed
+          barrier as the main walk (campaign-3 F2): a custom-element reaction
+          inside a shadow root could abort this pre-pass before the walk runs,
+          which would otherwise leave the entire live tree unsanitized. */
+       try {
+-        _sanitizeAttachedShadowRoots(dirty as Node);
++        _sanitizeAttachedShadowRoots(dirty as Node, dirty as Node);
+       } catch (error) {
+         _neutralizeRoot(dirty as Node);
++        _scrubDeparted(liveSnapshot, dirty as Node, dirty as Node);
+ 
+         throw error;
+       }
+@@ -2459,7 +2608,7 @@
+          descend into shadow trees. The walk routes every read through a
+          cached prototype getter so clobbering descendants on a form root
+          cannot hide a shadow host from this pass. */
+-      _sanitizeAttachedShadowRoots(importedNode);
++      _sanitizeAttachedShadowRoots(importedNode, null);
+     } else {
+       /* Exit directly if we have nothing to do */
+       if (
+@@ -2513,12 +2662,21 @@
+            instead of instanceof, so foreign-realm <template>.content is
+            walked correctly. */
+         if (_isDocumentFragment(currentNode.content)) {
+-          _sanitizeShadowDOM(currentNode.content);
++          _sanitizeShadowDOM(
++            currentNode.content,
++            inPlace ? (dirty as Node) : null
++          );
+         }
+       }
+     } catch (error) {
+       if (inPlace) {
+         _neutralizeRoot(dirty as Node);
++        /* Nodes that left the tree before the abort — and the ones
++           _neutralizeRoot just detached — are not reached by the root strip;
++           the snapshot sweep is what makes the fail-closed teardown inert. */
++        if (liveSnapshot) {
++          _scrubDeparted(liveSnapshot, dirty as Node, dirty as Node);
++        }
+       }
+ 
+       throw error;
+@@ -2539,6 +2697,14 @@
+         }
+       });
+ 
++      /* The removal inventory is public and a hook may re-enter sanitize,
++         which replaces it; the start-of-call snapshot does not depend on it.
++         Sweep every element the live tree started with that is no longer
++         contained in it (hook/ancestor/shadow detachments). */
++      if (liveSnapshot) {
++        _scrubDeparted(liveSnapshot, dirty as Node, dirty as Node);
++      }
++
+       if (SAFE_FOR_TEMPLATES) {
+         _scrubTemplateExpressions(dirty as Element);
+       }

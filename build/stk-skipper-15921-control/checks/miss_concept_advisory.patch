@@ -1,0 +1,213 @@
+diff --git a/filters/openpolicyagent/body_completeness.go b/filters/openpolicyagent/body_completeness.go
+new file mode 100644
+index 0000000..94ecb72
+--- /dev/null
++++ b/filters/openpolicyagent/body_completeness.go
+@@ -0,0 +1,82 @@
++package openpolicyagent
++
++import (
++	"io"
++	"net/http"
++)
++
++// fillBufferReportingTruncation reads the request body up to the policy's
++// maximum body size and also reports whether the bytes it returns are only a
++// prefix of the client's body.
++//
++// The cap alone cannot answer that question: a body of exactly the configured
++// maximum fills the buffer just like a larger one. When the cap is reached
++// without observing end-of-stream, one further read distinguishes the two
++// cases; the byte it yields stays in the buffer so the rest of the chain can
++// still forward the complete body upstream.
++func (m *bufferedBodyReader) fillBufferReportingTruncation(expectedSize int64) ([]byte, bool, error) {
++	var err error
++
++	for err == nil && int64(m.bodyBuffer.Len()) < m.maxBufferSize && int64(m.bodyBuffer.Len()) < expectedSize {
++		var n int
++		n, err = m.input.Read(m.readBuffer)
++
++		m.bodyBuffer.Write(m.readBuffer[:n])
++	}
++
++	if int64(m.bodyBuffer.Len()) >= m.maxBufferSize && err == nil {
++		var n int
++		n, err = m.input.Read(m.readBuffer)
++		m.bodyBuffer.Write(m.readBuffer[:n])
++		if n > 0 {
++			return m.bodyBuffer.Bytes(), true, nil
++		}
++		if err == io.EOF {
++			return m.bodyBuffer.Bytes(), false, nil
++		}
++		return m.bodyBuffer.Bytes(), false, err
++	}
++
++	if err == io.EOF {
++		err = nil
++	}
++
++	return m.bodyBuffer.Bytes(), false, err
++}
++
++// ExtractHttpBodyOptionallyWithStatus behaves like ExtractHttpBodyOptionally
++// and additionally reports whether the returned body was cut at the configured
++// maximum request body size. A caller that evaluates the body in a policy must
++// pass that value on, so the policy can tell a complete body from a partial one.
++func (opa *OpenPolicyAgentInstance) ExtractHttpBodyOptionallyWithStatus(req *http.Request) (io.ReadCloser, []byte, bool, func(), error) {
++	body := req.Body
++
++	// `req.ContentLength == -1` is set by net/http when the client uses
++	// Transfer-Encoding: chunked (HTTP/1.1) or omits content-length in
++	// HTTP/2 framing. Unknown-length bodies are driven with the policy cap
++	// rather than the negative sentinel, otherwise the fill loop
++	// short-circuits and the policy would evaluate an empty body.
++	expectedSize := req.ContentLength
++	if expectedSize < 0 {
++		expectedSize = opa.maxBodyBytes
++	}
++
++	if body != nil && !opa.EnvoyPluginConfig().SkipRequestBodyParse {
++		wrapper := newBufferedBodyReader(req.Body, opa.maxBodyBytes, opa.bodyReadBufferSize)
++
++		requestedBodyBytes := bodyUpperBound(expectedSize, opa.maxBodyBytes)
++		if !opa.registry.maxMemoryBodyParsingSem.TryAcquire(requestedBodyBytes) {
++			return req.Body, nil, false, func() {}, ErrTotalBodyBytesExceeded
++		}
++
++		rawBody, truncated, err := wrapper.fillBufferReportingTruncation(expectedSize)
++		// The last read may overshoot the cap by up to the read buffer size.
++		if int64(len(rawBody)) > opa.maxBodyBytes {
++			rawBody = rawBody[:opa.maxBodyBytes]
++			truncated = true
++		}
++		return wrapper, rawBody, truncated, func() { opa.registry.maxMemoryBodyParsingSem.Release(requestedBodyBytes) }, err
++	}
++
++	return req.Body, nil, false, func() {}, nil
++}
+diff --git a/filters/openpolicyagent/internal/envoy/body_status_adapter.go b/filters/openpolicyagent/internal/envoy/body_status_adapter.go
+new file mode 100644
+index 0000000..3deaa01
+--- /dev/null
++++ b/filters/openpolicyagent/internal/envoy/body_status_adapter.go
+@@ -0,0 +1,36 @@
++package envoy
++
++import (
++	"net/http"
++
++	ext_authz_v3_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	ext_authz_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
++)
++
++// partialBodyHeader is the header the OPA Envoy plugin reads to decide whether
++// the body it was given is the complete request body.
++const partialBodyHeader = "x-envoy-auth-partial-body"
++
++// AdaptToExtAuthRequestWithBodyStatus behaves like AdaptToExtAuthRequest and
++// additionally records whether rawBody is only a prefix of the client's body.
++// The value is written after the client headers have been copied, so a client
++// cannot supply it itself.
++func AdaptToExtAuthRequestWithBodyStatus(req *http.Request, metadata *ext_authz_v3_core.Metadata, contextExtensions map[string]string, rawBody []byte, bodyTruncated bool) (*ext_authz_v3.CheckRequest, error) {
++	ereq, err := AdaptToExtAuthRequest(req, metadata, contextExtensions, rawBody)
++	if err != nil {
++		return nil, err
++	}
++
++	headers := ereq.GetAttributes().GetRequest().GetHttp().GetHeaders()
++	if headers == nil {
++		headers = make(map[string]string, 1)
++		ereq.Attributes.Request.Http.Headers = headers
++	}
++	if bodyTruncated {
++		headers[partialBodyHeader] = "true"
++	} else {
++		headers[partialBodyHeader] = "false"
++	}
++
++	return ereq, nil
++}
+diff --git a/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go b/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go
+index a84fd04..ffd5d99 100644
+--- a/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go
++++ b/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go
+@@ -11,16 +11,22 @@ import (
+ 
+ // AdaptBodyPrefixToExtAuthRequest composes the ext_authz CheckRequest for a
+ // filter that evaluates only a bounded prefix of the request body.
+-func AdaptBodyPrefixToExtAuthRequest(req *http.Request, metadata *ext_authz_v3_core.Metadata, contextExtensions map[string]string, rawBody []byte) (*ext_authz_v3.CheckRequest, error) {
++func AdaptBodyPrefixToExtAuthRequest(req *http.Request, metadata *ext_authz_v3_core.Metadata, contextExtensions map[string]string, rawBody []byte, bodyTruncated bool) (*ext_authz_v3.CheckRequest, error) {
+ 	if err := validateURLForInvalidUTF8(req.URL); err != nil {
+ 		return nil, fmt.Errorf("invalid url: %w", err)
+ 	}
+ 
+-	headers := make(map[string]string, len(req.Header))
++	headers := make(map[string]string, len(req.Header)+1)
+ 	for h, vv := range req.Header {
+ 		headers[strings.ToLower(h)] = strings.Join(vv, ", ")
+ 	}
+ 
++	if bodyTruncated {
++		headers["x-envoy-auth-partial-body"] = "true"
++	} else {
++		headers["x-envoy-auth-partial-body"] = "false"
++	}
++
+ 	ereq := &ext_authz_v3.CheckRequest{
+ 		Attributes: &ext_authz_v3.AttributeContext{
+ 			Request: &ext_authz_v3.AttributeContext_Request{
+diff --git a/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
+index 56317e4..9b6795e 100644
+--- a/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
++++ b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
+@@ -70,19 +70,21 @@ func (f *opaAuthorizeRequestBodyPrefixFilter) Request(fc filters.FilterContext)
+ 	}
+ 
+ 	var rawBodyBytes []byte
++	var bodyTruncated bool
+ 	if req.Body != nil {
+ 		buf := make([]byte, DefaultBodyPrefixSize+1)
+ 		n, _ := io.ReadFull(req.Body, buf)
+ 		rawBodyBytes = buf[:n]
+ 		if len(rawBodyBytes) > DefaultBodyPrefixSize {
+ 			rawBodyBytes = rawBodyBytes[:DefaultBodyPrefixSize]
++			bodyTruncated = true
+ 		}
+ 		// Hand the whole body to the rest of the chain, including the byte that
+ 		// was read only to see whether the prefix was complete.
+ 		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), req.Body))
+ 	}
+ 
+-	authzreq, err := envoy.AdaptBodyPrefixToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), nil, rawBodyBytes)
++	authzreq, err := envoy.AdaptBodyPrefixToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), nil, rawBodyBytes, bodyTruncated)
+ 	if err != nil {
+ 		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
+ 		return
+diff --git a/filters/openpolicyagent/opaserveresponse/opaserveresponse.go b/filters/openpolicyagent/opaserveresponse/opaserveresponse.go
+index 757abf2..f07e1b1 100644
+--- a/filters/openpolicyagent/opaserveresponse/opaserveresponse.go
++++ b/filters/openpolicyagent/opaserveresponse/opaserveresponse.go
+@@ -109,11 +109,12 @@ func (f *opaServeResponseFilter) Request(fc filters.FilterContext) {
+ 	}
+ 
+ 	var rawBodyBytes []byte
++	var bodyTruncated bool
+ 	if f.bodyParsing {
+ 		var body io.ReadCloser
+ 		var err error
+ 		var finalizer func()
+-		body, rawBodyBytes, finalizer, err = f.opa.ExtractHttpBodyOptionally(req)
++		body, rawBodyBytes, bodyTruncated, finalizer, err = f.opa.ExtractHttpBodyOptionallyWithStatus(req)
+ 		defer finalizer()
+ 		if err != nil {
+ 			f.opa.ServeInvalidDecisionError(fc, span, nil, err)
+@@ -122,7 +123,7 @@ func (f *opaServeResponseFilter) Request(fc filters.FilterContext) {
+ 		req.Body = body
+ 	}
+ 
+-	authzreq, err := envoy.AdaptToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), f.envoyContextExtensions, rawBodyBytes)
++	authzreq, err := envoy.AdaptToExtAuthRequestWithBodyStatus(req, f.opa.InstanceConfig().GetEnvoyMetadata(), f.envoyContextExtensions, rawBodyBytes, bodyTruncated)
+ 	if err != nil {
+ 		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
+ 		return

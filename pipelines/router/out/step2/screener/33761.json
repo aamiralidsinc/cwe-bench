@@ -1,0 +1,115 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "33761",
+  "advisory_ids": ["GHSA-C7R6-VX3H-W5G2", "CVE-2026-84374"],
+  "repo": "spartnernl/laravel-excel",
+  "pinned_commit": "458061b63c6c7fa32772f5766748078a1e5baaa9",
+  "fix_commits": ["b5cafdfcf7ec63924e83303763be8fcae340f70b"],
+  "trust_decision": {
+    "summary": "The caller-supplied $filePath is trusted to be a path inside the configured disk, but Disk::copy() decides on realpath($destination) that any destination which already resolves on the local filesystem must be written directly with fopen('rb+') + stream_copy_to_stream, bypassing Flysystem and its disk root; so Excel::store()/queue() can write or overwrite any file the PHP process can reach (CWE-22/CWE-73).",
+    "evidence": ["src/Files/Disk.php:67-91", "src/Files/Disk.php:75-84", "src/Excel.php:108-117", "src/Jobs/StoreQueuedExport.php:50-58", "src/Files/Filesystem.php:27-34"]
+  },
+  "landing_point": {
+    "where": "src/Excel.php:102-118",
+    "why": "The summary says an export is written outside the configured disk when given a caller-controlled path; $filePath enters the library at Excel::store(), which exports to a temporary file and then hands both the temp file and $filePath to $this->filesystem->disk(...)->copy() (src/Excel.php:110), the first thing an engineer would read."
+  },
+  "fix_sites": [
+    {
+      "where": "src/Files/Disk.php:75-84",
+      "entry_point": "Excel::store() (src/Excel.php:110) and Excel::queue() through Jobs\\StoreQueuedExport::handle() (src/Jobs/StoreQueuedExport.php:52)",
+      "module_kind": "disk wrapper / filesystem sink"
+    },
+    {
+      "where": "src/Files/RemoteTemporaryFile.php:96-109",
+      "entry_point": "temporary-file sync, selected by excel.temporary_files.remote_disk (src/Files/TemporaryFileFactory.php:35-40), used by Writer::reopen() (src/Writer.php:140) and Jobs\\ReadChunk (src/Jobs/ReadChunk.php:194)",
+      "module_kind": "temporary-file subsystem (remote temp disk)"
+    },
+    {
+      "where": "src/Excel.php:110-117",
+      "entry_point": "Excel::store()",
+      "module_kind": "public API / facade entry point (temporary-file cleanup on failure)"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/Files/RemoteTemporaryFile.php:96-109"
+  },
+  "O3_reason_to_dismiss": "The sync() destination is the library's own local temporary file used only for remote temp disks (excel.temporary_files.remote_disk), not the caller's export path the report names, so a solver can argue the report's scope ends at Excel::store() and that this internal copy no longer has anything to do with it.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "With excel.temporary_files.remote_disk configured, RemoteTemporaryFile::sync() must still land the remote temporary object at the local temporary path (Writer::reopen and Jobs\\ReadChunk read it), and storing over an existing disk file must still truncate it (the old fopen 'rb+' path did not). A fix that just deletes the local-write branch in Disk::copy() silently breaks the remote-temp-disk route.",
+    "where": "src/Files/RemoteTemporaryFile.php:103-106, src/Writer.php:140, src/Jobs/ReadChunk.php:194, config/excel.php:346-361"
+  },
+  "O6_input_shapes": [
+    "relative path containing traversal segments, e.g. '../elsewhere.csv' (fix.diff:86-110)",
+    "absolute local filesystem path, e.g. '/.../tests/Data/Disks/elsewhere.csv' (fix.diff:112-133)",
+    "destination that already exists on the local filesystem (realpath() true) versus one that does not (realpath() false) - two branches before the fix, one after",
+    "path passed as the method argument versus falling back to the export object's $filePath/$disk properties (src/Concerns/Exportable.php:44-56)",
+    "synchronous store versus an export implementing ShouldQueue, which Excel::store() silently routes to the queued job (src/Excel.php:104-106)"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "src/Files/TemporaryFileFactory.php:33-40 (chosen from config('excel.temporary_files.remote_disk'), bound in src/ExcelServiceProvider.php:82-87; key at config/excel.php:360), which produces RemoteTemporaryFile whose local path reaches Disk::copy() in RemoteTemporaryFile::sync()",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Queued export: Excel::queue() / Exportable::queue() / store() on a ShouldQueue export passes the same caller-controlled $filePath to Jobs\\StoreQueuedExport::handle(), which calls disk->copy() with no path handling; the published fix does not touch that file.",
+      "where": "src/Jobs/StoreQueuedExport.php:50-58",
+      "reason_to_dismiss": "Queue workers are a different feature from the synchronous store() the report shows, and the report's example never mentions queueing, so the route looks out of scope.",
+      "distance": "one directory away (src/Jobs vs src/Files), same package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/Files/Disk.php:96-99",
+      "sibling": "Disk::touch() could take the same 'if the path resolves locally, touch it directly' shortcut instead of disk->put()",
+      "why_realistic": "it is the same wrapper class and the same local-path convenience the realpath() branch expressed; a maintainer adding an empty-placeholder fast path would copy that idiom"
+    },
+    {
+      "where": "src/Files/TemporaryFile.php:53-82",
+      "sibling": "copyFrom() already has the mirror image (realpath($filePath) when no disk is given) for the read direction, so a write-side sibling built on the same shortcut is plausible",
+      "why_realistic": "the local-path shortcut is an existing idiom in this file, so a maintainer adding another transfer would repeat it"
+    },
+    {
+      "where": "src/Files/LocalTemporaryFile.php:72-75",
+      "sibling": "LocalTemporaryFile::put() writes with file_put_contents() to a factory-built path; letting a caller-influenced name through it is a second unprotected writer",
+      "why_realistic": "RemoteTemporaryFile::sync() already feeds a name derived from the remote filename into makeLocal() and then put() (src/Files/RemoteTemporaryFile.php:98-101, 108)"
+    }
+  ],
+  "O9_family": "path traversal / arbitrary file write outside the configured disk (CWE-22, CWE-73)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "PHP",
+    "toolchain": "composer install; PHPUnit 10 (phpunit.xml.dist:2) through orchestra/testbench; phpoffice/phpspreadsheet (composer.json:22-34)",
+    "services": ["MySQL for the full suite (phpunit.xml.dist:4-11); not needed by the store/queue tests, which use local disk roots (tests/TestCase.php:83-87)"],
+    "offline_after_build": true,
+    "project_tests": "tests/ExcelTest.php:58-104 (store on default/other disk, CSV store); tests/QueuedExportTest.php:23-101 (queueing, remote temp disk, implicit queue via store); tests/TemporaryFileTest.php (temp path/permissions); tests/Concerns/ExportableTest.php (store/queue wrappers)"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/Excel.php, src/Files/Disk.php, src/Files/RemoteTemporaryFile.php",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Validate/sanitise $filePath inside Excel::store() (reject '..' or absolute paths) and leave Disk::copy()'s raw fopen/stream_copy_to_stream branch in place."
+  },
+  "out_of_scope_notes": [
+    "Read-side sibling not pursued: TemporaryFile::copyFrom() also resolves a caller path against the local filesystem with realpath() when no disk is given (src/Files/TemporaryFile.php:57-58), but this advisory is about writes."
+  ],
+  "unverified": [
+    "repo size in MB: no shell in this session; 158 PHP files under src/ and ~155 under tests/ suggest well under 5 MB of source, but the size was not measured",
+    "latest release code: the input says none, so O8 present_in_latest is unknown",
+    "whether the deployed Flysystem version rejects or normalises '..' segments on put() (not exercised here; the fix's tests only assert the disk resolves paths, fix.diff:93-104)"
+  ]
+}

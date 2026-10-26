@@ -1,0 +1,619 @@
+diff --git a/keras/src/legacy/saving/legacy_h5_format.py b/keras/src/legacy/saving/legacy_h5_format.py
+index 7cb0ed8..ef035f4 100644
+--- a/keras/src/legacy/saving/legacy_h5_format.py
++++ b/keras/src/legacy/saving/legacy_h5_format.py
+@@ -12,6 +12,8 @@ from keras.src.legacy.saving import saving_options
+ from keras.src.legacy.saving import saving_utils
+ from keras.src.saving import object_registration
+ from keras.src.saving import serialization_lib
++from keras.src.saving.saving_lib import safe_get_h5_dataset
++from keras.src.saving.saving_lib import safe_get_h5_group
+ from keras.src.utils import io_utils
+ 
+ try:
+@@ -139,7 +141,9 @@ def load_model_from_hdf5(
+             )
+ 
+             # set weights
+-            load_weights_from_hdf5_group(f["model_weights"], model)
++            load_weights_from_hdf5_group(
++                safe_get_h5_group(f, "model_weights"), model
++            )
+ 
+         if compile:
+             # instantiate optimizer
+@@ -199,48 +203,50 @@ def load_model_from_hdf5(
+     return model
+ 
+ 
+-def save_weights_to_hdf5_group(f, model):
++def save_weights_to_hdf5_group(group, model):
+     """Saves the weights of a list of layers to a HDF5 group.
+ 
+     Args:
+-        f: HDF5 group.
++        group: HDF5 group.
+         model: Model instance.
+     """
+     from keras.src import __version__ as keras_version
+ 
+     save_attributes_to_hdf5_group(
+-        f, "layer_names", [layer.name.encode("utf8") for layer in model.layers]
++        group,
++        "layer_names",
++        [layer.name.encode("utf8") for layer in model.layers],
+     )
+-    f.attrs["backend"] = backend.backend().encode("utf8")
+-    f.attrs["keras_version"] = str(keras_version).encode("utf8")
++    group.attrs["backend"] = backend.backend().encode("utf8")
++    group.attrs["keras_version"] = str(keras_version).encode("utf8")
+ 
+     # Sort model layers by layer name to ensure that group names are strictly
+     # growing to avoid prefix issues.
+     for layer in sorted(model.layers, key=lambda x: x.name):
+-        g = f.create_group(layer.name)
++        layer_group = group.create_group(layer.name)
+         weights = _legacy_weights(layer)
+-        save_subset_weights_to_hdf5_group(g, weights)
++        save_subset_weights_to_hdf5_group(layer_group, weights)
+     weights = list(
+         v
+         for v in model._trainable_variables + model._non_trainable_variables
+         if v in model.weights
+     )
+-    g = f.create_group("top_level_model_weights")
+-    save_subset_weights_to_hdf5_group(g, weights)
++    layer_group = group.create_group("top_level_model_weights")
++    save_subset_weights_to_hdf5_group(layer_group, weights)
+ 
+ 
+-def save_subset_weights_to_hdf5_group(f, weights):
++def save_subset_weights_to_hdf5_group(group, weights):
+     """Save top-level weights of a model to a HDF5 group.
+ 
+     Args:
+-        f: HDF5 group.
++        group: HDF5 group.
+         weights: List of weight variables.
+     """
+     weight_values = [backend.convert_to_numpy(w) for w in weights]
+     weight_names = [str(w.path).encode("utf8") for w in weights]
+-    save_attributes_to_hdf5_group(f, "weight_names", weight_names)
++    save_attributes_to_hdf5_group(group, "weight_names", weight_names)
+     for name, val in zip(weight_names, weight_values):
+-        param_dset = f.create_dataset(name, val.shape, dtype=val.dtype)
++        param_dset = group.create_dataset(name, val.shape, dtype=val.dtype)
+         if not val.shape:
+             # scalar
+             param_dset[()] = val
+@@ -248,11 +254,11 @@ def save_subset_weights_to_hdf5_group(f, weights):
+             param_dset[:] = val
+ 
+ 
+-def save_optimizer_weights_to_hdf5_group(hdf5_group, optimizer):
++def save_optimizer_weights_to_hdf5_group(group, optimizer):
+     """Saves optimizer weights of a optimizer to a HDF5 group.
+ 
+     Args:
+-        hdf5_group: HDF5 group.
++        group: HDF5 group.
+         optimizer: optimizer instance.
+     """
+     from keras.src import optimizers
+@@ -262,7 +268,7 @@ def save_optimizer_weights_to_hdf5_group(hdf5_group, optimizer):
+     else:
+         symbolic_weights = getattr(optimizer, "weights")
+     if symbolic_weights:
+-        weights_group = hdf5_group.create_group("optimizer_weights")
++        weights_group = group.create_group("optimizer_weights")
+         weight_names = [str(w.path).encode("utf8") for w in symbolic_weights]
+         save_attributes_to_hdf5_group(
+             weights_group, "weight_names", weight_names
+@@ -323,11 +329,11 @@ def save_attributes_to_hdf5_group(group, name, data):
+         group.attrs[name] = data
+ 
+ 
+-def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
++def load_weights_from_hdf5_group(group, model, skip_mismatch=False):
+     """Implements topological (order-based) weight loading.
+ 
+     Args:
+-        f: A pointer to a HDF5 group.
++        group: HDF5 group.
+         model: Model instance.
+         skip_mismatch: Boolean, whether to skip loading of weights
+             where there is a mismatch in the shape of the weights,
+@@ -336,14 +342,14 @@ def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
+         ValueError: in case of mismatch between provided layers
+             and weights file.
+     """
+-    if "keras_version" in f.attrs:
+-        original_keras_version = f.attrs["keras_version"]
++    if "keras_version" in group.attrs:
++        original_keras_version = group.attrs["keras_version"]
+         if hasattr(original_keras_version, "decode"):
+             original_keras_version = original_keras_version.decode("utf8")
+     else:
+         original_keras_version = "1"
+-    if "backend" in f.attrs:
+-        original_backend = f.attrs["backend"]
++    if "backend" in group.attrs:
++        original_backend = group.attrs["backend"]
+         if hasattr(original_backend, "decode"):
+             original_backend = original_backend.decode("utf8")
+     else:
+@@ -355,11 +361,13 @@ def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
+         if weights:
+             filtered_layers.append(layer)
+ 
+-    layer_names = load_attributes_from_hdf5_group(f, "layer_names")
++    layer_names = load_attributes_from_hdf5_group(group, "layer_names")
+     filtered_layer_names = []
+     for name in layer_names:
+-        g = f[name]
+-        weight_names = load_attributes_from_hdf5_group(g, "weight_names")
++        layer_group = safe_get_h5_group(group, name)
++        weight_names = load_attributes_from_hdf5_group(
++            layer_group, "weight_names"
++        )
+         if weight_names:
+             filtered_layer_names.append(name)
+     layer_names = filtered_layer_names
+@@ -371,10 +379,10 @@ def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
+         )
+ 
+     for k, name in enumerate(layer_names):
+-        g = f[name]
++        layer_group = safe_get_h5_group(group, name)
+         layer = filtered_layers[k]
+         symbolic_weights = _legacy_weights(layer)
+-        weight_values = load_subset_weights_from_hdf5_group(g)
++        weight_values = load_subset_weights_from_hdf5_group(layer_group)
+         if len(weight_values) != len(symbolic_weights):
+             raise ValueError(
+                 f"Weight count mismatch for layer #{k} (named {layer.name} in "
+@@ -390,7 +398,7 @@ def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
+             name=f"layer #{k} (named {layer.name})",
+         )
+ 
+-    if "top_level_model_weights" in f:
++    if "top_level_model_weights" in group:
+         symbolic_weights = list(
+             # model.weights
+             v
+@@ -398,7 +406,7 @@ def load_weights_from_hdf5_group(f, model, skip_mismatch=False):
+             if v in model.weights
+         )
+         weight_values = load_subset_weights_from_hdf5_group(
+-            f["top_level_model_weights"]
++            safe_get_h5_group(group, "top_level_model_weights")
+         )
+         if len(weight_values) != len(symbolic_weights):
+             raise ValueError(
+@@ -462,13 +470,13 @@ def _set_weights(
+         instance.finalize_state()
+ 
+ 
+-def load_weights_from_hdf5_group_by_name(f, model, skip_mismatch=False):
++def load_weights_from_hdf5_group_by_name(group, model, skip_mismatch=False):
+     """Implements name-based weight loading (instead of topological loading).
+ 
+     Layers that have no matching name are skipped.
+ 
+     Args:
+-        f: A pointer to a HDF5 group.
++        group: HDF5 group.
+         model: Model instance.
+         skip_mismatch: Boolean, whether to skip loading of layers
+             where there is a mismatch in the number of weights,
+@@ -478,21 +486,21 @@ def load_weights_from_hdf5_group_by_name(f, model, skip_mismatch=False):
+         ValueError: in case of mismatch between provided layers
+             and weights file and skip_match=False.
+     """
+-    if "keras_version" in f.attrs:
+-        original_keras_version = f.attrs["keras_version"]
++    if "keras_version" in group.attrs:
++        original_keras_version = group.attrs["keras_version"]
+         if hasattr(original_keras_version, "decode"):
+             original_keras_version = original_keras_version.decode("utf8")
+     else:
+         original_keras_version = "1"
+-    if "backend" in f.attrs:
+-        original_backend = f.attrs["backend"]
++    if "backend" in group.attrs:
++        original_backend = group.attrs["backend"]
+         if hasattr(original_backend, "decode"):
+             original_backend = original_backend.decode("utf8")
+     else:
+         original_backend = None
+ 
+     # New file format.
+-    layer_names = load_attributes_from_hdf5_group(f, "layer_names")
++    layer_names = load_attributes_from_hdf5_group(group, "layer_names")
+ 
+     # Reverse index of layer name to list of layers with name.
+     index = {}
+@@ -501,8 +509,8 @@ def load_weights_from_hdf5_group_by_name(f, model, skip_mismatch=False):
+             index.setdefault(layer.name, []).append(layer)
+ 
+     for k, name in enumerate(layer_names):
+-        g = f[name]
+-        weight_values = load_subset_weights_from_hdf5_group(g)
++        layer_group = safe_get_h5_group(group, name)
++        weight_values = load_subset_weights_from_hdf5_group(layer_group)
+         for layer in index.get(name, []):
+             symbolic_weights = _legacy_weights(layer)
+             if len(weight_values) != len(symbolic_weights):
+@@ -530,12 +538,12 @@ def load_weights_from_hdf5_group_by_name(f, model, skip_mismatch=False):
+                 name=f"layer #{k} (named {layer.name})",
+             )
+ 
+-    if "top_level_model_weights" in f:
++    if "top_level_model_weights" in group:
+         symbolic_weights = (
+             model._trainable_variables + model._non_trainable_variables
+         )
+         weight_values = load_subset_weights_from_hdf5_group(
+-            f["top_level_model_weights"]
++            safe_get_h5_group(group, "top_level_model_weights")
+         )
+ 
+         if len(weight_values) != len(symbolic_weights):
+@@ -565,11 +573,11 @@ def load_weights_from_hdf5_group_by_name(f, model, skip_mismatch=False):
+             )
+ 
+ 
+-def load_subset_weights_from_hdf5_group(f):
++def load_subset_weights_from_hdf5_group(group):
+     """Load layer weights of a model from hdf5.
+ 
+     Args:
+-        f: A pointer to a HDF5 group.
++        group: HDF5 group.
+ 
+     Returns:
+         List of NumPy arrays of the weight values.
+@@ -578,25 +586,29 @@ def load_subset_weights_from_hdf5_group(f):
+         ValueError: in case of mismatch between provided model
+             and weights file.
+     """
+-    weight_names = load_attributes_from_hdf5_group(f, "weight_names")
+-    return [np.asarray(f[weight_name]) for weight_name in weight_names]
++    weight_names = load_attributes_from_hdf5_group(group, "weight_names")
++    return [
++        np.asarray(safe_get_h5_dataset(group, weight_name))
++        for weight_name in weight_names
++    ]
+ 
+ 
+-def load_optimizer_weights_from_hdf5_group(hdf5_group):
++def load_optimizer_weights_from_hdf5_group(group):
+     """Load optimizer weights from a HDF5 group.
+ 
+     Args:
+-        hdf5_group: A pointer to a HDF5 group.
++        group: HDF5 group.
+ 
+     Returns:
+         data: List of optimizer weight names.
+     """
+-    weights_group = hdf5_group["optimizer_weights"]
++    weights_group = safe_get_h5_group(group, "optimizer_weights")
+     optimizer_weight_names = load_attributes_from_hdf5_group(
+         weights_group, "weight_names"
+     )
+     return [
+-        weights_group[weight_name] for weight_name in optimizer_weight_names
++        safe_get_h5_dataset(weights_group, weight_name)
++        for weight_name in optimizer_weight_names
+     ]
+ 
+ 
+diff --git a/keras/src/saving/file_editor.py b/keras/src/saving/file_editor.py
+index 732dafd..4f83875 100644
+--- a/keras/src/saving/file_editor.py
++++ b/keras/src/saving/file_editor.py
+@@ -4,7 +4,6 @@ import os.path
+ import pprint
+ import zipfile
+ 
+-import h5py
+ import numpy as np
+ import rich.console
+ 
+@@ -12,8 +11,11 @@ from keras.src import backend
+ from keras.src.api_export import keras_export
+ from keras.src.saving import saving_lib
+ from keras.src.saving.saving_lib import H5IOStore
++from keras.src.saving.saving_lib import safe_get_h5_dataset
++from keras.src.saving.saving_lib import safe_get_h5_group
+ from keras.src.utils import naming
+ from keras.src.utils import summary_utils
++from keras.src.utils.module_utils import h5py
+ 
+ try:
+     import IPython as ipython
+@@ -473,6 +475,13 @@ class KerasFileEditor:
+             # IMPORTANT:
+             # Never mutate inner_path; use local variable.
+             current_inner_path = f"{inner_path}/{key}"
++            link_type = data.get(
++                key, default=None, getclass=True, getlink=True
++            )
++            if link_type in (h5py.ExternalLink, h5py.SoftLink):
++                raise ValueError(
++                    f"Not allowed: H5 file with {link_type.__name__}"
++                )
+             value = data[key]
+ 
+             # ------------------------------------------------------
+@@ -484,13 +493,15 @@ class KerasFileEditor:
+                     continue
+ 
+                 # Skip empty "vars" groups
+-                if "vars" in value.keys() and len(value["vars"]) == 0:
++                if "vars" in value.keys() and len(
++                    safe_get_h5_group(value, "vars")
++                ) == 0:
+                     continue
+ 
+                 # Recurse into "vars" subgroup when present
+                 if "vars" in value.keys():
+                     result[key], metadata = self._extract_weights_from_store(
+-                        value["vars"],
++                        safe_get_h5_group(value, "vars"),
+                         metadata=metadata,
+                         inner_path=current_inner_path,
+                     )
+@@ -512,6 +523,7 @@ class KerasFileEditor:
+             if not isinstance(value, h5py.Dataset):
+                 continue
+ 
++            value = safe_get_h5_dataset(data, key)
+             if value.external:
+                 raise ValueError(
+                     "Not allowed: H5 file Dataset with external links: "
+diff --git a/keras/src/saving/saving_api.py b/keras/src/saving/saving_api.py
+index 3a45f35..1fe2552 100644
+--- a/keras/src/saving/saving_api.py
++++ b/keras/src/saving/saving_api.py
+@@ -6,6 +6,7 @@ from absl import logging
+ from keras.src.api_export import keras_export
+ from keras.src.legacy.saving import legacy_h5_format
+ from keras.src.saving import saving_lib
++from keras.src.saving.saving_lib import safe_get_h5_group
+ from keras.src.utils import file_utils
+ from keras.src.utils import io_utils
+ 
+@@ -299,7 +300,7 @@ def load_weights(model, filepath, skip_mismatch=False, **kwargs):
+             )
+         with h5py.File(filepath, "r") as f:
+             if "layer_names" not in f.attrs and "model_weights" in f:
+-                f = f["model_weights"]
++                f = safe_get_h5_group(f, "model_weights")
+             if by_name:
+                 legacy_h5_format.load_weights_from_hdf5_group_by_name(
+                     f, model, skip_mismatch
+diff --git a/keras/src/saving/saving_lib.py b/keras/src/saving/saving_lib.py
+index 8008c4f..d7ddb67 100644
+--- a/keras/src/saving/saving_lib.py
++++ b/keras/src/saving/saving_lib.py
+@@ -25,14 +25,11 @@ from keras.src.utils import io_utils
+ from keras.src.utils import naming
+ from keras.src.utils import plot_model
+ from keras.src.utils.model_visualization import check_pydot
++from keras.src.utils.module_utils import h5py
+ from keras.src.utils.summary_utils import readable_memory_size
+ from keras.src.utils.summary_utils import weight_memory_size
+ from keras.src.version import __version__ as keras_version
+ 
+-try:
+-    import h5py
+-except ImportError:
+-    h5py = None
+ try:
+     import psutil
+ except ImportError:
+@@ -986,6 +983,64 @@ class DiskIOStore:
+             file_utils.rmtree(self.tmp_dir)
+ 
+ 
++def safe_get_h5_group(parent, name):
++    """Retrieve a Group within a given File or Group.
++
++    Args:
++        parent: the parent h5py.File or h5py.Group.
++        name: the name of the Group to retrieve.
++
++    Returns:
++        The child h5py.Group.
++    """
++    # Also handles the case when the group is an empty dict initially.
++    if name not in parent:
++        raise KeyError(name)
++
++    group_type = parent.get(name, default=None, getclass=True, getlink=True)
++    if group_type in (h5py.ExternalLink, h5py.SoftLink):
++        raise ValueError(f"Not allowed: H5 file with {group_type.__name__}")
++
++    group = parent[name]
++    if not isinstance(group, h5py.Group):
++        raise ValueError(
++            f"Invalid H5 file, expected Group but received {type(group)}"
++        )
++    return group
++
++
++def safe_get_h5_dataset(group, name):
++    """Retrieve a Dataset within a given Group.
++
++    Args:
++        group: the parent h5py.Group.
++        name: the name of the Dataset to retrieve.
++
++    Returns:
++        The child h5py.Dataset.
++    """
++    # Also handles the case when the group is an empty dict initially.
++    if name not in group:
++        raise KeyError(name)
++
++    dataset_type = group.get(name, default=None, getclass=True, getlink=True)
++    if dataset_type in (h5py.ExternalLink, h5py.SoftLink):
++        raise ValueError(f"Not allowed: H5 file with {dataset_type.__name__}")
++
++    dataset = group[name]
++    if not isinstance(dataset, h5py.Dataset):
++        raise ValueError(
++            f"Invalid H5 file, expected Dataset, received {type(dataset)}"
++        )
++    if dataset.external:
++        raise ValueError(
++            f"Not allowed: H5 file with external Dataset: {dataset.external}"
++        )
++    if dataset.is_virtual:
++        raise ValueError("Not allowed: H5 file with virtual Dataset")
++    return dataset
++
++
+ class H5IOStore:
+     """Numerical variable store backed by HDF5.
+ 
+@@ -1037,25 +1092,6 @@ class H5IOStore:
+         # will mistakenly using `__len__` to determine the value.
+         return self.h5_file.__bool__()
+ 
+-    def _verify_group(self, group):
+-        if not isinstance(group, h5py.Group):
+-            raise ValueError(
+-                f"Invalid H5 file, expected Group but received {type(group)}"
+-            )
+-        return group
+-
+-    def _verify_dataset(self, dataset):
+-        if not isinstance(dataset, h5py.Dataset):
+-            raise ValueError(
+-                f"Invalid H5 file, expected Dataset, received {type(dataset)}"
+-            )
+-        if dataset.external:
+-            raise ValueError(
+-                "Not allowed: H5 file Dataset with external links: "
+-                f"{dataset.external}"
+-            )
+-        return dataset
+-
+     def _get_h5_file(self, path_or_io, mode=None):
+         mode = mode or self.mode
+         if mode not in ("r", "w", "a"):
+@@ -1113,22 +1149,27 @@ class H5IOStore:
+ 
+         self._h5_entry_path = path
+         self._h5_entry_group = {}  # Defaults to an empty dict if not found.
++        self._h5_entry_initialized = True
++
+         if not path:
+             if "vars" in self.h5_file:
+-                self._h5_entry_group = self._verify_group(self.h5_file["vars"])
+-        elif path in self.h5_file and "vars" in self.h5_file[path]:
+-            self._h5_entry_group = self._verify_group(
+-                self._verify_group(self.h5_file[path])["vars"]
+-            )
+-        else:
+-            # No hit. Fix for 2.13 compatibility.
+-            if "_layer_checkpoint_dependencies" in self.h5_file:
+-                path = path.replace("layers", "_layer_checkpoint_dependencies")
+-                if path in self.h5_file and "vars" in self.h5_file[path]:
+-                    self._h5_entry_group = self._verify_group(
+-                        self._verify_group(self.h5_file[path])["vars"]
+-                    )
+-        self._h5_entry_initialized = True
++                self._h5_entry_group = safe_get_h5_group(self.h5_file, "vars")
++            return self
++
++        if path in self.h5_file:
++            path_group = safe_get_h5_group(self.h5_file, path)
++            if "vars" in path_group:
++                self._h5_entry_group = safe_get_h5_group(path_group, "vars")
++                return self
++
++        # No hit. Fix for 2.13 compatibility.
++        if "_layer_checkpoint_dependencies" in self.h5_file:
++            path = path.replace("layers", "_layer_checkpoint_dependencies")
++            if path in self.h5_file:
++                path_group = safe_get_h5_group(self.h5_file, path)
++                if "vars" in path_group:
++                    self._h5_entry_group = safe_get_h5_group(path_group, "vars")
++
+         return self
+ 
+     def close(self):
+@@ -1160,7 +1201,7 @@ class H5IOStore:
+         return self._h5_entry_group.keys()
+ 
+     def __getitem__(self, key):
+-        value = self._verify_dataset(self._h5_entry_group[key])
++        value = safe_get_h5_dataset(self._h5_entry_group, key)
+         if (
+             hasattr(value, "attrs")
+             and "dtype" in value.attrs
+@@ -1391,10 +1432,10 @@ class ShardedH5IOStore(H5IOStore):
+         """Get the H5 entry group. If it doesn't exist, return an empty dict."""
+         try:
+             if not path:
+-                self._h5_entry_group = self._verify_group(self.h5_file["vars"])
++                self._h5_entry_group = safe_get_h5_group(self.h5_file, "vars")
+             else:
+-                self._h5_entry_group = self._verify_group(
+-                    self._verify_group(self.h5_file[path])["vars"]
++                self._h5_entry_group = safe_get_h5_group(
++                    safe_get_h5_group(self.h5_file, path), "vars"
+                 )
+             self._h5_entry_initialized = True
+         except KeyError:
+@@ -1434,19 +1475,9 @@ class ShardedH5IOStore(H5IOStore):
+                 continue
+             self._switch_h5_file(filename, mode="r")
+             if key in self._h5_entry_group:
+-                # The switch above already positioned the entry group on this
+-                # shard; read the value in place.
+-                value = self._h5_entry_group[key]
+-                if (
+-                    hasattr(value, "attrs")
+-                    and "dtype" in value.attrs
+-                    and value.attrs["dtype"] == "bfloat16"
+-                ):
+-                    value = np.array(value, dtype=ml_dtypes.bfloat16)
+-                elif not isinstance(value, np.ndarray):
+-                    value = np.array(value)
++                item = super().__getitem__(key)
+                 self._restore_h5_file()
+-                return value
++                return item
+         raise KeyError(
+             f"Key '{key}' not found in any of the shards: "
+             f"{self.current_shard_filenames}"
+diff --git a/keras/src/utils/module_utils.py b/keras/src/utils/module_utils.py
+index 286394a..e3b2ff8 100644
+--- a/keras/src/utils/module_utils.py
++++ b/keras/src/utils/module_utils.py
+@@ -44,6 +44,7 @@ gfile = LazyModule("tensorflow.io.gfile", pip_name="tensorflow")
+ tensorflow_io = LazyModule("tensorflow_io")
+ scipy = LazyModule("scipy")
+ jax = LazyModule("jax")
++h5py = LazyModule("h5py")
+ torch_xla = LazyModule(
+     "torch_xla",
+     import_error_msg=(
+diff --git a/keras/src/version.py b/keras/src/version.py
+index e955390..9c50576 100644
+--- a/keras/src/version.py
++++ b/keras/src/version.py
+@@ -1,7 +1,7 @@
+ from keras.src.api_export import keras_export
+ 
+ # Unique source of truth for the version number.
+-__version__ = "3.12.1"
++__version__ = "3.12.2"
+ 
+ 
+ @keras_export("keras.version")

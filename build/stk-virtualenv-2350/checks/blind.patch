@@ -1,0 +1,229 @@
+diff -ruN a/src/virtualenv/seed/embed/via_app_data/via_app_data.py b/src/virtualenv/seed/embed/via_app_data/via_app_data.py
+--- a/src/virtualenv/seed/embed/via_app_data/via_app_data.py	2026-10-26 02:33:52.000000000 +0000
++++ b/src/virtualenv/seed/embed/via_app_data/via_app_data.py	2026-10-26 05:25:40.700122842 +0000
+@@ -14,6 +14,7 @@
+ from virtualenv.info import fs_supports_symlink
+ from virtualenv.seed.embed.base_embed import BaseEmbed
+ from virtualenv.seed.wheels import get_wheel
++from virtualenv.seed.wheels.integrity import file_sha256
+ 
+ from .pip_install.copy import CopyPipInstall
+ from .pip_install.symlink import SymlinkPipInstall
+@@ -64,7 +65,9 @@
+             def _install(name: str, wheel: Wheel) -> None:
+                 LOGGER.debug("install %s from wheel %s via %s", name, wheel, installer_class.__name__)
+                 try:
+-                    key = Path(installer_class.__name__) / wheel.path.stem
++                    # The image name must identify the bytes it was built from: a wheel name is not unique enough
++                    # to reuse an image, because different bytes can be served under the same name over time.
++                    key = Path(installer_class.__name__) / f"{wheel.path.stem}-{file_sha256(wheel.path)}"
+                     wheel_img = self.app_data.wheel_image(creator.interpreter.version_release_str, key)
+                     installer = installer_class(wheel.path, creator, wheel_img)
+                     _build_wheel_image(self.app_data.lock / wheel_img.parent, wheel_img.name, installer)
+diff -ruN a/src/virtualenv/seed/wheels/acquire.py b/src/virtualenv/seed/wheels/acquire.py
+--- a/src/virtualenv/seed/wheels/acquire.py	2026-10-26 02:33:52.000000000 +0000
++++ b/src/virtualenv/seed/wheels/acquire.py	2026-10-26 05:25:35.652127491 +0000
+@@ -11,6 +11,7 @@
+ from typing import TYPE_CHECKING
+ 
+ from .bundle import from_bundle
++from .integrity import authenticate, custom_index_configured
+ from .periodic_update import add_wheel_to_update_log
+ from .util import Version, Wheel, discover_wheels
+ 
+@@ -130,6 +131,9 @@
+         str(to_folder),
+         to_download,
+     ]
++    # The public record only speaks for a download that came from the public index; an operator-supplied index may
++    # serve a rebuilt wheel under the same name on purpose.
++    against_public_record = not custom_index_configured(env)
+     # pip has no interface in python - must be a new sub-process
+     env = pip_wheel_env_run(search_dirs, app_data, env)
+     process = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, universal_newlines=True, encoding="utf-8")
+@@ -138,8 +142,13 @@
+         kwargs = {"output": out, "stderr": err}
+         raise CalledProcessError(process.returncode, cmd, **kwargs)
+     result = _find_downloaded_wheel(distribution, version_spec, for_py_version, to_folder, out)
+-    LOGGER.debug("downloaded wheel %s", result.name)  # ty: ignore[unresolved-attribute]
+-    return result  # ty: ignore[invalid-return-type]
++    if result is None:
++        msg = f"could not find the wheel for {to_download} under {to_folder}"
++        raise RuntimeError(msg)
++    if against_public_record:
++        authenticate(result)
++    LOGGER.debug("downloaded wheel %s", result.name)
++    return result
+ 
+ 
+ def _find_downloaded_wheel(
+diff -ruN a/src/virtualenv/seed/wheels/bundle.py b/src/virtualenv/seed/wheels/bundle.py
+--- a/src/virtualenv/seed/wheels/bundle.py	2026-10-26 02:33:52.000000000 +0000
++++ b/src/virtualenv/seed/wheels/bundle.py	2026-10-26 05:25:36.544126669 +0000
+@@ -4,6 +4,7 @@
+ 
+ from virtualenv.seed.wheels.embed import get_embed_wheel
+ 
++from .integrity import authenticate
+ from .periodic_update import periodic_update
+ from .util import Version, Wheel, discover_wheels
+ 
+@@ -55,6 +56,7 @@
+     """Load a compatible wheel from a given folder."""
+     for folder in directories:
+         for wheel in discover_wheels(folder, distribution, version, for_py_version):
++            authenticate(wheel)
+             return wheel
+     return None
+ 
+diff -ruN a/src/virtualenv/seed/wheels/integrity.py b/src/virtualenv/seed/wheels/integrity.py
+--- a/src/virtualenv/seed/wheels/integrity.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/virtualenv/seed/wheels/integrity.py	2026-10-26 05:25:31.896130950 +0000
+@@ -0,0 +1,127 @@
++"""Authenticate a seed wheel against the artefact its filename claims.
++
++A seed package can reach a new environment by several routes: it may be bundled with virtualenv, downloaded by pip,
++carried over from an earlier periodic update, or taken from an operator-supplied search directory. Transport security
++authenticates the connection, not the file, and an index (or a mirror of one) is free to answer a familiar filename
++with any bytes at all.
++
++The authoritative public release record is the only external statement about what a given filename contains. Where it
++publishes a sha256 for the exact filename, the bytes are required to match it. Where it publishes nothing - a private
++distribution, a local build, a wheel carrying a build tag - there is nothing to compare against and the wheel is left
++untouched, as it is when the record cannot be consulted at all (an offline machine, for example).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++from typing import TYPE_CHECKING
++from urllib import request
++
++from .util import Wheel
++
++if TYPE_CHECKING:
++    from collections.abc import Mapping
++    from pathlib import Path
++
++LOGGER = logging.getLogger(__name__)
++
++#: The authoritative public release record, addressed by distribution name.
++_RELEASE_URL = "https://pypi.org/pypi/{distribution}/json"
++
++_CHUNK_SIZE = 1 << 20
++
++#: Variables through which an operator points pip at an index of their own.
++_CUSTOM_INDEX_VARIABLES = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")
++
++
++def custom_index_configured(env: Mapping[str, str] | None) -> bool:
++    """Whether the caller pointed pip at a package index of their own.
++
++    A private mirror may legitimately serve a rebuilt wheel under the distribution, version and filename the public
++    index also uses - an internal mirror re-packaging a release, for instance. The public record cannot speak for
++    bytes that did not come from the public index, so in that case the operator's index is the trust anchor.
++
++    :param env: the environment the download subprocess would inherit.
++
++    :returns: ``True`` when at least one pip index variable names a non-empty index.
++
++    """
++    if not env:
++        return False
++    return any(env.get(variable) for variable in _CUSTOM_INDEX_VARIABLES)
++
++
++def published_sha256(distribution: str, filename: str) -> str | None:
++    """Return the sha256 the public release record publishes for ``filename``.
++
++    :param distribution: the distribution name the wheel claims.
++    :param filename: the exact wheel filename to look up.
++
++    :returns: the published sha256, or ``None`` when the record does not cover that filename or cannot be consulted.
++
++    """
++    try:
++        with request.urlopen(_RELEASE_URL.format(distribution=distribution)) as response:
++            document = json.load(response)
++    except Exception:  # ruff:ignore[blind-except] - an unreachable record is "nothing to compare against"
++        LOGGER.debug("could not read the release record for %s", distribution)
++        return None
++
++    releases = document.get("releases") if isinstance(document, dict) else None
++    if not isinstance(releases, dict):
++        return None
++    for files in releases.values():
++        if not isinstance(files, list):
++            continue
++        for entry in files:
++            if not isinstance(entry, dict) or entry.get("filename") != filename:
++                continue
++            digests = entry.get("digests")
++            if isinstance(digests, dict) and isinstance(digests.get("sha256"), str):
++                return digests["sha256"]
++    return None
++
++
++def file_sha256(path: Path) -> str:
++    """Hash a file's bytes without reading it all into memory at once."""
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(_CHUNK_SIZE), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def authenticate(wheel: Wheel) -> None:
++    """Refuse ``wheel`` unless its bytes are the artefact its filename claims.
++
++    A wheel whose path is gone is left for the caller to fail on when it tries to use it; refusing earlier would not
++    install anything either, and the periodic-update log legitimately outlives a cleared download cache.
++
++    :param wheel: the wheel about to be handed to an installer.
++
++    :raises RuntimeError: the release record publishes a sha256 for this exact filename and the file does not match.
++
++    """
++    if not wheel.path.exists():
++        return
++    expected = published_sha256(wheel.distribution, wheel.name)
++    if expected is None:
++        LOGGER.debug("no published sha256 for %s, nothing to authenticate against", wheel.name)
++        return
++    actual = file_sha256(wheel.path)
++    if actual != expected:
++        msg = (
++            f"refusing seed wheel {wheel.name}: the release record publishes sha256 {expected}, "
++            f"but the file's is {actual}"
++        )
++        raise RuntimeError(msg)
++
++
++__all__ = [
++    "authenticate",
++    "custom_index_configured",
++    "file_sha256",
++    "published_sha256",
++]
+diff -ruN a/src/virtualenv/seed/wheels/periodic_update.py b/src/virtualenv/seed/wheels/periodic_update.py
+--- a/src/virtualenv/seed/wheels/periodic_update.py	2026-10-26 02:33:52.000000000 +0000
++++ b/src/virtualenv/seed/wheels/periodic_update.py	2026-10-26 05:25:39.392124046 +0000
+@@ -20,6 +20,7 @@
+ 
+ from virtualenv.app_data import AppDataDiskFolder
+ from virtualenv.seed.wheels.embed import BUNDLE_SUPPORT
++from virtualenv.seed.wheels.integrity import authenticate
+ from virtualenv.seed.wheels.util import Wheel
+ from virtualenv.util.subprocess import CREATE_NO_WINDOW
+ 
+@@ -52,6 +53,8 @@
+ 
+     def _update_wheel(ver: NewVersion) -> Wheel:
+         updated_wheel = Wheel(app_data.house / ver.filename)
++        # The log records a filename, not bytes: the file behind it may have been replaced since it was accepted.
++        authenticate(updated_wheel)
+         LOGGER.debug("using %supdated wheel %s", "periodically " if updated_wheel else "", updated_wheel)
+         return updated_wheel
+ 

@@ -1,0 +1,120 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "8722",
+  "advisory_ids": ["GHSA-5GVR-V6QV-H5MM", "CVE-2026-11330"],
+  "repo": "thedotmack/claude-mem",
+  "pinned_commit": "4509da1409376afa77102031b12df74c0aea476a",
+  "fix_commits": ["f32fda8b35e9fe9329f87da65c31149362a03f97"],
+  "trust_decision": {
+    "summary": "The identity of an observation is decided by computeObservationContentHash: a 16-hex truncated SHA-256 of memorySessionId|title|narrative concatenated with no field boundary, and the dedup query trusts that string as an exact key (content_hash = ?), so two distinct observations whose fields re-split the same character stream are indistinguishable and one is silently dropped.",
+    "evidence": [
+      "src/services/sqlite/observations/store.ts:24-27",
+      "src/services/sqlite/observations/store.ts:41",
+      "src/services/sqlite/observations/store.ts:68-73",
+      "src/services/sqlite/migrations/runner.ts:841",
+      "plugin/scripts/worker-service.cjs:19"
+    ]
+  },
+  "landing_point": {
+    "where": "src/services/sqlite/observations/store.ts:19",
+    "why": "The advisory names computeObservationContentHash, and that function exists only here; lines 24-27 hold the whole cause (unseparated concat plus slice(0,16))."
+  },
+  "fix_sites": [
+    {
+      "where": "src/services/sqlite/observations/store.ts:24-27",
+      "entry_point": "POST /api/memory/save; POST /sessions/:sessionDbId/observations (+ /api/sessions/observations alias); exported storeObservation()/storeObservations()/storeObservationsAndMarkComplete(); bin import-xml-observations",
+      "module_kind": "library / persistence module (sqlite observations store)"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "plugin/scripts/worker-service.cjs:19 and plugin/scripts/context-generator.cjs:9 (minified copies of the same hash: update((t||\"\")+(e||\"\")+(r||\"\")).digest(\"hex\").slice(0,16))"
+  },
+  "O3_reason_to_dismiss": "Both .cjs files are esbuild output bundled from src/services/worker-service.ts and src/services/context-generator.ts (scripts/build-hooks.js:16-27,98-103) and the repo's own build regenerates them, so a solver can argue 'fix the source and let npm run build handle the bundle' - which is also exactly why the shipped copies stay stale unless the fix touches them.",
+  "O4_distance": {"files": 6, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The 30s dedup must keep collapsing genuinely identical repeat observations, and the persisted content_hash is a 16-char value with a non-unique index and pre-existing/backfilled rows; a fix that cuts a full 64-char digest, prefixes a version/scheme marker, or adds a nonce/timestamp to the key either stops dedup from ever matching or orphans every hash already stored, and the existing tests pin hash length at 16.",
+    "where": "src/services/sqlite/observations/store.ts:39-43; tests/sqlite/data-integrity.test.ts:58-70,108-116"
+  },
+  "O6_input_shapes": [
+    "field-boundary shift between title and narrative: (title=\"ab\", narrative=\"c\") vs (title=\"a\", narrative=\"bc\") hash identically",
+    "null vs empty string: (null, null) and (\"\", \"\") both normalise to the same input",
+    "boundary shift between memory_session_id and title",
+    "truncation to a 16-hex (64-bit) prefix of the digest"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "src/services/sqlite/migrations/runner.ts:841 (migration 22 backfills content_hash with substr(hex(randomblob(8)),1,16)); duplicated at src/services/sqlite/SessionStore.ts:853",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "POST /api/import stores observations through SessionStore.importObservation, which dedups on (memory_session_id, title, created_at_epoch) and inserts with content_hash NULL, so no content-derived identity is applied on that route at all",
+      "where": "src/services/worker/http/routes/DataRoutes.ts:62,358 -> src/services/sqlite/SessionStore.ts:2364-2397 (duplicate implementation at src/services/sqlite/import/bulk.ts:126-189)",
+      "reason_to_dismiss": "It is a restore/import path for an external database dump, not the live write path, it uses an exact-millisecond key of its own, and the advisory only names computeObservationContentHash, so it was never covered.",
+      "distance": "another module (worker HTTP routes -> legacy SessionStore import method), 2 files and a package boundary away from the observations store module",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Rows backfilled by migration 22 carry a random 16-hex content_hash that was never derived from their content, so a post-upgrade/save-reload re-insert of an existing observation can never match them",
+      "where": "src/services/sqlite/migrations/runner.ts:839-843",
+      "reason_to_dismiss": "The backfill comment says the random values are deliberate 'so they don't block new inserts', and SQL cannot recompute a SHA-256 in this schema, so a solver can call it a design choice rather than part of the collision fix.",
+      "distance": "migration layer, a different file from the store module and only reachable on an existing database",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/services/sqlite/summaries/store.ts:20-34",
+      "sibling": "A content-hash dedup for session_summaries mirroring the observation one",
+      "why_realistic": "Summaries are written by the same worker transaction (transactions.ts:106-127) with no dedup at all, so a maintainer adding duplicate protection would copy computeObservationContentHash and inherit the same unseparated-concat identity."
+    },
+    {
+      "where": "src/services/sync/ChromaSync.ts:158-176",
+      "sibling": "A content-derived stable vector id for observation chunks instead of obs_${id}_narrative",
+      "why_realistic": "The sync layer already needs a deterministic identity to upsert chunks and already imports observation content; hashing title/narrative/facts there is a natural next step and would repeat the same field-boundary ambiguity."
+    },
+    {
+      "where": "src/services/sqlite/import/bulk.ts:126-189",
+      "sibling": "A second dedup identity (session+title+exact epoch) for imported observations",
+      "why_realistic": "This already exists as a divergent copy of the store path, so a maintainer unifying import with the live path would plausibly bolt the content hash onto it."
+    }
+  ],
+  "O9_family": "CWE-327: risky hash construction - truncated digest over an ambiguous, unseparated concatenation used as a dedup identity (silent data loss on collision)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript (Bun runtime; bun:sqlite)",
+    "toolchain": "bun >= 1.0 (bun install, bun test); npm run build = node scripts/sync-plugin-manifests.js && node scripts/build-hooks.js (esbuild bundles into plugin/scripts/*.cjs)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/sqlite/data-integrity.test.ts covers this exact area (hash consistency, null handling, length 16, 30s dedup, content_hash populated); also tests/services/sqlite/migration-runner.test.ts:92-129 and tests/services/sqlite/schema-repair.test.ts. Run with bun test tests/sqlite/."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/services/sqlite/observations/store.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Hash only the field the report's example varies (narrative) or add a nonce/timestamp so hashes never collide - the visible tests stay green while the identity is still ambiguous or the 30s dedup stops working."
+  },
+  "out_of_scope_notes": [
+    "scripts/translate-readme/index.ts:17 uses the same sha256().slice(0,16) shape as a translation-cache key; unrelated to observation identity and not pursued.",
+    "src/services/sync/ChromaSync.ts derives vector ids from row ids (obs_${id}_narrative), not from content; a related identity question but outside this advisory's protection."
+  ],
+  "unverified": [
+    "The supplied fix diff contains only the commit header for f32fda8b (a merge commit) and no hunks, so the exact published change (separator vs length-prefix vs full digest), whether tests were added or changed, and whether the plugin/scripts bundles were rebuilt in the fix are unknown.",
+    "Repository size in MB could not be measured without a shell, so tiny_repo/giant_repo cannot be decided (repo_mb left null).",
+    "No latest checkout was provided, so present_in_latest for both O8 routes is unknown.",
+    "Whether any test invokes the minified plugin/scripts copy rather than src (i.e. whether the stale bundle is observable to a hidden behavioural test) was not checked."
+  ]
+}

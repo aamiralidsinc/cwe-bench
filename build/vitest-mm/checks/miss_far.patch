@@ -1,0 +1,210 @@
+diff --git a/packages/browser/src/node/commands/artifacts.ts b/packages/browser/src/node/commands/artifacts.ts
+index ba6874f..89b3d2d 100644
+--- a/packages/browser/src/node/commands/artifacts.ts
++++ b/packages/browser/src/node/commands/artifacts.ts
+@@ -1,7 +1,7 @@
+ import type { BrowserCommand } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { dirname, resolve } from 'node:path'
+-import { assertFileAccess } from './fs'
++import { assertFileAccess, assertWriteAllowed } from './fs'
+ 
+ /**
+  * Writes a test artifact (a recorded payload, a generated report fragment, …)
+@@ -10,6 +10,7 @@ import { assertFileAccess } from './fs'
+ export const exportArtifact: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
++  assertWriteAllowed(project)
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+index 9d4cb2a..7107cb3 100644
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -3,13 +3,51 @@ import type { BrowserCommand, TestProject } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+-import { isFileServingAllowed } from 'vitest/node'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++export function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++/**
++ * File writes and deletes are refused while any API that fronts this project is
++ * reachable from the network. The browser API inherits the runner's binding, so
++ * the runner's own API is part of the check.
++ */
++export function assertWriteAllowed(project: TestProject): void {
++  const bindings = [
++    project.vitest.config.api,
++    project.config.api,
++    project.vitest.config.browser.api,
++    project.config.browser.api,
++  ]
++  if (bindings.some(isApiExposed)) {
++    throw new Error(
++      'Cannot modify files because the server is exposed to the network. Bind the API to the local machine to allow writes.',
++    )
++  }
++}
++
++function isInsideAllowedRoots(config: { server: { fs: { allow: string[] } } }, filepath: string): boolean {
++  const target = resolve(filepath)
++  return config.server.fs.allow.some((root) => {
++    const base = resolve(root)
++    return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++  })
++}
++
++/**
++ * A path is reachable only when it sits inside one of the locations the project
++ * explicitly allows. This is checked on its own, so it still holds when the
++ * project widens Vite's file-serving settings.
++ */
+ export function assertFileAccess(path: string, project: TestProject): void {
+-  if (
+-    !isFileServingAllowed(path, project.vite)
+-    && !isFileServingAllowed(path, project.vitest.vite)
+-  ) {
++  const configs = [project.vite?.config, project.vitest.vite?.config].filter(Boolean) as { server: { fs: { allow: string[] } } }[]
++  if (!configs.some(config => isInsideAllowedRoots(config, path))) {
+     throw new Error(
+       `Access denied to "${path}". See Vite config documentation for "server.fs": https://vitejs.dev/config/server-options.html#server-fs-strict.`,
+     )
+diff --git a/packages/browser/src/node/plugin.ts b/packages/browser/src/node/plugin.ts
+index 0b23b6d..aff9b77 100644
+--- a/packages/browser/src/node/plugin.ts
++++ b/packages/browser/src/node/plugin.ts
+@@ -12,7 +12,6 @@ import { basename, dirname, extname, join, resolve } from 'pathe'
+ import sirv from 'sirv'
+ import { coverageConfigDefaults } from 'vitest/config'
+ import {
+-  isFileServingAllowed,
+   isValidApiRequest,
+   resolveApiServerConfig,
+   resolveFsAllow,
+@@ -191,7 +190,15 @@ export default (parentServer: ParentBrowserProject, base = '/'): Plugin[] => {
+ 
+           const fsPath = decodeURIComponent(path)
+ 
+-          if (!isFileServingAllowed(parentServer.vite.config, fsPath)) {
++          // Confinement is checked on its own so it still holds when the
++          // project widens Vite's file-serving settings.
++          const allowList = parentServer.vite.config.server.fs.allow
++          const target = resolve(fsPath)
++          const inside = allowList.some((root: string) => {
++            const base = resolve(root)
++            return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++          })
++          if (!inside) {
+             return next()
+           }
+ 
+diff --git a/packages/ui/node/index.ts b/packages/ui/node/index.ts
+index 9a9af99..19f0054 100644
+--- a/packages/ui/node/index.ts
++++ b/packages/ui/node/index.ts
+@@ -7,7 +7,7 @@ import { basename, resolve } from 'pathe'
+ import sirv from 'sirv'
+ import c from 'tinyrainbow'
+ import { coverageConfigDefaults } from 'vitest/config'
+-import { isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { isValidApiRequest } from 'vitest/node'
+ import { version } from '../package.json'
+ 
+ export default (ctx: Vitest): Plugin => {
+@@ -74,11 +74,28 @@ export default (ctx: Vitest): Plugin => {
+ 
+             const fsPath = decodeURIComponent(path)
+ 
+-            if (!isFileServingAllowed(ctx.vite.config, fsPath)) {
++            // Confinement is checked on its own so it still holds when the
++            // project widens Vite's file-serving settings.
++            const allowList = ctx.vite.config.server.fs.allow
++            const target = resolve(fsPath)
++            const inside = allowList.some((root) => {
++              const base = resolve(root)
++              return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
++            })
++            if (!inside) {
+               return next()
+             }
+ 
+             if (req.method === 'POST') {
++              // writes are refused while the control server is network-reachable
++              const api = ctx.config.api
++              const exposed = api && !api.middlewareMode && api.host
++                && api.host !== 'localhost' && api.host !== '127.0.0.1'
++              if (exposed) {
++                res.writeHead(403)
++                res.end()
++                return
++              }
+               // save the attachment the UI is holding back to disk
+               const chunks: Buffer[] = []
+               req.on('data', (chunk: Buffer) => {
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index f4c9a9c..dfa28af 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -28,6 +28,23 @@ import { getModuleGraph } from '../utils/graph'
+ import { stringifyReplace } from '../utils/serialization'
+ import { isValidApiRequest } from './check'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++function assertWriteAllowed(ctx: Vitest): void {
++  if (isApiExposed(ctx.config.api)) {
++    throw new Error(
++      'Cannot modify files or start test runs because the server is exposed to the network. Bind the API to the local machine to allow writes.',
++    )
++  }
++}
++
+ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   const wss = new WebSocketServer({ noServer: true })
+ 
+@@ -75,6 +92,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.readFile(id, 'utf-8')
+         },
+         async saveTestFile(id, content) {
++          assertWriteAllowed(ctx)
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+@@ -83,9 +101,11 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          assertWriteAllowed(ctx)
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          assertWriteAllowed(ctx)
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -150,6 +170,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return getModuleGraph(ctx, project, id, browser)
+         },
+         async updateSnapshot(file?: File) {
++          assertWriteAllowed(ctx)
+           if (!file) {
+             await ctx.updateSnapshot()
+           }

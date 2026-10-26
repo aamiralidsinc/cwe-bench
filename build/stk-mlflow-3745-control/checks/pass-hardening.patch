@@ -1,0 +1,161 @@
+diff --git a/mlflow/gateway/network_policy.py b/mlflow/gateway/network_policy.py
+new file mode 100644
+index 000000000..d5ac36dea
+--- /dev/null
++++ b/mlflow/gateway/network_policy.py
+@@ -0,0 +1,90 @@
++"""Outbound address policy for gateway provider configuration.
++
++A gateway endpoint calls a model provider at an address taken from its configuration.
++Only publicly routable destinations are allowed by default; an operator can opt in to
++internal destinations with ``MLFLOW_GATEWAY_ALLOW_PRIVATE_UPSTREAMS``.
++"""
++
++import ipaddress
++import os
++import socket
++from urllib.parse import urlsplit
++
++ALLOW_PRIVATE_UPSTREAMS_ENV_VAR = "MLFLOW_GATEWAY_ALLOW_PRIVATE_UPSTREAMS"
++
++_ALLOWED_SCHEMES = ("http", "https")
++_URL_FIELDS = ("api_base", "base_url")
++
++
++class UnsafeUpstreamError(ValueError):
++    """A configured upstream address is not publicly routable."""
++
++
++def allow_private_upstreams() -> bool:
++    value = os.environ.get(ALLOW_PRIVATE_UPSTREAMS_ENV_VAR, "")
++    return value.strip().lower() in {"1", "true", "yes", "on"}
++
++
++def _ip_is_public(address: ipaddress._BaseAddress) -> bool:
++    if address.version == 6 and address.ipv4_mapped is not None:
++        address = address.ipv4_mapped
++    return address.is_global and not address.is_multicast
++
++
++def _host_is_public(host: str) -> bool:
++    """Whether ``host`` names only publicly routable addresses."""
++    host = host.strip().strip("[]")
++    try:
++        return _ip_is_public(ipaddress.ip_address(host))
++    except ValueError:
++        pass
++    try:
++        infos = socket.getaddrinfo(host, None)
++    except (socket.gaierror, UnicodeError, OSError):
++        return True
++    if not infos:
++        return True
++    for info in infos:
++        addr = info[4][0]
++        try:
++            address = ipaddress.ip_address(str(addr).split("%", 1)[0])
++        except ValueError:
++            return False
++        if not _ip_is_public(address):
++            return False
++    return True
++
++
++def validate_upstream_url(value: str, *, field: str = "upstream address") -> None:
++    """Raise `UnsafeUpstreamError` unless ``value`` names a public http(s) host."""
++    if not isinstance(value, str) or not value.strip():
++        raise UnsafeUpstreamError(f"{field} must be a non-empty URL")
++    value = value.strip()
++    try:
++        parts = urlsplit(value)
++        host = parts.hostname
++        port = parts.port
++    except ValueError as e:
++        raise UnsafeUpstreamError(f"{field} is not a valid URL: {e}") from e
++    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
++        raise UnsafeUpstreamError(f"{field} must use http or https")
++    if not host:
++        raise UnsafeUpstreamError(f"{field} must include a host")
++    if parts.username is not None or parts.password is not None:
++        raise UnsafeUpstreamError(f"{field} must not embed credentials")
++    if port is not None and not 0 < port < 65536:
++        raise UnsafeUpstreamError(f"{field} has an invalid port")
++    if allow_private_upstreams():
++        return
++    if not _host_is_public(host):
++        raise UnsafeUpstreamError(f"{field} must name a publicly routable host")
++
++
++def validate_supplied_config(auth_config: dict | None, secret_value: dict | None) -> None:
++    """Validate every supplied value that determines the upstream address."""
++    for source in (auth_config or {}, secret_value or {}):
++        if not isinstance(source, dict):
++            continue
++        for field in _URL_FIELDS:
++            if field in source:
++                validate_upstream_url(source[field], field=field)
+diff --git a/mlflow/server/gateway_api.py b/mlflow/server/gateway_api.py
+index 8dd090e95..55eedfe2d 100644
+--- a/mlflow/server/gateway_api.py
++++ b/mlflow/server/gateway_api.py
+@@ -282,6 +282,13 @@ def _build_endpoint_config(
+ 
+     provider_config = None
+ 
++    from mlflow.gateway.network_policy import UnsafeUpstreamError, validate_supplied_config
++
++    try:
++        validate_supplied_config(model_config.auth_config, model_config.secret_value)
++    except UnsafeUpstreamError as e:
++        raise MlflowException.invalid_parameter_value(str(e)) from e
++
+     if model_config.provider == Provider.OPENAI:
+         auth_config = model_config.auth_config or {}
+         openai_config = {
+diff --git a/mlflow/store/tracking/gateway/sqlalchemy_mixin.py b/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
+index 5f8baf6be..0054e74a7 100644
+--- a/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
++++ b/mlflow/store/tracking/gateway/sqlalchemy_mixin.py
+@@ -35,6 +35,10 @@ from mlflow.entities.gateway_guardrail import (
+     GuardrailAction,
+     GuardrailStage,
+ )
++from mlflow.gateway.network_policy import (
++    UnsafeUpstreamError,
++    validate_supplied_config,
++)
+ from mlflow.exceptions import MlflowException
+ from mlflow.protos.databricks_pb2 import (
+     INVALID_PARAMETER_VALUE,
+@@ -191,6 +195,8 @@ class SqlAlchemyGatewayStoreMixin:
+         Returns:
+             Secret entity with metadata (encrypted value not included).
+         """
++        _validate_gateway_secret_config(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             secret_id = f"s-{uuid.uuid4().hex}"
+             current_time = get_current_time_millis()
+@@ -288,6 +294,8 @@ class SqlAlchemyGatewayStoreMixin:
+         Returns:
+             Updated Secret entity.
+         """
++        _validate_gateway_secret_config(auth_config, secret_value)
++
+         with self.ManagedSessionMaker(read_only=False) as session:
+             sql_secret = self._get_entity_or_raise(
+                 session, SqlGatewaySecret, {"secret_id": secret_id}, "GatewaySecret"
+@@ -1540,3 +1548,13 @@ class SqlAlchemyGatewayStoreMixin:
+                 .all()
+             )
+             return [c.to_mlflow_entity() for c in configs]
++
++
++def _validate_gateway_secret_config(
++    auth_config: dict[str, Any] | None, secret_value: dict[str, Any] | None
++) -> None:
++    """Reject stored configuration that would send a call to a non-public address."""
++    try:
++        validate_supplied_config(auth_config, secret_value)
++    except UnsafeUpstreamError as e:
++        raise MlflowException.invalid_parameter_value(str(e)) from e

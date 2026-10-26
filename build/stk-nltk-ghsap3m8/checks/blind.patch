@@ -1,0 +1,246 @@
+diff -ruN a/nltk/_pathguard.py b/nltk/_pathguard.py
+--- a/nltk/_pathguard.py	1970-01-01 00:00:00.000000000 +0000
++++ b/nltk/_pathguard.py	2026-10-25 23:34:24.591255924 +0000
+@@ -0,0 +1,69 @@
++# Natural Language Toolkit: containment helpers for resolved file names
++#
++# Copyright (C) 2001-2023 NLTK Project
++# URL: <https://www.nltk.org/>
++# For license information, see LICENSE.TXT
++#
++"""
++Keep a name that is joined onto a directory inside that directory.
++
++Both the data search path and the downloader take names that do not come from
++the caller -- an index entry, a resource name, a corpus file id -- and resolve
++them against a directory that *does* come from the caller.  These helpers apply
++one rule to every such join: after ``..`` segments and symbolic links are
++resolved, the result must lie at or below the root.  Any other result is
++reported as an ``EscapeError`` instead of being used.
++"""
++
++import os
++
++
++class EscapeError(ValueError):
++    """A name resolved to a location outside the root it was joined onto."""
++
++
++def _resolved(path):
++    return os.path.realpath(os.path.abspath(path))
++
++
++def is_inside(root, candidate):
++    """
++    Return True when ``candidate`` lies at or below ``root``.
++
++    Both arguments are made absolute and their symbolic links are resolved
++    first, so a link inside the root cannot be used to reach a file outside it.
++    """
++    root = _resolved(root)
++    candidate = _resolved(candidate)
++    try:
++        return os.path.commonpath([root, candidate]) == root
++    except ValueError:
++        # Different drives (Windows): no common location at all.
++        return False
++
++
++def join_inside(root, name, what="path"):
++    """
++    Join ``name`` onto ``root``, returning the resolved path.
++
++    :raise EscapeError: if ``name`` is absolute, holds a NUL byte, or the
++        joined path lies outside ``root``.
++    """
++    name = os.fspath(name)
++    if "\x00" in name:
++        raise EscapeError(f"{what} contains a NUL byte")
++    root = os.path.abspath(os.fspath(root))
++    joined = os.path.abspath(os.path.join(root, name))
++    if not is_inside(root, joined):
++        raise EscapeError(f"{what} {name!r} resolves outside {root!r}")
++    return joined
++
++
++def check_archive_members(zip_file, root, what="archive"):
++    """
++    Refuse an archive whose members would land outside ``root`` when unpacked.
++
++    :raise EscapeError: on the first member name that escapes ``root``.
++    """
++    for member in zip_file.infolist():
++        join_inside(root, member.filename, what=f"{what} member")
+diff -ruN a/nltk/data.py b/nltk/data.py
+--- a/nltk/data.py	2026-10-25 23:13:31.000000000 +0000
++++ b/nltk/data.py	2026-10-25 23:34:53.335229820 +0000
+@@ -51,6 +51,7 @@
+     from zlib import Z_FINISH as FLUSH
+ 
+ from nltk import grammar, sem
++from nltk._pathguard import EscapeError, is_inside
+ from nltk.compat import add_py3_data, py3_data
+ from nltk.internals import deprecated
+ 
+@@ -331,6 +332,8 @@
+ 
+     def join(self, fileid):
+         _path = os.path.join(self._path, fileid)
++        if not is_inside(self._path, _path):
++            raise EscapeError(f"File id {fileid!r} escapes {self._path!r}")
+         return FileSystemPathPointer(_path)
+ 
+     def __repr__(self):
+@@ -446,7 +449,14 @@
+         return self._zipfile.getinfo(self._entry).file_size
+ 
+     def join(self, fileid):
+-        entry = f"{self._entry}/{fileid}"
++        entry = normalize_resource_name(f"{self._entry}/{fileid}", True, "/").lstrip(
++            "/"
++        )
++        base = normalize_resource_name(self._entry, True, "/").lstrip("/")
++        # The entry names come from outside the caller: they must stay below
++        # the directory this pointer already identifies.
++        if base and entry != base and not entry.startswith(base + "/"):
++            raise EscapeError(f"File id {fileid!r} escapes {base!r} in the zip file")
+         return ZipFilePathPointer(self._zipfile, entry)
+ 
+     def __repr__(self):
+@@ -505,6 +515,9 @@
+     :rtype: str
+     """
+     resource_name = normalize_resource_name(resource_name, True)
++    # Percent-escapes are decoded when the name is joined onto a search path,
++    # so the containment test has to look at the decoded form as well.
++    decoded_name = url2pathname(resource_name)
+ 
+     # Resolve default paths at runtime in-case the user overrides
+     # nltk.data.path
+@@ -527,8 +540,12 @@
+ 
+         # Is the path item a directory or is resource_name an absolute path?
+         elif not path_ or os.path.isdir(path_):
++            # A name resolved against a search location may not reach a file
++            # outside that location; if it does, this location has no match.
+             if zipfile is None:
+-                p = os.path.join(path_, url2pathname(resource_name))
++                p = os.path.join(path_, decoded_name)
++                if path_ and not is_inside(path_, p):
++                    continue
+                 if os.path.exists(p):
+                     if p.endswith(".gz"):
+                         return GzipFileSystemPathPointer(p)
+@@ -536,6 +553,8 @@
+                         return FileSystemPathPointer(p)
+             else:
+                 p = os.path.join(path_, url2pathname(zipfile))
++                if path_ and not is_inside(path_, p):
++                    continue
+                 if os.path.exists(p):
+                     try:
+                         return ZipFilePathPointer(p, zipentry)
+@@ -881,7 +900,10 @@
+     protocol, path_ = split_resource_url(resource_url)
+ 
+     if protocol is None or protocol.lower() == "nltk":
+-        return find(path_, path + [""]).open()
++        # "nltk:" names are resolved against the configured data locations
++        # only; there is no absolute fallback for them (an absolute name is
++        # normalised to "file:" above).
++        return find(path_).open()
+     elif protocol.lower() == "file":
+         # urllib might not use mode='rb', so handle this one ourselves:
+         return find(path_, [""]).open()
+diff -ruN a/nltk/downloader.py b/nltk/downloader.py
+--- a/nltk/downloader.py	2026-10-25 23:13:31.000000000 +0000
++++ b/nltk/downloader.py	2026-10-25 23:34:35.159246326 +0000
+@@ -187,6 +187,7 @@
+ from urllib.request import urlopen
+ 
+ import nltk
++from nltk._pathguard import EscapeError, check_archive_members, join_inside
+ 
+ # urllib2 = nltk.internals.import_from_stdlib('urllib2')
+ 
+@@ -676,6 +677,21 @@
+         yield StartPackageMessage(info)
+         yield ProgressMessage(0)
+ 
++        # Everything the index contributes to the destination -- the
++        # subdirectory, the package id that forms the file name, or a
++        # ``filename`` attribute that overrides it -- is checked here, before
++        # the stale-file removal and the directory creation below.  A refusal
++        # therefore leaves the filesystem untouched.
++        try:
++            download_dir = os.path.abspath(download_dir)
++            package_path = join_inside(download_dir, info.filename, "package file name")
++            subdir_path = join_inside(
++                download_dir, info.subdir, "package subdirectory"
++            )
++        except EscapeError as e:
++            yield ErrorMessage(info, f"Refusing to install {info.id!r}: {e}")
++            return
++
+         # Do we already have the current version?
+         status = self.status(info, download_dir)
+         if not force and status == self.INSTALLED:
+@@ -688,7 +704,7 @@
+         self._status_cache.pop(info.id, None)
+ 
+         # Check for (and remove) any old/stale version.
+-        filepath = os.path.join(download_dir, info.filename)
++        filepath = package_path
+         if os.path.exists(filepath):
+             if status == self.STALE:
+                 yield StaleMessage(info)
+@@ -696,7 +712,7 @@
+ 
+         # Ensure the download_dir exists
+         os.makedirs(download_dir, exist_ok=True)
+-        os.makedirs(os.path.join(download_dir, info.subdir), exist_ok=True)
++        os.makedirs(subdir_path, exist_ok=True)
+ 
+         # Download the file.  This will raise an IOError if the url
+         # is not found.
+@@ -723,9 +739,23 @@
+         yield FinishDownloadMessage(info)
+         yield ProgressMessage(80)
+ 
++        # The index publishes a checksum for the archive.  Compare it now,
++        # while nothing has been unpacked yet: content that does not match is
++        # never extracted, rather than being caught later by a status query.
++        if info.checksum:
++            checksum = md5_hexdigest(filepath)
++            if checksum != info.checksum:
++                yield ErrorMessage(
++                    info,
++                    "Checksum mismatch for %r: the index publishes %s,"
++                    " the downloaded file has %s"
++                    % (info.id, info.checksum, checksum),
++                )
++                return
++
+         # If it's a zipfile, uncompress it.
+         if info.filename.endswith(".zip"):
+-            zipdir = os.path.join(download_dir, info.subdir)
++            zipdir = subdir_path
+             # Unzip if we're unzipping by default; *or* if it's already
+             # been unzipped (presumably a previous version).
+             if info.unzip or os.path.exists(os.path.join(zipdir, info.id)):
+@@ -2247,6 +2277,15 @@
+         yield ErrorMessage(filename, e)
+         return
+ 
++    # The member names come from the archive, not from the caller: refuse any
++    # of them that would be unpacked outside ``root``.
++    try:
++        check_archive_members(zf, root)
++    except EscapeError as e:
++        zf.close()
++        yield ErrorMessage(filename, str(e))
++        return
++
+     zf.extractall(root)
+ 
+     if verbose:

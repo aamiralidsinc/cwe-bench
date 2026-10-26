@@ -1,0 +1,124 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "15196",
+  "advisory_ids": ["GHSA-2FQW-7C6R-2CQ6", "CVE-2026-53471", "GO-2026-6228"],
+  "repo": "kubev2v/migration-planner",
+  "pinned_commit": "d7ba2e1920104552cbf91f6f640b97edd10ba130",
+  "fix_commits": ["fd21a239216f5eeec635d16c72be9c033bd5d1aa"],
+  "trust_decision": {
+    "summary": "The agent API treats the source_id claim of the X-Agent-Token JWT (or, with agent authentication off, a sourceId read out of the request body) as the caller's entire authority, and at the pinned commit neither agent handler compares it with the source being written, so a token issued for one source can create an agent row for, and rewrite the inventory of, any other source.",
+    "evidence": [
+      "internal/auth/agent_authenticator.go:114-127",
+      "internal/auth/agent_authenticator.go:131-143",
+      "internal/handlers/v1alpha1/agent.go:29-44",
+      "internal/handlers/v1alpha1/agent.go:68-84",
+      "internal/service/agent.go:59-62",
+      "internal/service/agent.go:89-101"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/handlers/v1alpha1/agent.go:29",
+    "why": "AgentHandler.UpdateSourceInventory is the write the advisory summary describes ('cross-tenant data manipulation'): an agent token plus a path source id goes straight into the source update with no use of the JWT, so an engineer greps the agent handlers and lands here first."
+  },
+  "fix_sites": [
+    {"where": "internal/handlers/v1alpha1/agent.go:34", "entry_point": "PUT /api/v1/sources/{id}/status (api/v1alpha1/agent/openapi.yaml:11-16) -> AgentHandler.UpdateSourceInventory", "module_kind": "http_handler"},
+    {"where": "internal/handlers/v1alpha1/agent.go:77", "entry_point": "PUT /api/v1/agents/{id}/status (api/v1alpha1/agent/openapi.yaml:68-73) -> AgentHandler.UpdateAgentStatus", "module_kind": "http_handler"},
+    {"where": "internal/api_server/agentserver/server.go:77-82", "entry_point": "AgentServer.Run router construction: the agent authenticator is currently mounted only when the enabled flag is set", "module_kind": "server_router_middleware_composition"},
+    {"where": "internal/auth/agent_authenticator.go:79-81", "entry_point": "auth.NewAgentAuthenticator factory, called only from internal/api_server/agentserver/server.go:80", "module_kind": "auth_factory"},
+    {"where": "fix.diff:143-191 (new file internal/auth/none_agent_authenticator.go)", "entry_point": "agent-server middleware now always mounted, so this one runs when MIGRATION_PLANNER_AGENT_AUTH_ENABLED=false", "module_kind": "middleware_authenticator"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "internal/auth/agent_authenticator.go:79-81 (fix.diff:34-47 turns the constructor into a factory that composes a second authenticator, fix.diff:143-191, in the auth package rather than the handler package)"
+  },
+  "O3_reason_to_dismiss": "Where the caller's source identity comes from is decided in internal/auth and the router wiring, not in the handlers the advisory names; and with agent authentication disabled (a supported documented mode, doc/run-locally.md:58) there is no JWT claim at all to validate, so the factory and the disabled branch look like auth plumbing and a dev-only path rather than part of the claim check.",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "(i) Agent-authentication-disabled deployments must keep accepting inventory updates, but the published none-authenticator derives SourceID from a body field named sourceId that SourceStatusUpdate does not have, so in that mode every PUT /api/v1/sources/{id}/status returns 403 with an empty claim; (ii) two agents may legitimately be attached to one source and both must be allowed to update it (the service comment says so), so a check keyed on the agent instead of the source breaks multi-agent updates; (iii) PUT /api/v1/agents/{id}/status legitimately creates the agent row on first contact when it does not exist yet.",
+    "where": "api/v1alpha1/agent/types.gen.go:21-24; doc/run-locally.md:58; internal/service/agent.go:32-36; internal/service/agent.go:94-101; fix.diff:161-191"
+  },
+  "O6_input_shapes": [
+    "target source as a path UUID: request.Id in PUT /api/v1/sources/{id}/status (internal/handlers/v1alpha1/agent.go:39-40)",
+    "target source as a JSON body UUID: request.Body.SourceId in PUT /api/v1/agents/{id}/status (internal/handlers/v1alpha1/agent.go:77-79)",
+    "caller identity as a JWT claim source_id taken from the X-Agent-Token header (internal/auth/agent_authenticator.go:114,140)",
+    "caller identity as a JSON body sourceId string when agent auth is disabled (fix.diff:170-186), and absent entirely on the inventory route because that body has no sourceId field (api/v1alpha1/agent/types.gen.go:21-24)",
+    "agent id as a path UUID that is never bound to a source anywhere in the handlers (internal/handlers/v1alpha1/agent.go:77-84)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "internal/auth/agent_authenticator.go:112-129 is the middleware that puts the AgentJWT into the request context (claims parsed at :131-143); in the fixed tree the alternative producer is the body-parsing middleware at fix.diff:161-191, and an independent producer of the same source_id token is the image download path at internal/service/source.go:62-87",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "GET /api/v1/sources/{id}/image-url mints and stores that source's agent JWT and returns a presigned OVA download URL with no ownership check, so any caller with a valid main-API identity (any org; everyone when MIGRATION_PLANNER_AUTH is the empty default) obtains an X-Agent-Token whose source_id is the target source, which makes the new handler check pass for that source.",
+      "where": "internal/handlers/v1alpha1/source.go:236-247; internal/service/source.go:44-48,62-87; internal/image/builder.go:281,473-475",
+      "reason_to_dismiss": "The advisory asks the agent API to validate the claim it is handed; this route writes no source data at all, it only downloads an OVA, and the caller is expected to already own the source id, so token issuance reads as a separate feature (source access control) rather than the claim check.",
+      "distance": "3 files / 2 packages from the landing point: handler at internal/handlers/v1alpha1/source.go:236, minting at internal/service/source.go:35-87, embedding at internal/image/builder.go:473-475",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "PUT /api/v1/agents/{id}/status still lets a token for source A rewrite another tenant's agent row: the added check compares source_id only with the body's sourceId, never with the source that owns the agent id in the path, and store.Agent().Update overwrites SourceID, status, credUrl and version on that row.",
+      "where": "internal/handlers/v1alpha1/agent.go:77-84; internal/service/agent.go:89-105; internal/store/agent.go:71-81",
+      "reason_to_dismiss": "The advisory is about which source is being updated and the fix compares exactly that value; an agent id is not a tenant-scoped object in the report's model, so re-pointing somebody else's agent row looks like a neighbouring record-tampering concern.",
+      "distance": "same handler, write reached through internal/service/agent.go and internal/store/agent.go (2 files, 2 packages away)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "internal/handlers/v1alpha1/source.go:236",
+      "sibling": "An ownership check (user.Organization/user.Username against source.OrgID/source.Username) before GetSourceDownloadURL mints or reuses the source's agent token",
+      "why_realistic": "The exact three-field ownership comparison is already written in the neighbouring GetSource (source.go:119-123), UpdateSource (source.go:153-157) and DeleteSource (source.go:94-98) handlers in this same file; a maintainer adding a token-minting route would plausibly copy one of them, or plausibly forget, exactly as here."
+    },
+    {
+      "where": "internal/service/source.go:233",
+      "sibling": "A second inventory writer that takes a caller-supplied AgentID and silently creates an agent row for the source when the id is unknown (source.go:247-261)",
+      "why_realistic": "It is the user-side twin of the agent sink and already auto-creates agents; a maintainer adding a CLI or rvtools ingest path would naturally call this service method and inherit the same 'agent id is not bound to the source' weakness."
+    },
+    {
+      "where": "internal/auth/agent_authenticator.go:131-143",
+      "sibling": "A claim-shape guard that the source_id claim exists, is a UUID and is non-empty before building AgentJWT, instead of the bare claims[\"source_id\"].(string) assertion",
+      "why_realistic": "The token producers already vary (image download token, none mode, local keys), and anyone hardening the identity anchor for this advisory would put the shape check at the parse site rather than in each handler."
+    }
+  ],
+  "O9_family": "authorization / cross-tenant object modification through a user-controlled key (CWE-639 IDOR): the identity claim is read but never bound to the object being written",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.25.0 (go.mod:3); `go build ./...`; unit tests via ginkgo (`make test`, Makefile:416-419; UNIT_TEST_PACKAGES excludes the agent-v2 submodule); no vendor directory, so the first build needs the module cache or a proxy",
+    "services": ["postgres for store-backed handler tests (config.go:15 DB_TYPE defaults to pgsql; a sqlite branch exists at internal/store/gorm.go:48-50)"],
+    "offline_after_build": true,
+    "project_tests": "internal/handlers/v1alpha1/agent_test.go (Ginkgo; real DB via store.InitDB, agent_test.go:29-37) covers both agent handlers; internal/auth/agent_authenticator_test.go covers token parsing/middleware with in-memory RSA keys; internal/service/agent_test.go and internal/store/agent_test.go cover the service check; e2e lives under test/e2e"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/api_server/agentserver/server.go, internal/auth/agent_authenticator.go, internal/auth/none_agent_authenticator.go (new), internal/handlers/v1alpha1/agent.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Compare the JWT source_id only with the target in UpdateSourceInventory (the write the report names), or push the comparison into the service next to the existing agent.SourceID != source check at internal/service/agent.go:60, leaving UpdateAgentStatus's arbitrary agent id, the disabled-authentication mode and the image-URL token issuance untouched."
+  },
+  "out_of_scope_notes": [
+    "The agent client is the agent-v2 submodule (assisted-migration-agent, .gitmodules:1-3), not checked out at the pinned commit and a different repository, so no second client-side implementation was examined.",
+    "internal/auth/auth.go:43-44 maps an empty MIGRATION_PLANNER_AUTH (the default) to the no-op authenticator, so the whole user-side API including the image-url route is unauthenticated by default; that is a separate weakness from this advisory's claim validation and was not pursued.",
+    "The candidate metadata records one sibling advisory; possibly the image-URL / source-ownership issue, but that could not be resolved without network access."
+  ],
+  "unverified": [
+    "Repo size in MB: no shell was available in this session, so tiny_repo/giant_repo were left unflagged; the tree has ~458 tracked files plus binary image assets (data/persistence-disk.vmdk, data/MigrationAssessment.ovf) that are not source.",
+    "present_in_latest for both O8 routes: 'latest release: none' and no later tree or network, so unknown; the published fix diff touches neither internal/handlers/v1alpha1/source.go nor the agent-id scoping in internal/service/agent.go.",
+    "Whether the agent VM actually reads the token from the OVA config (internal/image/builder.go:281 passes it into the image config): the agent implementation is the un-checked-out agent-v2 submodule.",
+    "O11 fix_minutes is an estimate; the disabled-mode repair (deriving source identity without a body sourceId) is the least well-defined part.",
+    "The exact advisory text (GHSA/CVE body) was not available; the trust decision is reconstructed from the summary, the fix diff and the pinned code."
+  ]
+}

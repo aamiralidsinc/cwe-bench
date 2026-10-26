@@ -1,0 +1,142 @@
+diff -ruN pristine/src/runtime/components/MDCRenderer.vue app/src/runtime/components/MDCRenderer.vue
+--- a/src/runtime/components/MDCRenderer.vue	2026-10-26 05:35:38.000000000 +0000
++++ b/src/runtime/components/MDCRenderer.vue	2026-10-26 06:12:24.473584845 +0000
+@@ -6,6 +6,7 @@
+ import type { VNode, ConcreteComponent, PropType, DefineComponent } from 'vue'
+ import type { MDCElement, MDCNode, MDCRoot, MDCData, MDCRenderOptions } from '@nuxtjs/mdc'
+ import htmlTags from '../parser/utils/html-tags-list'
++import { validateProps, isUrlAttribute, isAllowedUrl } from '../parser/utils/props'
+ import { flatUnwrap, nodeTextContent } from '../utils/node'
+ import { pick } from '../utils'
+ 
+@@ -208,7 +209,7 @@
+     component.tag = originalTag
+   }
+ 
+-  const props = propsToData(node, documentMeta)
++  const props = propsToData(sanitizeNodeProps(node), documentMeta)
+   if (keyInParent) {
+     props.key = keyInParent
+   }
+@@ -310,6 +311,15 @@
+ }
+ 
+ /**
++ * A parsed document can reach the renderer without having been produced by the parser in this
++ * process (it may have been stored and restored), so re-apply the attribute rules here, at the
++ * point where node props become DOM attributes.
++ */
++function sanitizeNodeProps(node: MDCElement) {
++  return { ...node, props: validateProps(node.tag || '', node.props) }
++}
++
++/**
+  * Create component data from node props.
+  */
+ function propsToData(node: MDCElement, documentMeta: MDCData) {
+@@ -379,6 +389,18 @@
+  */
+ function propsToDataVBind(_key: string, value: any, data: any, documentMeta: MDCData) {
+   const val = evalInContext(value, documentMeta)
++  if (val && typeof val === 'object' && !Array.isArray(val)) {
++    // Binding values are resolved at render time, after the parser has run, so check the URL
++    // attributes of the resolved object here as well.
++    for (const [name, bound] of Object.entries(val)) {
++      if (isUrlAttribute(name) && typeof bound === 'string' && !isAllowedUrl(bound)) {
++        continue
++      }
++      data[name] = bound
++    }
++    return data
++  }
++
+   data = Object.assign(data, val)
+   return data
+ }
+@@ -398,7 +420,13 @@
+  */
+ function propsToDataRxBind(key: string, value: any, data: any, documentMeta: MDCData) {
+   key = key.replace(rxBind, '')
+-  data[key] = evalInContext(value, documentMeta)
++  const resolved = evalInContext(value, documentMeta)
++  // The bound value only exists now: it can name a refused scheme even though the expression
++  // the parser saw looks harmless, so keep such values away from URL attributes.
++  if (isUrlAttribute(key) && typeof resolved === 'string' && !isAllowedUrl(resolved)) {
++    return data
++  }
++  data[key] = resolved
+   return data
+ }
+ 
+diff -ruN pristine/src/runtime/parser/utils/props.ts app/src/runtime/parser/utils/props.ts
+--- a/src/runtime/parser/utils/props.ts	2026-10-26 05:35:38.000000000 +0000
++++ b/src/runtime/parser/utils/props.ts	2026-10-26 06:12:10.309597650 +0000
+@@ -18,7 +18,37 @@
+   'data:text/xml',
+ ]
+ 
+-function isAnchorLinkAllowed(value: string) {
++/**
++ * Reduce every way of naming an attribute to the same form: lowercase, without the Vue binding
++ * syntax (`:href`, `v-bind:href`) and without the SVG namespace prefix (`xlink:href`, which hast
++ * exposes as the `xLinkHref` property).
++ */
++function normalizeAttributeName(attribute: string) {
++  return attribute
++    .toLowerCase()
++    .replace(/^(?::|v-bind:)/, '')
++    .replace(/^xlink:?/, '')
++}
++
++/**
++ * Whether the attribute carries a URL that the deny list applies to.
++ */
++export function isUrlAttribute(attribute: string) {
++  const name = normalizeAttributeName(attribute)
++  return name === 'href' || name === 'src'
++}
++
++function hasUnsafePrefix(target: string) {
++  // `data:` URLs may separate the scheme from their media type with whitespace; the deny list
++  // names the media type, so fold that separator away before comparing.
++  const url = target.toLowerCase().replace(/^data:\s+/, 'data:')
++  return unsafeLinkPrefix.some(prefix => url.startsWith(prefix))
++}
++
++/**
++ * Whether a value may be emitted by a URL-carrying attribute.
++ */
++export function isAllowedUrl(value: string) {
+   const decodedUrl = decodeURIComponent(value)
+   const urlSanitized = decodedUrl.replace(/&#x([0-9a-f]+);?/gi, '')
+     .replace(/&#(\d+);?/g, '')
+@@ -30,15 +60,13 @@
+       return true
+     }
+ 
+-    if (unsafeLinkPrefix.some(prefix => url.protocol.toLowerCase().startsWith(prefix))) {
+-      return false
+-    }
++    // The deny list names whole values (including inline-document media types), not only
++    // schemes, so compare it against the complete normalised target instead of `url.protocol`.
++    return !hasUnsafePrefix(url.href)
+   }
+   catch {
+     return false
+   }
+-
+-  return true
+ }
+ 
+ export const validateProp = (attribute: string, value: string) => {
+@@ -47,8 +75,8 @@
+     return false
+   }
+ 
+-  if (attribute === 'href' || attribute === 'src') {
+-    return isAnchorLinkAllowed(value)
++  if (isUrlAttribute(attribute)) {
++    return typeof value === 'string' ? isAllowedUrl(value) : true
+   }
+ 
+   return true

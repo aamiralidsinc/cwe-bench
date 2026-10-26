@@ -1,0 +1,139 @@
+diff -ruN a/addon.py b/addon.py
+--- a/addon.py	2026-10-26 02:39:11.000000000 +0000
++++ b/addon.py	2026-10-26 05:25:32.272130604 +0000
+@@ -36,6 +36,50 @@
+ REQ_HEADERS = requests.utils.default_headers()
+ REQ_HEADERS.update({"User-Agent": "blender-mcp"})
+ 
++
++def _confined_path(base_dir, name, what="path"):
++    """Resolve ``name`` inside ``base_dir``, or raise ``ValueError``.
++
++    Asset services and callers supply these names, so nothing about them is trusted:
++    an absolute path, a ``..`` component or any other form whose normalized location
++    is not strictly below ``base_dir`` is refused before a directory, a file or an
++    extraction target is created.
++    """
++    if not isinstance(name, str) or not name:
++        raise ValueError(f"empty {what}")
++    normalized = os.path.normpath(name)
++    if os.path.isabs(name) or os.path.isabs(normalized):
++        raise ValueError(f"{what} is an absolute path: {name!r}")
++    base = os.path.abspath(base_dir)
++    target = os.path.abspath(os.path.join(base, normalized))
++    try:
++        inside_base = os.path.commonpath([base, target]) == base
++    except ValueError:
++        inside_base = False
++    if not inside_base or target == base:
++        raise ValueError(f"{what} escapes the asset's temporary folder: {name!r}")
++    return target
++
++
++def _name_fragment(value, fallback="asset"):
++    """Reduce an untrusted identifier to characters that cannot form a path component.
++
++    Used wherever an identifier becomes part of a file name (``tempfile`` prefixes,
++    archive names), so a separator or an absolute form cannot decide the directory
++    the file is created in.
++    """
++    fragment = re.sub(r"[^A-Za-z0-9._-]", "_", str(value if value is not None else ""))
++    fragment = fragment.lstrip(".")
++    return fragment or fallback
++
++
++def _extract_zip_within(zip_ref, base_dir):
++    """Extract ``zip_ref`` into ``base_dir`` after checking every member name."""
++    for member in zip_ref.infolist():
++        _confined_path(base_dir, member.filename, what="archive member")
++    zip_ref.extractall(base_dir)
++
++
+ def get_blendermcp_addon_preferences(context=None):
+     """Get add-on preferences object if available."""
+     if context is None:
+@@ -806,7 +850,12 @@
+                     try:
+                         # Download the main model file
+                         main_file_name = file_url.split("/")[-1]
+-                        main_file_path = os.path.join(temp_dir, main_file_name)
++                        try:
++                            main_file_path = _confined_path(
++                                temp_dir, main_file_name, what="model file name"
++                            )
++                        except ValueError as exc:
++                            return {"error": f"Failed to download model: {exc}"}
+ 
+                         response = requests.get(file_url, headers=REQ_HEADERS)
+                         if response.status_code != 200:
+@@ -821,8 +870,18 @@
+                                 # Get the URL for the included file - this is the fix
+                                 include_url = include_info["url"]
+ 
++                                # The keys of this mapping come from the service response, so
++                                # confine each attached file to this download's folder before
++                                # creating anything for it. Subdirectories stay allowed.
++                                try:
++                                    include_file_path = _confined_path(
++                                        temp_dir, include_path, what="attached file path"
++                                    )
++                                except ValueError as exc:
++                                    print(f"Skipping included file: {exc}")
++                                    continue
++
+                                 # Create the directory structure for the included file
+-                                include_file_path = os.path.join(temp_dir, include_path)
+                                 os.makedirs(os.path.dirname(include_file_path), exist_ok=True)
+ 
+                                 # Download the included file
+@@ -1459,9 +1518,11 @@
+         temp_file = None
+         for i in data_["list"]:
+             if i["name"].endswith(".glb"):
++                # task_uuid is caller-supplied and only a hint: reduce it to characters
++                # that cannot act as a path separator for the temporary file.
+                 temp_file = tempfile.NamedTemporaryFile(
+                     delete=False,
+-                    prefix=task_uuid,
++                    prefix=f"rodin_{_name_fragment(task_uuid, 'task')}_",
+                     suffix=".glb",
+                 )
+ 
+@@ -1524,9 +1585,11 @@
+         data_ = response.json()
+         temp_file = None
+ 
++        # request_id is caller-supplied and only a hint: reduce it to characters that
++        # cannot act as a path separator for the temporary file.
+         temp_file = tempfile.NamedTemporaryFile(
+             delete=False,
+-            prefix=request_id,
++            prefix=f"rodin_{_name_fragment(request_id, 'request')}_",
+             suffix=".glb",
+         )
+ 
+@@ -1839,7 +1902,11 @@
+ 
+             # Save to temporary file
+             temp_dir = tempfile.mkdtemp()
+-            zip_file_path = os.path.join(temp_dir, f"{uid}.zip")
++            # The identifier names the archive but must not be able to move it: only
++            # characters that cannot act as a separator survive into the file name.
++            zip_file_path = os.path.join(
++                temp_dir, f"{_name_fragment(uid, 'sketchfab')}.zip"
++            )
+ 
+             with open(zip_file_path, "wb") as f:
+                 f.write(model_response.content)
+@@ -2369,9 +2436,9 @@
+                 for chunk in zip_response.iter_content(chunk_size=8192):
+                     f.write(chunk)
+ 
+-            # Unzip the ZIP
++            # Unzip the ZIP, refusing member names that would leave the folder
+             with zipfile.ZipFile(zip_file_path, "r") as zip_ref:
+-                zip_ref.extractall(temp_dir)
++                _extract_zip_within(zip_ref, temp_dir)
+ 
+             # Find the .obj file (there may be multiple, assuming the main file is model.obj)
+             for file in os.listdir(temp_dir):

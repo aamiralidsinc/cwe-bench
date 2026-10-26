@@ -1,0 +1,316 @@
+--- a/internal/server/routes/templates.go	2026-10-18 19:53:32.032447593 +0000
++++ b/internal/server/routes/templates.go	2026-10-18 20:11:40.691686224 +0000
+@@ -301,7 +301,11 @@
+ 		templateFile = "main.hbs"
+ 	}
+ 
+-	hbsPath := filepath.Join(tmpl.Path, templateFile)
++	hbsPath, cerr := storage.ContainedName(tmpl.Path, templateFile)
++	if cerr != nil {
++		respondError(w, http.StatusBadRequest, "invalid template file path")
++		return
++	}
+ 	hbsContent, err := os.ReadFile(hbsPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, "template file not found: "+templateFile)
+--- a/internal/storage/contain.go	1970-01-01 00:00:00.000000000 +0000
++++ b/internal/storage/contain.go	2026-10-18 20:11:40.639686260 +0000
+@@ -0,0 +1,83 @@
++package storage
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// ContainedName reports whether name stays inside root once joined, without
++// using the shared path helper. Parent segments, absolute names and names that
++// leave through a symbolic link are rejected.
++func ContainedName(root, name string) (string, error) {
++	if strings.TrimSpace(name) == "" {
++		return "", fmt.Errorf("name is required")
++	}
++	if strings.IndexByte(name, 0) >= 0 {
++		return "", fmt.Errorf("name contains a NUL byte")
++	}
++	norm := strings.ReplaceAll(name, `\`, "/")
++	if !filepath.IsLocal(norm) {
++		return "", fmt.Errorf("name %q is not local", name)
++	}
++	rootAbs, err := filepath.Abs(root)
++	if err != nil {
++		return "", err
++	}
++	rootAbs = filepath.Clean(rootAbs)
++	candidate := filepath.Join(rootAbs, filepath.FromSlash(norm))
++	rel, err := filepath.Rel(rootAbs, candidate)
++	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
++		return "", fmt.Errorf("name %q escapes its root", name)
++	}
++	probe := candidate
++	for {
++		if _, err := os.Lstat(probe); err == nil {
++			break
++		} else if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(probe)
++		if parent == probe {
++			return "", fmt.Errorf("name %q has no existing ancestor", name)
++		}
++		probe = parent
++	}
++	rootProbe := rootAbs
++	for {
++		if _, err := os.Lstat(rootProbe); err == nil {
++			break
++		} else if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(rootProbe)
++		if parent == rootProbe {
++			break
++		}
++		rootProbe = parent
++	}
++	resolvedRoot, err := filepath.EvalSymlinks(rootProbe)
++	if err != nil {
++		return "", err
++	}
++	rootTail, err := filepath.Rel(rootProbe, rootAbs)
++	if err != nil {
++		return "", err
++	}
++	resolvedRoot = filepath.Join(resolvedRoot, rootTail)
++	resolvedProbe, err := filepath.EvalSymlinks(probe)
++	if err != nil {
++		return "", err
++	}
++	rel2, err := filepath.Rel(probe, candidate)
++	if err != nil {
++		return "", err
++	}
++	resolved := filepath.Join(resolvedProbe, rel2)
++	rel3, err := filepath.Rel(resolvedRoot, resolved)
++	if err != nil || rel3 == ".." || strings.HasPrefix(rel3, ".."+string(filepath.Separator)) {
++		return "", fmt.Errorf("name %q escapes its root through a link", name)
++	}
++	return candidate, nil
++}
+--- a/internal/storage/doc_archive.go	2026-10-18 19:53:32.168447501 +0000
++++ b/internal/storage/doc_archive.go	2026-10-18 20:11:40.687686226 +0000
+@@ -18,8 +18,14 @@
+ 		return fmt.Errorf("doc path is required")
+ 	}
+ 	path = strings.TrimSuffix(path, ".md")
+-	src := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+-	dst := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
++	src, err := ContainedName(ds.docsDir(), path+".md")
++	if err != nil {
++		return err
++	}
++	dst, err := ContainedName(ds.archiveDir(), path+".md")
++	if err != nil {
++		return err
++	}
+ 	data, err := os.ReadFile(src)
+ 	if err != nil {
+ 		return fmt.Errorf("archive doc %q: %w", path, err)
+@@ -39,8 +45,14 @@
+ 		return fmt.Errorf("doc path is required")
+ 	}
+ 	path = strings.TrimSuffix(path, ".md")
+-	src := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
+-	dst := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	src, err := ContainedName(ds.archiveDir(), path+".md")
++	if err != nil {
++		return err
++	}
++	dst, err := ContainedName(ds.docsDir(), path+".md")
++	if err != nil {
++		return err
++	}
+ 	data, err := os.ReadFile(src)
+ 	if err != nil {
+ 		return fmt.Errorf("unarchive doc %q: %w", path, err)
+--- a/internal/storage/doc_store.go	2026-10-18 19:53:32.036447590 +0000
++++ b/internal/storage/doc_store.go	2026-10-18 20:11:40.683686229 +0000
+@@ -124,9 +124,12 @@
+ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 	path = strings.TrimPrefix(path, "/")
+ 	path = strings.TrimSuffix(path, ".md")
++	absPath, err := ContainedName(ds.docsDir(), path+".md")
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	// Try local docs first.
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+ 	if _, err := os.Stat(absPath); err == nil {
+ 		folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 		if folder == "." {
+@@ -174,7 +177,10 @@
+ 	if doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
++	absPath, err := ContainedName(ds.docsDir(), doc.Path+".md")
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return fmt.Errorf("create doc dir: %w", err)
+ 	}
+@@ -189,7 +195,10 @@
+ 	if existing, err := ds.Get(doc.Path); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
++	absPath, err := ContainedName(ds.docsDir(), doc.Path+".md")
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -343,7 +352,10 @@
+ // Delete removes a doc file.
+ func (ds *DocStore) Delete(path string) error {
+ 	path = strings.TrimSuffix(path, ".md")
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	absPath, err := ContainedName(ds.docsDir(), path+".md")
++	if err != nil {
++		return err
++	}
+ 	return os.Remove(absPath)
+ }
+ 
+--- a/internal/storage/memory_history.go	2026-10-18 19:53:32.168447501 +0000
++++ b/internal/storage/memory_history.go	2026-10-18 20:11:40.687686226 +0000
+@@ -32,8 +32,8 @@
+ }
+ 
+ // memoryHistoryPath returns the history file recorded for a memory entry.
+-func (ms *MemoryStore) memoryHistoryPath(id string) string {
+-	return filepath.Join(ms.memoryHistoryDir(), "mem-"+id+".json")
++func (ms *MemoryStore) memoryHistoryPath(id string) (string, error) {
++	return ContainedName(ms.memoryHistoryDir(), "mem-"+id+".json")
+ }
+ 
+ // History returns the recorded revisions for a memory entry.
+@@ -41,7 +41,11 @@
+ 	if id == "" {
+ 		return nil, fmt.Errorf("memory ID is required")
+ 	}
+-	data, err := os.ReadFile(ms.memoryHistoryPath(id))
++	hp, err := ms.memoryHistoryPath(id)
++	if err != nil {
++		return nil, err
++	}
++	data, err := os.ReadFile(hp)
+ 	if err != nil {
+ 		if os.IsNotExist(err) {
+ 			return &MemoryHistory{MemoryID: id, Versions: []MemoryRevision{}}, nil
+@@ -80,7 +84,11 @@
+ 	if err != nil {
+ 		return nil, fmt.Errorf("encode memory history: %w", err)
+ 	}
+-	if err := atomicWrite(ms.memoryHistoryPath(id), data); err != nil {
++	hp, err := ms.memoryHistoryPath(id)
++	if err != nil {
++		return nil, err
++	}
++	if err := atomicWrite(hp, data); err != nil {
+ 		return nil, fmt.Errorf("write memory history: %w", err)
+ 	}
+ 	return &revision, nil
+--- a/internal/storage/memory_store.go	2026-10-18 19:53:32.036447590 +0000
++++ b/internal/storage/memory_store.go	2026-10-18 20:11:40.731686196 +0000
+@@ -208,7 +208,10 @@
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	absPath := filepath.Join(dir, models.MemoryFileName(id))
++	absPath, cerr := ContainedName(dir, models.MemoryFileName(id))
++	if cerr != nil {
++		return nil, cerr
++	}
+ 	if _, err := os.Stat(absPath); err != nil {
+ 		return nil, fmt.Errorf("memory %q not found in %s layer", id, layer)
+ 	}
+@@ -250,7 +253,10 @@
+ 		return fmt.Errorf("create memory dir: %w", err)
+ 	}
+ 
+-	absPath := filepath.Join(dir, models.MemoryFileName(entry.ID))
++	absPath, cerr := ContainedName(dir, models.MemoryFileName(entry.ID))
++	if cerr != nil {
++		return cerr
++	}
+ 	return atomicWrite(absPath, []byte(renderMemory(entry)))
+ }
+ 
+@@ -343,7 +349,10 @@
+ 		return err
+ 	}
+ 
+-	absPath := filepath.Join(dir, models.MemoryFileName(entry.ID))
++	absPath, cerr := ContainedName(dir, models.MemoryFileName(entry.ID))
++	if cerr != nil {
++		return cerr
++	}
+ 	return atomicWrite(absPath, []byte(renderMemory(entry)))
+ }
+ 
+@@ -450,8 +459,14 @@
+ 	}
+ 
+ 	filename := models.MemoryFileName(entry.ID)
+-	oldPath := filepath.Join(oldDir, filename)
+-	newPath := filepath.Join(newDir, filename)
++	oldPath, cerr := ContainedName(oldDir, filename)
++	if cerr != nil {
++		return nil, cerr
++	}
++	newPath, cerr := ContainedName(newDir, filename)
++	if cerr != nil {
++		return nil, cerr
++	}
+ 
+ 	// Update layer and timestamp.
+ 	entry.Layer = newLayer
+--- a/internal/storage/template_store.go	2026-10-18 19:53:32.040447587 +0000
++++ b/internal/storage/template_store.go	2026-10-18 20:11:40.691686224 +0000
+@@ -109,10 +109,16 @@
+ 	if idx := strings.Index(name, "/"); idx != -1 {
+ 		importName := name[:idx]
+ 		templateName := name[idx+1:]
+-		templateDir := filepath.Join(ts.importsDir(), importName, "templates", templateName)
++		templateDir, cerr := ContainedName(filepath.Join(ts.importsDir(), importName, "templates"), templateName)
++		if cerr != nil {
++			return nil, cerr
++		}
+ 		return ts.parseTemplate(templateName, templateDir, true, importName)
+ 	}
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, cerr := ContainedName(ts.templatesDir(), name)
++	if cerr != nil {
++		return nil, cerr
++	}
+ 	return ts.parseTemplate(name, templateDir, false, "")
+ }
+ 
+@@ -168,7 +174,10 @@
+ // Create scaffolds a new template directory with a _template.yaml and a
+ // starter .hbs file.
+ func (ts *TemplateStore) Create(name string, description string) error {
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, cerr := ContainedName(ts.templatesDir(), name)
++	if cerr != nil {
++		return cerr
++	}
+ 	if err := os.MkdirAll(templateDir, 0755); err != nil {
+ 		return fmt.Errorf("create template dir: %w", err)
+ 	}

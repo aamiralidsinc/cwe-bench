@@ -1,0 +1,112 @@
+diff --git a/lib/ansible/parsing/dataloader.py b/lib/ansible/parsing/dataloader.py
+index 3e8bce7096..06a02a8a6c 100644
+--- a/lib/ansible/parsing/dataloader.py
++++ b/lib/ansible/parsing/dataloader.py
+@@ -322,7 +322,7 @@ class DataLoader:
+ 
+     def _create_content_tempfile(self, content):
+         ''' Create a tempfile containing defined content '''
+-        fd, content_tempfile = tempfile.mkstemp()
++        fd, content_tempfile = tempfile.mkstemp(dir=C.DEFAULT_LOCAL_TMP)
+         f = os.fdopen(fd, 'wb')
+         content = to_bytes(content)
+         try:
+@@ -374,6 +374,22 @@ class DataLoader:
+         except (IOError, OSError) as e:
+             raise AnsibleParserError("an error occurred while trying to read the file '%s': %s" % (to_native(real_path), to_native(e)), orig_exc=e)
+ 
++    @staticmethod
++    def _destroy_tempfile(file_path):
++        """Overwrite a temporary file, then remove it, so its contents are not recoverable."""
++        try:
++            if os.path.isfile(file_path):
++                with open(file_path, 'r+b') as f:
++                    os.ftruncate(f.fileno(), 0)
++                    f.flush()
++                    os.fsync(f.fileno())
++                os.unlink(file_path)
++        except OSError:
++            try:
++                os.unlink(file_path)
++            except OSError:
++                pass
++
+     def cleanup_tmp_file(self, file_path):
+         """
+         Removes any temporary files created from a previous call to
+@@ -381,7 +397,7 @@ class DataLoader:
+         previous call to get_real_file.
+         """
+         if file_path in self._tempfiles:
+-            os.unlink(file_path)
++            self._destroy_tempfile(file_path)
+             self._tempfiles.remove(file_path)
+ 
+     def cleanup_all_tmp_files(self):
+diff --git a/lib/ansible/parsing/vault/__init__.py b/lib/ansible/parsing/vault/__init__.py
+index 566d699975..39893dadfc 100644
+--- a/lib/ansible/parsing/vault/__init__.py
++++ b/lib/ansible/parsing/vault/__init__.py
+@@ -848,39 +848,34 @@ class VaultEditor:
+     def _edit_file_helper(self, filename, secret,
+                           existing_data=None, force_save=False, vault_id=None):
+ 
+-        # Create a tempfile
++        # Keep the file object open and write the decrypted bytes through it, so the plaintext
++        # is never re-created by name. The file lives in the private controller temp directory.
+         root, ext = os.path.splitext(os.path.realpath(filename))
+-        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+-        os.close(fd)
+-
+-        cmd = self._editor_shell_command(tmp_path)
++        tmp_file = tempfile.NamedTemporaryFile(suffix=ext, dir=C.DEFAULT_LOCAL_TMP, delete=False)
++        tmp_path = tmp_file.name
+         try:
+             if existing_data:
+-                self.write_data(existing_data, tmp_path, shred=False)
+-
+-            # drop the user into an editor on the tmp file
+-            subprocess.call(cmd)
+-        except Exception as e:
+-            # whatever happens, destroy the decrypted file
+-            self._shred_file(tmp_path)
+-            raise AnsibleError('Unable to execute the command "%s": %s' % (' '.join(cmd), to_native(e)))
+-
+-        b_tmpdata = self.read_data(tmp_path)
++                tmp_file.write(to_bytes(existing_data))
++                tmp_file.flush()
++            tmp_file.close()
+ 
+-        # Do nothing if the content has not changed
+-        if existing_data == b_tmpdata and not force_save:
++            cmd = self._editor_shell_command(tmp_path)
++            try:
++                subprocess.call(cmd)
++            except Exception as e:
++                raise AnsibleError('Unable to execute the command "%s": %s' % (' '.join(cmd), to_native(e)))
++
++            b_tmpdata = self.read_data(tmp_path)
++            if force_save or existing_data != b_tmpdata:
++                b_ciphertext = self.vault.encrypt(b_tmpdata, secret, vault_id=vault_id)
++                with open(tmp_path, 'wb') as handle:
++                    handle.write(b_ciphertext)
++                self.shuffle_files(tmp_path, filename)
++                display.vvvvv(u'Saved edited file "%s" encrypted using %s and  vault id "%s"' % (to_text(filename), to_text(secret), to_text(vault_id)))
++        finally:
++            if not tmp_file.closed:
++                tmp_file.close()
+             self._shred_file(tmp_path)
+-            return
+-
+-        # encrypt new data and write out to tmp
+-        # An existing vaultfile will always be UTF-8,
+-        # so decode to unicode here
+-        b_ciphertext = self.vault.encrypt(b_tmpdata, secret, vault_id=vault_id)
+-        self.write_data(b_ciphertext, tmp_path)
+-
+-        # shuffle tmp file into place
+-        self.shuffle_files(tmp_path, filename)
+-        display.vvvvv(u'Saved edited file "%s" encrypted using %s and  vault id "%s"' % (to_text(filename), to_text(secret), to_text(vault_id)))
+ 
+     def _real_path(self, filename):
+         # '-' is special to VaultEditor, dont expand it.

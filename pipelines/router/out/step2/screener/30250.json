@@ -1,0 +1,113 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "30250",
+  "advisory_ids": ["GHSA-X2F5-4PRF-W687", "CVE-2026-54696"],
+  "repo": "ruby/json",
+  "pinned_commit": "8144d4cb3473b9b48f10716a6ea7fcc83300e826",
+  "fix_commits": ["996bac686d64e4e3aaeae03b14a7f9ee9695ebdb"],
+  "trust_decision": {
+    "summary": "An IO-backed FBuffer starts as a 512-byte stack buffer (type STACK, capa 512); on the first growth the io fast path promotes it to a heap block of FBUFFER_IO_BUFFER_SIZE (16383) and then returns on `requested < fb->capa` without accounting for the fb->len bytes already buffered from the stack buffer, so the append that triggered the growth writes up to fb->len bytes past the new heap allocation. The published fix decides this in one place: io buffers are initialised heap-only (capa 0, initial_length = FBUFFER_IO_BUFFER_SIZE) and the growth loop sizes for requested + fb->len.",
+    "evidence": [
+      "ext/json/ext/fbuffer/fbuffer.h:97-121",
+      "ext/json/ext/fbuffer/fbuffer.h:100-108",
+      "ext/json/ext/fbuffer/fbuffer.h:40-47",
+      "ext/json/ext/fbuffer/fbuffer.h:143-147",
+      "ext/json/ext/generator/generator.c:1310-1314",
+      "fix.diff:54-86"
+    ]
+  },
+  "landing_point": {
+    "where": "ext/json/ext/generator/generator.c:1306-1314",
+    "why": "The summary says the heap buffer overflow happens while streaming to an IO, so an engineer looks at the generate path that takes an io VALUE; this is where the io is stored into the FBuffer and where the 512-byte stack_buffer is declared (the same block is duplicated at generator.c:1866-1876)."
+  },
+  "fix_sites": [
+    {
+      "where": "ext/json/ext/fbuffer/fbuffer.h:40-51",
+      "entry_point": "initialisation used by every FBuffer user: JSON::State#generate(obj, io), JSON::State#_generate_no_fallback(obj, io) (generator.c:1314) and JSON::State.generate(obj, opts, io) reached by JSON.dump and JSON::Coder#dump (generator.c:1876)",
+      "module_kind": "internal growable-buffer helper (ext/json/ext/fbuffer)"
+    },
+    {
+      "where": "ext/json/ext/fbuffer/fbuffer.h:82-95",
+      "entry_point": "same as above - fbuffer_realloc is the only allocation path for the generator's output buffer",
+      "module_kind": "internal growable-buffer helper (ext/json/ext/fbuffer)"
+    },
+    {
+      "where": "ext/json/ext/fbuffer/fbuffer.h:97-121",
+      "entry_point": "same as above - fbuffer_do_inc_capa is the capacity check reached from every fbuffer_append* used by the generator",
+      "module_kind": "internal growable-buffer helper (ext/json/ext/fbuffer)"
+    },
+    {
+      "where": "ext/json/ext/generator/generator.c:1306-1314",
+      "entry_point": "JSON::State#generate(obj, io) and JSON::State#_generate_no_fallback(obj, io) (cState_generate at generator.c:1335)",
+      "module_kind": "C extension entry point"
+    },
+    {
+      "where": "ext/json/ext/generator/generator.c:1866-1876",
+      "entry_point": "JSON::State.generate(obj, opts, io) (cState_m_generate at generator.c:1889), reached by JSON.dump(obj, io) at lib/json/common.rb:958 and JSON::Coder#dump(obj, io) at lib/json/common.rb:1080",
+      "module_kind": "C extension entry point"
+    }
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "ext/json/ext/fbuffer/fbuffer.h:97-121"
+  },
+  "O3_reason_to_dismiss": "fbuffer.h is a private helper (static functions) that also serves the non-IO string/float/indent writers, so a solver can argue the report is about the generator and that the fix belongs where the io enters (generator.c's two FBuffer initialisations) - which is enough to close the reachable crash without touching the shared capacity maths.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The IO contract must stay byte-identical and referentially transparent: State#generate(obj, io) and JSON.dump(obj, io) return the same io object and write exactly the string the non-IO path returns, with partial flushes allowed at each growth; the non-IO path must keep honouring the buffer_initial_length option. An over-broad fix (forcing FBUFFER_IO_BUFFER_SIZE on every buffer, flushing on every append, or dropping the stack->heap copy of the buffered prefix) changes that output/identity behaviour.",
+    "where": "ext/json/ext/fbuffer/fbuffer.h:249-258"
+  },
+  "O6_input_shapes": [
+    "io streaming versus generating the same object without an io (only the io path is affected)",
+    "a short document prefix (<512 bytes, left unflushed in the stack buffer) followed by a single append of 15872-16382 bytes - the only shape that overflows",
+    "a single append larger than FBUFFER_IO_BUFFER_SIZE (16383), which takes the capacity-doubling path",
+    "repeated growth/flush cycles over a large document (many small appends; safe in the pinned code)",
+    "buffer_initial_length option values (0, negative, custom) which only apply to the non-io path at the pinned commit"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "ext/json/ext/generator/generator.c:1872-1876",
+      "sibling": "a third streaming entry point (e.g. a fragment or streaming writer) that copies this five-line `char stack_buffer[FBUFFER_STACK_SIZE]; FBuffer buffer = { .io = ... }; fbuffer_stack_init(...)` block",
+      "why_realistic": "the setup block is already duplicated verbatim at generator.c:1310-1314 and 1872-1876, so a maintainer adding another io-taking generator function would copy it with the stack buffer again and reproduce the bug."
+    },
+    {
+      "where": "ext/json/ext/fbuffer/fbuffer.h:171-196",
+      "sibling": "a new bulk-append helper (like fbuffer_append_str_repeat) that reserves `repeat * len` via fbuffer_inc_capa and writes in a loop, but is used on an io buffer before the first growth",
+      "why_realistic": "the file already has three reserve-then-write helpers, and each of them relies on fbuffer_inc_capa accounting for fb->len; a new one written against the io fast path would inherit the same len-blind assumption."
+    }
+  ],
+  "O9_family": "heap buffer overflow from an incorrect buffer-size calculation (CWE-122 / CWE-131 / CWE-787)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C (Ruby C extension)",
+    "toolchain": "Ruby >= 3.3 headers with mkmf/extconf (ext/json/ext/generator/extconf.rb), a C99 compiler, optional SSE2/NEON SIMD; JSON_DEBUG=1 builds reservation assertions",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/json/json_common_interface_test.rb:263 (test_dump_in_io: StringIO streaming, `assert_same io, JSON.dump([1], io)`, large-object streaming) and test/json/json_generator_test.rb:432 (buffer_initial_length), run with `rake test` or `ruby -Ilib -Itest`; no existing test exercises the stack-buffer-to-IO-heap promotion window."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "ext/json/ext/fbuffer/fbuffer.h, ext/json/ext/generator/generator.c",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Take the commit title literally and only stop passing the stack buffer in the two generator entry points' FBuffer initialisation, leaving the len-blind `requested < fb->capa` guard in fbuffer_do_inc_capa unfixed."
+  },
+  "out_of_scope_notes": [
+    "lib/json/truffle_ruby/generator.rb and java/src/json/ext/Generator.java are separate generator implementations for other runtimes, untouched by the fix and using GC-managed buffers (no FBuffer sink); not pursued.",
+    "ext/json/ext/parser/parser.c has no FBuffer and is a separate area from this advisory; not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell/du available); the tree is 125 files with no large source subtree, so tiny_repo is judged from the listing rather than an exact size.",
+    "The overflow window (a prefix buffered in the 512-byte stack buffer plus a first-growth append of 15872-16382 bytes) is derived by reading the code, not by running it; no execution was permitted.",
+    "Whether the grading harness builds with ASAN/valgrind is unknown. JSON_DEBUG's assertions (ext/json/ext/fbuffer/fbuffer.h:53-62) only compare consumed against the reserved count, which matches here, so a plain build may not fail deterministically on the up-to-511-byte overrun."
+  ]
+}

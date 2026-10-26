@@ -1,0 +1,102 @@
+diff --git a/config/security/securityConfig.go b/config/security/securityConfig.go
+index 3ecc67fcf..27a17ac2d 100644
+--- a/config/security/securityConfig.go
++++ b/config/security/securityConfig.go
+@@ -74,6 +74,10 @@ var DefaultConfig = Config{
+ 			AllowChildProcess: []string{"tailwindcss"}, // detect-libc spawns getconf on some Linux setups.
+ 		},
+ 	},
++	// Content under /content is treated as untrusted. Bodies whose media type
++	// is HTML are emitted verbatim and are an XSS sink, so any media type with
++	// an "html" subtype is denied by default.
++	AllowContent: MustNewWhitelist(`! ^[^/]+/html(\+.*)?$`),
+ }
+ 
+ // Config is the top level security config.
+@@ -92,6 +96,11 @@ type Config struct {
+ 	// Node holds Node.js security settings.
+ 	Node Node `json:"node"`
+ 
++	// AllowContent restricts which content media types may be used for
++	// content bodies. A media type with an "html" subtype is denied by
++	// default because the body is emitted verbatim.
++	AllowContent Whitelist `json:"allowContent"`
++
+ 	// Allow inline shortcodes
+ 	EnableInlineShortcodes bool `json:"enableInlineShortcodes"`
+ }
+@@ -200,6 +209,18 @@ func (c Config) CheckAllowedHTTPMethod(method string) error {
+ 	return nil
+ }
+ 
++// CheckAllowedContent reports whether the given content media type is allowed.
++func (c Config) CheckAllowedContent(mediaType string) error {
++	if !c.AllowContent.Accept(mediaType) {
++		return &AccessDeniedError{
++			name:     mediaType,
++			path:     "security.allowContent",
++			policies: c.ToTOML(),
++		}
++	}
++	return nil
++}
++
+ // ToSecurityMap converts c to a map with 'security' as the root key.
+ func (c Config) ToSecurityMap() map[string]any {
+ 	// Take it to JSON and back to get proper casing etc.
+diff --git a/hugolib/content_map.go b/hugolib/content_map.go
+index fe7f2f5fc..888b2ebff 100644
+--- a/hugolib/content_map.go
++++ b/hugolib/content_map.go
+@@ -413,6 +413,11 @@ func (m *pageMap) addPagesFromGoTmplFi(fi hugofs.FileMetaInfo, buildConfig *Buil
+ 						return err
+ 					}
+ 
++					mt := rc.ContentMediaType
++					if err := s.h.Deps.ExecHelper.Sec().CheckAllowedContent(mt.Type); err != nil {
++						return err
++					}
++
+ 					// Create one dimension now, the rest later on demand.
+ 					rs := &resourceSource{path: rc.PathInfo, rc: rc, opener: nil, fi: pt.GoTmplFi, sv: s.siteVector}
+ 
+diff --git a/hugolib/page__meta.go b/hugolib/page__meta.go
+index 8ca377b1c..0357d7f51 100644
+--- a/hugolib/page__meta.go
++++ b/hugolib/page__meta.go
+@@ -209,6 +209,12 @@ func (m *pageMetaSource) doInitEarly(h *HugoSites, cascades *page.PageMatcherPar
+ 			return err
+ 		}
+ 	}
++
++	// The content format may have been changed by configuration applied
++	// above, so check the final value as well.
++	if err := m.checkContentPolicy(h); err != nil {
++		return err
++	}
+ 	return nil
+ }
+ 
+@@ -238,9 +244,22 @@ func (m *pageMetaSource) initFrontMatter(h *HugoSites) error {
+ 		return err
+ 	}
+ 
++	if err := m.checkContentPolicy(h); err != nil {
++		return err
++	}
++
+ 	return nil
+ }
+ 
++// checkContentPolicy rejects a content format that would be published without
++// markup conversion unless the site's security policy allows it.
++func (m *pageMetaSource) checkContentPolicy(h *HugoSites) error {
++	if m.f == nil || m.pageConfigSource == nil || m.pageConfigSource.ContentMediaType.IsZero() {
++		return nil
++	}
++	return h.Deps.ExecHelper.Sec().CheckAllowedContent(m.pageConfigSource.ContentMediaType.Type)
++}
++
+ func (m *pageMetaSource) initPathInfo(h *HugoSites) error {
+ 	pcfg := m.pageConfigSource
+ 	if pcfg.Path != "" {

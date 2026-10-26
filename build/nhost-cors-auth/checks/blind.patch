@@ -1,0 +1,765 @@
+diff -ruN a/cli/cmd/configserver/configserver.go b/cli/cmd/configserver/configserver.go
+--- a/cli/cmd/configserver/configserver.go	2026-10-17 21:32:29.977614660 +0000
++++ b/cli/cmd/configserver/configserver.go	2026-10-17 21:38:50.265361811 +0000
+@@ -3,6 +3,7 @@
+ import (
+ 	"context"
+ 	"fmt"
++	"net/http"
+ 	"os"
+ 
+ 	"github.com/99designs/gqlgen/graphql"
+@@ -11,6 +12,7 @@
+ 	"github.com/google/uuid"
+ 	"github.com/nhost/be/services/mimir/graph"
+ 	"github.com/nhost/nhost/cli/cmd/configserver/logsapi"
++	"github.com/nhost/nhost/cli/cmd/configserver/origin"
+ 	cors "github.com/rs/cors/wrapper/gin"
+ 	"github.com/sirupsen/logrus"
+ 	"github.com/urfave/cli/v3"
+@@ -108,11 +110,32 @@
+ 	return m
+ }
+ 
++// originGuard rejects requests sent by browser pages that aren't the local
++// dashboard. Requests without an Origin header (CLI tools, scripts) are let
++// through.
++func originGuard() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		if !origin.RequestAllowed(c.Request) {
++			c.AbortWithStatus(http.StatusForbidden)
++			return
++		}
++
++		c.Next()
++	}
++}
++
++func corsMiddleware() gin.HandlerFunc {
++	return cors.New(cors.Options{ //nolint:exhaustruct
++		AllowOriginFunc: origin.Allowed,
++	})
++}
++
+ func setupLogsAPI(
+ 	r *gin.Engine,
+ 	logger logrus.FieldLogger,
+ 	enablePlayground bool,
+ 	version string,
++	guard *secretGuard,
+ ) error {
+ 	dockerClient, err := client.NewClientWithOpts(
+ 		client.FromEnv,
+@@ -126,7 +149,7 @@
+ 	logGatherer := NewDockerLogGatherer(dockerClient, projectName)
+ 
+ 	logsResolver := &logsapi.Resolver{
+-		LogGatherer: logGatherer,
++		LogGatherer: &scrubbingLogGatherer{LogGatherer: logGatherer, guard: guard},
+ 		Logger:      logger,
+ 	}
+ 
+@@ -158,6 +181,8 @@
+ 		return fmt.Errorf("failed to create resolver: %w", err)
+ 	}
+ 
++	guard := newSecretGuard(secretsFile, resolver)
++
+ 	r := graph.SetupRouter(
+ 		"/v1/configserver",
+ 		resolver,
+@@ -165,13 +190,14 @@
+ 		dummyMiddleware2,
+ 		cmd.Bool(enablePlaygroundFlag),
+ 		cmd.Root().Version,
+-		[]graphql.FieldMiddleware{},
++		[]graphql.FieldMiddleware{guard.FieldMiddleware},
+ 		gin.Recovery(),
+-		cors.Default(),
++		originGuard(),
++		corsMiddleware(),
+ 	)
+ 
+ 	if err := setupLogsAPI(
+-		r, logger, cmd.Bool(enablePlaygroundFlag), cmd.Root().Version,
++		r, logger, cmd.Bool(enablePlaygroundFlag), cmd.Root().Version, guard,
+ 	); err != nil {
+ 		return err
+ 	}
+diff -ruN a/cli/cmd/configserver/logsapi/router.go b/cli/cmd/configserver/logsapi/router.go
+--- a/cli/cmd/configserver/logsapi/router.go	2026-10-17 21:32:29.985614654 +0000
++++ b/cli/cmd/configserver/logsapi/router.go	2026-10-17 21:40:36.249292536 +0000
+@@ -2,8 +2,6 @@
+ 
+ import (
+ 	"net/http"
+-	"net/url"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/99designs/gqlgen/graphql/handler"
+@@ -13,6 +11,7 @@
+ 	"github.com/gorilla/websocket"
+ 	nhhandler "github.com/nhost/be/lib/graphql/handler"
+ 	"github.com/nhost/nhost/cli/cmd/configserver/logsapi/generated"
++	"github.com/nhost/nhost/cli/cmd/configserver/origin"
+ )
+ 
+ const (
+@@ -21,26 +20,16 @@
+ )
+ 
+ // checkWebSocketOrigin only accepts WebSocket upgrades from the local dashboard
+-// hosts the configserver is exposed under, plus plain localhost. Without this
+-// any page the user visits during `nhost dev` could open a subscription and
+-// exfiltrate container logs, which routinely contain secrets.
++// hosts the configserver is exposed under. Without this any page the user
++// visits during `nhost dev` could open a subscription and exfiltrate container
++// logs, which routinely contain secrets.
+ func checkWebSocketOrigin(r *http.Request) bool {
+-	origin := r.Header.Get("Origin")
+-	if origin == "" {
++	values := r.Header.Values("Origin")
++	if len(values) != 1 {
+ 		return false
+ 	}
+ 
+-	u, err := url.Parse(origin)
+-	if err != nil {
+-		return false
+-	}
+-
+-	host := u.Hostname()
+-
+-	return strings.HasSuffix(host, ".dashboard.local.nhost.run") ||
+-		host == "local.dashboard.nhost.run" ||
+-		host == "localhost" ||
+-		host == "127.0.0.1"
++	return origin.Allowed(values[0])
+ }
+ 
+ // AddRoutes adds the logs GraphQL endpoint to an existing gin engine.
+diff -ruN a/cli/cmd/configserver/origin/origin.go b/cli/cmd/configserver/origin/origin.go
+--- a/cli/cmd/configserver/origin/origin.go	1970-01-01 00:00:00.000000000 +0000
++++ b/cli/cmd/configserver/origin/origin.go	2026-10-17 21:36:59.137433161 +0000
+@@ -0,0 +1,53 @@
++// Package origin decides which browser origins may talk to the configserver.
++package origin
++
++import (
++	"net/http"
++	"regexp"
++	"strconv"
++)
++
++const maxPort = 65535
++
++// dashboardOriginRe matches the origins the local dashboard is served from:
++// <subdomain>.dashboard.local.nhost.run (subdomain being a single DNS label)
++// and local.dashboard.nhost.run, over http or https, with an optional port.
++var dashboardOriginRe = regexp.MustCompile(
++	`^https?://` +
++		`(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.dashboard\.local\.nhost\.run|local\.dashboard\.nhost\.run)` +
++		`(?::([0-9]{1,5}))?$`,
++)
++
++// Allowed reports whether a browser request with the given Origin header
++// value may access the configserver. The empty origin is not allowed here;
++// callers decide how to treat requests without an Origin header.
++func Allowed(origin string) bool {
++	m := dashboardOriginRe.FindStringSubmatch(origin)
++	if m == nil {
++		return false
++	}
++
++	if m[1] != "" {
++		port, err := strconv.Atoi(m[1])
++		if err != nil || port < 1 || port > maxPort {
++			return false
++		}
++	}
++
++	return true
++}
++
++// RequestAllowed reports whether the request either carries no Origin header
++// (i.e. it doesn't come from a browser page) or comes from an allowed origin.
++func RequestAllowed(r *http.Request) bool {
++	values := r.Header.Values("Origin")
++	if len(values) == 0 {
++		return true
++	}
++
++	if len(values) != 1 {
++		return false
++	}
++
++	return Allowed(values[0])
++}
+diff -ruN a/cli/cmd/configserver/secrets.go b/cli/cmd/configserver/secrets.go
+--- a/cli/cmd/configserver/secrets.go	1970-01-01 00:00:00.000000000 +0000
++++ b/cli/cmd/configserver/secrets.go	2026-10-17 21:38:41.305367616 +0000
+@@ -0,0 +1,563 @@
++package configserver
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++	"time"
++
++	"github.com/99designs/gqlgen/graphql"
++	"github.com/nhost/be/services/mimir/graph"
++	"github.com/nhost/be/services/mimir/model"
++	"github.com/nhost/nhost/cli/cmd/configserver/logsapi"
++	logsmodel "github.com/nhost/nhost/cli/cmd/configserver/logsapi/model"
++	"github.com/nhost/nhost/cli/project/env"
++)
++
++const redactedSecret = "[REDACTED]"
++
++var ErrResolvedConfigUnavailable = errors.New("unable to build resolved config")
++
++// secretGuard makes sure the value of a secret never leaves the configserver.
++//
++// - the `value` of secrets returned by secret queries/mutations is blanked out
++// - resolved configs keep their `{{ secrets.NAME }}` templates instead of the
++// value of the secret, and `where` filters are matched against that config
++// - secret values are scrubbed from error messages and logs.
++type secretGuard struct {
++	secretsFile string
++	resolver    *graph.Resolver
++}
++
++func newSecretGuard(secretsFile string, resolver *graph.Resolver) *secretGuard {
++	return &secretGuard{
++		secretsFile: secretsFile,
++		resolver:    resolver,
++	}
++}
++
++// values returns the values of all known secrets, longest first.
++func (g *secretGuard) values(ctx context.Context) []string {
++	seen := make(map[string]struct{})
++
++	if b, err := os.ReadFile(g.secretsFile); err == nil {
++		var secrets model.Secrets
++		if err := env.Unmarshal(b, &secrets); err == nil {
++			for _, s := range secrets {
++				seen[s.Value] = struct{}{}
++			}
++		}
++	}
++
++	if g.resolver != nil {
++		if apps, err := g.resolver.Query().AppsSecrets(ctx); err == nil {
++			for _, app := range apps {
++				for _, s := range app.Secrets {
++					seen[s.Value] = struct{}{}
++				}
++			}
++		}
++	}
++
++	values := make([]string, 0, len(seen))
++	for v := range seen {
++		if v != "" {
++			values = append(values, v)
++		}
++	}
++
++	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
++
++	return values
++}
++
++func scrub(s string, values []string) string {
++	for _, v := range values {
++		s = strings.ReplaceAll(s, v, redactedSecret)
++	}
++
++	return s
++}
++
++func (g *secretGuard) scrubError(ctx context.Context, err error) error {
++	msg := err.Error()
++	if scrubbed := scrub(msg, g.values(ctx)); scrubbed != msg {
++		return errors.New(scrubbed) //nolint:err113
++	}
++
++	return err
++}
++
++// isSecretListing returns true if the ConfigEnvironmentVariable being resolved
++// is a project secret (as opposed to an environment variable of a config).
++func isSecretListing(fc *graphql.FieldContext) bool {
++	p := fc.Parent
++	for p != nil && p.Index != nil {
++		p = p.Parent
++	}
++
++	if p == nil {
++		return true
++	}
++
++	switch p.Object {
++	case "Query", "Mutation", "ConfigAppSecrets", "ConfigInsertConfigResponse":
++		return true
++	default:
++		return false
++	}
++}
++
++func (g *secretGuard) FieldMiddleware(ctx context.Context, next graphql.Resolver) (any, error) {
++	fc := graphql.GetFieldContext(ctx)
++	if fc == nil {
++		return next(ctx)
++	}
++
++	switch fc.Object {
++	case "ConfigEnvironmentVariable":
++		if fc.Field.Name == "value" && isSecretListing(fc) {
++			return "", nil
++		}
++
++		return next(ctx)
++	case "Query", "Mutation":
++		res, err := g.root(ctx, fc, next)
++		if err != nil {
++			return res, g.scrubError(ctx, err)
++		}
++
++		return res, nil
++	default:
++		return next(ctx)
++	}
++}
++
++// callWith calls next with some arguments temporarily overridden.
++func callWith(
++	ctx context.Context,
++	fc *graphql.FieldContext,
++	next graphql.Resolver,
++	args map[string]any,
++) (any, error) {
++	type saved struct {
++		value any
++		ok    bool
++	}
++
++	orig := make(map[string]saved, len(args))
++	for k, v := range args {
++		old, ok := fc.Args[k]
++		orig[k] = saved{value: old, ok: ok}
++		fc.Args[k] = v
++	}
++
++	defer func() {
++		for k, s := range orig {
++			if s.ok {
++				fc.Args[k] = s.value
++			} else {
++				delete(fc.Args, k)
++			}
++		}
++	}()
++
++	return next(ctx)
++}
++
++func (g *secretGuard) root( //nolint:cyclop
++	ctx context.Context,
++	fc *graphql.FieldContext,
++	next graphql.Resolver,
++) (any, error) {
++	if fc.Object != "Query" || fc.Args == nil {
++		return next(ctx)
++	}
++
++	resolve, _ := fc.Args["resolve"].(bool)
++
++	switch fc.Field.Name {
++	case "config", "configRawJSON", "runServiceConfig", "runServiceConfigRawJSON",
++		"runServiceConfigs":
++		if !resolve {
++			return next(ctx)
++		}
++
++		resolved, err := next(ctx)
++		if err != nil || resolved == nil {
++			return resolved, err
++		}
++
++		raw, err := callWith(ctx, fc, next, map[string]any{"resolve": false})
++		if err != nil {
++			return nil, err
++		}
++
++		return safeResolved(fc.Field.Name, resolved, raw)
++	case "configs":
++		return g.configs(ctx, fc, next, resolve)
++	case "runServiceConfigsAll":
++		return g.runServiceConfigsAll(ctx, fc, next, resolve)
++	default:
++		return next(ctx)
++	}
++}
++
++func (g *secretGuard) configs(
++	ctx context.Context,
++	fc *graphql.FieldContext,
++	next graphql.Resolver,
++	resolve bool,
++) (any, error) {
++	where, _ := fc.Args["where"].(*model.ConfigConfigComparisonExp)
++
++	resolvedAny, err := callWith(ctx, fc, next, map[string]any{
++		"resolve": true, "where": (*model.ConfigConfigComparisonExp)(nil),
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	rawAny, err := callWith(ctx, fc, next, map[string]any{
++		"resolve": false, "where": (*model.ConfigConfigComparisonExp)(nil),
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	resolvedList, _ := resolvedAny.([]*model.ConfigAppConfig)
++	rawList, _ := rawAny.([]*model.ConfigAppConfig)
++
++	raws := make(map[string]*model.ConfigConfig, len(rawList))
++	for _, c := range rawList {
++		raws[c.AppID] = c.Config
++	}
++
++	res := make([]*model.ConfigAppConfig, 0, len(resolvedList))
++
++	for _, c := range resolvedList {
++		raw, ok := raws[c.AppID]
++		if !ok {
++			return nil, ErrResolvedConfigUnavailable
++		}
++
++		safe, err := safeCopy(c.Config, raw)
++		if err != nil {
++			return nil, err
++		}
++
++		if !where.Matches(safe) {
++			continue
++		}
++
++		cfg := raw
++		if resolve {
++			cfg = safe
++		}
++
++		res = append(res, &model.ConfigAppConfig{AppID: c.AppID, Config: cfg})
++	}
++
++	return res, nil
++}
++
++func (g *secretGuard) runServiceConfigsAll(
++	ctx context.Context,
++	fc *graphql.FieldContext,
++	next graphql.Resolver,
++	resolve bool,
++) (any, error) {
++	where, _ := fc.Args["where"].(*model.ConfigRunServiceConfigComparisonExp)
++
++	resolvedAny, err := callWith(ctx, fc, next, map[string]any{
++		"resolve": true, "where": (*model.ConfigRunServiceConfigComparisonExp)(nil),
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	rawAny, err := callWith(ctx, fc, next, map[string]any{
++		"resolve": false, "where": (*model.ConfigRunServiceConfigComparisonExp)(nil),
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	resolvedList, _ := resolvedAny.([]*model.ConfigRunServiceConfigWithID)
++	rawList, _ := rawAny.([]*model.ConfigRunServiceConfigWithID)
++
++	safeList, err := safeServiceList(resolvedList, rawList)
++	if err != nil {
++		return nil, err
++	}
++
++	raws := make(map[string]*model.ConfigRunServiceConfig, len(rawList))
++	for _, c := range rawList {
++		raws[c.ServiceID] = c.Config
++	}
++
++	res := make([]*model.ConfigRunServiceConfigWithID, 0, len(safeList))
++
++	for _, c := range safeList {
++		if !where.Matches(c.Config) {
++			continue
++		}
++
++		if !resolve {
++			c = &model.ConfigRunServiceConfigWithID{ServiceID: c.ServiceID, Config: raws[c.ServiceID]}
++		}
++
++		res = append(res, c)
++	}
++
++	return res, nil
++}
++
++func safeServiceList(
++	resolvedList, rawList []*model.ConfigRunServiceConfigWithID,
++) ([]*model.ConfigRunServiceConfigWithID, error) {
++	raws := make(map[string]*model.ConfigRunServiceConfig, len(rawList))
++	for _, c := range rawList {
++		raws[c.ServiceID] = c.Config
++	}
++
++	res := make([]*model.ConfigRunServiceConfigWithID, 0, len(resolvedList))
++
++	for _, c := range resolvedList {
++		raw, ok := raws[c.ServiceID]
++		if !ok {
++			return nil, ErrResolvedConfigUnavailable
++		}
++
++		safe, err := safeCopy(c.Config, raw)
++		if err != nil {
++			return nil, err
++		}
++
++		res = append(res, &model.ConfigRunServiceConfigWithID{ServiceID: c.ServiceID, Config: safe})
++	}
++
++	return res, nil
++}
++
++func safeRawJSON[T any](resolved, raw any) (string, error) {
++	resolvedS, _ := resolved.(string)
++	rawS, _ := raw.(string)
++
++	var resolvedCfg, rawCfg *T
++	if err := json.Unmarshal([]byte(resolvedS), &resolvedCfg); err != nil {
++		return "", fmt.Errorf("%w: %w", ErrResolvedConfigUnavailable, err)
++	}
++
++	if err := json.Unmarshal([]byte(rawS), &rawCfg); err != nil {
++		return "", fmt.Errorf("%w: %w", ErrResolvedConfigUnavailable, err)
++	}
++
++	safe, err := safeCopy(resolvedCfg, rawCfg)
++	if err != nil {
++		return "", err
++	}
++
++	if safe == nil {
++		return "{}", nil
++	}
++
++	b, err := json.Marshal(safe)
++	if err != nil {
++		return "", fmt.Errorf("failed to marshal config: %w", err)
++	}
++
++	return string(b), nil
++}
++
++// safeResolved returns the resolved config with every value coming from a
++// secret replaced by the template of the unresolved config.
++func safeResolved(field string, resolved, raw any) (any, error) {
++	switch field {
++	case "config":
++		r, _ := resolved.(*model.ConfigConfig)
++		w, _ := raw.(*model.ConfigConfig)
++
++		return safeCopy(r, w)
++	case "runServiceConfig":
++		r, _ := resolved.(*model.ConfigRunServiceConfig)
++		w, _ := raw.(*model.ConfigRunServiceConfig)
++
++		return safeCopy(r, w)
++	case "runServiceConfigs":
++		r, _ := resolved.([]*model.ConfigRunServiceConfigWithID)
++		w, _ := raw.([]*model.ConfigRunServiceConfigWithID)
++
++		return safeServiceList(r, w)
++	case "configRawJSON":
++		return safeRawJSON[model.ConfigConfig](resolved, raw)
++	case "runServiceConfigRawJSON":
++		return safeRawJSON[model.ConfigRunServiceConfig](resolved, raw)
++	default:
++		return nil, ErrResolvedConfigUnavailable
++	}
++}
++
++func toGeneric(v any) (any, error) {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal config: %w", err)
++	}
++
++	var g any
++	if err := json.Unmarshal(b, &g); err != nil {
++		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
++	}
++
++	return g, nil
++}
++
++// safeCopy returns a copy of the resolved config where every string that is
++// templated in the unresolved config is replaced by its template, so the
++// values of the secrets it references are not exposed.
++func safeCopy[T any](resolved, raw *T) (*T, error) {
++	if resolved == nil {
++		return nil, nil //nolint:nilnil
++	}
++
++	if raw == nil {
++		return nil, ErrResolvedConfigUnavailable
++	}
++
++	r, err := toGeneric(resolved)
++	if err != nil {
++		return nil, err
++	}
++
++	w, err := toGeneric(raw)
++	if err != nil {
++		return nil, err
++	}
++
++	b, err := json.Marshal(restoreTemplates(r, w))
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal config: %w", err)
++	}
++
++	var res T
++	if err := json.Unmarshal(b, &res); err != nil {
++		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
++	}
++
++	return &res, nil
++}
++
++func restoreTemplates(resolved, raw any) any {
++	switch w := raw.(type) {
++	case string:
++		if strings.Contains(w, "{{") {
++			return w
++		}
++	case map[string]any:
++		if r, ok := resolved.(map[string]any); ok {
++			for k, v := range r {
++				if wv, ok := w[k]; ok {
++					r[k] = restoreTemplates(v, wv)
++				}
++			}
++		}
++	case []any:
++		if r, ok := resolved.([]any); ok {
++			for i := range r {
++				if i < len(w) {
++					r[i] = restoreTemplates(r[i], w[i])
++				}
++			}
++		}
++	}
++
++	return resolved
++}
++
++// scrubbingLogGatherer removes the values of secrets from logs.
++type scrubbingLogGatherer struct {
++	logsapi.LogGatherer
++
++	guard *secretGuard
++}
++
++func (s *scrubbingLogGatherer) scrubLogs(ctx context.Context, logs []logsmodel.Log) {
++	values := s.guard.values(ctx)
++	for i := range logs {
++		logs[i].Log = scrub(logs[i].Log, values)
++	}
++}
++
++func (s *scrubbingLogGatherer) GetLogs(
++	ctx context.Context,
++	service, regexFilter string,
++	from, to time.Time,
++) ([]logsmodel.Log, error) {
++	logs, err := s.LogGatherer.GetLogs(ctx, service, regexFilter, from, to)
++	s.scrubLogs(ctx, logs)
++
++	return logs, err //nolint:wrapcheck
++}
++
++func (s *scrubbingLogGatherer) GetFunctionsLogs(
++	ctx context.Context,
++	path, regexFilter string,
++	from, to time.Time,
++) ([]logsmodel.Log, error) {
++	logs, err := s.LogGatherer.GetFunctionsLogs(ctx, path, regexFilter, from, to)
++	s.scrubLogs(ctx, logs)
++
++	return logs, err //nolint:wrapcheck
++}
++
++// tail runs a tailing function on an intermediate channel and forwards the
++// scrubbed logs to logsCh. Like the wrapped gatherer, it closes logsCh when done.
++func (s *scrubbingLogGatherer) tail(
++	ctx context.Context,
++	logsCh chan<- []logsmodel.Log,
++	run func(ch chan<- []logsmodel.Log) error,
++) error {
++	inner := make(chan []logsmodel.Log)
++
++	go func() {
++		defer close(logsCh)
++
++		for logs := range inner {
++			s.scrubLogs(ctx, logs)
++
++			select {
++			case logsCh <- logs:
++			case <-ctx.Done():
++			}
++		}
++	}()
++
++	// the wrapped gatherer closes inner when it returns, which closes logsCh
++	return run(inner)
++}
++
++func (s *scrubbingLogGatherer) TailLogs(
++	ctx context.Context,
++	service, regexFilter string,
++	from time.Time,
++	logsCh chan<- []logsmodel.Log,
++) error {
++	return s.tail(ctx, logsCh, func(ch chan<- []logsmodel.Log) error {
++		return s.LogGatherer.TailLogs(ctx, service, regexFilter, from, ch) //nolint:wrapcheck
++	})
++}
++
++func (s *scrubbingLogGatherer) TailFunctionsLogs(
++	ctx context.Context,
++	path, regexFilter string,
++	from time.Time,
++	logsCh chan<- []logsmodel.Log,
++) error {
++	return s.tail(ctx, logsCh, func(ch chan<- []logsmodel.Log) error {
++		return s.LogGatherer.TailFunctionsLogs(ctx, path, regexFilter, from, ch) //nolint:wrapcheck
++	})
++}

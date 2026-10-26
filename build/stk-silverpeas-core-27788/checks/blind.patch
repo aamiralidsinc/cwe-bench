@@ -1,0 +1,271 @@
+diff -ruN a/core-library/src/main/java/org/silverpeas/core/io/file/SilverpeasFileProvider.java b/core-library/src/main/java/org/silverpeas/core/io/file/SilverpeasFileProvider.java
+--- a/core-library/src/main/java/org/silverpeas/core/io/file/SilverpeasFileProvider.java	2026-10-26 03:18:51.000000000 +0000
++++ b/core-library/src/main/java/org/silverpeas/core/io/file/SilverpeasFileProvider.java	2026-10-26 05:09:59.680988651 +0000
+@@ -26,6 +26,9 @@
+ import org.silverpeas.core.process.io.file.FileHandler;
+ import org.silverpeas.core.util.file.FileRepositoryManager;
+ 
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+@@ -107,6 +110,13 @@
+    * and after filtering by pre and post file processing.
+    */
+   public static SilverpeasFile getFile(SilverpeasFileDescriptor descriptor) {
++    if (descriptor.isAbsolutePath() && !descriptor.isTemporaryFile() &&
++        !isInUploadRepository(getFilePathFrom(descriptor))) {
++      // an absolute location is only meaningful for a file that Silverpeas itself stores in its
++      // upload repository; any other absolute location is outside the scope of the platform and is
++      // refused rather than opened.
++      return SilverpeasFile.NO_FILE;
++    }
+     String filePath = processPath(getFilePathFrom(descriptor));
+     return processFile(new SilverpeasFile(descriptor.getComponentInstanceId(), filePath,
+         descriptor.getMimeType()), SilverpeasFileProcessor.ProcessingContext.GETTING);
+@@ -199,6 +209,27 @@
+     return processedFile;
+   }
+ 
++  /**
++   * Is the specified path a location inside the repository into which Silverpeas stores the files
++   * of the components? The comparison is done on the canonical paths so that symbolic links or
++   * relative navigation cannot make a foreign location look like a stored one.
++   * @param path an absolute path.
++   * @return true if the path is located inside the upload repository, false otherwise.
++   */
++  private static boolean isInUploadRepository(final String path) {
++    if (path == null) {
++      return false;
++    }
++    try {
++      Path repository =
++          new File(FileRepositoryManager.getUploadPath()).getCanonicalFile().toPath();
++      Path file = new File(path).getCanonicalFile().toPath();
++      return file.startsWith(repository);
++    } catch (IOException e) {
++      return false;
++    }
++  }
++
+   private static String getFilePathFrom(SilverpeasFileDescriptor descriptor) {
+     String filePath;
+     if (descriptor.isTemporaryFile()) {
+diff -ruN a/core-war/src/main/java/org/silverpeas/web/servlets/FileServer.java b/core-war/src/main/java/org/silverpeas/web/servlets/FileServer.java
+--- a/core-war/src/main/java/org/silverpeas/web/servlets/FileServer.java	2026-10-26 03:18:51.000000000 +0000
++++ b/core-war/src/main/java/org/silverpeas/web/servlets/FileServer.java	2026-10-26 05:09:40.929005526 +0000
+@@ -78,10 +78,17 @@
+     try {
+       final Map<String, String> params = HttpRequest.decorate(req).getParameterSimpleMap();
+       final String componentId = params.get(COMPONENT_ID_PARAMETER);
++      if (StringUtil.isNotDefined(componentId)) {
++        // a downloaded file always belongs to an identified space; an unnamed space cannot be
++        // authorized and is therefore always refused.
++        SilverLogger.getLogger(this).warn("File download without any space identifier refused");
++        res.sendError(HttpServletResponse.SC_BAD_REQUEST);
++        return;
++      }
+       final HttpSession session = req.getSession(true);
+       final MainSessionController mainSessionCtrl = (MainSessionController) session.getAttribute(
+           MainSessionController.MAIN_SESSION_CONTROLLER_ATT);
+-      if ((mainSessionCtrl == null) || (!isUserAllowed(mainSessionCtrl, componentId))) {
++      if (mainSessionCtrl == null) {
+         SilverLogger.getLogger(this)
+             .warn("Session timeout after {1}. New session id: {0}", session.getId(),
+                 ResourceLocator.getGeneralSettingBundle().getString("sessionTimeout"));
+@@ -89,6 +96,12 @@
+             ResourceLocator.getGeneralSettingBundle().getString("sessionTimeout"));
+         return;
+       }
++      if (!isUserAllowed(mainSessionCtrl, componentId)) {
++        SilverLogger.getLogger(this).warn("File download from space {0} refused to user {1}",
++            componentId, mainSessionCtrl.getUserId());
++        res.sendError(HttpServletResponse.SC_FORBIDDEN);
++        return;
++      }
+       final SilverpeasFile file = getSilverpeasFile(params);
+       sendFile(req, res, file);
+       final String archiveIt = params.get(ARCHIVE_IT_PARAMETER);
+@@ -109,26 +122,22 @@
+     final String componentId = params.get(COMPONENT_ID_PARAMETER);
+     final String mimeType = params.get(MIME_TYPE_PARAMETER);
+     final String dirType = params.get(DIR_TYPE_PARAMETER);
+-    final String typeUpload = params.get(TYPE_UPLOAD_PARAMETER);
+     final String size = params.get(SIZE_PARAMETER);
+-    String sourceFile = params.get(SOURCE_FILE_PARAMETER);
+-    if (StringUtil.isDefined(size)) {
+-      sourceFile = size + File.separatorChar + sourceFile;
+-    }
++    final String sourceFile = params.get(SOURCE_FILE_PARAMETER);
++    // the location of a file of a space is always relative to the storage directory of that space;
++    // no request parameter can turn it into an absolute location outside of it.
++    final String path =
++        StringUtil.isDefined(size) ? size + File.separatorChar + sourceFile : sourceFile;
++
+     SilverpeasFileDescriptor descriptor =
+-        new SilverpeasFileDescriptor(componentId).fileName(sourceFile).mimeType(mimeType);
+-    if (typeUpload != null) {
+-      descriptor.absolutePath();
+-    } else {
+-      if (dirType != null) {
+-        if (dirType.equals(
+-            ResourceLocator.getGeneralSettingBundle().getString("RepositoryTypeTemp"))) {
+-          descriptor = descriptor.temporaryFile();
+-        }
+-      } else {
+-        String directory = params.get(DIRECTORY_PARAMETER);
+-        descriptor = descriptor.parentDirectory(directory);
++        new SilverpeasFileDescriptor(componentId).fileName(path).mimeType(mimeType);
++    if (dirType != null) {
++      if (dirType.equals(
++          ResourceLocator.getGeneralSettingBundle().getString("RepositoryTypeTemp"))) {
++        descriptor = descriptor.temporaryFile();
+       }
++    } else {
++      descriptor = descriptor.parentDirectory(params.get(DIRECTORY_PARAMETER));
+     }
+     return SilverpeasFileProvider.getFile(descriptor);
+   }
+@@ -146,21 +155,12 @@
+ 
+   // check if the user is allowed to access the required component
+   private boolean isUserAllowed(MainSessionController controller, String componentId) {
+-    boolean isAllowed;
+-    if (componentId == null) {
+-      // Personal space
+-      isAllowed = true;
+-    } else {
+-      if ("yes".equalsIgnoreCase(
+-          controller.getComponentParameterValue(componentId, "publicFiles"))) {
+-        // Case of file contained in a component used as a file storage
+-        isAllowed = true;
+-      } else {
+-        isAllowed =
+-            organizationController.isComponentAvailableToUser(componentId, controller.getUserId());
+-      }
++    if ("yes".equalsIgnoreCase(
++        controller.getComponentParameterValue(componentId, "publicFiles"))) {
++      // Case of file contained in a component used as a file storage
++      return true;
+     }
+-    return isAllowed;
++    return organizationController.isComponentAvailableToUser(componentId, controller.getUserId());
+   }
+ 
+   @Override
+diff -ruN a/core-war/src/main/java/org/silverpeas/web/servlets/OnlineFileServer.java b/core-war/src/main/java/org/silverpeas/web/servlets/OnlineFileServer.java
+--- a/core-war/src/main/java/org/silverpeas/web/servlets/OnlineFileServer.java	2026-10-26 03:18:51.000000000 +0000
++++ b/core-war/src/main/java/org/silverpeas/web/servlets/OnlineFileServer.java	2026-10-26 05:09:50.012997351 +0000
+@@ -29,14 +29,18 @@
+ import org.silverpeas.core.io.file.SilverpeasFile;
+ import org.silverpeas.core.io.file.SilverpeasFileDescriptor;
+ import org.silverpeas.core.io.file.SilverpeasFileProvider;
++import org.silverpeas.core.security.authorization.ComponentAccessControl;
+ import org.silverpeas.core.web.mvc.AbstractFileSender;
++import org.silverpeas.core.web.mvc.controller.MainSessionController;
+ import org.silverpeas.kernel.bundle.ResourceLocator;
+ import org.silverpeas.kernel.bundle.SettingBundle;
+ import org.silverpeas.kernel.util.StringUtil;
+ 
++import javax.inject.Inject;
+ import javax.servlet.ServletException;
+ import javax.servlet.http.HttpServletRequest;
+ import javax.servlet.http.HttpServletResponse;
++import javax.servlet.http.HttpSession;
+ import java.io.IOException;
+ 
+ /**
+@@ -48,6 +52,9 @@
+ 
+   private static final long serialVersionUID = -6153872618631360113L;
+ 
++  @Inject
++  private ComponentAccessControl componentAccessControl;
++
+   @Override
+   public void doGet(HttpServletRequest req, HttpServletResponse res)
+       throws ServletException, IOException {
+@@ -58,6 +65,14 @@
+   public void doPost(HttpServletRequest req, HttpServletResponse response)
+       throws ServletException, IOException {
+ 
++    final HttpSession session = req.getSession(false);
++    final MainSessionController mainSessionCtrl = session == null ? null
++        : (MainSessionController) session.getAttribute(
++            MainSessionController.MAIN_SESSION_CONTROLLER_ATT);
++    if (mainSessionCtrl == null) {
++      response.sendError(HttpServletResponse.SC_UNAUTHORIZED);
++      return;
++    }
+ 
+     String mimeType = req.getParameter("MimeType");
+     String sourceFile = req.getParameter("SourceFile");
+@@ -66,6 +81,9 @@
+     String attachmentId = req.getParameter("attachmentId");
+     String language = req.getParameter("lang");
+     String documentId = req.getParameter("DocumentId");
++    // the space a file really belongs to is the one the stored document refers to; until such a
++    // document is resolved, the space is the one named by the request.
++    String fileComponentId = componentId;
+     SilverpeasFileDescriptor ref = null;
+ 
+     if (StringUtil.isDefined(documentId)) {
+@@ -75,8 +93,9 @@
+           AttachmentServiceProvider.getAttachmentService().searchDocumentById(versionPK, language);
+ 
+       if (version != null) {
++        fileComponentId = version.getInstanceId();
+         ref =
+-            new SilverpeasFileDescriptor(version.getInstanceId()).mimeType(version.getContentType())
++            new SilverpeasFileDescriptor(fileComponentId).mimeType(version.getContentType())
+                 .fileName(version.getAttachmentPath()).absolutePath();
+       }
+     }
+@@ -85,7 +104,8 @@
+       SimpleDocument attachment = AttachmentServiceProvider.getAttachmentService()
+           .searchDocumentById(new SimpleDocumentPK(attachmentId), language);
+       if (attachment != null) {
+-        ref = new SilverpeasFileDescriptor(attachment.getInstanceId())
++        fileComponentId = attachment.getInstanceId();
++        ref = new SilverpeasFileDescriptor(fileComponentId)
+             .mimeType(attachment.getContentType()).fileName(attachment.getAttachmentPath())
+             .absolutePath();
+       }
+@@ -95,10 +115,35 @@
+           .parentDirectory(directory);
+     }
+ 
++    if (!isUserAuthorized(mainSessionCtrl, fileComponentId)) {
++      response.sendError(HttpServletResponse.SC_FORBIDDEN);
++      return;
++    }
++
+     SilverpeasFile onlineFile = SilverpeasFileProvider.getFile(ref);
+     sendFile(req, response, onlineFile);
+   }
+ 
++  /**
++   * Is the given user allowed to reach the files of the specified space? A space that shares its
++   * files (the {@code publicFiles} parameter is set to {@code yes}) is reachable by any signed-in
++   * user; otherwise the user must be entitled to the space. An unnamed space is never reachable.
++   * @param controller the session controller of the signed-in user.
++   * @param componentId the identifier of the space the file belongs to.
++   * @return true if the user can reach the files of the space, false otherwise.
++   */
++  private boolean isUserAuthorized(final MainSessionController controller,
++      final String componentId) {
++    if (StringUtil.isNotDefined(componentId)) {
++      return false;
++    }
++    if ("yes".equalsIgnoreCase(
++        controller.getComponentParameterValue(componentId, "publicFiles"))) {
++      return true;
++    }
++    return componentAccessControl.isUserAuthorized(controller.getUserId(), componentId);
++  }
++
+ 
+   @Override
+   protected SettingBundle getSettingBunde() {

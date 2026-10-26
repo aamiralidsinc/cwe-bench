@@ -1,0 +1,327 @@
+diff --git a/runtime/python/prompty/prompty/core/confine.py b/runtime/python/prompty/prompty/core/confine.py
+new file mode 100644
+index 0000000..ab8d4bc
+--- /dev/null
++++ b/runtime/python/prompty/prompty/core/confine.py
+@@ -0,0 +1,25 @@
++"""Filesystem confinement for references written in a prompt document."""
++
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++__all__ = ["confine"]
++
++
++def confine(base_dir: str | Path, reference: str) -> Path:
++    """Resolve *reference* under *base_dir*, refusing anything that escapes.
++
++    The reference is canonicalized before the check, so a link is judged by
++    the location it leads to rather than by how it is spelled.
++    """
++    base = os.path.realpath(os.fspath(base_dir))
++    target = os.path.realpath(os.path.join(base, os.fspath(reference)))
++    try:
++        inside = os.path.commonpath([base, target]) == base
++    except ValueError:  # different drives / no common prefix
++        inside = False
++    if not inside:
++        raise PermissionError(f"Reference '{reference}' resolves outside the prompt directory '{base}'")
++    return Path(target)
+diff --git a/runtime/python/prompty/prompty/core/loader.py b/runtime/python/prompty/prompty/core/loader.py
+index d254e3c..064ccbc 100644
+--- a/runtime/python/prompty/prompty/core/loader.py
++++ b/runtime/python/prompty/prompty/core/loader.py
+@@ -16,6 +16,7 @@ from typing import Any
+ import yaml
+ 
+ from ..model import LoadContext, Prompty, SaveContext
++from .confine import confine
+ from .partials import expand_partials
+ from .utils import load_fragment, load_prompty, load_prompty_async
+ 
+@@ -100,7 +101,7 @@ def _build_agent(data: dict[str, Any] | str, path: Path) -> Prompty:
+     # base defines are inherited unless this prompt sets them explicitly.
+     base_ref = data.pop("base", None)
+     if isinstance(base_ref, str) and base_ref:
+-        base_data = load_prompty(path.parent / base_ref)
++        base_data = load_prompty(confine(path.parent, base_ref))
+         if isinstance(base_data, dict):
+             for base_key, base_value in base_data.items():
+                 data.setdefault(base_key, base_value)
+@@ -168,7 +169,7 @@ def _pre_process(agent_file: Path) -> Callable[[Any], Any]:
+                     data[key] = env_val
+ 
+             elif protocol == "file":
+-                relative_path = (agent_file.parent / val).resolve()
++                relative_path = confine(agent_file.parent, val)
+                 if not relative_path.exists():
+                     raise FileNotFoundError(
+                         f"Referenced file '{val}' not found for key '{key}' (resolved to {relative_path})"
+diff --git a/runtime/python/prompty/prompty/core/partials.py b/runtime/python/prompty/prompty/core/partials.py
+index 537b225..46f6600 100644
+--- a/runtime/python/prompty/prompty/core/partials.py
++++ b/runtime/python/prompty/prompty/core/partials.py
+@@ -14,6 +14,7 @@ from __future__ import annotations
+ import re
+ from pathlib import Path
+ 
++from .confine import confine
+ from .utils import load_text
+ 
+ __all__ = ["expand_partials"]
+@@ -34,6 +35,6 @@ def expand_partials(instructions: str, base_dir: str | Path) -> str:
+     root = Path(base_dir)
+ 
+     def _read(match: re.Match[str]) -> str:
+-        return load_text(root / match.group(1))
++        return load_text(confine(root, match.group(1)))
+ 
+     return _INCLUDE_RE.sub(_read, instructions)
+diff --git a/runtime/python/prompty/prompty/core/tool_dispatch.py b/runtime/python/prompty/prompty/core/tool_dispatch.py
+index 0f2173f..6a40603 100644
+--- a/runtime/python/prompty/prompty/core/tool_dispatch.py
++++ b/runtime/python/prompty/prompty/core/tool_dispatch.py
+@@ -277,7 +277,9 @@ class PromptyToolHandler:
+         parent_path = metadata.get("__source_path", "")
+         if not parent_path:
+             raise FileNotFoundError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path")
+-        return str(Path(parent_path).parent / tool.path)
++        from .confine import confine
++
++        return str(confine(Path(parent_path).parent, tool.path))
+ 
+     @staticmethod
+     def _check_circular(child_path: str, agent: Any) -> None:
+diff --git a/runtime/python/prompty/prompty/core/utils.py b/runtime/python/prompty/prompty/core/utils.py
+index ae3dab1..d62fd1d 100644
+--- a/runtime/python/prompty/prompty/core/utils.py
++++ b/runtime/python/prompty/prompty/core/utils.py
+@@ -7,6 +7,8 @@ import re
+ from pathlib import Path
+ from typing import Any
+ 
++from .confine import confine
++
+ import aiofiles
+ import yaml
+ 
+@@ -30,7 +32,7 @@ class PromptySafeLoader(yaml.SafeLoader):
+ def _construct_include(loader: PromptySafeLoader, node: yaml.Node) -> Any:
+     reference = loader.construct_scalar(node)
+     base_dir = loader.base_dir if loader.base_dir is not None else Path.cwd()
+-    return _yaml_load(load_text(Path(base_dir) / reference), base_dir)
++    return _yaml_load(load_text(confine(base_dir, reference)), base_dir)
+ 
+ 
+ PromptySafeLoader.add_constructor("!include", _construct_include)
+@@ -72,8 +74,7 @@ def load_fragment(base_dir: str | Path, reference: str, encoding: str = "utf-8")
+     Used by the ``${prompt:...}`` reference protocol to compose a prompt from
+     shared fragment files that live alongside the ``.prompty`` file.
+     """
+-    target = Path(base_dir) / reference
+-    return load_text(target, encoding=encoding)
++    return load_text(confine(base_dir, reference), encoding=encoding)
+ 
+ 
+ def load_prompty(file_path: str | Path, encoding: str = "utf-8") -> dict[str, Any] | str:
+diff --git a/runtime/python/prompty/prompty/providers/openai/executor.py b/runtime/python/prompty/prompty/providers/openai/executor.py
+index 6fe213e..2e64da7 100644
+--- a/runtime/python/prompty/prompty/providers/openai/executor.py
++++ b/runtime/python/prompty/prompty/providers/openai/executor.py
+@@ -141,6 +141,7 @@ def _project_prompty_tool(tool: Any, parent: Prompty) -> dict[str, Any]:
+     """
+     from pathlib import Path
+ 
++    from ...core.confine import confine
+     from ...core.loader import load
+ 
+     # Validate tool.path
+@@ -152,7 +153,7 @@ def _project_prompty_tool(tool: Any, parent: Prompty) -> dict[str, Any]:
+     parent_path = (parent.metadata or {}).get("__source_path", "")
+     if not parent_path:
+         raise ValueError(f"Cannot resolve PromptyTool '{tool.name}': parent agent has no __source_path in metadata")
+-    child_path = Path(parent_path).parent / tool_path
++    child_path = confine(Path(parent_path).parent, tool_path)
+     child = load(str(child_path))
+ 
+     func_def: dict[str, Any] = {"name": tool.name}
+diff --git a/runtime/python/prompty/prompty/renderers/jinja2.py b/runtime/python/prompty/prompty/renderers/jinja2.py
+index 42c9f8f..57ad9f6 100644
+--- a/runtime/python/prompty/prompty/renderers/jinja2.py
++++ b/runtime/python/prompty/prompty/renderers/jinja2.py
+@@ -6,9 +6,13 @@ Registered as ``jinja2`` in ``prompty.renderers``.
+ 
+ from __future__ import annotations
+ 
++import os
+ from pathlib import Path
+ from typing import Any
+ 
++from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader, TemplateNotFound
++from jinja2.loaders import split_template_path
++
+ from ..model import Prompty
+ from ..tracing.tracer import trace
+ from ._common import _prepare_render_inputs, _thread_nonces_local
+@@ -16,6 +20,21 @@ from ._common import _prepare_render_inputs, _thread_nonces_local
+ __all__ = ["Jinja2Renderer"]
+ 
+ 
++class _ConfinedLoader(FileSystemLoader):
++    """Serve template fragments only from the document's own directory."""
++
++    def get_source(self, environment, template):
++        root = os.path.realpath(self.searchpath[0])
++        target = os.path.realpath(os.path.join(root, *split_template_path(template)))
++        try:
++            inside = os.path.commonpath([root, target]) == root
++        except ValueError:
++            inside = False
++        if not inside:
++            raise TemplateNotFound(template)
++        return super().get_source(environment, template)
++
++
+ class Jinja2Renderer:
+     """Renders Jinja2 templates in a sandboxed environment.
+ 
+@@ -39,7 +58,6 @@ class Jinja2Renderer:
+         template: str,
+         inputs: dict[str, Any],
+     ) -> str:
+-        from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
+         from jinja2.sandbox import ImmutableSandboxedEnvironment
+ 
+         render_inputs, thread_nonces = _prepare_render_inputs(agent, inputs)
+@@ -50,7 +68,7 @@ class Jinja2Renderer:
+         # document, e.g. ``{% include "partials/style.md" %}``.
+         source_path = (agent.metadata or {}).get("__source_path")
+         if source_path:
+-            loaders.append(FileSystemLoader(str(Path(source_path).parent)))
++            loaders.append(_ConfinedLoader(str(Path(source_path).parent)))
+ 
+         env = ImmutableSandboxedEnvironment(
+             loader=ChoiceLoader(loaders),
+diff --git a/runtime/typescript/packages/core/src/core/index.ts b/runtime/typescript/packages/core/src/core/index.ts
+index fbda71f..ebb7256 100644
+--- a/runtime/typescript/packages/core/src/core/index.ts
++++ b/runtime/typescript/packages/core/src/core/index.ts
+@@ -3,6 +3,7 @@ export * from "./interfaces.js";
+ export * from "./registry.js";
+ export * from "./connections.js";
+ export { load, defaultSaveContext } from "./loader.js";
++export { confinePath } from "./paths.js";
+ export {
+   validateInputs,
+   render,
+diff --git a/runtime/typescript/packages/core/src/core/loader.ts b/runtime/typescript/packages/core/src/core/loader.ts
+index 49c6c5d..27fa1fc 100644
+--- a/runtime/typescript/packages/core/src/core/loader.ts
++++ b/runtime/typescript/packages/core/src/core/loader.ts
+@@ -10,6 +10,7 @@
+ 
+ import { readFileSync } from "node:fs";
+ import { resolve, dirname, extname } from "node:path";
++import { confinePath } from "./paths.js";
+ import matter from "gray-matter";
+ import { LoadContext, SaveContext } from "../model/context.js";
+ import { Prompty } from "../model/agent/prompty.js";
+@@ -144,7 +145,7 @@ function makePreProcess(agentFile: string): (data: unknown) => unknown {
+           );
+         }
+       } else if (protocol === "file") {
+-        const filePath = resolve(agentDir, val);
++        const filePath = confinePath(agentDir, val);
+         record[key] = loadFileContent(filePath);
+       }
+     }
+diff --git a/runtime/typescript/packages/core/src/core/paths.ts b/runtime/typescript/packages/core/src/core/paths.ts
+new file mode 100644
+index 0000000..0155f92
+--- /dev/null
++++ b/runtime/typescript/packages/core/src/core/paths.ts
+@@ -0,0 +1,25 @@
++/**
++ * Confinement for author-named filesystem references.
++ *
++ * @module
++ */
++
++import { realpathSync } from "node:fs";
++import { relative, resolve, isAbsolute, sep } from "node:path";
++
++/**
++ * Resolve `reference` under `baseDir`, refusing anything that escapes it.
++ *
++ * The resolved target is canonicalized (links followed) first, so upward
++ * spellings, absolute paths and links that lead elsewhere are all rejected.
++ */
++export function confinePath(baseDir: string, reference: string): string {
++  const root = realpathSync(resolve(baseDir));
++  const target = realpathSync(resolve(root, reference));
++  const rel = relative(root, target);
++  if (rel === "") return target;
++  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
++    throw new Error(`Reference '${reference}' resolves outside the prompt directory '${root}'`);
++  }
++  return target;
++}
+diff --git a/runtime/typescript/packages/core/src/core/tool-dispatch.ts b/runtime/typescript/packages/core/src/core/tool-dispatch.ts
+index 5f170cc..2079636 100644
+--- a/runtime/typescript/packages/core/src/core/tool-dispatch.ts
++++ b/runtime/typescript/packages/core/src/core/tool-dispatch.ts
+@@ -23,6 +23,7 @@
+ 
+ import { dirname, resolve } from "node:path";
+ import type { Prompty } from "../model/agent/prompty.js";
++import { confinePath } from "./paths.js";
+ 
+ // ---------------------------------------------------------------------------
+ // ToolHandler interface
+@@ -181,7 +182,7 @@ class PromptyToolHandler implements ToolHandler {
+       return `Error: cannot resolve PromptyTool '${tool.name}': parent has no __source_path`;
+     }
+ 
+-    const childPath = resolve(dirname(parentPath), tool.path as string);
++    const childPath = confinePath(dirname(parentPath), tool.path as string);
+ 
+     // Circular reference detection
+     const stack = ((agent.metadata ?? {}).__prompty_tool_stack as string[] | undefined) ?? [];
+diff --git a/runtime/typescript/packages/core/src/index.ts b/runtime/typescript/packages/core/src/index.ts
+index 5211ffe..e3e3b56 100644
+--- a/runtime/typescript/packages/core/src/index.ts
++++ b/runtime/typescript/packages/core/src/index.ts
+@@ -57,6 +57,7 @@ export {
+ 
+   // Loader
+   load,
++  confinePath,
+ 
+   // Pipeline functions
+   validateInputs,
+diff --git a/runtime/typescript/packages/openai/src/wire.ts b/runtime/typescript/packages/openai/src/wire.ts
+index 8f59212..52166bb 100644
+--- a/runtime/typescript/packages/openai/src/wire.ts
++++ b/runtime/typescript/packages/openai/src/wire.ts
+@@ -6,8 +6,8 @@
+ 
+ import type { Prompty } from "@prompty/core";
+ import type { ContentPart, Message } from "@prompty/core";
+-import { load as loadPrompty } from "@prompty/core";
+-import { dirname, resolve } from "node:path";
++import { load as loadPrompty, confinePath } from "@prompty/core";
++import { dirname } from "node:path";
+ 
+ /**
+  * Convert an abstract Message to OpenAI wire format.
+@@ -375,7 +375,7 @@ function projectPromptyTool(tool: Record<string, unknown>, parent: Prompty): Rec
+       `Cannot resolve PromptyTool '${tool.name}': parent agent has no __source_path in metadata`,
+     );
+   }
+-  const childPath = resolve(dirname(parentPath), toolPath);
++  const childPath = confinePath(dirname(parentPath), toolPath);
+   const child = loadPrompty(childPath);
+ 
+   const funcDef: Record<string, unknown> = { name: tool.name };

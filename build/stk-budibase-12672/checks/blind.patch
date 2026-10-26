@@ -1,0 +1,224 @@
+diff -ruN a/packages/backend-core/src/utils/outboundFetch.ts b/packages/backend-core/src/utils/outboundFetch.ts
+--- a/packages/backend-core/src/utils/outboundFetch.ts
++++ b/packages/backend-core/src/utils/outboundFetch.ts
+@@ -136,6 +136,12 @@
+ > {
+   followRedirects?: boolean
+   returnRedirectWithoutLocation?: boolean
++  // When set, the request may only be redirected to an origin equal to this
++  // one. A redirect anywhere else is refused before the redirected request is
++  // sent. Callers that carry their own credentials opt in; everyone else keeps
++  // the default behaviour of following the redirect without the well-known
++  // sensitive headers.
++  sameOriginAs?: string
+   fetchFn?: (
+     url: string,
+     request: RedirectSafeRequest<TRequest>,
+@@ -177,6 +183,7 @@
+   {
+     followRedirects = true,
+     returnRedirectWithoutLocation = false,
++    sameOriginAs,
+     fetchFn = fetch as unknown as (
+       url: string,
+       request: RedirectSafeRequest<TRequest>,
+@@ -239,6 +246,14 @@
+     ).toString()
+     nextRequest = nextRequestForRedirect(nextRequest, response.status)
+     if (shouldStripSensitiveHeadersForRedirect(nextUrl, redirectUrl)) {
++      if (
++        sameOriginAs !== undefined &&
++        new URL(sameOriginAs).origin !== new URL(redirectUrl).origin
++      ) {
++        throw new Error(
++          "Redirect to a different origin is not permitted for this request."
++        )
++      }
+       nextRequest = stripSensitiveHeadersForRedirect(nextRequest)
+     }
+     nextUrl = redirectUrl
+diff -ruN a/packages/server/src/integrations/rest.ts b/packages/server/src/integrations/rest.ts
+--- a/packages/server/src/integrations/rest.ts
++++ b/packages/server/src/integrations/rest.ts
+@@ -238,6 +238,16 @@
+   }
+ }
+ 
++// The origin of a URL, or undefined when it cannot be read as one at all. Used
++// to decide whether a request would leave the origin it was authored against.
++function originOf(candidate: string): string | undefined {
++  try {
++    return new URL(candidate).origin
++  } catch {
++    return undefined
++  }
++}
++
+ export class RestIntegration implements IntegrationBase {
+   private config: RestConfig
+   private headers: {
+@@ -657,10 +667,55 @@
+     return this.buildHeadersFromAuthConfig(resolved.auth)
+   }
+ 
++  /**
++   * Guard the destination of a REST query before any of the datasource's stored
++   * headers or authentication are put on the request.
++   *
++   * A REST query resolves to a single URL, and that URL is built from run-time
++   * values (query parameters, pagination, default query parameters) that a
++   * caller of a published query can influence. The only statements of intent
++   * about where the request belongs are the datasource's configured base
++   * address and the query's own saved path, before those run-time values are
++   * substituted into it. If the URL we are about to call is not on the origin
++   * both of those name, the request is refused outright rather than sent with
++   * the stored credentials removed, so a caller can never reach their own
++   * server with the datasource's secrets.
++   */
++  private assertStoredCredentialsMayBeSent(
++    destinationUrl: string,
++    authoredPath?: string
++  ): void {
++    const authoredUrls: string[] = []
++    if (this.config.url) {
++      authoredUrls.push(this.getUrl("", ""))
++    }
++    if (authoredPath !== undefined) {
++      authoredUrls.push(this.getUrl(authoredPath))
++    }
++
++    // A datasource without a base address, queried with a path that is only
++    // known at run time, has no authored destination to compare against; that
++    // pre-existing shape is left alone.
++    if (authoredUrls.length === 0) {
++      return
++    }
++
++    const destination = originOf(destinationUrl)
++    const onAuthoredOrigin =
++      destination !== undefined &&
++      authoredUrls.every(candidate => originOf(candidate) === destination)
++    if (!onAuthoredOrigin) {
++      throw new Error(
++        "Query refused: the request would leave the origin this datasource and query were saved for."
++      )
++    }
++  }
++
+   async _req(query: RestQuery, retry401 = true): Promise<ParsedResponse> {
+     const {
+       path = "",
+       queryString = "",
++      authoredPath,
+       headers = {},
+       method = HttpMethod.GET,
+       disabledHeaders,
+@@ -671,6 +726,26 @@
+       pagination,
+       paginationValues,
+     } = query
++
++    const defaultQueryParameters = this.config.defaultQueryParameters || {}
++    let mergedQueryString = queryString
++    if (Object.keys(defaultQueryParameters).length > 0) {
++      const queryParams = queryString ? qs.decode(queryString) : {}
++      const merged = { ...defaultQueryParameters, ...queryParams }
++      mergedQueryString = qs.encode(merged)
++    }
++
++    this.startTimeMs = performance.now()
++    const url = this.getUrl(
++      path,
++      mergedQueryString,
++      pagination,
++      paginationValues
++    )
++
++    // Decide the destination before anything secret is attached to a request.
++    this.assertStoredCredentialsMayBeSent(url, authoredPath)
++
+     const authHeaders = await this.getAuthHeaders(authConfigId, authConfigType)
+ 
+     this.headers = {
+@@ -707,22 +782,6 @@
+       input.extraHttpOptions = { insecureHTTPParser: true }
+     }
+ 
+-    const defaultQueryParameters = this.config.defaultQueryParameters || {}
+-    let mergedQueryString = queryString
+-    if (Object.keys(defaultQueryParameters).length > 0) {
+-      const queryParams = queryString ? qs.decode(queryString) : {}
+-      const merged = { ...defaultQueryParameters, ...queryParams }
+-      mergedQueryString = qs.encode(merged)
+-    }
+-
+-    this.startTimeMs = performance.now()
+-    const url = this.getUrl(
+-      path,
+-      mergedQueryString,
+-      pagination,
+-      paginationValues
+-    )
+-
+     // Configure dispatcher for proxy and/or TLS settings
+     // Use datasource config if set, otherwise fall back to environment variable
+     const rejectUnauthorized =
+@@ -765,6 +824,9 @@
+         url,
+         input,
+         {
++          // The credentials on this request belong to the origin we just
++          // validated; a redirect elsewhere must not carry them along.
++          sameOriginAs: url,
+           fetchFn: async (
+             requestUrl: string,
+             requestInput: RequestInit,
+diff -ruN a/packages/server/src/sdk/workspace/oauth2/utils.ts b/packages/server/src/sdk/workspace/oauth2/utils.ts
+--- a/packages/server/src/sdk/workspace/oauth2/utils.ts
++++ b/packages/server/src/sdk/workspace/oauth2/utils.ts
+@@ -65,7 +65,12 @@
+   }
+   fetchConfig.body = new URLSearchParams(bodyParams)
+ 
+-  const resp = await coreUtils.fetchWithBlacklist(config.url, fetchConfig)
++  // The client credential this request carries (in the body or in a Basic
++  // header) belongs to the configured token endpoint's origin; do not let a
++  // redirect carry it to another one.
++  const resp = await coreUtils.fetchWithBlacklist(config.url, fetchConfig, {
++    sameOriginAs: config.url,
++  })
+   return resp
+ }
+ 
+diff -ruN a/packages/server/src/threads/query.ts b/packages/server/src/threads/query.ts
+--- a/packages/server/src/threads/query.ts
++++ b/packages/server/src/threads/query.ts
+@@ -190,7 +190,15 @@
+         }
+       )
+     } else {
++      // Keep the path the query author saved: after any datasource base
++      // rewrite, but before run-time parameters are substituted into it. It is
++      // the only statement of intent about the destination, so the REST
++      // integration needs it to check the URL it ends up calling.
++      const authoredPath = fieldsClone.path
+       query = await sdk.queries.enrichContext(fieldsClone, enrichedContext)
++      if (datasourceClone.source === SourceName.REST) {
++        query.authoredPath = authoredPath
++      }
+     }
+     // Add pagination values for REST queries
+     if (this.pagination) {
+diff -ruN a/packages/types/src/documents/workspace/query.ts b/packages/types/src/documents/workspace/query.ts
+--- a/packages/types/src/documents/workspace/query.ts
++++ b/packages/types/src/documents/workspace/query.ts
+@@ -84,6 +84,9 @@
+ 
+ export interface RestQueryFields {
+   path?: string
++  // The path as saved on the query, before run-time parameter substitution.
++  // Set by the query runner for REST queries; not part of the saved document.
++  authoredPath?: string
+   queryString?: string
+   headers?: { [key: string]: any }
+   disabledHeaders?: { [key: string]: any }

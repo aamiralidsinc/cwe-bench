@@ -1,0 +1,343 @@
+diff --git a/config/api/routes/files.php b/config/api/routes/files.php
+index 7af8105b..890988f2 100644
+--- a/config/api/routes/files.php
++++ b/config/api/routes/files.php
+@@ -1,5 +1,8 @@
+ <?php
+ 
++use Kirby\Cms\File;
++use Kirby\Exception\PermissionException;
++
+ // routing pattern to match all models with files
+ $filePattern   = '(account/|pages/[^/]+/|site/|users/[^/]+/|)files/(:any)';
+ $parentPattern = '(account|pages/[^/]+|site|users/[^/]+)/files';
+@@ -46,17 +49,33 @@ return [
+ 		'action'  => function (string $path) {
+ 			// move_uploaded_file() not working with unit test
+ 			// @codeCoverageIgnoreStart
+-			return $this->upload(function ($source, $filename) use ($path) {
+-				// move the source file to the content folder
+-				return $this->parent($path)->createFile([
+-					'content' => [
+-						'sort' => $this->requestBody('sort')
+-					],
+-					'source'   => $source,
+-					'template' => $this->requestBody('template'),
+-					'filename' => $filename
+-				], true);
+-			});
++			$parent = $this->parent($path);
++
++			return $this->upload(
++				callback: function ($source, $filename) use ($parent) {
++					return $parent->createFile([
++						'content' => [
++							'sort' => $this->requestBody('sort')
++						],
++						'source'   => $source,
++						'template' => $this->requestBody('template'),
++						'filename' => $filename
++					], move: true);
++				},
++				preflight: function (string $filename, string|null $template) use ($parent) {
++					$file = new File([
++						'parent'   => $parent,
++						'filename' => $filename,
++						'template' => $template
++					]);
++
++					if ($file->permissions()->can('create') !== true) {
++						throw new PermissionException(
++							message: 'The file cannot be created'
++						);
++					}
++				}
++			);
+ 			// @codeCoverageIgnoreEnd
+ 		}
+ 	],
+@@ -110,9 +129,10 @@ return [
+ 		'pattern' => $filePattern,
+ 		'method'  => 'POST',
+ 		'action'  => function (string $path, string $filename) {
+-			// move the source file from the temp dir
++			$file = $this->file($path, $filename);
++
+ 			return $this->upload(
+-				fn ($source) => $this->file($path, $filename)->replace($source, true)
++				callback: fn ($source) => $file->replace($source, move: true),
+ 			);
+ 		}
+ 	],
+diff --git a/config/api/routes/users.php b/config/api/routes/users.php
+index 4f71f509..a8c88c95 100644
+--- a/config/api/routes/users.php
++++ b/config/api/routes/users.php
+@@ -1,6 +1,7 @@
+ <?php
+ 
+ use Kirby\Cms\Find;
++use Kirby\Exception\PermissionException;
+ use Kirby\Filesystem\F;
+ 
+ /**
+@@ -87,7 +88,8 @@ return [
+ 		'method'  => 'POST',
+ 		'action'  => function (string $id) {
+ 			return $this->upload(
+-				function ($source, $filename) use ($id) {
++				single: true,
++				callback: function ($source, $filename) use ($id) {
+ 					$user   = Find::user($id);
+ 					$method = $user->avatar() === null ? 'createAvatar' : 'replaceAvatar';
+ 
+@@ -97,7 +99,6 @@ return [
+ 						move: true
+ 					)->avatar();
+ 				},
+-				single: true
+ 			);
+ 		}
+ 	],
+diff --git a/config/fields/mixins/upload.php b/config/fields/mixins/upload.php
+index b2b71404..06193c5d 100644
+--- a/config/fields/mixins/upload.php
++++ b/config/fields/mixins/upload.php
+@@ -4,6 +4,7 @@ use Kirby\Cms\Api;
+ use Kirby\Cms\File;
+ use Kirby\Exception\Exception;
+ use Kirby\Exception\InvalidArgumentException;
++use Kirby\Exception\PermissionException;
+ 
+ return [
+ 	'props' => [
+@@ -62,24 +63,27 @@ return [
+ 			$parent   = $this->uploadParent($params['parent'] ?? null);
+ 			$template = $params['template'] ?? null;
+ 
+-			return $api->upload(function ($source, $filename, $template) use ($parent, $map) {
+-				$props = [
+-					'source'   => $source,
+-					'template' => $template,
+-					'filename' => $filename,
+-				];
+-
+-				// move the source file from the temp dir
+-				$file = $parent->createFile($props, true);
+-
+-				if ($file instanceof File === false) {
+-					throw new Exception(
+-						message: 'The file could not be uploaded'
+-					);
+-				}
+-
+-				return $map($file, $parent);
+-			}, template: $template);
++			return $api->upload(
++				template: $template,
++				callback: function ($source, $filename, $template) use ($parent, $map) {
++					$props = [
++						'source'   => $source,
++						'template' => $template,
++						'filename' => $filename,
++					];
++
++					// move the source file from the temp dir
++					$file = $parent->createFile($props, move: true);
++
++					if ($file instanceof File === false) {
++						throw new Exception(
++							message: 'The file could not be uploaded'
++						);
++					}
++
++					return $map($file, $parent);
++				},
++			);
+ 		},
+ 		'uploadParent' => function (string|null $parentQuery = null) {
+ 			$parent = $this->model();
+diff --git a/src/Api/Api.php b/src/Api/Api.php
+index bc2ce0c0..5041730c 100644
+--- a/src/Api/Api.php
++++ b/src/Api/Api.php
+@@ -639,13 +639,15 @@ class Api
+ 		Closure $callback,
+ 		bool $single = false,
+ 		bool $debug = false,
+-		string|null $template = null
++		string|null $template = null,
++		Closure|null $preflight = null
+ 	): array {
+ 		$upload = new Upload(
+ 			api: $this,
+ 			single: $single,
+ 			debug: $debug,
+-			template: $template
++			template: $template,
++			preflight: $preflight
+ 		);
+ 
+ 		return $upload->process($callback);
+diff --git a/src/Api/Upload.php b/src/Api/Upload.php
+index 7a40f801..b7ee0bfb 100644
+--- a/src/Api/Upload.php
++++ b/src/Api/Upload.php
+@@ -8,6 +8,7 @@ use Kirby\Cms\App;
+ use Kirby\Cms\File;
+ use Kirby\Cms\FileRules;
+ use Kirby\Cms\Page;
++use Kirby\Data\Json;
+ use Kirby\Exception\DuplicateException;
+ use Kirby\Exception\InvalidArgumentException;
+ use Kirby\Exception\NotFoundException;
+@@ -35,7 +36,8 @@ readonly class Upload
+ 		protected Api $api,
+ 		protected bool $single = true,
+ 		protected bool $debug = false,
+-		protected string|null $template = null
++		protected string|null $template = null,
++		protected Closure|null $preflight = null
+ 	) {
+ 	}
+ 
+@@ -175,7 +177,20 @@ readonly class Upload
+ 				}
+ 
+ 				$filename = static::filename($upload);
+-				$source   = $this->source($upload['tmp_name'], $filename);
++
++				// authorize the upload before any (chunk) data is
++				// persisted to the cache dir; for chunked uploads this
++				// runs on every request (not just the first chunk), so
++				// the request that ultimately completes the file is
++				// always authorized for its own declared template
++				if ($this->preflight !== null) {
++					($this->preflight)(
++						$filename,
++						$this->template ?? $this->api->requestBody('template')
++					);
++				}
++
++				$source = $this->source($upload['tmp_name'], $filename);
+ 
+ 				// if the file is uploaded in chunks…
+ 				if ($this->api->requestHeaders('Upload-Length')) {
+@@ -230,19 +245,45 @@ readonly class Upload
+ 		$id       = $this->api->requestHeaders('Upload-Id', '');
+ 		$id       = static::chunkId($id);
+ 		$total    = (int)$this->api->requestHeaders('Upload-Length');
++		$offset   = (int)$this->api->requestHeaders('Upload-Offset');
+ 		$filename = basename($filename);
++		$template = $this->template ?? $this->api->requestBody('template');
+ 		$tmpRoot  = $dir . '/' . $id . '-' . $filename;
+ 
++		// meta sidecar file storing the template and total length
++		// for the first chunk, so that all following chunks
++		// can be validated against it
++		$metaRoot = $tmpRoot . '.json';
++
+ 		// validate various aspects of the request
+ 		// to ensure the chunk isn't trying to do malicious actions
+ 		static::validateChunk(
+ 			source:   $source,
+ 			tmp:      $tmpRoot,
++			meta:     $metaRoot,
+ 			total:    $total,
+-			offset:   $this->api->requestHeaders('Upload-Offset'),
+-			template: $this->template ?? $this->api->requestBody('template'),
++			offset:   $offset,
++			template: $template,
++			filename: $filename,
+ 		);
+ 
++		if ($offset === 0) {
++			// If the very first chunk already contains the whole file,
++			// there is no need to buffer it in the tmp upload directory.
++			// It can be used directly like a regular, non-chunked upload.
++			if (F::size($source) >= $total) {
++				return $source;
++			}
++
++			// Write the meta file for the first chunk;
++			// the template and total length must not change for any of
++			// the following chunks (enforced by `::validateChunk()`)
++			Json::write($metaRoot, [
++				'template' => $template,
++				'total'    => $total
++			]);
++		}
++
+ 		// stream chunk content and append it to partial file
+ 		stream_copy_to_stream(
+ 			fopen($source, 'r'),
+@@ -258,9 +299,12 @@ readonly class Upload
+ 			return null;
+ 		}
+ 
+-		// remove id from partial filename now the file is complete,
+-		// so we can pass the path from the tmp upload directory
+-		// as new source path for the file back to the API upload method
++		// the upload is complete: the meta sidecar is no longer
++		// needed and the id prefix can be removed from the filename, so
++		// we can pass the path from the tmp upload directory as new
++		// source path for the file back to the API upload method
++		F::remove($metaRoot);
++
+ 		rename(
+ 			$tmpRoot,
+ 			$source = $dir . '/' . $filename
+@@ -342,18 +386,26 @@ readonly class Upload
+ 	 * @throws \Kirby\Exception\DuplicateException Duplicate first chunk (same filename and id)
+ 	 * @throws \Kirby\Exception\InvalidArgumentException Chunk offset does not match existing tmp file
+ 	 * @throws \Kirby\Exception\InvalidArgumentException The maximum file size for this blueprint was exceeded
++	 * @throws \Kirby\Exception\InvalidArgumentException Template or total length changed between chunks
+ 	 * @throws \Kirby\Exception\NotFoundException Subsequent chunk has no  existing tmp file
+ 	 */
+ 	protected static function validateChunk(
+ 		string $source,
+ 		string $tmp,
++		string $meta,
+ 		int $total,
+ 		int $offset,
+-		string|null $template = null
++		string|null $template = null,
++		string|null $filename = null
+ 	): void {
++		// validate the filename that will actually be
++		// stored, not the id-prefixed name of the
++		// temporary chunk file
++		$filename = basename($filename ?? $tmp);
++
+ 		$file = new File([
+ 			'parent'   => new Page(['slug' => 'tmp']),
+-			'filename' => $filename = basename($tmp),
++			'filename' => $filename,
+ 			'template' => $template
+ 		]);
+ 
+@@ -400,6 +452,24 @@ readonly class Upload
+ 			);
+ 		}
+ 
++		// the upload meta (file template and total length) must
++		// be identical to the one stored for the first chunk; this
++		// prevents a later chunk from smuggling in a different template
++		// than the initial one
++		$descriptor = F::exists($meta) === true
++			? json_decode(F::read($meta), true)
++			: null;
++
++		if (
++			is_array($descriptor) === false ||
++			($descriptor['template'] ?? null) !== $template ||
++			($descriptor['total'] ?? null) !== $total
++		) {
++			throw new InvalidArgumentException(
++				message: 'The file template and upload length must not change between chunks'
++			);
++		}
++
+ 		// sent chunk's offset is not the continuation of the tmp file
+ 		if ($offset !== F::size($tmp)) {
+ 			throw new InvalidArgumentException(

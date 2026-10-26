@@ -1,0 +1,216 @@
+diff --git a/middlewares/access_control_middlewares.go b/middlewares/access_control_middlewares.go
+index 2427549..36c18f9 100644
+--- a/middlewares/access_control_middlewares.go
++++ b/middlewares/access_control_middlewares.go
+@@ -95,6 +95,16 @@ func NeededScope(NeededScopes []string) shared.MiddlewareFunc {
+ 	}
+ }
+ 
++func DisallowPublicRequests(next echo.HandlerFunc) echo.HandlerFunc {
++	return func(ctx shared.Context) error {
++		if shared.IsPublicRequest(ctx) {
++			slog.Warn("access denied for public request in DisallowPublicRequests middleware")
++			return echo.NewHTTPError(404, "could not find resource")
++		}
++		return next(ctx)
++	}
++}
++
+ func AssetAccessControlFactory(assetRepository shared.AssetRepository) shared.RBACMiddleware {
+ 	return func(obj shared.Object, act shared.Action) shared.MiddlewareFunc {
+ 		return func(next echo.HandlerFunc) echo.HandlerFunc {
+diff --git a/router/artifact_router.go b/router/artifact_router.go
+index 7d48b2d..9b5ee19 100644
+--- a/router/artifact_router.go
++++ b/router/artifact_router.go
+@@ -30,8 +30,10 @@ func NewArtifactRouter(
+ 	assetVersionGroup AssetVersionRouter,
+ 	artifactController *controllers.ArtifactController,
+ 	artifactRepository shared.ArtifactRepository,
++	assetRepository shared.AssetRepository,
+ ) ArtifactRouter {
+ 	artifactRouter := assetVersionGroup.Group.Group("/artifacts/:artifactName", middlewares.ArtifactMiddleware(artifactRepository))
++	assetScopedRBAC := middlewares.AssetAccessControlFactory(assetRepository)
+ 
+ 	artifactRouter.GET("/sbom.json/", artifactController.SBOMJSON)
+ 	artifactRouter.GET("/sbom.xml/", artifactController.SBOMXML)
+@@ -41,8 +43,8 @@ func NewArtifactRouter(
+ 	artifactRouter.GET("/sbom.pdf/", artifactController.BuildPDFFromSBOM)
+ 	artifactRouter.GET("/vulnerability-report.pdf/", artifactController.BuildVulnerabilityReportPDF)
+ 
+-	artifactRouter.DELETE("/", artifactController.DeleteArtifact, middlewares.NeededScope([]string{"manage"}))
+-	artifactRouter.PUT("/", artifactController.UpdateArtifact, middlewares.NeededScope([]string{"manage"}))
++	artifactRouter.DELETE("/", artifactController.DeleteArtifact, middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
++	artifactRouter.PUT("/", artifactController.UpdateArtifact, middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+ 
+ 	return ArtifactRouter{Group: artifactRouter}
+ }
+diff --git a/router/asset_router.go b/router/asset_router.go
+index 2dd169c..b44b918 100644
+--- a/router/asset_router.go
++++ b/router/asset_router.go
+@@ -67,6 +67,7 @@ func NewAssetRouter(
+ 	assetRouter.POST("/in-toto/", intotoController.Create, middlewares.NeededScope([]string{"scan"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+ 
+ 	assetUpdateAccessControlRequired := assetRouter.Group("", middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
++
+ 	assetUpdateAccessControlRequired.POST("/sbom-file/", scanController.ScanSbomFile)
+ 	assetUpdateAccessControlRequired.POST("/integrations/gitlab/autosetup/", integrationController.AutoSetup)
+ 	assetUpdateAccessControlRequired.POST("/members/", assetController.InviteMembers)
+diff --git a/router/asset_version_router.go b/router/asset_version_router.go
+index 06a6f1d..6a026ec 100644
+--- a/router/asset_version_router.go
++++ b/router/asset_version_router.go
+@@ -67,9 +67,9 @@ func NewAssetVersionRouter(
+ 	assetVersionRouter.GET("/artifacts/", assetVersionController.ListArtifacts)
+ 	assetVersionRouter.GET("/artifact-root-nodes/", assetVersionController.ReadRootNodes)
+ 
+-	assetVersionRouter.POST("/artifacts/", artifactController.Create, middlewares.NeededScope([]string{"manage"}))
++	assetVersionRouter.POST("/artifacts/", artifactController.Create, middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+ 
+-	assetVersionRouter.POST("/components/licenses/refresh/", assetVersionController.RefetchLicenses, middlewares.NeededScope([]string{"manage"}))
++	assetVersionRouter.POST("/components/licenses/refresh/", assetVersionController.RefetchLicenses, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
+ 	assetVersionRouter.DELETE("/", assetVersionController.Delete, middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+ 	assetVersionRouter.POST("/make-default/", assetVersionController.MakeDefault, middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+ 	assetVersionRouter.DELETE("/events/:eventID/", vulnEventController.DeleteEventByID, middlewares.EventMiddleware(vulnEventRepository), middlewares.NeededScope([]string{"manage"}), assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))
+diff --git a/router/dependency_vuln_router.go b/router/dependency_vuln_router.go
+index 5ee89cf..d96646e 100644
+--- a/router/dependency_vuln_router.go
++++ b/router/dependency_vuln_router.go
+@@ -29,6 +29,7 @@ func NewDependencyVulnRouter(
+ 	assetVersionGroup AssetVersionRouter,
+ 	dependencyVulnController *controllers.DependencyVulnController,
+ 	vulnEventController *controllers.VulnEventController,
++
+ ) DependencyVulnRouter {
+ 	dependencyVulnRouter := assetVersionGroup.Group.Group("/dependency-vulns")
+ 	dependencyVulnRouter.GET("/", dependencyVulnController.ListPaged)
+@@ -36,10 +37,10 @@ func NewDependencyVulnRouter(
+ 	dependencyVulnRouter.GET("/:dependencyVulnID/events/", vulnEventController.ReadAssetEventsByVulnID)
+ 	dependencyVulnRouter.GET("/:dependencyVulnID/hints/", dependencyVulnController.Hints)
+ 
+-	dependencyVulnRouter.POST("/sync/", dependencyVulnController.SyncDependencyVulns, middlewares.NeededScope([]string{"manage"}))
+-	dependencyVulnRouter.POST("/batch/", dependencyVulnController.BatchCreateEvent, middlewares.NeededScope([]string{"manage"}))
+-	dependencyVulnRouter.POST("/:dependencyVulnID/", dependencyVulnController.CreateEvent, middlewares.NeededScope([]string{"manage"}))
+-	dependencyVulnRouter.POST("/:dependencyVulnID/mitigate/", dependencyVulnController.Mitigate, middlewares.NeededScope([]string{"manage"}))
++	dependencyVulnRouter.POST("/sync/", dependencyVulnController.SyncDependencyVulns, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	dependencyVulnRouter.POST("/batch/", dependencyVulnController.BatchCreateEvent, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	dependencyVulnRouter.POST("/:dependencyVulnID/", dependencyVulnController.CreateEvent, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	dependencyVulnRouter.POST("/:dependencyVulnID/mitigate/", dependencyVulnController.Mitigate, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
+ 
+ 	return DependencyVulnRouter{Group: dependencyVulnRouter}
+ }
+diff --git a/router/external_reference_router.go b/router/external_reference_router.go
+index bc2e1bd..41950e5 100644
+--- a/router/external_reference_router.go
++++ b/router/external_reference_router.go
+@@ -18,6 +18,7 @@ package router
+ import (
+ 	"github.com/l3montree-dev/devguard/controllers"
+ 	"github.com/l3montree-dev/devguard/middlewares"
++	"github.com/l3montree-dev/devguard/shared"
+ 	"github.com/labstack/echo/v4"
+ )
+ 
+@@ -28,7 +29,9 @@ type ExternalReferenceRouter struct {
+ func NewExternalReferenceRouter(
+ 	assetVersionRouter AssetVersionRouter,
+ 	externalReferenceController *controllers.ExternalReferenceController,
++	assetRepository shared.AssetRepository,
+ ) ExternalReferenceRouter {
++	assetScopedRBAC := middlewares.AssetAccessControlFactory(assetRepository)
+ 	// External references are scoped to asset versions
+ 	// Read access - anyone who can read the asset version can list references
+ 	refGroup := assetVersionRouter.Group.Group("/external-references")
+@@ -36,9 +39,9 @@ func NewExternalReferenceRouter(
+ 
+ 	// Write access - requires asset update permission
+ 	refWriteGroup := refGroup.Group("", middlewares.NeededScope([]string{"manage"}))
+-	refWriteGroup.POST("/", externalReferenceController.Create)       // Create reference
+-	refWriteGroup.POST("/sync/", externalReferenceController.Sync)    // Sync external sources
+-	refWriteGroup.DELETE("/:id/", externalReferenceController.Delete) // Delete reference
++	refWriteGroup.POST("/", externalReferenceController.Create, assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))       // Create reference
++	refWriteGroup.POST("/sync/", externalReferenceController.Sync, assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate))    // Sync external sources
++	refWriteGroup.DELETE("/:id/", externalReferenceController.Delete, assetScopedRBAC(shared.ObjectAsset, shared.ActionUpdate)) // Delete reference
+ 
+ 	return ExternalReferenceRouter{Group: refGroup}
+ }
+diff --git a/router/first_party_vuln_router.go b/router/first_party_vuln_router.go
+index 755cd86..9675206 100644
+--- a/router/first_party_vuln_router.go
++++ b/router/first_party_vuln_router.go
+@@ -35,8 +35,8 @@ func NewFirstPartyVulnRouter(
+ 	firstPartyVulnRouter.GET("/:firstPartyVulnID/", firstPartyVulnController.Read)
+ 	firstPartyVulnRouter.GET("/:firstPartyVulnID/events/", vulnEventController.ReadAssetEventsByVulnID)
+ 
+-	firstPartyVulnRouter.POST("/:firstPartyVulnID/", firstPartyVulnController.CreateEvent, middlewares.NeededScope([]string{"manage"}))
+-	firstPartyVulnRouter.POST("/:firstPartyVulnID/mitigate/", firstPartyVulnController.Mitigate, middlewares.NeededScope([]string{"manage"}))
++	firstPartyVulnRouter.POST("/:firstPartyVulnID/", firstPartyVulnController.CreateEvent, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	firstPartyVulnRouter.POST("/:firstPartyVulnID/mitigate/", firstPartyVulnController.Mitigate, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
+ 
+ 	return FirstPartyVulnRouter{Group: firstPartyVulnRouter}
+ }
+diff --git a/router/license_risk_router.go b/router/license_risk_router.go
+index f9ab91e..a7ed907 100644
+--- a/router/license_risk_router.go
++++ b/router/license_risk_router.go
+@@ -32,10 +32,10 @@ func NewLicenseRiskRouter(
+ 	licenseRiskRouter := assetVersionGroup.Group.Group("/license-risks")
+ 	licenseRiskRouter.GET("/", licenseRiskController.ListPaged)
+ 	licenseRiskRouter.GET("/:licenseRiskID/", licenseRiskController.Read)
+-	licenseRiskRouter.POST("/", licenseRiskController.Create, middlewares.NeededScope([]string{"manage"}))
+-	licenseRiskRouter.POST("/:licenseRiskID/", licenseRiskController.CreateEvent, middlewares.NeededScope([]string{"manage"}))
+-	licenseRiskRouter.POST("/:licenseRiskID/mitigate/", licenseRiskController.Mitigate, middlewares.NeededScope([]string{"manage"}))
+-	licenseRiskRouter.POST("/:licenseRiskID/final-license-decision/", licenseRiskController.MakeFinalLicenseDecision, middlewares.NeededScope([]string{"manage"}))
++	licenseRiskRouter.POST("/", licenseRiskController.Create, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	licenseRiskRouter.POST("/:licenseRiskID/", licenseRiskController.CreateEvent, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	licenseRiskRouter.POST("/:licenseRiskID/mitigate/", licenseRiskController.Mitigate, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
++	licenseRiskRouter.POST("/:licenseRiskID/final-license-decision/", licenseRiskController.MakeFinalLicenseDecision, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
+ 
+ 	return LicenseRiskRouter{Group: licenseRiskRouter}
+ }
+diff --git a/router/org_router.go b/router/org_router.go
+index d20fc53..4e29730 100644
+--- a/router/org_router.go
++++ b/router/org_router.go
+@@ -82,7 +82,7 @@ func NewOrgRouter(
+ 	organizationRouter.GET("/projects/", projectController.List)
+ 	organizationRouter.GET("/projects/search/", projectController.SearchProjectsWithSubProjectsAndAssets)
+ 	organizationRouter.GET("/integrations/repositories/", integrationController.ListRepositories)
+-	organizationRouter.POST("/policies/:policyID/reapply/", policyController.UpdatePolicy, middlewares.NeededScope([]string{"manage"}))
++	organizationRouter.POST("/policies/:policyID/reapply/", policyController.UpdatePolicy, middlewares.NeededScope([]string{"manage"}), middlewares.DisallowPublicRequests)
+ 
+ 	organizationUpdateAccessControlRequired := organizationRouter.Group("", middlewares.NeededScope([]string{"manage"}), middlewares.OrganizationAccessControlMiddleware(shared.ObjectOrganization, shared.ActionUpdate))
+ 
+diff --git a/router/project_router.go b/router/project_router.go
+index 9044328..efd9797 100644
+--- a/router/project_router.go
++++ b/router/project_router.go
+@@ -67,7 +67,7 @@ func NewProjectRouter(
+ 	projectRouter.GET("/releases/:releaseID/", releaseController.Read)
+ 	projectRouter.GET("/releases/", releaseController.List)
+ 	projectRouter.GET("/components/", componentController.SearchComponentOccurrences, projectScopedRBAC(shared.ObjectAsset, shared.ActionCreate))
+-	projectRouter.POST("/policies/:policyID/enable/", policyController.EnablePolicyForProject, middlewares.NeededScope([]string{"manage"}), projectScopedRBAC(shared.ObjectProject, shared.ActionRead))
++	projectRouter.POST("/policies/:policyID/enable/", policyController.EnablePolicyForProject, middlewares.NeededScope([]string{"manage"}), projectScopedRBAC(shared.ObjectProject, shared.ActionRead), middlewares.DisallowPublicRequests)
+ 
+ 	projectRouter.POST("/assets/", assetController.Create, middlewares.NeededScope([]string{"manage"}), projectScopedRBAC(shared.ObjectAsset, shared.ActionCreate))
+ 
+diff --git a/router/vex_rule_router.go b/router/vex_rule_router.go
+index 067e1fb..52c7af3 100644
+--- a/router/vex_rule_router.go
++++ b/router/vex_rule_router.go
+@@ -37,10 +37,10 @@ func NewVEXRuleRouter(
+ 
+ 	// Write access - requires asset update permission
+ 	ruleWriteGroup := ruleGroup.Group("", middlewares.NeededScope([]string{"manage"}))
+-	ruleWriteGroup.POST("/", vexRuleController.Create)                  // Create rule
+-	ruleWriteGroup.PUT("/:ruleId/", vexRuleController.Update)           // Update rule by ID
+-	ruleWriteGroup.POST("/:ruleId/reapply/", vexRuleController.Reapply) // Reapply rule to existing vulns
+-	ruleWriteGroup.DELETE("/:ruleId/", vexRuleController.Delete)        // Delete rule by ID
++	ruleWriteGroup.POST("/", vexRuleController.Create, middlewares.DisallowPublicRequests)                  // Create rule
++	ruleWriteGroup.PUT("/:ruleId/", vexRuleController.Update, middlewares.DisallowPublicRequests)           // Update rule by ID
++	ruleWriteGroup.POST("/:ruleId/reapply/", vexRuleController.Reapply, middlewares.DisallowPublicRequests) // Reapply rule to existing vulns
++	ruleWriteGroup.DELETE("/:ruleId/", vexRuleController.Delete, middlewares.DisallowPublicRequests)        // Delete rule by ID
+ 
+ 	return VEXRuleRouter{Group: ruleGroup}
+ }

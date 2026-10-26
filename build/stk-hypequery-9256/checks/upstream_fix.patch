@@ -1,0 +1,606 @@
+diff --git a/packages/clickhouse/src/core/formatters/sql-formatter.ts b/packages/clickhouse/src/core/formatters/sql-formatter.ts
+index f8b29e8d..7aadd34e 100644
+--- a/packages/clickhouse/src/core/formatters/sql-formatter.ts
++++ b/packages/clickhouse/src/core/formatters/sql-formatter.ts
+@@ -1,4 +1,5 @@
+ import { FilterOperator, type CompiledQuery, type ExprNode, type SelectQueryNode, type SourceNode, type ValueNode } from '../../types/index.js';
++import { hasTopLevelLogicalOperator, terminateTrailingLineComment } from '../utils/sql-scan.js';
+ 
+ export class SQLFormatter {
+   formatSelect(query: SelectQueryNode<any, any>): string {
+@@ -42,11 +43,17 @@ export class SQLFormatter {
+     if (!expr) return { query: '', parameters: [] };
+ 
+     switch (expr.kind) {
+-      case 'raw':
++      case 'raw': {
++        // A raw fragment with a top-level AND/OR would be re-associated against
++        // sibling conditions when embedded in a sequence, so wrap it.
++        const rawExpression = terminateTrailingLineComment(expr.expression);
+         return {
+-          query: expr.expression,
++          query: nested && hasTopLevelLogicalOperator(rawExpression)
++            ? `(${rawExpression})`
++            : rawExpression,
+           parameters: expr.parameters.map(parameter => parameter.value),
+         };
++      }
+       case 'group':
+         if (!expr.expression) {
+           return { query: '', parameters: [] };
+@@ -179,11 +186,17 @@ export class SQLFormatter {
+   compileHaving(query: SelectQueryNode<any, any>): CompiledQuery {
+     if (!query.having?.length) return { query: '', parameters: [] };
+ 
++    const wrapFragments = query.having.length > 1;
+     return this.combineCompiledWithSeparator(
+-      query.having.map(item => ({
+-        query: item.expression,
+-        parameters: item.parameters?.map(parameter => parameter.value) || [],
+-      })),
++      query.having.map(item => {
++        const expression = terminateTrailingLineComment(item.expression);
++        return {
++          query: wrapFragments && hasTopLevelLogicalOperator(expression)
++            ? `(${expression})`
++            : expression,
++          parameters: item.parameters?.map(parameter => parameter.value) || [],
++        };
++      }),
+       ' AND '
+     );
+   }
+diff --git a/packages/clickhouse/src/core/query-builder.ts b/packages/clickhouse/src/core/query-builder.ts
+index 81facd6f..43b41ee0 100644
+--- a/packages/clickhouse/src/core/query-builder.ts
++++ b/packages/clickhouse/src/core/query-builder.ts
+@@ -40,6 +40,7 @@ import type { QueryRuntimeContext } from './cache/runtime-context.js';
+ import { executeWithCache } from './cache/cache-manager.js';
+ import { mergeCacheOptionsPartial, initializeCacheRuntime } from './cache/utils.js';
+ import { normalizeFilterApplication } from './utils/filter-application.js';
++import { assertSafeIdentifier } from './utils/identifiers.js';
+ import { toLegacyQueryConfig } from './utils/query-config-compat.js';
+ import { applyRelationPath, resolveRelationPath } from './utils/relation-application.js';
+ import type {
+@@ -356,6 +357,7 @@ export class QueryBuilder<
+     alias: string,
+     subquery: QueryBuilder<any, AnyBuilderState> | string
+   ): this {
++    assertSafeIdentifier(alias, 'CTE alias');
+     return this.updateQuery(() => this.analytics.addCTE(alias, subquery));
+   }
+ 
+diff --git a/packages/clickhouse/src/core/utils.ts b/packages/clickhouse/src/core/utils.ts
+index ce4ed6de..00587ffc 100644
+--- a/packages/clickhouse/src/core/utils.ts
++++ b/packages/clickhouse/src/core/utils.ts
+@@ -1,23 +1,37 @@
+-export function escapeValue(value: any): string {
+-  if (typeof value === 'boolean') {
++import { splitSqlPlaceholders } from './utils/sql-parens.js';
++
++export function escapeValue(value: unknown): string {
++  if (value === null) {
++    return 'NULL';
++  } else if (typeof value === 'boolean') {
+     return value ? 'true' : 'false';
+-  }
+-  else if (typeof value === 'number') {
++  } else if (typeof value === 'number') {
++    if (!Number.isFinite(value)) {
++      throw new Error('Cannot render a non-finite number as a SQL parameter');
++    }
+     return value.toString();
+   } else if (typeof value === 'string') {
+-    return `'${value.replace(/'/g, "''")}'`;
++    const escaped = value.replace(/\\/g, '\\\\').replace(/'/g, "''");
++    return `'${escaped}'`;
+   } else if (value instanceof Date) {
++    if (!Number.isFinite(value.getTime())) {
++      throw new Error('Cannot render an invalid Date as a SQL parameter');
++    }
+     return `'${value.toISOString()}'`;
+   } else {
+-    return `'${JSON.stringify(value)}'`;
++    const serialized = JSON.stringify(value);
++    if (serialized === undefined) {
++      throw new Error(`Cannot render ${typeof value} as a SQL parameter`);
++    }
++    // JSON is still carried inside a ClickHouse string literal. Route it
++    // through the same escaping as any other string so quotes in nested values
++    // cannot terminate that literal.
++    return escapeValue(serialized);
+   }
+ }
+ 
+-export function substituteParameters(sql: string, params: any[]): string {
+-  if (!params.length) {
+-    return sql;
+-  }
+-  const parts = sql.split('?');
++export function substituteParameters(sql: string, params: readonly unknown[]): string {
++  const parts = splitSqlPlaceholders(sql);
+   if (parts.length - 1 !== params.length) {
+     throw new Error(`Mismatch between placeholders and parameters. Found ${parts.length - 1} placeholders but ${params.length} parameters.`);
+   }
+diff --git a/packages/clickhouse/src/core/utils/identifiers.ts b/packages/clickhouse/src/core/utils/identifiers.ts
+new file mode 100644
+index 00000000..6410ff22
+--- /dev/null
++++ b/packages/clickhouse/src/core/utils/identifiers.ts
+@@ -0,0 +1,21 @@
++const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
++
++/**
++ * An identifier is written into SQL text, so it may only ever contain what an
++ * identifier can contain. Dotted, unquoted names are accepted because joined
++ * columns and schema-qualified names are written that way.
++ */
++export function assertSafeIdentifier(name: string, kind: string): void {
++  if (typeof name !== 'string' || !IDENTIFIER.test(name)) {
++    throw new Error(
++      `Invalid ${kind} "${String(name)}". Use an unquoted SQL identifier (letters, numbers, underscore; dots between parts).`
++    );
++  }
++}
++
++export function assertSafeCount(value: number, kind: string): number {
++  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
++    throw new Error(`Invalid ${kind} "${String(value)}". Use a non-negative whole number.`);
++  }
++  return value;
++}
+diff --git a/packages/clickhouse/src/core/utils/predicate-builder.ts b/packages/clickhouse/src/core/utils/predicate-builder.ts
+index f0872852..d0e7e003 100644
+--- a/packages/clickhouse/src/core/utils/predicate-builder.ts
++++ b/packages/clickhouse/src/core/utils/predicate-builder.ts
+@@ -1,5 +1,7 @@
+ import type { AnyBuilderState, BaseRow } from '../types/builder-state.js';
+ import type { SelectableColumn } from '../types/select-types.js';
++import { assertSafeIdentifier } from './identifiers.js';
++import { isFullyParenthesized, terminateTrailingLineComment } from './sql-scan.js';
+ 
+ export type PredicatePrimitive = string | number | boolean | Date | null;
+ type PredicateValue = Exclude<PredicatePrimitive, string>;
+@@ -135,8 +137,9 @@ function buildFunctionExpression<State extends AnyBuilderState, T = unknown>(
+   name: string,
+   args: PredicateArg<State>[]
+ ): PredicateExpression<T> {
++  assertSafeIdentifier(name, 'function');
+   const builtArgs = args.map(arg => normalizeArgument(arg));
+-  const sql = `${name}(${builtArgs.map(arg => arg.sql).join(', ')})`;
++  const sql = `${name}(${builtArgs.map(arg => terminateTrailingLineComment(arg.sql)).join(', ')})`;
+   const parameters = builtArgs.flatMap(arg => arg.parameters);
+   return createExpression(sql, parameters);
+ }
+@@ -149,7 +152,14 @@ function buildLogical(operator: 'AND' | 'OR', expressions: PredicateExpression[]
+     return expressions[0] as PredicateExpression<boolean>;
+   }
+ 
+-  const sql = expressions.map(expr => `(${expr.sql})`).join(` ${operator} `);
++  // The group must be wrapped as a whole: without the outer parentheses an OR
++  // group combined with sibling conditions would be re-associated by operator
++  // precedence, so one branch could escape the conditions before it.
++  const operands = expressions.map(expr => {
++    const sql = terminateTrailingLineComment(expr.sql);
++    return isFullyParenthesized(sql) ? sql : `(${sql})`;
++  });
++  const sql = `(${operands.join(` ${operator} `)})`;
+   const parameters = expressions.flatMap(expr => expr.parameters);
+   return createExpression(sql, parameters);
+ }
+diff --git a/packages/clickhouse/src/core/utils/sql-parens.ts b/packages/clickhouse/src/core/utils/sql-parens.ts
+new file mode 100644
+index 00000000..af9b3565
+--- /dev/null
++++ b/packages/clickhouse/src/core/utils/sql-parens.ts
+@@ -0,0 +1,216 @@
++const WORD_CHAR = /[A-Za-z0-9_$]/;
++const HEREDOC_TAG_CHAR = /[A-Za-z0-9_]/;
++
++function skipQuoted(sql: string, start: number, quote: string): number {
++  let i = start + 1;
++  while (i < sql.length) {
++    const ch = sql[i];
++    if (ch === '\\') {
++      i += 2;
++      continue;
++    }
++    if (ch === quote) {
++      if (sql[i + 1] === quote) {
++        i += 2;
++        continue;
++      }
++      return i + 1;
++    }
++    i += 1;
++  }
++  return i;
++}
++
++function skipUnicodeQuoted(sql: string, start: number, closingQuote: string): number {
++  const closing = sql.indexOf(closingQuote, start + 1);
++  return closing === -1 ? sql.length : closing + 1;
++}
++
++function skipLineComment(sql: string, start: number): number {
++  const newline = sql.indexOf('\n', start + 2);
++  return newline === -1 ? sql.length : newline + 1;
++}
++
++function skipBlockComment(sql: string, start: number): number {
++  let depth = 1;
++  let i = start + 2;
++  while (i < sql.length) {
++    if (sql.startsWith('/*', i)) {
++      depth += 1;
++      i += 2;
++      continue;
++    }
++    if (sql.startsWith('*/', i)) {
++      depth -= 1;
++      i += 2;
++      if (depth === 0) return i;
++      continue;
++    }
++    i += 1;
++  }
++  return i;
++}
++
++function skipHeredoc(sql: string, start: number): number | undefined {
++  let tagEnd = start + 1;
++  while (tagEnd < sql.length && sql[tagEnd] !== '$') {
++    if (!HEREDOC_TAG_CHAR.test(sql[tagEnd]!)) return undefined;
++    tagEnd += 1;
++  }
++  if (tagEnd >= sql.length) return undefined;
++
++  const delimiter = sql.slice(start, tagEnd + 1);
++  const closing = sql.indexOf(delimiter, tagEnd + 1);
++  return closing === -1 ? undefined : closing + delimiter.length;
++}
++
++function isLineCommentStart(sql: string, start: number): boolean {
++  if (sql.startsWith('--', start) || sql.startsWith('//', start)) return true;
++  return sql[start] === '#' && (sql[start + 1] === ' ' || sql[start + 1] === '!');
++}
++
++function skipNonCode(sql: string, start: number): number | undefined {
++  const ch = sql[start]!;
++  if (ch === "'" || ch === '"' || ch === '`') {
++    return skipQuoted(sql, start, ch);
++  }
++  if (ch === '\u2018') {
++    return skipUnicodeQuoted(sql, start, '\u2019');
++  }
++  if (ch === '\u201c') {
++    return skipUnicodeQuoted(sql, start, '\u201d');
++  }
++  if (ch === '$') {
++    return skipHeredoc(sql, start);
++  }
++  if (sql.startsWith('/*', start)) {
++    return skipBlockComment(sql, start);
++  }
++  if (isLineCommentStart(sql, start)) {
++    return skipLineComment(sql, start);
++  }
++  return undefined;
++}
++
++function matchingCloser(ch: string): string | undefined {
++  if (ch === '(') return ')';
++  if (ch === '[') return ']';
++  if (ch === '{') return '}';
++  return undefined;
++}
++
++/**
++ * Split on positional parameter markers that occur in SQL code. Question marks
++ * inside literals, quoted identifiers, heredocs, or comments are data, not
++ * placeholders, and must not affect parameter binding.
++ */
++export function splitSqlPlaceholders(sql: string): string[] {
++  const parts: string[] = [];
++  let partStart = 0;
++  let i = 0;
++
++  while (i < sql.length) {
++    const skippedTo = skipNonCode(sql, i);
++    if (skippedTo !== undefined) {
++      i = skippedTo;
++      continue;
++    }
++
++    if (sql[i] === '?') {
++      parts.push(sql.slice(partStart, i));
++      partStart = i + 1;
++    }
++    i += 1;
++  }
++
++  parts.push(sql.slice(partStart));
++  return parts;
++}
++
++/**
++ * A generated separator appended after an unterminated line comment would be
++ * swallowed by that comment. Add a newline only when the fragment ends inside
++ * a ClickHouse line comment so it remains safe to compose with generated SQL.
++ */
++export function terminateTrailingLineComment(sql: string): string {
++  let i = 0;
++  while (i < sql.length) {
++    if (isLineCommentStart(sql, i)) {
++      const newline = sql.indexOf('\n', i + 2);
++      if (newline === -1) return `${sql}\n`;
++      i = newline + 1;
++      continue;
++    }
++
++    const skippedTo = skipNonCode(sql, i);
++    i = skippedTo === undefined ? i + 1 : skippedTo;
++  }
++  return sql;
++}
++
++/**
++ * True when the fragment contains an AND/OR at paren depth 0 (outside string
++ * literals, heredocs, comments, and nested delimiters), i.e. embedding it next
++ * to other conditions without parentheses would change how the surrounding
++ * WHERE parses.
++ */
++export function hasTopLevelLogicalOperator(sql: string): boolean {
++  const closers: string[] = [];
++  let i = 0;
++  while (i < sql.length) {
++    const ch = sql[i]!;
++    const skippedTo = skipNonCode(sql, i);
++    if (skippedTo !== undefined) {
++      i = skippedTo;
++      continue;
++    }
++
++    const closer = matchingCloser(ch);
++    if (closer) {
++      closers.push(closer);
++      i += 1;
++      continue;
++    }
++    if (ch === ')' || ch === ']' || ch === '}') {
++      if (closers[closers.length - 1] === ch) closers.pop();
++      i += 1;
++      continue;
++    }
++    if (closers.length === 0 && (i === 0 || !WORD_CHAR.test(sql[i - 1]!))) {
++      const upcoming = sql.slice(i, i + 3).toUpperCase();
++      if (upcoming === 'AND' && !WORD_CHAR.test(sql[i + 3] ?? ' ')) return true;
++      if (upcoming.startsWith('OR') && !WORD_CHAR.test(sql[i + 2] ?? ' ')) return true;
++    }
++    i += 1;
++  }
++  return false;
++}
++
++/**
++ * True when the fragment is a single parenthesized group, so wrapping it again
++ * would only add redundant parentheses.
++ */
++export function isFullyParenthesized(sql: string): boolean {
++  const trimmed = sql.trim();
++  if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return false;
++  const closers: string[] = [];
++  let i = 0;
++  while (i < trimmed.length) {
++    const ch = trimmed[i]!;
++    const skippedTo = skipNonCode(trimmed, i);
++    if (skippedTo !== undefined) {
++      i = skippedTo;
++      continue;
++    }
++
++    const closer = matchingCloser(ch);
++    if (closer) {
++      closers.push(closer);
++    } else if (ch === ')' || ch === ']' || ch === '}') {
++      if (closers.pop() !== ch) return false;
++      if (closers.length === 0) return i === trimmed.length - 1;
++    }
++    i += 1;
++  }
++  return false;
++}
+diff --git a/packages/clickhouse/src/core/utils/sql-scan.ts b/packages/clickhouse/src/core/utils/sql-scan.ts
+new file mode 100644
+index 00000000..95e71ad7
+--- /dev/null
++++ b/packages/clickhouse/src/core/utils/sql-scan.ts
+@@ -0,0 +1,187 @@
++const WORD_CHAR = /[A-Za-z0-9_$]/;
++const HEREDOC_TAG_CHAR = /[A-Za-z0-9_]/;
++
++function skipQuoted(sql: string, start: number, quote: string): number {
++  let i = start + 1;
++  while (i < sql.length) {
++    const ch = sql[i];
++    if (ch === '\\') {
++      i += 2;
++      continue;
++    }
++    if (ch === quote) {
++      if (sql[i + 1] === quote) {
++        i += 2;
++        continue;
++      }
++      return i + 1;
++    }
++    i += 1;
++  }
++  return i;
++}
++
++function skipUnicodeQuoted(sql: string, start: number, closingQuote: string): number {
++  const closing = sql.indexOf(closingQuote, start + 1);
++  return closing === -1 ? sql.length : closing + 1;
++}
++
++function skipLineComment(sql: string, start: number): number {
++  const newline = sql.indexOf('\n', start + 2);
++  return newline === -1 ? sql.length : newline + 1;
++}
++
++function skipBlockComment(sql: string, start: number): number {
++  let depth = 1;
++  let i = start + 2;
++  while (i < sql.length) {
++    if (sql.startsWith('/*', i)) {
++      depth += 1;
++      i += 2;
++      continue;
++    }
++    if (sql.startsWith('*/', i)) {
++      depth -= 1;
++      i += 2;
++      if (depth === 0) return i;
++      continue;
++    }
++    i += 1;
++  }
++  return i;
++}
++
++function skipHeredoc(sql: string, start: number): number | undefined {
++  let tagEnd = start + 1;
++  while (tagEnd < sql.length && sql[tagEnd] !== '$') {
++    if (!HEREDOC_TAG_CHAR.test(sql[tagEnd]!)) return undefined;
++    tagEnd += 1;
++  }
++  if (tagEnd >= sql.length) return undefined;
++
++  const delimiter = sql.slice(start, tagEnd + 1);
++  const closing = sql.indexOf(delimiter, tagEnd + 1);
++  return closing === -1 ? undefined : closing + delimiter.length;
++}
++
++function isLineCommentStart(sql: string, start: number): boolean {
++  if (sql.startsWith('--', start) || sql.startsWith('//', start)) return true;
++  return sql[start] === '#' && (sql[start + 1] === ' ' || sql[start + 1] === '!');
++}
++
++function skipNonCode(sql: string, start: number): number | undefined {
++  const ch = sql[start]!;
++  if (ch === "'" || ch === '"' || ch === '`') {
++    return skipQuoted(sql, start, ch);
++  }
++  if (ch === '‘') {
++    return skipUnicodeQuoted(sql, start, '’');
++  }
++  if (ch === '“') {
++    return skipUnicodeQuoted(sql, start, '”');
++  }
++  if (ch === '$') {
++    return skipHeredoc(sql, start);
++  }
++  if (sql.startsWith('/*', start)) {
++    return skipBlockComment(sql, start);
++  }
++  if (isLineCommentStart(sql, start)) {
++    return skipLineComment(sql, start);
++  }
++  return undefined;
++}
++
++function matchingCloser(ch: string): string | undefined {
++  if (ch === '(') return ')';
++  if (ch === '[') return ']';
++  if (ch === '{') return '}';
++  return undefined;
++}
++
++/**
++ * A generated separator appended after an unterminated line comment would be
++ * swallowed by that comment, so the fragment would absorb following SQL. Add a
++ * newline only when the fragment ends inside a line comment.
++ */
++export function terminateTrailingLineComment(sql: string): string {
++  let i = 0;
++  while (i < sql.length) {
++    if (isLineCommentStart(sql, i)) {
++      const newline = sql.indexOf('\n', i + 2);
++      if (newline === -1) return `${sql}\n`;
++      i = newline + 1;
++      continue;
++    }
++
++    const skippedTo = skipNonCode(sql, i);
++    i = skippedTo === undefined ? i + 1 : skippedTo;
++  }
++  return sql;
++}
++
++/**
++ * True when the fragment contains an AND/OR at paren depth 0, i.e. embedding it
++ * next to other conditions without parentheses would change how the surrounding
++ * expression parses.
++ */
++export function hasTopLevelLogicalOperator(sql: string): boolean {
++  const closers: string[] = [];
++  let i = 0;
++  while (i < sql.length) {
++    const ch = sql[i]!;
++    const skippedTo = skipNonCode(sql, i);
++    if (skippedTo !== undefined) {
++      i = skippedTo;
++      continue;
++    }
++
++    const closer = matchingCloser(ch);
++    if (closer) {
++      closers.push(closer);
++      i += 1;
++      continue;
++    }
++    if (ch === ')' || ch === ']' || ch === '}') {
++      if (closers[closers.length - 1] === ch) closers.pop();
++      i += 1;
++      continue;
++    }
++    if (closers.length === 0 && (i === 0 || !WORD_CHAR.test(sql[i - 1]!))) {
++      const upcoming = sql.slice(i, i + 3).toUpperCase();
++      if (upcoming === 'AND' && !WORD_CHAR.test(sql[i + 3] ?? ' ')) return true;
++      if (upcoming.startsWith('OR') && !WORD_CHAR.test(sql[i + 2] ?? ' ')) return true;
++    }
++    i += 1;
++  }
++  return false;
++}
++
++/**
++ * True when the fragment is a single parenthesized group, so wrapping it again
++ * would only add redundant parentheses.
++ */
++export function isFullyParenthesized(sql: string): boolean {
++  const trimmed = sql.trim();
++  if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return false;
++  const closers: string[] = [];
++  let i = 0;
++  while (i < trimmed.length) {
++    const ch = trimmed[i]!;
++    const skippedTo = skipNonCode(trimmed, i);
++    if (skippedTo !== undefined) {
++      i = skippedTo;
++      continue;
++    }
++
++    const closer = matchingCloser(ch);
++    if (closer) {
++      closers.push(closer);
++    } else if (ch === ')' || ch === ']' || ch === '}') {
++      if (closers.pop() !== ch) return false;
++      if (closers.length === 0) return i === trimmed.length - 1;
++    }
++    i += 1;
++  }
++  return false;
++}

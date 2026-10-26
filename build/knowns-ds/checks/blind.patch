@@ -1,0 +1,799 @@
+diff --git a/internal/codegen/template_engine.go b/internal/codegen/template_engine.go
+index 1bb5b72..3fd3377 100644
+--- a/internal/codegen/template_engine.go
++++ b/internal/codegen/template_engine.go
+@@ -13,6 +13,7 @@ import (
+ 	"text/template"
+ 
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/storage"
+ )
+ 
+ // Engine executes Knowns code-generation templates.
+@@ -143,6 +144,9 @@ func (e *Engine) runAddMany(
+ 	result *models.TemplateResult,
+ ) error {
+ 	sourceDir := filepath.Join(tmpl.Path, action.Source)
++	if err := storage.EnsureWithin(tmpl.Path, sourceDir); err != nil {
++		return fmt.Errorf("addMany source %q: %w", action.Source, err)
++	}
+ 
+ 	globPat := action.GlobPattern
+ 	if globPat == "" {
+@@ -330,6 +334,9 @@ func (e *Engine) loadAndRenderTemplate(tmpl *models.Template, src string, vars m
+ 		if !filepath.IsAbs(src) {
+ 			srcPath = filepath.Join(tmpl.Path, src)
+ 		}
++		if err := storage.EnsureWithin(tmpl.Path, srcPath); err != nil {
++			return "", fmt.Errorf("template file %q: %w", src, err)
++		}
+ 		data, err := os.ReadFile(srcPath)
+ 		if err != nil {
+ 			return "", fmt.Errorf("read template file %s: %w", srcPath, err)
+diff --git a/internal/server/routes/docs.go b/internal/server/routes/docs.go
+index 0fb1ad0..194787d 100644
+--- a/internal/server/routes/docs.go
++++ b/internal/server/routes/docs.go
+@@ -195,7 +195,11 @@ func splitDocSourcePath(raw string) (string, bool) {
+ //
+ // GET /api/docs/*/source
+ func (dr *DocRoutes) source(w http.ResponseWriter, path string) {
+-	absPath := filepath.Join(dr.getStore().Root, "docs", filepath.FromSlash(path)+".md")
++	absPath, err := dr.getStore().Docs.SourcePath(path)
++	if err != nil {
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), err.Error())
++		return
++	}
+ 	data, err := os.ReadFile(absPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, err.Error())
+@@ -213,7 +217,7 @@ func (dr *DocRoutes) get(w http.ResponseWriter, r *http.Request) {
+ 	path := docPathParam(r)
+ 	doc, err := dr.getStore().Docs.Get(path)
+ 	if err != nil {
+-		respondError(w, http.StatusNotFound, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), err.Error())
+ 		return
+ 	}
+ 	respondJSON(w, http.StatusOK, toDocResponse(doc))
+@@ -253,7 +257,7 @@ func (dr *DocRoutes) create(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	if err := dr.getStore().Docs.Create(&doc); err != nil {
+-		respondError(w, http.StatusInternalServerError, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusInternalServerError), err.Error())
+ 		return
+ 	}
+ 
+@@ -279,7 +283,7 @@ func (dr *DocRoutes) update(w http.ResponseWriter, r *http.Request) {
+ 
+ 	existing, err := dr.getStore().Docs.Get(path)
+ 	if err != nil {
+-		respondError(w, http.StatusNotFound, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), err.Error())
+ 		return
+ 	}
+ 	oldDoc := *existing
+@@ -324,7 +328,7 @@ func (dr *DocRoutes) update(w http.ResponseWriter, r *http.Request) {
+ 
+ 	if oldPath != doc.Path {
+ 		if err := dr.getStore().Docs.Rename(oldPath, &doc); err != nil {
+-			respondError(w, http.StatusInternalServerError, err.Error())
++			respondError(w, storeErrorStatus(err, http.StatusInternalServerError), err.Error())
+ 			return
+ 		}
+ 		if err := dr.getStore().Docs.RewriteDocReferences(oldPath, doc.Path, dr.getStore().Tasks, dr.getStore().Memory); err != nil {
+@@ -333,7 +337,7 @@ func (dr *DocRoutes) update(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 		search.BestEffortRemoveDoc(dr.getStore(), oldPath)
+ 	} else if err := dr.getStore().Docs.Update(&doc); err != nil {
+-		respondError(w, http.StatusInternalServerError, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusInternalServerError), err.Error())
+ 		return
+ 	}
+ 
+diff --git a/internal/server/routes/helpers.go b/internal/server/routes/helpers.go
+index f27ff28..2b0867b 100644
+--- a/internal/server/routes/helpers.go
++++ b/internal/server/routes/helpers.go
+@@ -4,6 +4,8 @@ import (
+ 	"encoding/json"
+ 	"net/http"
+ 	"strings"
++
++	"github.com/howznguyen/knowns/internal/storage"
+ )
+ 
+ // respondJSON writes status and JSON-encodes data to the response.
+@@ -16,6 +18,15 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+ }
+ 
+ // respondError writes a JSON error body with the given HTTP status code.
++// storeErrorStatus maps a store error to an HTTP status: names rejected as
++// invalid paths are client errors, everything else uses fallback.
++func storeErrorStatus(err error, fallback int) int {
++	if storage.IsInvalidPath(err) {
++		return http.StatusBadRequest
++	}
++	return fallback
++}
++
+ func respondError(w http.ResponseWriter, status int, message string) {
+ 	respondJSON(w, status, map[string]string{"error": message})
+ }
+diff --git a/internal/server/routes/memories.go b/internal/server/routes/memories.go
+index 1ddb890..69f4e5e 100644
+--- a/internal/server/routes/memories.go
++++ b/internal/server/routes/memories.go
+@@ -732,7 +732,7 @@ func (mr *MemoryRoutes) delete(w http.ResponseWriter, r *http.Request) {
+ 
+ func respondMemoryMutationError(w http.ResponseWriter, err error) {
+ 	status := http.StatusInternalServerError
+-	if errors.Is(err, models.ErrLegacyDecisionMemoryWrite) {
++	if errors.Is(err, models.ErrLegacyDecisionMemoryWrite) || storage.IsInvalidPath(err) {
+ 		status = http.StatusBadRequest
+ 	}
+ 	respondError(w, status, err.Error())
+diff --git a/internal/server/routes/templates.go b/internal/server/routes/templates.go
+index c5f85c3..b079153 100644
+--- a/internal/server/routes/templates.go
++++ b/internal/server/routes/templates.go
+@@ -205,7 +205,7 @@ func (tr *TemplateRoutes) get(w http.ResponseWriter, r *http.Request) {
+ 	name := chi.URLParam(r, "name")
+ 	tmpl, err := tr.getStore().Templates.Get(name)
+ 	if err != nil {
+-		respondError(w, http.StatusNotFound, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), err.Error())
+ 		return
+ 	}
+ 	uiPrompts := toUIPrompts(tmpl.Prompts)
+@@ -253,7 +253,7 @@ func (tr *TemplateRoutes) create(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	if err := tr.getStore().Templates.Create(req.Name, req.Description); err != nil {
+-		respondError(w, http.StatusInternalServerError, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusInternalServerError), err.Error())
+ 		return
+ 	}
+ 
+@@ -293,7 +293,7 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 
+ 	tmpl, err := tr.getStore().Templates.Get(req.Name)
+ 	if err != nil {
+-		respondError(w, http.StatusNotFound, "template not found: "+err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), "template not found: "+err.Error())
+ 		return
+ 	}
+ 
+@@ -302,7 +302,11 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 		templateFile = "main.hbs"
+ 	}
+ 
+-	hbsPath := filepath.Join(tmpl.Path, templateFile)
++	hbsPath, err := storage.TemplateFilePath(tmpl, templateFile)
++	if err != nil {
++		respondError(w, http.StatusBadRequest, err.Error())
++		return
++	}
+ 	hbsContent, err := os.ReadFile(hbsPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, "template file not found: "+templateFile)
+@@ -342,7 +346,11 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 	// change that running the template would make.
+ 	existingContent := ""
+ 	if destPath != "" {
+-		existingPath := filepath.Join(filepath.Dir(tr.getStore().Root), filepath.FromSlash(destPath))
++		existingPath, err := projectPathWithin(filepath.Dir(tr.getStore().Root), destPath)
++		if err != nil {
++			respondError(w, http.StatusBadRequest, "invalid destination: "+err.Error())
++			return
++		}
+ 		if data, readErr := os.ReadFile(existingPath); readErr == nil {
+ 			existingContent = string(data)
+ 		}
+@@ -376,7 +384,7 @@ func (tr *TemplateRoutes) run(w http.ResponseWriter, r *http.Request) {
+ 
+ 	tmpl, err := tr.getStore().Templates.Get(name)
+ 	if err != nil {
+-		respondError(w, http.StatusNotFound, err.Error())
++		respondError(w, storeErrorStatus(err, http.StatusNotFound), err.Error())
+ 		return
+ 	}
+ 
+@@ -407,9 +415,14 @@ func (tr *TemplateRoutes) run(w http.ResponseWriter, r *http.Request) {
+ 
+ 		skipped := false
+ 		skipReason := ""
++		projectRoot := filepath.Dir(tr.getStore().Root)
++		absPath, pathErr := projectPathWithin(projectRoot, path)
++		if pathErr != nil {
++			respondError(w, http.StatusBadRequest, "invalid destination: "+pathErr.Error())
++			return
++		}
+ 		if action.SkipIfExists && !req.DryRun {
+-			projectRoot := filepath.Dir(tr.getStore().Root)
+-			if _, statErr := os.Stat(filepath.Join(projectRoot, path)); statErr == nil {
++			if _, statErr := os.Stat(absPath); statErr == nil {
+ 				skipped = true
+ 				skipReason = "file exists"
+ 			}
+@@ -435,3 +448,18 @@ func (tr *TemplateRoutes) run(w http.ResponseWriter, r *http.Request) {
+ 		"message":   "Template executed successfully",
+ 	})
+ }
++
++// projectPathWithin resolves a generated destination (relative to the project
++// root) and verifies it stays inside the project, symlinks included. Absolute,
++// volume/UNC and backslash/colon spellings are refused.
++func projectPathWithin(projectRoot, rel string) (string, error) {
++	if strings.HasPrefix(rel, "/") || filepath.IsAbs(rel) || filepath.VolumeName(rel) != "" ||
++		strings.ContainsAny(rel, "\\:\x00") {
++		return "", storage.ErrInvalidPath
++	}
++	p := filepath.Join(projectRoot, filepath.FromSlash(rel))
++	if err := storage.EnsureWithin(projectRoot, p); err != nil {
++		return "", err
++	}
++	return p, nil
++}
+diff --git a/internal/storage/doc_store.go b/internal/storage/doc_store.go
+index 9ace4d2..edaadb0 100644
+--- a/internal/storage/doc_store.go
++++ b/internal/storage/doc_store.go
+@@ -110,6 +110,9 @@ func (ds *DocStore) walkDocs(dir, relBase string, imported bool, importSource st
+ 			relPath = relBase + "/" + baseName
+ 		}
+ 		folder := relBase
++		if err := EnsureWithin(dir, fullPath); err != nil {
++			continue
++		}
+ 		doc, err := ds.parseFile(fullPath, relPath, folder, imported, importSource)
+ 		if err != nil {
+ 			continue
+@@ -124,10 +127,16 @@ func (ds *DocStore) walkDocs(dir, relBase string, imported bool, importSource st
+ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 	path = strings.TrimPrefix(path, "/")
+ 	path = strings.TrimSuffix(path, ".md")
++	if err := ValidateRelPath(path, "doc path"); err != nil {
++		return nil, err
++	}
+ 
+ 	// Try local docs first.
+ 	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+ 	if _, err := os.Stat(absPath); err == nil {
++		if err := EnsureWithin(ds.docsDir(), absPath); err != nil {
++			return nil, err
++		}
+ 		folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 		if folder == "." {
+ 			folder = ""
+@@ -142,9 +151,13 @@ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 			continue
+ 		}
+ 		importSource := e.Name()
++		importDocsDir := filepath.Join(ds.importsDir(), importSource, "docs")
+ 		// Direct lookup: path already includes the source prefix.
+-		candidate := filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(path)+".md")
++		candidate := filepath.Join(importDocsDir, filepath.FromSlash(path)+".md")
+ 		if _, err := os.Stat(candidate); err == nil {
++			if err := EnsureWithin(importDocsDir, candidate); err != nil {
++				return nil, err
++			}
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 			if folder == "." {
+ 				folder = ""
+@@ -155,8 +168,11 @@ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 		// source prefix (e.g. @doc/patterns/foo instead of @doc/source/patterns/foo).
+ 		// Try prepending the import source name.
+ 		prefixed := importSource + "/" + path
+-		candidate = filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(prefixed)+".md")
++		candidate = filepath.Join(importDocsDir, filepath.FromSlash(prefixed)+".md")
+ 		if _, err := os.Stat(candidate); err == nil {
++			if err := EnsureWithin(importDocsDir, candidate); err != nil {
++				return nil, err
++			}
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(prefixed)))
+ 			if folder == "." {
+ 				folder = ""
+@@ -174,7 +190,10 @@ func (ds *DocStore) Create(doc *models.Doc) error {
+ 	if doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
++	absPath, err := ds.localDocPath(doc.Path)
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return fmt.Errorf("create doc dir: %w", err)
+ 	}
+@@ -186,10 +205,13 @@ func (ds *DocStore) Update(doc *models.Doc) error {
+ 	if doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
++	absPath, err := ds.localDocPath(doc.Path)
++	if err != nil {
++		return err
++	}
+ 	if existing, err := ds.Get(doc.Path); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -201,11 +223,17 @@ func (ds *DocStore) Rename(oldPath string, doc *models.Doc) error {
+ 	if strings.TrimSpace(oldPath) == "" || doc == nil || strings.TrimSpace(doc.Path) == "" {
+ 		return fmt.Errorf("old path and new doc path are required")
+ 	}
++	oldAbsPath, err := ds.localDocPath(strings.TrimSuffix(oldPath, ".md"))
++	if err != nil {
++		return err
++	}
++	newAbsPath, err := ds.localDocPath(strings.TrimSuffix(doc.Path, ".md"))
++	if err != nil {
++		return err
++	}
+ 	if existing, err := ds.Get(oldPath); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	oldAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(oldPath, ".md"))+".md")
+-	newAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(doc.Path, ".md"))+".md")
+ 	if err := os.MkdirAll(filepath.Dir(newAbsPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -343,10 +371,35 @@ func (ds *DocStore) RewriteDocReferences(oldPath, newPath string, taskStore *Tas
+ // Delete removes a doc file.
+ func (ds *DocStore) Delete(path string) error {
+ 	path = strings.TrimSuffix(path, ".md")
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	absPath, err := ds.localDocPath(path)
++	if err != nil {
++		return err
++	}
+ 	return os.Remove(absPath)
+ }
+ 
++// localDocPath validates a doc path (relative, without .md) and returns the
++// absolute file path inside .knowns/docs/. Paths that use path syntax to
++// escape the library, or that resolve outside it through a symlink, are
++// rejected with ErrInvalidPath.
++func (ds *DocStore) localDocPath(path string) (string, error) {
++	if err := ValidateRelPath(path, "doc path"); err != nil {
++		return "", err
++	}
++	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	if err := EnsureWithin(ds.docsDir(), absPath); err != nil {
++		return "", err
++	}
++	return absPath, nil
++}
++
++// SourcePath returns the absolute path of a local doc's markdown file after
++// validating that it stays inside the docs library.
++func (ds *DocStore) SourcePath(path string) (string, error) {
++	path = strings.TrimPrefix(path, "/")
++	return ds.localDocPath(strings.TrimSuffix(path, ".md"))
++}
++
+ // parseFile reads and parses a single doc markdown file.
+ func (ds *DocStore) parseFile(absPath, relPath, folder string, imported bool, importSource string) (*models.Doc, error) {
+ 	data, err := os.ReadFile(absPath)
+diff --git a/internal/storage/memory_store.go b/internal/storage/memory_store.go
+index 92284f1..7cbad65 100644
+--- a/internal/storage/memory_store.go
++++ b/internal/storage/memory_store.go
+@@ -122,6 +122,9 @@ func (ms *MemoryStore) listDir(dir, layer string) ([]*models.MemoryEntry, error)
+ 			continue
+ 		}
+ 		absPath := filepath.Join(dir, e.Name())
++		if err := EnsureWithin(dir, absPath); err != nil {
++			continue
++		}
+ 		entry, err := ms.parseFile(absPath, layer)
+ 		if err != nil {
+ 			continue
+@@ -133,6 +136,9 @@ func (ms *MemoryStore) listDir(dir, layer string) ([]*models.MemoryEntry, error)
+ 
+ // Get retrieves a memory entry by ID. Searches project, then global.
+ func (ms *MemoryStore) Get(id string) (*models.MemoryEntry, error) {
++	if err := ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	for _, layer := range []string{models.MemoryLayerProject, models.MemoryLayerGlobal} {
+ 		entry, err := ms.GetInLayer(id, layer)
+ 		if err == nil {
+@@ -208,7 +214,10 @@ func (ms *MemoryStore) GetInLayer(id, layer string) (*models.MemoryEntry, error)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	absPath := filepath.Join(dir, models.MemoryFileName(id))
++	absPath, err := memoryPathIn(dir, id)
++	if err != nil {
++		return nil, err
++	}
+ 	if _, err := os.Stat(absPath); err != nil {
+ 		return nil, fmt.Errorf("memory %q not found in %s layer", id, layer)
+ 	}
+@@ -232,6 +241,9 @@ func (ms *MemoryStore) Create(entry *models.MemoryEntry) error {
+ 	if entry.ID == "" {
+ 		entry.ID = models.NewTaskID()
+ 	}
++	if err := ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 	entry.ApplyLifecycleDefaults()
+ 
+ 	now := time.Now().UTC()
+@@ -250,7 +262,10 @@ func (ms *MemoryStore) Create(entry *models.MemoryEntry) error {
+ 		return fmt.Errorf("create memory dir: %w", err)
+ 	}
+ 
+-	absPath := filepath.Join(dir, models.MemoryFileName(entry.ID))
++	absPath, err := memoryPathIn(dir, entry.ID)
++	if err != nil {
++		return err
++	}
+ 	return atomicWrite(absPath, []byte(renderMemory(entry)))
+ }
+ 
+@@ -346,12 +361,18 @@ func (ms *MemoryStore) writeExisting(entry, existing *models.MemoryEntry, touch
+ 		return err
+ 	}
+ 
+-	absPath := filepath.Join(dir, models.MemoryFileName(entry.ID))
++	absPath, err := memoryPathIn(dir, entry.ID)
++	if err != nil {
++		return err
++	}
+ 	return atomicWrite(absPath, []byte(renderMemory(entry)))
+ }
+ 
+ // Delete removes a memory entry by ID.
+ func (ms *MemoryStore) Delete(id string) error {
++	if err := ValidateMemoryID(id); err != nil {
++		return err
++	}
+ 	if entry, err := ms.Get(id); err == nil && models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return models.ErrLegacyDecisionMemoryWrite
+ 	}
+@@ -361,6 +382,9 @@ func (ms *MemoryStore) Delete(id string) error {
+ 	for _, dir := range dirs {
+ 		absPath := filepath.Join(dir, filename)
+ 		if _, err := os.Stat(absPath); err == nil {
++			if err := EnsureWithin(dir, absPath); err != nil {
++				return err
++			}
+ 			return os.Remove(absPath)
+ 		}
+ 	}
+@@ -439,6 +463,10 @@ func (ms *MemoryStore) moveLayer(entry *models.MemoryEntry, newLayer string) (*m
+ 	if models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return nil, models.ErrLegacyDecisionMemoryWrite
+ 	}
++	// The ID comes from the record's own metadata: treat it as untrusted.
++	if err := ValidateMemoryID(entry.ID); err != nil {
++		return nil, err
++	}
+ 	oldDir, err := ms.dirForLayer(entry.Layer)
+ 	if err != nil {
+ 		return nil, err
+@@ -452,9 +480,14 @@ func (ms *MemoryStore) moveLayer(entry *models.MemoryEntry, newLayer string) (*m
+ 		return nil, fmt.Errorf("create memory dir: %w", err)
+ 	}
+ 
+-	filename := models.MemoryFileName(entry.ID)
+-	oldPath := filepath.Join(oldDir, filename)
+-	newPath := filepath.Join(newDir, filename)
++	oldPath, err := memoryPathIn(oldDir, entry.ID)
++	if err != nil {
++		return nil, err
++	}
++	newPath, err := memoryPathIn(newDir, entry.ID)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	// Update layer and timestamp.
+ 	entry.Layer = newLayer
+@@ -667,7 +700,11 @@ func (ms *MemoryStore) writeSnapshot(entry *models.MemoryEntry) error {
+ 	if err := os.MkdirAll(dir, 0755); err != nil {
+ 		return fmt.Errorf("create memory snapshot dir: %w", err)
+ 	}
+-	return atomicWrite(filepath.Join(dir, models.MemoryFileName(entry.ID)), []byte(renderMemory(entry)))
++	absPath, err := memoryPathIn(dir, entry.ID)
++	if err != nil {
++		return err
++	}
++	return atomicWrite(absPath, []byte(renderMemory(entry)))
+ }
+ 
+ // ReadSnapshot returns the copy of a memory entry stored by the last update.
+@@ -679,9 +716,25 @@ func (ms *MemoryStore) ReadSnapshot(id, layer string) (*models.MemoryEntry, erro
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	absPath := filepath.Join(dir, models.MemoryFileName(id))
++	absPath, err := memoryPathIn(dir, id)
++	if err != nil {
++		return nil, err
++	}
+ 	if _, err := os.Stat(absPath); err != nil {
+ 		return nil, fmt.Errorf("memory snapshot %q not found in %s layer", id, layer)
+ 	}
+ 	return ms.parseFile(absPath, layer)
+ }
++
++// memoryPathIn validates a memory ID and returns its file path inside dir,
++// verifying the result (symlinks included) stays inside dir.
++func memoryPathIn(dir, id string) (string, error) {
++	if err := ValidateMemoryID(id); err != nil {
++		return "", err
++	}
++	absPath := filepath.Join(dir, models.MemoryFileName(id))
++	if err := EnsureWithin(dir, absPath); err != nil {
++		return "", err
++	}
++	return absPath, nil
++}
+diff --git a/internal/storage/path_safety.go b/internal/storage/path_safety.go
+new file mode 100644
+index 0000000..d0fff52
+--- /dev/null
++++ b/internal/storage/path_safety.go
+@@ -0,0 +1,172 @@
++package storage
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// ErrInvalidPath is returned when a client- or data-supplied name for a doc,
++// memory, template or template file is not a valid item name, or would resolve
++// to a file outside the folder managed for that kind of content.
++var ErrInvalidPath = errors.New("invalid path")
++
++func invalidPathf(format string, args ...any) error {
++	return fmt.Errorf("%w: %s", ErrInvalidPath, fmt.Sprintf(format, args...))
++}
++
++// IsInvalidPath reports whether err was caused by a rejected item name/path.
++func IsInvalidPath(err error) bool {
++	return errors.Is(err, ErrInvalidPath)
++}
++
++// validateSegment checks a single path segment (file or directory name).
++func validateSegment(seg, kind, value string) error {
++	if seg == "" {
++		return invalidPathf("%s %q contains an empty path segment", kind, value)
++	}
++	// Segments made only of dots and spaces ("..", "...", ".. ") are
++	// navigation (or become navigation on platforms that strip trailing dots
++	// and spaces), never a name.
++	if strings.Trim(seg, ". ") == "" {
++		return invalidPathf("%s %q contains a relative path segment", kind, value)
++	}
++	for _, r := range seg {
++		switch {
++		case r == '\\':
++			return invalidPathf("%s %q contains a backslash", kind, value)
++		case r == ':':
++			return invalidPathf("%s %q contains a colon", kind, value)
++		case r < 0x20 || r == 0x7f:
++			return invalidPathf("%s %q contains a control character", kind, value)
++		}
++	}
++	return nil
++}
++
++// ValidateRelPath validates a slash-separated relative path made of ordinary
++// name segments (nested paths allowed). Absolute paths, volume/UNC/device
++// spellings, backslashes, colons and "."/".." segments are rejected.
++func ValidateRelPath(p, kind string) error {
++	if strings.TrimSpace(p) == "" {
++		return invalidPathf("%s is required", kind)
++	}
++	if strings.HasPrefix(p, "/") || filepath.IsAbs(p) || filepath.VolumeName(p) != "" {
++		return invalidPathf("%s %q must be a relative path", kind, p)
++	}
++	for _, seg := range strings.Split(p, "/") {
++		if err := validateSegment(seg, kind, p); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// ValidateName validates a single-segment item name (no path syntax at all).
++func ValidateName(name, kind string) error {
++	if strings.Contains(name, "/") {
++		return invalidPathf("%s %q must not contain a path separator", kind, name)
++	}
++	return ValidateRelPath(name, kind)
++}
++
++// ValidateMemoryID validates a memory identifier: letters, digits, dots,
++// underscores and hyphens; it must not start or end with a dot.
++func ValidateMemoryID(id string) error {
++	if id == "" {
++		return invalidPathf("memory id is required")
++	}
++	for _, r := range id {
++		ok := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
++			r == '.' || r == '_' || r == '-'
++		if !ok {
++			return invalidPathf("memory id %q contains invalid characters", id)
++		}
++	}
++	if strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") {
++		return invalidPathf("memory id %q must not start or end with a dot", id)
++	}
++	return nil
++}
++
++// lexicallyWithin reports whether target is base or lies below it.
++func lexicallyWithin(base, target string) bool {
++	rel, err := filepath.Rel(base, target)
++	if err != nil || filepath.IsAbs(rel) {
++		return false
++	}
++	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
++}
++
++// resolveExisting resolves symlinks in the deepest existing ancestor of p and
++// re-appends the not-yet-existing remainder.
++func resolveExisting(p string) (string, error) {
++	cur := p
++	suffix := ""
++	for {
++		if _, err := os.Lstat(cur); err == nil {
++			real, err := filepath.EvalSymlinks(cur)
++			if err != nil {
++				return "", err
++			}
++			if suffix == "" {
++				return real, nil
++			}
++			return filepath.Join(real, suffix), nil
++		}
++		parent := filepath.Dir(cur)
++		if parent == cur {
++			return p, nil
++		}
++		if suffix == "" {
++			suffix = filepath.Base(cur)
++		} else {
++			suffix = filepath.Join(filepath.Base(cur), suffix)
++		}
++		cur = parent
++	}
++}
++
++// EnsureWithin verifies that target (an already-joined path) stays inside
++// base, both lexically and after resolving symbolic links.
++func EnsureWithin(base, target string) error {
++	absBase, err := filepath.Abs(base)
++	if err != nil {
++		return invalidPathf("cannot resolve %q", base)
++	}
++	absTarget, err := filepath.Abs(target)
++	if err != nil {
++		return invalidPathf("cannot resolve %q", target)
++	}
++	if !lexicallyWithin(absBase, absTarget) {
++		return invalidPathf("path escapes its managed folder")
++	}
++	realBase, err := resolveExisting(absBase)
++	if err != nil {
++		return invalidPathf("cannot resolve %q", base)
++	}
++	realTarget, err := resolveExisting(absTarget)
++	if err != nil {
++		// e.g. a dangling symlink: never follow it.
++		return invalidPathf("path escapes its managed folder")
++	}
++	if !lexicallyWithin(realBase, realTarget) {
++		return invalidPathf("path escapes its managed folder")
++	}
++	return nil
++}
++
++// JoinWithin validates rel as a slash-separated relative path, joins it to
++// base and verifies the result stays inside base.
++func JoinWithin(base, rel, kind string) (string, error) {
++	if err := ValidateRelPath(rel, kind); err != nil {
++		return "", err
++	}
++	p := filepath.Join(base, filepath.FromSlash(rel))
++	if err := EnsureWithin(base, p); err != nil {
++		return "", err
++	}
++	return p, nil
++}
+diff --git a/internal/storage/template_store.go b/internal/storage/template_store.go
+index a0bee35..7741581 100644
+--- a/internal/storage/template_store.go
++++ b/internal/storage/template_store.go
+@@ -109,13 +109,51 @@ func (ts *TemplateStore) Get(name string) (*models.Template, error) {
+ 	if idx := strings.Index(name, "/"); idx != -1 {
+ 		importName := name[:idx]
+ 		templateName := name[idx+1:]
+-		templateDir := filepath.Join(ts.importsDir(), importName, "templates", templateName)
++		if err := ValidateName(importName, "template import name"); err != nil {
++			return nil, err
++		}
++		if err := ValidateName(templateName, "template name"); err != nil {
++			return nil, err
++		}
++		importTemplatesDir := filepath.Join(ts.importsDir(), importName, "templates")
++		templateDir := filepath.Join(importTemplatesDir, templateName)
++		if err := EnsureWithin(importTemplatesDir, templateDir); err != nil {
++			return nil, err
++		}
++		if err := EnsureWithin(ts.importsDir(), importTemplatesDir); err != nil {
++			return nil, err
++		}
+ 		return ts.parseTemplate(templateName, templateDir, true, importName)
+ 	}
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := ts.localTemplateDir(name)
++	if err != nil {
++		return nil, err
++	}
+ 	return ts.parseTemplate(name, templateDir, false, "")
+ }
+ 
++// localTemplateDir validates a local template name (a single path segment) and
++// returns its directory inside .knowns/templates/.
++func (ts *TemplateStore) localTemplateDir(name string) (string, error) {
++	if err := ValidateName(name, "template name"); err != nil {
++		return "", err
++	}
++	templateDir := filepath.Join(ts.templatesDir(), name)
++	if err := EnsureWithin(ts.templatesDir(), templateDir); err != nil {
++		return "", err
++	}
++	return templateDir, nil
++}
++
++// TemplateFilePath validates a template file selector (a relative, possibly
++// nested path) and returns its absolute path inside the template directory.
++func TemplateFilePath(tmpl *models.Template, file string) (string, error) {
++	if tmpl == nil || tmpl.Path == "" {
++		return "", invalidPathf("template has no directory")
++	}
++	return JoinWithin(tmpl.Path, file, "template file")
++}
++
+ // parseTemplate reads and parses a _template.yaml file.
+ func (ts *TemplateStore) parseTemplate(name, dir string, imported bool, importName string) (*models.Template, error) {
+ 	configPath := filepath.Join(dir, "_template.yaml")
+@@ -168,7 +206,10 @@ func (ts *TemplateStore) parseTemplate(name, dir string, imported bool, importNa
+ // Create scaffolds a new template directory with a _template.yaml and a
+ // starter .hbs file.
+ func (ts *TemplateStore) Create(name string, description string) error {
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := ts.localTemplateDir(name)
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(templateDir, 0755); err != nil {
+ 		return fmt.Errorf("create template dir: %w", err)
+ 	}
+diff --git a/internal/storage/version_store.go b/internal/storage/version_store.go
+index b2a4632..ea1282c 100644
+--- a/internal/storage/version_store.go
++++ b/internal/storage/version_store.go
+@@ -333,7 +333,7 @@ func (vs *VersionStore) docVersionPath(docPath string) string {
+ }
+ 
+ func (vs *VersionStore) legacyDocVersionPath(docPath string) string {
+-	safe := strings.ReplaceAll(docPath, "/", "--")
++	safe := strings.NewReplacer("/", "--", "\\", "--").Replace(docPath)
+ 	return filepath.Join(vs.versionsDir(), "doc-"+safe+".json")
+ }
+ 

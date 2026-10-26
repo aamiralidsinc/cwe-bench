@@ -1,0 +1,322 @@
+diff -ruN a/src/ujson/lib/ultrajsondec.c b/src/ujson/lib/ultrajsondec.c
+--- a/src/ujson/lib/ultrajsondec.c	2026-10-26 02:42:19.000000000 +0000
++++ b/src/ujson/lib/ultrajsondec.c	2026-10-26 05:28:53.111946016 +0000
+@@ -359,16 +359,62 @@
+   /* 0xf0 */ 4, 4, 4, 4, 4, 4, 4, 4, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR, DS_UTFLENERROR,
+ };
+ 
+-static FASTCALL_ATTR JSOBJ FASTCALL_MSVC decode_string ( struct DecoderState *ds)
++/*
++Read one UTF-8 sequence of `len` bytes (2, 3 or 4) starting at *inputOffset and advance past it.
++Every byte after the lead must be a continuation byte (10xxxxxx); the value must not be an
++overlong form of a shorter sequence and must be a code point (at most U+10FFFF).  Surrogates are
++accepted: the decoder represents them as lone surrogate characters, as it does today.
++
++Returns TRUE with the code point stored in *ucs, or FALSE after recording the error.
++*/
++static FASTCALL_ATTR int FASTCALL_MSVC DecodeUTF8CodePoint (struct DecoderState *ds, JSUINT8 **inputOffset, int len, JSUTF32 *ucs)
+ {
++  JSUINT8 *io = *inputOffset;
++  JSUTF32 value;
++  JSUTF32 minimum;
+   int index;
++
++  /* The lead byte carries 7 - len payload bits: 0x1f, 0x0f and 0x07 for 2, 3 and 4 bytes. */
++  value = (JSUTF32) (io[0] & (0x7f >> len));
++  for (index = 1; index < len; index++)
++  {
++    JSUINT8 oct = io[index];
++
++    if ((oct & 0xc0) != 0x80)
++    {
++      SetError (ds, -1, "Invalid octet in UTF-8 sequence when decoding 'string'");
++      return FALSE;
++    }
++
++    value = (value << 6) | (JSUTF32) (oct & 0x3f);
++  }
++
++  minimum = (len == 2) ? 0x80 : (len == 3) ? 0x800 : 0x10000;
++  if (value < minimum)
++  {
++    SetError (ds, -1, "Overlong UTF-8 sequence detected when decoding 'string'");
++    return FALSE;
++  }
++
++  if (value > 0x10ffff)
++  {
++    SetError (ds, -1, "Code point above U+10FFFF in UTF-8 sequence when decoding 'string'");
++    return FALSE;
++  }
++
++  *inputOffset = io + len;
++  *ucs = value;
++  return TRUE;
++}
++
++static FASTCALL_ATTR JSOBJ FASTCALL_MSVC decode_string ( struct DecoderState *ds)
++{
+   JSUINT32 *escOffset;
+   JSUINT32 *escStart;
+   size_t escLen = (ds->escEnd - ds->escStart);
+   JSUINT8 *inputOffset;
+   JSUTF16 ch = 0;
+   JSUINT8 *lastHighSurrogate = NULL;
+-  JSUINT8 oct;
+   JSUTF32 ucs;
+   ds->lastType = JT_INVALID;
+   ds->start ++;
+@@ -415,7 +461,9 @@
+ 
+   for (;;)
+   {
+-    switch (g_decoderLookup[(JSUINT8)(*inputOffset)])
++    JSUINT8 utfLen = g_decoderLookup[(JSUINT8)(*inputOffset)];
++
++    switch (utfLen)
+     {
+       case DS_ISNULL:
+       {
+@@ -518,67 +566,23 @@
+ 
+       case 1:
+       {
+-        *(escOffset++) = (JSUINT32) (*inputOffset++);
+-        break;
+-      }
+-
+-      case 2:
+-      {
+-        ucs = (*inputOffset++) & 0x1f;
+-        ucs <<= 6;
+-        if (((*inputOffset) & 0x80) != 0x80)
++        /* 0x80-0xBF land here: a continuation byte cannot start a code point. */
++        if ((JSUINT8) (*inputOffset) >= 0x80)
+         {
+-          return SetError(ds, -1, "Invalid octet in UTF-8 sequence when decoding 'string'");
++          return SetError(ds, -1, "Invalid UTF-8 start byte when decoding 'string'");
+         }
+-        ucs |= (*inputOffset++) & 0x3f;
+-        if (ucs < 0x80) return SetError (ds, -1, "Overlong 2 byte UTF-8 sequence detected when decoding 'string'");
+-        *(escOffset++) = (JSUINT32) ucs;
++        *(escOffset++) = (JSUINT32) (*inputOffset++);
+         break;
+       }
+ 
++      case 2:
+       case 3:
+-      {
+-        JSUTF32 ucs = 0;
+-        ucs |= (*inputOffset++) & 0x0f;
+-
+-        for (index = 0; index < 2; index ++)
+-        {
+-          ucs <<= 6;
+-          oct = (*inputOffset++);
+-
+-          if ((oct & 0x80) != 0x80)
+-          {
+-            return SetError(ds, -1, "Invalid octet in UTF-8 sequence when decoding 'string'");
+-          }
+-
+-          ucs |= oct & 0x3f;
+-        }
+-
+-        if (ucs < 0x800) return SetError (ds, -1, "Overlong 3 byte UTF-8 sequence detected when encoding string");
+-        *(escOffset++) = (JSUINT32) ucs;
+-        break;
+-      }
+-
+       case 4:
+       {
+-        JSUTF32 ucs = 0;
+-        ucs |= (*inputOffset++) & 0x07;
+-
+-        for (index = 0; index < 3; index ++)
++        if (!DecodeUTF8CodePoint (ds, &inputOffset, (int) utfLen, &ucs))
+         {
+-          ucs <<= 6;
+-          oct = (*inputOffset++);
+-
+-          if ((oct & 0x80) != 0x80)
+-          {
+-            return SetError(ds, -1, "Invalid octet in UTF-8 sequence when decoding 'string'");
+-          }
+-
+-          ucs |= oct & 0x3f;
++          return NULL;
+         }
+-
+-        if (ucs < 0x10000) return SetError (ds, -1, "Overlong 4 byte UTF-8 sequence detected when decoding 'string'");
+-
+         *(escOffset++) = (JSUINT32) ucs;
+         break;
+       }
+diff -ruN a/src/ujson/lib/ultrajsonenc.c b/src/ujson/lib/ultrajsonenc.c
+--- a/src/ujson/lib/ultrajsonenc.c	2026-10-26 02:42:19.000000000 +0000
++++ b/src/ujson/lib/ultrajsonenc.c	2026-10-26 05:28:26.195970712 +0000
+@@ -299,6 +299,64 @@
+   }
+ }
+ 
++/*
++Decode exactly one UTF-8 sequence of `len` bytes (2, 3 or 4) starting at `io`, where `end - io`
++bytes of the input are available.  The sequence must be complete inside the input and every byte
++after the lead must be a continuation byte (10xxxxxx); otherwise nothing is emitted and the error
++is recorded.  The decoded value must be in the range this length is allowed to encode (no
++overlong form) and must be a code point (at most U+10FFFF).  Surrogate values are deliberately
++accepted: they are part of the library's output today, both for text and for bytes.
++
++Returns TRUE with the code point stored in *ucs, or FALSE after committing the output produced so
++far.  `of` is the encoder's current output position for this string.
++*/
++static int Buffer_DecodeUTF8CodePoint (JSOBJ obj, JSONObjectEncoder *enc, char *of, const char *io, const char *end, size_t len, JSUTF32 *ucs)
++{
++  const JSUINT8 *in = (const JSUINT8 *) io;
++  JSUTF32 value;
++  size_t minimum;
++  size_t i;
++
++  if ((size_t) (end - io) < len)
++  {
++    enc->offset += (of - enc->offset);
++    SetError (obj, enc, "Unterminated UTF-8 sequence when encoding string");
++    return FALSE;
++  }
++
++  /* The lead byte carries 7 - len payload bits: 0x1f, 0x0f and 0x07 for 2, 3 and 4 bytes. */
++  value = (JSUTF32) (in[0] & (0x7fu >> len));
++  for (i = 1; i < len; i++)
++  {
++    if ((in[i] & 0xc0) != 0x80)
++    {
++      enc->offset += (of - enc->offset);
++      SetError (obj, enc, "Invalid continuation byte in UTF-8 sequence when encoding string");
++      return FALSE;
++    }
++    value = (value << 6) | (JSUTF32) (in[i] & 0x3f);
++  }
++
++  /* The smallest value each length may encode; anything below it is an overlong form. */
++  minimum = (len == 2) ? 0x80u : (len == 3) ? 0x800u : 0x10000u;
++  if ((size_t) value < minimum)
++  {
++    enc->offset += (of - enc->offset);
++    SetError (obj, enc, "Overlong UTF-8 sequence detected when encoding string");
++    return FALSE;
++  }
++
++  if (value > 0x10ffff)
++  {
++    enc->offset += (of - enc->offset);
++    SetError (obj, enc, "Code point above U+10FFFF in UTF-8 sequence when encoding string");
++    return FALSE;
++  }
++
++  *ucs = value;
++  return TRUE;
++}
++
+ static int Buffer_EscapeStringValidated (JSOBJ obj, JSONObjectEncoder *enc, const char *io, const char *end)
+ {
+   JSUTF32 ucs;
+@@ -348,97 +406,15 @@
+       }
+ 
+       case 2:
+-      {
+-        JSUTF32 in;
+-        JSUTF16 in16;
+-
+-        if (end - io < 1)
+-        {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Unterminated UTF-8 sequence when encoding string");
+-          return FALSE;
+-        }
+-
+-        memcpy(&in16, io, sizeof(JSUTF16));
+-        in = (JSUTF32) in16;
+-
+-#ifdef __LITTLE_ENDIAN__
+-        ucs = ((in & 0x1f) << 6) | ((in >> 8) & 0x3f);
+-#else
+-        ucs = ((in & 0x1f00) >> 2) | (in & 0x3f);
+-#endif
+-
+-        if (ucs < 0x80)
+-        {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Overlong 2 byte UTF-8 sequence detected when encoding string");
+-          return FALSE;
+-        }
+-
+-        io += 2;
+-        break;
+-      }
+-
+       case 3:
+-      {
+-        JSUTF32 in;
+-        JSUTF16 in16;
+-        JSUINT8 in8;
+-
+-        if (end - io < 2)
+-        {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Unterminated UTF-8 sequence when encoding string");
+-          return FALSE;
+-        }
+-
+-        memcpy(&in16, io, sizeof(JSUTF16));
+-        memcpy(&in8, io + 2, sizeof(JSUINT8));
+-#ifdef __LITTLE_ENDIAN__
+-        in = (JSUTF32) in16;
+-        in |= in8 << 16;
+-        ucs = ((in & 0x0f) << 12) | ((in & 0x3f00) >> 2) | ((in & 0x3f0000) >> 16);
+-#else
+-        in = in16 << 8;
+-        in |= in8;
+-        ucs = ((in & 0x0f0000) >> 4) | ((in & 0x3f00) >> 2) | (in & 0x3f);
+-#endif
+-
+-        if (ucs < 0x800)
+-        {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Overlong 3 byte UTF-8 sequence detected when encoding string");
+-          return FALSE;
+-        }
+-
+-        io += 3;
+-        break;
+-      }
+       case 4:
+       {
+-        JSUTF32 in;
+-
+-        if (end - io < 3)
++        if (!Buffer_DecodeUTF8CodePoint (obj, enc, of, io, end, (size_t) utflen, &ucs))
+         {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Unterminated UTF-8 sequence when encoding string");
+-          return FALSE;
+-        }
+-
+-        memcpy(&in, io, sizeof(JSUTF32));
+-#ifdef __LITTLE_ENDIAN__
+-        ucs = ((in & 0x07) << 18) | ((in & 0x3f00) << 4) | ((in & 0x3f0000) >> 10) | ((in & 0x3f000000) >> 24);
+-#else
+-        ucs = ((in & 0x07000000) >> 6) | ((in & 0x3f0000) >> 4) | ((in & 0x3f00) >> 2) | (in & 0x3f);
+-#endif
+-        if (ucs < 0x10000)
+-        {
+-          enc->offset += (of - enc->offset);
+-          SetError (obj, enc, "Overlong 4 byte UTF-8 sequence detected when encoding string");
+           return FALSE;
+         }
+ 
+-        io += 4;
++        io += utflen;
+         break;
+       }
+ 

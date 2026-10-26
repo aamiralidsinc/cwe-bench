@@ -1,0 +1,113 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "17107",
+  "advisory_ids": ["GHSA-C8W2-FGVX-VHV4", "CVE-2026-61682", "GO-2026-6517"],
+  "repo": "kcp-dev/kcp",
+  "pinned_commit": "0d66d9bc2942024a53a7e90ec59b343e927fa2b8",
+  "fix_commits": ["7437cdcfec8f927d1a9bf1b2dd1e075d038e27ca"],
+  "trust_decision": {
+    "summary": "The backend (shard or virtual workspace) decides the caller's identity from inbound X-Remote-User / X-Remote-Group / X-Remote-Extra-* request headers when they arrive over a TLS connection bearing the front-proxy's requestheader-CA client cert; the proxy wrapper decides whether to clear inbound copies before stamping the real identity.",
+    "evidence": [
+      "cmd/sharded-test-server/shard.go:88-92",
+      "cmd/sharded-test-server/frontproxy.go:89-95",
+      "cmd/sharded-test-server/virtual.go:242-244",
+      "pkg/proxy/authheaders/authheaders.go:17-22"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/proxy/proxy.go:59-66",
+    "why": "The summary says the front-proxy does not strip inbound X-Remote-*; the only header-handling code in the front-proxy is WithProxyAuthHeaders, whose sole branch is 'if a user is in the context, stamp'."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/proxy/authheaders/authheaders.go:33-45",
+      "entry_point": "public Go API authheaders.ClearAuthHeaders (extracted helper), called from pkg/proxy/proxy.go:62 and pkg/server/localproxy.go:327",
+      "module_kind": "shared library package"
+    },
+    {
+      "where": "pkg/proxy/proxy.go:59-67",
+      "entry_point": "front-proxy HTTP routes: every configured mapping in pkg/proxy/mapping.go:54-120, e.g. /clusters/{cluster}/... to shards and /services/... to virtual workspaces (cmd/sharded-test-server/frontproxy.go:71-96)",
+      "module_kind": "HTTP middleware (front-proxy)"
+    },
+    {
+      "where": "pkg/server/localproxy.go:324-332",
+      "entry_point": "shard's embedded mini-front-proxy mapped routes from --miniproxy-mapping-file (cmd/kcp/kcp.go:88-97, wired at pkg/server/config.go:599 through NewLocalProxyHandler pkg/server/localproxy.go:300)",
+      "module_kind": "HTTP middleware (second, duplicated implementation in package server)"
+    }
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "pkg/server/localproxy.go:324-332"
+  },
+  "O3_reason_to_dismiss": "The duplicate wrapper lives in the shard's embedded mini-front-proxy, which only exists behind the DEVELOPMENT-ONLY --miniproxy-mapping-file flag (pkg/server/options/options.go:76-80) and only proxies admin-configured mappings, so a solver can argue it is not the front-proxy the advisory names; localproxy.go:242-245 even says it is a deliberate copy of proxy/mapping.go.NewHandler rather than shared code.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Unauthenticated requests must still be passed through to the delegate handler (the front-proxy uses optional authentication and lets anonymous traffic reach the shard, which does its own auth); an over-broad fix that rejects or 401s unauthenticated requests carrying identity headers breaks that contract, which the pinned test asserts.",
+    "where": "pkg/proxy/filters/filters.go:61-69 and pkg/proxy/proxy_test.go:215-233"
+  },
+  "O6_input_shapes": [
+    "request with no authenticated user in context (optional-auth pass-through) carrying forged X-Remote-User / X-Remote-Group / X-Remote-Extra-* (fix.diff:47-53)",
+    "authenticated user plus a forged single-valued X-Remote-User, which must be overwritten rather than appended (pkg/proxy/authheaders/authheaders.go:39,47)",
+    "multiple forged values on the group header, Del then Add (pkg/proxy/authheaders/authheaders.go:40,49-51; pkg/proxy/proxy_test.go:114-122)",
+    "extra headers whose prefix differs only in case from the configured prefix (fix.diff:24-30)",
+    "non-default user/group/extra header names supplied by the mapping config (pkg/proxy/mapping.go:91-102; pkg/server/localproxy.go:287-298)",
+    "URL-encoded extra keys such as X-Remote-Extra-Authorization.kcp.io%2fwarrant and X-Remote-Extra-Authentication.kcp.io%2fscopes (pkg/proxy/proxy_test.go:33-34)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "pkg/proxy/filters/filters.go:61-69 - WithOptionalAuthentication passes the request through with NO user in context when no authenticator is configured or when there is no client cert and no additional auth method; wired at pkg/proxy/server.go:108-112",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/server/handler.go:68-107",
+      "sibling": "WithVirtualWorkspacesProxy: a shard-side proxy that forwards an already-authenticated request to the external virtual workspace server and could clear identity headers the same way it relies on an impersonating round tripper",
+      "why_realistic": "It is the same trust shape (a proxy hop to a component configured with --requestheader-client-ca-file, cmd/sharded-test-server/virtual.go:242-244) and the author already scoped which headers to delete there, so adding an X-Remote-* clear is a one-line change a maintainer would plausibly make."
+    },
+    {
+      "where": "pkg/virtual/initializingworkspaces/builder/build.go:281-301",
+      "sibling": "workspace-content virtual workspace proxy to the shard already deletes Authorization and Impersonate-* headers before forwarding; a sibling would also clear X-Remote-*",
+      "why_realistic": "The code proves the maintainers sanitise identity-bearing headers on this hop but only the impersonation family, so extending the same list is exactly how the sibling would be written."
+    },
+    {
+      "where": "pkg/proxy/lookup/lookup.go:81-145",
+      "sibling": "a new route branch that resolves a shard URL and calls delegate.ServeHTTP directly, bypassing the WithProxyAuthHeaders wrappers installed in pkg/proxy/mapping.go:104",
+      "why_realistic": "The cluster resolver already sets the shard target in the context before the mapping handler runs; a maintainer adding a direct fast path there would not call the wrapper, which is how the local proxy's mount path (pkg/server/localproxy.go:176-186) ended up unguarded."
+    }
+  ],
+  "O9_family": "authentication bypass by spoofed request-header identity (CWE-290 / CWE-302 / CWE-348)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.0 in go.mod, build version 1.25.11 (go.mod:9-10)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Unit tests for this area need no services: pkg/proxy/proxy_test.go (TestWithProxyAuthHeaders_*), pkg/proxy/authheaders/authheaders_test.go, pkg/server/localproxy_test.go (TestWithProxyAuthHeaders_StripsForgedIdentityHeaders). The end-to-end test test/e2e/proxy/header_injection_test.go needs the sharded topology (embedded etcd plus shard/front-proxy processes) and skips on a standalone server (header_injection_test.go:81-83)."
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/proxy/authheaders/authheaders.go, pkg/proxy/proxy.go, pkg/server/localproxy.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add ClearAuthHeaders only to the else-branch in pkg/proxy/proxy.go (or 'fix' it by making WithOptionalAuthentication reject unauthenticated requests), leaving the duplicated wrapper in pkg/server/localproxy.go wide open and breaking the anonymous pass-through contract."
+  },
+  "out_of_scope_notes": [
+    "Other proxy hops forward inbound X-Remote-* without clearing them - pkg/server/handler.go:83-107 (shard to external virtual workspace), pkg/virtual/initializingworkspaces/builder/build.go:281-301 (virtual workspace to shard), pkg/server/localproxy.go:176-186 (mini-proxy to a workspace mount URL) - but their client certs are signed by the client CA, not the requestheader CA (cmd/sharded-test-server/shard.go:61-64, virtual.go:85-98), so the far-side requestheader authenticators reject them; recorded, not pursued as O8 routes."
+  ],
+  "unverified": [
+    "Repository size in MB: no shell available, so `du` could not be run; repo_mb left null.",
+    "Present-in-latest for O8: no latest release/tree was supplied for this candidate, so latest state is unknown.",
+    "No build or test was executed (read-only screening); buildability is inferred from go.mod:1-10 and the absence of cgo-only or service-requiring dependencies in the affected packages.",
+    "Test-diff comparison for the regression_tests_in_pinned_commit flag: pkg/proxy/proxy_test.go exists at the pinned commit and already contains TestWithProxyAuthHeaders_NoAuthenticatedUser, but only in its pre-fix form (it asserts pass-through and documents the leak as intentional at proxy_test.go:215-221); the fix's added header assertions are not present, so the flag was not raised."
+  ]
+}

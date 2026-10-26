@@ -1,0 +1,169 @@
+diff -ruN a/pytonapi/webhook/dispatcher.py b/pytonapi/webhook/dispatcher.py
+--- a/pytonapi/webhook/dispatcher.py	2026-10-26 02:32:56.000000000 +0000
++++ b/pytonapi/webhook/dispatcher.py	2026-10-26 05:17:31.248577433 +0000
+@@ -60,7 +60,11 @@
+         """
+         self._client = client
+         self._url = url.rstrip("/")
+-        self._path = urlparse(self._url).path
++        parsed_url = urlparse(self._url)
++        self._path = parsed_url.path
++        # ``scheme://netloc`` — lets any registered local route (including a
++        # custom ``path=``) be turned into the absolute callback endpoint.
++        self._origin = f"{parsed_url.scheme}://{parsed_url.netloc}" if parsed_url.netloc else ""
+         self._accounts: set[str] = set(accounts) if accounts else set()
+         self._opcodes: set[str] = set(opcodes) if opcodes else set()
+         self._defaults: dict[str, t.Any] = kwargs
+@@ -103,23 +107,13 @@
+             raise TONAPIError("client is required for setup()")
+         await self._client.create_session()
+ 
+-        for event_type, handlers in self._handlers.items():
+-            if not handlers:
+-                continue
+-            suffix = self.DEFAULT_SUFFIXES[event_type]
+-            local_path = self._path + suffix
+-            webhook = await self._client.ensure(f"{self._url}{suffix}")
++        # Provision one webhook per registered route — every route the
++        # application serves needs its own TONAPI-issued secret, otherwise a
++        # delivery to it cannot be authenticated.
++        for event_type, local_path in self._routes():
++            webhook = await self._client.ensure(self._endpoint(local_path))
+             self._tokens[local_path] = webhook.token
+-
+-            if event_type is WebhookEventType.ACCOUNT_TX and self._accounts:
+-                await webhook.sync_accounts(list(self._accounts))
+-            elif event_type is WebhookEventType.MEMPOOL_MSG:
+-                await webhook.subscribe_mempool_msg()
+-            elif event_type is WebhookEventType.OPCODE_MSG and self._opcodes:
+-                for opcode in self._opcodes:
+-                    await webhook.subscribe_opcode_msg(opcode)
+-            elif event_type is WebhookEventType.NEW_CONTRACTS:
+-                await webhook.subscribe_new_contracts()
++            await self._sync_subscriptions(webhook, event_type, removing=False)
+ 
+     async def teardown(self, cleanup: bool = False) -> None:
+         """Close session and optionally unsubscribe.
+@@ -137,25 +131,12 @@
+             webhooks = await self._client.list()
+             endpoint_map = {w.endpoint: w for w in webhooks}
+ 
+-            for event_type, handlers in self._handlers.items():
+-                if not handlers:
+-                    continue
+-                suffix = self.DEFAULT_SUFFIXES[event_type]
+-                endpoint = f"{self._url}{suffix}"
+-                info = endpoint_map.get(endpoint)
++            for event_type, local_path in self._routes():
++                info = endpoint_map.get(self._endpoint(local_path))
+                 if info is None:
+                     continue
+                 webhook = TonapiWebhook(self._client, info.id, info.endpoint, info.token)
+-
+-                if event_type is WebhookEventType.ACCOUNT_TX and self._accounts:
+-                    await webhook.unsubscribe(list(self._accounts))
+-                elif event_type is WebhookEventType.MEMPOOL_MSG:
+-                    await webhook.unsubscribe_mempool_msg()
+-                elif event_type is WebhookEventType.OPCODE_MSG and self._opcodes:
+-                    for opcode in self._opcodes:
+-                        await webhook.unsubscribe_opcode_msg(opcode)
+-                elif event_type is WebhookEventType.NEW_CONTRACTS:
+-                    await webhook.unsubscribe_new_contracts()
++                await self._sync_subscriptions(webhook, event_type, removing=True)
+ 
+         await self._client.close_session()
+ 
+@@ -177,9 +158,75 @@
+         """
+         return self._path + self.DEFAULT_SUFFIXES[event_type]
+ 
++    def _routes(self) -> list[tuple[WebhookEventType, str]]:
++        """List every distinct ``(event_type, local_path)`` the application registered.
++
++        :return: Registered routes in registration order.
++        """
++        routes: list[tuple[WebhookEventType, str]] = []
++        for event_type, handlers in self._handlers.items():
++            seen: set[str] = set()
++            for _, _, local_path in handlers:
++                if local_path not in seen:
++                    seen.add(local_path)
++                    routes.append((event_type, local_path))
++        return routes
++
++    def _endpoint(self, local_path: str) -> str:
++        """Build the absolute callback URL for a registered local path.
++
++        :param local_path: Route the application serves (default or custom).
++        :return: Endpoint TONAPI calls for this route.
++        """
++        if not self._origin:
++            return local_path
++        return f"{self._origin}/{local_path.lstrip('/')}"
++
++    async def _sync_subscriptions(
++        self,
++        webhook: t.Any,
++        event_type: WebhookEventType,
++        *,
++        removing: bool,
++    ) -> None:
++        """Apply (or drop) the dispatcher's subscriptions on one webhook.
++
++        :param webhook: Bound webhook object for one route.
++        :param event_type: Event type the route serves.
++        :param removing: ``True`` to unsubscribe, ``False`` to subscribe.
++        """
++        if event_type is WebhookEventType.ACCOUNT_TX:
++            if not self._accounts:
++                return
++            accounts = list(self._accounts)
++            if removing:
++                await webhook.unsubscribe(accounts)
++            else:
++                # Sync instead of blind-subscribe so a reused webhook is exact.
++                await webhook.sync_accounts(accounts)
++            return
++
++        if event_type is WebhookEventType.OPCODE_MSG:
++            if not self._opcodes:
++                return
++            for opcode in self._opcodes:
++                if removing:
++                    await webhook.unsubscribe_opcode_msg(opcode)
++                else:
++                    await webhook.subscribe_opcode_msg(opcode)
++            return
++
++        if event_type is WebhookEventType.MEMPOOL_MSG:
++            method = webhook.unsubscribe_mempool_msg if removing else webhook.subscribe_mempool_msg
++        elif event_type is WebhookEventType.NEW_CONTRACTS:
++            method = webhook.unsubscribe_new_contracts if removing else webhook.subscribe_new_contracts
++        else:
++            return
++        await method()
++
+     def _build_path_map(self) -> dict[str, WebhookEventType]:
+-        """Build reverse mapping from path to event type."""
+-        return {handlers[0][2]: et for et, handlers in self._handlers.items() if handlers}
++        """Build reverse mapping from every registered path to its event type."""
++        return {path: event_type for event_type, handlers in self._handlers.items() for _, _, path in handlers}
+ 
+     def account_tx(
+         self,
+@@ -284,7 +331,14 @@
+             raise TONAPIError(f"Unknown webhook path: {path}")
+ 
+         expected_token = self._tokens.get(path)
+-        if expected_token is not None and authorization != f"Bearer {expected_token}":
++        if expected_token is None:
++            # A dispatcher wired to TONAPI can only vouch for a route whose
++            # secret TONAPI issued during setup(); a route without one (never
++            # provisioned, or registered after the last setup) cannot be
++            # authenticated, so it must be refused rather than let through.
++            if self._client is not None:
++                raise TONAPIError("Invalid webhook token")
++        elif authorization != f"Bearer {expected_token}":
+             raise TONAPIError("Invalid webhook token")
+ 
+         adapter = _ADAPTERS[event_type]

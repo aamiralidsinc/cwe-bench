@@ -1,0 +1,236 @@
+diff --git a/service/internal/config/config.go b/service/internal/config/config.go
+index 9bc60779..b118afa8 100644
+--- a/service/internal/config/config.go
++++ b/service/internal/config/config.go
+@@ -4,6 +4,9 @@ import (
+ 	"fmt"
+ )
+ 
++// ReservedArgumentNamePrefix is reserved for OliveTin-injected system arguments.
++const ReservedArgumentNamePrefix = "ot_"
++
+ // Action represents the core functionality of OliveTin - commands that show up
+ // as buttons in the UI.
+ type Action struct {
+diff --git a/service/internal/config/sanitize.go b/service/internal/config/sanitize.go
+index 674fba5a..d22cc90e 100644
+--- a/service/internal/config/sanitize.go
++++ b/service/internal/config/sanitize.go
+@@ -26,6 +26,34 @@ func (cfg *Config) Sanitize() {
+ 	}
+ 
+ 	cfg.sanitizeDashboardsForInlineActions()
++
++	if err := cfg.validateReservedActionArgumentNames(); err != nil {
++		log.Fatalf("%v", err)
++	}
++}
++
++func (cfg *Config) validateReservedActionArgumentNames() error {
++	for _, action := range cfg.Actions {
++		if err := action.validateReservedArgumentNames(); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (action *Action) validateReservedArgumentNames() error {
++	if action == nil {
++		return nil
++	}
++
++	for _, arg := range action.Arguments {
++		if strings.HasPrefix(arg.Name, ReservedArgumentNamePrefix) {
++			return fmt.Errorf("action %q argument %q uses reserved prefix %q", action.Title, arg.Name, ReservedArgumentNamePrefix)
++		}
++	}
++
++	return nil
+ }
+ 
+ func (cfg *Config) sanitizeDashboardsForInlineActions() {
+diff --git a/service/internal/executor/arguments.go b/service/internal/executor/arguments.go
+index b623557a..e499134d 100644
+--- a/service/internal/executor/arguments.go
++++ b/service/internal/executor/arguments.go
+@@ -21,6 +21,7 @@ var (
+ 		"unicode_identifier":        `^[\w\-\.\_\d]+$`,
+ 		"ascii":                     `^[a-zA-Z0-9]+$`,
+ 		"ascii_identifier":          `^[a-zA-Z0-9\-\._]+$`,
++		"shell_safe_identifier":     `^[a-zA-Z0-9@\.\_\+\-]+$`,
+ 		"ascii_sentence":            `^[a-zA-Z0-9\-\._, ]+$`,
+ 	}
+ )
+@@ -98,10 +99,6 @@ func parseActionArguments(req *ExecutionRequest) (string, error) {
+ 		}).Debugf("Arg assigned")
+ 	}
+ 
+-	if req.AuthenticatedUser != nil {
+-		req.Arguments["userGroups"] = req.AuthenticatedUser.UsergroupLine
+-	}
+-
+ 	parsedShellCommand, err := tpl.ParseTemplateWithActionContext(req.Binding.Action.Shell, req.Binding.Entity, req.Arguments)
+ 
+ 	if err != nil {
+diff --git a/service/internal/executor/executor.go b/service/internal/executor/executor.go
+index ab30794b..0638d155 100644
+--- a/service/internal/executor/executor.go
++++ b/service/internal/executor/executor.go
+@@ -666,13 +666,15 @@ func stepACLCheck(req *ExecutionRequest) bool {
+ 
+ func stepParseArgs(req *ExecutionRequest) bool {
+ 	ensureArgumentMap(req)
+-	injectSystemArgs(req)
+ 
+ 	if !hasBindingAndAction(req) {
+ 		return fail(req, fmt.Errorf("cannot parse arguments: Binding or Action is nil"))
+ 	}
+ 
+ 	filterToDefinedArgumentsOnly(req)
++	if err := injectSystemArgs(req); err != nil {
++		return fail(req, err)
++	}
+ 	mangleInvalidArgumentValues(req)
+ 
+ 	if hasExec(req) {
+@@ -683,10 +685,6 @@ func stepParseArgs(req *ExecutionRequest) bool {
+ }
+ 
+ func handleExecBranch(req *ExecutionRequest) bool {
+-	if req.AuthenticatedUser != nil {
+-		req.Arguments["userGroups"] = req.AuthenticatedUser.UsergroupLine
+-	}
+-
+ 	args, err := parseActionExec(req.Arguments, req.Binding.Action, req.Binding.Entity)
+ 
+ 	if err != nil {
+@@ -739,7 +737,7 @@ func filterToDefinedArgumentsOnly(req *ExecutionRequest) {
+ 
+ func keepArgument(name string, definedNames map[string]struct{}) bool {
+ 	_, ok := definedNames[name]
+-	return ok || strings.HasPrefix(name, "ot_")
++	return ok
+ }
+ 
+ func hasWebhookTag(req *ExecutionRequest) bool {
+@@ -751,9 +749,32 @@ func hasWebhookTag(req *ExecutionRequest) bool {
+ 	return false
+ }
+ 
+-func injectSystemArgs(req *ExecutionRequest) {
++var systemArgumentDefinitions = []config.ActionArgument{
++	{Name: "ot_executionTrackingId", Type: "ascii_identifier", RejectNull: true},
++	{Name: "ot_username", Type: "shell_safe_identifier", RejectNull: true},
++}
++
++func injectSystemArgs(req *ExecutionRequest) error {
+ 	req.Arguments["ot_executionTrackingId"] = req.TrackingID
+ 	req.Arguments["ot_username"] = req.AuthenticatedUser.Username
++
++	return nil
++}
++
++func validatedSystemArgs(req *ExecutionRequest) (map[string]string, error) {
++	values := map[string]string{
++		"ot_executionTrackingId": req.TrackingID,
++		"ot_username":            req.AuthenticatedUser.Username,
++	}
++
++	for i := range systemArgumentDefinitions {
++		arg := &systemArgumentDefinitions[i]
++		if err := ValidateArgument(arg, values[arg.Name], req.Binding.Action); err != nil {
++			return nil, fmt.Errorf("system argument %q failed validation: %w", arg.Name, err)
++		}
++	}
++
++	return values, nil
+ }
+ 
+ func hasBindingAndAction(req *ExecutionRequest) bool {
+@@ -943,36 +964,20 @@ func prepareCommand(cmd *exec.Cmd, streamer *OutputStreamer, req *ExecutionReque
+ }
+ 
+ func stepExecAfter(req *ExecutionRequest) bool {
+-	if req.Binding.Action.ShellAfterCompleted == "" {
+-		return true
+-	}
+-
+ 	ctx, cancel := newTimeoutContext(context.Background(), time.Duration(req.Binding.Action.Timeout)*time.Second, req.executor)
+ 	defer cancel()
+ 
+ 	var stdout bytes.Buffer
+ 	var stderr bytes.Buffer
+ 
+-	args := map[string]string{
+-		"output":                 req.logEntry.Output,
+-		"exitCode":               fmt.Sprintf("%v", req.logEntry.ExitCode),
+-		"ot_executionTrackingId": req.TrackingID,
+-		"ot_username":            req.AuthenticatedUser.Username,
+-	}
+-
+-	finalParsedCommand, err := tpl.ParseTemplateWithActionContext(req.Binding.Action.ShellAfterCompleted, req.Binding.Entity, args)
+-
++	cmd, args, err := buildShellAfterCommand(ctx, req, &stdout, &stderr)
+ 	if err != nil {
+-		msg := "Could not prepare shellAfterCompleted command: " + err.Error() + "\n"
+-		req.logEntry.Output += msg
+-		log.Warn(msg)
++		return fail(req, err)
++	}
++	if cmd == nil {
+ 		return true
+ 	}
+ 
+-	cmd := wrapCommandInShell(ctx, finalParsedCommand)
+-	cmd.Stdout = &stdout
+-	cmd.Stderr = &stderr
+-
+ 	cmd.Env = buildEnv(args)
+ 
+ 	runerr := cmd.Start()
+@@ -1002,6 +1007,43 @@ func stepExecAfter(req *ExecutionRequest) bool {
+ 	return true
+ }
+ 
++func buildShellAfterCommand(ctx context.Context, req *ExecutionRequest, stdout, stderr *bytes.Buffer) (*exec.Cmd, map[string]string, error) {
++	if req.Binding.Action.ShellAfterCompleted == "" {
++		return nil, nil, nil
++	}
++
++	args, err := buildShellAfterArgs(req)
++	if err != nil {
++		return nil, nil, err
++	}
++
++	finalParsedCommand, err := tpl.ParseTemplateWithActionContext(req.Binding.Action.ShellAfterCompleted, req.Binding.Entity, args)
++	if err != nil {
++		msg := "Could not prepare shellAfterCompleted command: " + err.Error() + "\n"
++		req.logEntry.Output += msg
++		log.Warn(msg)
++		return nil, nil, nil
++	}
++
++	cmd := wrapCommandInShell(ctx, finalParsedCommand)
++	cmd.Stdout = stdout
++	cmd.Stderr = stderr
++
++	return cmd, args, nil
++}
++
++func buildShellAfterArgs(req *ExecutionRequest) (map[string]string, error) {
++	args, err := validatedSystemArgs(req)
++	if err != nil {
++		return nil, err
++	}
++
++	args["output"] = req.logEntry.Output
++	args["exitCode"] = fmt.Sprintf("%v", req.logEntry.ExitCode)
++
++	return args, nil
++}
++
+ //gocyclo:ignore
+ func stepTrigger(req *ExecutionRequest) bool {
+ 	if req.Binding.Action.Triggers == nil {

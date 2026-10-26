@@ -1,0 +1,123 @@
+diff -ruN pristine/glance/api/v1/images.py app/glance/api/v1/images.py
+--- a/glance/api/v1/images.py	2026-10-26 03:09:12.000000000 +0000
++++ b/glance/api/v1/images.py	2026-10-26 03:48:20.897419416 +0000
+@@ -827,22 +827,43 @@
+             raise HTTPForbidden(explanation=msg, request=req,
+                                 content_type="text/plain")
+ 
+-        status = 'deleted'
++        # Being able to see an image (public or shared with us) is not the
++        # right to destroy it: only its owner or an administrator may.
++        if not (req.context.is_admin
++                or image['owner'] is None
++                or image['owner'] == req.context.owner):
++            msg = _("Unable to delete image you do not own")
++            LOG.debug(msg)
++            raise HTTPForbidden(explanation=msg, request=req,
++                                content_type="text/plain")
++
++        # With delayed deletion the backend removal is only queued, and the
++        # metadata has to record that fact.  Without a stored location there
++        # is nothing to queue, so the record is simply marked as deleted.
++        if image['location'] and CONF.delayed_delete:
++            status = 'pending_delete'
++        else:
++            status = 'deleted'
++
+         try:
++            # The registry delete carries the ownership check, so the
++            # metadata transition must happen before the backend is touched.
++            # Destroying the stored data first would leave a refused request
++            # that has already caused damage; the status is written first
++            # because a destroyed record can no longer be updated.
++            registry.update_image_metadata(req.context, id, {'status': status})
++            registry.delete_image_metadata(req.context, id)
++
+             # The image's location field may be None in the case
+             # of a saving or queued image, therefore don't ask a backend
+             # to delete the image if the backend doesn't yet store it.
+             # See https://bugs.launchpad.net/glance/+bug/747799
+             if image['location']:
+                 if CONF.delayed_delete:
+-                    status = 'pending_delete'
+                     schedule_delayed_delete_from_backend(image['location'], id)
+                 else:
+                     safe_delete_from_backend(image['location'],
+                                              req.context, id)
+-
+-            registry.update_image_metadata(req.context, id, {'status': status})
+-            registry.delete_image_metadata(req.context, id)
+         except exception.NotFound, e:
+             msg = ("Failed to find image to delete: %(e)s" % locals())
+             for line in msg.split('\n'):
+diff -ruN pristine/glance/api/v2/images.py app/glance/api/v2/images.py
+--- a/glance/api/v2/images.py	2026-10-26 03:09:12.000000000 +0000
++++ b/glance/api/v2/images.py	2026-10-26 03:48:26.521414346 +0000
+@@ -260,25 +260,36 @@
+                     % locals())
+             raise webob.exc.HTTPForbidden(explanation=msg)
+ 
+-        status = 'deleted'
+-        if image['location']:
+-            if CONF.delayed_delete:
+-                status = 'pending_delete'
+-                self.store_api.schedule_delayed_delete_from_backend(
+-                                image['location'], id)
+-            else:
+-                self.store_api.safe_delete_from_backend(image['location'],
+-                                                        req.context, id)
++        # Only a stored location can be removed; a queued/saving image has
++        # no backend copy yet, so its record is simply marked as deleted.
++        if image['location'] and CONF.delayed_delete:
++            status = 'pending_delete'
++        else:
++            status = 'deleted'
+ 
+         try:
++            # Both database calls authorize the mutation, so the stored data
++            # must survive until they have both been accepted.  Doing it the
++            # other way round let a caller who can only see the image destroy
++            # its data and still receive a not-found refusal.
+             self.db_api.image_update(req.context, image_id, {'status': status})
+             self.db_api.image_destroy(req.context, image_id)
+         except (exception.NotFound, exception.Forbidden):
+             msg = ("Failed to find image %(image_id)s to delete" % locals())
+             LOG.info(msg)
+             raise webob.exc.HTTPNotFound()
+-        else:
+-            self.notifier.info('image.delete', image)
++
++        # The record is now gone (or pending removal), so the backend copy
++        # can be removed, or queued for the scrubber, under the image's id.
++        if image['location']:
++            if CONF.delayed_delete:
++                self.store_api.schedule_delayed_delete_from_backend(
++                                image['location'], image_id)
++            else:
++                self.store_api.safe_delete_from_backend(image['location'],
++                                                        req.context, image_id)
++
++        self.notifier.info('image.delete', image)
+ 
+ 
+ class RequestDeserializer(wsgi.JSONRequestDeserializer):
+diff -ruN pristine/glance/db/sqlalchemy/api.py app/glance/db/sqlalchemy/api.py
+--- a/glance/db/sqlalchemy/api.py	2026-10-26 03:09:12.000000000 +0000
++++ b/glance/db/sqlalchemy/api.py	2026-10-26 03:48:11.929427501 +0000
+@@ -214,6 +214,16 @@
+         # Perform authorization check
+         check_mutate_authorization(context, image_ref)
+ 
++        # Ownership is necessary but not sufficient: a protected image has
++        # to be unprotected through the update path before it may be
++        # removed.  This is the last line of defence, since callers such as
++        # the registry service reach this function without passing through
++        # either public API's own protected-image guard.
++        if image_ref.protected:
++            msg = _("Image %s is protected and cannot be deleted") % image_id
++            LOG.info(msg)
++            raise exception.Forbidden(msg)
++
+         image_ref.delete(session=session)
+ 
+         for prop_ref in image_ref.properties:

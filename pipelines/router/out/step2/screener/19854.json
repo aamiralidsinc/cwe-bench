@@ -1,0 +1,83 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "19854", "advisory_ids": ["GHSA-XGX4-4H9W-53PV", "CVE-2026-47703", "GO-2026-5756"],
+  "repo": "adguardteam/dnsproxy", "pinned_commit": "05f86f08e51351db253aa692c6ebb4a77a561e82",
+  "fix_commits": ["f00d992ce9567a50f596853978ad6500acfdcf1d"],
+  "trust_decision": {
+    "summary": "Whether an outbound plain-DNS message may carry a caller-supplied zero transaction ID over UDP: decided in upstream/plain.go dialExchange, where a zero ID must be replaced by a random one for UDP only and the caller's original ID restored on the response.",
+    "evidence": ["upstream/plain.go:95-102", "upstream/plain.go:112", "upstream/plain.go:120", "fix.diff:256-275", "fix.diff:219-224"]
+  },
+  "landing_point": {
+    "where": "proxy/serverquic.go:282",
+    "why": "The summary names a DoQ-to-UDP path, so an engineer looks first at the DoQ server handler that unpacks the client message and hands it to the resolver; the ID-0 requirement is documented right there (proxy/serverquic.go:339-345)."
+  },
+  "fix_sites": [{
+    "where": "upstream/plain.go:95-127",
+    "entry_point": "upstream.(*plainDNS).Exchange, the exported Upstream API (upstream/plain.go:139), reached from the DoQ listener (proxy/serverquic.go:253-287), the DoH listener (proxy/serverhttps.go:177-184), the plain UDP listener (proxy/serverudp.go:147-159), the plain TCP listener (proxy/servertcp.go:179-187) and Proxy.LookupNetIP (proxy/lookup.go:32-36)",
+    "module_kind": "library (upstream resolver, package upstream)"
+  }, {
+    "where": "fix.diff:256-275",
+    "entry_point": "new helper setRequestForNetwork, called only from upstream/plain.go dialExchange",
+    "module_kind": "library (upstream resolver, package upstream)"
+  }],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "RFC 9250 and RFC 8484 make ID 0 the expected shape for DoQ/DoH (proxy/serverquic.go:339-345 deliberately accepts any ID; upstream/doh.go:154-167 and upstream/doq.go:171-184 zero it by design), so a solver can call a zero ID legitimate and leave the DoQ-to-UDP path as it is.",
+  "O4_distance": {"files": 4, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The response returned to the caller must keep the caller's original message ID: the DoQ/DoH servers write d.Res back to the client, and a caller-supplied nonzero ID must not be replaced (upstream/dot.go:211-213 and upstream/plain_internal_test.go:41-67 both treat a response ID differing from the request ID as an error). A fix that mutates req.Id in place instead of copying and restoring breaks that contract and races with concurrent users of the same message.",
+    "where": "upstream/doq.go:178-184"
+  },
+  "O6_input_shapes": [
+    "dns.Msg with Id == 0 (DoQ clients per RFC 9250, DoH clients per RFC 8484, and Proxy.LookupNetIP requests built with SetQuestion)",
+    "dns.Msg with a non-zero caller ID (must be forwarded unchanged and must not be rewritten in place)",
+    "network UDP vs network TCP: only UDP gets the new ID, TCP keeps the original",
+    "truncated UDP answer, which retries over TCP with the unmodified request"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "proxy/serverquic.go:253-282 (DoQ handler unpacks a client message whose ID is normally 0) and proxy/lookup.go:32 (SetQuestion leaves Id 0)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [{
+    "where": "upstream/dot.go:201-213",
+    "sibling": "a second plain-DNS message-writing implementation next to the TLS one, which would need its own zero-ID handling",
+    "why_realistic": "dot.go already builds and checks DNS messages by hand (dns.Conn.WriteMsg/ReadMsg plus an explicit reply.Id != req.Id check), so a maintainer splitting plain.go into a pooled or connected exchange would naturally copy that shape."
+  }, {
+    "where": "proxy/serverquic.go:282-287",
+    "sibling": "normalising the DoQ request (for example re-randomising d.Req.Id) in the server handler before it reaches the resolver",
+    "why_realistic": "AdGuard Home historically zeroed IDs at the DoQ server, and this handler already owns the DoQ-specific protocol rules, so a maintainer could put the fix here as a composition wrapper."
+  }, {
+    "where": "proxy/lookup.go:32-36",
+    "sibling": "a direct lookup path that constructs its own message (Id 0 from SetQuestion) and exchanges it outside Proxy.Resolve",
+    "why_realistic": "This helper already fabricates DNS messages in the proxy layer rather than the upstream layer; adding a fast path for internal A/AAAA or PTR lookups is a small, plausible change."
+  }, {
+    "where": "internal/bootstrap/bootstrap.go:44-60",
+    "sibling": "a bootstrap resolver that sends its own plain UDP queries to bootstrap addresses instead of going through upstream.plainDNS",
+    "why_realistic": "The bootstrap package owns dialing and hostname resolution and is deliberately independent of package upstream, so a resolver added there would duplicate message construction and could keep ID 0."
+  }],
+  "O9_family": "insufficient randomness in the outbound DNS transaction ID (off-path spoofing / cache-poisoning class), CWE-330, with CWE-362/CWE-662 concerns around mutating a caller-shared message",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.26.1 at the pinned commit (go.mod:3), Makefile GOTOOLCHAIN=go1.26.1; module github.com/AdguardTeam/dnsproxy with deps fetched from proxy.golang.org",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "upstream/plain_internal_test.go:18-67 and :69+ run against a local UDP/TCP test DNS server (startDNSServer), including TestUpstream_plainDNS, TestUpstream_plainDNS_badID and TestUpstream_plainDNS_fallbackToTCP; proxy/proxy_internal_test.go:593 TestExchangeWithReservedDomains covers routing; upstream/upstream_internal_test.go:119-234 TestUpstreams performs real exchanges with public resolvers (8.8.8.8, 1.1.1.1, tls://..., quic://...), so the full suite is not offline even though the affected plain-UDP behaviour is exercisable on loopback."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["single_site", "tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "internal/cmd/proxy.go, proxy/errors.go, proxy/errors_plan9.go, upstream/doh.go, upstream/doq.go, upstream/plain.go, upstream/upstream.go", "j_sibling_sites": "no", "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Randomise or mutate d.Req.Id in the DoQ (or DoH) server handler before forwarding instead of in the plain-UDP upstream exchange"},
+  "out_of_scope_notes": [
+    "The fix commit also carries unrelated refactors inside the same diff (toolchain bump in Makefile/bamboo/docker/go.mod, build-tag cleanup in proxy/errors*.go, slices.Contains in upstream/doh.go, strings.SplitSeq in internal/cmd/proxy.go, min()/wg.Go test tidy-ups); they are not part of the protection and were not screened."
+  ],
+  "unverified": [
+    "Repo size was not measured (no shell in this session); 117 .go files with no vendored dependencies indicate well under 5 MB, so tiny_repo is asserted from file count, not from du.",
+    "The advisory text itself was not readable offline; the protection was inferred from the fix diff and the RFC comments in the code.",
+    "regression_tests_in_pinned_commit judged not to hold: the diff's test-file edits are cosmetic (min(), wg.Go, TEST-NET addresses) and no test of the new ID randomisation exists at the pinned commit, so no hidden test is leaked.",
+    "No later tree or release was available, so latest-code presence of the routes was not checked; O8 is empty at the pinned commit."
+  ]
+}

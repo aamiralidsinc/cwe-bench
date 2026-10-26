@@ -1,0 +1,121 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "15420",
+  "advisory_ids": ["GHSA-3CCM-4QQ2-5WRP", "CVE-2026-100836", "GO-2026-5864"],
+  "repo": "edgelesssys/contrast",
+  "pinned_commit": "5c266fa3c4a3f9cede156306b6ded1b54887a1bb",
+  "fix_commits": ["d6584fbff816037472034f7ad6e08cdbab1d870d"],
+  "trust_decision": {
+    "summary": "The decode step trusts the base64-decoded ciphertext to be at least aesGCMNonceSize (12) bytes before slicing the nonce off, and the decrypt handler trusts that a ciphertext field was supplied at all; both decisions are made at request-decode time in coordinator/internal/transitengineapi on data that an mTLS-authenticated workload fully controls.",
+    "evidence": [
+      "coordinator/internal/transitengineapi/crypto.go:85-86",
+      "coordinator/internal/transitengineapi/crypto.go:66-88",
+      "coordinator/internal/transitengineapi/transitengineapi.go:47",
+      "coordinator/internal/transitengineapi/transitengineapi.go:191-202",
+      "fix.diff:13-15",
+      "fix.diff:38-47"
+    ]
+  },
+  "landing_point": {
+    "where": "coordinator/internal/transitengineapi/crypto.go:85",
+    "why": "The advisory summary names ciphertextContainer.UnmarshalJSON, and the fixed-offset slice fullCiphertext[:aesGCMNonceSize] is the first thing an engineer reads there."
+  },
+  "fix_sites": [
+    {
+      "where": "coordinator/internal/transitengineapi/crypto.go:85",
+      "entry_point": "PUT /v1/transit/decrypt/{name} (HTTP, mTLS mesh client cert required)",
+      "module_kind": "json decoder / crypto helper (serializer)"
+    },
+    {
+      "where": "coordinator/internal/transitengineapi/transitengineapi.go:47",
+      "entry_point": "PUT /v1/transit/decrypt/{name}",
+      "module_kind": "request struct definition (decoder schema; value -> pointer)"
+    },
+    {
+      "where": "coordinator/internal/transitengineapi/transitengineapi.go:202",
+      "entry_point": "PUT /v1/transit/decrypt/{name}",
+      "module_kind": "http handler (missing-field guard before keyVersion deref)"
+    },
+    {
+      "where": "coordinator/internal/transitengineapi/transitengineapi.go:216",
+      "entry_point": "PUT /v1/transit/decrypt/{name}",
+      "module_kind": "http handler (error mapping 500 -> 400)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "coordinator/internal/transitengineapi/crypto.go:47-62 (symmetricDecryptRaw; its gcm.Open at crypto.go:57 panics on a non-12-byte nonce)"
+  },
+  "O3_reason_to_dismiss": "symmetricDecryptRaw is unexported and has exactly one caller, the decrypt handler, whose input is already validated in UnmarshalJSON - so it is 'covered one layer up and not attacker-reachable'.",
+  "O4_distance": {
+    "files": 1,
+    "packages": 0,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "Encrypting an empty plaintext is legitimate: Plaintext has no minimum length (transitengineapi.go:41), seal of an empty plaintext yields a tag-only 16-byte ciphertext (28 bytes after the 12-byte nonce), and that is exactly what this API's own encrypt endpoint returns. An over-broad 'decoded length must be greater than nonce+tag' guard in UnmarshalJSON would reject ciphertext this API produced.",
+    "where": "coordinator/internal/transitengineapi/crypto.go:38"
+  },
+  "O6_input_shapes": [
+    "empty request body (no JSON at all) - already 400 via io.EOF before the fix",
+    "`{}` - ciphertext key absent, so UnmarshalJSON is never called and a zero-value container reaches gcm.Open with a 0-byte nonce",
+    "`\"ciphertext\": null` - decodes to a nil pointer without calling UnmarshalJSON",
+    "string with fewer than 3 colon-separated parts (`vaul`, `vault:v1`)",
+    "`vault:vX:<base64>` whose decoded length is under 12 bytes (truncated nonce)",
+    "`vault:vX:<base64>` decoding to 12+ bytes of random data - well-formed shape, GCM tag failure, must map to 400 rather than 500",
+    "non-string JSON value for ciphertext (number/array/object) - rejected by encoding/json into string"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "coordinator/internal/transitengineapi/crypto.go:66-88",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "coordinator/internal/transitengineapi/crypto.go:47-62",
+      "sibling": "A second symmetric primitive in the same package (e.g. symmetricDecryptWithExplicitNonce, or a key-version-0 legacy decrypt) that parses its own container instead of calling UnmarshalJSON",
+      "why_realistic": "The package doc at transitengineapi.go:4-6 declares a deliberate two-layer split (http handling vs crypto business logic), and crypto.go already hosts two symmetric primitives; a second one for an explicit-nonce or wrapped-key import path is the natural next commit."
+    },
+    {
+      "where": "coordinator/internal/transitengineapi/transitengineapi.go:40-49",
+      "sibling": "A new request field decoded the same way (e.g. a `wrapped_key` or client-supplied `nonce` for a v2 request shape) with its own fixed-offset parse",
+      "why_realistic": "The request structs already carry optional fields (associated_data, key_version) added incrementally against the upstream Vault/OpenBao transit spec documented at transitengineapi.go:107-109, so an added optional field is in character."
+    }
+  ],
+  "O9_family": "Improper validation of an array index / unchecked slice bounds on attacker-controlled input leading to panic (CWE-129), plus a nil-pointer and a GCM nonce-size panic on the same route",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.6 (go.mod:3); no vendor directory, so the first build needs module downloads, then works offline",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "coordinator/internal/transitengineapi/transitengineapi_test.go (TestTransitAPICyclic, httptest mux over getEncryptHandler/getDecryptHandler with a fake state guard) and crypto_test.go (TestCryptoCyclic); both are hermetic, no external services. e2e/vault/vault_test.go exercises the same API end to end but needs a Kubernetes cluster."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "coordinator/internal/transitengineapi/crypto.go, coordinator/internal/transitengineapi/transitengineapi.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add `if len(fullCiphertext) < aesGCMNonceSize` in UnmarshalJSON and stop - which still panics for `{}`/empty body (zero-value container reaches gcm.Open with a 0-byte nonce) and leaves the well-shaped-but-undecryptable case at 500 instead of 400."
+  },
+  "out_of_scope_notes": [
+    "nodeinstaller/internal/config/config.go:81,84 slices f.Integrity[:7] and nodeinstaller/internal/asset/fetcher.go:77,85,87 slices integrity[:7] with no length check - same unchecked-slice panic class but a different sink (SRI digest parsing), not this advisory's protection; noted only, not pursued.",
+    "internal/atls/atls.go:326,492 base64-decode client/server nonces but never slice at a fixed offset, so they are not a second implementation of this sink; noted while searching for one, not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB not measured (no shell in this session); judged from 284 Go files plus docs/e2e trees, so neither tiny_repo nor giant_repo is claimed.",
+    "Whether the hidden tests will drive the unexported symmetricDecryptRaw directly, which decides whether the O2 lower_level_api site can be scored at all.",
+    "Only the advisory summary was supplied offline, so the exact published write-up and therefore recall_risk are inferred from the project's niche (contrast) rather than observed.",
+    "The panic (rather than error) behaviour of crypto/cipher GCM.Open on a wrong-size nonce is taken from the Go implementation as known, not re-read from stdlib source in this session."
+  ]
+}

@@ -1,0 +1,126 @@
+diff --git a/esphome_device_builder/__main__.py b/esphome_device_builder/__main__.py
+index 23b1833..4c74b1d 100644
+--- a/esphome_device_builder/__main__.py
++++ b/esphome_device_builder/__main__.py
+@@ -322,6 +322,8 @@ def main() -> None:
+ 
+     _warn_deprecated_credential_flags(args)
+ 
++    _warn_legacy_credential_env(args)
++
+     # ``--version`` / ``--help`` exit above before reaching this
+     # point, so the lazy imports below are reachable only when the
+     # user actually meant to run the dashboard. Gate on
+@@ -463,17 +465,46 @@ def _format_version() -> str:
+     return f"{base} (esphome {esphome})"
+ 
+ 
++def _resolve_pair(args: argparse.Namespace) -> tuple[str, str, bool]:
++    """Resolve the pair through flags, the current names, then the old pair."""
++    username = args.username or os.getenv("ESPHOME_USERNAME") or ""
++    password = args.password or os.getenv("ESPHOME_PASSWORD") or ""
++    legacy = False
++    if not username and not password and os.getenv("PASSWORD"):
++        username = os.getenv("USERNAME", "")
++        password = os.getenv("PASSWORD", "")
++        legacy = bool(username and password)
++    return username, password, legacy
++
++
+ def _validate_credentials(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+     """Reject mismatched --username / --password (or env equivalents)."""
+-    has_user = bool(args.username or os.getenv("ESPHOME_USERNAME"))
+-    has_pass = bool(args.password or os.getenv("ESPHOME_PASSWORD"))
+-    if has_user != has_pass:
++    username, password, _legacy = _resolve_pair(args)
++    if bool(username) != bool(password):
+         parser.error(
+             "--username and --password must both be set (or both unset). "
+             "Use $ESPHOME_USERNAME / $ESPHOME_PASSWORD env vars as alternatives."
+         )
+ 
+ 
++def _warn_legacy_credential_env(args: argparse.Namespace) -> None:
++    """Warn loudly when auth came from the deprecated bare $USERNAME / $PASSWORD."""
++    _username, _password, legacy = _resolve_pair(args)
++    if not legacy:
++        return
++    banner = "=" * 70
++    logging.getLogger(_LOGGER_NAME).warning(
++        "\n%s\n"
++        " DEPRECATION: authenticating with the legacy $USERNAME / $PASSWORD\n"
++        " environment variables. Rename them to $ESPHOME_USERNAME /\n"
++        " $ESPHOME_PASSWORD; the bare names will stop working in a future\n"
++        " release.\n"
++        "%s",
++        banner,
++        banner,
++    )
++
++
+ def _warn_deprecated_credential_flags(args: argparse.Namespace) -> None:
+     """Log a deprecation warning when --username / --password are used."""
+     if not (args.username or args.password):
+diff --git a/esphome_device_builder/api/ws.py b/esphome_device_builder/api/ws.py
+index d607120..c7bd4ef 100644
+--- a/esphome_device_builder/api/ws.py
++++ b/esphome_device_builder/api/ws.py
+@@ -37,10 +37,7 @@ if TYPE_CHECKING:
+ _LOGGER = logging.getLogger(__name__)
+ 
+ # Commands a client may send before the authenticated flag is set.
+-# ``dashboard/summary`` is listed because the sign-in view shows which
+-# instance (configuration location and managed devices) the operator is
+-# connecting to while the login form is still open.
+-_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login", "dashboard/summary"})
++_PRE_AUTH_COMMANDS = frozenset({"auth", "auth/login"})
+ 
+ # Server-side WebSocket ping interval. aiohttp's default is ``None``
+ # (no heartbeat) — without one, idle clients behind NAT / Cloudflare
+diff --git a/esphome_device_builder/controllers/config/settings.py b/esphome_device_builder/controllers/config/settings.py
+index 7c54246..8e33fc2 100644
+--- a/esphome_device_builder/controllers/config/settings.py
++++ b/esphome_device_builder/controllers/config/settings.py
+@@ -101,15 +101,14 @@ class DashboardSettings:
+         """Parse CLI arguments into settings."""
+         self.on_ha_addon = getattr(args, "ha_addon", False)
+         self.allow_public_port = getattr(args, "ha_addon_allow_public", False)
+-        # Env-var fallback uses ``ESPHOME_*`` rather than the legacy
+-        # dashboard's bare ``USERNAME`` / ``PASSWORD``: the bare names
+-        # collide with login-shell / Windows system vars (``$USERNAME``
+-        # is the OS user on both), which would silently promote the
+-        # OS user to the dashboard username when only ``--password``
+-        # / ``$ESPHOME_PASSWORD`` is set. Intentional divergence from
+-        # ``esphome/dashboard/settings.py``.
+-        username = getattr(args, "username", None) or os.getenv("ESPHOME_USERNAME") or ""
+-        password = getattr(args, "password", None) or os.getenv("ESPHOME_PASSWORD") or ""
++        # Fall back through the pre-rename names once the current scheme has
++        # supplied nothing, but only when the old password half is present: a
++        # lone ``$USERNAME`` is the login-shell user and must stay ignored.
++        username = getattr(args, "username", "") or os.getenv("ESPHOME_USERNAME") or ""
++        password = getattr(args, "password", "") or os.getenv("ESPHOME_PASSWORD") or ""
++        if not username and not password and os.getenv("PASSWORD"):
++            username = os.getenv("USERNAME", "")
++            password = os.getenv("PASSWORD", "")
+         self.username = username
+         self.using_password = bool(username and password)
+         if self.using_password:
+diff --git a/esphome_device_builder/helpers/auth.py b/esphome_device_builder/helpers/auth.py
+index faff1a7..0633ca9 100644
+--- a/esphome_device_builder/helpers/auth.py
++++ b/esphome_device_builder/helpers/auth.py
+@@ -319,13 +319,10 @@ def parse_basic_auth(authorization: str) -> tuple[str, str] | None:
+ # /version is public so the upstream Docker image's HEALTHCHECK
+ # (curl --fail .../version) keeps passing when a password is set; it
+ # exposes only the esphome version, matching the legacy dashboard.
+-# /api/config/export/ bypasses too: the editor's "Download configuration"
+-# action opens the file as a plain navigation, which can't attach a bearer
+-# header, so the route is served alongside the other public downloads.
+ _PUBLIC_PATHS = frozenset(
+     {"/", "/ws", "/favicon.ico", "/manifest.json", "/version", "/api/firmware/download"}
+ )
+-_PUBLIC_PREFIXES = ("/assets/", "/boards/images/", "/api/config/export/")
++_PUBLIC_PREFIXES = ("/assets/", "/boards/images/")
+ 
+ # Content-hash segment in a frontend bundle filename (app.<hash>.js,
+ # chunks, vendors, .js.map / .js.LICENSE.txt sidecars). These load from the

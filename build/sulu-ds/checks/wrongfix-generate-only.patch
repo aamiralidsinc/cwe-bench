@@ -1,0 +1,259 @@
+diff --git a/src/Sulu/Bundle/PreviewBundle/Application/Manager/PreviewLinkManager.php b/src/Sulu/Bundle/PreviewBundle/Application/Manager/PreviewLinkManager.php
+index 997812c..088a134 100644
+--- a/src/Sulu/Bundle/PreviewBundle/Application/Manager/PreviewLinkManager.php
++++ b/src/Sulu/Bundle/PreviewBundle/Application/Manager/PreviewLinkManager.php
+@@ -17,6 +17,9 @@ use Sulu\Bundle\PreviewBundle\Domain\Event\PreviewLinkRevokedEvent;
+ use Sulu\Bundle\PreviewBundle\Domain\Model\PreviewLinkInterface;
+ use Sulu\Bundle\PreviewBundle\Domain\Repository\PreviewLinkRepositoryInterface;
+ use Sulu\Bundle\PreviewBundle\Preview\Object\PreviewObjectProviderRegistryInterface;
++use Sulu\Component\Security\Authorization\PermissionTypes;
++use Sulu\Component\Security\Authorization\SecurityCheckerInterface;
++use Sulu\Component\Security\Authorization\SecurityCondition;
+ use Symfony\Component\Routing\RouterInterface;
+ 
+ class PreviewLinkManager implements PreviewLinkManagerInterface
+@@ -26,6 +29,7 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+         private DomainEventCollectorInterface $domainEventCollector,
+         private PreviewObjectProviderRegistryInterface $previewObjectProviderRegistry,
+         private RouterInterface $router,
++        private ?SecurityCheckerInterface $securityChecker = null,
+     ) {
+     }
+ 
+@@ -35,6 +39,9 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+         string $locale,
+         array $options
+     ): PreviewLinkInterface {
++        $securityContext = $this->resolveSecurityContext($resourceKey, $resourceId, $locale);
++        $this->checkViewPermission($securityContext, $locale);
++
+         $previewLink = $this->previewLinkRepository->create($resourceKey, $resourceId, $locale, $options);
+         $this->previewLinkRepository->add($previewLink);
+         $this->domainEventCollector->collect(
+@@ -51,7 +58,7 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+                     'locale' => $locale,
+                     'options' => $options,
+                 ],
+-                $this->resolveSecurityContext($resourceKey, $resourceId, $locale)
++                $securityContext
+             )
+         );
+         $this->previewLinkRepository->commit();
+@@ -61,6 +68,8 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+ 
+     public function revoke(string $resourceKey, string $resourceId, string $locale): void
+     {
++        $securityContext = $this->resolveSecurityContext($resourceKey, $resourceId, $locale);
++
+         $previewLink = $this->previewLinkRepository->findByResource($resourceKey, $resourceId, $locale);
+         if (!$previewLink) {
+             return;
+@@ -78,7 +87,7 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+                 $resourceKey,
+                 $resourceId,
+                 $link,
+-                $this->resolveSecurityContext($resourceKey, $resourceId, $locale)
++                $securityContext
+             )
+         );
+         $this->previewLinkRepository->commit();
+@@ -90,4 +99,16 @@ class PreviewLinkManager implements PreviewLinkManagerInterface
+ 
+         return $provider->getSecurityContext($resourceId, $locale);
+     }
++
++    private function checkViewPermission(?string $securityContext, string $locale): void
++    {
++        if (null === $this->securityChecker || null === $securityContext) {
++            return;
++        }
++
++        $this->securityChecker->checkPermission(
++            new SecurityCondition($securityContext, $locale),
++            PermissionTypes::VIEW
++        );
++    }
+ }
+diff --git a/src/Sulu/Bundle/PreviewBundle/Resources/config/services.php b/src/Sulu/Bundle/PreviewBundle/Resources/config/services.php
+index c9bf3f3..85ce6f0 100644
+--- a/src/Sulu/Bundle/PreviewBundle/Resources/config/services.php
++++ b/src/Sulu/Bundle/PreviewBundle/Resources/config/services.php
+@@ -93,6 +93,7 @@ return static function(ContainerConfigurator $container) {
+             new Reference('sulu_activity.domain_event_collector'),
+             new Reference('sulu_preview.preview_object_provider_registry'),
+             new Reference('router'),
++            new Reference('sulu_security.security_checker', ContainerInterface::NULL_ON_INVALID_REFERENCE),
+         ]);
+ 
+     // Controller
+@@ -123,6 +124,8 @@ return static function(ContainerConfigurator $container) {
+             new Reference('sulu_preview.preview_link_manager'),
+             new Reference('fos_rest.view_handler'),
+             new Reference('security.token_storage'),
++            new Reference('sulu_preview.preview_object_provider_registry'),
++            new Reference('sulu_security.security_checker', ContainerInterface::NULL_ON_INVALID_REFERENCE),
+         ])
+         ->tag('sulu.context', ['context' => 'admin']);
+ 
+@@ -130,6 +133,7 @@ return static function(ContainerConfigurator $container) {
+         ->public()
+         ->args([
+             new Reference('sulu_preview.preview_link_repository'),
++            new Reference('sulu_preview.preview_object_provider_registry'),
+             new Reference('sulu_security.security_checker'),
+             new Reference('router'),
+         ])
+@@ -139,6 +143,8 @@ return static function(ContainerConfigurator $container) {
+         ->public()
+         ->args([
+             new Reference('sulu_preview.preview_link_repository'),
++            new Reference('sulu_preview.preview_object_provider_registry'),
++            new Reference('sulu_security.security_checker'),
+             new Reference('router'),
+         ])
+         ->tag('sulu.context', ['context' => 'admin']);
+diff --git a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkController.php b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkController.php
+index 19d4f99..72d072a 100644
+--- a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkController.php
++++ b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkController.php
+@@ -16,10 +16,14 @@ use HandcraftedInTheAlps\RestRoutingBundle\Controller\Annotations\RouteResource;
+ use HandcraftedInTheAlps\RestRoutingBundle\Routing\ClassResourceInterface;
+ use Sulu\Bundle\PreviewBundle\Application\Manager\PreviewLinkManagerInterface;
+ use Sulu\Bundle\PreviewBundle\Domain\Repository\PreviewLinkRepositoryInterface;
++use Sulu\Bundle\PreviewBundle\Preview\Object\PreviewObjectProviderRegistryInterface;
+ use Sulu\Component\Rest\AbstractRestController;
+ use Sulu\Component\Rest\Exception\MissingParameterException;
+ use Sulu\Component\Rest\Exception\RestException;
+ use Sulu\Component\Rest\RequestParametersTrait;
++use Sulu\Component\Security\Authorization\PermissionTypes;
++use Sulu\Component\Security\Authorization\SecurityCheckerInterface;
++use Sulu\Component\Security\Authorization\SecurityCondition;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+ use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
+@@ -35,7 +39,9 @@ class PreviewLinkController extends AbstractRestController implements ClassResou
+         private PreviewLinkRepositoryInterface $previewLinkRepository,
+         private PreviewLinkManagerInterface $previewLinkManager,
+         ViewHandlerInterface $viewHandler,
+-        ?TokenStorageInterface $tokenStorage = null
++        ?TokenStorageInterface $tokenStorage = null,
++        private ?PreviewObjectProviderRegistryInterface $previewObjectProviderRegistry = null,
++        private ?SecurityCheckerInterface $securityChecker = null,
+     ) {
+         parent::__construct($viewHandler, $tokenStorage);
+     }
+@@ -50,6 +56,8 @@ class PreviewLinkController extends AbstractRestController implements ClassResou
+             return $this->handleView($this->view(null, 404));
+         }
+ 
++        $this->checkViewPermission($previewLink->getResourceKey(), $previewLink->getResourceId(), $previewLink->getLocale());
++
+         return $this->handleView($this->view($previewLink));
+     }
+ 
+@@ -82,4 +90,22 @@ class PreviewLinkController extends AbstractRestController implements ClassResou
+             return $this->handleView($this->view($ex->toArray(), 400));
+         }
+     }
++
++    private function checkViewPermission(string $resourceKey, string $resourceId, string $locale): void
++    {
++        if (null === $this->securityChecker || null === $this->previewObjectProviderRegistry) {
++            return;
++        }
++
++        $provider = $this->previewObjectProviderRegistry->getPreviewObjectProvider($resourceKey);
++        $securityContext = $provider->getSecurityContext($resourceId, $locale);
++        if (null === $securityContext) {
++            return;
++        }
++
++        $this->securityChecker->checkPermission(
++            new SecurityCondition($securityContext, $locale),
++            PermissionTypes::VIEW
++        );
++    }
+ }
+diff --git a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkRotationController.php b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkRotationController.php
+index 0020409..5453068 100644
+--- a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkRotationController.php
++++ b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkRotationController.php
+@@ -12,6 +12,10 @@
+ namespace Sulu\Bundle\PreviewBundle\UserInterface\Controller;
+ 
+ use Sulu\Bundle\PreviewBundle\Domain\Repository\PreviewLinkRepositoryInterface;
++use Sulu\Bundle\PreviewBundle\Preview\Object\PreviewObjectProviderRegistryInterface;
++use Sulu\Component\Security\Authorization\PermissionTypes;
++use Sulu\Component\Security\Authorization\SecurityCheckerInterface;
++use Sulu\Component\Security\Authorization\SecurityCondition;
+ use Symfony\Component\HttpFoundation\JsonResponse;
+ use Symfony\Component\HttpFoundation\Request;
+ use Symfony\Component\HttpFoundation\Response;
+@@ -24,6 +28,8 @@ class PreviewLinkRotationController
+ {
+     public function __construct(
+         private PreviewLinkRepositoryInterface $previewLinkRepository,
++        private PreviewObjectProviderRegistryInterface $previewObjectProviderRegistry,
++        private SecurityCheckerInterface $securityChecker,
+         private RouterInterface $router,
+     ) {
+     }
+@@ -33,6 +39,15 @@ class PreviewLinkRotationController
+         $resourceKey = $request->query->get('resourceKey', 'pages');
+         $locale = $request->query->get('locale', 'en');
+ 
++        $provider = $this->previewObjectProviderRegistry->getPreviewObjectProvider($resourceKey);
++        $securityContext = $provider->getSecurityContext($resourceId, $locale);
++        if (null !== $securityContext) {
++            $this->securityChecker->checkPermission(
++                new SecurityCondition($securityContext, $locale),
++                PermissionTypes::VIEW
++            );
++        }
++
+         $previewLink = $this->previewLinkRepository->findByResource($resourceKey, $resourceId, $locale);
+         if (!$previewLink) {
+             return new JsonResponse(['message' => 'No preview link exists for this resource.'], 404);
+diff --git a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkShareController.php b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkShareController.php
+index e619628..2d89413 100644
+--- a/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkShareController.php
++++ b/src/Sulu/Bundle/PreviewBundle/UserInterface/Controller/PreviewLinkShareController.php
+@@ -12,6 +12,7 @@
+ namespace Sulu\Bundle\PreviewBundle\UserInterface\Controller;
+ 
+ use Sulu\Bundle\PreviewBundle\Domain\Repository\PreviewLinkRepositoryInterface;
++use Sulu\Bundle\PreviewBundle\Preview\Object\PreviewObjectProviderRegistryInterface;
+ use Sulu\Component\Security\Authorization\PermissionTypes;
+ use Sulu\Component\Security\Authorization\SecurityCheckerInterface;
+ use Sulu\Component\Security\Authorization\SecurityCondition;
+@@ -25,10 +26,9 @@ use Symfony\Component\Routing\RouterInterface;
+  */
+ class PreviewLinkShareController
+ {
+-    private const WEBSPACE_SECURITY_CONTEXT = 'sulu.webspaces.%s';
+-
+     public function __construct(
+         private PreviewLinkRepositoryInterface $previewLinkRepository,
++        private PreviewObjectProviderRegistryInterface $previewObjectProviderRegistry,
+         private SecurityCheckerInterface $securityChecker,
+         private RouterInterface $router,
+     ) {
+@@ -44,10 +44,14 @@ class PreviewLinkShareController
+             return new JsonResponse(['message' => 'The "webspaceKey" parameter is required.'], 400);
+         }
+ 
+-        $this->securityChecker->checkPermission(
+-            new SecurityCondition(\sprintf(self::WEBSPACE_SECURITY_CONTEXT, $webspaceKey), $locale),
+-            PermissionTypes::VIEW
+-        );
++        $provider = $this->previewObjectProviderRegistry->getPreviewObjectProvider($resourceKey);
++        $securityContext = $provider->getSecurityContext($resourceId, $locale);
++        if (null !== $securityContext) {
++            $this->securityChecker->checkPermission(
++                new SecurityCondition($securityContext, $locale),
++                PermissionTypes::VIEW
++            );
++        }
+ 
+         $previewLink = $this->previewLinkRepository->findByResource($resourceKey, $resourceId, $locale);
+         if ($previewLink) {

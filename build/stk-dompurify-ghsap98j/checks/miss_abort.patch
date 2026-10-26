@@ -1,0 +1,221 @@
+--- a/src/purify.ts
++++ b/src/purify.ts
+@@ -1135,6 +1135,14 @@
+    * @param node a DOM node
+    */
+   const _forceRemove = function (node: Node): void {
++    /* Neutralize at the point of detach. The end-of-walk pass iterates
++       DOMPurify.removed, which a re-entrant sanitize call from inside a hook
++       replaces with a fresh array; scrubbing here makes the guarantee
++       independent of that inventory. */
++    if (IN_PLACE) {
++      _neutralizeSubtree(node);
++    }
++
+     arrayPush(DOMPurify.removed, { element: node });
+ 
+     try {
+@@ -1328,6 +1336,54 @@
+   };
+ 
+   /**
++   * _handleHookDetachedNode
++   *
++   * A hook is allowed to remove the node it is called on (a documented
++   * pattern). On the IN_PLACE path the caller's live tree is what can still
++   * fire a queued resource event, so any subtree that leaves that tree during
++   * the walk must have its non-allowlisted attributes stripped before
++   * sanitize returns. The hook may detach the node it was invoked with, or an
++   * ancestor / sibling / child of it, and the iterator does not revisit a
++   * detached subtree; therefore check containment against the current walk
++   * root, not only the node's own parent, and strip the topmost detached
++   * subtree.
++   *
++   * @param currentNode the node a hook was just called on
++   * @param root the current walk root
++   * @return true when the node is no longer part of the walk tree
++   */
++  const _handleHookDetachedNode = function (
++    currentNode: Node,
++    root: Node
++  ): boolean {
++    if (!IN_PLACE || currentNode === root) {
++      return false;
++    }
++
++    let node: Node | null = getParentNode(currentNode);
++    while (node) {
++      if (node === root) {
++        return false;
++      }
++
++      node = getParentNode(node);
++    }
++
++    /* No ancestor chain to the walk root: the node (or one of its
++       ancestors) left the tree. Strip the topmost detached subtree, so the
++       originals that hold any queued event are scrubbed. */
++    let top = currentNode;
++    let parent = getParentNode(top);
++    while (parent) {
++      top = parent;
++      parent = getParentNode(top);
++    }
++
++    _neutralizeSubtree(top);
++    return true;
++  };
++
++  /**
+    * _initDocument
+    *
+    * @param dirty - a string of dirty markup
+@@ -1748,10 +1804,21 @@
+    * @param currentNode to check for permission to exist
+    * @return true if node was killed, false if left alive
+    */
+-  const _sanitizeElements = function (currentNode: any): boolean {
++  const _sanitizeElements = function (
++    currentNode: any,
++    root: Node
++  ): boolean {
+     /* Execute a hook if present */
+     _executeHooks(hooks.beforeSanitizeElements, currentNode, null);
+ 
++    /* A hook may have detached the node it was called on. */
++    if (
++      hooks.beforeSanitizeElements.length > 0 &&
++      _handleHookDetachedNode(currentNode, root)
++    ) {
++      return true;
++    }
++
+     /* Check if element is clobbered or can clobber */
+     if (_isClobbered(currentNode)) {
+       _forceRemove(currentNode);
+@@ -1769,6 +1836,14 @@
+       allowedTags: ALLOWED_TAGS,
+     });
+ 
++    /* The upon-hook may have detached the node as well. */
++    if (
++      hooks.uponSanitizeElement.length > 0 &&
++      _handleHookDetachedNode(currentNode, root)
++    ) {
++      return true;
++    }
++
+     /* Remove mXSS vectors, processing instructions and risky comments */
+     if (_isUnsafeNode(currentNode, tagName)) {
+       _forceRemove(currentNode);
+@@ -1784,7 +1859,24 @@
+       ) &&
+         !ALLOWED_TAGS[tagName])
+     ) {
+-      return _sanitizeDisallowedNode(currentNode, tagName);
++      const removed = _sanitizeDisallowedNode(currentNode, tagName);
++
++      /* A false return keeps a custom element that the configured policy
++         allows. It must still run the element post-hook, exactly like a
++         normally-allowed element, or an application policy applied there
++         silently skips it. */
++      if (removed === false) {
++        _executeHooks(hooks.afterSanitizeElements, currentNode, null);
++
++        if (
++          hooks.afterSanitizeElements.length > 0 &&
++          _handleHookDetachedNode(currentNode, root)
++        ) {
++          return true;
++        }
++      }
++
++      return removed;
+     }
+ 
+     /* Check whether element has a valid namespace.
+@@ -1824,7 +1916,12 @@
+     /* Execute a hook if present */
+     _executeHooks(hooks.afterSanitizeElements, currentNode, null);
+ 
+-    return false;
++    /* The afterSanitizeElements hook is a documented place to remove a node;
++       treat a node that left the walk tree as removed and neutralize it. */
++    return (
++      hooks.afterSanitizeElements.length > 0 &&
++      _handleHookDetachedNode(currentNode, root)
++    );
+   };
+ 
+   /**
+@@ -2051,11 +2148,22 @@
+    * @protect setAttribute
+    *
+    * @param currentNode to sanitize
++   * @param root the current walk root
+    */
+-  const _sanitizeAttributes = function (currentNode: Element): void {
++  const _sanitizeAttributes = function (
++    currentNode: Element,
++    root: Node
++  ): void {
+     /* Execute a hook if present */
+     _executeHooks(hooks.beforeSanitizeAttributes, currentNode, null);
+ 
++    if (
++      hooks.beforeSanitizeAttributes.length > 0 &&
++      _handleHookDetachedNode(currentNode, root)
++    ) {
++      return;
++    }
++
+     const { attributes } = currentNode;
+ 
+     /* Check if we have attributes; if not we might have a text node */
+@@ -2166,6 +2274,10 @@
+ 
+     /* Execute a hook if present */
+     _executeHooks(hooks.afterSanitizeAttributes, currentNode, null);
++
++    if (hooks.afterSanitizeAttributes.length > 0) {
++      _handleHookDetachedNode(currentNode, root);
++    }
+   };
+ 
+   /**
+@@ -2185,10 +2297,10 @@
+       _executeHooks(hooks.uponSanitizeShadowNode, shadowNode, null);
+ 
+       /* Sanitize tags and elements */
+-      _sanitizeElements(shadowNode);
++      _sanitizeElements(shadowNode, fragment);
+ 
+       /* Check attributes next */
+-      _sanitizeAttributes(shadowNode);
++      _sanitizeAttributes(shadowNode, fragment);
+ 
+       /* Deep shadow DOM detected.
+          Realm-safe check (GHSA-hpcv-96wg-7vj8): use nodeType against the
+@@ -2489,7 +2601,8 @@
+     }
+ 
+     /* Get node iterator */
+-    const nodeIterator = _createNodeIterator(inPlace ? dirty : body);
++    const walkRoot = inPlace ? dirty : body;
++    const nodeIterator = _createNodeIterator(walkRoot);
+ 
+     /* Now start iterating over the created document.
+        The walk runs inside an exception barrier (campaign-3 F2): a re-entrant
+@@ -2503,10 +2616,10 @@
+     try {
+       while ((currentNode = nodeIterator.nextNode())) {
+         /* Sanitize tags and elements */
+-        _sanitizeElements(currentNode);
++        _sanitizeElements(currentNode, walkRoot);
+ 
+         /* Check attributes next */
+-        _sanitizeAttributes(currentNode);
++        _sanitizeAttributes(currentNode, walkRoot);
+ 
+         /* Shadow DOM detected, sanitize it.
+            Realm-safe check (GHSA-hpcv-96wg-7vj8): nodeType-based detection

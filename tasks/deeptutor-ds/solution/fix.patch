@@ -1,0 +1,252 @@
+diff --git a/deeptutor/agents/chat/agentic_pipeline.py b/deeptutor/agents/chat/agentic_pipeline.py
+--- a/deeptutor/agents/chat/agentic_pipeline.py
++++ b/deeptutor/agents/chat/agentic_pipeline.py
+@@ -203,6 +203,7 @@
+         self._usage = UsageTracker(model=self.model)
+         self._deferred_loader: DeferredToolLoader | None = None
+         self._deferred_pool: list[Any] = []
++        self._deferred_allowed: set[str] | None = None
+         self._exec_enabled = False
+ 
+         try:
+@@ -316,7 +317,9 @@
+                 for schema in tool_schemas
+                 if isinstance(schema, dict)
+             }
+-            for schema in persisted_tool_schemas(context.session_id, self.registry):
++            for schema in persisted_tool_schemas(
++                context.session_id, self.registry, self._deferred_allowed
++            ):
+                 name = str((schema.get("function") or {}).get("name") or "")
+                 if name and name not in known:
+                     tool_schemas.append(schema)
+@@ -452,10 +455,13 @@
+             from deeptutor.multi_user.tool_access import allowed_mcp_tools, combine_whitelists
+ 
+             raw_filter = context.metadata.get("mcp_tools_filter")
+-            allowed: set[str] | None = combine_whitelists(
+-                {str(name) for name in raw_filter} if isinstance(raw_filter, list) else None,
+-                allowed_mcp_tools(),
+-            )
++            caller_allowed = (
++                {str(name) for name in raw_filter} if isinstance(raw_filter, list) else None
++            )
++            is_partner = str((context.metadata or {}).get("source")) == "partner"
++            user_allowed = None if is_partner else allowed_mcp_tools()
++            allowed: set[str] | None = combine_whitelists(caller_allowed, user_allowed)
++            self._deferred_allowed = allowed
+             pool = self.registry.deferred_tools()
+             if allowed is not None:
+                 pool = [t for t in pool if t.get_definition().name in allowed]
+@@ -740,6 +746,7 @@
+                 tool=tn,
+                 default=f"An unknown error occurred while executing {tn}.",
+             ),
++            allowed_deferred=self._deferred_allowed,
+         )
+ 
+     async def _dispatch_tool_calls(
+@@ -770,6 +777,7 @@
+             retrieve_meta_factory=lambda meta, tn, ta: self._retrieve_trace_metadata(
+                 meta, context=context, tool_name=tn, tool_args=ta
+             ),
++            allowed_deferred=self._deferred_allowed,
+             tool_call_label=self._t("labels.tool_call", default="Tool call"),
+             retrieve_label=self._t("labels.retrieve", default="Retrieve"),
+             empty_tool_result_message=self._t("notices.empty_tool_result"),
+diff --git a/deeptutor/api/routers/plugins_api.py b/deeptutor/api/routers/plugins_api.py
+--- a/deeptutor/api/routers/plugins_api.py
++++ b/deeptutor/api/routers/plugins_api.py
+@@ -33,6 +33,16 @@
+ 
+ router = APIRouter()
+ ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
++
++
++def _tool_not_granted(tool: Any) -> bool:
++    """True when the current account may not use this extended tool."""
++    from deeptutor.multi_user.tool_access import allowed_mcp_tools
++
++    if tool is None or not getattr(tool, "deferred", False):
++        return False
++    allowed = allowed_mcp_tools()
++    return allowed is not None and tool.name not in allowed
+ 
+ 
+ def _discover_plugins() -> list[Any]:
+@@ -70,25 +80,30 @@
+     capability_registry = get_capability_registry()
+     plugin_manifests = _discover_plugins()
+ 
+-    tools = [
+-        {
+-            "name": definition.name,
+-            "description": definition.description,
+-            "description_i18n": tool_description_i18n(definition.name, definition.description),
+-            "parameters": [
+-                {
+-                    "name": parameter.name,
+-                    "type": parameter.type,
+-                    "description": parameter.description,
+-                    "required": parameter.required,
+-                    "default": parameter.default,
+-                    "enum": parameter.enum,
+-                }
+-                for parameter in definition.parameters
+-            ],
+-        }
+-        for definition in tool_registry.get_definitions()
+-    ]
++    tools = []
++    for definition in tool_registry.get_definitions():
++        if _tool_not_granted(tool_registry.get(definition.name)):
++            continue
++        tools.append(
++            {
++                "name": definition.name,
++                "description": definition.description,
++                "description_i18n": tool_description_i18n(
++                    definition.name, definition.description
++                ),
++                "parameters": [
++                    {
++                        "name": parameter.name,
++                        "type": parameter.type,
++                        "description": parameter.description,
++                        "required": parameter.required,
++                        "default": parameter.default,
++                        "enum": parameter.enum,
++                    }
++                    for parameter in definition.parameters
++                ],
++            }
++        )
+ 
+     capabilities = capability_registry.get_manifests()
+ 
+@@ -118,6 +133,11 @@
+     tool = registry.get(tool_name)
+     if not tool:
+         raise HTTPException(status_code=404, detail=t("api.tool_not_found", name=tool_name))
++    if _tool_not_granted(tool):
++        raise HTTPException(
++            status_code=403,
++            detail="This tool is not available for this account.",
++        )
+ 
+     try:
+         result = await tool.execute(**body.params)
+@@ -210,6 +230,9 @@
+     tool = registry.get(tool_name)
+     if not tool:
+         yield _sse("error", {"detail": t("api.tool_not_found", name=tool_name)})
++        return
++    if _tool_not_granted(tool):
++        yield _sse("error", {"detail": "This tool is not available for this account."})
+         return
+ 
+     event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+diff --git a/deeptutor/core/agentic/tool_dispatch.py b/deeptutor/core/agentic/tool_dispatch.py
+--- a/deeptutor/core/agentic/tool_dispatch.py
++++ b/deeptutor/core/agentic/tool_dispatch.py
+@@ -87,6 +87,7 @@
+     too_many_tool_calls_message: str | None = None,
+     unknown_error_message_factory: UnknownErrorMessageFactory | None = None,
+     trace_id_prefix: str = "iter",
++    allowed_deferred: set[str] | None = None,
+ ) -> DispatchOutcome:
+     """Execute tool calls in parallel and assemble a :class:`DispatchOutcome`."""
+     registry = registry or get_tool_registry()
+@@ -173,6 +174,7 @@
+             start_retrieval_message=start_retrieval_message,
+             unknown_error_message_factory=unknown_error_message_factory,
+             retrieve_label=retrieve_label,
++            allowed_deferred=allowed_deferred,
+         )
+ 
+     results = await asyncio.gather(*[_run_one(i) for i in range(len(prepared))])
+@@ -334,6 +336,7 @@
+     start_retrieval_message: str = "Starting retrieval",
+     retrieve_label: str = "Retrieve",
+     unknown_error_message_factory: UnknownErrorMessageFactory | None = None,
++    allowed_deferred: set[str] | None = None,
+ ) -> dict[str, Any]:
+     """Run one tool, emitting retrieve-flavored progress events when relevant.
+ 
+@@ -360,6 +363,22 @@
+                 **(metadata or {}),
+             ),
+         )
++
++    if allowed_deferred is not None:
++        guarded = registry.get(tool_name)
++        if (
++            guarded is not None
++            and getattr(guarded, "deferred", False)
++            and tool_name not in allowed_deferred
++        ):
++            return {
++                "result_text": "This tool is not available for this account.",
++                "success": False,
++                "sources": [],
++                "metadata": {"error_type": "tool_not_granted"},
++                "terminate_turn": False,
++                "pause_for_user": None,
++            }
+ 
+     if retrieve_meta is not None:
+         query = str(retrieve_meta.get("query") or tool_args.get("query") or "").strip()
+diff --git a/deeptutor/multi_user/tool_access.py b/deeptutor/multi_user/tool_access.py
+--- a/deeptutor/multi_user/tool_access.py
++++ b/deeptutor/multi_user/tool_access.py
+@@ -44,13 +44,19 @@
+ 
+ 
+ def allowed_mcp_tools() -> set[str] | None:
+-    """Whitelist of MCP (deferred) tool names, ``None`` = unrestricted."""
++    """Whitelist of MCP (deferred) tool names.
++
++    ``None`` means unrestricted and is reserved for administrators. A
++    non-admin account that was not explicitly granted MCP tool names gets an
++    empty whitelist, so a turn can neither list nor load deployment-wide MCP
++    host tools.
++    """
+     grant = _current_grant()
+     if grant is None:
+         return None
+     value = grant.get("mcp_tools")
+     if value is None:
+-        return None
++        return set()
+     return {str(name) for name in value}
+ 
+ 
+diff --git a/deeptutor/runtime/registry/deferred_tools.py b/deeptutor/runtime/registry/deferred_tools.py
+--- a/deeptutor/runtime/registry/deferred_tools.py
++++ b/deeptutor/runtime/registry/deferred_tools.py
+@@ -155,6 +155,8 @@
+             if str(getattr(tool, "server_name", "") or "") != server:
+                 continue
+             name = tool.get_definition().name
++            if not self._is_allowed(name):
++                continue
+             if name in self._loaded:
+                 already.append(name)
+                 continue
+@@ -178,6 +180,7 @@
+ def persisted_tool_schemas(
+     session_id: str,
+     registry: ToolRegistry,
++    allowed: set[str] | None = None,
+ ) -> list[dict[str, Any]]:
+     """Schemas for the extended tools this conversation already loaded.
+ 
+@@ -192,6 +195,8 @@
+         tool = registry.get(name)
+         if tool is None or not getattr(tool, "deferred", False):
+             continue
++        if allowed is not None and name not in allowed:
++            continue
+         schemas.append(tool.get_definition().to_openai_schema())
+     return schemas
+ 

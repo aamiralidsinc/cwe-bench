@@ -1,0 +1,343 @@
+diff --git a/src/app/api/chat/agentRuntime.ts b/src/app/api/chat/agentRuntime.ts
+index bb613822e8..cf0761934e 100644
+--- a/src/app/api/chat/agentRuntime.ts
++++ b/src/app/api/chat/agentRuntime.ts
+@@ -7,8 +7,10 @@ import {
+   TracePayload,
+   TraceTagMap,
+ } from '@/const/trace';
+-import { AgentRuntime, ChatStreamPayload, ModelProvider } from '@/libs/agent-runtime';
++import { AgentRuntime, AgentRuntimeError, ChatStreamPayload, ModelProvider } from '@/libs/agent-runtime';
+ import { TraceClient } from '@/libs/traces';
++import { ChatErrorType } from '@/types/fetch';
++import { isInternalDestination } from '@/utils/internalDestination';
+ 
+ import apiKeyManager from './apiKeyManager';
+ 
+@@ -26,13 +28,23 @@ export interface AgentChatOptions {
+  * @param payload - The JWT payload.
+  * @returns The options object.
+  */
+-const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
++const clientSuppliedEndpoint = async (endpoint?: string) => {
++  if (!endpoint) return undefined;
++
++  if (await isInternalDestination(endpoint)) {
++    throw AgentRuntimeError.createError(ChatErrorType.BadRequest);
++  }
++
++  return endpoint;
++};
++
++const getLlmOptionsFromPayload = async (provider: string, payload: JWTPayload) => {
+   switch (provider) {
+     default: // Use Openai options as default
+     case ModelProvider.OpenAI: {
+       const { OPENAI_API_KEY, OPENAI_PROXY_URL } = getServerConfig();
+       const openaiApiKey = payload?.apiKey || OPENAI_API_KEY;
+-      const baseURL = payload?.endpoint || OPENAI_PROXY_URL;
++      const baseURL = (await clientSuppliedEndpoint(payload?.endpoint)) || OPENAI_PROXY_URL;
+       const apiKey = apiKeyManager.pick(openaiApiKey);
+       return {
+         apiKey,
+@@ -42,7 +54,7 @@ const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
+     case ModelProvider.Azure: {
+       const { AZURE_API_KEY, AZURE_API_VERSION, AZURE_ENDPOINT } = getServerConfig();
+       const apiKey = apiKeyManager.pick(payload?.apiKey || AZURE_API_KEY);
+-      const endpoint = payload?.endpoint || AZURE_ENDPOINT;
++      const endpoint = (await clientSuppliedEndpoint(payload?.endpoint)) || AZURE_ENDPOINT;
+       const apiVersion = payload?.azureApiVersion || AZURE_API_VERSION;
+       return {
+         apiVersion,
+@@ -60,7 +72,7 @@ const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
+     case ModelProvider.Google: {
+       const { GOOGLE_API_KEY, GOOGLE_PROXY_URL } = getServerConfig();
+       const apiKey = apiKeyManager.pick(payload?.apiKey || GOOGLE_API_KEY);
+-      const baseURL = payload?.endpoint || GOOGLE_PROXY_URL;
++      const baseURL = (await clientSuppliedEndpoint(payload?.endpoint)) || GOOGLE_PROXY_URL;
+       return {
+         apiKey,
+         baseURL,
+@@ -93,7 +105,7 @@ const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
+     }
+     case ModelProvider.Ollama: {
+       const { OLLAMA_PROXY_URL } = getServerConfig();
+-      const baseURL = payload?.endpoint || OLLAMA_PROXY_URL;
++      const baseURL = (await clientSuppliedEndpoint(payload?.endpoint)) || OLLAMA_PROXY_URL;
+       return {
+         baseURL,
+       };
+@@ -108,7 +120,7 @@ const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
+     case ModelProvider.Anthropic: {
+       const { ANTHROPIC_API_KEY, ANTHROPIC_PROXY_URL } = getServerConfig();
+       const apiKey = apiKeyManager.pick(payload?.apiKey || ANTHROPIC_API_KEY);
+-      const baseURL = payload?.endpoint || ANTHROPIC_PROXY_URL;
++      const baseURL = (await clientSuppliedEndpoint(payload?.endpoint)) || ANTHROPIC_PROXY_URL;
+       return {
+         apiKey,
+         baseURL,
+@@ -158,9 +170,9 @@ const getLlmOptionsFromPayload = (provider: string, payload: JWTPayload) => {
+  * @param payload - The JWT payload.
+  * @returns A promise that resolves when the agent runtime is initialized.
+  */
+-export const initAgentRuntimeWithUserPayload = (provider: string, payload: JWTPayload) => {
++export const initAgentRuntimeWithUserPayload = async (provider: string, payload: JWTPayload) => {
+   return AgentRuntime.initializeWithProviderOptions(provider, {
+-    [provider]: getLlmOptionsFromPayload(provider, payload),
++    [provider]: await getLlmOptionsFromPayload(provider, payload),
+   });
+ };
+ 
+diff --git a/src/app/api/files/image/route.ts b/src/app/api/files/image/route.ts
+index d6ccb672e2..45629d40f1 100644
+--- a/src/app/api/files/image/route.ts
++++ b/src/app/api/files/image/route.ts
+@@ -1,10 +1,12 @@
++import { fetchInternalSafe, InternalDestinationError } from '@/utils/internalDestination';
++
+ import { Imgur } from './imgur';
+ 
+ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+   let imageBlob: Blob;
+ 
+   if (url) {
+-    const res = await fetch(url);
++    const res = await fetchInternalSafe(url);
+     imageBlob = await res.blob();
+   } else if (blob) {
+     imageBlob = blob;
+@@ -21,13 +23,25 @@ const updateByImgur = async ({ url, blob }: { blob?: Blob; url?: string }) => {
+ export const POST = async (req: Request) => {
+   const { url } = await req.json();
+ 
+-  const cdnUrl = await updateByImgur({ url });
++  try {
++    const cdnUrl = await updateByImgur({ url });
++
++    return new Response(JSON.stringify({ url: cdnUrl }));
++  } catch (error) {
++    if (error instanceof InternalDestinationError) {
++      return new Response(JSON.stringify({ error: 'Not support internal host proxy' }), {
++        headers: { 'content-type': 'application/json' },
++        status: 400,
++      });
++    }
+ 
+-  return new Response(JSON.stringify({ url: cdnUrl }));
++    throw error;
++  }
+ };
++
+ // import { Imgur } from './imgur';
+ 
+-export const runtime = 'edge';
++export const runtime = 'nodejs';
+ 
+ // export const POST = async (req: Request) => {
+ //   const { url } = await req.json();
+diff --git a/src/app/api/proxy/route.ts b/src/app/api/proxy/route.ts
+index c17dde10e7..54ce016fda 100644
+--- a/src/app/api/proxy/route.ts
++++ b/src/app/api/proxy/route.ts
+@@ -1,4 +1,8 @@
+-export const runtime = 'edge';
++import { NextResponse } from 'next/server';
++
++import { fetchInternalSafe, InternalDestinationError } from '@/utils/internalDestination';
++
++export const runtime = 'nodejs';
+ 
+ /**
+  * just for a proxy
+@@ -6,7 +10,15 @@ export const runtime = 'edge';
+ export const POST = async (req: Request) => {
+   const url = await req.text();
+ 
+-  const res = await fetch(url);
++  try {
++    const res = await fetchInternalSafe(url);
++
++    return new Response(res.body, { headers: res.headers });
++  } catch (error) {
++    if (error instanceof InternalDestinationError) {
++      return NextResponse.json({ error: 'Not support internal host proxy' }, { status: 400 });
++    }
+ 
+-  return new Response(res.body, { headers: res.headers });
++    throw error;
++  }
+ };
+diff --git a/src/utils/internalDestination.ts b/src/utils/internalDestination.ts
+new file mode 100644
+index 0000000000..f8dc31cc37
+--- /dev/null
++++ b/src/utils/internalDestination.ts
+@@ -0,0 +1,168 @@
++import { lookup } from 'node:dns/promises';
++import { isIP } from 'node:net';
++
++/**
++ * A destination was refused because the address it leads to is not reachable from a server.
++ * Callers turn this into a client error response.
++ */
++export class InternalDestinationError extends Error {
++  constructor(public readonly destination: string) {
++    super(`internal destination is not allowed: ${destination}`);
++    this.name = 'InternalDestinationError';
++  }
++}
++
++const IPV4_BLOCKED: Array<[string, number]> = [
++  ['0.0.0.0', 8],
++  ['10.0.0.0', 8],
++  ['100.64.0.0', 10],
++  ['127.0.0.0', 8],
++  ['169.254.0.0', 16],
++  ['172.16.0.0', 12],
++  ['192.0.0.0', 24],
++  ['192.168.0.0', 16],
++  ['198.18.0.0', 15],
++  ['224.0.0.0', 4],
++  ['240.0.0.0', 4],
++];
++
++const toIpv4Number = (address: string): number => {
++  const parts = address.split('.').map((part) => Number.parseInt(part, 10));
++
++  return parts.reduce((acc, part) => ((acc << 8) + part) >>> 0, 0);
++};
++
++const isBlockedIpv4 = (address: string): boolean => {
++  const value = toIpv4Number(address);
++
++  return IPV4_BLOCKED.some(([network, bits]) => {
++    const size = 2 ** (32 - bits);
++    const base = toIpv4Number(network);
++
++    return value >= base && value < base + size;
++  });
++};
++
++const expandIpv6 = (address: string): number[] | undefined => {
++  const [head, tail] = address.split('::');
++  const parse = (part?: string) =>
++    part
++      ? part
++          .split(':')
++          .filter(Boolean)
++          .map((group) => Number.parseInt(group, 16))
++      : [];
++
++  const left = parse(head);
++  const right = parse(tail);
++
++  if (left.some((g) => Number.isNaN(g)) || right.some((g) => Number.isNaN(g))) return undefined;
++
++  const missing = 8 - left.length - right.length;
++
++  if (!address.includes('::') && missing !== 0) return undefined;
++  if (missing < 0) return undefined;
++
++  return [...left, ...new Array(missing).fill(0), ...right];
++};
++
++const isBlockedIpv6 = (address: string): boolean => {
++  const groups = expandIpv6(address.toLowerCase());
++  if (!groups) return true;
++
++  const first = groups[0];
++  // ::1 loopback and :: unspecified
++  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] <= 1) return true;
++  // fc00::/7 unique local
++  if ((first & 0xfe00) === 0xfc00) return true;
++  // fe80::/10 link local
++  if ((first & 0xffc0) === 0xfe80) return true;
++  // ::ffff:0:0/96 IPv4 mapped, checked through the embedded address
++  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
++    const v4 = [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join('.');
++
++    return isBlockedIpv4(v4);
++  }
++  // 64:ff9b::/96 NAT64 mapped IPv4
++  if (first === 0x64 && groups[1] === 0xff9b && groups.slice(2, 6).every((g) => g === 0)) {
++    const v4 = [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join('.');
++
++    return isBlockedIpv4(v4);
++  }
++
++  return false;
++};
++
++export const isInternalAddress = (address: string): boolean => {
++  const bare = address.replace(/^\[/, '').replace(/\]$/, '').replace(/%.*$/, '');
++  const family = isIP(bare);
++
++  if (family === 4) return isBlockedIpv4(bare);
++  if (family === 6) return isBlockedIpv6(bare);
++
++  // Anything that is not a literal address cannot be judged here.
++  return true;
++};
++
++const hostResolvesInternally = async (hostname: string): Promise<boolean> => {
++  const bare = hostname.replace(/^\[/, '').replace(/\]$/, '');
++
++  if (isIP(bare)) return isInternalAddress(bare);
++
++  try {
++    const addresses = await lookup(bare, { all: true, verbatim: true });
++
++    if (addresses.length === 0) return true;
++
++    return addresses.some(({ address }) => isInternalAddress(address));
++  } catch {
++    // A name that cannot be resolved cannot be contacted either.
++    return true;
++  }
++};
++
++/**
++ * Whether a URL offered by a client points at an address a server must not contact. Values that
++ * are not absolute http(s) URLs are left to the caller, which rejects them on its own.
++ */
++export const isInternalDestination = async (raw: string | undefined | null): Promise<boolean> => {
++  if (!raw || typeof raw !== 'string') return false;
++
++  let url: URL;
++  try {
++    url = new URL(raw);
++  } catch {
++    return false;
++  }
++
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') return true;
++
++  return hostResolvesInternally(url.hostname);
++};
++
++const MAX_REDIRECTS = 5;
++
++/**
++ * Fetches a URL a client supplied, checking the destination of every hop so that a redirect
++ * cannot lead to an address the client itself would not be allowed to name.
++ */
++export const fetchInternalSafe = async (raw: string, init?: RequestInit): Promise<Response> => {
++  let current = new URL(raw);
++
++  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
++    if (await hostResolvesInternally(current.hostname)) {
++      throw new InternalDestinationError(current.toString());
++    }
++
++    const response = await fetch(current.toString(), { ...init, redirect: 'manual' });
++
++    const location = response.headers.get('location');
++    const isRedirect = [301, 302, 303, 307, 308].includes(response.status);
++
++    if (!isRedirect || !location) return response;
++
++    current = new URL(location, current);
++  }
++
++  throw new InternalDestinationError(current.toString());
++};

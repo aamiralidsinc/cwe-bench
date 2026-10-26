@@ -1,0 +1,227 @@
+diff --git a/pyod/mcp_server.py b/pyod/mcp_server.py
+index 21e517d..334bc75 100644
+--- a/pyod/mcp_server.py
++++ b/pyod/mcp_server.py
+@@ -63,7 +63,11 @@ def _to_json(obj):
+     return json.dumps(obj, indent=2, default=str)
+ 
+ 
+-def profile_data(data_path: str, data_type: str = "auto") -> str:
++def profile_data(
++    data_path: str,
++    data_type: str = "auto",
++    trusted: bool = False
++) -> str:
+     """Profile a dataset for anomaly detection.
+ 
+     Loads data from path, detects data type and characteristics.
+@@ -73,7 +77,7 @@ def profile_data(data_path: str, data_type: str = "auto") -> str:
+         data_path: Path to data file (CSV, NPY, JSON).
+         data_type: Override. One of 'tabular', 'text', 'image', or 'auto'.
+     """
+-    X = _load_data(data_path)
++    X = _load_data(data_path, trusted=trusted)
+     dt = None if data_type == "auto" else data_type
+     return _to_json(_get_engine().profile_data(X, data_type=dt))
+ 
+@@ -256,7 +260,8 @@ def _deserialize_result(result_json: str):
+ def run_detection(
+     data_path: str,
+     plan: str,
+-    test_data_path: str = ""
++    test_data_path: str = "",
++    trusted: bool = False
+ ) -> str:
+     """Run anomaly detection with a given plan.
+ 
+@@ -278,14 +283,14 @@ def run_detection(
+     if not isinstance(plan_dict, dict):
+         return _to_json({"error": "plan must be a JSON object"})
+     try:
+-        X_train = _load_data(data_path)
++        X_train = _load_data(data_path, trusted=trusted)
+     except (OSError, ValueError) as e:
+         return _to_json({"error": "Failed to load training data",
+                          "details": str(e)})
+     X_test = None
+     if test_data_path:
+         try:
+-            X_test = _load_data(test_data_path)
++            X_test = _load_data(test_data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load test data",
+                              "details": str(e)})
+@@ -308,7 +313,8 @@ def run_detection(
+ def analyze_results(
+     result: str,
+     data_path: str = "",
+-    top_k: int = 10
++    top_k: int = 10,
++    trusted: bool = False
+ ) -> str:
+     """Analyze a detection result.
+ 
+@@ -327,7 +333,7 @@ def analyze_results(
+     X = None
+     if data_path:
+         try:
+-            X = _load_data(data_path)
++            X = _load_data(data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load data",
+                              "details": str(e)})
+@@ -345,7 +351,8 @@ def explain_findings(
+     result: str,
+     indices: str = "",
+     top_k: int = 5,
+-    data_path: str = ""
++    data_path: str = "",
++    trusted: bool = False
+ ) -> str:
+     """Explain why specific samples were flagged as anomalies.
+ 
+@@ -374,7 +381,7 @@ def explain_findings(
+     X = None
+     if data_path:
+         try:
+-            X = _load_data(data_path)
++            X = _load_data(data_path, trusted=trusted)
+         except (OSError, ValueError) as e:
+             return _to_json({"error": "Failed to load data",
+                              "details": str(e)})
+@@ -388,9 +395,13 @@ def explain_findings(
+     return _to_json(explanations)
+ 
+ 
+-def _load_data(path):
++def _load_data(path, *, trusted=False):
+     """Load data from file path."""
+     import numpy as np
++    from pyod.utils.persistence import open_vouched
++
++    if os.path.splitext(path)[1].lower() in ('.pkl', '.pickle', '.joblib'):
++        path = open_vouched(path, trusted, '_load_data()')
+ 
+     ext = os.path.splitext(path)[1].lower()
+     if ext == '.npy':
+diff --git a/pyod/models/base_dl.py b/pyod/models/base_dl.py
+index d958b5f..cda63da 100644
+--- a/pyod/models/base_dl.py
++++ b/pyod/models/base_dl.py
+@@ -24,6 +24,7 @@ import tqdm
+ from sklearn.utils import check_array
+ 
+ from .base import BaseDetector
++from ..utils.persistence import open_vouched
+ from ..utils.torch_utility import TorchDataset, \
+     get_optimizer_by_name, get_criterion_by_name
+ 
+@@ -330,7 +331,7 @@ class BaseDeepLearningDetector(BaseDetector):
+             pickle.dump(self, file)
+ 
+     @classmethod
+-    def load(cls, path):
++    def load(cls, path, *, trusted=False):
+         """Load the model from the specified path.
+ 
+         Parameters
+@@ -343,6 +344,8 @@ class BaseDeepLearningDetector(BaseDetector):
+         model : BaseDeepLearningDetector
+             The loaded model.
+         """
++        path = open_vouched(
++            path, trusted, f'{cls.__name__}.load()')
+         with open(path, 'rb') as file:
+             detector = pickle.load(file)
+         return detector
+diff --git a/pyod/utils/persistence.py b/pyod/utils/persistence.py
+index 90406ca..6a9379a 100644
+--- a/pyod/utils/persistence.py
++++ b/pyod/utils/persistence.py
+@@ -98,6 +98,20 @@ _VERSION_CHECKS: list[tuple[str, Any, str]] = [
+ ]
+ 
+ 
++def open_vouched(path: Any, trusted: Any, api: str) -> Any:
++    """Return ``path`` for reading, or refuse before it is opened.
++
++    Every deserializing surface funnels through here, so the decision
++    is taken before any file is touched and there is one place to
++    audit.
++    """
++    if trusted is not True:
++        raise PermissionError(
++            f"{api}: the source of this artifact has not been vouched "
++            "for; pass trusted=True only for a trusted source.")
++    return path
++
++
+ def _running_version(package_name: str) -> str:
+     """Resolve the running version of an optional dependency."""
+     if package_name == "sklearn":
+@@ -170,7 +184,9 @@ def save(model: Any, path: Any, metadata: dict | None = None) -> None:
+ def load(
+         path: Any,
+         strict: bool = False,
+-        return_metadata: bool = False) -> Any:
++        return_metadata: bool = False,
++        *,
++        trusted: bool = False) -> Any:
+     """Load a PyOD detector saved by `save()` or by raw joblib.dump.
+ 
+     `load()` understands three input shapes:
+@@ -215,6 +231,7 @@ def load(
+         legacy artifacts, or after a successful compat repair under
+         strict mode.
+     """
++    path = open_vouched(path, trusted, "load()")
+     try:
+         obj = joblib.load(path)
+     except ValueError as exc:
+@@ -308,7 +325,7 @@ def _handle_compat_fallthrough(
+         strict: bool,
+         return_metadata: bool) -> Any:
+     try:
+-        obj = compat_load(path)
++        obj = compat_load(path, trusted=True)
+     except Exception as compat_exc:
+         raise compat_exc from original_exc
+     return _handle_loaded_object(
+@@ -388,7 +405,7 @@ def _format_strict_compat_drift_msg(
+ # inspect_artifact
+ # ----------------------------------------------------------------------
+ 
+-def inspect_artifact(path: Any) -> dict:
++def inspect_artifact(path: Any, *, trusted: bool = False) -> dict:
+     """Read the version envelope of a saved detector.
+ 
+     Returns the envelope written by `save()` with the ``model`` field
+@@ -411,6 +428,7 @@ def inspect_artifact(path: Any) -> dict:
+     ValueError
+         When the artifact has no PyOD version envelope.
+     """
++    path = open_vouched(path, trusted, "inspect_artifact()")
+     obj = joblib.load(path)
+     if not _is_envelope(obj):
+         raise ValueError(
+@@ -423,7 +441,11 @@ def inspect_artifact(path: Any) -> dict:
+ # compat_load
+ # ----------------------------------------------------------------------
+ 
+-def compat_load(path: Any, mmap_mode: str | None = None) -> Any:
++def compat_load(
++        path: Any,
++        mmap_mode: str | None = None,
++        *,
++        trusted: bool = False) -> Any:
+     """Load an artifact whose sklearn Tree node dtype no longer matches.
+ 
+     Mirrors `joblib.load` but plugs a dispatch-table override into
+@@ -454,6 +476,7 @@ def compat_load(path: Any, mmap_mode: str | None = None) -> Any:
+         legacy raw saves; an envelope dict for Phase 2 saves). Callers
+         that need envelope unwrapping should use `load()`.
+     """
++    path = open_vouched(path, trusted, "compat_load()")
+     trees_realigned = [0]
+ 
+     class _CompatNumpyUnpickler(NumpyUnpickler):

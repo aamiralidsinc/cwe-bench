@@ -1,0 +1,326 @@
+diff --git a/src/bika/lims/jsonapi/__init__.py b/src/bika/lims/jsonapi/__init__.py
+index 1835612..1715694 100644
+--- a/src/bika/lims/jsonapi/__init__.py
++++ b/src/bika/lims/jsonapi/__init__.py
+@@ -18,19 +18,37 @@
+ # Copyright 2018-2025 by it's authors.
+ # Some rights reserved, see README and LICENSE.
+ 
++import json
++import sys
++import traceback
++
++import Missing
++import six
++from AccessControl import Unauthorized
++from AccessControl import getSecurityManager
++from bika.lims import api
++from bika.lims import logger
++from bika.lims.utils import to_utf8
+ from plone.app.textfield import RichTextValue
+ from Products.Archetypes.config import TOOL_NAME
+ from Products.CMFCore.utils import getToolByName
++from senaite.core.browser.fields.parsing import parse_record_literal
++from senaite.core.permissions import AccessJSONAPI
+ 
+-from bika.lims import api
+-from bika.lims.utils import to_utf8
+-from bika.lims import logger
+ 
+-import json
+-import Missing
+-import six
+-import sys
+-import traceback
++def check_jsonapi_permission(obj):
++    """Check the AccessJSONAPI permission on the given object
++
++    Raises Unauthorized if the current user does not hold the
++    `senaite.core: Access JSON API` permission on the passed-in object.
++    This guards the state-changing JSON API routes against anonymous and
++    under-privileged callers (CWE-862).
++    """
++    if getSecurityManager().checkPermission(AccessJSONAPI, obj):
++        return
++    msg = "You don't have the '{0}' permission on {1}".format(
++        AccessJSONAPI, obj.absolute_url())
++    raise Unauthorized(msg)
+ 
+ 
+ def handle_errors(f):
+@@ -237,7 +255,7 @@ def set_fields_from_request(obj, request):
+         elif fieldtype in ['senaite.core.browser.fields.records.RecordsField',
+                            'senaite.core.browser.fields.record.RecordField']:
+             try:
+-                value = eval(value)
++                value = parse_record_literal(value)
+             except Exception:
+                 logger.warning(
+                     "JSONAPI: " + fieldname + ": Invalid "
+diff --git a/src/bika/lims/jsonapi/create.py b/src/bika/lims/jsonapi/create.py
+index 61f1901..1fe9c5a 100644
+--- a/src/bika/lims/jsonapi/create.py
++++ b/src/bika/lims/jsonapi/create.py
+@@ -19,16 +19,14 @@
+ # Some rights reserved, see README and LICENSE.
+ 
+ import transaction
+-from AccessControl import Unauthorized
+-from AccessControl import getSecurityManager
+-from senaite.core.idserver import renameAfterCreation
++from bika.lims.jsonapi import check_jsonapi_permission
+ from bika.lims.jsonapi import set_fields_from_request
+ from bika.lims.utils import tmpID
+ from plone.jsonapi.core import router
+ from plone.jsonapi.core.interfaces import IRouteProvider
+ from Products.Archetypes.event import ObjectInitializedEvent
+ from Products.CMFPlone.utils import _createObjectByType
+-from senaite.core.permissions import AccessJSONAPI
++from senaite.core.idserver import renameAfterCreation
+ from zExceptions import BadRequest
+ from zope import event
+ from zope import interface
+@@ -176,10 +174,7 @@ class Create(object):
+         site_path = request['PATH_INFO'].replace("/@@API/create", "")
+         parent = context.restrictedTraverse(str(site_path + obj_path))
+         # normal permissions still apply for this user
+-        if not getSecurityManager().checkPermission(AccessJSONAPI, parent):
+-            msg = "You don't have the '{0}' permission on {1}".format(
+-                AccessJSONAPI, parent.absolute_url())
+-            raise Unauthorized(msg)
++        check_jsonapi_permission(parent)
+ 
+         obj_id = request.get("obj_id", "")
+         _renameAfterCreation = False
+diff --git a/src/bika/lims/jsonapi/doactionfor.py b/src/bika/lims/jsonapi/doactionfor.py
+index 81e9693..19a14fe 100644
+--- a/src/bika/lims/jsonapi/doactionfor.py
++++ b/src/bika/lims/jsonapi/doactionfor.py
+@@ -18,15 +18,16 @@
+ # Copyright 2018-2025 by it's authors.
+ # Some rights reserved, see README and LICENSE.
+ 
++import json
++
++import transaction
++from bika.lims.jsonapi import check_jsonapi_permission
+ from bika.lims.jsonapi.read import read
+ from plone.jsonapi.core import router
+ from plone.jsonapi.core.interfaces import IRouteProvider
+ from Products.CMFCore.utils import getToolByName
+ from zExceptions import BadRequest
+ from zope import interface
+-import json
+-
+-import transaction
+ 
+ 
+ class doActionFor(object):
+@@ -73,8 +74,10 @@ class doActionFor(object):
+         if len(objects) == 0:
+             raise BadRequest("No matching objects found")
+         for obj_dict in objects:
++            obj = uc(UID=obj_dict['UID'])[0].getObject()
++            # normal permissions still apply for this user
++            check_jsonapi_permission(obj)
+             try:
+-                obj = uc(UID=obj_dict['UID'])[0].getObject()
+                 workflow.doActionFor(obj, action)
+                 obj.reindexObject()
+             except Exception as e:
+@@ -114,6 +117,8 @@ class doActionFor(object):
+             if not obj_path.startswith("/"):
+                 obj_path = "/" + obj_path
+             obj = context.restrictedTraverse(str(site_path + obj_path))
++            # normal permissions still apply for this user
++            check_jsonapi_permission(obj)
+             if obj_path.startswith(site_path):
+                 obj_path = obj_path[len(site_path):]
+             try:
+diff --git a/src/bika/lims/jsonapi/getusers.py b/src/bika/lims/jsonapi/getusers.py
+index 0522489..b8f2f71 100644
+--- a/src/bika/lims/jsonapi/getusers.py
++++ b/src/bika/lims/jsonapi/getusers.py
+@@ -18,6 +18,7 @@
+ # Copyright 2018-2025 by it's authors.
+ # Some rights reserved, see README and LICENSE.
+ 
++from bika.lims.jsonapi import check_jsonapi_permission
+ from plone.jsonapi.core import router
+ from plone.jsonapi.core.interfaces import IRouteProvider
+ from Products.CMFCore.utils import getToolByName
+@@ -67,12 +68,15 @@ class getUsers(object):
+         >>> browser.contents
+         'No roles specified'
+         """
++        # normal permissions still apply for this user
++        check_jsonapi_permission(context)
++
+         roles = request.get('roles','')
+ 
+         if len(roles) == 0:
+             raise BadRequest("No roles specified")
+-        
+-        mtool = getToolByName(context, 'portal_membership') 
++
++        mtool = getToolByName(context, 'portal_membership')
+         users = []
+         for user in mtool.searchForMembers(roles=roles):
+             uid = user.getId()
+diff --git a/src/bika/lims/jsonapi/remove.py b/src/bika/lims/jsonapi/remove.py
+index 7f9e23a..f3b1300 100644
+--- a/src/bika/lims/jsonapi/remove.py
++++ b/src/bika/lims/jsonapi/remove.py
+@@ -18,12 +18,13 @@
+ # Copyright 2018-2025 by it's authors.
+ # Some rights reserved, see README and LICENSE.
+ 
++import transaction
++from bika.lims.jsonapi import check_jsonapi_permission
+ from plone.jsonapi.core import router
+ from plone.jsonapi.core.interfaces import IRouteProvider
+ from Products.CMFCore.utils import getToolByName
+ from zExceptions import BadRequest
+ from zope import interface
+-import transaction
+ 
+ 
+ class Remove(object):
+@@ -78,14 +79,17 @@ class Remove(object):
+             "success": True,
+             "error": False,
+         }
+-        
++
+         data = uc(UID=_uid)
+         if not data:
+             raise BadRequest("No objects found")
+-        
++
+         for proxy in data:
++            obj = proxy.getObject()
++            # normal permissions still apply for this user
++            check_jsonapi_permission(obj)
+             try:
+-                parent = proxy.getObject().aq_parent
++                parent = obj.aq_parent
+                 parent.manage_delObjects([proxy.id])
+             except Exception as e:
+                 savepoint.rollback()
+diff --git a/src/bika/lims/jsonapi/update.py b/src/bika/lims/jsonapi/update.py
+index 5e8d88f..7da20ac 100644
+--- a/src/bika/lims/jsonapi/update.py
++++ b/src/bika/lims/jsonapi/update.py
+@@ -18,15 +18,17 @@
+ # Copyright 2018-2025 by it's authors.
+ # Some rights reserved, see README and LICENSE.
+ 
++import json
++
++import six
++import transaction
++from bika.lims.jsonapi import check_jsonapi_permission
+ from bika.lims.jsonapi import set_fields_from_request
+-from Products.CMFCore.utils import getToolByName
+ from plone.jsonapi.core import router
+ from plone.jsonapi.core.interfaces import IRouteProvider
++from Products.CMFCore.utils import getToolByName
+ from zExceptions import BadRequest
+ from zope import interface
+-import json
+-import six
+-import transaction
+ 
+ 
+ class Update(object):
+@@ -146,6 +148,9 @@ class Update(object):
+             ret['error'] = True
+             return ret
+ 
++        # normal permissions still apply for this user
++        check_jsonapi_permission(obj)
++
+         try:
+             fields = set_fields_from_request(obj, request)
+             if not fields:
+@@ -225,6 +230,8 @@ class Update(object):
+             if obj_path.startswith(site_path):
+                 obj_path = obj_path[len(site_path):]
+             obj = context.restrictedTraverse(str(site_path + obj_path))
++            # normal permissions still apply for this user
++            check_jsonapi_permission(obj)
+             this_ret = {
+                 "url": router.url_for("update_many", force_external=True),
+                 "success": False,
+diff --git a/src/senaite/core/browser/fields/parsing.py b/src/senaite/core/browser/fields/parsing.py
+new file mode 100644
+index 0000000..94cafe1
+--- /dev/null
++++ b/src/senaite/core/browser/fields/parsing.py
+@@ -0,0 +1,21 @@
++# -*- coding: utf-8 -*-
++#
++# This file is part of SENAITE.CORE.
++
++import ast
++
++
++def parse_record_literal(value, normalize_records=False):
++    """Safely parse stringified record values without executing code.
++
++    Some record payloads are persisted as string representations of Python
++    literals. Historically these were parsed with eval(), which allows
++    arbitrary code execution. We only accept Python literals here.
++    """
++    if not isinstance(value, str):
++        return value
++
++    if normalize_records:
++        value = value.replace('}\n', '},')
++
++    return ast.literal_eval(value)
+diff --git a/src/senaite/core/browser/fields/record.py b/src/senaite/core/browser/fields/record.py
+index dddde21..57e3e7c 100644
+--- a/src/senaite/core/browser/fields/record.py
++++ b/src/senaite/core/browser/fields/record.py
+@@ -40,6 +40,7 @@ from Products.CMFCore.Expression import Expression
+ from Products.CMFCore.Expression import createExprContext
+ from Products.CMFCore.utils import getToolByName
+ from Products.PythonScripts.standard import html_quote
++from senaite.core.browser.fields.parsing import parse_record_literal
+ from senaite.core.browser.widgets.recordwidget import RecordWidget
+ 
+ # we have to define our own validation handling
+@@ -253,7 +254,7 @@ class RecordField(ObjectField):
+     def set(self, instance, value, **kwargs):
+         if type(value) in StringTypes:
+             try:
+-                value = eval(value)
++                value = parse_record_literal(value)
+                 # more checks to add?
+             except Exception: # what to catch here?
+                 pass
+diff --git a/src/senaite/core/browser/fields/records.py b/src/senaite/core/browser/fields/records.py
+index a0301a2..322e814 100644
+--- a/src/senaite/core/browser/fields/records.py
++++ b/src/senaite/core/browser/fields/records.py
+@@ -26,6 +26,7 @@ from bika.lims import api
+ from Products.Archetypes.Registry import registerField
+ from Products.Archetypes.Registry import registerPropertyType
+ from Products.PythonScripts.standard import html_quote
++from senaite.core.browser.fields.parsing import parse_record_literal
+ from senaite.core.browser.fields.record import RecordField
+ from senaite.core.browser.widgets.recordswidget import RecordsWidget
+ 
+@@ -137,7 +138,10 @@ class RecordsField(RecordField):
+                 value = [value]
+             elif type(value) == str:
+                 try:
+-                    value = eval(value.replace('}\n', '},'))
++                    value = parse_record_literal(
++                        value,
++                        normalize_records=True,
++                    )
+                 except Exception:
+                     pass
+         return [RecordField._to_dict(self, entry) for entry in value]

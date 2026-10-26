@@ -1,0 +1,198 @@
+diff --git a/internal/sources/impl.go b/internal/sources/impl.go
+index f43d9ee1..f44cd8a8 100644
+--- a/internal/sources/impl.go
++++ b/internal/sources/impl.go
+@@ -443,7 +443,17 @@ func (s *Service) FindSourceByID(ctx context.Context, projectID, id string) (*da
+ 		return nil, &ServiceError{ErrMsg: "error retrieving source", Err: err}
+ 	}
+ 
+-	return rowToSource(row)
++	source, err := rowToSource(row)
++	if err != nil {
++		return nil, err
++	}
++
++	// FetchSourceByID keys only on the source id, so enforce the project scope here.
++	if source.ProjectID != projectID {
++		return nil, datastore.ErrSourceNotFound
++	}
++
++	return source, nil
+ }
+ 
+ // FindSourceByName retrieves a source by its name and project ID
+diff --git a/internal/sources/queries.sql b/internal/sources/queries.sql
+index 622e4c48..06d53dbe 100644
+--- a/internal/sources/queries.sql
++++ b/internal/sources/queries.sql
+@@ -105,7 +105,7 @@ SET
+     body_function = @body_function,
+     header_function = @header_function,
+     updated_at = NOW()
+-WHERE id = @id AND deleted_at IS NULL;
++WHERE id = @id AND project_id = @project_id AND deleted_at IS NULL;
+ 
+ -- ============================================================================
+ -- FETCH Operations
+diff --git a/internal/sources/repo/queries.sql.go b/internal/sources/repo/queries.sql.go
+index ef29ef63..976ab443 100644
+--- a/internal/sources/repo/queries.sql.go
++++ b/internal/sources/repo/queries.sql.go
+@@ -874,7 +874,7 @@ SET
+     body_function = $13,
+     header_function = $14,
+     updated_at = NOW()
+-WHERE id = $15 AND deleted_at IS NULL
++WHERE id = $15 AND project_id = $7 AND deleted_at IS NULL
+ `
+ 
+ type UpdateSourceParams struct {
+diff --git a/internal/subscriptions/impl.go b/internal/subscriptions/impl.go
+index fd297c18..e2d8a2e0 100644
+--- a/internal/subscriptions/impl.go
++++ b/internal/subscriptions/impl.go
+@@ -71,6 +71,10 @@ func (s *Service) CreateSubscription(ctx context.Context, projectID string, subs
+ 		return datastore.ErrNotAuthorisedToAccessDocument
+ 	}
+ 
++	if err := s.ensureSourceInProject(ctx, projectID, subscription.SourceID); err != nil {
++		return err
++	}
++
+ 	// Begin transaction
+ 	tx, err := s.db.Begin(ctx)
+ 	if err != nil {
+@@ -260,6 +264,10 @@ func (s *Service) createSubscriptionInTx(ctx context.Context, qtx repo.Querier,
+ // ============================================================================
+ 
+ func (s *Service) UpdateSubscription(ctx context.Context, projectID string, subscription *datastore.Subscription) error {
++	if err := s.ensureSourceInProject(ctx, projectID, subscription.SourceID); err != nil {
++		return err
++	}
++
+ 	ac := subscription.GetAlertConfig()
+ 	rc := subscription.GetRetryConfig()
+ 	fc := subscription.GetFilterConfig()
+@@ -1035,3 +1043,24 @@ func (s *Service) CompareFlattenedPayload(_ context.Context, payload, filter fla
+ 
+ 	return compare.Compare(payload, filter)
+ }
++
++// ensureSourceInProject refuses a subscription that references a source outside its project.
++func (s *Service) ensureSourceInProject(ctx context.Context, projectID, sourceID string) error {
++	if util.IsStringEmpty(sourceID) {
++		return nil
++	}
++
++	var exists bool
++	err := s.db.QueryRow(ctx,
++		`SELECT EXISTS(SELECT 1 FROM convoy.sources WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL)`,
++		sourceID, projectID).Scan(&exists)
++	if err != nil {
++		return &ServiceError{ErrMsg: "failed to validate source", Err: err}
++	}
++
++	if !exists {
++		return datastore.ErrSourceNotFound
++	}
++
++	return nil
++}
+diff --git a/internal/subscriptions/queries.sql b/internal/subscriptions/queries.sql
+index 91a23e4a..86254da9 100644
+--- a/internal/subscriptions/queries.sql
++++ b/internal/subscriptions/queries.sql
+@@ -201,7 +201,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.id = @id AND s.project_id = @project_id AND s.deleted_at IS NULL;
+ 
+@@ -259,7 +259,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = @project_id AND s.source_id = @source_id AND s.deleted_at IS NULL;
+ 
+@@ -317,7 +317,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = @project_id AND s.endpoint_id = @endpoint_id AND s.deleted_at IS NULL;
+ 
+@@ -375,7 +375,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = @project_id AND s.type = 'cli' AND s.deleted_at IS NULL;
+ 
+@@ -441,7 +441,7 @@ WITH filtered_subscriptions AS (
+         COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+     FROM convoy.subscriptions s
+     LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-    LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++    LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+     LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+     WHERE s.deleted_at IS NULL
+         AND s.project_id = @project_id
+diff --git a/internal/subscriptions/repo/queries.sql.go b/internal/subscriptions/repo/queries.sql.go
+index e1a9a601..a0203042 100644
+--- a/internal/subscriptions/repo/queries.sql.go
++++ b/internal/subscriptions/repo/queries.sql.go
+@@ -314,7 +314,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = $1 AND s.type = 'cli' AND s.deleted_at IS NULL
+ `
+@@ -652,7 +652,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.id = $1 AND s.project_id = $2 AND s.deleted_at IS NULL
+ `
+@@ -830,7 +830,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = $1 AND s.endpoint_id = $2 AND s.deleted_at IS NULL
+ `
+@@ -1018,7 +1018,7 @@ SELECT
+     COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+ FROM convoy.subscriptions s
+ LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+ LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+ WHERE s.project_id = $1 AND s.source_id = $2 AND s.deleted_at IS NULL
+ `
+@@ -1293,7 +1293,7 @@ WITH filtered_subscriptions AS (
+         COALESCE(sv.hmac_encoding, '') AS source_verifier_hmac_encoding
+     FROM convoy.subscriptions s
+     LEFT JOIN convoy.endpoints em ON s.endpoint_id = em.id
+-    LEFT JOIN convoy.sources sm ON s.source_id = sm.id
++    LEFT JOIN convoy.sources sm ON s.source_id = sm.id AND sm.project_id = s.project_id
+     LEFT JOIN convoy.source_verifiers sv ON sv.id = sm.source_verifier_id
+     WHERE s.deleted_at IS NULL
+         AND s.project_id = $2

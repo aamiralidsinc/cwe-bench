@@ -1,0 +1,132 @@
+diff --git a/deeptutor/agents/chat/agentic_pipeline.py b/deeptutor/agents/chat/agentic_pipeline.py
+--- a/deeptutor/agents/chat/agentic_pipeline.py
++++ b/deeptutor/agents/chat/agentic_pipeline.py
+@@ -40,6 +40,7 @@
+ )
+ from deeptutor.runtime.registry.deferred_tools import (
+     DeferredToolLoader,
++    persisted_tool_schemas,
+     render_deferred_tools_manifest,
+ )
+ from deeptutor.runtime.registry.tool_registry import get_tool_registry
+@@ -309,6 +310,17 @@
+         if tool_schemas is not None and self._deferred_loader is not None:
+             tool_schemas.extend(self._deferred_loader.initial_schemas())
+             self._deferred_loader.bind_live_schemas(tool_schemas)
++        if tool_schemas is not None:
++            known = {
++                str((schema.get("function") or {}).get("name") or "")
++                for schema in tool_schemas
++                if isinstance(schema, dict)
++            }
++            for schema in persisted_tool_schemas(context.session_id, self.registry):
++                name = str((schema.get("function") or {}).get("name") or "")
++                if name and name not in known:
++                    tool_schemas.append(schema)
++                    known.add(name)
+ 
+         loop = AgentLoop(
+             pipeline=self,
+diff --git a/deeptutor/runtime/registry/deferred_tools.py b/deeptutor/runtime/registry/deferred_tools.py
+--- a/deeptutor/runtime/registry/deferred_tools.py
++++ b/deeptutor/runtime/registry/deferred_tools.py
+@@ -142,6 +142,30 @@
+             self._persist()
+         return {"loaded": loaded, "already_loaded": already, "unknown": unknown}
+ 
++    def load_server(self, server: str) -> dict[str, list[str]]:
++        """Load every extended tool exposed by one MCP server.
++
++        A whole server is often the unit a user thinks in ("the github
++        tools"), so this keeps the model from having to enumerate every
++        tool name it wants.
++        """
++        loaded: list[str] = []
++        already: list[str] = []
++        for tool in self._registry.deferred_tools():
++            if str(getattr(tool, "server_name", "") or "") != server:
++                continue
++            name = tool.get_definition().name
++            if name in self._loaded:
++                already.append(name)
++                continue
++            if self._live_schemas is not None:
++                self._live_schemas.append(tool.get_definition().to_openai_schema())
++            self._loaded.add(name)
++            loaded.append(name)
++        if loaded:
++            self._persist()
++        return {"loaded": loaded, "already_loaded": already, "unknown": []}
++
+     def _persist(self) -> None:
+         try:
+             from deeptutor.services.mcp.session_state import record_loaded_tools
+@@ -151,4 +175,25 @@
+             logger.warning("failed to persist deferred-tool state", exc_info=True)
+ 
+ 
+-__all__ = ["DeferredToolLoader", "render_deferred_tools_manifest"]
++def persisted_tool_schemas(
++    session_id: str,
++    registry: ToolRegistry,
++) -> list[dict[str, Any]]:
++    """Schemas for the extended tools this conversation already loaded.
++
++    ``load_tools`` records the tool names per session. A turn that resumes
++    the conversation starts with those schemas so the model does not have to
++    load them again; tools that disappeared from the registry are skipped.
++    """
++    from deeptutor.services.mcp.session_state import load_loaded_tools
++
++    schemas: list[dict[str, Any]] = []
++    for name in sorted(load_loaded_tools(session_id)):
++        tool = registry.get(name)
++        if tool is None or not getattr(tool, "deferred", False):
++            continue
++        schemas.append(tool.get_definition().to_openai_schema())
++    return schemas
++
++
++__all__ = ["DeferredToolLoader", "persisted_tool_schemas", "render_deferred_tools_manifest"]
+diff --git a/deeptutor/tools/builtin/__init__.py b/deeptutor/tools/builtin/__init__.py
+--- a/deeptutor/tools/builtin/__init__.py
++++ b/deeptutor/tools/builtin/__init__.py
+@@ -1308,7 +1308,16 @@
+                     description=(
+                         "Exact tool names to load, as listed in the Extended Tools section."
+                     ),
++                    required=False,
+                     items={"type": "string"},
++                ),
++                ToolParameter(
++                    name="server",
++                    type="string",
++                    description=(
++                        "Load every Extended Tool exposed by one MCP server, by server name."
++                    ),
++                    required=False,
+                 ),
+             ],
+         )
+@@ -1316,14 +1325,18 @@
+     async def execute(self, **kwargs: Any) -> ToolResult:
+         loader = kwargs.get("_tool_loader")
+         names = kwargs.get("names")
++        server = kwargs.get("server")
+         if loader is None:
+             return ToolResult(
+                 content="(load_tools is unavailable in this context)",
+                 success=False,
+             )
+-        if not isinstance(names, list) or not names:
+-            raise ValueError("load_tools requires a non-empty `names` array.")
+-        outcome = loader.load(names)
++        if isinstance(server, str) and server.strip():
++            outcome = loader.load_server(server.strip())
++        elif isinstance(names, list) and names:
++            outcome = loader.load(names)
++        else:
++            raise ValueError("load_tools requires a non-empty `names` array or a `server`.")
+         parts: list[str] = []
+         if outcome["loaded"]:
+             parts.append("Loaded (now callable): " + ", ".join(outcome["loaded"]))

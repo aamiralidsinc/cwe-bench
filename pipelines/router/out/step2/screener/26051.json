@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "26051", "advisory_ids": ["GHSA-GX55-P8G7-P3FH", "CVE-2026-57288"], "repo": "jenkinsci/active-directory-plugin",
+  "pinned_commit": "e06d0e0d93c1406ce50d7c121b77514b334c3e7a", "fix_commits": ["5028dea8e0acc45ff9d6be302d4e1cbc1f9da464"],
+  "trust_decision": {
+    "summary": "The decision is which directory object a login or group-details request is about: the request-supplied user or group name is concatenated raw into the ADO command text \"<LDAP://DC>;(sAMAccountName=<name>);distinguishedName;subTree\" at ActiveDirectoryAuthenticationProvider.java:332 (Windows ADSI/COM implementation only), so the LDAP search filter is decided by the requester, not by the service.",
+    "evidence": [
+      "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:332",
+      "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:211",
+      "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:348",
+      "fix.diff:27"
+    ]
+  },
+  "landing_point": {
+    "where": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:332",
+    "why": "It is the only hand-built LDAP filter string in the tree; every other search passes the value as a JNDI {0} argument (LDAPSearchBuilder.java:120), which the JDK escapes, so an engineer hunting for a concatenated filter ends here."
+  },
+  "fix_sites": [
+    {
+      "where": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:332",
+      "entry_point": "ActiveDirectorySecurityRealm.authenticate2 (login) and loadUserByUsername2 -> ActiveDirectoryAuthenticationProvider.retrieveUser -> getDnOfUserOrGroup (line 211); ActiveDirectorySecurityRealm.loadGroupByGroupname2 -> loadGroupByGroupname -> getDnOfUserOrGroup (line 348)",
+      "module_kind": "Jenkins SecurityRealm authentication provider (Windows ADSI/COM implementation of the two implementations the plugin ships)"
+    },
+    {
+      "where": "fix.diff:41-58",
+      "entry_point": "new static helper escapeLdapFilterValue, reached only from the line 332 call site",
+      "module_kind": "new utility method in the same class"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "No O2 or O8 site exists to argue away: both public routes (login/user lookup and group details) funnel through the single private getDnOfUserOrGroup, so the only dismissal on offer is that ADSI mode itself is a Windows-only legacy path (the plugin prints 'Using Windows ADSI. No diagnostics available.' at ActiveDirectorySecurityRealm.java:451).",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legit logins for user@domain (UPN), user.name and DOMAIN\\user names must keep passing through unchanged, the DN->LDAP-URL conversion deliberately must not be double-escaped, and the ';' delimiters of the ADO command text must stay intact; an over-broad fix that escapes the DN or the naming context, that rewrites the whole command text, that rejects names containing '@' or '\\', or that adds escaping to the JNDI {0} arguments (already escaped by DirContext.search) breaks binds and lookups for existing accounts.",
+    "where": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:190"
+  },
+  "O6_input_shapes": [
+    "plain String username from the login/web path",
+    "plain String group name from the group-details path",
+    "null name (helper returns an empty string)",
+    "empty string",
+    "values containing each RFC 4515 metacharacter: backslash, asterisk, open paren, close paren, NUL (including an already-escaped-looking input such as a literal \\2a)",
+    "benign names such as user.name and user@domain that must be unchanged"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:332",
+      "sibling": "a second ADO commandText filter in the same method, e.g. the userPrincipalName-then-sAMAccountName fallback pair the Unix implementation has",
+      "why_realistic": "the plugin ships two implementations of the same lookup and keeps the Windows one in step with the Java one (README.md:10-14); ActiveDirectoryUnixAuthenticationProvider.java:385,390 already shows the two-search shape, so a maintainer adding the UPN fallback to ADSI mode would hand-build a second filter and need the same escaping there"
+    },
+    {
+      "where": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java:348",
+      "sibling": "a cn fallback before the sAMAccountName lookup inside loadGroupByGroupname, mirroring the group search order of the Unix implementation",
+      "why_realistic": "ActiveDirectoryUnixAuthenticationProvider.java:528,534 does (cn) then (sAMAccountName) for groups; porting that order into the ADSI provider is a natural maintainer change and would add another raw concatenation of the group name"
+    },
+    {
+      "where": "src/main/java/hudson/plugins/active_directory/LDAPSearchBuilder.java:120",
+      "sibling": "a caller that formats the name into the filter string itself instead of passing it as a {0} argument to search()/searchOne()",
+      "why_realistic": "the builder takes an arbitrary filter string, so nothing in its API prevents a caller from concatenating; a refactor of one of the four search sites could drop the argument form and silently lose the JDK's escaping"
+    }
+  ],
+  "O9_family": "LDAP injection (CWE-90): unescaped filter value concatenated into a directory search filter", "O9_dos": false,
+  "O10_build": {
+    "language": "Java",
+    "toolchain": "Maven with the Jenkins plugin parent 5.24, hpi packaging, jenkins.version 2.504.3, .mvn/maven.config adding the incremental profiles",
+    "services": [
+      "Maven artifact repository reachable over the network at build time (dependencies not vendored)",
+      "an Active Directory domain controller (Samba AD container or a domain-joined Windows host with COM4J) to exercise the affected path at runtime"
+    ],
+    "offline_after_build": false,
+    "project_tests": "ActiveDirectoryAuthenticationProviderTest.java is a plain unit test but at the pinned commit covers only dnToLdapUrl (no escaping test); the ADSI-mode coverage is Windows-only ITs that skip elsewhere (WindowsAdsiModeUserCacheDisabledIT.java:29 assumeTrue(isWindows()), same in WindowsAdsiModeUserCacheEnabledIT.java:31) and needs a domain-joined host with a pre-created user; the Samba AD end-to-end tests are Testcontainers-based and skip without Docker (RequireDockerRule.java:24)."
+  },
+  "O11_fix_minutes": 15,
+  "O12_red_flags": ["tiny_repo", "single_site", "needs_network_at_runtime"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/main/java/hudson/plugins/active_directory/ActiveDirectoryAuthenticationProvider.java",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Replace the * ( and ) characters at the single commandText call (typically with a regex) and stop, leaving the literal backslash that re-introduces wildcard injection through a \\2a sequence and the NUL character unhandled."
+  },
+  "out_of_scope_notes": [
+    "Adjacent but outside this advisory: ActiveDirectoryUnixAuthenticationProvider.java:366 passes the user-supplied principal name as the LDAP bind name; that is a bind, not a search filter, and was not pursued."
+  ],
+  "unverified": [
+    "The ADO LDAP dialect is '<LDAP://server>;filter;attributes;scope', so ';' is a component separator that the published escaper does not map; whether a name containing ';' can still break out of the filter component cannot be checked without a live Windows ADO/AD stack.",
+    "Whether the grader can exercise this fix at all: getDnOfUserOrGroup is reachable only through COM4J/ADO, and the provider is selected only when canDoNativeAuth() is true, which returns false unless the host is Windows (ActiveDirectorySecurityRealm.java:526-527, 949-956); no offline unit test on Linux can reach the sink, so a hidden behavioural test would have to target a solver-chosen helper by name or rely on a refactor.",
+    "Repository size in megabytes was not measured (no shell in this session); src/main/java is 4,403 lines across 26 files, which is the basis for the tiny_repo flag.",
+    "The advisory text itself was not supplied (only the one-line summary), so its exact wording about affected modes and scope could not be compared with the diff."
+  ]
+}

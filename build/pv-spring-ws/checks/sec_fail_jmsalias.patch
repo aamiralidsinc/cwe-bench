@@ -1,0 +1,1492 @@
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/client/support/WebServiceAccessor.java b/spring-ws-core/src/main/java/org/springframework/ws/client/support/WebServiceAccessor.java
+index 797faed89..2f2feaf93 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/client/support/WebServiceAccessor.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/client/support/WebServiceAccessor.java
+@@ -25,6 +25,7 @@ import org.springframework.util.Assert;
+ import org.springframework.ws.WebServiceMessageFactory;
+ import org.springframework.ws.transport.WebServiceConnection;
+ import org.springframework.ws.transport.WebServiceMessageSender;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
+ import org.springframework.xml.transform.TransformerObjectSupport;
+ 
+ /**
+@@ -95,8 +96,9 @@ public abstract class WebServiceAccessor extends TransformerObjectSupport implem
+ 	 * resolved.
+ 	 * <p>
+ 	 * Default implementation iterates over all configured {@link WebServiceMessageSender}
+-	 * objects, and calls {@link WebServiceMessageSender#supports(URI)} for each of them.
+-	 * If the sender supports the parameter URI, it creates a connection using
++	 * objects, and calls {@link WebServiceMessageSender#supports(URI, UriSource)} with
++	 * {@link UriSource#APPLICATION} for each of them. If the sender supports the
++	 * parameter URI, it creates a connection using
+ 	 * {@link WebServiceMessageSender#createConnection(URI)} .
+ 	 * @param uri the URI to open a connection to
+ 	 * @return the created connection
+@@ -107,7 +109,7 @@ public abstract class WebServiceAccessor extends TransformerObjectSupport implem
+ 		Assert.notEmpty(getMessageSenders(), "Property 'messageSenders' is required");
+ 		WebServiceMessageSender[] messageSenders = getMessageSenders();
+ 		for (WebServiceMessageSender messageSender : messageSenders) {
+-			if (messageSender.supports(uri)) {
++			if (messageSender.supports(uri, UriSource.APPLICATION)) {
+ 				WebServiceConnection connection = messageSender.createConnection(uri);
+ 				if (this.logger.isDebugEnabled()) {
+ 					try {
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/server/endpoint/interceptor/DelegatingSmartEndpointInterceptor.java b/spring-ws-core/src/main/java/org/springframework/ws/server/endpoint/interceptor/DelegatingSmartEndpointInterceptor.java
+index d52fb222d..1fa38351f 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/server/endpoint/interceptor/DelegatingSmartEndpointInterceptor.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/server/endpoint/interceptor/DelegatingSmartEndpointInterceptor.java
+@@ -16,6 +16,7 @@
+ 
+ package org.springframework.ws.server.endpoint.interceptor;
+ 
++import org.springframework.core.Ordered;
+ import org.springframework.util.Assert;
+ import org.springframework.ws.WebServiceMessage;
+ import org.springframework.ws.context.MessageContext;
+@@ -25,11 +26,22 @@ import org.springframework.ws.server.SmartEndpointInterceptor;
+ /**
+  * Implementation of the {@link SmartEndpointInterceptor} interface that delegates to a
+  * delegate {@link EndpointInterceptor}.
++ * <p>
++ * If the target {@link EndpointInterceptor} does not implement {@link Ordered}, a default
++ * order is applied ({@value #DEFAULT_ORDER}).
+  *
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 2.0
+  */
+-public class DelegatingSmartEndpointInterceptor implements SmartEndpointInterceptor {
++public class DelegatingSmartEndpointInterceptor implements SmartEndpointInterceptor, Ordered {
++
++	/**
++	 * Default order for {@link SmartEndpointInterceptor} instances managed by this class
++	 * that do not implement {@link Ordered} themselves.
++	 * @since 3.1.9
++	 */
++	public static final int DEFAULT_ORDER = 100;
+ 
+ 	private final EndpointInterceptor delegate;
+ 
+@@ -51,6 +63,14 @@ public class DelegatingSmartEndpointInterceptor implements SmartEndpointIntercep
+ 		return this.delegate;
+ 	}
+ 
++	@Override
++	public int getOrder() {
++		if (this.delegate instanceof Ordered) {
++			return ((Ordered) this.delegate).getOrder();
++		}
++		return DEFAULT_ORDER;
++	}
++
+ 	/**
+ 	 * {@inheritDoc}
+ 	 * <p>
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AbstractAddressingEndpointMapping.java b/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AbstractAddressingEndpointMapping.java
+index ceb580041..88149a655 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AbstractAddressingEndpointMapping.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AbstractAddressingEndpointMapping.java
+@@ -30,8 +30,10 @@ import org.springframework.beans.factory.BeanFactoryUtils;
+ import org.springframework.beans.factory.InitializingBean;
+ import org.springframework.context.ApplicationContext;
+ import org.springframework.context.ApplicationContextAware;
++import org.springframework.core.OrderComparator;
+ import org.springframework.core.Ordered;
+ import org.springframework.util.Assert;
++import org.springframework.util.ObjectUtils;
+ import org.springframework.ws.context.MessageContext;
+ import org.springframework.ws.server.EndpointInterceptor;
+ import org.springframework.ws.server.EndpointInvocationChain;
+@@ -49,6 +51,7 @@ import org.springframework.ws.soap.addressing.version.AddressingVersion;
+ import org.springframework.ws.soap.server.SoapEndpointInvocationChain;
+ import org.springframework.ws.soap.server.SoapEndpointMapping;
+ import org.springframework.ws.transport.WebServiceMessageSender;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
+ import org.springframework.xml.transform.TransformerObjectSupport;
+ 
+ /**
+@@ -66,19 +69,30 @@ import org.springframework.xml.transform.TransformerObjectSupport;
+  * {@link UuidMessageIdStrategy}.
+  * <p>
+  * The {@link #setMessageSenders(WebServiceMessageSender[]) messageSenders} are used to
+- * send out-of-band reply messages. If a request messages defines a non-anonymous reply
+- * address, these senders will be used to send the message.
++ * send out-of-band reply messages. If a request message defines a non-anonymous reply
++ * address, these senders will be used to send the message. Each sender's
++ * {@link WebServiceMessageSender#supports(java.net.URI, UriSource)} with
++ * {@link UriSource#REMOTE} determines whether client-supplied {@code wsa:ReplyTo} /
++ * {@code wsa:FaultTo} URIs are accepted for that transport.
+  * <p>
+  * This mapping (and all subclasses) uses an implicit WS-Addressing
+  * {@link EndpointInterceptor}, which is added in every {@link EndpointInvocationChain}
+  * produced. As such, this mapping does not have the standard {@code interceptors}
+  * property, but rather a {@link #setPreInterceptors(EndpointInterceptor[])
+- * preInterceptors} and {@link #setPostInterceptors(EndpointInterceptor[])
+- * postInterceptors} property, which are added before and after the implicit WS-Addressing
+- * interceptor, respectively.
++ * preInterceptors} property and a {@link #setPostInterceptors(EndpointInterceptor[])
++ * postInterceptors} property.
++ * <p>
++ * Pre-interceptors always run first in the order they have been configured. All other
++ * interceptors — the implicit WS-Addressing interceptor, any auto-discovered
++ * {@link org.springframework.ws.server.SmartEndpointInterceptor
++ * SmartEndpointInterceptors}, and post-interceptors — are sorted together using
++ * {@link org.springframework.core.OrderComparator}. The implicit WS-Addressing
++ * interceptor has a fixed order of {@code 0}; unordered interceptors default to
++ * {@link Integer#MAX_VALUE} so they run last.
+  *
+  * @author Arjen Poutsma
+  * @author Nate Stoddard
++ * @author Stephane Nicoll
+  * @since 1.5.0
+  */
+ public abstract class AbstractAddressingEndpointMapping extends TransformerObjectSupport
+@@ -162,8 +176,9 @@ public abstract class AbstractAddressingEndpointMapping extends TransformerObjec
+ 	}
+ 
+ 	/**
+-	 * Set additional interceptors to be applied before the implicit WS-Addressing
+-	 * interceptor, e.g. {@code Wss4jSecurityInterceptor}.
++	 * Set the {@link EndpointInterceptor interceptors} to be applied first, in the order
++	 * they have been defined.
++	 * @param preInterceptors the interceptors to apply first, in that order
+ 	 */
+ 	public final void setPreInterceptors(EndpointInterceptor[] preInterceptors) {
+ 		Assert.notNull(preInterceptors, "'preInterceptors' must not be null");
+@@ -171,8 +186,18 @@ public abstract class AbstractAddressingEndpointMapping extends TransformerObjec
+ 	}
+ 
+ 	/**
+-	 * Set additional interceptors to be applied after the implicit WS-Addressing
+-	 * interceptor, e.g. {@code PayloadLoggingInterceptor}.
++	 * Set additional interceptors to apply alongside the implicit WS-Addressing
++	 * interceptor.
++	 * <p>
++	 * Interceptors are sorted together with any auto-discovered
++	 * {@link org.springframework.ws.server.SmartEndpointInterceptor
++	 * SmartEndpointInterceptors} and the implicit WS-Addressing interceptor (order
++	 * {@code 0}) using {@link org.springframework.core.OrderComparator}. By default,
++	 * interceptors without an explicit order are placed at the end, and therefore after
++	 * the WS-Addressing interceptor. Implement {@link org.springframework.core.Ordered}
++	 * to customize the position.
++	 * @param postInterceptors additional interceptors to apply alongside the implicit
++	 * WS-Addressing interceptor
+ 	 */
+ 	public final void setPostInterceptors(EndpointInterceptor[] postInterceptors) {
+ 		Assert.notNull(postInterceptors, "'postInterceptors' must not be null");
+@@ -286,24 +311,39 @@ public abstract class AbstractAddressingEndpointMapping extends TransformerObjec
+ 
+ 		WebServiceMessageSender[] messageSenders = getMessageSenders(endpoint);
+ 		MessageIdStrategy messageIdStrategy = getMessageIdStrategy(endpoint);
+-
+-		List<EndpointInterceptor> interceptors = new ArrayList<>(Arrays.asList(this.preInterceptors));
+-
+ 		AddressingEndpointInterceptor addressingInterceptor = new AddressingEndpointInterceptor(version,
+ 				messageIdStrategy, messageSenders, responseAction, faultAction);
+-		interceptors.add(addressingInterceptor);
+-		interceptors.addAll(Arrays.asList(this.postInterceptors));
++		EndpointInterceptor[] interceptors = buildInterceptors(endpoint, messageContext, addressingInterceptor);
++		return new SoapEndpointInvocationChain(endpoint, interceptors, this.actorsOrRoles, this.isUltimateReceiver);
++	}
+ 
+-		if (this.smartInterceptors != null) {
++	/**
++	 * Build the list of {@link EndpointInterceptor EndpointInterceptors} for the given
++	 * endpoint and message context. Only add {@link SmartEndpointInterceptor} that should
++	 * be {@link SmartEndpointInterceptor#shouldIntercept(MessageContext, Object)
++	 * intercepted}.
++	 * @param endpoint the endpoint
++	 * @param messageContext the current message context
++	 * @param addressingInterceptor the implicit WS-Addressing interceptor
++	 * @return the interceptors to use
++	 * @since 3.1.9
++	 */
++	protected EndpointInterceptor[] buildInterceptors(Object endpoint, MessageContext messageContext,
++			EndpointInterceptor addressingInterceptor) {
++		List<EndpointInterceptor> allInterceptor = new ArrayList<>(Arrays.asList(this.preInterceptors));
++		List<EndpointInterceptor> interceptors = new ArrayList<>();
++		if (!ObjectUtils.isEmpty(this.smartInterceptors)) {
+ 			for (SmartEndpointInterceptor smartInterceptor : this.smartInterceptors) {
+ 				if (smartInterceptor.shouldIntercept(messageContext, endpoint)) {
+ 					interceptors.add(smartInterceptor);
+ 				}
+ 			}
+ 		}
+-
+-		return new SoapEndpointInvocationChain(endpoint, interceptors.toArray(new EndpointInterceptor[0]),
+-				this.actorsOrRoles, this.isUltimateReceiver);
++		interceptors.add(addressingInterceptor);
++		interceptors.addAll(Arrays.asList(this.postInterceptors));
++		OrderComparator.sort(interceptors);
++		allInterceptor.addAll(interceptors);
++		return allInterceptor.toArray(new EndpointInterceptor[0]);
+ 	}
+ 
+ 	private boolean supports(AddressingVersion version, SoapMessage request) {
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AddressingEndpointInterceptor.java b/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AddressingEndpointInterceptor.java
+index 00a001181..2dea5d7bf 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AddressingEndpointInterceptor.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/soap/addressing/server/AddressingEndpointInterceptor.java
+@@ -22,6 +22,7 @@ import java.net.URI;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
++import org.springframework.core.Ordered;
+ import org.springframework.util.Assert;
+ import org.springframework.ws.context.MessageContext;
+ import org.springframework.ws.soap.SoapHeaderElement;
+@@ -33,6 +34,7 @@ import org.springframework.ws.soap.addressing.version.AddressingVersion;
+ import org.springframework.ws.soap.server.SoapEndpointInterceptor;
+ import org.springframework.ws.transport.WebServiceConnection;
+ import org.springframework.ws.transport.WebServiceMessageSender;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
+ 
+ /**
+  * {@link SoapEndpointInterceptor} implementation that deals with WS-Addressing headers.
+@@ -41,7 +43,17 @@ import org.springframework.ws.transport.WebServiceMessageSender;
+  * @author Arjen Poutsma
+  * @since 1.5.0
+  */
+-class AddressingEndpointInterceptor implements SoapEndpointInterceptor {
++class AddressingEndpointInterceptor implements SoapEndpointInterceptor, Ordered {
++
++	/**
++	 * Default order for WS-Addressing support. Application endpoint interceptors should
++	 * usually be invoked after, so that addressing headers such as required-header checks
++	 * and message ID deduplication have been validated. Interceptors with no order or a
++	 * positive order can rely on the request being fully WS-Addressing-conformant. Use a
++	 * negative value to order an interceptor before WS-Addressing processing.
++	 * @since 3.1.9
++	 */
++	public static final int DEFAULT_ORDER = 0;
+ 
+ 	private static final Log logger = LogFactory.getLog(AddressingEndpointInterceptor.class);
+ 
+@@ -114,7 +126,7 @@ class AddressingEndpointInterceptor implements SoapEndpointInterceptor {
+ 			sendOutOfBand(messageContext, replyEpr, () -> {
+ 				if (logger.isWarnEnabled()) {
+ 					logger.warn("Could not send out-of-band response to [" + replyEpr.getAddress() + "]. "
+-							+ "Configure WebServiceMessageSenders which support this uri.");
++							+ "Configure WebServiceMessageSenders which support this uri and pass remote destination checks.");
+ 				}
+ 				messageContext.clearResponse();
+ 				this.version.addInvalidAddressingHeaderFault((SoapMessage) messageContext.getResponse());
+@@ -153,11 +165,12 @@ class AddressingEndpointInterceptor implements SoapEndpointInterceptor {
+ 					+ "] reply address; sending out-of-band reply [" + messageContext.getResponse() + "]");
+ 		}
+ 
++		URI address = replyEpr.getAddress();
+ 		boolean supported = false;
+ 		for (WebServiceMessageSender messageSender : this.messageSenders) {
+-			if (messageSender.supports(replyEpr.getAddress())) {
++			if (messageSender.supports(address, UriSource.REMOTE)) {
+ 				supported = true;
+-				try (WebServiceConnection connection = messageSender.createConnection(replyEpr.getAddress())) {
++				try (WebServiceConnection connection = messageSender.createConnection(address)) {
+ 					connection.send(messageContext.getResponse());
+ 					break;
+ 				}
+@@ -179,6 +192,11 @@ class AddressingEndpointInterceptor implements SoapEndpointInterceptor {
+ 		return responseMessageId;
+ 	}
+ 
++	@Override
++	public int getOrder() {
++		return DEFAULT_ORDER;
++	}
++
+ 	@Override
+ 	public void afterCompletion(MessageContext messageContext, Object endpoint, Exception ex) {
+ 	}
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/transport/AbstractWebServiceMessageSender.java b/spring-ws-core/src/main/java/org/springframework/ws/transport/AbstractWebServiceMessageSender.java
+new file mode 100644
+index 000000000..14ca92d3b
+--- /dev/null
++++ b/spring-ws-core/src/main/java/org/springframework/ws/transport/AbstractWebServiceMessageSender.java
+@@ -0,0 +1,98 @@
++/*
++ * Copyright 2005-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.ws.transport;
++
++import java.net.URI;
++import java.util.function.Predicate;
++
++import org.springframework.util.Assert;
++import org.springframework.ws.transport.WebServiceMessageSender.DestinationDescriptor;
++
++/**
++ * Base class for {@link WebServiceMessageSender} implementations that share
++ * {@link DestinationPolicy} handling for {@link #supports(URI, UriSource)}.
++ * <p>
++ * A URI filter must be provided to only accept a URI that the implementation handles,
++ * irrespective of whether it is acceptable according to an {@link UriSource}.
++ * Implementations typically inspect the URI scheme (or other transport-specific traits)
++ * in that filter.
++ *
++ * @param <D> concrete {@link DestinationDescriptor} type
++ * @author Stephane Nicoll
++ * @since 3.1.9
++ */
++public abstract class AbstractWebServiceMessageSender<D extends DestinationDescriptor>
++		implements WebServiceMessageSender {
++
++	private final Predicate<URI> supportedUriFilter;
++
++	private DestinationPolicy<D> destinationPolicy;
++
++	/**
++	 * Create an instance with the URI filter to apply to accept a given URI.
++	 * @param supportedUriFilter the predicate to apply to a URI to test if it is
++	 * supported by the instance
++	 */
++	protected AbstractWebServiceMessageSender(Predicate<URI> supportedUriFilter) {
++		Assert.notNull(supportedUriFilter, "'supportedUriFilter' must not be null");
++		this.supportedUriFilter = supportedUriFilter;
++	}
++
++	/**
++	 * Set a custom {@link DestinationPolicy} to compose with the sender's default checks.
++	 * When unset, only default checks apply.
++	 * @param destinationPolicy the policy to apply
++	 */
++	public void setDestinationPolicy(DestinationPolicy<D> destinationPolicy) {
++		this.destinationPolicy = destinationPolicy;
++	}
++
++	/**
++	 * Return the configured {@link DestinationPolicy} or {@code null} if none is set.
++	 * @return the custom destination policy or {@code null} if none is set.
++	 */
++	protected DestinationPolicy<D> getDestinationPolicy() {
++		return this.destinationPolicy;
++	}
++
++	@Override
++	public boolean supports(URI uri, UriSource uriSource) {
++		if (!this.supportedUriFilter.test(uri)) {
++			return false;
++		}
++		D details = createDescriptor(uri, uriSource);
++		Predicate<D> defaultChecks = defaultChecks(uriSource);
++		return (this.destinationPolicy != null) ? this.destinationPolicy.accept(details, defaultChecks)
++				: defaultChecks.test(details);
++	}
++
++	/**
++	 * Create a {@link DestinationDescriptor} for the given {@code uri} and
++	 * {@code uriSource}.
++	 * @param uri the URI to check
++	 * @param uriSource the source of the URI
++	 * @return a suitable descriptor
++	 */
++	protected abstract D createDescriptor(URI uri, UriSource uriSource);
++
++	/**
++	 * Return the default checks to apply for the given {@link UriSource}.
++	 * @return the default checks to apply
++	 */
++	protected abstract Predicate<D> defaultChecks(UriSource uriSource);
++
++}
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/transport/WebServiceMessageSender.java b/spring-ws-core/src/main/java/org/springframework/ws/transport/WebServiceMessageSender.java
+index d72e35a0a..fe6889a43 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/transport/WebServiceMessageSender.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/transport/WebServiceMessageSender.java
+@@ -18,17 +18,21 @@ package org.springframework.ws.transport;
+ 
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.function.Predicate;
+ 
+ import org.springframework.ws.WebServiceMessage;
+ 
+ /**
+  * Defines the methods for classes capable of sending and receiving
+- * {@link WebServiceMessage} instances across a transport.
++ * {@link WebServiceMessage} instances for a given transport. Also validates if a
++ * destination {@link URI} is supported, which is used both for expressing that the
++ * instance can handle the URI but that it is acceptable for a given {@link UriSource}.
+  * <p>
+  * The {@code WebServiceMessageSender} is basically a factory for
+  * {@link WebServiceConnection} objects.
+  *
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 1.0.0
+  * @see WebServiceConnection
+  */
+@@ -43,11 +47,94 @@ public interface WebServiceMessageSender {
+ 	WebServiceConnection createConnection(URI uri) throws IOException;
+ 
+ 	/**
+-	 * Does this {@link WebServiceMessageSender} support the supplied URI?
++	 * Whether this sender supports the given URI for the supplied {@link UriSource}.
++	 * Implementations typically apply the same transport rules for
++	 * {@link UriSource#APPLICATION} as for legacy {@link #supports(URI)}, and add
++	 * stricter checks for {@link UriSource#REMOTE}.
++	 * @param uri the URI to be checked
++	 * @param uriSource whether the URI is application-controlled or remote-influenced
++	 * @return {@code true} if this sender accepts the URI for that source
++	 * @since 3.1.9
++	 */
++	boolean supports(URI uri, UriSource uriSource);
++
++	/**
++	 * Whether this sender supports the given URI for application-controlled use.
+ 	 * @param uri the URI to be checked
+ 	 * @return {@code true} if this {@code WebServiceMessageSender} supports the supplied
+ 	 * URI
++	 * @deprecated as of 3.1.9 in favor of {@link #supports(URI, UriSource)}
+ 	 */
+-	boolean supports(URI uri);
++	@Deprecated
++	default boolean supports(URI uri) {
++		return supports(uri, UriSource.APPLICATION);
++	}
++
++	/**
++	 * Source of a destination URI.
++	 *
++	 * @since 3.1.9
++	 */
++	enum UriSource {
++
++		/**
++		 * Destination chosen by the application (for example, a
++		 * {@code WebServiceTemplate} endpoint URL).
++		 */
++		APPLICATION,
++
++		/**
++		 * Destination influenced by a remote peer (for example, WS-Addressing
++		 * {@code ReplyTo} / {@code FaultTo} on a server).
++		 */
++		REMOTE
++
++	}
++
++	/**
++	 * Description of a destination URI for validation, including its
++	 * {@linkplain UriSource source}. Transport-specific descriptors provide additional
++	 * details to help express custom checks.
++	 *
++	 * @since 3.1.9
++	 */
++	interface DestinationDescriptor {
++
++		/**
++		 * Return the URI.
++		 * @return the URI
++		 */
++		URI uri();
++
++		/**
++		 * Return the origin of the URI.
++		 * @return the source of the URI
++		 */
++		UriSource uriSource();
++
++	}
++
++	/**
++	 * Specifies the policy to apply for a given {@linkplain DestinationDescriptor
++	 * descriptor}. Implementation may choose to apply the default checks that would
++	 * otherwise be applied if such policy was not configured.
++	 *
++	 * @param <D> concrete descriptor type supplied by the sender implementation
++	 * @since 3.1.9
++	 */
++	@FunctionalInterface
++	interface DestinationPolicy<D extends DestinationDescriptor> {
++
++		/**
++		 * Whether the given destination is acceptable.
++		 * @param descriptor transport-specific view of the destination
++		 * @param defaultChecks predicate that runs the sender's default checks for this
++		 * descriptor. Call {@code defaultChecks.test(descriptor)} when those checks
++		 * should apply
++		 * @return whether the destination is acceptable
++		 */
++		boolean accept(D descriptor, Predicate<D> defaultChecks);
++
++	}
+ 
+ }
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/transport/http/AbstractHttpWebServiceMessageSender.java b/spring-ws-core/src/main/java/org/springframework/ws/transport/http/AbstractHttpWebServiceMessageSender.java
+index f7dd20794..9e0a59c7c 100644
+--- a/spring-ws-core/src/main/java/org/springframework/ws/transport/http/AbstractHttpWebServiceMessageSender.java
++++ b/spring-ws-core/src/main/java/org/springframework/ws/transport/http/AbstractHttpWebServiceMessageSender.java
+@@ -16,22 +16,38 @@
+ 
+ package org.springframework.ws.transport.http;
+ 
++import java.net.Inet4Address;
++import java.net.InetAddress;
+ import java.net.URI;
++import java.util.function.Predicate;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
+-import org.springframework.ws.transport.WebServiceMessageSender;
++import org.springframework.ws.transport.AbstractWebServiceMessageSender;
+ 
+ /**
+  * Abstract base class for
+  * {@link org.springframework.ws.transport.WebServiceMessageSender} implementations that
+  * use HTTP.
++ * <p>
++ * For {@link UriSource#APPLICATION}, default checks accept any {@code http:} or
++ * {@code https:} URI. For {@link UriSource#REMOTE}, default checks require a host; reject
++ * {@code localhost} and {@code *.localhost}; and when the host is an IP literal, reject
++ * loopback, link-local, any-local addresses without DNS lookups, and RFC&nbsp;1918-style
++ * private IPv4 literals. Non-literal host names are not resolved in the defaults, so
++ * private network access through DNS is not rejected unless you add a
++ * {@link DestinationPolicy}, for example, using
++ * {@link HttpDestinationDescriptor#hostAddress(boolean)} with DNS for stricter checks or
++ * host allowlists. Private IPv4 literals can be enabled by setting
++ * {@link #setAllowSiteLocalIpv4(boolean) allowSiteLocalIpv4} to {@code true}.
+  *
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 1.0.0
+  */
+-public abstract class AbstractHttpWebServiceMessageSender implements WebServiceMessageSender {
++public abstract class AbstractHttpWebServiceMessageSender
++		extends AbstractWebServiceMessageSender<HttpDestinationDescriptor> {
+ 
+ 	/**
+ 	 * Logger available to subclasses.
+@@ -40,6 +56,28 @@ public abstract class AbstractHttpWebServiceMessageSender implements WebServiceM
+ 
+ 	private boolean acceptGzipEncoding = true;
+ 
++	private boolean allowSiteLocalIpv4 = false;
++
++	private boolean allowDnsResolution = false;
++
++	/**
++	 * Create an instance with the URI filter to apply to accept a given URI.
++	 * @param supportedUriFilter the predicate to apply to a URI to test if it is
++	 * supported by the instance
++	 * @since 3.1.9
++	 */
++	protected AbstractHttpWebServiceMessageSender(Predicate<URI> supportedUriFilter) {
++		super(supportedUriFilter);
++	}
++
++	/**
++	 * Create an instance that accepts {@code http:} and {@code https:} URIs.
++	 */
++	protected AbstractHttpWebServiceMessageSender() {
++		this((uri) -> uri.getScheme().equals(HttpTransportConstants.HTTP_URI_SCHEME)
++				|| uri.getScheme().equals(HttpTransportConstants.HTTPS_URI_SCHEME));
++	}
++
+ 	/**
+ 	 * Return whether to accept GZIP encoding, that is, whether to send the HTTP
+ 	 * {@code Accept-Encoding} header with {@code gzip} as value.
+@@ -59,10 +97,77 @@ public abstract class AbstractHttpWebServiceMessageSender implements WebServiceM
+ 		this.acceptGzipEncoding = acceptGzipEncoding;
+ 	}
+ 
++	/**
++	 * Set whether to allow site-local IPv4 addresses for remote destinations.
++	 * <p>
++	 * Default is {@code false}. When {@code false}, remote default checks reject private
++	 * (RFC 1918) IPv4 literals like {@code 10.0.0.1}. Set to {@code true} to allow
++	 * out-of-band replies to internal network destinations unless blocked by another
++	 * policy.
++	 * @since 3.1.9
++	 */
++	public void setAllowSiteLocalIpv4(boolean allowSiteLocalIpv4) {
++		this.allowSiteLocalIpv4 = allowSiteLocalIpv4;
++	}
++
++	/**
++	 * Set whether to allow DNS resolution for remote destinations.
++	 * <p>
++	 * Default is {@code false} to avoid the performance penalty of resolving every remote
++	 * destination. However, this means that malicious hostnames resolving to internal IPs
++	 * (DNS rebinding or simply internal DNS records) are not blocked by the default
++	 * IP-level checks. To secure out-of-band replies without the DNS resolution penalty,
++	 * it is strongly recommended to configure a strict allowlist of known hosts using a
++	 * {@link DestinationPolicy}.
++	 * <p>
++	 * Set to {@code true} to resolve host names and apply default checks to the resolved
++	 * IPs, mitigating SSRF attacks using DNS at the cost of additional latency.
++	 * @since 3.1.9
++	 */
++	public void setAllowDnsResolution(boolean allowDnsResolution) {
++		this.allowDnsResolution = allowDnsResolution;
++	}
++
+ 	@Override
+-	public boolean supports(URI uri) {
+-		return uri.getScheme().equals(HttpTransportConstants.HTTP_URI_SCHEME)
+-				|| uri.getScheme().equals(HttpTransportConstants.HTTPS_URI_SCHEME);
++	protected HttpDestinationDescriptor createDescriptor(URI uri, UriSource uriSource) {
++		return HttpDestinationDescriptor.of(uri, uriSource);
++	}
++
++	@Override
++	protected Predicate<HttpDestinationDescriptor> defaultChecks(UriSource uriSource) {
++		return (uriSource == UriSource.REMOTE) ? this::remoteDefaultChecks : (details) -> true;
++	}
++
++	/**
++	 * Apply default checks for {@link UriSource#REMOTE} URIs.
++	 * @param descriptor the descriptor
++	 * @return whether the default checks accept the URI of the given descriptor
++	 */
++	protected boolean remoteDefaultChecks(HttpDestinationDescriptor descriptor) {
++		String hostName = descriptor.hostName();
++		if (hostName == null) {
++			return false;
++		}
++		if ("localhost".equals(hostName) || hostName.endsWith(".localhost")) {
++			return false;
++		}
++		if (!this.allowSiteLocalIpv4 && descriptor.isSiteLocalIpv4Literal()) {
++			return false;
++		}
++		InetAddress hostAddress = descriptor.hostAddress(this.allowDnsResolution);
++		if (hostAddress != null) {
++			if (isLocalAddress(hostAddress)) {
++				return false;
++			}
++			if (!this.allowSiteLocalIpv4 && hostAddress instanceof Inet4Address && hostAddress.isSiteLocalAddress()) {
++				return false;
++			}
++		}
++		return true;
++	}
++
++	private boolean isLocalAddress(InetAddress address) {
++		return address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isAnyLocalAddress();
+ 	}
+ 
+ }
+diff --git a/spring-ws-core/src/main/java/org/springframework/ws/transport/http/HttpDestinationDescriptor.java b/spring-ws-core/src/main/java/org/springframework/ws/transport/http/HttpDestinationDescriptor.java
+new file mode 100644
+index 000000000..73a9fe3b4
+--- /dev/null
++++ b/spring-ws-core/src/main/java/org/springframework/ws/transport/http/HttpDestinationDescriptor.java
+@@ -0,0 +1,146 @@
++/*
++ * Copyright 2005-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.ws.transport.http;
++
++import java.net.Inet4Address;
++import java.net.InetAddress;
++import java.net.URI;
++import java.net.UnknownHostException;
++import java.util.Locale;
++import java.util.function.Supplier;
++
++import org.springframework.util.StringUtils;
++import org.springframework.util.function.SingletonSupplier;
++import org.springframework.ws.transport.WebServiceMessageSender.DestinationDescriptor;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
++
++/**
++ * {@link DestinationDescriptor} implementation for HTTP destinations.
++ *
++ * @author Stephane Nicoll
++ * @since 3.1.9
++ */
++public final class HttpDestinationDescriptor implements DestinationDescriptor {
++
++	private final URI uri;
++
++	private final UriSource uriSource;
++
++	private final Supplier<InetAddress> simpleHostAddressResolver = SingletonSupplier
++		.of(() -> resolveHostAddress(false));
++
++	private final Supplier<InetAddress> dnsResolutionHostAddressResolver = SingletonSupplier
++		.of(() -> resolveHostAddress(true));
++
++	private HttpDestinationDescriptor(URI uri, UriSource uriSource) {
++		this.uri = uri;
++		this.uriSource = uriSource;
++	}
++
++	/**
++	 * Create an instance from the given URI and URI source.
++	 * @param uri the URI
++	 * @param uriSource the URI source
++	 * @return a descriptor
++	 */
++	public static HttpDestinationDescriptor of(URI uri, UriSource uriSource) {
++		return new HttpDestinationDescriptor(uri, uriSource);
++	}
++
++	@Override
++	public URI uri() {
++		return this.uri;
++	}
++
++	@Override
++	public UriSource uriSource() {
++		return this.uriSource;
++	}
++
++	/**
++	 * Return the host name of the URI, lower-cased.
++	 * @return the host name, or {@code null} if the URI has no host name
++	 */
++	public String hostName() {
++		String host = this.uri.getHost();
++		if (!StringUtils.hasText(host)) {
++			return null;
++		}
++		String cleanedHostName = host.toLowerCase(Locale.ROOT);
++		if (cleanedHostName.length() >= 2 && cleanedHostName.charAt(0) == '['
++				&& cleanedHostName.charAt(cleanedHostName.length() - 1) == ']') {
++			cleanedHostName = cleanedHostName.substring(1, cleanedHostName.length() - 1);
++		}
++		return cleanedHostName;
++	}
++
++	/**
++	 * Resolve the host name to an {@link InetAddress}.
++	 * @param allowDnsResolution whether to allow DNS resolution, when false, only IP
++	 * literals are considered
++	 * @return the address of the host or {@code null} if the host name is not resolvable
++	 */
++	public InetAddress hostAddress(boolean allowDnsResolution) {
++		return allowDnsResolution ? this.dnsResolutionHostAddressResolver.get() : this.simpleHostAddressResolver.get();
++	}
++
++	/**
++	 * Whether the URI host is an IPv4 address literal in a private (RFC&nbsp;1918) range.
++	 * @return {@code true} if the host parses as an IPv4 literal and
++	 * {@link InetAddress#isSiteLocalAddress()} is {@code true}; {@code false} for host
++	 * names, non-literal hosts, non-IPv4 literals, and public IPv4 literals
++	 */
++	public boolean isSiteLocalIpv4Literal() {
++		InetAddress address = hostAddress(false);
++		return address instanceof Inet4Address && address.isSiteLocalAddress();
++	}
++
++	private InetAddress resolveHostAddress(boolean allowDnsResolution) {
++		String hostName = hostName();
++		if (hostName != null && (allowDnsResolution || isIpLiteral(hostName))) {
++			try {
++				return InetAddress.getByName(hostName);
++			}
++			catch (UnknownHostException ex) {
++				// do not return loopback
++			}
++		}
++		return null;
++	}
++
++	/**
++	 * Check if the given host name is an IP literal. {@code true} only for forms
++	 * {@link InetAddress#getByName(String)} treats as numeric IP addresses (no DNS),
++	 * avoiding resolution for host names.
++	 */
++	private static boolean isIpLiteral(String hostName) {
++		if (hostName.indexOf(':') >= 0) {
++			return true;
++		}
++		if (hostName.indexOf('.') < 0) {
++			return false;
++		}
++		for (int i = 0; i < hostName.length(); i++) {
++			char c = hostName.charAt(i);
++			if (c != '.' && !Character.isDigit(c)) {
++				return false;
++			}
++		}
++		return true;
++	}
++
++}
+diff --git a/spring-ws-security/src/main/java/org/springframework/ws/soap/security/AbstractWsSecurityInterceptor.java b/spring-ws-security/src/main/java/org/springframework/ws/soap/security/AbstractWsSecurityInterceptor.java
+index 98051a6d2..92c84f2e1 100644
+--- a/spring-ws-security/src/main/java/org/springframework/ws/soap/security/AbstractWsSecurityInterceptor.java
++++ b/spring-ws-security/src/main/java/org/springframework/ws/soap/security/AbstractWsSecurityInterceptor.java
+@@ -24,6 +24,7 @@ import javax.xml.namespace.QName;
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
+ 
++import org.springframework.core.Ordered;
+ import org.springframework.util.Assert;
+ import org.springframework.ws.client.WebServiceClientException;
+ import org.springframework.ws.client.support.interceptor.ClientInterceptor;
+@@ -51,7 +52,15 @@ import org.springframework.ws.soap.soap11.Soap11Body;
+  * @author Arjen Poutsma
+  * @since 1.0.0
+  */
+-public abstract class AbstractWsSecurityInterceptor implements SoapEndpointInterceptor, ClientInterceptor {
++public abstract class AbstractWsSecurityInterceptor implements SoapEndpointInterceptor, ClientInterceptor, Ordered {
++
++	/**
++	 * Default order for WS-Security interceptors, ensuring they run early. Any
++	 * interceptor with a higher precedence than {@value} will therefore run before
++	 * security is applied.
++	 * @since 3.1.9
++	 */
++	public static final int DEFAULT_ORDER = -200;
+ 
+ 	/** Logger available to subclasses. */
+ 	protected final Log logger = LogFactory.getLog(getClass());
+@@ -119,6 +128,11 @@ public abstract class AbstractWsSecurityInterceptor implements SoapEndpointInter
+ 	 * Server-side
+ 	 */
+ 
++	@Override
++	public int getOrder() {
++		return DEFAULT_ORDER;
++	}
++
+ 	/**
+ 	 * Validates a server-side incoming request. Delegates to
+ 	 * {@link #validateMessage(org.springframework.ws.soap.SoapMessage,org.springframework.ws.context.MessageContext)}
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsDestinationDescriptor.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsDestinationDescriptor.java
+new file mode 100644
+index 000000000..20f0fa9ab
+--- /dev/null
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsDestinationDescriptor.java
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2005-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.ws.transport.jms;
++
++import java.net.URI;
++import java.util.Locale;
++
++import org.springframework.util.StringUtils;
++import org.springframework.ws.transport.WebServiceMessageSender.DestinationDescriptor;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
++import org.springframework.ws.transport.jms.support.JmsTransportUtils;
++
++/**
++ * {@link DestinationDescriptor} implementation for JMS destinations.
++ *
++ * @author Stephane Nicoll
++ * @since 3.1.9
++ */
++public final class JmsDestinationDescriptor implements DestinationDescriptor {
++
++	private final URI uri;
++
++	private final UriSource uriSource;
++
++	private JmsDestinationDescriptor(URI uri, UriSource uriSource) {
++		this.uri = uri;
++		this.uriSource = uriSource;
++	}
++
++	/**
++	 * Create an instance from the given URI and URI source.
++	 * @param uri the URI
++	 * @param uriSource the URI source
++	 * @return a descriptor
++	 */
++	public static JmsDestinationDescriptor of(URI uri, UriSource uriSource) {
++		return new JmsDestinationDescriptor(uri, uriSource);
++	}
++
++	@Override
++	public URI uri() {
++		return this.uri;
++	}
++
++	@Override
++	public UriSource uriSource() {
++		return this.uriSource;
++	}
++
++	/**
++	 * Return the name of the destination.
++	 * @return the destination name
++	 */
++	public String destinationName() {
++		return JmsTransportUtils.getDestinationName(this.uri);
++	}
++
++	/**
++	 * Return the name of the replyTo.
++	 * @return the replyTo name
++	 */
++	public String replyToName() {
++		return JmsTransportUtils.getReplyToName(this.uri);
++	}
++
++	/**
++	 * Check if either the destination name or the replyTo name are suspicious, that is if
++	 * either of those names contains a known protocol that could lead to RCE attacks.
++	 * @return {@code true} if any of the destination or replyTo names is suspicious,
++	 * {@code false} otherwise
++	 */
++	public boolean containsSuspiciousJmsNameIndirection() {
++		return containsSuspiciousToken(destinationName()) || containsSuspiciousToken(replyToName());
++	}
++
++	/**
++	 * Check if the legacy reply destination parameter contains a suspicious name.
++	 * @return {@code true} if the legacy reply destination is suspicious, {@code false}
++	 * otherwise
++	 */
++	public boolean containsSuspiciousLegacyReplyToName() {
++		return containsSuspiciousToken(JmsTransportUtils.getReplyToAlias(this.uri));
++	}
++
++	private static boolean containsSuspiciousToken(String name) {
++		if (!StringUtils.hasLength(name)) {
++			return false;
++		}
++		String lower = name.toLowerCase(Locale.ROOT);
++		return lower.contains("ldap:") || lower.contains("ldaps:") || lower.contains("rmi:") || lower.contains("dns:")
++				|| lower.contains("iiop:") || lower.contains("iiopname:") || lower.contains("corbaname:")
++				|| lower.contains("java:") || lower.contains("${");
++	}
++
++}
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsMessageSender.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsMessageSender.java
+index 7c9af193a..5101172d6 100644
+--- a/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsMessageSender.java
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/jms/JmsMessageSender.java
+@@ -18,6 +18,7 @@ package org.springframework.ws.transport.jms;
+ 
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.function.Predicate;
+ 
+ import jakarta.jms.Connection;
+ import jakarta.jms.ConnectionFactory;
+@@ -93,8 +94,16 @@ import org.springframework.ws.transport.jms.support.JmsTransportUtils;
+  * {@code jms:SomeTopic?priority=3&deliveryMode=NON_PERSISTENT}<br>
+  * {@code jms:RequestQueue?replyToName=ResponseQueueName}<br>
+  * {@code jms:Queue?messageType=TEXT_MESSAGE}</blockquote>
++ * <p>
++ * For {@link UriSource#APPLICATION}, default checks accept any {@code jms:} URI. For
++ * {@link UriSource#REMOTE}, default checks reject destination and {@code replyToName}
++ * fragments that resemble JNDI/LDAP/RMI-style indirection (see
++ * {@link JmsDestinationDescriptor#containsSuspiciousJmsNameIndirection()}). Use a
++ * {@link DestinationPolicy} for explicit allowlists, resolver-specific rules, or to tune
++ * validation when legitimate destination names contain such substrings.
+  *
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 1.5.0
+  * @see <a href="https://datatracker.ietf.org/doc/rfc6167">IRI Scheme for Java(tm) Message
+  * Service 1.0</a>
+@@ -119,6 +128,8 @@ public class JmsMessageSender extends JmsDestinationAccessor implements WebServi
+ 
+ 	private MessagePostProcessor postProcessor;
+ 
++	private DestinationPolicy<JmsDestinationDescriptor> destinationPolicy;
++
+ 	/**
+ 	 * Create a new {@code JmsMessageSender}
+ 	 * <p>
+@@ -163,6 +174,16 @@ public class JmsMessageSender extends JmsDestinationAccessor implements WebServi
+ 		this.postProcessor = postProcessor;
+ 	}
+ 
++	/**
++	 * Set a custom {@link DestinationPolicy} to compose with the sender's default checks.
++	 * When unset, only default checks apply.
++	 * @param destinationPolicy the policy to apply
++	 * @since 3.1.9
++	 */
++	public void setDestinationPolicy(DestinationPolicy<JmsDestinationDescriptor> destinationPolicy) {
++		this.destinationPolicy = destinationPolicy;
++	}
++
+ 	@Override
+ 	public WebServiceConnection createConnection(URI uri) throws IOException {
+ 		Connection jmsConnection = null;
+@@ -192,8 +213,23 @@ public class JmsMessageSender extends JmsDestinationAccessor implements WebServi
+ 	}
+ 
+ 	@Override
+-	public boolean supports(URI uri) {
+-		return uri.getScheme().equals(JmsTransportConstants.JMS_URI_SCHEME);
++	public boolean supports(URI uri, UriSource uriSource) {
++		if (!uri.getScheme().equals(JmsTransportConstants.JMS_URI_SCHEME)) {
++			return false;
++		}
++		JmsDestinationDescriptor descriptor = JmsDestinationDescriptor.of(uri, uriSource);
++		Predicate<JmsDestinationDescriptor> defaultChecks = defaultChecks(uriSource);
++		return (this.destinationPolicy != null) ? this.destinationPolicy.accept(descriptor, defaultChecks)
++				: defaultChecks.test(descriptor);
++	}
++
++	/**
++	 * Return the default checks to apply for the given {@link UriSource}.
++	 * @return the default checks to apply
++	 * @since 3.1.9
++	 */
++	protected Predicate<JmsDestinationDescriptor> defaultChecks(UriSource uriSource) {
++		return (descriptor) -> uriSource != UriSource.REMOTE || !descriptor.containsSuspiciousJmsNameIndirection();
+ 	}
+ 
+ 	private Destination resolveRequestDestination(Session session, URI uri) throws JMSException {
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailDestinationDescriptor.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailDestinationDescriptor.java
+new file mode 100644
+index 000000000..dd4cd2a2d
+--- /dev/null
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailDestinationDescriptor.java
+@@ -0,0 +1,133 @@
++/*
++ * Copyright 2005-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.ws.transport.mail;
++
++import java.net.URI;
++import java.util.List;
++import java.util.Locale;
++
++import jakarta.mail.internet.InternetAddress;
++
++import org.springframework.util.StringUtils;
++import org.springframework.ws.transport.WebServiceMessageSender.DestinationDescriptor;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
++import org.springframework.ws.transport.mail.support.MailTransportUtils;
++
++/**
++ * {@link DestinationDescriptor} implementation for Mail destinations.
++ *
++ * @author Stephane Nicoll
++ * @since 3.1.9
++ */
++public final class MailDestinationDescriptor implements DestinationDescriptor {
++
++	private final URI uri;
++
++	private final UriSource uriSource;
++
++	private final InternetAddress toAddress;
++
++	private final String mailboxHost;
++
++	private MailDestinationDescriptor(URI uri, UriSource uriSource, InternetAddress toAddress, String mailboxHost) {
++		this.uri = uri;
++		this.uriSource = uriSource;
++		this.toAddress = toAddress;
++		this.mailboxHost = mailboxHost;
++	}
++
++	/**
++	 * Create an instance from the given URI and URI source.
++	 * @param uri the URI
++	 * @param uriSource the URI source
++	 * @return a descriptor
++	 */
++	public static MailDestinationDescriptor of(URI uri, UriSource uriSource) {
++		InternetAddress parsedTo = MailTransportUtils.getTo(uri);
++		return new MailDestinationDescriptor(uri, uriSource, parsedTo, extractMailboxHost(parsedTo));
++	}
++
++	@Override
++	public URI uri() {
++		return this.uri;
++	}
++
++	@Override
++	public UriSource uriSource() {
++		return this.uriSource;
++	}
++
++	/**
++	 * Return the parsed {@code To} address, or {@code null} when missing or invalid.
++	 * @return the destination address, or {@code null}
++	 */
++	public InternetAddress toAddress() {
++		return this.toAddress;
++	}
++
++	/**
++	 * Return the domain part of the mailbox (after {@code @}), lower-cased, or
++	 * {@code null} when not extractable.
++	 * @return the mailbox host, or {@code null}
++	 */
++	public String mailboxHost() {
++		return this.mailboxHost;
++	}
++
++	/**
++	 * Whether an auxiliary recipient of the mail URI has a mailbox host that must not
++	 * receive peer-influenced mail.
++	 * @return {@code true} if any auxiliary recipient is unsafe
++	 */
++	public boolean hasUnsafeAuxiliaryRecipient() {
++		return hasUnsafeAuxiliaryRecipient(MailTransportUtils.getCc(this.uri))
++				|| hasUnsafeAuxiliaryRecipient(MailTransportUtils.getBcc(this.uri));
++	}
++
++	private static boolean hasUnsafeAuxiliaryRecipient(List<InternetAddress> addresses) {
++		for (InternetAddress address : addresses) {
++			String host = extractMailboxHost(address);
++			if (host == null || "localhost".equals(host) || host.endsWith(".localhost")) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	private static String extractMailboxHost(InternetAddress to) {
++		if (to == null) {
++			return null;
++		}
++		String address = to.getAddress();
++		if (!StringUtils.hasText(address) || address.length() > 512) {
++			return null;
++		}
++		if (address.indexOf('\n') >= 0 || address.indexOf('\r') >= 0) {
++			return null;
++		}
++		int at = address.lastIndexOf('@');
++		if (at <= 0 || at == address.length() - 1) {
++			return null;
++		}
++		String host = address.substring(at + 1).trim().toLowerCase(Locale.ROOT);
++		if (!StringUtils.hasLength(host)) {
++			return null;
++		}
++		return host;
++	}
++
++}
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailMessageSender.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailMessageSender.java
+index e36323ddc..b0781b248 100644
+--- a/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailMessageSender.java
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/mail/MailMessageSender.java
+@@ -19,6 +19,7 @@ package org.springframework.ws.transport.mail;
+ import java.io.IOException;
+ import java.net.URI;
+ import java.util.Properties;
++import java.util.function.Predicate;
+ 
+ import jakarta.mail.Session;
+ import jakarta.mail.URLName;
+@@ -29,6 +30,7 @@ import jakarta.mail.internet.MimeMessage;
+ import org.springframework.beans.factory.InitializingBean;
+ import org.springframework.util.Assert;
+ import org.springframework.ws.WebServiceMessageFactory;
++import org.springframework.ws.transport.AbstractWebServiceMessageSender;
+ import org.springframework.ws.transport.WebServiceConnection;
+ import org.springframework.ws.transport.WebServiceMessageSender;
+ import org.springframework.ws.transport.mail.monitor.PollingMonitoringStrategy;
+@@ -66,12 +68,21 @@ import org.springframework.ws.transport.mail.support.MailTransportUtils;
+  * <p>
+  * Some examples of email URIs are: {@code mailto:john@example.com}<br>
+  * {@code mailto:john@example.com@?subject=SOAP%20Test}<br>
++ * <p>
++ * For {@link UriSource#APPLICATION}, default checks accept any {@code mailto:} URI. For
++ * {@link UriSource#REMOTE}, default checks require a well-formed mailbox in the
++ * {@link MailDestinationDescriptor} (parsable {@code To}, extractable host, basic
++ * header-injection guards); reject {@code localhost} and {@code *.localhost} in the
++ * mailbox host segment. Use a {@link WebServiceMessageSender.DestinationPolicy} for
++ * domain allowlists, header rules, or other mail-specific validation.
+  *
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 1.5.0
+  * @see <a href="http://www.ietf.org/rfc/rfc2368.txt">The mailto URL scheme</a>
+  */
+-public class MailMessageSender implements WebServiceMessageSender, InitializingBean {
++public class MailMessageSender extends AbstractWebServiceMessageSender<MailDestinationDescriptor>
++		implements InitializingBean {
+ 
+ 	/**
+ 	 * Default timeout for receive operations. Set to 1000 * 60 milliseconds (i.e. 1
+@@ -89,6 +100,10 @@ public class MailMessageSender implements WebServiceMessageSender, InitializingB
+ 
+ 	private InternetAddress from;
+ 
++	public MailMessageSender() {
++		super((uri) -> uri.getScheme().equals(MailTransportConstants.MAIL_URI_SCHEME));
++	}
++
+ 	/**
+ 	 * Sets the from address to use when sending request messages.
+ 	 */
+@@ -179,8 +194,24 @@ public class MailMessageSender implements WebServiceMessageSender, InitializingB
+ 	}
+ 
+ 	@Override
+-	public boolean supports(URI uri) {
+-		return uri.getScheme().equals(MailTransportConstants.MAIL_URI_SCHEME);
++	protected MailDestinationDescriptor createDescriptor(URI uri, UriSource uriSource) {
++		return MailDestinationDescriptor.of(uri, uriSource);
++	}
++
++	@Override
++	protected Predicate<MailDestinationDescriptor> defaultChecks(UriSource uriSource) {
++		return (uriSource == UriSource.REMOTE) ? this::remoteDefaultChecks : (details) -> true;
++	}
++
++	protected boolean remoteDefaultChecks(MailDestinationDescriptor details) {
++		if (details.toAddress() == null || details.mailboxHost() == null) {
++			return false;
++		}
++		if (details.hasUnsafeAuxiliaryRecipient()) {
++			return false;
++		}
++		String host = details.mailboxHost();
++		return !"localhost".equals(host) && !host.endsWith(".localhost");
+ 	}
+ 
+ }
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppDestinationDescriptor.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppDestinationDescriptor.java
+new file mode 100644
+index 000000000..8b80d02a9
+--- /dev/null
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppDestinationDescriptor.java
+@@ -0,0 +1,104 @@
++/*
++ * Copyright 2005-present the original author or authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.springframework.ws.transport.xmpp;
++
++import java.net.URI;
++import java.util.Locale;
++
++import org.springframework.util.StringUtils;
++import org.springframework.ws.transport.WebServiceMessageSender.DestinationDescriptor;
++import org.springframework.ws.transport.WebServiceMessageSender.UriSource;
++import org.springframework.ws.transport.xmpp.support.XmppTransportUtils;
++
++/**
++ * {@link DestinationDescriptor} implementation for XMPP destinations.
++ *
++ * @author Stephane Nicoll
++ * @since 3.1.9
++ */
++public final class XmppDestinationDescriptor implements DestinationDescriptor {
++
++	private final URI uri;
++
++	private final UriSource uriSource;
++
++	private final String jabberId;
++
++	private final String domain;
++
++	private XmppDestinationDescriptor(URI uri, UriSource uriSource, String jabberId, String domain) {
++		this.uri = uri;
++		this.uriSource = uriSource;
++		this.jabberId = jabberId;
++		this.domain = domain;
++	}
++
++	/**
++	 * Create an instance from the given URI and URI source.
++	 * @param uri the URI
++	 * @param uriSource the URI source
++	 * @return a descriptor
++	 */
++	public static XmppDestinationDescriptor of(URI uri, UriSource uriSource) {
++		String to = XmppTransportUtils.getTo(uri);
++		return new XmppDestinationDescriptor(uri, uriSource, to, extractDomainFromJid(to));
++	}
++
++	private static String extractDomainFromJid(String jid) {
++		if (!StringUtils.hasLength(jid)) {
++			return null;
++		}
++		int at = jid.indexOf('@');
++		if (at < 0 || at == jid.length() - 1) {
++			return null;
++		}
++		String rest = jid.substring(at + 1);
++		int slash = rest.indexOf('/');
++		if (slash >= 0) {
++			rest = rest.substring(0, slash);
++		}
++		return rest.toLowerCase(Locale.ROOT);
++	}
++
++	@Override
++	public URI uri() {
++		return this.uri;
++	}
++
++	@Override
++	public UriSource uriSource() {
++		return this.uriSource;
++	}
++
++	/**
++	 * Return the Jabber ID.
++	 * @return the Jabber ID
++	 */
++	public String jabberId() {
++		return this.jabberId;
++	}
++
++	/**
++	 * Return the domain part of the JabberID (after {@code @}), lower-cased, or
++	 * {@code null}.
++	 * @return the domain, or {@code null}
++	 */
++	public String domain() {
++		return this.domain;
++	}
++
++}
+diff --git a/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppMessageSender.java b/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppMessageSender.java
+index 9237121d4..5f2b62b24 100644
+--- a/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppMessageSender.java
++++ b/spring-ws-support/src/main/java/org/springframework/ws/transport/xmpp/XmppMessageSender.java
+@@ -18,12 +18,16 @@ package org.springframework.ws.transport.xmpp;
+ 
+ import java.io.IOException;
+ import java.net.URI;
++import java.util.Locale;
+ import java.util.UUID;
++import java.util.function.Predicate;
+ 
+ import org.jivesoftware.smack.XMPPConnection;
+ 
+ import org.springframework.beans.factory.InitializingBean;
+ import org.springframework.util.Assert;
++import org.springframework.util.StringUtils;
++import org.springframework.ws.transport.AbstractWebServiceMessageSender;
+ import org.springframework.ws.transport.WebServiceConnection;
+ import org.springframework.ws.transport.WebServiceMessageSender;
+ import org.springframework.ws.transport.xmpp.support.XmppTransportUtils;
+@@ -34,13 +38,26 @@ import org.springframework.ws.transport.xmpp.support.XmppTransportUtils;
+  * {@link #setConnection(org.jivesoftware.smack.XMPPConnection) connection}to be set.
+  * <p>
+  * This message sender supports URI's of the following format: <blockquote>
+- * {@code xmpp:<to>} </blockquote> The {@code to} represents a Jabber ID.
++ * <tt><b>xmpp:</b></tt><i>to</i> </blockquote> The <i>to</i> represents a Jabber ID.
++ * <p>
++ * For {@link UriSource#APPLICATION}, default checks accept any {@code xmpp:} URI. For
++ * {@link UriSource#REMOTE}, default checks require a configured {@link XMPPConnection}
++ * and accept only URIs whose JID domain matches the connection's XMPP service domain (see
++ * {@link XmppDestinationDescriptor#domain()}). Use a
++ * {@link WebServiceMessageSender.DestinationPolicy} for allow-lists, multi-tenant
++ * routing, or stricter JID checks.
+  *
+  * @author Gildas Cuisinier
+  * @author Arjen Poutsma
++ * @author Stephane Nicoll
+  * @since 2.0
+  */
+-public class XmppMessageSender implements WebServiceMessageSender, InitializingBean {
++public class XmppMessageSender extends AbstractWebServiceMessageSender<XmppDestinationDescriptor>
++		implements InitializingBean {
++
++	public XmppMessageSender() {
++		super((uri) -> uri.getScheme().equals(XmppTransportConstants.XMPP_URI_SCHEME));
++	}
+ 
+ 	/**
+ 	 * Default timeout for receive operations: -1 indicates a blocking receive without
+@@ -100,8 +117,24 @@ public class XmppMessageSender implements WebServiceMessageSender, InitializingB
+ 	}
+ 
+ 	@Override
+-	public boolean supports(URI uri) {
+-		return uri.getScheme().equals(XmppTransportConstants.XMPP_URI_SCHEME);
++	protected XmppDestinationDescriptor createDescriptor(URI uri, WebServiceMessageSender.UriSource uriSource) {
++		return XmppDestinationDescriptor.of(uri, uriSource);
++	}
++
++	@Override
++	protected Predicate<XmppDestinationDescriptor> defaultChecks(WebServiceMessageSender.UriSource uriSource) {
++		return (uriSource == UriSource.REMOTE) ? this::xmppRemoteDefaultChecks : (details) -> true;
++	}
++
++	private boolean xmppRemoteDefaultChecks(XmppDestinationDescriptor descriptor) {
++		if (this.connection == null) {
++			return false;
++		}
++		String serviceDomain = this.connection.getXMPPServiceDomain().toString().toLowerCase(Locale.ROOT);
++		if (!StringUtils.hasLength(serviceDomain)) {
++			return false;
++		}
++		return descriptor.domain() != null && serviceDomain.equalsIgnoreCase(descriptor.domain());
+ 	}
+ 
+ 	protected String createThread() {
+diff --git a/spring-ws-test/src/main/java/org/springframework/ws/test/client/MockWebServiceMessageSender.java b/spring-ws-test/src/main/java/org/springframework/ws/test/client/MockWebServiceMessageSender.java
+index 3014b87c7..577a2b924 100644
+--- a/spring-ws-test/src/main/java/org/springframework/ws/test/client/MockWebServiceMessageSender.java
++++ b/spring-ws-test/src/main/java/org/springframework/ws/test/client/MockWebServiceMessageSender.java
+@@ -59,7 +59,7 @@ public class MockWebServiceMessageSender implements WebServiceMessageSender {
+ 	 * Always returns {@code true}.
+ 	 */
+ 	@Override
+-	public boolean supports(URI uri) {
++	public boolean supports(URI uri, UriSource uriSource) {
+ 		return true;
+ 	}
+ 

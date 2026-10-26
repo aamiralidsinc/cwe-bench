@@ -1,0 +1,273 @@
+diff -ruN a/java/org/apache/catalina/Wrapper.java b/java/org/apache/catalina/Wrapper.java
+--- a/java/org/apache/catalina/Wrapper.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/Wrapper.java	2026-10-26 05:16:13.476650692 +0000
+@@ -371,4 +371,15 @@
+      */
+     public void setEnabled(boolean enabled);
+ 
++    /**
++     * Make sure the {@link javax.servlet.annotation.ServletSecurity}
++     * annotation of the servlet behind this wrapper has been processed before
++     * any access-control decision is taken for a request that reaches it. The
++     * servlet is loaded if it is not loaded yet; an already loaded servlet is
++     * inspected once.
++     *
++     * @exception ServletException if the servlet could not be loaded
++     */
++    public void scanServletSecurityAnnotations() throws ServletException;
++
+ }
+diff -ruN a/java/org/apache/catalina/authenticator/AuthenticatorBase.java b/java/org/apache/catalina/authenticator/AuthenticatorBase.java
+--- a/java/org/apache/catalina/authenticator/AuthenticatorBase.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/authenticator/AuthenticatorBase.java	2026-10-26 05:16:43.588622282 +0000
+@@ -37,6 +37,7 @@
+ import org.apache.catalina.Realm;
+ import org.apache.catalina.Session;
+ import org.apache.catalina.Valve;
++import org.apache.catalina.Wrapper;
+ import org.apache.catalina.connector.Request;
+ import org.apache.catalina.connector.Response;
+ import org.apache.catalina.deploy.LoginConfig;
+@@ -469,8 +470,10 @@
+         // to which it submits) might be outside the secured area
+         String contextPath = this.context.getPath();
+         String requestURI = request.getDecodedRequestURI();
+-        if (requestURI.startsWith(contextPath) &&
+-            requestURI.endsWith(Constants.FORM_ACTION)) {
++        // Only the login action of this context itself is exempt from the
++        // normal flow, not an arbitrary servlet whose path merely ends with
++        // the same name.
++        if (requestURI.equals(contextPath + Constants.FORM_ACTION)) {
+             if (!authenticate(request, response, config)) {
+                 if (log.isDebugEnabled())
+                     log.debug(" Failed authenticate() test ??" + requestURI );
+@@ -478,6 +481,15 @@
+             }
+         }
+ 
++        // ServletSecurity annotations are turned into constraints when the
++        // servlet is first used. That has to happen before constraints are
++        // looked up for this request, otherwise the first request slips
++        // through unprotected.
++        Object wrapperObject = request.getMappingData().wrapper;
++        if (wrapperObject instanceof Wrapper) {
++            ((Wrapper) wrapperObject).scanServletSecurityAnnotations();
++        }
++
+         Realm realm = this.context.getRealm();
+         // Is this request URI subject to a security constraint?
+         SecurityConstraint [] constraints
+diff -ruN a/java/org/apache/catalina/core/ApplicationServletRegistration.java b/java/org/apache/catalina/core/ApplicationServletRegistration.java
+--- a/java/org/apache/catalina/core/ApplicationServletRegistration.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/core/ApplicationServletRegistration.java	2026-10-26 05:16:34.556630796 +0000
+@@ -44,7 +44,13 @@
+     
+     private Wrapper wrapper;
+     private Context context;
+-    
++    /**
++     * The security element last set through this registration. It has to be
++     * remembered because mappings may be added after the rules were set, and
++     * every such mapping has to be covered by the same rules.
++     */
++    private ServletSecurityElement constraint;
++
+     public ApplicationServletRegistration(Wrapper wrapper,
+             Context context) {
+         this.wrapper = wrapper;
+@@ -158,6 +164,7 @@
+                     getName(), context.getName()));
+         }
+ 
++        this.constraint = constraint;
+         return context.addServletSecurity(this, constraint);
+     }
+ 
+@@ -183,6 +190,13 @@
+         for (String urlPattern : urlPatterns) {
+             context.addServletMapping(urlPattern, wrapper.getName());
+         }
++
++        // Security rules set before this mapping must cover the new pattern
++        // too. addServletSecurity reads the registration's current mappings,
++        // so it has to be called again after the mapping was registered.
++        if (constraint != null) {
++            context.addServletSecurity(this, constraint);
++        }
+         return Collections.emptySet();
+     }
+ 
+diff -ruN a/java/org/apache/catalina/core/StandardWrapper.java b/java/org/apache/catalina/core/StandardWrapper.java
+--- a/java/org/apache/catalina/core/StandardWrapper.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/core/StandardWrapper.java	2026-10-26 05:16:28.252636743 +0000
+@@ -42,9 +42,11 @@
+ import javax.servlet.ServletException;
+ import javax.servlet.ServletRequest;
+ import javax.servlet.ServletResponse;
++import javax.servlet.ServletSecurityElement;
+ import javax.servlet.SingleThreadModel;
+ import javax.servlet.UnavailableException;
+ import javax.servlet.annotation.MultipartConfig;
++import javax.servlet.annotation.ServletSecurity;
+ 
+ import org.apache.catalina.Container;
+ import org.apache.catalina.ContainerServlet;
+@@ -272,6 +274,13 @@
+     protected boolean enabled = true;
+ 
+     /**
++     * Has the {@link ServletSecurity} annotation of this servlet already been
++     * turned into security constraints? Access-control decisions must not be
++     * taken before that has happened.
++     */
++    protected volatile boolean servletSecurityAnnotationsProcessed = false;
++
++    /**
+      * Static class array used when the SecurityManager is turned on and 
+      * <code>Servlet.init</code> is invoked.
+      */
+@@ -1075,6 +1084,10 @@
+                 }
+             }
+ 
++            // Turn any ServletSecurity annotation into constraints now, so
++            // that it is enforced before the first request is served.
++            processServletSecurityAnnotation(servlet);
++
+             // Special handling for ContainerServlet instances
+             if ((servlet instanceof ContainerServlet) &&
+                   (isContainerProvidedServlet(servletClass) ||
+@@ -1111,6 +1124,45 @@
+ 
+     }
+ 
++    /**
++     * Make sure the security annotation of the servlet is processed. The
++     * servlet is loaded on demand when this is the first time it is used; a
++     * servlet instance that was registered directly (and therefore bypassed
++     * {@link #loadServlet()}) is inspected here instead.
++     */
++    @Override
++    public synchronized void scanServletSecurityAnnotations()
++            throws ServletException {
++        if (instance == null) {
++            load();
++        }
++        Servlet servlet = instance;
++        if (servlet != null && !servletSecurityAnnotationsProcessed) {
++            processServletSecurityAnnotation(servlet);
++        }
++    }
++
++    /**
++     * Convert the {@link ServletSecurity} annotation of the given servlet into
++     * security constraints. Runs at most once per wrapper: repeated execution
++     * would churn the constraint set without changing the outcome.
++     */
++    private void processServletSecurityAnnotation(Servlet servlet) {
++        if (servlet == null || servletSecurityAnnotationsProcessed) {
++            return;
++        }
++
++        ServletSecurity annotation =
++                servlet.getClass().getAnnotation(ServletSecurity.class);
++        if (annotation != null) {
++            Context ctxt = (Context) getParent();
++            ctxt.addServletSecurity(
++                    new ApplicationServletRegistration(this, ctxt),
++                    new ServletSecurityElement(annotation));
++        }
++        servletSecurityAnnotationsProcessed = true;
++    }
++
+     private synchronized void initServlet(Servlet servlet)
+             throws ServletException {
+         
+diff -ruN a/java/org/apache/catalina/deploy/SecurityConstraint.java b/java/org/apache/catalina/deploy/SecurityConstraint.java
+--- a/java/org/apache/catalina/deploy/SecurityConstraint.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/deploy/SecurityConstraint.java	2026-10-26 05:16:36.772628708 +0000
+@@ -540,6 +540,11 @@
+         
+         if (create) {
+             collection.addPattern(urlPattern);
++            // Constraints built from a ServletSecurityElement come from the
++            // application, not from the deployment descriptor. Marking them so
++            // lets a later setServletSecurity call replace them instead of
++            // treating them as an immutable descriptor conflict.
++            collection.setFromDescriptor(false);
+             constraint.addCollection(collection);
+             return constraint;
+         }
+diff -ruN a/java/org/apache/catalina/realm/RealmBase.java b/java/org/apache/catalina/realm/RealmBase.java
+--- a/java/org/apache/catalina/realm/RealmBase.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/realm/RealmBase.java	2026-10-26 05:16:46.264619760 +0000
+@@ -728,7 +728,11 @@
+                     log.debug(" Allow access to error page " + errorPage);
+                 return (true);
+             }
+-            if (requestURI.endsWith(Constants.FORM_ACTION)) {
++            // The login action itself (path relative to the context), and only
++            // that exact path, is outside the constraints. Matching a suffix
++            // would also exempt a servlet that happens to be mapped under a
++            // name ending with the action.
++            if (requestURI.equals(Constants.FORM_ACTION)) {
+                 if (log.isDebugEnabled())
+                     log.debug(" Allow access to username/password submission");
+                 return (true);
+diff -ruN a/java/org/apache/catalina/startup/ContextConfig.java b/java/org/apache/catalina/startup/ContextConfig.java
+--- a/java/org/apache/catalina/startup/ContextConfig.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/startup/ContextConfig.java	2026-10-26 05:16:49.540616673 +0000
+@@ -366,9 +366,14 @@
+      */
+     protected synchronized void authenticatorConfig() {
+ 
+-        // Does this Context require an Authenticator?
++        // Does this Context require an Authenticator? A Context only skips
++        // the authenticator when annotations are ignored and no constraint is
++        // declared: when annotations are enabled, programmatic registration
++        // can still add a constraint after this phase, so a valve must already
++        // be in place to enforce it.
+         SecurityConstraint constraints[] = context.findConstraints();
+-        if ((constraints == null) || (constraints.length == 0))
++        if (context.getIgnoreAnnotations() &&
++                ((constraints == null) || (constraints.length == 0)))
+             return;
+         LoginConfig loginConfig = context.getLoginConfig();
+         if (loginConfig == null) {
+diff -ruN a/java/org/apache/catalina/startup/Tomcat.java b/java/org/apache/catalina/startup/Tomcat.java
+--- a/java/org/apache/catalina/startup/Tomcat.java	2026-10-26 03:55:53.000000000 +0000
++++ b/java/org/apache/catalina/startup/Tomcat.java	2026-10-26 05:16:58.960607801 +0000
+@@ -42,6 +42,7 @@
+ import org.apache.catalina.Server;
+ import org.apache.catalina.Service;
+ import org.apache.catalina.Wrapper;
++import org.apache.catalina.authenticator.NonLoginAuthenticator;
+ import org.apache.catalina.connector.Connector;
+ import org.apache.catalina.core.NamingContextListener;
+ import org.apache.catalina.core.StandardContext;
+@@ -50,6 +51,7 @@
+ import org.apache.catalina.core.StandardServer;
+ import org.apache.catalina.core.StandardService;
+ import org.apache.catalina.core.StandardWrapper;
++import org.apache.catalina.deploy.LoginConfig;
+ import org.apache.catalina.realm.GenericPrincipal;
+ import org.apache.catalina.realm.RealmBase;
+ import org.apache.catalina.session.StandardManager;
+@@ -697,6 +699,17 @@
+                 Context context = (Context) event.getLifecycle();
+                 if (event.getType().equals(Lifecycle.CONFIGURE_START_EVENT)) {
+                     context.setConfigured(true);
++                    // An embedded context has no ContextConfig to install a
++                    // valve. Without one a constraint added later (through an
++                    // annotation or the registration API) would never be
++                    // enforced, so install a non-login authenticator unless
++                    // the application already chose a login configuration.
++                    if (context.getLoginConfig() == null) {
++                        context.setLoginConfig(
++                                new LoginConfig("NONE", null, null, null));
++                        context.getPipeline().addValve(
++                                new NonLoginAuthenticator());
++                    }
+                 }
+             } catch (ClassCastException e) {
+                 return;

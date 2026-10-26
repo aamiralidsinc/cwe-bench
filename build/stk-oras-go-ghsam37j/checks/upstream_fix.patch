@@ -1,0 +1,159 @@
+commit cc323e564d90c6b5b4bdd71d3c8d2ee2713b37e5
+Author: Terry Howe <terrylhowe@gmail.com>
+Date:   Thu May 28 08:25:49 2026 -0600
+
+    Merge commit from fork
+    
+    resolveWritePath enforced the workingDir write boundary with a lexical
+    filepath.Rel check. This prevented "../" path escapes but did not resolve
+    symlinks: a path component under workingDir pointing to an external
+    directory (e.g. "out" -> "/outside") passed the check, causing writes to
+    land outside workingDir when AllowPathTraversalOnWrite=false.
+    
+    Fix: after the lexical check, call checkSymlinkEscape, which resolves
+    symlinks in workingDir and in the deepest existing ancestor of the write
+    target, then verifies the resulting real path is still under the real
+    workingDir. The helper realPathForWrite walks up to the deepest existing
+    ancestor before calling EvalSymlinks so it handles write targets whose
+    parent directories do not yet exist.
+    
+    Add TestStore_resolveWritePath_SymlinkTraversal with two sub-tests:
+    - a symlink component under workingDir escaping the boundary is blocked
+    - a regular subdirectory write within workingDir continues to work
+    
+    Signed-off-by: Terry Howe <terrylhowe@gmail.com>
+
+diff --git a/content/file/file.go b/content/file/file.go
+index cacf199..6cdba2e 100644
+--- a/content/file/file.go
++++ b/content/file/file.go
+@@ -625,6 +625,13 @@ func (s *Store) resolveWritePath(name string) (string, error) {
+ 		if strings.HasPrefix(rel, "../") || rel == ".." {
+ 			return "", ErrPathTraversalDisallowed
+ 		}
++		// The lexical check above prevents "../" escapes but does not resolve
++		// symlinks. A symlink component under workingDir (e.g. "out" -> "/outside")
++		// passes the lexical check yet directs writes outside workingDir.
++		// Re-check after resolving symlinks in the parent path to close that gap.
++		if err := checkSymlinkEscape(base, target); err != nil {
++			return "", err
++		}
+ 	}
+ 	if s.DisableOverwrite {
+ 		if _, err := os.Stat(path); err == nil {
+@@ -686,3 +693,52 @@ func (s *Store) setClosed() {
+ func ensureDir(path string) error {
+ 	return os.MkdirAll(path, 0777)
+ }
++
++// checkSymlinkEscape returns ErrPathTraversalDisallowed if resolving symlinks
++// in target's ancestor directories causes it to escape base. target may not
++// yet exist, so symlinks are resolved on its deepest existing ancestor.
++func checkSymlinkEscape(base, target string) error {
++	realBase, err := filepath.EvalSymlinks(base)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil // base doesn't exist yet; no symlinks to follow
++		}
++		return err
++	}
++	realTarget, err := realPathForWrite(target)
++	if err != nil {
++		return err
++	}
++	rel, err := filepath.Rel(realBase, realTarget)
++	if err != nil {
++		return ErrPathTraversalDisallowed
++	}
++	rel = filepath.ToSlash(rel)
++	if strings.HasPrefix(rel, "../") || rel == ".." {
++		return ErrPathTraversalDisallowed
++	}
++	return nil
++}
++
++// realPathForWrite resolves symlinks in the deepest existing ancestor of path
++// and returns the resulting absolute path. Non-existent path components are
++// appended verbatim, matching the semantics of a file about to be created.
++func realPathForWrite(path string) (string, error) {
++	dir := filepath.Dir(path)
++	suffix := filepath.Base(path)
++	for {
++		real, err := filepath.EvalSymlinks(dir)
++		if err == nil {
++			return filepath.Join(real, suffix), nil
++		}
++		if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(dir)
++		if parent == dir {
++			return path, nil // reached filesystem root
++		}
++		suffix = filepath.Join(filepath.Base(dir), suffix)
++		dir = parent
++	}
++}
+commit adab2f25ea95ef4e6e41f50db9266a6701399422
+Author: Terry Howe <terrylhowe@gmail.com>
+Date:   Fri Jul 10 08:18:14 2026 -0600
+
+    Merge commit from fork
+    
+    The file store unpack path (pushDir -> extractTarDirectory) validated
+    symlink targets only lexically and skipped the parent-symlink check for
+    root-level entries, then wrote regular files with O_CREATE|O_TRUNC and no
+    O_NOFOLLOW. A malicious unpack layer could plant a chain of symlinks whose
+    lexical target stays inside the extraction root but whose kernel-resolved
+    target is an arbitrary absolute path, then write through it with a
+    same-named regular-file entry, creating or overwriting files outside the
+    store working directory under the default AllowPathTraversalOnWrite=false.
+    
+    Fix:
+    - writeFile removes a pre-existing terminal symlink before opening, so a
+      regular-file entry can never be written through a link left by an
+      earlier entry.
+    - extractTarDirectory re-verifies containment with symlinks resolved via
+      the existing checkSymlinkEscape helper, matching the pushFile path.
+    
+    Adds a regression test reproducing the symlink-chain escape.
+    
+    Signed-off-by: Terry Howe <terrylhowe@gmail.com>
+
+diff --git a/content/file/utils.go b/content/file/utils.go
+index 8e3939a..db9434a 100644
+--- a/content/file/utils.go
++++ b/content/file/utils.go
+@@ -175,6 +175,15 @@ func extractTarDirectory(dirPath, dirName string, r io.Reader, buf []byte, prese
+ 		}
+ 		filePath := filepath.Join(dirPath, filePathRel)
+ 
++		// resolveRelToBase only performs lexical and per-component Lstat checks,
++		// which a chain of previously-extracted symlinks can bypass. Re-verify
++		// containment with symlinks fully resolved before mutating the
++		// filesystem, matching the check on the pushFile path.
++		// (GHSA-m37j-52j7-pjw7)
++		if err := checkSymlinkEscape(dirPath, filePath); err != nil {
++			return err
++		}
++
+ 		// Create content
+ 		switch header.Typeflag {
+ 		case tar.TypeReg:
+@@ -281,6 +290,16 @@ func ensureLinkPath(baseAbs, baseRel, link, target string) (string, error) {
+ 
+ // writeFile writes content to the file specified by the `path` parameter.
+ func writeFile(path string, r io.Reader, perm os.FileMode, buf []byte) (err error) {
++	// os.OpenFile follows a terminal symlink, so a regular-file entry whose
++	// path was already created as a symlink by an earlier archive entry would
++	// be written through that link, landing outside the extraction root
++	// (GHSA-m37j-52j7-pjw7). Remove any such symlink first so the content is
++	// written to a regular file at path itself.
++	if fi, err := os.Lstat(path); err == nil && fi.Mode()&os.ModeSymlink != 0 {
++		if err := os.Remove(path); err != nil {
++			return err
++		}
++	}
+ 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+ 	if err != nil {
+ 		return err

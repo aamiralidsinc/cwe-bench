@@ -1,0 +1,83 @@
+diff -ruN a/playlist/playlist.go b/playlist/playlist.go
+--- a/playlist/playlist.go	2026-05-15 18:11:04.000000000 +0000
++++ b/playlist/playlist.go	2026-10-26 02:18:18.666284713 +0000
+@@ -92,6 +92,9 @@
+ 		return nil, err
+ 	}
+ 
++	if relPath == "" {
++		return nil, ErrInvalidPathFormat
++	}
+ 	absPath := filepath.Join(s.basePath, relPath)
+ 	stat, err := os.Stat(absPath)
+ 	if err != nil {
+@@ -105,12 +108,16 @@
+ 	var playlist Playlist
+ 	playlist.UpdatedAt = stat.ModTime()
+ 
+-	playlist.UserID, err = userIDFromPath(relPath)
++	// derive metadata from the cleaned relative path so traversal segments
++	// can't spoof the first-segment user id check.
++	cleanRel, _ := filepath.Rel(s.basePath, absPath)
++
++	playlist.UserID, err = userIDFromPath(cleanRel)
+ 	if err != nil {
+ 		playlist.UserID = 1
+ 	}
+ 
+-	playlist.Name = strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
++	playlist.Name = strings.TrimSuffix(filepath.Base(cleanRel), filepath.Ext(cleanRel))
+ 
+ 	file, err := os.Open(absPath)
+ 	if err != nil {
+diff -ruN a/server/ctrlsubsonic/handlers_playlist.go b/server/ctrlsubsonic/handlers_playlist.go
+--- a/server/ctrlsubsonic/handlers_playlist.go	2026-05-15 18:11:04.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist.go	2026-10-26 02:18:18.666284713 +0000
+@@ -49,15 +49,23 @@
+ }
+ 
+ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+ 		return spec.NewError(10, "please provide an `id` parameter")
+ 	}
+-	playlist, err := c.playlistStore.Read(playlistIDDecode(playlistID))
++	playlistPath := playlistIDDecode(playlistID)
++	if playlistPath == "" {
++		return spec.NewError(10, "please provide an `id` parameter")
++	}
++	playlist, err := c.playlistStore.Read(playlistPath)
+ 	if err != nil {
+ 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+ 	}
++	if playlist.UserID != user.ID && !playlist.IsPublic {
++		return spec.NewError(50, "you aren't allowed to read that user's playlist")
++	}
+ 	sub := spec.NewResponse()
+ 	rendered, err := playlistRender(c, params, playlist, playlistID, true)
+ 	if err != nil {
+@@ -175,12 +183,21 @@
+ }
+ 
+ func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+ 		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+ 	}
+-	if err := c.playlistStore.Delete(playlistIDDecode(playlistID)); err != nil {
++	playlistPath := playlistIDDecode(playlistID)
++	playlist, err := c.playlistStore.Read(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", playlistID)
++	}
++	if playlist.UserID != 0 && playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed to delete that user's playlist")
++	}
++	if err := c.playlistStore.Delete(playlistPath); err != nil {
+ 		return spec.NewError(0, "delete playlist: %v", err)
+ 	}
+ 	return spec.NewResponse()

@@ -1,0 +1,591 @@
+diff --git a/internal/models/memory.go b/internal/models/memory.go
+index b454eb9..c840f47 100644
+--- a/internal/models/memory.go
++++ b/internal/models/memory.go
+@@ -2,6 +2,7 @@ package models
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"strings"
+ 	"time"
+ )
+@@ -177,6 +178,30 @@ func MemoryFileName(id string) string {
+ 	return "memory-" + id + ".md"
+ }
+ 
++// ValidateMemoryID rejects IDs that can change the canonical memory filename
++// or use platform-specific alternate path syntax.
++func ValidateMemoryID(id string) error {
++	if id == "" || len(id) > 128 || strings.HasSuffix(id, ".") {
++		return fmt.Errorf("invalid memory ID %q", id)
++	}
++	first := id[0]
++	if !(first >= 'a' && first <= 'z') && !(first >= 'A' && first <= 'Z') && !(first >= '0' && first <= '9') {
++		return fmt.Errorf("invalid memory ID %q", id)
++	}
++	for i := 0; i < len(id); i++ {
++		c := id[i]
++		switch {
++		case c >= 'a' && c <= 'z':
++		case c >= 'A' && c <= 'Z':
++		case c >= '0' && c <= '9':
++		case c == '.' || c == '_' || c == '-':
++		default:
++			return fmt.Errorf("invalid memory ID %q", id)
++		}
++	}
++	return nil
++}
++
+ // ValidMemoryLayer reports whether layer is a recognised memory layer.
+ func ValidMemoryLayer(layer string) bool {
+ 	return layer == MemoryLayerProject || layer == MemoryLayerGlobal
+diff --git a/internal/safepath/path.go b/internal/safepath/path.go
+new file mode 100644
+index 0000000..fdd7663
+--- /dev/null
++++ b/internal/safepath/path.go
+@@ -0,0 +1,156 @@
++// Package safepath resolves untrusted filesystem paths inside an explicit root.
++package safepath
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// Resolve resolves an untrusted relative path inside root. Absolute paths,
++// parent traversal, Windows volume paths, and symlink escapes are rejected.
++func Resolve(root, untrusted string) (string, error) {
++	return resolve(root, untrusted, false)
++}
++
++// ResolveProject resolves a project path inside root. Native absolute paths
++// are accepted only when they still resolve inside root.
++func ResolveProject(root, untrusted string) (string, error) {
++	return resolve(root, untrusted, true)
++}
++
++// ResolveProjectReal is ResolveProject plus canonical symlink resolution.
++func ResolveProjectReal(root, untrusted string) (string, error) {
++	path, err := resolve(root, untrusted, true)
++	if err != nil {
++		return "", err
++	}
++	return canonical(path)
++}
++
++func resolve(root, untrusted string, allowContainedAbsolute bool) (string, error) {
++	if strings.TrimSpace(untrusted) == "" {
++		return "", fmt.Errorf("path is required")
++	}
++	if strings.IndexByte(untrusted, 0) >= 0 {
++		return "", fmt.Errorf("path contains a NUL byte")
++	}
++
++	unified := strings.ReplaceAll(untrusted, `\`, "/")
++	if strings.HasPrefix(unified, "//?/") || strings.HasPrefix(unified, "//./") {
++		return "", fmt.Errorf("path must not use a Windows device prefix")
++	}
++	absoluteSpelling := strings.HasPrefix(unified, "/")
++	volumeSpelling := len(unified) >= 2 && isASCIILetter(unified[0]) && unified[1] == ':'
++	if (absoluteSpelling || volumeSpelling) && !allowContainedAbsolute {
++		return "", fmt.Errorf("path must not be absolute or use a volume prefix")
++	}
++
++	segments := strings.Split(unified, "/")
++	clean := make([]string, 0, len(segments))
++	for i, segment := range segments {
++		if segment == "" || segment == "." {
++			continue
++		}
++		if segment == ".." {
++			return "", fmt.Errorf("path must not contain parent traversal")
++		}
++		if i == 0 && volumeSpelling && len(segment) == 2 {
++			clean = append(clean, segment)
++			continue
++		}
++		if strings.Contains(segment, ":") {
++			return "", fmt.Errorf("path must not use an alternate data stream")
++		}
++		clean = append(clean, segment)
++	}
++	if len(clean) == 0 {
++		return "", fmt.Errorf("path is required")
++	}
++
++	rootAbs, err := filepath.Abs(root)
++	if err != nil {
++		return "", fmt.Errorf("resolve root: %w", err)
++	}
++	rootAbs = filepath.Clean(rootAbs)
++
++	joined := strings.Join(clean, "/")
++	candidate := filepath.Join(rootAbs, filepath.FromSlash(joined))
++	if absoluteSpelling || (volumeSpelling && filepath.IsAbs(filepath.FromSlash(unified))) {
++		candidate = filepath.Clean(filepath.FromSlash(unified))
++	}
++	if err := within(rootAbs, candidate); err != nil {
++		return "", err
++	}
++	if err := realWithin(rootAbs, candidate); err != nil {
++		return "", err
++	}
++	return candidate, nil
++}
++
++// realWithin resolves the root and the candidate through any symbolic links
++// among their existing ancestors, and rejects a candidate that lands outside.
++func realWithin(root, candidate string) error {
++	rootReal, err := prospective(root)
++	if err != nil {
++		return fmt.Errorf("resolve root: %w", err)
++	}
++	candidateReal, err := prospective(candidate)
++	if err != nil {
++		return fmt.Errorf("resolve path: %w", err)
++	}
++	if err := within(rootReal, candidateReal); err != nil {
++		return fmt.Errorf("path escapes root through a symlink: %w", err)
++	}
++	return nil
++}
++
++// prospective resolves the existing ancestors of a path and re-appends the
++// part that does not exist yet.
++func prospective(path string) (string, error) {
++	if resolved, err := filepath.EvalSymlinks(path); err == nil {
++		return resolved, nil
++	} else if !os.IsNotExist(err) {
++		return "", err
++	}
++	parent := filepath.Dir(path)
++	if parent == path {
++		return "", fmt.Errorf("path has no existing ancestor")
++	}
++	parentReal, err := prospective(parent)
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(parentReal, filepath.Base(path)), nil
++}
++
++func canonical(path string) (string, error) {
++	for {
++		if _, err := os.Lstat(path); err == nil {
++			return filepath.EvalSymlinks(path)
++		} else if !os.IsNotExist(err) {
++			return "", err
++		}
++		parent := filepath.Dir(path)
++		if parent == path {
++			return "", fmt.Errorf("path has no existing ancestor")
++		}
++		path = parent
++	}
++}
++
++func within(root, candidate string) error {
++	rel, err := filepath.Rel(root, candidate)
++	if err != nil {
++		return fmt.Errorf("compare path to root: %w", err)
++	}
++	if rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
++		return fmt.Errorf("path escapes allowed root")
++	}
++	return nil
++}
++
++func isASCIILetter(c byte) bool {
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++}
+diff --git a/internal/server/routes/docs.go b/internal/server/routes/docs.go
+index 0fb1ad0..81567a7 100644
+--- a/internal/server/routes/docs.go
++++ b/internal/server/routes/docs.go
+@@ -10,6 +10,7 @@ import (
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"github.com/howznguyen/knowns/internal/search"
+ 	"github.com/howznguyen/knowns/internal/storage"
+ )
+@@ -195,7 +196,12 @@ func splitDocSourcePath(raw string) (string, bool) {
+ //
+ // GET /api/docs/*/source
+ func (dr *DocRoutes) source(w http.ResponseWriter, path string) {
+-	absPath := filepath.Join(dr.getStore().Root, "docs", filepath.FromSlash(path)+".md")
++	docsRoot := filepath.Join(dr.getStore().Root, "docs")
++	absPath, err := safepath.Resolve(docsRoot, filepath.ToSlash(path)+".md")
++	if err != nil {
++		respondError(w, http.StatusBadRequest, "invalid doc path")
++		return
++	}
+ 	data, err := os.ReadFile(absPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, err.Error())
+diff --git a/internal/server/routes/templates.go b/internal/server/routes/templates.go
+index c5f85c3..4604e34 100644
+--- a/internal/server/routes/templates.go
++++ b/internal/server/routes/templates.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"github.com/howznguyen/knowns/internal/storage"
+ )
+ 
+@@ -302,7 +303,11 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 		templateFile = "main.hbs"
+ 	}
+ 
+-	hbsPath := filepath.Join(tmpl.Path, templateFile)
++	hbsPath, err := safepath.Resolve(tmpl.Path, templateFile)
++	if err != nil {
++		respondError(w, http.StatusBadRequest, "invalid template file path")
++		return
++	}
+ 	hbsContent, err := os.ReadFile(hbsPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, "template file not found: "+templateFile)
+@@ -342,7 +347,12 @@ func (tr *TemplateRoutes) preview(w http.ResponseWriter, r *http.Request) {
+ 	// change that running the template would make.
+ 	existingContent := ""
+ 	if destPath != "" {
+-		existingPath := filepath.Join(filepath.Dir(tr.getStore().Root), filepath.FromSlash(destPath))
++		projectRoot := filepath.Dir(tr.getStore().Root)
++		existingPath, resolveErr := safepath.Resolve(projectRoot, destPath)
++		if resolveErr != nil {
++			respondError(w, http.StatusBadRequest, "invalid destination path")
++			return
++		}
+ 		if data, readErr := os.ReadFile(existingPath); readErr == nil {
+ 			existingContent = string(data)
+ 		}
+diff --git a/internal/storage/doc_store.go b/internal/storage/doc_store.go
+index 9ace4d2..2f1ab15 100644
+--- a/internal/storage/doc_store.go
++++ b/internal/storage/doc_store.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/howznguyen/knowns/internal/models"
+ 	"github.com/howznguyen/knowns/internal/references"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+@@ -122,11 +123,12 @@ func (ds *DocStore) walkDocs(dir, relBase string, imported bool, importSource st
+ // Get retrieves a doc by its relative path (without .md extension).
+ // Examples: "readme", "patterns/module", "specs/user-auth"
+ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+-	path = strings.TrimPrefix(path, "/")
+-	path = strings.TrimSuffix(path, ".md")
++	path, absPath, err := resolveDocPath(ds.docsDir(), path)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	// Try local docs first.
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+ 	if _, err := os.Stat(absPath); err == nil {
+ 		folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 		if folder == "." {
+@@ -143,7 +145,11 @@ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 		}
+ 		importSource := e.Name()
+ 		// Direct lookup: path already includes the source prefix.
+-		candidate := filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(path)+".md")
++		importDocsDir := filepath.Join(ds.importsDir(), importSource, "docs")
++		candidate, err := safepath.Resolve(importDocsDir, path+".md")
++		if err != nil {
++			continue
++		}
+ 		if _, err := os.Stat(candidate); err == nil {
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 			if folder == "." {
+@@ -155,7 +161,10 @@ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ 		// source prefix (e.g. @doc/patterns/foo instead of @doc/source/patterns/foo).
+ 		// Try prepending the import source name.
+ 		prefixed := importSource + "/" + path
+-		candidate = filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(prefixed)+".md")
++		candidate, err = safepath.Resolve(importDocsDir, prefixed+".md")
++		if err != nil {
++			continue
++		}
+ 		if _, err := os.Stat(candidate); err == nil {
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(prefixed)))
+ 			if folder == "." {
+@@ -171,10 +180,14 @@ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+ // Create writes a new doc to .knowns/docs/{path}.md.
+ // doc.Path must be set (relative, without .md).
+ func (ds *DocStore) Create(doc *models.Doc) error {
+-	if doc.Path == "" {
++	if doc == nil || doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
++	path, absPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = path
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return fmt.Errorf("create doc dir: %w", err)
+ 	}
+@@ -183,13 +196,17 @@ func (ds *DocStore) Create(doc *models.Doc) error {
+ 
+ // Update writes updated doc content.
+ func (ds *DocStore) Update(doc *models.Doc) error {
+-	if doc.Path == "" {
++	if doc == nil || doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	if existing, err := ds.Get(doc.Path); err == nil {
++	path, absPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = path
++	if existing, err := ds.Get(path); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -201,11 +218,18 @@ func (ds *DocStore) Rename(oldPath string, doc *models.Doc) error {
+ 	if strings.TrimSpace(oldPath) == "" || doc == nil || strings.TrimSpace(doc.Path) == "" {
+ 		return fmt.Errorf("old path and new doc path are required")
+ 	}
++	oldPath, oldAbsPath, err := resolveDocPath(ds.docsDir(), oldPath)
++	if err != nil {
++		return err
++	}
++	newPath, newAbsPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = newPath
+ 	if existing, err := ds.Get(oldPath); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	oldAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(oldPath, ".md"))+".md")
+-	newAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(doc.Path, ".md"))+".md")
+ 	if err := os.MkdirAll(filepath.Dir(newAbsPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -342,11 +366,30 @@ func (ds *DocStore) RewriteDocReferences(oldPath, newPath string, taskStore *Tas
+ 
+ // Delete removes a doc file.
+ func (ds *DocStore) Delete(path string) error {
+-	path = strings.TrimSuffix(path, ".md")
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	_, absPath, err := resolveDocPath(ds.docsDir(), path)
++	if err != nil {
++		return err
++	}
+ 	return os.Remove(absPath)
+ }
+ 
++func resolveDocPath(root, path string) (string, string, error) {
++	path = strings.TrimSuffix(path, ".md")
++	if strings.TrimSpace(path) == "" {
++		return "", "", fmt.Errorf("doc path is required")
++	}
++	absPath, err := safepath.Resolve(root, filepath.ToSlash(path)+".md")
++	if err != nil {
++		return "", "", fmt.Errorf("invalid doc path %q: %w", path, err)
++	}
++	rel, err := filepath.Rel(root, absPath)
++	if err != nil {
++		return "", "", fmt.Errorf("resolve doc path: %w", err)
++	}
++	canonical := strings.TrimSuffix(filepath.ToSlash(rel), ".md")
++	return canonical, absPath, nil
++}
++
+ // parseFile reads and parses a single doc markdown file.
+ func (ds *DocStore) parseFile(absPath, relPath, folder string, imported bool, importSource string) (*models.Doc, error) {
+ 	data, err := os.ReadFile(absPath)
+diff --git a/internal/storage/memory_store.go b/internal/storage/memory_store.go
+index 92284f1..1772469 100644
+--- a/internal/storage/memory_store.go
++++ b/internal/storage/memory_store.go
+@@ -133,6 +133,9 @@ func (ms *MemoryStore) listDir(dir, layer string) ([]*models.MemoryEntry, error)
+ 
+ // Get retrieves a memory entry by ID. Searches project, then global.
+ func (ms *MemoryStore) Get(id string) (*models.MemoryEntry, error) {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	for _, layer := range []string{models.MemoryLayerProject, models.MemoryLayerGlobal} {
+ 		entry, err := ms.GetInLayer(id, layer)
+ 		if err == nil {
+@@ -201,6 +204,9 @@ func slugifyMemoryReferenceTitle(title string) string {
+ 
+ // GetInLayer retrieves a memory entry by ID from a specific layer only.
+ func (ms *MemoryStore) GetInLayer(id, layer string) (*models.MemoryEntry, error) {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	if !models.ValidMemoryLayer(layer) {
+ 		return nil, fmt.Errorf("invalid memory layer: %q", layer)
+ 	}
+@@ -232,6 +238,9 @@ func (ms *MemoryStore) Create(entry *models.MemoryEntry) error {
+ 	if entry.ID == "" {
+ 		entry.ID = models.NewTaskID()
+ 	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 	entry.ApplyLifecycleDefaults()
+ 
+ 	now := time.Now().UTC()
+@@ -256,9 +265,15 @@ func (ms *MemoryStore) Create(entry *models.MemoryEntry) error {
+ 
+ // Update overwrites an existing memory entry.
+ func (ms *MemoryStore) Update(entry *models.MemoryEntry) error {
++	if entry == nil {
++		return fmt.Errorf("memory entry is required")
++	}
+ 	if entry.ID == "" {
+ 		return fmt.Errorf("memory ID is required")
+ 	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 
+ 	// Find the existing file to determine its current location.
+ 	existing, err := ms.Get(entry.ID)
+@@ -333,6 +348,12 @@ func memoryEntriesMigrationEqual(left, right *models.MemoryEntry) bool {
+ }
+ 
+ func (ms *MemoryStore) writeExisting(entry, existing *models.MemoryEntry, touch bool) error {
++	if entry == nil || existing == nil {
++		return fmt.Errorf("memory entry and existing memory are required")
++	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 	if touch {
+ 		entry.UpdatedAt = time.Now().UTC()
+ 	}
+@@ -352,6 +373,9 @@ func (ms *MemoryStore) writeExisting(entry, existing *models.MemoryEntry, touch
+ 
+ // Delete removes a memory entry by ID.
+ func (ms *MemoryStore) Delete(id string) error {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return err
++	}
+ 	if entry, err := ms.Get(id); err == nil && models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return models.ErrLegacyDecisionMemoryWrite
+ 	}
+@@ -436,6 +460,12 @@ func (ms *MemoryStore) DemotePersistent(id string) (*models.MemoryEntry, error)
+ 
+ // moveLayer moves a memory entry from its current layer to a new layer.
+ func (ms *MemoryStore) moveLayer(entry *models.MemoryEntry, newLayer string) (*models.MemoryEntry, error) {
++	if entry == nil {
++		return nil, fmt.Errorf("memory entry is required")
++	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return nil, err
++	}
+ 	if models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return nil, models.ErrLegacyDecisionMemoryWrite
+ 	}
+@@ -660,6 +690,9 @@ func (ms *MemoryStore) writeSnapshot(entry *models.MemoryEntry) error {
+ 	if entry == nil || entry.ID == "" {
+ 		return nil
+ 	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 	dir, err := ms.snapshotDir(entry.Layer)
+ 	if err != nil {
+ 		return err
+@@ -672,6 +705,9 @@ func (ms *MemoryStore) writeSnapshot(entry *models.MemoryEntry) error {
+ 
+ // ReadSnapshot returns the copy of a memory entry stored by the last update.
+ func (ms *MemoryStore) ReadSnapshot(id, layer string) (*models.MemoryEntry, error) {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	if !models.ValidMemoryLayer(layer) {
+ 		return nil, fmt.Errorf("invalid memory layer: %q", layer)
+ 	}
+diff --git a/internal/storage/template_store.go b/internal/storage/template_store.go
+index a0bee35..5a9788c 100644
+--- a/internal/storage/template_store.go
++++ b/internal/storage/template_store.go
+@@ -7,6 +7,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+@@ -21,14 +22,14 @@ func (ts *TemplateStore) importsDir() string   { return filepath.Join(ts.root, "
+ // templateYAML is the raw parsed form of _template.yaml, using the exact field
+ // structure that matches the TypeScript _template.yaml format.
+ type templateYAML struct {
+-	Name        string                  `yaml:"name"`
+-	Description string                  `yaml:"description"`
+-	Version     string                  `yaml:"version"`
+-	Author      string                  `yaml:"author"`
+-	Doc         string                  `yaml:"doc"`
+-	Destination string                  `yaml:"destination"`
+-	Prompts     []models.TemplatePrompt `yaml:"prompts"`
+-	Actions     []models.TemplateAction `yaml:"actions"`
++	Name        string                   `yaml:"name"`
++	Description string                   `yaml:"description"`
++	Version     string                   `yaml:"version"`
++	Author      string                   `yaml:"author"`
++	Doc         string                   `yaml:"doc"`
++	Destination string                   `yaml:"destination"`
++	Prompts     []models.TemplatePrompt  `yaml:"prompts"`
++	Actions     []models.TemplateAction  `yaml:"actions"`
+ 	Messages    *models.TemplateMessages `yaml:"messages"`
+ }
+ 
+@@ -109,10 +110,20 @@ func (ts *TemplateStore) Get(name string) (*models.Template, error) {
+ 	if idx := strings.Index(name, "/"); idx != -1 {
+ 		importName := name[:idx]
+ 		templateName := name[idx+1:]
+-		templateDir := filepath.Join(ts.importsDir(), importName, "templates", templateName)
++		importDir, err := safepath.Resolve(ts.importsDir(), importName)
++		if err != nil {
++			return nil, fmt.Errorf("invalid import template name: %w", err)
++		}
++		templateDir, err := safepath.Resolve(filepath.Join(importDir, "templates"), templateName)
++		if err != nil {
++			return nil, fmt.Errorf("invalid import template name: %w", err)
++		}
+ 		return ts.parseTemplate(templateName, templateDir, true, importName)
+ 	}
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := safepath.Resolve(ts.templatesDir(), name)
++	if err != nil {
++		return nil, fmt.Errorf("invalid template name: %w", err)
++	}
+ 	return ts.parseTemplate(name, templateDir, false, "")
+ }
+ 
+@@ -168,7 +179,10 @@ func (ts *TemplateStore) parseTemplate(name, dir string, imported bool, importNa
+ // Create scaffolds a new template directory with a _template.yaml and a
+ // starter .hbs file.
+ func (ts *TemplateStore) Create(name string, description string) error {
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := safepath.Resolve(ts.templatesDir(), name)
++	if err != nil {
++		return fmt.Errorf("invalid template name: %w", err)
++	}
+ 	if err := os.MkdirAll(templateDir, 0755); err != nil {
+ 		return fmt.Errorf("create template dir: %w", err)
+ 	}

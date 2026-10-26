@@ -1,0 +1,489 @@
+--- a/local_operator/agents.py
++++ b/local_operator/agents.py
+@@ -3,6 +3,7 @@
+ import inspect
+ import json
+ import logging
++import re
+ import os  # Added os
+ import shutil
+ import tempfile
+@@ -16,7 +17,7 @@
+ from typing import Any, Dict, Iterator, List, Optional, Tuple
+ 
+ import yaml
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, Field, ValidationError
+ 
+ from local_operator.jsonl import read_jsonl, write_jsonl
+ from local_operator.optional import missing_extra_error
+@@ -32,6 +33,23 @@
+ )
+ 
+ 
++_SAFE_AGENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
++
++
++def _is_safe_agent_id(agent_id: object) -> bool:
++    """True when ``agent_id`` can only name one directory directly under agents/.
++
++    An agent ID is a storage key, never a path supplied by the caller: a value
++    that carries a separator, starts a drive or is a relative reference must
++    not be joined to the agents directory.
++    """
++    if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 128:
++        return False
++    if agent_id in (".", ".."):
++        return False
++    return bool(_SAFE_AGENT_ID.fullmatch(agent_id))
++
++
+ def _dill() -> Any:
+     """Import ``dill`` on demand for the pickled-context APIs.
+ 
+@@ -305,7 +323,16 @@
+                     agent_data = yaml.safe_load(f)
+ 
+                 agent = AgentData.model_validate(agent_data)
+-                self._agents[agent.id] = agent
++                # The row's directory is the only identity the registry may
++                # address. Metadata inside the file is data: an older build
++                # could have written an ID that names somewhere else.
++                if agent.id != agent_dir.name:
++                    logging.warning(
++                        f"Agent metadata in {agent_dir.name} names {agent.id!r}; "
++                        "using the directory name"
++                    )
++                    agent.id = agent_dir.name
++                self._agents[agent_dir.name] = agent
+             except Exception as e:
+                 logging.error(f"Invalid agent metadata in {agent_dir.name}: {str(e)}")
+ 
+@@ -369,6 +396,8 @@
+         Args:
+             agent_metadata (AgentData): The metadata of the agent to save
+         """
++        if not _is_safe_agent_id(agent_metadata.id):
++            raise ValueError(f"Invalid agent id: {agent_metadata.id!r}")
+         # Add to in-memory agents
+         self._agents[agent_metadata.id] = agent_metadata
+ 
+@@ -418,7 +447,7 @@
+             KeyError: If the agent_id does not exist
+             Exception: If there is an error saving the updated metadata
+         """
+-        if agent_id not in self._agents:
++        if not _is_safe_agent_id(agent_id) or agent_id not in self._agents:
+             raise KeyError(f"Agent with id {agent_id} not found")
+ 
+         current_metadata_obj = self._agents[agent_id]
+@@ -529,7 +558,7 @@
+             KeyError: If the agent_id does not exist
+             Exception: If there is an error deleting the agent files
+         """
+-        if agent_id not in self._agents:
++        if not _is_safe_agent_id(agent_id) or agent_id not in self._agents:
+             raise KeyError(f"Agent with id {agent_id} not found")
+ 
+         # Remove from in-memory dict
+@@ -674,7 +703,13 @@
+                         agent_data = yaml.safe_load(f)
+ 
+                     agent = AgentData.model_validate(agent_data)
+-                    refreshed_agents[agent.id] = agent
++                    if agent.id != agent_dir.name:
++                        logging.warning(
++                            f"Agent metadata in {agent_dir.name} names {agent.id!r}; "
++                            "using the directory name"
++                        )
++                        agent.id = agent_dir.name
++                    refreshed_agents[agent_dir.name] = agent
+                 except Exception as e:
+                     # Log the error but continue processing other agents
+                     logging.error(
+@@ -1255,6 +1290,9 @@
+                     if not agent_id:
+                         logging.warning(f"Skipping agent without ID: {agent_data}")
+                         continue
++                    if not _is_safe_agent_id(agent_id):
++                        logging.warning(f"Skipping agent with unsafe ID: {agent_id!r}")
++                        continue
+ 
+                     # Check if agent directory already exists
+                     agent_dir = self.agents_dir / agent_id
+@@ -1448,6 +1486,7 @@
+         Import an agent from a ZIP file.
+ 
+         The ZIP file should contain agent state files with an agent.yml file.
++        Every import receives a fresh local ID; archive IDs never select storage.
+         The current working directory will be reset to local-operator-home.
+         For security, serialized execution context (`context.pkl`) is not imported.
+ 
+@@ -1484,8 +1523,14 @@
+                 with open(agent_yml_path, "r", encoding="utf-8") as f:
+                     agent_data = yaml.safe_load(f)
+ 
+-                # Create a new agent with the imported data
+-                agent_id = agent_data["id"]
++                if not isinstance(agent_data, dict):
++                    raise ValueError("Invalid agent metadata in agent.yml")
++
++                # An archive describes a profile, not a destination on this host.
++                # Ignore its identity even when it looks like a valid local UUID:
++                # preserving one would allow a normal import to destroy an agent.
++                agent_id = str(uuid.uuid4())
++                agent_data["id"] = agent_id
+                 agent_data["current_working_directory"] = default_agent_cwd()
+                 # Older profile bundles duplicated the final conversation turn
+                 # into agent.yml. History files are ignored below, but leaving
+@@ -1500,47 +1545,57 @@
+                 if "model" in agent_data:
+                     del agent_data["model"]
+ 
+-                # Save the updated agent.yml
++                # Validate before allocating anything in the registry. Malformed
++                # profiles must not leave partially imported metadata behind.
++                try:
++                    imported_agent = AgentData.model_validate(agent_data)
++                except ValidationError as exc:
++                    raise ValueError("Invalid agent metadata in agent.yml") from exc
++
+                 with open(agent_yml_path, "w", encoding="utf-8") as f:
+-                    yaml.dump(agent_data, f, default_flow_style=False)
++                    yaml.dump(imported_agent.model_dump(), f, default_flow_style=False)
+ 
+-                # Create the agent directory in the registry
+                 agent_dir = self.agents_dir / agent_id
+-                # Always overwrite the agent directory if it exists
+-                if agent_dir.exists():
+-                    shutil.rmtree(agent_dir)
+-                agent_dir.mkdir(parents=True, exist_ok=True)
++                # mkdir is an exclusive reservation, not an exists/check pair:
++                # even a UUID collision, dangling symlink or concurrent import
++                # must fail closed rather than replace an existing destination.
++                if agent_id in self._agents:
++                    raise ValueError("Import destination already exists; retry the import")
++                try:
++                    agent_dir.mkdir(mode=0o700)
++                except FileExistsError as exc:
++                    raise ValueError("Import destination already exists; retry the import") from exc
+ 
+-                # Copy instruction files only. Conversation history, execution
+-                # traces, learnings, schedules and pickled context are private
+-                # to whoever authored the archive — even a hub listing that
+-                # still carries them from an older build must not land in the
+-                # importer's registry. ``context.pkl`` is also untrusted
+-                # serialized code.
+-                extracted_agent_dir = agent_yml_path.parent
+-                for item in extracted_agent_dir.iterdir():
+-                    if item.is_file():
+-                        if item.name in self._EXPORT_SKIP_NAMES:
+-                            logging.info(
+-                                "Skipping imported %s (agent: %s)",
+-                                item.name,
+-                                agent_id,
+-                            )
+-                            continue
+-                        shutil.copy2(item, agent_dir)
+-
+-                # Create a new AgentData object directly from the data
+-                agent_data = AgentData.model_validate(agent_data)
+-
+-                # Save the agent to the registry. Conversation / learnings are
+-                # intentionally NOT seeded: an imported profile is an
+-                # instruction set, and pretending it has a prior conversation
+-                # with the importer is how private history used to leak across
+-                # the hub.
+-                self.save_agent(agent_data)
++                try:
++                    # Copy instruction files only. Conversation history, execution
++                    # traces, learnings, schedules and pickled context are private
++                    # to whoever authored the archive. ``context.pkl`` is also
++                    # untrusted serialized code.
++                    extracted_agent_dir = agent_yml_path.parent
++                    for item in extracted_agent_dir.iterdir():
++                        if item.is_file():
++                            if item.name in self._EXPORT_SKIP_NAMES:
++                                logging.info(
++                                    "Skipping imported %s (agent: %s)",
++                                    item.name,
++                                    agent_id,
++                                )
++                                continue
++                            shutil.copy2(item, agent_dir)
++
++                    # Imported profiles start with empty history; persistence stays
++                    # on the same path as a locally created profile.
++                    self.save_agent(imported_agent)
++                except Exception:
++                    # Only this invocation's exclusively reserved directory can
++                    # reach cleanup. A pre-existing directory or symlink fails
++                    # above, outside this block, and is never removed.
++                    self._agents.pop(agent_id, None)
++                    if agent_dir.exists():
++                        shutil.rmtree(agent_dir)
++                    raise
+ 
+-                # Return the agent data
+-                return agent_data
++                return imported_agent
+ 
+             except zipfile.BadZipFile:
+                 raise ValueError("Invalid ZIP file")
+@@ -1735,6 +1790,8 @@
+             KeyError: If the agent is not found
+             Exception: If there is an error exporting the agent
+         """
++        if not _is_safe_agent_id(agent_id):
++            raise KeyError(f"Agent with id {agent_id} not found")
+         # Verify the agent exists
+         agent = self.get_agent(agent_id)
+ 
+--- a/local_operator/cli.py
++++ b/local_operator/cli.py
+@@ -366,8 +366,11 @@
+     serve_parser.add_argument(
+         "--host",
+         type=str,
+-        default="0.0.0.0",
+-        help="Host address for the server (default: 0.0.0.0)",
++        default="127.0.0.1",
++        help=(
++            "Host address (default: 127.0.0.1). This API has no authentication; "
++            "use a non-loopback address only behind trusted access controls."
++        ),
+     )
+     serve_parser.add_argument(
+         "--port",
+--- a/local_operator/legacy_bundle.py
++++ b/local_operator/legacy_bundle.py
+@@ -14,7 +14,7 @@
+ from pathlib import Path
+ from typing import List
+ 
+-from local_operator.agents import AgentRegistry
++from local_operator.agents import AgentRegistry, _is_safe_agent_id
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -41,6 +41,16 @@
+         raise ValueError(f"Invalid agents.json manifest: {exc}") from exc
+     if not isinstance(entries, list) or not entries:
+         raise ValueError("Invalid agents.json manifest: expected a non-empty list of agents")
++    # The manifest is written by another installation, so every ID in it is
++    # data. An ID that is not one plain directory name is refused before the
++    # upgrade can join it to the agents directory.
++    for entry in entries:
++        if not isinstance(entry, dict) or not _is_safe_agent_id(entry.get("id")):
++            raise ValueError(
++                f"Invalid agent id in agents.json manifest: {entry!r}"
++                if isinstance(entry, dict)
++                else "Invalid agent record in agents.json manifest"
++            )
+ 
+     shutil.copyfile(manifest_path, registry.agents_file)
+     migrated = registry.migrate_legacy_agents()
+--- a/local_operator/profile_share.py
++++ b/local_operator/profile_share.py
+@@ -46,13 +46,17 @@
+     """Install one shared profile document as a new local agent row.
+ 
+     The row is stored in a directory of its own so installing a profile can
+-    never replace files that are already in the registry. The identity the
+-    profile travels with is kept on the row, so a profile that is shared back
+-    and re-installed keeps the same identity everywhere.
++    never replace files that are already in the registry. The identity in the
++    document is the identity it had where it was shared; it is replaced with
++    the local one before anything is written, so it can never address a row
++    that already exists here.
+     """
++    # A document describes a profile, not a place to keep it, and not the
++    # identity of a row that already exists here: every install gets its own.
++    row_id = str(uuid.uuid4())
+     profile = AgentData.model_validate(
+         {
+-            "id": shared.id,
++            "id": row_id,
+             "name": shared.name,
+             "created_date": shared.created_date,
+             "version": shared.version,
+@@ -64,14 +68,15 @@
+         }
+     )
+ 
+-    row_id = str(uuid.uuid4())
+     destination = registry.agents_dir / row_id
+     destination.mkdir(mode=0o700)
+     try:
+         # The row keeps the document the profile was shared as, so it can be
+         # re-shared or inspected without rebuilding it from the local row.
++        document = shared.model_dump(exclude_none=True)
++        document["id"] = row_id
+         with (destination / "agent.yml").open("w", encoding="utf-8") as handle:
+-            yaml.safe_dump(shared.model_dump(exclude_none=True), handle, default_flow_style=False)
++            yaml.safe_dump(document, handle, default_flow_style=False)
+         (destination / "system_prompt.md").write_text(shared.system_prompt, encoding="utf-8")
+         for filename in (
+             "conversation.jsonl",
+--- a/local_operator/server/models/schemas.py
++++ b/local_operator/server/models/schemas.py
+@@ -938,7 +938,8 @@
+     Attributes:
+         hosting: The hosting service to use for the edit.
+         model: The model to use for the edit.
+-        file_path: The path to the file to edit.
++        file_path: The workspace path, or display identity when content is supplied.
++        file_content: Optional live editor buffer; an empty string is a valid buffer.
+         edit_prompt: The prompt for the edit.
+         selection: The selection to edit.
+         attachments: The attachments to use for the edit.
+@@ -946,7 +947,17 @@
+ 
+     hosting: str = Field(..., description="The hosting service to use for the edit.")
+     model: str = Field(..., description="The model to use for the edit.")
+-    file_path: str = Field(..., description="The path to the file to edit.")
++    file_path: str = Field(
++        ...,
++        description="Workspace file path, or display identity when file_content is supplied.",
++    )
++    file_content: Optional[str] = Field(
++        None,
++        description=(
++            "Live editor buffer. When supplied (including an empty string), the server does "
++            "not read file_path. When omitted or null, reads are confined to the agent workspace."
++        ),
++    )
+     selection: Optional[str] = Field(None, description="The selection to edit.")
+     edit_prompt: str = Field(..., description="The prompt for the edit.")
+     attachments: Optional[List[str]] = Field(
+--- a/local_operator/server/routes/chat.py
++++ b/local_operator/server/routes/chat.py
+@@ -570,6 +570,53 @@
+         raise HTTPException(status_code=500, detail="Internal Server Error")
+ 
+ 
++def _read_edit_workspace_file(workspace: str | None, file_path: str) -> tuple[FilePath, str]:
++    """Read a legacy edit target within the agent's configured workspace.
++
++    This is the HTTP one-shot edit boundary, not a restriction on trusted local
++    harness tools. Canonical paths cover traversal and symlink/junction escapes
++    on supported platforms; they do not sandbox a concurrent local directory
++    mutator. Open the canonical target, never the original caller-supplied path.
++    """
++    try:
++        if not workspace or not workspace.strip():
++            raise ValueError("Missing workspace")
++        root = FilePath(workspace).expanduser()
++        if not root.is_absolute():
++            raise ValueError("Workspace must be absolute")
++        root = root.resolve(strict=True)
++        if not root.is_dir():
++            raise ValueError("Workspace must be a directory")
++    except (OSError, RuntimeError, ValueError):
++        raise HTTPException(status_code=403, detail="Agent workspace is unavailable")
++
++    try:
++        if not file_path or "\x00" in file_path:
++            raise ValueError("Invalid file path")
++        target = FilePath(file_path).expanduser()
++        if not target.is_absolute():
++            target = root / target
++        target = target.resolve()
++    except (OSError, RuntimeError, ValueError):
++        raise HTTPException(status_code=400, detail="Invalid file path")
++    if not target.is_relative_to(root):
++        raise HTTPException(status_code=403, detail="File is outside the agent workspace")
++
++    try:
++        if target.exists() and not target.is_file():
++            raise HTTPException(status_code=400, detail="File must be a regular text file")
++        return target, target.read_text(encoding="utf-8")
++    except FileNotFoundError:
++        raise HTTPException(status_code=404, detail="File not found")
++    except PermissionError:
++        raise HTTPException(status_code=403, detail="File cannot be read")
++    except UnicodeError:
++        raise HTTPException(status_code=400, detail="File must be UTF-8 text")
++    except OSError:
++        logger.exception("Error reading workspace edit file")
++        raise HTTPException(status_code=500, detail="Error reading file")
++
++
+ @router.post(
+     "/v1/chat/agents/{agent_id}/edit",
+     response_model=CRUDResponse,
+@@ -599,7 +646,9 @@
+                 }
+             },
+         },
+-        404: {"description": "Agent not found"},
++        400: {"description": "Invalid file path or non-text file"},
++        403: {"description": "Workspace unavailable or file outside the workspace"},
++        404: {"description": "Agent or workspace file not found"},
+         500: {"description": "Internal Server Error"},
+     },
+ )
+@@ -616,8 +665,9 @@
+     """
+     Edit a file using a specific agent with an edit prompt.
+ 
+-    The endpoint loads the specified file, applies the agent's conversation history,
+-    and uses the agent to generate edit diffs based on the provided edit prompt.
++    The endpoint uses the supplied live buffer, or reads a file confined to the
++    agent workspace when no buffer is supplied. It applies conversation history
++    and generates edit diffs without writing the file.
+ 
+     Args:
+         request: The edit request containing file path and edit prompt
+@@ -641,17 +691,17 @@
+             logger.exception("Error retrieving agent")
+             raise HTTPException(status_code=404, detail=f"Agent not found: {e}")
+ 
+-        resolved_file_path = FilePath(request.file_path).expanduser().resolve()
+-
+-        # Load the file content
+-        try:
+-            with open(resolved_file_path, "r", encoding="utf-8") as f:
+-                file_content = f.read()
+-        except FileNotFoundError:
+-            raise HTTPException(status_code=404, detail=f"File not found: {resolved_file_path}")
+-        except Exception as e:
+-            logger.exception(f"Error reading file {resolved_file_path}")
+-            raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
++        if request.file_content is not None:
++            # Desktop editors own their live buffer, including unsaved and empty
++            # documents outside the server workspace. The path in this mode is
++            # display identity only: do not expand, resolve or open it.
++            resolved_file_path = request.file_path
++            file_content = request.file_content
++        else:
++            workspace_path, file_content = _read_edit_workspace_file(
++                agent_obj.current_working_directory, request.file_path
++            )
++            resolved_file_path = str(workspace_path)
+ 
+         # Create operator with the agent
+         operator = create_operator(
+--- a/local_operator/server/routes/editor.py
++++ b/local_operator/server/routes/editor.py
+@@ -39,7 +39,10 @@
+     if not workspace:
+         raise HTTPException(status_code=400, detail="Agent has no workspace")
+ 
+-    root = FilePath(workspace).expanduser().resolve()
++    root = FilePath(workspace).expanduser()
++    if not root.is_absolute():
++        raise HTTPException(status_code=400, detail="Agent workspace must be absolute")
++    root = root.resolve()
+     if not root.is_dir():
+         raise HTTPException(status_code=400, detail="Agent workspace is unavailable")
+ 
+@@ -47,7 +50,7 @@
+     target = candidate if candidate.is_absolute() else root / candidate
+     target = target.resolve()
+ 
+-    if not str(target).startswith(str(root)):
++    if target != root and root not in target.parents:
+         raise HTTPException(status_code=403, detail="File is outside the agent workspace")
+     if not target.is_file():
+         raise HTTPException(status_code=404, detail="File not found")

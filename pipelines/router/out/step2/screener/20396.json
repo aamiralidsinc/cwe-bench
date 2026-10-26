@@ -1,0 +1,72 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "20396", "advisory_ids": ["GHSA-3GJW-F78C-VVPW", "RUSTSEC-2026-0178"], "repo": "rust-postgres/rust-postgres",
+  "pinned_commit": "a7cf84b5c46431cbca9d8ff50508c23f446efa7d",
+  "fix_commits": ["7a00ffa9ad4d951ec0a4564b52f1780fa9d353c1"],
+  "trust_decision": {
+    "summary": "A server-supplied DataRow field count must be proven equal to the statement's column count before a Row or SimpleQueryRow is exposed, so a short row is rejected as a parse error instead of indexing past the field list and panicking; the decision is placed in the two row constructors in tokio-postgres/src/row.rs.",
+    "evidence": ["tokio-postgres/src/row.rs:114-121", "tokio-postgres/src/row.rs:213-225", "tokio-postgres/src/row.rs:194", "tokio-postgres/src/row.rs:277", "fix.diff:31", "fix.diff:55"]
+  },
+  "landing_point": {
+    "where": "tokio-postgres/src/row.rs:114",
+    "why": "The panic is `self.ranges[idx]` (row.rs:194) where idx comes from the column list (row.rs:171-176); the first place an engineer looks for a DataRow/column mismatch is the typed Row constructor that builds both the column list and the field ranges."
+  },
+  "fix_sites": [
+    {"where": "tokio-postgres/src/row.rs:114-121", "entry_point": "Client::query / query_one / query_opt / query_raw / query_typed* / query_portal (and postgres::Client, postgres::Transaction, postgres::RowIter) -> RowStream (query.rs:344-353) -> Row::new; then Row::get (row.rs:146) or Row::try_get (row.rs:158)", "module_kind": "core protocol row type (extended query protocol)"},
+    {"where": "tokio-postgres/src/row.rs:213-225", "entry_point": "Client::simple_query / Client::simple_query_raw (and postgres::Client::simple_query) -> SimpleQueryStream (simple_query.rs:104-109) -> SimpleQueryRow::new; then SimpleQueryRow::get (row.rs:250) or try_get (row.rs:261)", "module_kind": "simple-query stream row type (text rows, separate public API)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "tokio-postgres/src/row.rs:213-225 (SimpleQueryRow::new, reached only through tokio-postgres/src/simple_query.rs:104-109)"},
+  "O3_reason_to_dismiss": "simple_query is a convenience path that returns text rows (SimpleQueryMessage::Row with Option<&str>), so a solver can call its row type a separate feature and apply the advisory's DataRow panic only to the typed Row path.",
+  "O4_distance": {"files": 0, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A DataRow whose field count matches the columns must still be accepted (fix.diff:116-120), including a matching row with NULL fields; and in a multi-statement simple query the column list legitimately changes between statements (simple_query.rs:101 replaces `*this.columns` on every RowDescription), so a fix that pins the first column count or rejects a row after a RowDescription change breaks legitimate use.",
+    "where": "tokio-postgres/src/row.rs:114-121, tokio-postgres/src/simple_query.rs:93-109"
+  },
+  "O6_input_shapes": [
+    "field count smaller than the column count (the reported panic shape, rejected)",
+    "field count larger than the column count (also rejected because the check uses != and not <, fix.diff:31)",
+    "matching field count containing NULL entries (null is a -1 length, backend.rs:579-580; same count applies and must stay accepted)"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "tokio-postgres/src/prepare.rs:93-107 builds the Statement column schema from RowDescription (same job at tokio-postgres/src/query.rs:98-116 and tokio-postgres/src/simple_query.rs:93-100); the DataRow field count is parsed independently from another message in postgres-protocol/src/message/backend.rs:164-168. The check reads the stored schema through Statement::columns (tokio-postgres/src/statement.rs:72-74) and never re-parses RowDescription.",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "tokio-postgres/src/binary_copy.rs:184-189", "sibling": "the same declared-count-vs-expected-columns check for COPY BINARY rows (compared against user-supplied types) before ranges are indexed at binary_copy.rs:250", "why_realistic": "the maintainers already wrote exactly this guard on that path, so a third row-shaped path would copy the idiom; it is also the shape a planted sibling should imitate because its count source (user types) differs from Row's (Statement columns)"},
+    {"where": "tokio-postgres/src/query.rs:91-97", "sibling": "a statement-less row path: on Message::NoData query_typed hands RowStream a Statement::unnamed(vec![], vec![]) while still consuming whatever DataRows arrive", "why_realistic": "a maintainer adding a describe-then-execute shortcut would reuse this branch, and then the column list is empty while the server still controls the field count - the same split identity with no check"},
+    {"where": "postgres-protocol/src/message/backend.rs:527-552", "sibling": "a public DataRowBody::field_count() or row-building helper in the lower-level crate that pairs a field list with a caller-supplied column list", "why_realistic": "DataRowBody and its ranges() are already public and used outside tokio-postgres, so a helper there is plausible; a fix placed at that layer cannot see the column count and must be duplicated in every consumer"},
+    {"where": "postgres-derive/src/fromsql.rs:204-208", "sibling": "the generated composite FromSql field-count check (wire count vs compile-time field list)", "why_realistic": "the derive already implements this exact mechanism for composite values in another package, so a row-mapping derive or a second decoded type is a realistic place for a maintainer to write it again - possibly with <= instead of != or without the check"}
+  ],
+  "O9_family": "out-of-bounds read / index-out-of-bounds panic on a protocol row whose backing field list is shorter than its column list (CWE-125)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo workspace, edition 2024, rust-version 1.85 (tokio-postgres/Cargo.toml:12); CI pins 1.85.0 (.github/workflows/ci.yml:88)",
+    "services": ["PostgreSQL server for the crate's integration tests (docker compose up -d at .github/workflows/ci.yml:87; tests dial 127.0.0.1:5433 at tokio-postgres/tests/test/main.rs:57) - not needed by the fix's own unit test"],
+    "offline_after_build": true,
+    "project_tests": "No test at the pinned commit feeds a malformed DataRow (grep over tokio-postgres/tests finds none); tokio-postgres/tests/test/main.rs is a live-database suite. tokio-postgres/Cargo.toml:15 sets [lib] test = false, so the #[cfg(test)] module the fix adds to row.rs (fix.diff:70-121) is not run by cargo test; exercising the behaviour needs an in-crate test that is currently disabled or a mock server on a loopback socket driving a real client."
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "tokio-postgres/src/row.rs",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Bounds-check the accessor instead of the constructor: make Row::col_buffer (row.rs:194) use self.ranges.get(idx) and return an error, which stops the panic the report shows but leaves Row::len()/columns() inconsistent and never touches SimpleQueryRow::get_inner (row.rs:277) where the same ranges[idx] panics."
+  },
+  "out_of_scope_notes": ["No issue outside this advisory was noticed or pursued; the only adjacent count check found (postgres-derive/src/fromsql.rs:204-208) is already guarded and unrelated to this panic."],
+  "unverified": [
+    "repo_mb not measured (no shell in this session); 132 .rs files totalling 26,816 Rust lines, i.e. roughly 1 MB of source, which is why tiny_repo is flagged.",
+    "Whether a hidden harness can observe the behaviour: Row::new and SimpleQueryRow::new are pub(crate) (row.rs:114, row.rs:215) and tokio-postgres/Cargo.toml:15 disables lib tests, so the test must either be compiled inside the crate or drive a mock PostgreSQL server over a loopback socket; not verified.",
+    "latest release code was not available for O8 (no release given) and O8 is empty, so present_in_latest is moot.",
+    "Judgement, not measured: pattern A fit is weak - both fixed sites are in tokio-postgres/src/row.rs, 0 files and 0 packages apart, and no module at distance was found; the A fit rests only on the second row type being reachable through a different public API (simple_query)."
+  ]
+}

@@ -1,0 +1,447 @@
+diff -ruN a/app/Ai/Tools/AddPodcast.php b/app/Ai/Tools/AddPodcast.php
+--- a/app/Ai/Tools/AddPodcast.php	2026-10-26 02:29:46.000000000 +0000
++++ b/app/Ai/Tools/AddPodcast.php	2026-10-26 05:35:56.047559140 +0000
+@@ -4,6 +4,7 @@
+ 
+ use App\Ai\AiAssistantResult;
+ use App\Ai\AiRequestContext;
++use App\Helpers\OutboundUrlGuard;
+ use App\Services\Podcast\PodcastService;
+ use Illuminate\Contracts\JsonSchema\JsonSchema;
+ use Laravel\Ai\Contracts\Tool;
+@@ -32,7 +33,13 @@
+ 
+     public function handle(Request $request): Stringable|string
+     {
+-        $podcast = $this->podcastService->addPodcast($request['url'], $this->context->user);
++        $url = (string) $request['url'];
++
++        if (!OutboundUrlGuard::isPublic($url)) {
++            return 'Cannot add podcast: the feed URL must point to a public address.';
++        }
++
++        $podcast = $this->podcastService->addPodcast($url, $this->context->user);
+ 
+         $this->result->action = 'add_podcast';
+         $this->result->data = [
+diff -ruN a/app/Ai/Tools/AddRadioStation.php b/app/Ai/Tools/AddRadioStation.php
+--- a/app/Ai/Tools/AddRadioStation.php	2026-10-26 02:53:54.000000000 +0000
++++ b/app/Ai/Tools/AddRadioStation.php	2026-10-26 05:36:00.487555087 +0000
+@@ -4,6 +4,7 @@
+ 
+ use App\Ai\AiAssistantResult;
+ use App\Ai\AiRequestContext;
++use App\Helpers\OutboundUrlGuard;
+ use App\Services\RadioService;
+ use App\Values\Radio\RadioStationCreateData;
+ use Illuminate\Contracts\JsonSchema\JsonSchema;
+@@ -34,8 +35,14 @@
+ 
+     public function handle(Request $request): Stringable|string
+     {
++        $url = (string) $request['url'];
++
++        if (!OutboundUrlGuard::isPublic($url)) {
++            return 'Cannot add radio station: the URL must point to a public address.';
++        }
++
+         $station = $this->radioService->createRadioStation(
+-            RadioStationCreateData::make(url: $request['url'], name: $request['name'], description: ''),
++            RadioStationCreateData::make(url: $url, name: $request['name'], description: ''),
+             $this->context->user,
+         );
+ 
+diff -ruN a/app/Exceptions/UnsafeOutboundUrlException.php b/app/Exceptions/UnsafeOutboundUrlException.php
+--- a/app/Exceptions/UnsafeOutboundUrlException.php	1970-01-01 00:00:00.000000000 +0000
++++ b/app/Exceptions/UnsafeOutboundUrlException.php	2026-10-26 05:35:37.843575758 +0000
+@@ -0,0 +1,16 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++/**
++ * Thrown when a server-side fetch would leave the publicly routable internet.
++ */
++final class UnsafeOutboundUrlException extends RuntimeException
++{
++    public static function forUrl(string $url): self
++    {
++        return new self(sprintf('Refusing to fetch a URL that does not point to a public host: %s', $url));
++    }
++}
+diff -ruN a/app/Helpers/OutboundUrlGuard.php b/app/Helpers/OutboundUrlGuard.php
+--- a/app/Helpers/OutboundUrlGuard.php	1970-01-01 00:00:00.000000000 +0000
++++ b/app/Helpers/OutboundUrlGuard.php	2026-10-26 05:35:50.283564402 +0000
+@@ -0,0 +1,90 @@
++<?php
++
++namespace App\Helpers;
++
++use App\Exceptions\UnsafeOutboundUrlException;
++use Illuminate\Support\Uri;
++use Psr\Http\Message\RequestInterface;
++use Psr\Http\Message\ResponseInterface;
++use Psr\Http\Message\UriInterface;
++use Throwable;
++
++/**
++ * Decides whether an outbound URL may be fetched, and supplies the redirect policy that keeps
++ * the decision applying to every hop.
++ *
++ * A URL supplied by a user (or carried inside data fetched on their behalf) can point at an
++ * address only the server can reach; checking the first URL is not enough because an ordinary
++ * public host can answer with a redirect to such an address. Anything that follows redirects
++ * therefore re-checks the next URI with {@see self::redirectSettings()} before it is requested.
++ */
++final class OutboundUrlGuard
++{
++    /** Schemes a server-side fetch is allowed to use. */
++    private const array FETCHABLE_SCHEMES = ['http', 'https'];
++
++    private const int MAX_REDIRECTS = 5;
++
++    /**
++     * Whether the URL is fetchable and its host is publicly routable. Performs no request;
++     * a host name is resolved only to make the address decision.
++     */
++    public static function isPublic(string $url): bool
++    {
++        try {
++            $uri = Uri::of($url);
++        } catch (Throwable) {
++            return false;
++        }
++
++        if (!in_array($uri->scheme(), self::FETCHABLE_SCHEMES, true)) {
++            return false;
++        }
++
++        $host = $uri->host();
++
++        return is_string($host) && $host !== '' && Network::isPublicHost($host);
++    }
++
++    /**
++     * Refuse the URL unless it may be fetched; throws before any connection is opened.
++     *
++     * @throws UnsafeOutboundUrlException
++     */
++    public static function ensurePublic(string $url): void
++    {
++        if (!self::isPublic($url)) {
++            throw UnsafeOutboundUrlException::forUrl($url);
++        }
++    }
++
++    /**
++     * Guzzle redirect settings that re-check each hop. Intended to be merged into the
++     * `allow_redirects` request option so the check runs before the next hop is sent.
++     *
++     * @return array<string, mixed>
++     */
++    public static function redirectSettings(int $max = self::MAX_REDIRECTS): array
++    {
++        return [
++            'max' => $max,
++            'on_redirect' => static function (
++                RequestInterface $request,
++                ResponseInterface $response,
++                UriInterface $nextUri,
++            ): void {
++                self::ensurePublic((string) $nextUri);
++            },
++        ];
++    }
++
++    /**
++     * The `allow_redirects` request option carrying {@see self::redirectSettings()}.
++     *
++     * @return array<string, mixed>
++     */
++    public static function followOptions(int $max = self::MAX_REDIRECTS): array
++    {
++        return ['allow_redirects' => self::redirectSettings($max)];
++    }
++}
+diff -ruN a/app/Rules/HasAudioContentType.php b/app/Rules/HasAudioContentType.php
+--- a/app/Rules/HasAudioContentType.php	2026-10-26 02:53:54.000000000 +0000
++++ b/app/Rules/HasAudioContentType.php	2026-10-26 05:39:54.071342038 +0000
+@@ -2,10 +2,14 @@
+ 
+ namespace App\Rules;
+ 
++use App\Exceptions\UnsafeOutboundUrlException;
++use App\Helpers\Network;
++use App\Helpers\OutboundUrlGuard;
+ use Closure;
+ use Illuminate\Contracts\Validation\ValidationRule;
+ use Illuminate\Support\Facades\Http;
+ use Illuminate\Support\Str;
++use Illuminate\Support\Uri;
+ use Illuminate\Translation\PotentiallyTranslatedString;
+ use Throwable;
+ 
+@@ -22,6 +26,10 @@
+ 
+         try {
+             $contentType = $this->resolveContentType($url);
++        } catch (UnsafeOutboundUrlException) {
++            $fail('The :attribute must point to a public URL.');
++
++            return;
+         } catch (Throwable) {
+             $fail("The $attribute couldn't be reached.");
+ 
+@@ -40,19 +48,45 @@
+      */
+     private function resolveContentType(string $url): string
+     {
++        $this->refuseInternalLiteral($url);
++
+         // Try HEAD first — fast and lightweight
+         try {
+-            $response = Http::head($url);
++            $response = Http::withOptions(OutboundUrlGuard::followOptions())->head($url);
+ 
+             if ($response->successful()) {
+                 return $response->header('Content-Type');
+             }
++        } catch (UnsafeOutboundUrlException $e) {
++            throw $e;
+         } catch (Throwable) { // @mago-expect lint:no-empty-catch-clause -- HEAD may time out or fail on streaming servers; fall through to GET below.
+         }
+ 
+         // Fall back to GET with ICY headers — streaming servers often only respond to GET
+-        $response = Http::withHeaders(['Icy-MetaData' => '1'])->withOptions(['stream' => true])->get($url);
++        $response = Http::withHeaders(['Icy-MetaData' => '1'])->withOptions([
++            ...OutboundUrlGuard::followOptions(),
++            'stream' => true,
++        ])->get($url);
+ 
+         return $response->header('Content-Type');
+     }
++
++    /**
++     * An address that is written as an IP literal can be judged without a resolver; host names
++     * are checked by the SafeUrl rule this one is documented to follow.
++     */
++    private function refuseInternalLiteral(string $url): void
++    {
++        try {
++            $host = Uri::of($url)->host();
++        } catch (Throwable) {
++            return;
++        }
++
++        $host = trim((string) $host, '[]');
++
++        if ($host !== '' && filter_var($host, FILTER_VALIDATE_IP) && !Network::isPublicHost($host)) {
++            throw UnsafeOutboundUrlException::forUrl($url);
++        }
++    }
+ }
+diff -ruN a/app/Rules/SafeUrl.php b/app/Rules/SafeUrl.php
+--- a/app/Rules/SafeUrl.php	2026-10-26 02:53:54.000000000 +0000
++++ b/app/Rules/SafeUrl.php	2026-10-26 05:36:14.559542243 +0000
+@@ -2,7 +2,9 @@
+ 
+ namespace App\Rules;
+ 
++use App\Exceptions\UnsafeOutboundUrlException;
+ use App\Helpers\Network;
++use App\Helpers\OutboundUrlGuard;
+ use Closure;
+ use Illuminate\Contracts\Validation\ValidationRule;
+ use Illuminate\Support\Facades\Http;
+@@ -43,11 +45,22 @@
+         }
+ 
+         try {
+-            $response = Http::head((string) $value);
++            $response = Http::withOptions(OutboundUrlGuard::followOptions())->head((string) $value);
++        } catch (UnsafeOutboundUrlException) {
++            $fail('The :attribute must point to a public URL.');
++
++            return;
+         } catch (Throwable) {
+             // Some streaming servers don't support HEAD — try GET
+             try {
+-                $response = Http::withOptions(['stream' => true])->get((string) $value);
++                $response = Http::withOptions([
++                    ...OutboundUrlGuard::followOptions(),
++                    'stream' => true,
++                ])->get((string) $value);
++            } catch (UnsafeOutboundUrlException) {
++                $fail('The :attribute must point to a public URL.');
++
++                return;
+             } catch (Throwable) {
+                 $fail("The $attribute couldn't be reached.");
+ 
+diff -ruN a/app/Services/Podcast/PodcastService.php b/app/Services/Podcast/PodcastService.php
+--- a/app/Services/Podcast/PodcastService.php	2026-10-26 02:53:54.000000000 +0000
++++ b/app/Services/Podcast/PodcastService.php	2026-10-26 05:36:39.407519567 +0000
+@@ -5,6 +5,7 @@
+ use App\Events\UserUnsubscribedFromPodcast;
+ use App\Exceptions\FailedToParsePodcastFeedException;
+ use App\Exceptions\UserAlreadySubscribedToPodcastException;
++use App\Helpers\OutboundUrlGuard;
+ use App\Helpers\Uuid;
+ use App\Models\Podcast;
+ use App\Models\PodcastUserPivot;
+@@ -136,6 +137,20 @@
+                 continue;
+             }
+ 
++            $enclosureUrl = (string) $episodeValue->enclosure->url;
++
++            // The media address comes from data fetched on the user's behalf, not from the
++            // subscription request; it must not be stored when only the server can reach it.
++            if (!OutboundUrlGuard::isPublic($enclosureUrl)) {
++                Log::warning(sprintf(
++                    'Skipping podcast episode "%s" with an unsafe enclosure URL: %s',
++                    $episodeValue->title,
++                    $enclosureUrl,
++                ));
++
++                continue;
++            }
++
+             $id = Uuid::generate();
+             $ids[] = $id;
+             $records[] = [
+@@ -143,7 +158,7 @@
+                 'podcast_id' => $podcast->id,
+                 'title' => $episodeValue->title,
+                 'lyrics' => '',
+-                'path' => $episodeValue->enclosure->url,
++                'path' => $enclosureUrl,
+                 'created_at' => $episodeValue->metadata->pubDate ?: now(),
+                 'updated_at' => $episodeValue->metadata->pubDate ?: now(),
+                 'episode_metadata' => $episodeValue->metadata->toJson(),
+@@ -204,7 +219,15 @@
+         }
+ 
+         try {
+-            $lastModified = Http::head($podcast->url)->header('Last-Modified');
++            if (!OutboundUrlGuard::isPublic($podcast->url)) {
++                Log::warning(sprintf('Refusing to probe feed URL of podcast %s: not publicly routable', $podcast->url));
++
++                return false;
++            }
++
++            $lastModified = Http::withOptions(OutboundUrlGuard::followOptions())
++                ->head($podcast->url)
++                ->header('Last-Modified');
+ 
+             if (!$lastModified) {
+                 return true;
+@@ -226,6 +249,11 @@
+     public function getStreamableUrl(string|Episode $url, ?Client $client = null, string $method = 'OPTIONS'): ?string
+     {
+         $url = $url instanceof Episode ? $url->path : $url;
++
++        if (!OutboundUrlGuard::isPublic($url)) {
++            return null;
++        }
++
+         $client ??= new Client();
+ 
+         try {
+@@ -235,7 +263,10 @@
+                     'Origin' => '*',
+                 ],
+                 RequestOptions::HTTP_ERRORS => false,
+-                RequestOptions::ALLOW_REDIRECTS => ['track_redirects' => true],
++                RequestOptions::ALLOW_REDIRECTS => [
++                    ...OutboundUrlGuard::redirectSettings(),
++                    'track_redirects' => true,
++                ],
+             ]);
+ 
+             $redirects = Arr::wrap($response->getHeader(RedirectMiddleware::HISTORY_HEADER));
+@@ -272,6 +303,8 @@
+ 
+     private function createParser(string $url): Poddle
+     {
++        OutboundUrlGuard::ensurePublic($url);
++
+         return Poddle::fromUrl($url, 5 * 60, $this->client);
+     }
+ }
+diff -ruN a/app/Services/Radio/RadioStreamProxy.php b/app/Services/Radio/RadioStreamProxy.php
+--- a/app/Services/Radio/RadioStreamProxy.php	2026-10-26 02:53:54.000000000 +0000
++++ b/app/Services/Radio/RadioStreamProxy.php	2026-10-26 05:36:05.423550581 +0000
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Services\Radio;
+ 
++use App\Helpers\OutboundUrlGuard;
+ use App\Models\RadioStation;
+ 
+ class RadioStreamProxy
+@@ -14,10 +15,26 @@
+      */
+     public function openStream(string $url)
+     {
++        if (!OutboundUrlGuard::isPublic($url)) {
++            return false;
++        }
++
++        // Redirects are not followed: a public station may answer with a Location that points
++        // somewhere only the server can reach, and stream contexts cannot re-check a hop.
+         $context = stream_context_create([
+             'http' => [
+                 'header' => "Icy-MetaData: 1\r\n",
+                 'timeout' => 5,
++                'follow_location' => 0,
++                'max_redirects' => 0,
++            ],
++        ]);
++
++        $plainContext = stream_context_create([
++            'http' => [
++                'timeout' => 5,
++                'follow_location' => 0,
++                'max_redirects' => 0,
+             ],
+         ]);
+ 
+@@ -30,7 +47,7 @@
+                 return $stream;
+             }
+ 
+-            return fopen($url, 'r');
++            return fopen($url, 'r', false, $plainContext);
+         } finally {
+             restore_error_handler();
+         }
+diff -ruN a/app/Values/Podcast/EpisodePlayable.php b/app/Values/Podcast/EpisodePlayable.php
+--- a/app/Values/Podcast/EpisodePlayable.php	2026-10-26 02:53:55.000000000 +0000
++++ b/app/Values/Podcast/EpisodePlayable.php	2026-10-26 05:36:09.587546782 +0000
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Values\Podcast;
+ 
++use App\Helpers\OutboundUrlGuard;
+ use App\Models\Song as Episode;
+ use Illuminate\Contracts\Support\Arrayable;
+ use Illuminate\Contracts\Support\Jsonable;
+@@ -39,7 +40,14 @@
+         $file = artifact_path("episodes/{$episode->id}.mp3");
+ 
+         if (!File::exists($file)) {
+-            Http::sink($file)->get($episode->path)->throw();
++            $url = (string) $episode->path;
++
++            OutboundUrlGuard::ensurePublic($url);
++
++            Http::sink($file)
++                ->withOptions(OutboundUrlGuard::followOptions())
++                ->get($url)
++                ->throw();
+         }
+ 
+         $playable = new self($file, File::hash($file));

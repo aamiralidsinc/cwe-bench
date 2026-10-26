@@ -1,0 +1,168 @@
+diff --git a/context.go b/context.go
+index 0806a23..1fc8da0 100644
+--- a/context.go
++++ b/context.go
+@@ -20,6 +20,8 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"unsafe"
++
++	"github.com/labstack/echo/v5/internal/pathutil"
+ )
+ 
+ // stringToBytes returns a []byte view over s without copying, avoiding the allocation+copy of []byte(s)
+@@ -678,7 +680,11 @@ func (c *Context) FileFS(file string, filesystem fs.FS) error {
+ // whose names need escaping in a URL. For example, a route `/download/:name` may serve the file
+ // named by the `name` parameter from the given file system.
+ func (c *Context) FileParam(name string, filesystem fs.FS) error {
+-	p, err := url.PathUnescape(c.Param(name))
++	p := c.Param(name)
++	if pathutil.HasEncodedPathSeparator(p) || pathutil.RequestHasEncodedPathSeparator(c.Request()) {
++		return ErrNotFound
++	}
++	p, err := url.PathUnescape(p)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/echo.go b/echo.go
+index f22d2dd..07395c7 100644
+--- a/echo.go
++++ b/echo.go
+@@ -53,11 +53,14 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"os/signal"
++	"path"
+ 	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"syscall"
++
++	"github.com/labstack/echo/v5/internal/pathutil"
+ )
+ 
+ // Echo is the top-level framework instance.
+@@ -587,8 +590,19 @@ func (e *Echo) StaticFS(pathPrefix string, filesystem fs.FS, middleware ...Middl
+ // When disablePathUnescaping is set then file name from path is not unescaped and is served as is.
+ func StaticDirectoryHandler(fileSystem fs.FS, disablePathUnescaping bool) HandlerFunc {
+ 	return func(c *Context) error {
++		// The router matches on the escaped request path by default, so an encoded separator is
++		// not a segment boundary during routing. It must not become one when the file location is
++		// resolved, otherwise the request reaches a file the matched route never authorized.
++		if pathutil.RequestHasEncodedPathSeparator(c.Request()) {
++			return NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound)).
++				Wrap(fmt.Errorf("rejected encoded path separator in static path"))
++		}
+ 		p := c.Param("*")
+ 		if !disablePathUnescaping { // when router is already unescaping we do not want to do is twice
++			if pathutil.HasEncodedPathSeparator(p) {
++				return NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound)).
++					Wrap(fmt.Errorf("rejected encoded path separator in static path"))
++			}
+ 			tmpPath, err := url.PathUnescape(p)
+ 			if err != nil {
+ 				return fmt.Errorf("failed to unescape path variable: %w", err)
+@@ -596,8 +610,9 @@ func StaticDirectoryHandler(fileSystem fs.FS, disablePathUnescaping bool) Handle
+ 			p = tmpPath
+ 		}
+ 
+-		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid
+-		name := filepath.ToSlash(filepath.Clean(strings.TrimPrefix(p, "/")))
++		// fs.FS.Open() already assumes that file names are relative to FS root path and considers name with prefix `/` as invalid.
++		// path.Clean (not filepath.Clean): fs.FS paths always use forward slashes, so a backslash stays a literal character.
++		name := path.Clean(strings.TrimPrefix(p, "/"))
+ 		fi, err := fs.Stat(fileSystem, name)
+ 		if err != nil {
+ 			return ErrNotFound
+diff --git a/echo_httpserve.go b/echo_httpserve.go
+index d5450b9..68eedf8 100644
+--- a/echo_httpserve.go
++++ b/echo_httpserve.go
+@@ -6,6 +6,8 @@ package echo
+ import (
+ 	"net/http"
+ 	"strings"
++
++	"github.com/labstack/echo/v5/internal/pathutil"
+ )
+ 
+ // StaticHTTP registers a new route with the path prefix to serve static files from the given
+@@ -15,6 +17,9 @@ import (
+ func (e *Echo) StaticHTTP(pathPrefix string, fileSystem http.FileSystem, middleware ...MiddlewareFunc) RouteInfo {
+ 	handler := http.StripPrefix(strings.TrimSuffix(pathPrefix, "/"), http.FileServer(fileSystem))
+ 	return e.GET(pathPrefix+"*", func(c *Context) error {
++		if pathutil.RequestHasEncodedPathSeparator(c.Request()) {
++			return ErrNotFound
++		}
+ 		handler.ServeHTTP(c.Response(), c.Request())
+ 		return nil
+ 	}, middleware...)
+diff --git a/internal/pathutil/pathutil.go b/internal/pathutil/pathutil.go
+new file mode 100644
+index 0000000..15d4309
+--- /dev/null
++++ b/internal/pathutil/pathutil.go
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileCopyrightText: © 2015 LabStack LLC and Echo contributors
++
++// Package pathutil holds internal helpers for safely handling request and file paths.
++package pathutil
++
++import "net/http"
++
++// HasEncodedPathSeparator reports whether s contains a percent-encoded path separator,
++// case-insensitively: %2F/%2f (forward slash) or %5C/%5c (backslash). Backslash is included as
++// defense-in-depth against Windows-style separators even though fs.FS only uses forward slashes.
++func HasEncodedPathSeparator(s string) bool {
++	for i := 0; i+2 < len(s); i++ {
++		if s[i] != '%' {
++			continue
++		}
++		switch {
++		case s[i+1] == '2' && (s[i+2] == 'f' || s[i+2] == 'F'):
++			return true
++		case s[i+1] == '5' && (s[i+2] == 'c' || s[i+2] == 'C'):
++			return true
++		}
++	}
++	return false
++}
++
++// RequestHasEncodedPathSeparator reports whether the request's escaped path contains a
++// percent-encoded path separator. The router matches on this escaped form by default, so a
++// separator encoded here was not a segment boundary during routing and must not become one when
++// a file location is resolved from the request.
++func RequestHasEncodedPathSeparator(r *http.Request) bool {
++	if r == nil || r.URL == nil {
++		return false
++	}
++	return HasEncodedPathSeparator(r.URL.RawPath)
++}
+diff --git a/middleware/static.go b/middleware/static.go
+index 152dded..6a469ae 100644
+--- a/middleware/static.go
++++ b/middleware/static.go
+@@ -18,6 +18,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/labstack/echo/v5"
++	"github.com/labstack/echo/v5/internal/pathutil"
+ )
+ 
+ // StaticConfig defines the config for Static middleware.
+@@ -205,6 +206,13 @@ func (config StaticConfig) ToMiddleware() (echo.MiddlewareFunc, error) {
+ 				pathUnescape = !config.DisablePathUnescaping // because router could already do PathUnescape
+ 			}
+ 			if pathUnescape {
++				// The wildcard parameter is still escaped here. A separator encoded in it was not
++				// a segment boundary during routing (the router matched the escaped request path),
++				// so it must not become one when the file location is resolved.
++				if pathutil.HasEncodedPathSeparator(p) || pathutil.RequestHasEncodedPathSeparator(c.Request()) {
++					return echo.NewHTTPError(http.StatusNotFound, http.StatusText(http.StatusNotFound)).
++						Wrap(fmt.Errorf("rejected encoded path separator in static path"))
++				}
+ 				p, err = url.PathUnescape(p)
+ 				if err != nil {
+ 					return err

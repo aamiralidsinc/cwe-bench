@@ -1,0 +1,483 @@
+diff --git a/src/Extension/Attributes/Event/AttributesListener.php b/src/Extension/Attributes/Event/AttributesListener.php
+index fa068f4..09fbc45 100644
+--- a/src/Extension/Attributes/Event/AttributesListener.php
++++ b/src/Extension/Attributes/Event/AttributesListener.php
+@@ -44,12 +44,29 @@ final class AttributesListener
+ 
+     public function processDocument(DocumentParsedEvent $event): void
+     {
++        // Targets already worked out for attribute blocks we walked past; see findTargetAndDirection()
++        /** @var \SplObjectStorage<Attributes|AttributesInline, array<Node|string|null>> $resolved */
++        $resolved = new \SplObjectStorage();
++
++        /**
++         * Attributes waiting to be written to their target, keyed by target object ID.
++         *
++         * Everything is merged and filtered per node exactly as it would be if it were written
++         * straight to the target, except for the class list: only its first (whole) value takes
++         * part in the merges, with the classes contributed by later nodes recorded separately and
++         * joined once at the end. Feeding the growing list back through mergeAttributes() for
++         * every node would re-split and re-join all of it each time, which is quadratic.
++         *
++         * @var array<int, array{node: Node, attributes: array<string, mixed>, class: string|null, before: list<string>, after: list<string>}> $pending
++         */
++        $pending = [];
++
+         foreach ($event->getDocument()->iterator() as $node) {
+             if (! ($node instanceof Attributes || $node instanceof AttributesInline)) {
+                 continue;
+             }
+ 
+-            [$target, $direction] = self::findTargetAndDirection($node);
++            [$target, $direction] = self::findTargetAndDirection($node, $resolved);
+ 
+             if ($target instanceof Node) {
+                 $parent = $target->parent();
+@@ -57,29 +74,84 @@ final class AttributesListener
+                     $target = $parent;
+                 }
+ 
++                $id = \spl_object_id($target);
++                if (! isset($pending[$id])) {
++                    /** @var array<string, mixed> $existing */
++                    $existing     = (array) $target->data->get('attributes');
++                    $pending[$id] = ['node' => $target, 'attributes' => $existing, 'class' => null, 'before' => [], 'after' => []];
++                }
++
++                $attributes = $node->getAttributes();
+                 if ($direction === self::DIRECTION_SUFFIX) {
+-                    $attributes = AttributesHelper::mergeAttributes($target, $node->getAttributes());
++                    $merged = AttributesHelper::mergeAttributes($pending[$id]['attributes'], $attributes);
++                } else {
++                    $merged = AttributesHelper::mergeAttributes($attributes, $pending[$id]['attributes']);
++                }
++
++                $merged = AttributesHelper::filterAttributes($merged, $this->allowList, $this->allowUnsafeLinks);
++
++                if (! isset($merged['class'])) {
++                    $pending[$id]['class']  = null;
++                    $pending[$id]['before'] = $pending[$id]['after'] = [];
++                } elseif ($pending[$id]['class'] === null) {
++                    $pending[$id]['class'] = $merged['class'];
+                 } else {
+-                    $attributes = AttributesHelper::mergeAttributes($node->getAttributes(), $target);
++                    // Only this node's own classes can have been added to the list, so record them
++                    // and put the short value the merge started from back in their place.
++                    $added = AttributesHelper::classList($attributes['class'] ?? []);
++                    if ($direction === self::DIRECTION_SUFFIX) {
++                        foreach ($added as $class) {
++                            $pending[$id]['after'][] = $class;
++                        }
++                    } else {
++                        foreach (\array_reverse($added) as $class) {
++                            $pending[$id]['before'][] = $class;
++                        }
++                    }
++
++                    $merged['class'] = $pending[$id]['class'];
+                 }
+ 
+-                $target->data->set('attributes', AttributesHelper::filterAttributes($attributes, $this->allowList, $this->allowUnsafeLinks));
++                $pending[$id]['attributes'] = $merged;
+             }
+ 
+             $node->detach();
+         }
++
++        foreach ($pending as $entry) {
++            $attributes = $entry['attributes'];
++            if ($entry['class'] !== null && ($entry['before'] !== [] || $entry['after'] !== [])) {
++                $classes   = \array_reverse($entry['before']);
++                $classes[] = $entry['class'];
++
++                $attributes['class'] = \implode(' ', \array_merge($classes, $entry['after']));
++            }
++
++            $entry['node']->data->set('attributes', $attributes);
++        }
+     }
+ 
+     /**
+-     * @param Attributes|AttributesInline $node
++     * @param Attributes|AttributesInline                                             $node
++     * @param \SplObjectStorage<Attributes|AttributesInline, array<Node|string|null>> $resolved
+      *
+      * @return array<Node|string|null>
+      */
+-    private static function findTargetAndDirection($node): array
++    private static function findTargetAndDirection($node, \SplObjectStorage $resolved): array
+     {
++        if (isset($resolved[$node])) {
++            $result = $resolved[$node];
++            // Each node is only ever resolved once, so don't keep it alive any longer
++            unset($resolved[$node]);
++
++            return $result;
++        }
++
+         $target    = null;
+         $direction = null;
+         $previous  = $next = $node;
++        /** @var list<Attributes> $shared */
++        $shared = [];
+         while (true) {
+             $previous = self::getPrevious($previous);
+             $next     = self::getNext($next);
+@@ -94,7 +166,16 @@ final class AttributesListener
+             }
+ 
+             if ($node instanceof AttributesInline && ($previous === null || ($previous instanceof AbstractInline && $node->isBlock()))) {
+-                continue;
++                // Once this condition holds it holds for every remaining iteration, as walking
++                // further to the left can only ever yield another inline sibling or null. No
++                // sibling can therefore be chosen, so the target must be the parent; continuing
++                // to walk would only re-scan the remaining siblings for nothing.
++                if (! $node->parent() instanceof FencedCode) {
++                    $target    = $node->parent();
++                    $direction = self::DIRECTION_SUFFIX;
++                }
++
++                break;
+             }
+ 
+             if ($previous !== null && ! self::isAttributesNode($previous)) {
+@@ -110,9 +191,27 @@ final class AttributesListener
+ 
+                 break;
+             }
++
++            // Only a TARGET_NEXT block can have a sibling block to walk past, so if that's what
++            // we're looking at then we are one too, which means getPrevious() already returned
++            // null for us and will keep doing so. Neither of us can therefore pick anything up on
++            // the left, and what is left of this walk is the whole of that block's own walk: it
++            // must end up with the same target we do. Remember that instead of re-scanning the
++            // chain once per block.
++            if (! ($next instanceof Attributes) || $next->getTarget() !== Attributes::TARGET_NEXT) {
++                continue;
++            }
++
++            $shared[] = $next;
++        }
++
++        /** @var array<Node|string|null> $result */
++        $result = [$target, $direction];
++        foreach ($shared as $sharedNode) {
++            $resolved[$sharedNode] = $result;
+         }
+ 
+-        return [$target, $direction];
++        return $result;
+     }
+ 
+     /**
+diff --git a/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php b/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php
+index 6e0cdc6..46945b7 100644
+--- a/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php
++++ b/src/Extension/Attributes/Parser/AttributesBlockContinueParser.php
+@@ -30,6 +30,15 @@ final class AttributesBlockContinueParser extends AbstractBlockContinueParser
+ 
+     private bool $hasSubsequentLine = false;
+ 
++    /**
++     * The first whole class list we saw, which is all that takes part in the per-line merges, plus
++     * the classes each later line adds. Merging the growing list on every line would be quadratic.
++     */
++    private ?string $class = null;
++
++    /** @var list<string> */
++    private array $additionalClasses = [];
++
+     /**
+      * @param array<string, mixed> $attributes The attributes identified by the block start parser
+      * @param AbstractBlock        $container  The node we were in when these attributes were discovered
+@@ -57,10 +66,26 @@ final class AttributesBlockContinueParser extends AbstractBlockContinueParser
+         $cursor->advanceToNextNonSpaceOrTab();
+         if ($cursor->isAtEnd() && $attributes !== []) {
+             // It does! Merge them into what we parsed previously
+-            $this->block->setAttributes(AttributesHelper::mergeAttributes(
++            $merged = AttributesHelper::mergeAttributes(
+                 $this->block->getAttributes(),
+                 $attributes
+-            ));
++            );
++
++            if (isset($merged['class'])) {
++                if ($this->class === null) {
++                    $this->class = $merged['class'];
++                } else {
++                    // Only this line's own classes can have been added to the list, so record them
++                    // and put the short value the merge started from back in their place.
++                    foreach (AttributesHelper::classList($attributes['class'] ?? []) as $class) {
++                        $this->additionalClasses[] = $class;
++                    }
++
++                    $merged['class'] = $this->class;
++                }
++            }
++
++            $this->block->setAttributes($merged);
+ 
+             // Tell the core parser we've consumed everything
+             return BlockContinue::at($cursor);
+@@ -77,6 +102,12 @@ final class AttributesBlockContinueParser extends AbstractBlockContinueParser
+ 
+     public function closeBlock(): void
+     {
++        if ($this->additionalClasses !== []) {
++            $attributes          = $this->block->getAttributes();
++            $attributes['class'] = \implode(' ', \array_merge([(string) $this->class], $this->additionalClasses));
++            $this->block->setAttributes($attributes);
++        }
++
+         // Attributes appearing at the very end of the document won't have any last lines to check
+         // so we can make that determination here
+         if (! $this->hasSubsequentLine) {
+diff --git a/src/Extension/Attributes/Util/AttributesHelper.php b/src/Extension/Attributes/Util/AttributesHelper.php
+index 53a8287..9b03650 100644
+--- a/src/Extension/Attributes/Util/AttributesHelper.php
++++ b/src/Extension/Attributes/Util/AttributesHelper.php
+@@ -119,11 +119,7 @@ final class AttributesHelper
+             /** @var array<string, mixed> $arg */
+             $arg = (array) $arg;
+             if (isset($arg['class'])) {
+-                if (\is_string($arg['class'])) {
+-                    $arg['class'] = \array_filter(\explode(' ', \trim($arg['class'])));
+-                }
+-
+-                foreach ($arg['class'] as $class) {
++                foreach (self::classList($arg['class']) as $class) {
+                     $attributes['class'][] = $class;
+                 }
+ 
+@@ -140,6 +136,22 @@ final class AttributesHelper
+         return $attributes;
+     }
+ 
++    /**
++     * Split a `class` attribute value into the individual classes it contributes to a merge
++     *
++     * @param mixed $class
++     *
++     * @return list<string>
++     */
++    public static function classList($class): array
++    {
++        if (\is_string($class)) {
++            return \array_values(\array_filter(\explode(' ', \trim($class))));
++        }
++
++        return \array_values((array) $class);
++    }
++
+     /**
+      * @param array<string, mixed> $attributes
+      * @param list<string>         $allowList
+diff --git a/src/Extension/Attributes/Util/AttributesHelper.php.orig b/src/Extension/Attributes/Util/AttributesHelper.php.orig
+new file mode 100644
+index 0000000..53a8287
+--- /dev/null
++++ b/src/Extension/Attributes/Util/AttributesHelper.php.orig
+@@ -0,0 +1,180 @@
++<?php
++
++/*
++ * This file is part of the league/commonmark package.
++ *
++ * (c) Colin O'Dell <colinodell@gmail.com>
++ * (c) 2015 Martin Hasoň <martin.hason@gmail.com>
++ *
++ * For the full copyright and license information, please view the LICENSE
++ * file that was distributed with this source code.
++ */
++
++declare(strict_types=1);
++
++namespace League\CommonMark\Extension\Attributes\Util;
++
++use League\CommonMark\Node\Node;
++use League\CommonMark\Parser\Cursor;
++use League\CommonMark\Util\RegexHelper;
++
++/**
++ * @internal
++ */
++final class AttributesHelper
++{
++    private const SINGLE_ATTRIBUTE = '\s*([.]-?[_a-z][^\s.}]*|[#][^\s}]+|' . RegexHelper::PARTIAL_ATTRIBUTENAME . RegexHelper::PARTIAL_ATTRIBUTEVALUESPEC . ')\s*';
++    private const ATTRIBUTE_LIST   = '/^{:?(' . self::SINGLE_ATTRIBUTE . ')+}/i';
++
++    /**
++     * @return array<string, mixed>
++     */
++    public static function parseAttributes(Cursor $cursor): array
++    {
++        $state = $cursor->saveState();
++        $cursor->advanceToNextNonSpaceOrNewline();
++
++        // Quick check to see if we might have attributes
++        if ($cursor->getCharacter() !== '{') {
++            $cursor->restoreState($state);
++
++            return [];
++        }
++
++        // Attempt to match the entire attribute list expression
++        // While this is less performant than checking for '{' now and '}' later, it simplifies
++        // matching individual attributes since they won't need to look ahead for the closing '}'
++        // while dealing with the fact that attributes can technically contain curly braces.
++        // So we'll just match the start and end braces up front.
++        $attributeExpression = $cursor->match(self::ATTRIBUTE_LIST);
++        if ($attributeExpression === null) {
++            $cursor->restoreState($state);
++
++            return [];
++        }
++
++        // Trim the leading '{' or '{:' and the trailing '}'
++        $attributeExpression = \ltrim(\substr($attributeExpression, 1, -1), ':');
++        $attributeCursor     = new Cursor($attributeExpression);
++
++        /** @var array<string, mixed> $attributes */
++        $attributes = [];
++        while ($attribute = \trim((string) $attributeCursor->match('/^' . self::SINGLE_ATTRIBUTE . '/i'))) {
++            if ($attribute[0] === '#') {
++                $attributes['id'] = \substr($attribute, 1);
++
++                continue;
++            }
++
++            if ($attribute[0] === '.') {
++                $attributes['class'][] = \substr($attribute, 1);
++
++                continue;
++            }
++
++            /** @psalm-suppress PossiblyUndefinedArrayOffset */
++            [$name, $value] = \explode('=', $attribute, 2);
++
++            if ($value === 'true') {
++                $attributes[$name] = true;
++                continue;
++            }
++
++            $first = $value[0];
++            $last  = \substr($value, -1);
++            if (($first === '"' && $last === '"') || ($first === "'" && $last === "'") && \strlen($value) > 1) {
++                $value = \substr($value, 1, -1);
++            }
++
++            if (\strtolower(\trim($name)) === 'class') {
++                foreach (\array_filter(\explode(' ', \trim($value))) as $class) {
++                    $attributes['class'][] = $class;
++                }
++            } else {
++                $attributes[\trim($name)] = \trim($value);
++            }
++        }
++
++        if (isset($attributes['class'])) {
++            $attributes['class'] = \implode(' ', (array) $attributes['class']);
++        }
++
++        return $attributes;
++    }
++
++    /**
++     * @param Node|array<string, mixed> $attributes1
++     * @param Node|array<string, mixed> $attributes2
++     *
++     * @return array<string, mixed>
++     */
++    public static function mergeAttributes($attributes1, $attributes2): array
++    {
++        $attributes = [];
++        foreach ([$attributes1, $attributes2] as $arg) {
++            if ($arg instanceof Node) {
++                $arg = $arg->data->get('attributes');
++            }
++
++            /** @var array<string, mixed> $arg */
++            $arg = (array) $arg;
++            if (isset($arg['class'])) {
++                if (\is_string($arg['class'])) {
++                    $arg['class'] = \array_filter(\explode(' ', \trim($arg['class'])));
++                }
++
++                foreach ($arg['class'] as $class) {
++                    $attributes['class'][] = $class;
++                }
++
++                unset($arg['class']);
++            }
++
++            $attributes = \array_merge($attributes, $arg);
++        }
++
++        if (isset($attributes['class'])) {
++            $attributes['class'] = \implode(' ', $attributes['class']);
++        }
++
++        return $attributes;
++    }
++
++    /**
++     * @param array<string, mixed> $attributes
++     * @param list<string>         $allowList
++     *
++     * @return array<string, mixed>
++     */
++    public static function filterAttributes(array $attributes, array $allowList, bool $allowUnsafeLinks): array
++    {
++        $allowList = \array_fill_keys($allowList, true);
++
++        foreach ($attributes as $name => $value) {
++            $attrNameLower = \strtolower($name);
++
++            // Remove any unsafe links
++            if (! $allowUnsafeLinks && ($attrNameLower === 'href' || $attrNameLower === 'src') && \is_string($value) && RegexHelper::isLinkPotentiallyUnsafe($value)) {
++                unset($attributes[$name]);
++                continue;
++            }
++
++            // No allowlist?
++            if ($allowList === []) {
++                // Just remove JS event handlers
++                if (\str_starts_with($attrNameLower, 'on')) {
++                    unset($attributes[$name]);
++                }
++
++                continue;
++            }
++
++            // Remove any attributes not in that allowlist (case-sensitive)
++            if (! isset($allowList[$name])) {
++                unset($attributes[$name]);
++            }
++        }
++
++        return $attributes;
++    }
++}
+diff --git a/src/Node/Inline/AdjacentTextMerger.php b/src/Node/Inline/AdjacentTextMerger.php
+index 43922d4..7d82e63 100644
+--- a/src/Node/Inline/AdjacentTextMerger.php
++++ b/src/Node/Inline/AdjacentTextMerger.php
+@@ -89,17 +89,13 @@ final class AdjacentTextMerger
+             return;
+         }
+ 
+-        $s = $first->getLiteral();
+-
+         $node = $first->next();
+         $stop = $last->next();
+         while ($node !== $stop && $node instanceof Text) {
+-            $s     .= $node->getLiteral();
++            $first->append($node->getLiteral());
+             $unlink = $node;
+             $node   = $node->next();
+             $unlink->detach();
+         }
+-
+-        $first->setLiteral($s);
+     }
+ }

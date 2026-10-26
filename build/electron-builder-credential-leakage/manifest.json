@@ -1,0 +1,241 @@
+{
+ "slug": "electron-builder-credential-leakage",
+ "candidate": {
+  "repo": "electron-userland/electron-builder",
+  "advisory": "GHSA-P2F4-R6V6-J797",
+  "cve": "CVE-2026-54673",
+  "cwe": "CWE-200",
+  "vulnerable_commit": "8a035f836bb79d5346c69246530190dd72ec4519",
+  "fix_commit": "22a7532bd01b9fb42cff7c58d599c7ad683569fe",
+  "screener_entry_id": "12765",
+  "flaw": "on a redirect the shared redirect helper only drops the exact lower-case `authorization` key, so other credential headers (capitalised Authorization, PRIVATE-TOKEN, API keys, cookies, proxy credentials) follow to another origin; publish tokens and JSON request bodies appear in clear in errors and debug output"
+ },
+ "pattern": "A+B",
+ "builder_prompt_version": "build-v1",
+ "strict_gate": true,
+ "verified": {
+  "exploit_entry_point": "public library API driven in-process: electron-updater NsisUpdater constructed as a packaged app does (ElectronAppAdapter + ElectronHttpExecutor over an in-process stand-in for Electron 39 `net`, virtual hosts, no sockets) -> checkForUpdates()/downloadUpdate() with requestHeaders / addAuthHeader / a GitLab token; builder-util httpExecutor (NodeHttpExecutor, used by the publishers) .request()/.downloadToBuffer() against two loopback servers on different ports; electron-publish GitHubPublisher/GitlabPublisher constructors with GH_TOKEN/GITLAB_TOKEN; DEBUG=electron-builder output of httpExecutor.request(). Tests assert only on what another origin received or what was printed.",
+  "pinned_commit_check": "22a7532b's parent is 8a035f83 (git log); the pinned tree has none of the advisory's regression tests (the fix commit adds them to test/src/httpExecutorTest.ts)",
+  "electron_semantics": "Electron v39.8.5 lib/common/api/net-client-request.ts (read-only): 'redirect' is emitted in both follow and manual mode; shell/common/api/electron_api_url_loader.cc: abort() in the event cancels the follow; Chromium net/url_request/redirect_util.cc keeps custom and Authorization headers on a followed redirect (the Fetch-spec Authorization drop lives in Blink, not used by Electron net). The fake in tests/support/fakeElectron.ts implements exactly this.",
+  "sites": {
+   "httpExecutor.ts:323 prepareRedirectUrlOptions (landing)": "reproduced via both executors (5 security tests)",
+   "httpExecutor.ts:90 request() debug of JSON body": "reproduced (debug log test)",
+   "gitHubPublisher.ts:61 / gitlabPublisher.ts:49 invalid-token error": "reproduced (2 tests)",
+   "GitLabProvider.ts:53-55 (published: force redirect:manual)": "NOT a behavioural site at Electron 39: in follow mode the executor's redirect listener still runs, aborts and re-issues through the shared helper, so the GitLab metadata request is covered by the landing-site fix alone (GitLab security test passes with prepareRedirectUrlOptions fixed and GitLabProvider untouched). Kept in the reference fix, not used as a lever.",
+   "keygenPublisher.ts:182/254, util.ts removePassword/env filters/exec stdout, httpExecutor.ts:209 error body": "in the reference fix (upstream); not tested: no credential in keygen bodies, and the remaining helpers are separate redaction routes of the same concept"
+  },
+  "routes": {
+   "B1 DifferentialDownloader.ts:260-264 single-range redirect followRedirect()": "confirmed on the pinned copy: the Authorization set with addAuthHeader (lower-case, so the shared helper would have dropped it) reaches the redirect host on the followed request and on every later range (security test fails at nop on the leak assertion)",
+   "B2 multipleRangeDownloader.ts:71-73,94-96 no redirect listener": "real by reading (follow mode, no listener -> Electron follows with all headers); tested since the fairness revision (security/differential.test.ts multi-range test, X-Api-Key via requestHeaders); closed in the reference and alt fixes",
+   "B3 Provider.ts:82-94 metadata requests without redirect:manual": "NOT a route: ElectronHttpExecutor.doApiRequest registers the redirect listener for every request, and Electron 39 emits 'redirect' in follow mode, so these requests already go through the shared helper (covered by the landing-site fix)"
+  },
+  "services": [
+   "none (in-process fake Electron net; loopback HTTP servers for the Node executor)"
+  ],
+  "project_tests_run": "test/src/httpExecutorTest.ts (47), test/src/builder-util/utilTest.ts (73, Windows-only case dropped, snapshot file copied), test/src/builder-util/nodeHttpExecutorTest.ts (20): pass at the vulnerable commit and with the reference fix",
+  "nop": "local run: 10/10 security fail (each on its leak assertion), 156/156 functional pass",
+  "reference": "local run: reward 1.0 (10/10, 156/156); tsc reports no errors for the four rebuilt packages"
+ },
+ "traps": [
+  {
+   "id": "T1",
+   "name": "credential header spellings and kinds at the shared redirect decision",
+   "shape": "input-shape variants of the landing site (capitalised Authorization, PRIVATE-TOKEN, X-Api-Key + Cookie + Proxy-Authorization together with ordinary headers), each through a real client: Electron updater (download, GitLab metadata) and the Node publishing client (API request, download)",
+   "where": "packages/builder-util-runtime/src/httpExecutor.ts:323 (reached from :189 Node API path, :287 Node download path, packages/electron-updater/src/electronHttpExecutor.ts:91 Electron path)",
+   "security_tests": [
+    "security/redirect.test.ts::app updater (Electron net) > full download: a capitalised Authorization request header is not sent to the redirect target on another host",
+    "security/redirect.test.ts::app updater (Electron net) > GitLab provider: the project access token is not sent to object storage the asset link redirects to",
+    "security/redirect.test.ts::publishing HTTP client (Node) > API request: API-key, cookie and proxy credentials are not forwarded to another origin",
+    "security/redirect.test.ts::publishing HTTP client (Node) > API request: a PRIVATE-TOKEN header is not forwarded to another origin",
+    "security/redirect.test.ts::publishing HTTP client (Node) > download: a capitalised Authorization header is not forwarded to another origin"
+   ],
+   "coupled_functional_tests": [
+    "functional/redirect.test.ts (8): same-origin redirect keeps Authorization/PRIVATE-TOKEN (Node, Electron), http->https same-host upgrade keeps the auth header, cross-origin redirects still complete and still carry Accept/User-Agent, GitLab asset redirects (same host with token, other host) still resolve",
+    "functional/project/httpExecutorTest.ts (47, the repo's own)"
+   ],
+   "security_fail_patch": "auth_and_private_token_only.patch",
+   "reason_to_dismiss": "the report's example is the GitLab token; adding PRIVATE-TOKEN and a case-insensitive Authorization check closes it",
+   "realistic_because": "the advisory's own landing site; the narrow fix is the screener's tempting wrong fix"
+  },
+  {
+   "id": "T2",
+   "name": "block-based (differential) update download follows redirects with all request headers",
+   "shape": "pattern B uncovered route to the same sink (credential headers sent to another origin on a redirect) that never calls the shared redirect helper",
+   "where": "packages/electron-updater/src/differentialDownloader/DifferentialDownloader.ts:260-264 (request.on('redirect') -> followRedirect() with unchanged headers, then requestOptions rewritten to the new host for every later range); packages/electron-updater/src/differentialDownloader/multipleRangeDownloader.ts:71-73,94-96 (multi-range requests, the default for the generic provider: no redirect listener, Electron follows with all headers)",
+   "security_tests": [
+    "security/differential.test.ts::differential download: the auth token is not sent to the host the update file redirects to",
+    "security/differential.test.ts::differential download with the default multi-range requests: an application credential header is not sent to the host the update file redirects to"
+   ],
+   "coupled_functional_tests": [
+    "functional/differential.test.ts::differential download without redirects fetches only the changed blocks",
+    "functional/differential.test.ts::differential download through a redirect to another host completes with the right file",
+    "functional/differential.test.ts::differential download through a redirect on the same server keeps the auth header"
+   ],
+   "security_fail_patch": "upstream_fix.patch",
+   "reason_to_dismiss": "a separate subsystem in another package; comments say 'Electron net handles redirects automatically'; the test uses lower-case authorization via addAuthHeader, which the old helper already handled",
+   "distance": "packages/electron-updater/src/differentialDownloader/ vs packages/builder-util-runtime/src/httpExecutor.ts",
+   "realistic_because": "real, unmodified upstream code (unchanged by the fix and still present in current upstream master)"
+  },
+  {
+   "id": "T3",
+   "name": "secret redaction in error messages and debug output",
+   "shape": "pattern A far sites of the published fix in other packages: publisher invalid-token errors (GitHub, GitLab) and the debug log of JSON request bodies (field names apiKey / clientSecret that the old field-name filter misses)",
+   "where": "packages/electron-publish/src/gitHubPublisher.ts:61, packages/electron-publish/src/gitlabPublisher.ts:49, packages/builder-util-runtime/src/httpExecutor.ts:90",
+   "security_tests": [
+    "security/redaction.test.ts::publish token configuration errors > GitHub: a GH_TOKEN with an invalid character is not echoed in the error",
+    "security/redaction.test.ts::publish token configuration errors > GitLab: a GITLAB_TOKEN with an invalid character is not echoed in the error",
+    "security/redaction.test.ts::debug output (DEBUG=electron-builder) > a JSON request body's password, API key and client secret are not logged in clear"
+   ],
+   "coupled_functional_tests": [
+    "functional/redaction.test.ts (5): invalid tokens still refused naming GH_TOKEN/GITLAB_TOKEN, valid tokens accepted, debug output still shows non-secret body fields",
+    "functional/project/utilTest.ts (the repo's own removePassword / filterSensitiveEnv tests)"
+   ],
+   "security_fail_patch": "miss_redaction.patch",
+   "reason_to_dismiss": "the report is about redirects; logging lives in other packages (electron-publish) and looks like a separate concern",
+   "realistic_because": "published fix sites (real upstream code changed by 22a7532b)"
+  }
+ ],
+ "leak_terms": [
+  "GHSA-P2F4-R6V6-J797",
+  "CVE-2026-54673",
+  "prepareRedirectUrlOptions",
+  "isCrossOriginRedirect",
+  "reconstructOriginalUrl",
+  "HttpExecutor",
+  "ElectronHttpExecutor",
+  "NodeHttpExecutor",
+  "httpExecutor",
+  "doApiRequest",
+  "handleResponse",
+  "doDownload",
+  "downloadToBuffer",
+  "addRedirectHandlers",
+  "DifferentialDownloader",
+  "GenericDifferentialDownloader",
+  "multipleRangeDownloader",
+  "differential",
+  "blockmap",
+  "block map",
+  "range request",
+  "range requests",
+  "followRedirect",
+  "redirect: manual",
+  "manual redirect",
+  "createRequestOptions",
+  "requestHeaders",
+  "addAuthHeader",
+  "safeStringifyJson",
+  "isSensitiveFieldName",
+  "hashSensitiveValue",
+  "removePassword",
+  "filterSensitiveEnv",
+  "stripSensitiveEnvVars",
+  "GitLabProvider",
+  "PrivateGitHubProvider",
+  "GitHubPublisher",
+  "GitlabPublisher",
+  "KeygenPublisher",
+  "PRIVATE-TOKEN",
+  "X-Api-Key",
+  "Proxy-Authorization",
+  "builder-util-runtime",
+  "builder-util",
+  "electron-publish",
+  "net.request",
+  "fakeElectron"
+ ],
+ "patch_checks": [
+  {
+   "patch": "upstream_fix.patch",
+   "expect": "security_fail",
+   "note": "the published fix alone (source files): misses T2 (single-range and multi-range tests)"
+  },
+  {
+   "patch": "miss_redaction.patch",
+   "expect": "security_fail",
+   "note": "reference without the redaction part: misses T3 (3 tests)"
+  },
+  {
+   "patch": "auth_and_private_token_only.patch",
+   "expect": "security_fail",
+   "note": "the tempting narrow fix (Authorization any case + PRIVATE-TOKEN): misses T1's other credential kinds (1 test)"
+  },
+  {
+   "patch": "lowercase_only_names.patch",
+   "expect": "security_fail",
+   "note": "header names matched without case-folding (5 tests)"
+  },
+  {
+   "patch": "electron_only.patch",
+   "expect": "security_fail",
+   "note": "credentials dropped only in the Electron redirect listener; the Node publishing client keeps the old helper (3 tests)"
+  },
+  {
+   "patch": "strip_after_follow.patch",
+   "expect": "security_fail",
+   "note": "differential download drops credentials for later ranges but still follows the redirect with them (1 test)"
+  },
+  {
+   "patch": "single_range_only.patch",
+   "expect": "security_fail",
+   "note": "reference with the block-based download fixed only on the single-range path; the default multi-range requests still follow redirects with all headers (1 test)"
+  },
+  {
+   "patch": "hostname_only_compare.patch",
+   "expect": "functional_fail",
+   "note": "origin decided by host name only: the Node port-change tests leak (3) and the repo's own port/downgrade tests fail"
+  },
+  {
+   "patch": "refuse_cross_origin.patch",
+   "expect": "functional_fail",
+   "note": "refuses every cross-origin redirect"
+  },
+  {
+   "patch": "strip_on_every_redirect.patch",
+   "expect": "functional_fail",
+   "note": "drops credentials on same-origin redirects too"
+  },
+  {
+   "patch": "drop_all_headers_cross_origin.patch",
+   "expect": "functional_fail",
+   "note": "drops every header on a cross-origin redirect"
+  },
+  {
+   "patch": "no_body_debug.patch",
+   "expect": "functional_fail",
+   "note": "request bodies removed from debug output altogether"
+  },
+  {
+   "patch": "hardening_fix.patch",
+   "expect": "pass",
+   "kind": "hardening",
+   "note": "reference + redirect helper copies headers instead of mutating the caller's, more credential header/field names, shortened hash in publisher errors"
+  },
+  {
+   "patch": "alt_allowlist_fallback_fix.patch",
+   "expect": "pass",
+   "kind": "alternative",
+   "note": "independent design: header allow-list on cross-origin redirects, differential download aborts on a cross-origin redirect and falls back to a full download, own body redaction"
+  },
+  {
+   "patch": "blind.patch",
+   "expect": "pass",
+   "kind": "blind",
+   "why": "fresh agent, report + repo only"
+  }
+ ],
+ "wrong_fix_catalogue": {
+  "refuse_all": "refuse_cross_origin.patch",
+  "crash_as_refusal": "n/a: library clients; an exception is an acceptable refusal and the security tests assert only on what other origins or logs received; throwing on legitimate redirects is caught by the functional tests (refuse_cross_origin.patch)",
+  "wrong_resource": "hostname_only_compare.patch",
+  "one_role_or_direction": "electron_only.patch",
+  "reads_only": "n/a: there are no read/write verbs; the credential decision is made per redirect for every method (the analogue, one client only, is electron_only.patch)",
+  "check_after_adjustment": "strip_after_follow.patch",
+  "unlisted_route": "upstream_fix.patch",
+  "malformed_identity": "lowercase_only_names.patch",
+  "missing_authority": "n/a: no authority or secret lookup decides the outcome; the decision depends only on the two URLs, and a request without a resolvable origin already throws at the vulnerable commit (repo test 'Missing hostname')",
+  "adjacent_api": "strip_on_every_redirect.patch"
+ },
+ "status": "built; gate static (blind + FAIRNESS pending, written by others)/nop/oracle/patches passed",
+ "notes": "see notes.md; the blind patch and FAIRNESS.md are written by independent agents after this build"
+}

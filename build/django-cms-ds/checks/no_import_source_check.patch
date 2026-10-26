@@ -1,0 +1,174 @@
+diff --git a/cms/admin/forms.py b/cms/admin/forms.py
+index 845fa2ccf..43f4db89e 100644
+--- a/cms/admin/forms.py
++++ b/cms/admin/forms.py
+@@ -51,6 +51,12 @@ from cms.utils.compat.warnings import RemovedInDjangoCMS51Warning
+ from cms.utils.conf import get_cms_setting
+ from cms.utils.i18n import get_language_list, get_site_language_from_request
+ from cms.utils.page import get_clean_username
++from cms.utils.page_permissions import (
++    user_can_add_page,
++    user_can_add_subpage,
++    user_can_change_page,
++    user_can_view_page,
++)
+ from cms.utils.permissions import (
+     get_current_user,
+     get_subordinate_groups,
+@@ -276,16 +282,16 @@ class AddPageForm(BasePageContentForm):
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+ 
+-        source_field = self.fields.get("source")
+-
+-        if not source_field or source_field.widget.is_hidden:
+-            return
+-
+         page_field = self.fields.get("cms_page")
+ 
+         if page_field:
+             page_field.queryset = page_field.queryset.filter(site=self._site)
+ 
++        source_field = self.fields.get("source")
++
++        if not source_field or source_field.widget.is_hidden:
++            return
++
+         root_page = PageType.get_root_page(site=self._site)
+ 
+         if root_page:
+@@ -294,8 +300,12 @@ class AddPageForm(BasePageContentForm):
+             titles = PageContent.objects.filter(page__in=descendants, language=self._language)
+             choices = [("", "---------")]
+             choices.extend((title.page_id, title.title) for title in titles)
++            # The value posted by the client is validated against the queryset,
++            # not against the choices rendered below.
++            source_field.queryset = descendants
+             source_field.choices = choices
+         else:
++            source_field.queryset = source_field.queryset.none()
+             choices = []
+ 
+         if len(choices) < 2:
+@@ -333,10 +343,32 @@ class AddPageForm(BasePageContentForm):
+ 
+     def clean_parent_page(self):
+         parent_page = self.cleaned_data.get("parent_page")
+-        if parent_page and parent_page.site_id != self._site.pk:
+-            raise ValidationError("Site doesn't match the parent's page site")
++        if parent_page:
++            if parent_page.site_id != self._site.pk:
++                raise ValidationError("Site doesn't match the parent's page site")
++            if not user_can_add_subpage(self._user, parent_page, site=self._site):
++                raise ValidationError(_("You do not have permission to add a page here."))
++        elif not user_can_add_page(self._user, site=self._site):
++            raise ValidationError(_("You do not have permission to add a page here."))
+         return parent_page
+ 
++    def clean_source(self):
++        source = self.cleaned_data.get("source")
++        # The source is validated against its queryset, not against the choices
++        # rendered for this site, and its content is copied into the new page or
++        # translation. The user must be allowed to view it on its own site.
++        if source and not user_can_view_page(self._user, source, site=source.site):
++            raise ValidationError(_("You do not have permission to use this page."))
++        return source
++
++    def clean_cms_page(self):
++        page = self.cleaned_data.get("cms_page")
++        # The existing page receiving a translation is controlled by the client
++        # and may be outside the user's permission scope.
++        if page and not user_can_change_page(self._user, page, site=page.site):
++            raise ValidationError(_("You do not have permission to change this page."))
++        return page
++
+     def create_translation(self, page, main_language_page_content_template=None):
+         data = self.cleaned_data
+         title_kwargs = {
+@@ -518,6 +550,16 @@ class DuplicatePageForm(AddPageForm):
+         widget=forms.HiddenInput(),
+     )
+ 
++    def clean_source(self):
++        source = self.cleaned_data.get("source")
++        # A hidden field whose value is fully controlled by the client and whose
++        # queryset spans every page on every site. Adding a page only checks the
++        # generic add permission, so the copied page has to be readable by the
++        # requesting user on its own site.
++        if source and not user_can_view_page(self._user, source, site=source.site):
++            raise ValidationError(_("You do not have permission to copy this page."))
++        return source
++
+ 
+ def url_is_locked(page_content: PageContent) -> bool:
+     """Return whether ``page_content``'s URL is shared with a published
+diff --git a/cms/admin/pageadmin.py b/cms/admin/pageadmin.py
+index e3c0e039a..da0a7627c 100644
+--- a/cms/admin/pageadmin.py
++++ b/cms/admin/pageadmin.py
+@@ -660,10 +660,16 @@ class PageAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+             return jsonify_request(HttpResponseBadRequest("error"))
+ 
+         target = form.cleaned_data["target"]
+-        source_site = form.cleaned_data["source_site"]
+ 
+-        # User can only copy pages he can see
+-        can_copy_page = page_permissions.user_can_view_page(user, page, source_site)
++        # User can only copy pages he can see -- on the site the page lives on,
++        # and only if every page copied with it is visible to him as well.
++        can_copy_page = page_permissions.user_can_view_page(user, page, page.site)
++
++        if can_copy_page:
++            for descendant in page.get_descendant_pages():
++                if not page_permissions.user_can_view_page(user, descendant, descendant.site):
++                    can_copy_page = False
++                    break
+ 
+         if can_copy_page and target:
+             # User can only copy a page into another one if he has permission
+@@ -724,6 +730,15 @@ class PageAdmin(PageDeleteMessageMixin, admin.ModelAdmin):
+             except Page.DoesNotExist:
+                 return jsonify_request(HttpResponseBadRequest("error"))
+ 
++        if target_page:
++            can_add_page = page_permissions.user_can_add_subpage(user, target_page, site=target_site)
++        else:
++            can_add_page = page_permissions.user_can_add_page(user, site=target_site)
++
++        if not can_add_page:
++            message = _("Error! You don't have permissions to add a page to this site.")
++            return jsonify_request(HttpResponseForbidden(message))
++
+         new_page = page.copy(
+             site=target_site,
+             parent_page=target_page,
+diff --git a/cms/forms/wizards.py b/cms/forms/wizards.py
+index afe9f093a..be0487a83 100644
+--- a/cms/forms/wizards.py
++++ b/cms/forms/wizards.py
+@@ -113,6 +113,12 @@ class CreateCMSPageForm(AddPageForm):
+             raise forms.ValidationError(_("Please provide a valid slug."))
+         return data
+ 
++    def clean_content_page(self):
++        page = self.cleaned_data.get("content_page")
++        if page and not user_can_view_page(self._user, page, site=page.site):
++            raise ValidationError(_("You do not have permission to use this page."))
++        return page
++
+     def clean_parent_page(self):
+         # Check to see if this user has permissions to make this page. We've
+         # already checked this when producing a list of wizard entries, but this
+diff --git a/cms/utils/page_permissions.py b/cms/utils/page_permissions.py
+index 379c3797f..48dd56046 100644
+--- a/cms/utils/page_permissions.py
++++ b/cms/utils/page_permissions.py
+@@ -284,7 +284,7 @@ def user_can_view_page(user, page, site=None):
+         # Page has no restrictions but user can't see unrestricted pages
+         return False
+ 
+-    if user_can_change_page(user, page):
++    if user_can_change_page(user, page, site=site):
+         # If user has change permissions on a page
+         # then he can automatically view it.
+         return True

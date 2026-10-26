@@ -1,0 +1,181 @@
+--- a/python/djust/runtime.py	2026-10-26 02:39:21.000000000 +0000
++++ b/python/djust/runtime.py	2026-10-26 05:25:36.188126997 +0000
+@@ -357,6 +357,7 @@
+                 log_message=f"Error in {sanitize_for_log(view_path)}.mount()",
+             )
+             await self.transport.send(response)
++            self.view_instance = None
+             return
+ 
+         # ---- handle_params (Phoenix-parity, fixes #1237 bug 3) ----
+@@ -376,6 +377,7 @@
+                 log_message=f"Error in {sanitize_for_log(view_path)}.handle_params()",
+             )
+             await self.transport.send(response)
++            self.view_instance = None
+             return
+ 
+         # ---- Initial render ----
+@@ -398,6 +400,7 @@
+                 log_message=f"Error rendering {sanitize_for_log(view_path)}",
+             )
+             await self.transport.send(response)
++            self.view_instance = None
+             return
+ 
+         mount_msg: Dict[str, Any] = {
+@@ -714,7 +717,12 @@
+                 await self.transport.send({"type": "navigate", "to": redirect_url})
+                 return True
+         except Exception as exc:
++            # Fail closed: if the authorisation check cannot be evaluated we
++            # cannot conclude the view is allowed, so the mount is refused
++            # and the runtime keeps no event target.
+             logger.warning("Runtime: auth check error: %s", exc)
++            await self.transport.send({"type": "error", "error": "Permission denied"})
++            return True
+         return None
+ 
+     def _resolve_url_kwargs(self, page_url: str) -> Dict[str, Any]:
+--- a/python/djust/sse.py	2026-10-26 02:39:21.000000000 +0000
++++ b/python/djust/sse.py	2026-10-26 05:25:24.724137557 +0000
+@@ -226,7 +226,10 @@
+     # Use a stable session-scoped ID so VDOM caching works the same as WS
+     view_instance._websocket_session_id = session.session_id
+ 
+-    session.view_instance = view_instance
++    # NOTE: ``session.view_instance`` is deliberately not assigned here. The
++    # session becomes able to dispatch events to this view only after the
++    # authorisation check has passed AND mount()/the initial render have
++    # completed; every refusal below returns with the session still unmounted.
+ 
+     # ---- Auth check ----
+     try:
+@@ -243,7 +246,11 @@
+             session.push({"type": "navigate", "to": redirect_url})
+             return
+     except Exception as exc:
++        # Fail closed: an authorisation check that cannot be evaluated is a
++        # refusal, not permission to mount the view.
+         logger.warning("SSE: auth check error: %s", exc)
++        session.push({"type": "error", "error": "Permission denied"})
++        return
+ 
+     # ---- Resolve URL kwargs (for path-based params like pk, slug) ----
+     mount_kwargs: Dict[str, Any] = {}
+@@ -297,6 +304,9 @@
+         return
+ 
+     # ---- Push mount message ----
++    # The mount is complete (authorisation passed, mount() ran, first render
++    # succeeded): only now does the session get an event target.
++    session.view_instance = view_instance
+     mount_msg: Dict[str, Any] = {
+         "type": "mount",
+         "session_id": session.session_id,
+--- a/python/djust/websocket.py	2026-10-26 02:39:21.000000000 +0000
++++ b/python/djust/websocket.py	2026-10-26 05:25:15.088146436 +0000
+@@ -420,6 +420,13 @@
+         # Track whether a user event is currently being processed so ticks
+         # can yield priority to user interactions.
+         self._processing_user_event = False
++        # Mount bookkeeping: ``_mount_completed`` is set once a mount attempt
++        # has emitted its ``mount`` frame (and is the only state in which the
++        # freshly created view may receive events); ``_mount_in_batch`` marks
++        # a refusal inside a multiplexed ``mount_batch``, where the shared
++        # socket must stay open for the sibling views.
++        self._mount_completed = False
++        self._mount_in_batch = False
+ 
+     async def _flush_push_events(self) -> None:
+         """
+@@ -1676,6 +1683,35 @@
+         sticky_preserved: Optional[Dict[str, Any]] = None,
+         state_snapshot: Optional[Dict[str, Any]] = None,
+     ):
++        """Mount a view, rolling the session's event target back on refusal.
++
++        A mount attempt is only allowed to change which view this session
++        dispatches events to when it reaches the point where the ``mount``
++        frame is emitted. Every other ending — an unroutable payload, a
++        refused authorisation check, an ``on_mount`` hook that redirects, or
++        a failure raised by ``mount()`` / rendering — puts back the view
++        that was dispatchable before the attempt. A refused view therefore
++        never becomes the target of a later ``event`` frame, while a sibling
++        already mounted in the same ``mount_batch`` keeps serving events on
++        the shared socket.
++        """
++        previous_view = self.view_instance
++        self._mount_completed = False
++        try:
++            await self._mount_view(data, sticky_preserved, state_snapshot)
++        finally:
++            if not self._mount_completed:
++                # The mount did not produce a mount frame: this view was
++                # never authorised/fully mounted and must not be reachable
++                # by a subsequent {type: event} frame.
++                self.view_instance = previous_view
++
++    async def _mount_view(
++        self,
++        data: Dict[str, Any],
++        sticky_preserved: Optional[Dict[str, Any]] = None,
++        state_snapshot: Optional[Dict[str, Any]] = None,
++    ):
+         """
+         Handle view mounting with proper view resolution.
+ 
+@@ -1974,7 +2010,10 @@
+                     "Permission denied for %s: %s", self.view_instance.__class__.__name__, exc
+                 )
+                 await self.send_json({"type": "error", "message": "Permission denied"})
+-                await self.close(code=4403)
++                # A batch shares one socket with its sibling views; only a
++                # standalone refusal may terminate the transport.
++                if not self._mount_in_batch:
++                    await self.close(code=4403)
+                 return
+             if redirect_url:
+                 await self.send_json(
+@@ -2209,7 +2248,10 @@
+                         exc,
+                     )
+                     await self.send_json({"type": "error", "message": "Permission denied"})
+-                    await self.close(code=4403)
++                    # The post-mount object check can also refuse inside a
++                    # batch; never tear down the shared socket for it.
++                    if not self._mount_in_batch:
++                        await self.close(code=4403)
+                     return
+                 # --- End object-permission check ---
+         except Exception as e:
+@@ -2466,6 +2508,10 @@
+             except Exception:  # noqa: BLE001 — defensive: never break mount
+                 logger.exception("failed to emit sticky_hold frame before mount")
+ 
++        # The mount completed: authorisation passed, mount() ran and the
++        # initial render succeeded. From here on this view is the session's
++        # event target; anything that returned earlier is rolled back.
++        self._mount_completed = True
+         await self.send_json(response)
+ 
+         # Mount-time queues: drain push events queued during mount() (or
+@@ -2525,6 +2571,10 @@
+             captured.append(payload)
+ 
+         self.send_json = _collect  # type: ignore[assignment]
++        # Mark the refusal context: a view refused here is reported in the
++        # batch frame, but the shared socket stays open for its siblings.
++        previous_in_batch = self._mount_in_batch
++        self._mount_in_batch = True
+         # Mount-batch is never combined with sticky preservation (sticky
+         # only runs through live_redirect_mount which doesn't batch) or
+         # state_snapshot (snapshot is for popstate restoration, also
+@@ -2554,6 +2604,7 @@
+             # Only restore if the try-block didn't already restore (else
+             # we'd double-restore harmlessly). Idempotent.
+             self.send_json = orig_send_json  # type: ignore[assignment]
++            self._mount_in_batch = previous_in_batch
+ 
+         # Extract the successful mount frame; any "error" frame means failure.
+         # Fix #4: capture "navigate" frames too — those are emitted when

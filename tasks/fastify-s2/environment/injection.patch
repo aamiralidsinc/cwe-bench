@@ -1,0 +1,260 @@
+diff --git a/docs/Reference/Request.md b/docs/Reference/Request.md
+index 217a7a46..9b6596a1 100644
+--- a/docs/Reference/Request.md
++++ b/docs/Reference/Request.md
+@@ -102,6 +102,10 @@ Request is a core Fastify object containing the following fields:
+   Validates the input using the specified schema or HTTP part and returns
+   `true` if the input is valid, `false` otherwise. If `httpPart` is provided,
+   the function uses the validator for that HTTP part. Defaults to `null`.
++- [.validateSchema(schema, data, [httpPart])](#validateschema) -
++  Validates `data` against an inline schema and returns `true` when the data
++  satisfies it, `false` otherwise. Every JSON Schema form is accepted,
++  including the boolean schemas `true` and `false`.
+ 
+ ### Headers
+ 
+@@ -316,3 +320,16 @@ request
+ 
+ See [.compileValidationSchema(schema, [httpStatus])](#compileValidationSchema)
+ for more information on compiling validation schemas.
++
++### .validateSchema(schema, data, [httpPart])
++<a id="validateschema"></a>
++
++Validates `data` against an inline schema at request time and returns `true`
++when the data satisfies the schema. The optional `httpPart` is forwarded to the
++`ValidationCompiler` if provided, defaults to `null`. Unlike
++[.validateInput](#validate), any JSON Schema form is accepted, including the
++boolean schemas `true` and `false`.
++
++```js
++const accepted = request.validateSchema(false, request.body) // false
++```
+diff --git a/docs/Reference/Validation-and-Serialization.md b/docs/Reference/Validation-and-Serialization.md
+index c9f49481..3d88cf92 100644
+--- a/docs/Reference/Validation-and-Serialization.md
++++ b/docs/Reference/Validation-and-Serialization.md
+@@ -164,6 +164,28 @@ Validations can be a complete JSON Schema object with a `type` of `'object'` and
+ a `'properties'` object containing parameters, or a simpler variation listing
+ parameters at the top level.
+ 
++### Default schemas
++
++An instance can apply default request-part schemas to every route it registers
++with `setDefaultSchema`. A route that declares the same part overrides the
++default for that part; the remaining parts keep the default.
++
++```js
++const fastify = Fastify()
++fastify.setDefaultSchema({
++  headers: {
++    type: 'object',
++    required: ['x-api-key']
++  }
++})
++
++// Every route registered on this instance now requires `x-api-key`, unless the
++// route declares its own `headers` schema.
++```
++
++The defaults apply to the instance the method is called on and to its
++encapsulated plugins. Calling it again replaces the previous defaults.
++
+ > ℹ For using the latest Ajv (v8), refer to the
+ > [`schemaController`](./Server.md#schema-controller) section.
+ 
+diff --git a/fastify.js b/fastify.js
+index 3bcc66d7..d2909932 100644
+--- a/fastify.js
++++ b/fastify.js
+@@ -34,7 +34,8 @@ const {
+   kGenReqId,
+   kErrorHandlerAlreadySet,
+   kHandlerTimeout,
+-  kLogController
++  kLogController,
++  kDefaultSchema
+ } = require('./lib/symbols.js')
+ 
+ const { createServer } = require('./lib/server')
+@@ -234,6 +235,7 @@ function fastify (serverOptions) {
+     setValidatorCompiler,
+     setSerializerCompiler,
+     setSchemaController,
++    setDefaultSchema,
+     setReplySerializer,
+     setSchemaErrorFormatter,
+     // set generated request id
+@@ -730,6 +732,14 @@ function fastify (serverOptions) {
+     return this
+   }
+ 
++  // Request-part schemas applied to every route registered by this instance,
++  // unless the route declares that part itself.
++  function setDefaultSchema (schema) {
++    throwIfAlreadyStarted('Cannot call "setDefaultSchema"!')
++    this[kDefaultSchema] = schema
++    return this
++  }
++
+   function setSchemaErrorFormatter (errorFormatter) {
+     throwIfAlreadyStarted('Cannot call "setSchemaErrorFormatter"!')
+     validateSchemaErrorFormatter(errorFormatter)
+diff --git a/lib/request.js b/lib/request.js
+index c20ad1a1..f58b58e0 100644
+--- a/lib/request.js
++++ b/lib/request.js
+@@ -341,6 +341,34 @@ Object.defineProperties(Request.prototype, {
+       return validateFn
+     }
+   },
++  validateSchema: {
++    value: function (schema, data, httpPart = null) {
++      if (!schema) {
++        return true
++      }
++
++      let validateFn
++      if (schema !== null && typeof schema === 'object') {
++        validateFn = this.compileValidationSchema(schema, httpPart)
++      } else {
++        // Boolean schemas are valid JSON Schema but cannot be used as keys in
++        // the compilation cache, so they are compiled on their own.
++        const schemaController = this.server[kSchemaController]
++        const validatorCompiler = this[kRouteContext].validatorCompiler ||
++          schemaController.validatorCompiler ||
++          schemaController.setupValidator(this.server[kOptions]) ||
++          schemaController.validatorCompiler
++        validateFn = validatorCompiler({
++          schema,
++          method: this.method,
++          url: this.url,
++          httpPart
++        })
++      }
++
++      return validateFn(data) !== false
++    }
++  },
+   validateInput: {
+     value: function (input, schema, httpPart) {
+       httpPart = typeof schema === 'string' ? schema : httpPart
+diff --git a/lib/route.js b/lib/route.js
+index 4cbdb691..d038bc97 100644
+--- a/lib/route.js
++++ b/lib/route.js
+@@ -5,6 +5,7 @@ const Context = require('./context')
+ const handleRequest = require('./handle-request.js')
+ const { onRequestAbortHookRunner, lifecycleHooks, preParsingHookRunner, onTimeoutHookRunner, onRequestHookRunner } = require('./hooks')
+ const { normalizeSchema } = require('./schemas')
++const { applyDefaultSchema } = require('./schema-defaults')
+ const { parseHeadOnSendHandlers } = require('./head-route.js')
+ 
+ const {
+@@ -52,7 +53,8 @@ const {
+   kRequestSignal,
+   kTimeoutTimer,
+   kOnAbort,
+-  kLogController
++  kLogController,
++  kDefaultSchema
+ } = require('./symbols.js')
+ const { buildErrorHandler } = require('./error-handler')
+ const { createChildLogger, defaultChildLoggerFactory } = require('./logger-factory.js')
+@@ -204,6 +206,12 @@ function buildRouting (options) {
+   function route ({ options, isFastify }) {
+     throwIfAlreadyStarted('Cannot add route!')
+ 
++    // Server-wide default schemas apply to every route registered on an
++    // instance that configured them; a part declared by the route wins.
++    if (options && this[kDefaultSchema]) {
++      options = { ...options, schema: applyDefaultSchema(this[kDefaultSchema], options.schema) }
++    }
++
+     // Since we are mutating/assigning only top level props, it is fine to have a shallow copy using the spread operator
+     const opts = { ...options }
+ 
+diff --git a/lib/schema-defaults.js b/lib/schema-defaults.js
+new file mode 100644
+index 00000000..4b75dcb9
+--- /dev/null
++++ b/lib/schema-defaults.js
+@@ -0,0 +1,37 @@
++'use strict'
++
++const SCHEMA_PARTS = ['params', 'body', 'querystring', 'headers']
++
++/**
++ * Merge the server-wide default request schemas into the schemas declared by a
++ * route. A part that the route declares always wins, so applications can set a
++ * common default (for example a headers schema) and override it per route.
++ *
++ * @param {object|null} defaultSchema schemas applied to every route
++ * @param {object|undefined} routeSchema schemas declared by the route
++ * @returns {object|undefined} the schemas the route will be validated with
++ */
++function applyDefaultSchema (defaultSchema, routeSchema) {
++  if (!defaultSchema) {
++    return routeSchema
++  }
++
++  const schema = Object.assign({}, routeSchema)
++  let applied = false
++
++  for (const part of SCHEMA_PARTS) {
++    // `query` is an alias for `querystring`: a route that declares either one
++    // has already declared the query string part.
++    if (part === 'querystring' && schema.query !== undefined) {
++      continue
++    }
++    if (schema[part] === undefined && defaultSchema[part]) {
++      schema[part] = defaultSchema[part]
++      applied = true
++    }
++  }
++
++  return applied ? schema : routeSchema
++}
++
++module.exports = { applyDefaultSchema, SCHEMA_PARTS }
+diff --git a/lib/symbols.js b/lib/symbols.js
+index 507af35e..4bf1a4f0 100644
+--- a/lib/symbols.js
++++ b/lib/symbols.js
+@@ -26,6 +26,7 @@ const keys = {
+   kSchemaResponse: Symbol('response-schema'),
+   kSchemaErrorFormatter: Symbol('fastify.schemaErrorFormatter'),
+   kSchemaVisited: Symbol('fastify.schemas.visited'),
++  kDefaultSchema: Symbol('fastify.defaultSchema'),
+   // Request
+   kRequest: Symbol('fastify.Request'),
+   kRequestPayloadStream: Symbol('fastify.RequestPayloadStream'),
+diff --git a/types/instance.d.ts b/types/instance.d.ts
+index 0330e147..7126a920 100644
+--- a/types/instance.d.ts
++++ b/types/instance.d.ts
+@@ -629,6 +629,12 @@ export interface FastifyInstance<
+   setSchemaController(schemaControllerOpts: FastifySchemaControllerOptions): FastifyInstance<RawServer, RawRequest,
+     RawReply, Logger>;
+ 
++  /**
++   * Set the request-part schemas applied to every route that does not declare
++   * that part itself.
++   */
++  setDefaultSchema(schema: FastifySchema): FastifyInstance<RawServer, RawRequest, RawReply, Logger, TypeProvider>;
++
+   /**
+   * Set the reply serializer for all routes.
+   */
+diff --git a/types/request.d.ts b/types/request.d.ts
+index 6ee9757c..069b31b6 100644
+--- a/types/request.d.ts
++++ b/types/request.d.ts
+@@ -109,6 +109,7 @@ export interface FastifyRequest<RouteGeneric extends RouteGenericInterface = Rou
+   getValidationFunction(httpPart: HTTPRequestPart): ValidationFunction | undefined
+   getValidationFunction(schema: { [key: string]: any }): ValidationFunction | undefined
+   compileValidationSchema(schema: { [key: string]: any }, httpPart?: HTTPRequestPart): ValidationFunction
++  validateSchema(schema: unknown, data: any, httpPart?: HTTPRequestPart): boolean
+   validateInput(input: any, schema: { [key: string]: any }, httpPart?: HTTPRequestPart): boolean
+   validateInput(input: any, httpPart?: HTTPRequestPart): boolean
+   getDecorator<T>(name: string | symbol): T;

@@ -1,0 +1,284 @@
+diff --git a/crates/tensorzero-core/src/client/mod.rs b/crates/tensorzero-core/src/client/mod.rs
+index 2587a6d..4391135 100644
+--- a/crates/tensorzero-core/src/client/mod.rs
++++ b/crates/tensorzero-core/src/client/mod.rs
+@@ -1016,7 +1016,7 @@ pub struct Client {
+ impl StoragePathResolver for Client {
+     async fn resolve(&self, storage_path: StoragePath) -> Result<String, Error> {
+         Ok(self
+-            .get_object(storage_path.clone())
++            .get_object(&storage_path.path)
+             .await
+             .map_err(|e| {
+                 Error::new(ErrorDetails::InternalError {
+@@ -1298,9 +1298,14 @@ impl Client {
+         }
+     }
+ 
++    /// Fetches an object by path from the gateway's configured object store.
++    ///
++    /// `path` is the object's key inside the configured `[object_storage]` — the gateway
++    /// does not accept a caller-supplied filesystem root or S3 endpoint, so this method
++    /// can only read from the store the gateway itself is configured against.
+     pub async fn get_object(
+         &self,
+-        storage_path: StoragePath,
++        path: &object_store::path::Path,
+     ) -> Result<ObjectResponse, TensorZeroError> {
+         match &*self.mode {
+             ClientMode::HTTPGateway(client) => {
+@@ -1317,25 +1322,18 @@ impl Client {
+                         )
+                         .into(),
+                     })?;
+-                let storage_path_json =
+-                    serde_json::to_string(&storage_path).map_err(|e| TensorZeroError::Other {
+-                        source: Error::new(ErrorDetails::Serialization {
+-                            message: format!("Failed to serialize storage path: {e}"),
+-                        })
+-                        .into(),
+-                    })?;
+                 let builder = client
+                     .http_client
+                     .get(url)
+-                    .query(&[("storage_path", storage_path_json)]);
++                    .query(&[("path", path.as_ref())]);
+                 Ok(client.send_and_parse_http_response(builder).await?.0)
+             }
+             ClientMode::EmbeddedGateway { gateway, timeout } => {
+                 Ok(with_embedded_timeout(*timeout, async {
+                     let config = gateway.handle.app_state.config().load();
+-                    crate::endpoints::object_storage::get_object(
++                    crate::endpoints::object_storage::fetch_from_configured_store(
+                         config.object_store_info.as_ref(),
+-                        storage_path,
++                        path,
+                     )
+                     .await
+                     .map_err(err_to_http)
+diff --git a/crates/tensorzero-core/src/endpoints/object_storage.rs b/crates/tensorzero-core/src/endpoints/object_storage.rs
+index c0048fb..ef70a53 100644
+--- a/crates/tensorzero-core/src/endpoints/object_storage.rs
++++ b/crates/tensorzero-core/src/endpoints/object_storage.rs
+@@ -19,44 +19,92 @@ use object_store::ObjectStoreExt;
+ #[cfg_attr(feature = "e2e_tests", derive(PartialEq))]
+ pub struct ObjectResponse {
+     pub data: String,
+-    pub reused_object_store: bool,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+ pub struct PathParams {
+-    pub storage_path: String,
++    pub path: String,
+ }
+ 
+-/// Fetches an object using the object store and path specified by the encoded `StoragePath`.
+-/// This does not need to match the gateway's current object store (e.g. a `StorageKind::Filesystem`)
+-/// could be provided even if the gateway is configured with `StorageKind::S3Compatible`.
+-/// However, if the provider requires authentication, the gateway must have the correct credentials
+-/// set as environment variables.
++/// Fetches an object from the gateway's configured object store by path.
+ ///
+-/// This is invoked as `GET /internal/object_storage?storage_path=<urlencoded_storagepath>`.
+-/// The `<urlencoded_storagepath>` value constructed by serializing `StoragePath` to JSON,
+-/// and the urlencoding the resulting string.
+-/// For example, `GET /internal/object_storage?storage_path={%22kind%22:{%22type%22:%22filesystem%22,%22path%22:%22/tmp%22},%22path%22:%22fake-tensorzero-file%22}`
++/// This is invoked as `GET /internal/object_storage?path=<urlencoded_path>`.
++/// `path` is the object's key inside the configured store — the gateway does **not**
++/// accept caller-supplied filesystem roots, S3 endpoints, buckets, regions, or
++/// `allow_http` flags, so the endpoint cannot be coerced into opening a store other
++/// than the configured one.
+ pub async fn get_object_handler(
+     State(AppStateData { config, .. }): AppState,
+     Query(params): Query<PathParams>,
+ ) -> Result<Json<ObjectResponse>, Error> {
+-    // Use the existing object store if it matches the requested kind, so
+-    let storage_path: StoragePath = serde_json::from_str(&params.storage_path).map_err(|e| {
++    Ok(Json(
++        fetch_object_by_path(config.object_store_info.as_ref(), &params.path).await?,
++    ))
++}
++
++/// Parses a caller-supplied path string and fetches it from the configured store.
++///
++/// `object_store::path::Path::parse` rejects relative segments (`.`, `..`), empty
++/// segments, and ASCII control characters, so the resulting filesystem read is
++/// guaranteed to land inside the configured `[object_storage]` root and cannot
++/// traverse out of it.
++pub async fn fetch_object_by_path(
++    object_store_info: Option<&ObjectStoreInfo>,
++    path: &str,
++) -> Result<ObjectResponse, Error> {
++    let parsed = object_store::path::Path::parse(path).map_err(|e| {
+         Error::new(ErrorDetails::InvalidRequest {
+-            message: format!("Error parsing storage path: {e}"),
++            message: format!("Error parsing object path: {e}"),
+         })
+     })?;
+-    Ok(Json(
+-        get_object(config.object_store_info.as_ref(), storage_path).await?,
+-    ))
++    fetch_from_configured_store(object_store_info, &parsed).await
++}
++
++/// Fetches an object by path from the gateway's configured object store. Used by the
++/// `/internal/object_storage` HTTP handler and by the `Client::get_object` SDK method —
++/// neither lets the caller pick a different store, so this is the security-relevant
++/// fetch path for untrusted callers.
++pub async fn fetch_from_configured_store(
++    object_store_info: Option<&ObjectStoreInfo>,
++    path: &object_store::path::Path,
++) -> Result<ObjectResponse, Error> {
++    let store = object_store_info
++        .and_then(|info| info.object_store.as_ref())
++        .ok_or_else(|| {
++            Error::new(ErrorDetails::InvalidRequest {
++                message:
++                    "Object storage is not configured on this gateway, or is set to `disabled`. \
++                     Set `[object_storage]` in the gateway config to use this endpoint."
++                        .to_string(),
++            })
++        })?;
++    let object = store.get(path).await.map_err(|e| {
++        Error::new(ErrorDetails::InternalError {
++            message: format!("Error getting object: {e}"),
++        })
++    })?;
++    let bytes = object.bytes().await.map_err(|e| {
++        Error::new(ErrorDetails::InternalError {
++            message: format!("Error getting object bytes: {e}"),
++        })
++    })?;
++    Ok(ObjectResponse {
++        data: base64::encode(&bytes),
++    })
+ }
+ 
+ /// Fetches an object using the object store and path specified by the encoded `StoragePath`.
+-/// This does not need to match the gateway's current object store (e.g. a `StorageKind::Filesystem`)
+-/// could be provided even if the gateway is configured with `StorageKind::S3Compatible`.
++/// This does not need to match the gateway's current object store (e.g. a `StorageKind::Filesystem`
++/// could be provided even if the gateway is configured with `StorageKind::S3Compatible`).
+ /// However, if the provider requires authentication, the gateway must have the correct credentials
+ /// set as environment variables.
++///
++/// SECURITY: this function trusts its `storage_path` argument and will build an object store
++/// from a caller-supplied filesystem root or S3 endpoint when the kind does not match the
++/// configured store. It must NOT be exposed to untrusted callers — the HTTP handler and SDK
++/// surface go through `fetch_from_configured_store` instead. This entry point exists only for
++/// in-process code resolving `StoragePath`s the gateway itself recorded under a different
++/// configuration.
+ pub async fn get_object(
+     object_store_info: Option<&ObjectStoreInfo>,
+     storage_path: StoragePath,
+@@ -95,6 +143,5 @@ pub async fn get_object(
+     })?;
+     Ok(ObjectResponse {
+         data: base64::encode(&bytes),
+-        reused_object_store: matches!(store, Cow::Borrowed(_)),
+     })
+ }
+diff --git a/crates/tensorzero-core/src/endpoints/stored_inferences/render_samples.rs b/crates/tensorzero-core/src/endpoints/stored_inferences/render_samples.rs
+index dbcd502..028753a 100644
+--- a/crates/tensorzero-core/src/endpoints/stored_inferences/render_samples.rs
++++ b/crates/tensorzero-core/src/endpoints/stored_inferences/render_samples.rs
+@@ -5,7 +5,7 @@ use futures::future::join_all;
+ use tokio::sync::Semaphore;
+ 
+ use crate::config::{Config, ObjectStoreInfo};
+-use crate::endpoints::object_storage::get_object;
++use crate::endpoints::object_storage::fetch_from_configured_store;
+ use crate::endpoints::workflow_evaluation_run::validate_variant_pins;
+ use crate::error::{Error, ErrorDetails};
+ use crate::inference::types::storage::StoragePath;
+@@ -21,7 +21,9 @@ struct SampleObjectStoreResolver<'a> {
+ 
+ impl StoragePathResolver for SampleObjectStoreResolver<'_> {
+     async fn resolve(&self, storage_path: StoragePath) -> Result<String, Error> {
+-        Ok(get_object(self.object_store_info, storage_path).await?.data)
++        Ok(fetch_from_configured_store(self.object_store_info, &storage_path.path)
++            .await?
++            .data)
+     }
+ }
+ 
+diff --git a/crates/tensorzero-core/src/inference/types/mod.rs b/crates/tensorzero-core/src/inference/types/mod.rs
+index d16cb6a..9d9090f 100644
+--- a/crates/tensorzero-core/src/inference/types/mod.rs
++++ b/crates/tensorzero-core/src/inference/types/mod.rs
+@@ -81,7 +81,7 @@ use crate::cache::{CacheData, NonStreamingCacheData};
+ use crate::config::ObjectStoreInfo;
+ use crate::config::snapshot::SnapshotHash;
+ use crate::endpoints::inference::{InferenceDatabaseInsertMetadata, InferenceParams};
+-use crate::endpoints::object_storage::get_object;
++use crate::endpoints::object_storage::fetch_from_configured_store;
+ use crate::error::{Error, ErrorDetails, ErrorDetails::RateLimitMissingMaxTokens};
+ use crate::function::FunctionConfigType;
+ use crate::http::TensorzeroHttpClient;
+@@ -478,9 +478,11 @@ impl InputMessageContentExt for InputMessageContent {
+                         // Important: the future will not actually begin executing (including opening the network connection)
+                         // until the first time the `Shared` wrapper is `.await`ed.
+                         let delayed_file_future = async move {
+-                            let object_response =
+-                                get_object(object_store_info.as_ref(), owned_storage_path.clone())
+-                                    .await?;
++                            let object_response = fetch_from_configured_store(
++                                object_store_info.as_ref(),
++                                &owned_storage_path.path,
++                            )
++                            .await?;
+                             Ok(ObjectStorageFile {
+                                 file: ObjectStoragePointer {
+                                     source_url: source_url_for_future,
+diff --git a/crates/tensorzero-core/src/inference/types/stored_input.rs b/crates/tensorzero-core/src/inference/types/stored_input.rs
+index efece47..1f55863 100644
+--- a/crates/tensorzero-core/src/inference/types/stored_input.rs
++++ b/crates/tensorzero-core/src/inference/types/stored_input.rs
+@@ -1,6 +1,6 @@
+ use crate::client::{File, InputMessage, InputMessageContent};
+ use crate::config::Config;
+-use crate::endpoints::object_storage::get_object;
++use crate::endpoints::object_storage::fetch_from_configured_store;
+ use crate::error::Error;
+ use crate::inference::types::Input;
+ use crate::inference::types::ResolvedInput;
+@@ -56,7 +56,7 @@ pub trait StoragePathResolver {
+ 
+ impl StoragePathResolver for Config {
+     async fn resolve(&self, storage_path: StoragePath) -> Result<String, Error> {
+-        Ok(get_object(self.object_store_info.as_ref(), storage_path)
++        Ok(fetch_from_configured_store(self.object_store_info.as_ref(), &storage_path.path)
+             .await?
+             .data)
+     }
+diff --git a/ui/app/utils/resolve.server.ts b/ui/app/utils/resolve.server.ts
+index 2c9a8e1..f6b7992 100644
+--- a/ui/app/utils/resolve.server.ts
++++ b/ui/app/utils/resolve.server.ts
+@@ -115,7 +115,9 @@ async function resolveModelInferenceContent(
+ async function resolveFile(
+   content: ZodFileContent,
+ ): Promise<ZodResolvedBase64File> {
+-  const object = await getTensorZeroClient().getObject(content.storage_path);
++  const object = await getTensorZeroClient().getObject(
++    content.storage_path.path,
++  );
+   const json = JSON.parse(object);
+   return {
+     // Keep the canonical internal representation as raw base64.
+diff --git a/ui/app/utils/tensorzero/tensorzero.ts b/ui/app/utils/tensorzero/tensorzero.ts
+index 713f9af..fde0285 100644
+--- a/ui/app/utils/tensorzero/tensorzero.ts
++++ b/ui/app/utils/tensorzero/tensorzero.ts
+@@ -540,8 +540,8 @@ export class TensorZeroClient extends BaseTensorZeroClient {
+     return (await response.json()) as GetDatapointCountResponse;
+   }
+ 
+-  async getObject(storagePath: ZodStoragePath): Promise<string> {
+-    const endpoint = `/internal/object_storage?storage_path=${encodeURIComponent(JSON.stringify(storagePath))}`;
++  async getObject(path: string): Promise<string> {
++    const endpoint = `/internal/object_storage?path=${encodeURIComponent(path)}`;
+     const response = await this.fetch(endpoint, { method: "GET" });
+     if (!response.ok) {
+       const message = await this.getErrorText(response);

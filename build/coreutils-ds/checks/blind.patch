@@ -1,0 +1,275 @@
+diff --git a/src/uu/install/src/install.rs b/src/uu/install/src/install.rs
+index 3d266b7..aa75879 100644
+--- a/src/uu/install/src/install.rs
++++ b/src/uu/install/src/install.rs
+@@ -482,7 +482,7 @@ fn directory(paths: &[OsString], b: &Behavior) -> UResult<()> {
+                 // target directory. All created ancestor directories will have
+                 // the default mode. Hence it is safe to use fs::create_dir_all
+                 // and then only modify the target's dir mode.
+-                if let Err(e) = fs::create_dir_all(path_to_create.as_path())
++                if let Err(e) = create_dir_all_absolute(path_to_create.as_path())
+                     .map_err_context(|| translate!("install-error-create-dir-failed", "path" => path_to_create.as_path().quote()))
+                 {
+                     show!(e);
+@@ -574,8 +574,14 @@ fn create_target_dir(target: &Path, b: &Behavior) -> UResult<()> {
+     }
+     let target = to_create.as_path();
+ 
+-    if target.exists() {
+-        return Ok(());
++    // An existing non-symlink target keeps its previous handling (an existing
++    // directory is fine; a non-directory is reported downstream). A symbolic
++    // link where the final target directory is needed, or a missing target,
++    // goes through the symlink-safe creator, which refuses a link rather than
++    // following it to its target.
++    match std::fs::symlink_metadata(target) {
++        Ok(md) if !md.file_type().is_symlink() => return Ok(()),
++        _ => {}
+     }
+ 
+     if b.verbose {
+@@ -679,7 +685,14 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+                 _ => to_create,
+             };
+ 
+-            if !to_create.exists() {
++            // A missing parent is created; a symbolic link standing where the
++            // parent directory is needed is refused by the symlink-safe creator.
++            // An existing non-symlink parent keeps its previous handling.
++            let run_create = match std::fs::symlink_metadata(to_create) {
++                Ok(md) => md.file_type().is_symlink(),
++                Err(_) => true,
++            };
++            if run_create {
+                 if b.verbose {
+                     let mut result = PathBuf::new();
+                     // When creating directories with -Dv, show directory creations step by step
+@@ -696,7 +709,7 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+                     }
+                 }
+ 
+-                if let Err(e) = fs::create_dir_all(to_create) {
++                if let Err(e) = create_dir_all_absolute(to_create) {
+                     return Err(InstallError::CreateDirFailed(to_create.to_path_buf(), e).into());
+                 }
+ 
+@@ -749,6 +762,33 @@ fn standard(mut paths: Vec<OsString>, b: &Behavior) -> UResult<()> {
+ /// `target_dir` must be a directory.
+ ///
+ fn copy_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UResult<()> {
++    // The destination directory may be reached through symbolic links in its
++    // parent path, but a symbolic link standing for the directory itself would
++    // redirect every file that is written into it. A trailing separator makes
++    // the filesystem resolve the final component through a symbolic link, so
++    // inspect the name without it.
++    let target_dir_check: PathBuf = target_dir.components().collect();
++    if let Ok(meta) = fs::symlink_metadata(&target_dir_check) {
++        if meta.file_type().is_symlink() {
++            // Keep the diagnostic this situation already produced when a source
++            // is installed into the directory it already lives in.
++            for sourcepath in files {
++                if let Some(filename) = sourcepath.file_name() {
++                    let targetpath = target_dir.join(filename);
++                    if let (Ok(from_abs), Ok(to_abs)) =
++                        (sourcepath.canonicalize(), targetpath.canonicalize())
++                    {
++                        if from_abs == to_abs {
++                            return Err(
++                                InstallError::SameFile(sourcepath.clone(), targetpath).into()
++                            );
++                        }
++                    }
++                }
++            }
++            return Err(InstallError::TargetDirIsntDir(target_dir.to_path_buf()).into());
++        }
++    }
+     if !target_dir.is_dir() {
+         return Err(InstallError::TargetDirIsntDir(target_dir.to_path_buf()).into());
+     }
+@@ -774,8 +814,17 @@ fn copy_files_into_dir(files: &[PathBuf], target_dir: &Path, b: &Behavior) -> UR
+         // A destination that is already present keeps its inode when its
+         // contents are replaced, so its owner and permissions survive a
+         // re-install. Attributes requested on the command line are applied
+-        // afterwards, as for a new file.
+-        if targetpath.is_file() && b.backup_mode == BackupMode::None && !b.compare {
++        // afterwards, as for a new file. A symbolic link at the destination
++        // name is not an existing file to preserve: it is replaced like any
++        // other destination, never followed.
++        let destination_is_link = fs::symlink_metadata(&targetpath)
++            .map(|meta| meta.file_type().is_symlink())
++            .unwrap_or(false);
++        if targetpath.is_file()
++            && !destination_is_link
++            && b.backup_mode == BackupMode::None
++            && !b.compare
++        {
+             show_if_err!(copy_over_existing(sourcepath, &targetpath, b));
+             continue;
+         }
+@@ -919,10 +968,9 @@ fn perform_backup(to: &Path, b: &Behavior) -> UResult<Option<PathBuf>> {
+         }
+         let backup_path = backup_control::get_backup_path(b.backup_mode, to, &b.suffix);
+         if let Some(ref backup_path) = backup_path {
+-            // Back up the file the destination points at, so a symbolic link can
+-            // keep referring to the preserved copy after the install.
+-            let backup_source = fs::canonicalize(to).unwrap_or_else(|_| to.to_path_buf());
+-            fs::rename(&backup_source, backup_path).map_err(|err| {
++            // Rename the destination entry itself: a symbolic link at the
++            // destination is backed up as a link, never the file it points at.
++            fs::rename(to, backup_path).map_err(|err| {
+                 InstallError::BackupFailed(to.to_path_buf(), backup_path.clone(), err)
+             })?;
+         }
+diff --git a/src/uucore/src/lib/features/fs.rs b/src/uucore/src/lib/features/fs.rs
+index b0c6a5a..21bbfc9 100644
+--- a/src/uucore/src/lib/features/fs.rs
++++ b/src/uucore/src/lib/features/fs.rs
+@@ -563,13 +563,110 @@ pub fn dir_strip_dot_for_creation(path: &Path) -> PathBuf {
+ /// A relative path is resolved against the current directory first, so the
+ /// components are created at a stable location even if the working directory
+ /// changes later. Existing components are left untouched.
++///
++/// Components that already exist are traversed as they are, so an existing
++/// directory reached through a symbolic link keeps working. Every component
++/// this function creates is created relative to an open descriptor of its
++/// parent and then reopened without following symbolic links, so a symbolic
++/// link standing where a missing directory has to be created makes the call
++/// fail instead of redirecting the creation to the link's target.
+ pub fn create_dir_all_absolute(path: &Path) -> IOResult<()> {
+     let absolute = if path.is_absolute() {
+         path.to_path_buf()
+     } else {
+         env::current_dir()?.join(path)
+     };
+-    fs::create_dir_all(&absolute)
++    create_dir_all_nofollow(&absolute)
++}
++
++/// Create all missing components of `path` without letting a symbolic link
++/// redirect a component that has to be created.
++///
++/// See [`create_dir_all_absolute`].
++#[cfg(all(unix, not(target_os = "redox")))]
++pub fn create_dir_all_nofollow(path: &Path) -> IOResult<()> {
++    use crate::features::safe_traversal::DirFd;
++
++    if path.as_os_str().is_empty() {
++        return Ok(());
++    }
++
++    let mut current = if path.is_absolute() {
++        DirFd::open(Path::new("/"))?
++    } else {
++        DirFd::open(Path::new("."))?
++    };
++
++    let comps: Vec<Component> = path.components().collect();
++    let last_normal = comps
++        .iter()
++        .rposition(|c| matches!(c, Component::Normal(_)));
++
++    // Set once we descend into a directory by following a symbolic link. A new
++    // directory must never be created inside such a directory, and a symbolic
++    // link must never stand where the final directory component is needed, so
++    // nothing is ever created, placed or redirected at a link's target.
++    let mut followed_link = false;
++
++    for (idx, component) in comps.iter().enumerate() {
++        let name = match component {
++            Component::RootDir | Component::CurDir | Component::Prefix(_) => continue,
++            Component::ParentDir => {
++                current = current.open_subdir(OsStr::new(".."))?;
++                followed_link = false;
++                continue;
++            }
++            Component::Normal(name) => *name,
++        };
++        let is_last = Some(idx) == last_normal;
++
++        match current.stat_at(name, false) {
++            Ok(st) => {
++                let is_symlink =
++                    (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFLNK;
++                if is_symlink {
++                    // A symbolic link stands at a component we need as a
++                    // directory. If it is the final component the work (a
++                    // created directory, or the destination placed by the
++                    // caller) would happen at the link's target: refuse.
++                    // Otherwise it only leads to an already-existing location
++                    // deeper in the tree, so follow it but remember we did.
++                    if is_last {
++                        return Err(Error::from_raw_os_error(libc::ELOOP));
++                    }
++                    current = current.open_subdir(name)?;
++                    followed_link = true;
++                } else {
++                    // An existing real entry: open it without following a link
++                    // (a regular file here fails with ENOTDIR, as before).
++                    current = current.open_subdir_nofollow(name)?;
++                    followed_link = false;
++                }
++            }
++            Err(e) if e.kind() == ErrorKind::NotFound => {
++                // The component is missing and must be created. Refuse when its
++                // parent was reached by following a symbolic link.
++                if followed_link {
++                    return Err(Error::from_raw_os_error(libc::ELOOP));
++                }
++                let created = current.mkdir_at(name, 0o777);
++                match current.open_subdir_nofollow(name) {
++                    Ok(dir) => current = dir,
++                    Err(e) => return Err(created.err().unwrap_or(e)),
++                }
++                followed_link = false;
++            }
++            Err(e) => return Err(e),
++        }
++    }
++
++    Ok(())
++}
++
++/// Create all missing components of `path`.
++#[cfg(not(all(unix, not(target_os = "redox"))))]
++pub fn create_dir_all_nofollow(path: &Path) -> IOResult<()> {
++    fs::create_dir_all(path)
+ }
+ 
+ /// Checks if `p1` and `p2` are the same file.
+diff --git a/src/uucore/src/lib/features/safe_traversal.rs b/src/uucore/src/lib/features/safe_traversal.rs
+index 05c456a..e59dd5f 100644
+--- a/src/uucore/src/lib/features/safe_traversal.rs
++++ b/src/uucore/src/lib/features/safe_traversal.rs
+@@ -130,6 +130,31 @@ impl DirFd {
+         Ok(Self { fd })
+     }
+ 
++    /// Open a subdirectory relative to this directory without following a
++    /// symbolic link in place of `name`
++    pub fn open_subdir_nofollow(&self, name: &OsStr) -> io::Result<Self> {
++        let name_cstr =
++            CString::new(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
++        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
++        let fd = openat(&self.fd, name_cstr.as_c_str(), flags, Mode::empty()).map_err(|e| {
++            SafeTraversalError::OpenFailed {
++                path: name.into(),
++                source: io::Error::from_raw_os_error(e as i32),
++            }
++        })?;
++        Ok(Self { fd })
++    }
++
++    /// Create a directory relative to this directory
++    pub fn mkdir_at(&self, name: &OsStr, mode: u32) -> io::Result<()> {
++        let name_cstr =
++            CString::new(name.as_bytes()).map_err(|_| SafeTraversalError::PathContainsNull)?;
++        let mode = Mode::from_bits_truncate(mode as libc::mode_t);
++        nix::sys::stat::mkdirat(&self.fd, name_cstr.as_c_str(), mode)
++            .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
++        Ok(())
++    }
++
+     /// Get raw stat data for a file relative to this directory
+     pub fn stat_at(&self, name: &OsStr, follow_symlinks: bool) -> io::Result<FileStat> {
+         let name_cstr =

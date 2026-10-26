@@ -1,0 +1,98 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/frain-dev/convoy"
+	"github.com/frain-dev/convoy/config"
+	"github.com/frain-dev/convoy/datastore"
+	"github.com/frain-dev/convoy/mocks"
+)
+
+func provideReplayEventService(ctrl *gomock.Controller, event *datastore.Event) *ReplayEventService {
+	return &ReplayEventService{
+		EndpointRepo: mocks.NewMockEndpointRepository(ctrl),
+		Queue:        mocks.NewMockQueuer(ctrl),
+		Logger:       mocks.NewMockLogger(ctrl),
+		Event:        event,
+	}
+}
+
+func TestReplayEventService_Run(t *testing.T) {
+	ctx := context.Background()
+	type args struct {
+		ctx   context.Context
+		event *datastore.Event
+		g     *datastore.Project
+	}
+	tests := []struct {
+		name       string
+		args       args
+		dbFn       func(es *ReplayEventService)
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name: "should_replay_app_event",
+			args: args{
+				ctx:   ctx,
+				event: &datastore.Event{UID: "123", ProjectID: "proj1"},
+				g:     &datastore.Project{UID: "123", Name: "test_project"},
+			},
+			dbFn: func(es *ReplayEventService) {
+				eq, _ := es.Queue.(*mocks.MockQueuer)
+				eq.EXPECT().Write(gomock.Any(), convoy.CreateEventProcessor, gomock.Any(), gomock.Any()).
+					Times(1).Return(nil)
+			},
+			wantErr: false,
+		},
+		{
+			name: "should_fail_to_replay_app_event",
+			args: args{
+				ctx:   ctx,
+				event: &datastore.Event{UID: "123", ProjectID: "proj1"},
+				g:     &datastore.Project{UID: "123", Name: "test_project"},
+			},
+			dbFn: func(es *ReplayEventService) {
+				eq, _ := es.Queue.(*mocks.MockQueuer)
+				eq.EXPECT().Write(gomock.Any(), convoy.CreateEventProcessor, gomock.Any(), gomock.Any()).
+					Times(1).Return(errors.New("failed"))
+
+				ml, _ := es.Logger.(*mocks.MockLogger)
+				ml.EXPECT().ErrorContext(gomock.Any(), "replay_event: failed to write event to the queue", "error", gomock.Any()).Times(1)
+			},
+			wantErr:    true,
+			wantErrMsg: "failed to write event to queue",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			err := config.LoadConfig("./testdata/basic-config.json")
+			require.NoError(t, err)
+
+			es := provideReplayEventService(ctrl, tc.args.event)
+			require.NoError(t, err)
+
+			if tc.dbFn != nil {
+				tc.dbFn(es)
+			}
+
+			err = es.Run(tc.args.ctx)
+			if tc.wantErr {
+				require.NotNil(t, err)
+				require.Equal(t, tc.wantErrMsg, err.(*ServiceError).Error())
+				return
+			}
+
+			require.Nil(t, err)
+		})
+	}
+}

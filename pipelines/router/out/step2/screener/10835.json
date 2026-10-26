@@ -1,0 +1,93 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash",
+  "entry_id": "10835", "advisory_ids": ["GHSA-CWC9-CP4J-MCVV", "CVE-2026-49866"], "repo": "libp2p/js-libp2p", "pinned_commit": "ed1ad1f265dca9c94a7b38947c683864b987eafd", "fix_commits": ["773dd80ded24dbd6b19e675c89fd2f3b45f2d899"],
+  "trust_decision": {
+    "summary": "Inbound gossipsub RPCs must have their control arrays bounded at the protobuf decode boundary AND at each control handler; the pinned commit enforces neither, because the limits object is keyed `control$` while the codec reads `limits.control`, the default limits are Infinity, and handleIHave/handleIWant hash every message id in the RPC.",
+    "evidence": [
+      "packages/gossipsub/src/gossipsub.ts:869",
+      "packages/gossipsub/src/message/rpc.ts:1401-1405",
+      "packages/gossipsub/src/message/rpc.ts:392-439",
+      "packages/gossipsub/src/message/decodeRpc.ts:11-19",
+      "packages/gossipsub/src/gossipsub.ts:1319-1335",
+      "packages/gossipsub/src/gossipsub.ts:1385-1403"
+    ]
+  },
+  "landing_point": {
+    "where": "packages/gossipsub/src/gossipsub.ts:1319",
+    "why": "The advisory names IHAVE and IWANT control arrays, so an engineer looks first at the two loops that walk messageIDs (handleIHave 1319-1335, handleIWant 1385-1403). The real gate is ~450 lines earlier at the RPC.decode call (865-883), whose limits object never reaches the codec."
+  },
+  "fix_sites": [
+    {"where": "packages/gossipsub/src/message/decodeRpc.ts:11-19", "entry_point": "every inbound gossipsub RPC (onIncomingStream:615 -> pipePeerReadStream:725); these defaults apply whenever GossipsubOpts.decodeRpcLimits is absent (gossipsub.ts:318)", "module_kind": "defaults/config module"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:865-883", "entry_point": "inbound gossipsub stream handler registered at gossipsub.ts:469 (onIncomingStream:615 -> pipePeerReadStream:725)", "module_kind": "stream decode plumbing (limits object)"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:853-856", "entry_point": "same inbound stream path; new private decodeRpc() helper called at 865", "module_kind": "stream decode plumbing (new helper)"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:1319-1335", "entry_point": "inbound stream -> handleReceivedRpc:928 -> handleControlMessage:1228 -> handleIHave", "module_kind": "control handler (IHAVE)"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:1381-1384", "entry_point": "inbound stream -> handleReceivedRpc:928 -> handleControlMessage:1229 -> handleIWant", "module_kind": "control handler (IWANT per-heartbeat counter)"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:1385-1403", "entry_point": "same IWANT path (handleControlMessage:1229)", "module_kind": "control handler (IWANT)"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:594", "entry_point": "start/stop lifecycle (stop:586), called by libp2p when the node stops", "module_kind": "lifecycle housekeeping"},
+    {"where": "packages/gossipsub/src/gossipsub.ts:2614-2617", "entry_point": "public heartbeat() (gossipsub.ts:2588) run on the heartbeat interval", "module_kind": "heartbeat housekeeping"},
+    {"where": "packages/gossipsub/src/constants.ts:210-215", "entry_point": "inbound stream -> handleIHave/handleIWant, which read GossipsubMaxIHaveLength and the new GossipsubMaxIWantMessages", "module_kind": "constants"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "packages/gossipsub/src/message/decodeRpc.ts:11-19 (used by gossipsub.ts:318)"},
+  "O3_reason_to_dismiss": "The limits module holds only a type and its default values and the report is about IHAVE/IWANT handling, so setting a limit where the arrays are iterated looks sufficient.",
+  "O4_distance": {"files": 3, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "An honest peer may legitimately advertise up to GossipsubMaxIHaveLength (5000) ids in one IHAVE and must keep being served, and the new per-peer IWANT counter must be reset by every heartbeat so an honest peer that has used its budget is served on the next interval (the fix's own test asserts this). A cap keyed on GossipsubMaxIHaveMessages (10) or a counter that is never cleared breaks legitimate gossip.",
+    "where": "packages/gossipsub/src/constants.ts:204-210 and packages/gossipsub/src/gossipsub.ts:2614-2617"
+  },
+  "O6_input_shapes": [
+    "one IHAVE entry with many messageIDs (array nested in an entry)",
+    "one IWANT entry with many messageIDs",
+    "many control entries of one type (ihave/iwant/graft/prune/idontwant counts)",
+    "one PRUNE entry with many peers (nested repeated inside repeated)",
+    "one IDONTWANT entry with many messageIDs",
+    "many small IWANT RPCs from the same peer inside one heartbeat (rate, not size)",
+    "aggregate: maxControlMessages entries each carrying maxIhave/maxIwant ids",
+    "no options at all (default limits) versus a custom decodeRpcLimits",
+    "decode input as Uint8Array or Uint8ArrayList"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "packages/gossipsub/src/message/rpc.ts:1377-1412 (RPC codec builds subscriptions/messages/control from the wire and applies opts.limits?.control)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "GRAFT control array: handleGraft walks every graft entry and answers with one PRUNE per unknown/backed-off/over-Dhi topic, then Promise.all(prune.map(makePrune)); there is no per-call or per-heartbeat cap in the handler at the pinned commit, and the fix bounds it only through the decode defaults.", "where": "packages/gossipsub/src/gossipsub.ts:1426-1509", "reason_to_dismiss": "The advisory names IHAVE and IWANT; GRAFT is a different control type and the new decode defaults already cap control entries at 5000.", "distance": "same file, ~120 lines below handleIWant", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Public handleReceivedRpc(from, rpc) accepts an already-decoded RPC and never passes through decodeRpcLimits, so a caller or overriding subclass can hand it arbitrarily large subscriptions, messages and control arrays.", "where": "packages/gossipsub/src/gossipsub.ts:928-950", "reason_to_dismiss": "It is not part of the exported GossipSub interface and only the internal stream pipeline calls it, so no external caller can reach it.", "distance": "same file, the public API surface above the private handlers", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "decodeRpcLimits is taken wholesale (opts.decodeRpcLimits ?? defaultDecodeRpcLimits) with no merge over defaults, so a partial limits object leaves the omitted fields undefined, which protons treats as no limit.", "where": "packages/gossipsub/src/gossipsub.ts:318", "reason_to_dismiss": "DecodeRPCLimits declares all seven fields required, so a TypeScript caller must pass every limit.", "distance": "same file, constructor (configuration route), 1000 lines above the handlers", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "packages/gossipsub/src/gossipsub.ts:1518-1555", "sibling": "Cap the peers processed by handlePrune/pxConnect per call, the way prune$ peers is capped at decode.", "why_realistic": "prune.peers is the same nested repeated field as ihave.messageIDs and reaches per-peer signed-peer-record decoding and peerStore merges with no handler-side bound; a maintainer hardening PX would add it beside the existing IDONTWANT cap."},
+    {"where": "packages/gossipsub/src/gossipsub.ts:1426", "sibling": "Add a processed-entry budget to handleGraft using the same `out:` labelled-loop idiom the fix adds to handleIHave.", "why_realistic": "handleIdontwant already uses that exact labelled-break pattern (gossipsub.ts:1576-1588), so copying it into the remaining control handlers is the obvious next commit."},
+    {"where": "packages/gossipsub/src/message/decodeRpc.ts:11-19", "sibling": "Merge caller-supplied partial limits over the defaults instead of replacing the whole object.", "why_realistic": "The limits arrive from user configuration (GossipsubOpts.decodeRpcLimits) where partial JSON objects are common; a maintainer could write {...defaultDecodeRpcLimits, ...opts.decodeRpcLimits}."},
+    {"where": "packages/gossipsub/src/stream.ts:59-73", "sibling": "Give maxInboundDataLength a default so one length-prefixed frame cannot be unbounded.", "why_realistic": "The option is plumbed from gossipsub.ts:722 and has no default, so the same DoS shape arrives one layer earlier and a maintainer hardening this advisory would notice it."}
+  ],
+  "O9_family": "improper input validation leading to uncontrolled resource consumption (unbounded repeated protobuf arrays driving per-id CPU work)", "O9_dos": true,
+  "O10_build": {
+    "language": "TypeScript (ESM, Node >= 18)",
+    "toolchain": "yarn workspaces + aegir 47 (tsc build, mocha + chai tests, eslint); src/message/rpc.ts is generated by protons 8 and committed, so no codegen is needed to build",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "packages/gossipsub/test/*.spec.ts plus test/unit and test/e2e, run with `aegir test -t node -f dist/test/*.spec.js`; the gossipsub specs use in-memory mock muxers and a MemoryDatastore (test/utils/create-pubsub.ts:190-300) and run offline; test/e2e/go-gossipsub.spec.ts needs a go-libp2p binary/Docker and is not part of this area"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "packages/gossipsub/src/constants.ts, packages/gossipsub/src/gossipsub.ts, packages/gossipsub/src/message/decodeRpc.ts",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Slice each entry's messageIDs to GossipsubMaxIHaveLength inside handleIHave/handleIWant and stop there, leaving the `control$` limits key that the codec never reads and the Infinity defaults in place."
+  },
+  "out_of_scope_notes": [
+    "packages/floodsub has its own generated codec with the same ihave/iwant/prune arrays (packages/floodsub/src/message/rpc.ts) decoded with no limits via pbStream (packages/floodsub/src/peer-streams.ts:42) and never processes control messages; it is a separate pubsub implementation outside this gossipsub advisory and was not pursued.",
+    "InboundStream passes maxInboundDataLength straight through (packages/gossipsub/src/gossipsub.ts:722, packages/gossipsub/src/stream.ts:72) and the option has no default, so a single frame is unbounded at the pinned commit; that is a frame-size sink rather than the control-array sink this advisory's fix covers."
+  ],
+  "unverified": [
+    "Repo size in MB could not be measured without shell access, so repo_mb is null; the monorepo contains ~50 packages under packages/ and interop/.",
+    "present_in_latest is unknown for all three O8 routes: the inputs give no latest release and no latest tree was available to inspect.",
+    "handleReceivedRpc is public on the GossipSub class (gossipsub.ts:928) but is absent from the exported GossipSub interface (packages/gossipsub/src/index.ts:290-398); it was counted as a second entry point because the code comments call it the RPC-handling override point.",
+    "O4 distance is logical (decode layer versus handler layer), not physical: all nine fix sites are inside packages/gossipsub, with 3 files between the landing point and message/decodeRpc.ts and 0 package boundaries.",
+    "Buildability was judged from package.json and the workspace manifests only; no build, install or test was run, and dependency installation is assumed to be possible offline from a prepared node_modules."
+  ]
+}

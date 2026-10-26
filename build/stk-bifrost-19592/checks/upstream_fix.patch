@@ -1,0 +1,167 @@
+diff --git a/core/providers/utils/fetch.go b/core/providers/utils/fetch.go
+index 709f241..6f01d3b 100644
+--- a/core/providers/utils/fetch.go
++++ b/core/providers/utils/fetch.go
+@@ -21,9 +21,10 @@ import (
+ // deadlines; pass context.Background() if no request context is available.
+ //
+ // SSRF-hardened: only http/https schemes are accepted, and the dialer rejects
+-// connections to loopback, private, link-local, unique-local, and unspecified
+-// addresses. The IP check runs at dial time (not just lookup time) so DNS
+-// rebinding does not bypass it. Redirect targets are subject to the same
++// connections to loopback, private, CGNAT, link-local, unique-local, site-local,
++// and unspecified addresses (including IPv4 targets smuggled inside IPv6
++// transition addresses). The IP check runs at dial time (not just lookup time)
++// so DNS rebinding does not bypass it. Redirect targets are subject to the same
+ // scheme + dial-time IP validation.
+ func FetchAndEncodeURL(ctx context.Context, resourceURL string) (mediaType string, encoded string, err error) {
+ 	const maxBytes int64 = 25 * 1024 * 1024
+@@ -102,17 +103,77 @@ func FetchAndEncodeURL(ctx context.Context, resourceURL string) (mediaType strin
+ 	return mediaType, base64.StdEncoding.EncodeToString(body), nil
+ }
+ 
+-// isPublicIP reports whether the given IP address is safe to fetch from
+-// (i.e. not loopback, private, link-local, unique-local, or unspecified).
++// cgnat is the RFC 6598 Carrier-Grade NAT shared address space (100.64.0.0/10).
++// It is reserved for provider-internal networks and is used for pod IPs on some
++// Kubernetes platforms (e.g. EKS), so it must not be reachable. netip's
++// IsPrivate() does not cover it.
++var cgnat = netip.MustParsePrefix("100.64.0.0/10")
++
++// isPublicIP reports whether ip is safe to fetch from: not loopback, private,
++// CGNAT, link-local, unique-local, site-local, multicast, or unspecified.
++// IPv6 forms that embed an IPv4 address (IPv4-mapped, 6to4, NAT64) are reduced
++// to that IPv4 and re-checked, so an internal IPv4 such as the 169.254.169.254
++// metadata endpoint cannot be reached by wrapping it in an IPv6 transition
++// representation.
+ func isPublicIP(ip net.IP) bool {
+ 	addr, ok := netip.AddrFromSlice(ip)
+ 	if !ok {
+ 		return false
+ 	}
+ 	addr = addr.Unmap()
+-	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+-		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() {
++
++	// If the address embeds an IPv4 via a transition mechanism (6to4 / NAT64),
++	// classify the embedded IPv4 — otherwise an internal target like
++	// 169.254.169.254 can be reached as 2002:a9fe:a9fe:: or 64:ff9b::a9fe:a9fe,
++	// neither of which Unmap() collapses.
++	if embedded, ok := embeddedIPv4(addr); ok {
++		addr = embedded
++	}
++
++	if addr.IsLoopback() || addr.IsPrivate() || cgnat.Contains(addr) ||
++		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
++		addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() ||
++		addr == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+ 		return false
+ 	}
++
++	// Deprecated IPv6 site-local fec0::/10 (RFC 3879) isn't matched by any
++	// helper above; reject it explicitly.
++	if addr.Is6() {
++		b := addr.As16()
++		if b[0] == 0xfe && (b[1]&0xc0) == 0xc0 {
++			return false
++		}
++	}
++
+ 	return true
+ }
++
++// embeddedIPv4 extracts the IPv4 address carried inside an IPv6 transition
++// address: 6to4 (2002::/16) or NAT64 (RFC 6052 well-known 64:ff9b::/96 and
++// RFC 8215 local-use 64:ff9b:1::/48). Returns false for anything else.
++//
++// Limitation: NAT64 with an operator-chosen Network-Specific Prefix (any other
++// /32../96) is indistinguishable from a normal global address and is not
++// unwrapped — only the two standard prefixes are covered.
++func embeddedIPv4(addr netip.Addr) (netip.Addr, bool) {
++	if !addr.Is6() {
++		return netip.Addr{}, false
++	}
++	b := addr.As16()
++	switch {
++	case b[0] == 0x20 && b[1] == 0x02: // 6to4 2002::/16 -> bytes 2..5
++		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
++	case b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b:
++		// NAT64 well-known 64:ff9b::/96 -> IPv4 in the low 32 bits (bytes 12..15).
++		if b[4] == 0x00 && b[5] == 0x00 {
++			return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
++		}
++		// NAT64 local-use 64:ff9b:1::/48 -> per RFC 6052 the IPv4 occupies
++		// bytes 6,7,9,10 (byte 8 is the reserved u-octet, skipped).
++		if b[4] == 0x00 && b[5] == 0x01 {
++			return netip.AddrFrom4([4]byte{b[6], b[7], b[9], b[10]}), true
++		}
++	}
++	return netip.Addr{}, false
++}
+diff --git a/core/providers/utils/fetch_test.go b/core/providers/utils/fetch_test.go
+new file mode 100644
+index 0000000..96de529
+--- /dev/null
++++ b/core/providers/utils/fetch_test.go
+@@ -0,0 +1,61 @@
++package utils
++
++import (
++	"net"
++	"testing"
++)
++
++// TestIsPublicIP guards the SSRF denylist used by FetchAndEncodeURL. It locks
++// in both the long-standing blocks (loopback / RFC 1918 / link-local / ULA) and
++// the hardened cases: CGNAT, IPv6-transition-wrapped internal IPv4 (6to4 /
++// NAT64), and deprecated IPv6 site-local.
++func TestIsPublicIP(t *testing.T) {
++	tests := []struct {
++		name string
++		ip   string
++		want bool
++	}{
++		// Legitimate public targets must still be fetchable.
++		{"public v4 google dns", "8.8.8.8", true},
++		{"public v4 cloudflare", "1.1.1.1", true},
++		{"public v6", "2606:4700:4700::1111", true},
++		// 6to4 wrapping a *public* IPv4 is legitimately public.
++		{"6to4 public 8.8.8.8", "2002:0808:0808::", true},
++
++		// Existing blocks — regression guard.
++		{"loopback v4", "127.0.0.1", false},
++		{"private 10/8", "10.0.0.1", false},
++		{"private 172.16/12", "172.16.5.4", false},
++		{"private 192.168/16", "192.168.1.1", false},
++		{"link-local / IMDS", "169.254.169.254", false},
++		{"loopback v6", "::1", false},
++		{"ula v6", "fc00::1", false},
++		{"link-local v6", "fe80::1", false},
++		{"unspecified v4", "0.0.0.0", false},
++
++		// New: CGNAT (RFC 6598).
++		{"cgnat low", "100.64.0.1", false},
++		{"cgnat high", "100.127.255.255", false},
++		{"cgnat boundary just outside (public)", "100.128.0.1", true},
++
++		// New: IPv4 metadata endpoint smuggled inside IPv6 transition forms.
++		{"6to4-wrapped IMDS", "2002:a9fe:a9fe::", false},
++		{"nat64 well-known-wrapped IMDS", "64:ff9b::a9fe:a9fe", false},
++		{"nat64 local-use-wrapped IMDS", "64:ff9b:1:a9fe:a9:fe00::", false},
++
++		// New: deprecated IPv6 site-local (RFC 3879).
++		{"site-local fec0::/10", "fec0::1", false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			ip := net.ParseIP(tt.ip)
++			if ip == nil {
++				t.Fatalf("could not parse IP %q", tt.ip)
++			}
++			if got := isPublicIP(ip); got != tt.want {
++				t.Errorf("isPublicIP(%s) = %v, want %v", tt.ip, got, tt.want)
++			}
++		})
++	}
++}

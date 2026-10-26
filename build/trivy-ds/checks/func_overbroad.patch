@@ -1,0 +1,164 @@
+diff --git a/pkg/plugin/index.go b/pkg/plugin/index.go
+index d2ddc71b2..94d017f0e 100644
+--- a/pkg/plugin/index.go
++++ b/pkg/plugin/index.go
+@@ -60,7 +60,11 @@ func (m *Manager) Update(ctx context.Context, opts Options) error {
+ 		m.logger.WarnContext(ctx, "Unable to cache the plugin index", log.Err(err))
+ 	} else {
+ 		for _, p := range index.Plugins {
+-			cacheDir := filepath.Join(m.pluginRoot, p.Name+".index")
++			cacheDir, err := m.resolve(p.Name + ".index")
++			if err != nil {
++				m.logger.WarnContext(ctx, "Skipping the plugin index cache", log.String("name", p.Name), log.Err(err))
++				continue
++			}
+ 			if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+ 				return xerrors.Errorf("failed to create the plugin index cache: %w", err)
+ 			}
+diff --git a/pkg/plugin/manager.go b/pkg/plugin/manager.go
+index ffec18d97..cbd00e019 100644
+--- a/pkg/plugin/manager.go
++++ b/pkg/plugin/manager.go
+@@ -2,8 +2,10 @@ package plugin
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+@@ -79,6 +81,59 @@ func defaultManager() *Manager {
+ 	return _defaultManager
+ }
+ 
++// resolve returns the location of a plugin inside the plugin directory. The
++// name must be a plain relative path, and any symbolic link on the way to it
++// must stay inside the plugin directory.
++func (m *Manager) resolve(name string) (string, error) {
++	if !filepath.IsLocal(name) {
++		return "", xerrors.Errorf("invalid plugin name %q", name)
++	}
++	joined := filepath.Join(m.pluginRoot, name)
++	if err := withinDir(m.pluginRoot, joined); err != nil {
++		return "", err
++	}
++	return joined, nil
++}
++
++// withinDir reports whether path stays inside dir once symbolic links that
++// already exist are resolved. Components that do not exist yet are allowed.
++func withinDir(dir, path string) error {
++	realDir, err := filepath.EvalSymlinks(dir)
++	if err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return nil
++		}
++		return xerrors.Errorf("failed to resolve %q: %w", dir, err)
++	}
++
++	existing, rest := path, []string(nil)
++	for {
++		_, err := os.Lstat(existing)
++		if err == nil {
++			break
++		}
++		if !errors.Is(err, fs.ErrNotExist) {
++			return xerrors.Errorf("failed to inspect %q: %w", existing, err)
++		}
++		parent := filepath.Dir(existing)
++		if parent == existing {
++			break
++		}
++		rest = append([]string{filepath.Base(existing)}, rest...)
++		existing = parent
++	}
++
++	realExisting, err := filepath.EvalSymlinks(existing)
++	if err != nil {
++		return xerrors.Errorf("failed to resolve %q: %w", existing, err)
++	}
++	resolved := filepath.Join(append([]string{realExisting}, rest...)...)
++	if resolved != realDir && !strings.HasPrefix(resolved, realDir+string(filepath.Separator)) {
++		return xerrors.Errorf("%q is outside the plugin directory", path)
++	}
++	return nil
++}
++
+ func Install(ctx context.Context, name string, opts Options) (Plugin, error) {
+ 	return defaultManager().Install(ctx, name, opts)
+ }
+@@ -98,6 +153,9 @@ func Repair(ctx context.Context) error                  { return defaultManager(
+ 
+ // Install installs a plugin
+ func (m *Manager) Install(ctx context.Context, arg string, opts Options) (Plugin, error) {
++	if !filepath.IsLocal(arg) {
++		return Plugin{}, xerrors.Errorf("invalid plugin source %q", arg)
++	}
+ 	input := m.parseArg(ctx, arg)
+ 	input.name = m.tryIndex(ctx, input.name, opts)
+ 
+@@ -132,7 +190,13 @@ func (m *Manager) install(ctx context.Context, src string, opts Options) (Plugin
+ 		return Plugin{}, xerrors.Errorf("failed to load the plugin metadata: %w", err)
+ 	}
+ 
+-	if err = plugin.install(ctx, plugin.Dir(), tempDir, opts); err != nil {
++	dst, err := m.resolve(plugin.Name)
++	if err != nil {
++		return Plugin{}, xerrors.Errorf("failed to create the plugin directory: %w", err)
++	}
++	plugin.dir = dst
++
++	if err = plugin.install(ctx, dst, tempDir, opts); err != nil {
+ 		return Plugin{}, xerrors.Errorf("failed to install the plugin: %w", err)
+ 	}
+ 
+@@ -155,7 +219,10 @@ func (m *Manager) install(ctx context.Context, src string, opts Options) (Plugin
+ 
+ // Uninstall installs the plugin
+ func (m *Manager) Uninstall(ctx context.Context, name string) error {
+-	pluginDir := filepath.Join(m.pluginRoot, name)
++	pluginDir, err := m.resolve(name)
++	if err != nil {
++		return err
++	}
+ 	if !fsutils.DirExists(pluginDir) {
+ 		m.logger.ErrorContext(ctx, "No such plugin")
+ 		return nil
+@@ -195,7 +262,10 @@ func (m *Manager) Repair(ctx context.Context) error {
+ 			p.Summary = p.Usage
+ 			p.Usage = ""
+ 		}
+-		dir := filepath.Join(m.pluginRoot, p.Name)
++		dir, err := m.resolve(p.Name)
++		if err != nil {
++			return err
++		}
+ 		if err := os.MkdirAll(dir, 0o755); err != nil {
+ 			return xerrors.Errorf("failed to prepare the plugin directory: %w", err)
+ 		}
+@@ -361,7 +431,10 @@ func (m *Manager) Run(ctx context.Context, name string, opts Options) error {
+ }
+ 
+ func (m *Manager) load(name string) (Plugin, error) {
+-	pluginDir := filepath.Join(m.pluginRoot, name)
++	pluginDir, err := m.resolve(name)
++	if err != nil {
++		return Plugin{}, err
++	}
+ 	if _, err := os.Stat(pluginDir); err != nil {
+ 		if os.IsNotExist(err) {
+ 			return Plugin{}, xerrors.Errorf("could not find a plugin called '%s', did you install it?", name)
+@@ -394,8 +467,8 @@ func (m *Manager) loadMetadata(dir string) (Plugin, error) {
+ 		return Plugin{}, xerrors.Errorf("'name' is empty")
+ 	}
+ 
+-	// e.g. ~/.trivy/plugins/kubectl
+-	plugin.dir = filepath.Join(m.pluginRoot, plugin.Name)
++	// The directory the metadata was read from, not the name it records.
++	plugin.dir = dir
+ 
+ 	if plugin.Summary == "" && plugin.Usage != "" {
+ 		plugin.Summary = plugin.Usage // For backward compatibility

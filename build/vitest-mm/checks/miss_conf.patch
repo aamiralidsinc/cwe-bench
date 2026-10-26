@@ -1,0 +1,152 @@
+diff --git a/packages/browser/src/node/commands/artifacts.ts b/packages/browser/src/node/commands/artifacts.ts
+index ba6874f..89b3d2d 100644
+--- a/packages/browser/src/node/commands/artifacts.ts
++++ b/packages/browser/src/node/commands/artifacts.ts
+@@ -1,7 +1,7 @@
+ import type { BrowserCommand } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { dirname, resolve } from 'node:path'
+-import { assertFileAccess } from './fs'
++import { assertFileAccess, assertWriteAllowed } from './fs'
+ 
+ /**
+  * Writes a test artifact (a recorded payload, a generated report fragment, …)
+@@ -10,6 +10,7 @@ import { assertFileAccess } from './fs'
+ export const exportArtifact: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
++  assertWriteAllowed(project)
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+index 9d4cb2a..1819a7e 100644
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -5,6 +5,34 @@ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+ import { isFileServingAllowed } from 'vitest/node'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++export function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++/**
++ * File writes and deletes are refused while any API that fronts this project is
++ * reachable from the network. The browser API inherits the runner's binding, so
++ * the runner's own API is part of the check.
++ */
++export function assertWriteAllowed(project: TestProject): void {
++  const bindings = [
++    project.vitest.config.api,
++    project.config.api,
++    project.vitest.config.browser.api,
++    project.config.browser.api,
++  ]
++  if (bindings.some(isApiExposed)) {
++    throw new Error(
++      'Cannot modify files because the server is exposed to the network. Bind the API to the local machine to allow writes.',
++    )
++  }
++}
++
+ export function assertFileAccess(path: string, project: TestProject): void {
+   if (
+     !isFileServingAllowed(path, project.vite)
+@@ -31,6 +59,7 @@ export const readFile: BrowserCommand<
+ export const writeFile: BrowserCommand<
+   Parameters<BrowserCommands['writeFile']>
+ > = async ({ project }, path, data, options) => {
++  assertWriteAllowed(project)
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   const dir = dirname(filepath)
+@@ -43,6 +72,7 @@ export const writeFile: BrowserCommand<
+ export const removeFile: BrowserCommand<
+   Parameters<BrowserCommands['removeFile']>
+ > = async ({ project }, path) => {
++  assertWriteAllowed(project)
+   const filepath = resolve(project.config.root, path)
+   assertFileAccess(filepath, project)
+   await fsp.rm(filepath)
+diff --git a/packages/ui/node/index.ts b/packages/ui/node/index.ts
+index 9a9af99..41377b5 100644
+--- a/packages/ui/node/index.ts
++++ b/packages/ui/node/index.ts
+@@ -79,6 +79,15 @@ export default (ctx: Vitest): Plugin => {
+             }
+ 
+             if (req.method === 'POST') {
++              // writes are refused while the control server is network-reachable
++              const api = ctx.config.api
++              const exposed = api && !api.middlewareMode && api.host
++                && api.host !== 'localhost' && api.host !== '127.0.0.1'
++              if (exposed) {
++                res.writeHead(403)
++                res.end()
++                return
++              }
+               // save the attachment the UI is holding back to disk
+               const chunks: Buffer[] = []
+               req.on('data', (chunk: Buffer) => {
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index f4c9a9c..dfa28af 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -28,6 +28,23 @@ import { getModuleGraph } from '../utils/graph'
+ import { stringifyReplace } from '../utils/serialization'
+ import { isValidApiRequest } from './check'
+ 
++/** A binding is network-reachable when it names a host that is not the local machine. */
++function isApiExposed(api: { host?: string, middlewareMode?: boolean } | undefined): boolean {
++  if (!api || api.middlewareMode) {
++    return false
++  }
++  const host = api.host
++  return !!host && host !== 'localhost' && host !== '127.0.0.1'
++}
++
++function assertWriteAllowed(ctx: Vitest): void {
++  if (isApiExposed(ctx.config.api)) {
++    throw new Error(
++      'Cannot modify files or start test runs because the server is exposed to the network. Bind the API to the local machine to allow writes.',
++    )
++  }
++}
++
+ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   const wss = new WebSocketServer({ noServer: true })
+ 
+@@ -75,6 +92,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.readFile(id, 'utf-8')
+         },
+         async saveTestFile(id, content) {
++          assertWriteAllowed(ctx)
+           if (!ctx.state.filesMap.has(id) || !existsSync(id)) {
+             throw new Error(
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+@@ -83,9 +101,11 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          assertWriteAllowed(ctx)
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          assertWriteAllowed(ctx)
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -150,6 +170,7 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return getModuleGraph(ctx, project, id, browser)
+         },
+         async updateSnapshot(file?: File) {
++          assertWriteAllowed(ctx)
+           if (!file) {
+             await ctx.updateSnapshot()
+           }

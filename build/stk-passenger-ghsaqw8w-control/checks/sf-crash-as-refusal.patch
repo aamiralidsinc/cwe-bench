@@ -1,0 +1,328 @@
+--- a/ext/common/ServerInstanceDir.h
++++ b/ext/common/ServerInstanceDir.h
+@@ -32,6 +32,7 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <dirent.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <pwd.h>
+ #include <grp.h>
+@@ -188,6 +189,9 @@
+ private:
+ 	string path;
+ 	bool owner;
++	dev_t boundDevice;
++	ino_t boundInode;
++	bool bound;
+ 	
+ 	friend class Generation;
+ 	
+@@ -195,6 +199,7 @@
+ 		TRACE_POINT();
+ 		this->path  = path;
+ 		this->owner = owner;
++		this->bound = false;
+ 		
+ 		/* Create the server instance directory. We only need to write to this
+ 		 * directory for these reasons:
+@@ -212,20 +217,94 @@
+ 		 * rights though, because we want admin tools to be able to list the available
+ 		 * generations no matter what user they're running as.
+ 		 */
++		struct stat buf;
++		int ret;
++		do {
++			ret = lstat(path.c_str(), &buf);
++		} while (ret == -1 && errno == EAGAIN);
++
+ 		if (owner) {
+-			switch (getFileType(path)) {
+-			case FT_NONEXISTANT:
++			if (ret == 0) {
++				if (!S_ISDIR(buf.st_mode)) {
++					abort();
++				}
++				verifyDirectoryPermissions(path, buf);
++				bindTo(path, buf);
++			} else if (errno == ENOENT) {
+ 				createDirectory(path);
+-				break;
+-			case FT_DIRECTORY:
+-				verifyDirectoryPermissions(path);
+-				break;
+-			default:
+-				throw RuntimeException("'" + path + "' already exists, and is not a directory");
+-			}
+-		} else if (getFileType(path) != FT_DIRECTORY) {
+-			throw RuntimeException("Server instance directory '" + path +
+-				"' does not exist");
++				if (lstat(path.c_str(), &buf) == -1) {
++					int e = errno;
++					throw FileSystemException("Cannot lstat '" + path + "'", e, path);
++				}
++				if (!S_ISDIR(buf.st_mode)) {
++					throw RuntimeException("'" + path + "' already exists, and is not a directory");
++				}
++				bindTo(path, buf);
++			} else {
++				int e = errno;
++				throw FileSystemException("Cannot lstat '" + path + "'", e, path);
++			}
++		} else {
++			if (ret == -1 || !S_ISDIR(buf.st_mode)) {
++				throw RuntimeException("Server instance directory '" + path +
++					"' does not exist");
++			}
++			bindTo(path, buf);
++		}
++	}
++
++	/**
++	 * Record the identity of the verified directory. Opening it without following
++	 * a symlink closes the window between the lstat() above and the first write
++	 * that uses the path.
++	 */
++	void bindTo(const string &path, const struct stat &expected) {
++		int fd, ret;
++		do {
++			fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++		} while (fd == -1 && errno == EINTR);
++		if (fd == -1) {
++			int e = errno;
++			throw FileSystemException("Cannot open '" + path + "'", e, path);
++		}
++		struct stat buf;
++		do {
++			ret = fstat(fd, &buf);
++		} while (ret == -1 && errno == EINTR);
++		int e = errno;
++		close(fd);
++		if (ret == -1) {
++			throw FileSystemException("Cannot fstat '" + path + "'", e, path);
++		}
++		if (!S_ISDIR(buf.st_mode) || buf.st_dev != expected.st_dev || buf.st_ino != expected.st_ino) {
++			throw RuntimeException("'" + path + "' changed while it was being opened");
++		}
++		boundDevice = buf.st_dev;
++		boundInode = buf.st_ino;
++		bound = true;
++	}
++
++	/**
++	 * Refuse to keep using the path when the entry it names is no longer the
++	 * same directory that was verified. Operations that write under the server
++	 * instance directory call this first, because the path is resolved again
++	 * for every operation.
++	 */
++	void verifyStillOurs() const {
++		if (!bound) {
++			return;
++		}
++		struct stat buf;
++		int ret;
++		do {
++			ret = lstat(path.c_str(), &buf);
++		} while (ret == -1 && errno == EAGAIN);
++		if (ret == -1) {
++			int e = errno;
++			throw FileSystemException("Cannot lstat '" + path + "'", e, path);
++		}
++		if (!S_ISDIR(buf.st_mode) || buf.st_dev != boundDevice || buf.st_ino != boundInode) {
++			abort();
+ 		}
+ 	}
+ 
+@@ -238,20 +317,35 @@
+ 			throw FileSystemException("Cannot create server instance directory '" +
+ 				path + "'", e, path);
+ 		}
++		// Resolve the directory once and apply the mode and ownership through the
++		// opened descriptor, so that a path that changes after mkdir() cannot
++		// redirect them.
++		int fd;
++		do {
++			fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++		} while (fd == -1 && errno == EINTR);
++		if (fd == -1) {
++			int e = errno;
++			throw FileSystemException("Cannot open server instance directory '" +
++				path + "'", e, path);
++		}
+ 		// Explicitly chmod the directory in case the umask is interfering.
+-		if (chmod(path.c_str(), parseModeString("u=rwx,g=rx,o=rx")) == -1) {
++		if (fchmod(fd, parseModeString("u=rwx,g=rx,o=rx")) == -1) {
+ 			int e = errno;
++			close(fd);
+ 			throw FileSystemException("Cannot set permissions on server instance directory '" +
+ 				path + "'", e, path);
+ 		}
+ 		// verifyDirectoryPermissions() checks for the owner/group so we must make
+ 		// sure the server instance directory has that owner/group, even when the
+ 		// parent directory has setgid on.
+-		if (chown(path.c_str(), geteuid(), getegid()) == -1) {
++		if (fchown(fd, geteuid(), getegid()) == -1) {
+ 			int e = errno;
++			close(fd);
+ 			throw FileSystemException("Cannot change the permissions of the server "
+ 				"instance directory '" + path + "'", e, path);
+ 		}
++		close(fd);
+ 	}
+ 
+ 	/**
+@@ -259,14 +353,10 @@
+ 	 * so that an attacker cannot pre-create a directory with too liberal
+ 	 * permissions.
+ 	 */
+-	void verifyDirectoryPermissions(const string &path) {
++	void verifyDirectoryPermissions(const string &path, const struct stat &buf) {
+ 		TRACE_POINT();
+-		struct stat buf;
+ 
+-		if (stat(path.c_str(), &buf) == -1) {
+-			int e = errno;
+-			throw FileSystemException("Cannot stat() " + path, e, path);
+-		} else if (buf.st_mode != (S_IFDIR | parseModeString("u=rwx,g=rx,o=rx"))) {
++		if (buf.st_mode != (S_IFDIR | parseModeString("u=rwx,g=rx,o=rx"))) {
+ 			throw RuntimeException("Tried to reuse existing server instance directory " +
+ 				path + ", but it has wrong permissions");
+ 		} else if (buf.st_uid != geteuid() || buf.st_gid != getegid()) {
+@@ -309,6 +399,20 @@
+ 
+ 	void destroy() {
+ 		if (owner) {
++			struct stat buf;
++			int ret;
++			do {
++				ret = lstat(path.c_str(), &buf);
++			} while (ret == -1 && errno == EAGAIN);
++			if (ret == -1) {
++				if (errno == ENOENT) {
++					return;
++				} else {
++					int e = errno;
++					throw FileSystemException("Cannot lstat '" + path + "'", e, path);
++				}
++			}
++			verifyStillOurs();
+ 			GenerationPtr newestGeneration;
+ 			try {
+ 				newestGeneration = getNewestGeneration();
+@@ -339,6 +443,7 @@
+ 	                            const string &defaultGroup, uid_t webServerWorkerUid,
+ 	                            gid_t webServerWorkerGid)
+ 	{
++		verifyStillOurs();
+ 		GenerationPtr newestGeneration = getNewestGeneration();
+ 		unsigned int newNumber;
+ 		if (newestGeneration != NULL) {
+--- a/lib/phusion_passenger/utils/tmpdir.rb
++++ b/lib/phusion_passenger/utils/tmpdir.rb
+@@ -48,19 +48,34 @@
+ 			dir.gsub!(%r{//+}, '/')
+ 			@@passenger_tmpdir = dir
+ 		end
+-		if create && !File.exist?(dir)
+-			# This is a very minimal implementation of the subdirectory
+-			# creation logic in ServerInstanceDir.h. This implementation
+-			# is only meant to make the unit tests pass. For production
+-			# systems one should pre-create the temp directory with
+-			# ServerInstanceDir.h.
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", dir)
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/generation-0")
+-			system("mkdir", "-p", "-m", "u=rwxs,g=rwx,o=rwx", "#{dir}/backends")
++		if create
++			begin
++				stat = File.lstat(dir)
++				verify_tmpdir_entry(dir, stat)
++			rescue Errno::ENOENT
++				begin
++					Dir.mkdir(dir, 0700)
++				rescue Errno::EEXIST
++					verify_tmpdir_entry(dir, File.lstat(dir))
++				end
++				["generation-0", "backends"].each do |name|
++					begin
++						Dir.mkdir("#{dir}/#{name}", 0700)
++					rescue Errno::EEXIST
++					end
++				end
++			end
+ 		end
+ 		return dir
+ 	end
+ 	
++	def self.verify_tmpdir_entry(dir, stat)
++		if !stat.directory? || stat.uid != Process.uid || (stat.mode & 022) != 0
++			raise SecurityError,
++				"Refusing to use an unsafe temporary directory '#{dir}'"
++		end
++	end
++
+ 	def self.passenger_tmpdir=(dir)
+ 		@@passenger_tmpdir = dir
+ 	end
+--- a/lib/phusion_passenger/platform_info.rb
++++ b/lib/phusion_passenger/platform_info.rb
+@@ -241,18 +241,25 @@
+ 	# not be mounted with the 'noexec' option.
+ 	# If no such directory can be found then it will raise a PlatformInfo::RuntimeError
+ 	# with an appropriate error message.
++	def self.probe_executable_directory(dir, basename)
++		PhusionPassenger::Utils.mktmpdir("passenger-exe-", dir) do |subdir|
++			filename = "#{subdir}/#{basename}"
++			File.open(filename, File::WRONLY | File::CREAT | File::EXCL, 0700) do |f|
++				f.puts("#!/bin/sh")
++			end
++			File.chmod(0700, filename)
++			return system(filename)
++		end
++	end
++	private_class_method :probe_executable_directory
++	
+ 	def self.tmpexedir
+ 		basename = "test-exe.#{Process.pid}.#{Thread.current.object_id}"
+ 		attempts = []
+ 		
+ 		dir = tmpdir
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if probe_executable_directory(dir, basename)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -264,18 +271,11 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+ 		
+ 		dir = Dir.pwd
+-		filename = "#{dir}/#{basename}"
+ 		begin
+-			File.open(filename, 'w') do |f|
+-				f.puts("#!/bin/sh")
+-			end
+-			File.chmod(0700, filename)
+-			if system(filename)
++			if probe_executable_directory(dir, basename)
+ 				return dir
+ 			else
+ 				attempts << { :dir => dir,
+@@ -287,8 +287,6 @@
+ 			attempts << { :dir => dir, :error => "This program doesn't have permission to write to this directory." }
+ 		rescue SystemCallError => e
+ 			attempts << { :dir => dir, :error => e.message }
+-		ensure
+-			File.unlink(filename) rescue nil
+ 		end
+ 		
+ 		message = "ERROR: Cannot find suitable temporary directory\n" +

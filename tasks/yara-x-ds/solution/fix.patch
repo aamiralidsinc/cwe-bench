@@ -1,0 +1,162 @@
+diff --git a/lib/src/compiler/mod.rs b/lib/src/compiler/mod.rs
+index 1df2b984..7b10a6b8 100644
+--- a/lib/src/compiler/mod.rs
++++ b/lib/src/compiler/mod.rs
+@@ -2941,7 +2941,18 @@ impl From<PatternId> for usize {
+ /// For each pattern there's one or more sub-patterns, depending on the pattern
+ /// and its modifiers. For example the pattern `"foo" ascii wide` may have one
+ /// subpattern for the ascii case and another one for the wide case.
+-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
++#[derive(
++    Copy,
++    Clone,
++    Debug,
++    Eq,
++    Hash,
++    PartialEq,
++    PartialOrd,
++    Ord,
++    Serialize,
++    Deserialize,
++)]
+ #[serde(transparent)]
+ pub(crate) struct SubPatternId(u32);
+ 
+diff --git a/lib/src/compiler/rules.rs b/lib/src/compiler/rules.rs
+index d629f6ce..ce4b53df 100644
+--- a/lib/src/compiler/rules.rs
++++ b/lib/src/compiler/rules.rs
+@@ -218,6 +218,13 @@ impl Rules {
+ 
+     /// Deserializes the rules from a sequence of bytes produced by
+     /// [`Rules::serialize`].
++    ///
++    /// # Safety
++    ///
++    /// The bytes are validated: content that the compiler could not have
++    /// produced is rejected with [`SerializationError::InvalidFormat`]. As
++    /// long as you are deserializing rules from binary content produced by
++    /// [`Rules::serialize`] you are safe.
+     pub fn deserialize<B>(bytes: B) -> Result<Self, SerializationError>
+     where
+         B: AsRef<[u8]>,
+@@ -254,6 +261,12 @@ impl Rules {
+         #[cfg(feature = "logging")]
+         info!("Deserialization time: {:?}", Instant::elapsed(&start));
+ 
++        // The decoded data is used with unchecked accesses while scanning
++        // and when reading metadata, so it must satisfy the same invariants
++        // that the compiler establishes. Anything else is rejected here,
++        // before the rules can be used.
++        rules.validate()?;
++
+         // `rules.compiled_wasm_mod` can be `None` for two reasons:
+         //
+         //  1- The rules were serialized without compiled rules (i.e: the
+@@ -284,9 +297,91 @@ impl Rules {
+ 
+         rules.build_ac_automaton();
+ 
++        // Make sure that the maximum SubPatternId is within the boundaries
++        // of sub_patterns array. This check is important because during
++        // the scanning phase we use SubPatternId as indexes in the array
++        // without boundary checks for better performance.
++        if let Some(max_sub_pattern_id) =
++            rules.atoms.iter().map(|atom| atom.sub_pattern_id()).max()
++            && max_sub_pattern_id.0 as usize >= rules.sub_patterns.len()
++        {
++            return Err(SerializationError::InvalidFormat);
++        }
++
+         Ok(rules)
+     }
+ 
++    /// Checks that the decoded data is consistent with what the compiler
++    /// produces.
++    ///
++    /// The compiler establishes a set of invariants that the rest of the
++    /// library relies on (some of them through unchecked accesses): every
++    /// sub-pattern id is a valid index in `sub_patterns`, every regex code
++    /// location is inside `re_code`, text metadata is valid UTF-8, and the
++    /// tables indexed by pattern id have an entry for every pattern. A
++    /// serialized rule set that violates any of them can't have been produced
++    /// by the compiler and is refused.
++    fn validate(&self) -> Result<(), SerializationError> {
++        let num_sub_patterns = self.sub_patterns.len();
++
++        if self
++            .atoms
++            .iter()
++            .any(|atom| atom.sub_pattern_id().0 as usize >= num_sub_patterns)
++        {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        if self
++            .anchored_sub_patterns
++            .iter()
++            .any(|id| id.0 as usize >= num_sub_patterns)
++        {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        if self.sub_patterns.iter().any(|(_, sub_pattern)| {
++            sub_pattern
++                .chained_to()
++                .is_some_and(|id| id.0 as usize >= num_sub_patterns)
++        }) {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        let code_len = self.re_code.len();
++        if self.atoms.iter().any(|atom| {
++            atom
++                .fwd_code()
++                .is_some_and(|loc| crate::re::CodeLoc::location(&loc) >= code_len)
++                || atom
++                    .bck_code()
++                    .is_some_and(|loc| crate::re::CodeLoc::location(&loc) >= code_len)
++        }) {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        for rule in &self.rules {
++            for (_, value) in &rule.metadata {
++                if let MetaValue::String(id) = value
++                    && self
++                        .lit_pool
++                        .get_bytes(*id)
++                        .is_none_or(|bytes| std::str::from_utf8(bytes).is_err())
++                {
++                    return Err(SerializationError::InvalidFormat);
++                }
++            }
++        }
++
++        if self.fast_scan_patterns.len() < self.num_patterns
++            || self.filesize_bounds.len() < self.num_patterns
++        {
++            return Err(SerializationError::InvalidFormat);
++        }
++
++        Ok(())
++    }
++
+     /// Serializes the rules into a `writer`.
+     pub fn serialize_into<W>(
+         &self,
+diff --git a/lib/src/models.rs b/lib/src/models.rs
+index 7bf583e8..b1440925 100644
+--- a/lib/src/models.rs
++++ b/lib/src/models.rs
+@@ -203,9 +203,7 @@ impl<'r> Iterator for Metadata<'_, 'r> {
+             compiler::MetaValue::Float(f) => MetaValue::Float(*f),
+             compiler::MetaValue::String(id) => {
+                 let s = self.rules.lit_pool().get(*id).unwrap();
+-                // We can be sure that s is a valid UTF-8 string, because
+-                // the type of meta is MetaValue::String.
+-                let s = unsafe { s.to_str_unchecked() };
++                let s = s.to_str().unwrap();
+                 MetaValue::String(s)
+             }
+             compiler::MetaValue::Bytes(id) => {

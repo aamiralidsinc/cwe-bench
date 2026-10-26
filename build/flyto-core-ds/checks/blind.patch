@@ -1,0 +1,1076 @@
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/browser/checkpoint.py b/src/core/browser/checkpoint.py
+--- a/src/core/browser/checkpoint.py	2026-10-17 04:27:57.060186483 +0000
++++ b/src/core/browser/checkpoint.py	2026-10-21 23:48:52.899967799 +0000
+@@ -100,6 +100,11 @@
+         retries_used: int = 0,
+     ):
+         """Save pagination state. Appends new items to JSONL, updates metadata."""
++        # SECURITY: the item log and the metadata temp file are derived from
++        # the checkpoint path and written by this run; confine both.
++        from ..utils import validate_path_with_env_config
++        validate_path_with_env_config(str(self._items_path))
++        validate_path_with_env_config(str(self.path.with_suffix('.tmp')))
+         now = time.strftime('%Y-%m-%dT%H:%M:%S')
+ 
+         # Append new items to JSONL (streaming, no full-load needed)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/archive/tar_extract.py b/src/core/modules/atomic/archive/tar_extract.py
+--- a/src/core/modules/atomic/archive/tar_extract.py	2026-10-17 04:27:57.076186465 +0000
++++ b/src/core/modules/atomic/archive/tar_extract.py	2026-10-21 23:48:52.895967803 +0000
+@@ -127,16 +127,37 @@
+     try:
+         # Auto-detect compression via 'r:*'
+         with tarfile.open(safe_archive, 'r:*') as tf:
+-            # Security: check for path traversal in archive entries
++            # Security: every archive entry name is joined into the output
++            # location, so it is confined to the sandbox exactly like a
++            # caller-spelled path (absolute, `..` and symlink escapes).
+             for member in tf.getmembers():
+-                target_path = os.path.normpath(os.path.join(safe_output, member.name))
+-                if not target_path.startswith(os.path.normpath(safe_output)):
++                try:
++                    target_path = validate_path_with_env_config(
++                        os.path.join(safe_output, member.name)
++                    )
++                except PathTraversalError:
+                     raise ModuleError(
+                         "Tar entry attempts path traversal: {}".format(member.name),
+                         code="PATH_TRAVERSAL",
+                     )
++                if member.issym() or member.islnk():
++                    linkname = member.linkname
++                    if os.path.isabs(linkname):
++                        link_target = linkname
++                    elif member.islnk():
++                        # Hard link targets are relative to the archive root.
++                        link_target = os.path.join(safe_output, linkname)
++                    else:
++                        link_target = os.path.join(os.path.dirname(target_path), linkname)
++                    try:
++                        validate_path_with_env_config(link_target)
++                    except PathTraversalError:
++                        raise ModuleError(
++                            "Tar entry link escapes the sandbox: {}".format(member.name),
++                            code="PATH_TRAVERSAL",
++                        )
+ 
+-            # Use data_filter if available (Python 3.12+), otherwise fallback
++            # Use data_filter when available (Python 3.12+), otherwise fallback
+             try:
+                 tf.extractall(path=safe_output, filter='data')
+             except TypeError:
+@@ -145,7 +166,9 @@
+ 
+             for member in tf.getmembers():
+                 if member.isfile():
+-                    full_path = os.path.join(safe_output, member.name)
++                    full_path = validate_path_with_env_config(
++                        os.path.join(safe_output, member.name)
++                    )
+                     extracted_files.append(full_path)
+                     total_size += member.size
+     except ModuleError:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/archive/zip_extract.py b/src/core/modules/atomic/archive/zip_extract.py
+--- a/src/core/modules/atomic/archive/zip_extract.py	2026-10-17 04:27:57.076186465 +0000
++++ b/src/core/modules/atomic/archive/zip_extract.py	2026-10-21 23:48:52.895967803 +0000
+@@ -138,10 +138,15 @@
+ 
+     try:
+         with zipfile.ZipFile(safe_archive, 'r') as zf:
+-            # Security: check for path traversal in archive entries (zip slip)
++            # Security: every archive entry name is joined into the output
++            # location, so it is confined to the sandbox exactly like a
++            # caller-spelled path (zip slip).
+             for info in zf.infolist():
+-                target_path = os.path.normpath(os.path.join(safe_output, info.filename))
+-                if not target_path.startswith(os.path.normpath(safe_output)):
++                try:
++                    validate_path_with_env_config(
++                        os.path.join(safe_output, info.filename)
++                    )
++                except PathTraversalError:
+                     raise ModuleError(
+                         "Zip entry attempts path traversal: {}".format(info.filename),
+                         code="PATH_TRAVERSAL",
+@@ -151,7 +156,9 @@
+ 
+             for info in zf.infolist():
+                 if not info.is_dir():
+-                    full_path = os.path.join(safe_output, info.filename)
++                    full_path = validate_path_with_env_config(
++                        os.path.join(safe_output, info.filename)
++                    )
+                     extracted_files.append(full_path)
+                     total_size += info.file_size
+     except ModuleError:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/cookies_file.py b/src/core/modules/atomic/browser/cookies_file.py
+--- a/src/core/modules/atomic/browser/cookies_file.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/cookies_file.py	2026-10-21 23:48:52.895967803 +0000
+@@ -99,6 +99,11 @@
+         if self.domain_filter:
+             cookies = [c for c in cookies if self.domain_filter in c.get('domain', '')]
+ 
++        # SECURITY: exporting creates/overwrites a caller-supplied location;
++        # confine it to the sandbox before creating its directory.
++        from ....utils import validate_path_with_env_config
++        self.file_path = Path(validate_path_with_env_config(self.file_path))
++
+         self.file_path.parent.mkdir(parents=True, exist_ok=True)
+         self.file_path.write_text(json.dumps(cookies, indent=2, default=str), encoding='utf-8')
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/download.py b/src/core/modules/atomic/browser/download.py
+--- a/src/core/modules/atomic/browser/download.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/download.py	2026-10-21 23:48:52.895967803 +0000
+@@ -83,6 +83,11 @@
+         self.save_path = self.params['save_path']
+         self.timeout = self.params.get('timeout_ms', 60000)
+ 
++        # SECURITY: confine the download destination to the operator's
++        # sandbox before creating its directory.
++        from ....utils import validate_path_with_env_config
++        self.save_path = validate_path_with_env_config(self.save_path)
++
+         # Ensure directory exists
+         save_dir = Path(self.save_path).parent
+         save_dir.mkdir(parents=True, exist_ok=True)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/launch.py b/src/core/modules/atomic/browser/launch.py
+--- a/src/core/modules/atomic/browser/launch.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/launch.py	2026-10-21 23:48:52.895967803 +0000
+@@ -195,6 +195,11 @@
+         self.locale = self.params.get('locale', 'en-US')
+         self.slow_mo = self.params.get('slow_mo', 0)
+         self.record_video_dir = self.params.get('record_video_dir')
++        if self.record_video_dir:
++            # SECURITY: the browser writes recording files here; confine it to
++            # the operator's sandbox.
++            from ....utils import validate_path_with_env_config
++            self.record_video_dir = validate_path_with_env_config(self.record_video_dir)
+         self.viewport = {
+             'width': self.params.get('width', 1280),
+             'height': self.params.get('height', 720),
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/pagination.py b/src/core/modules/atomic/browser/pagination.py
+--- a/src/core/modules/atomic/browser/pagination.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/pagination.py	2026-10-21 23:48:52.895967803 +0000
+@@ -301,6 +301,12 @@
+         self.max_retries = self.params.get('max_retries', 3)
+         self.checkpoint_path = self.params.get('checkpoint_path')
+ 
++        # SECURITY: the checkpoint is created, rewritten and removed by this
++        # run; confine it to the operator's sandbox.
++        if self.checkpoint_path:
++            from ....utils import validate_path_with_env_config
++            self.checkpoint_path = validate_path_with_env_config(self.checkpoint_path)
++
+         if not self.item_selector:
+             raise ValueError("item_selector is required")
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/pdf.py b/src/core/modules/atomic/browser/pdf.py
+--- a/src/core/modules/atomic/browser/pdf.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/pdf.py	2026-10-21 23:48:52.895967803 +0000
+@@ -111,6 +111,11 @@
+         if self.scale < 0.1 or self.scale > 2:
+             raise ValueError(f"Scale must be between 0.1 and 2, got: {self.scale}")
+ 
++        # SECURITY: confine the PDF destination to the operator's sandbox
++        # before creating its directory.
++        from ....utils import validate_path_with_env_config
++        self.path = validate_path_with_env_config(self.path)
++
+         # Ensure output directory exists
+         output_dir = Path(self.path).parent
+         output_dir.mkdir(parents=True, exist_ok=True)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/record.py b/src/core/modules/atomic/browser/record.py
+--- a/src/core/modules/atomic/browser/record.py	2026-10-17 04:27:57.080186461 +0000
++++ b/src/core/modules/atomic/browser/record.py	2026-10-21 23:48:52.895967803 +0000
+@@ -222,7 +222,11 @@
+             # Save to file if path provided
+             if self.output_path:
+                 from pathlib import Path
+-                output_path = Path(self.output_path)
++                # SECURITY: confine the recording destination to the sandbox
++                # before creating its directory.
++                from ....utils import validate_path_with_env_config
++                safe_output = validate_path_with_env_config(self.output_path)
++                output_path = Path(safe_output)
+                 output_path.parent.mkdir(parents=True, exist_ok=True)
+                 with open(output_path, 'w') as f:
+                     f.write(workflow)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/screenshot.py b/src/core/modules/atomic/browser/screenshot.py
+--- a/src/core/modules/atomic/browser/screenshot.py	2026-10-17 04:27:57.084186456 +0000
++++ b/src/core/modules/atomic/browser/screenshot.py	2026-10-21 23:48:52.895967803 +0000
+@@ -62,6 +62,11 @@
+         self.format = self.params.get('format', 'png')
+         self.quality = self.params.get('quality', None)
+ 
++        # SECURITY: the screenshot destination is written by the run, so it
++        # is confined to the operator's sandbox.
++        from ....utils import validate_path_with_env_config
++        self.path = validate_path_with_env_config(self.path)
++
+     async def execute(self) -> Any:
+         browser = self.context.get('browser')
+         if not browser:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/snapshot.py b/src/core/modules/atomic/browser/snapshot.py
+--- a/src/core/modules/atomic/browser/snapshot.py	2026-10-17 04:27:57.084186456 +0000
++++ b/src/core/modules/atomic/browser/snapshot.py	2026-10-21 23:48:52.895967803 +0000
+@@ -174,7 +174,11 @@
+ 
+         # Save to file or return content
+         if self.output_path:
+-            path = Path(self.output_path)
++            # SECURITY: confine the snapshot destination to the sandbox before
++            # creating its directory.
++            from ....utils import validate_path_with_env_config
++            safe_output = validate_path_with_env_config(self.output_path)
++            path = Path(safe_output)
+             path.parent.mkdir(parents=True, exist_ok=True)
+ 
+             if isinstance(content, bytes):
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/browser/trace.py b/src/core/modules/atomic/browser/trace.py
+--- a/src/core/modules/atomic/browser/trace.py	2026-10-17 04:27:57.084186456 +0000
++++ b/src/core/modules/atomic/browser/trace.py	2026-10-21 23:48:52.895967803 +0000
+@@ -221,7 +221,11 @@
+ 
+             # Save to file if path provided, otherwise to temp file
+             if self.output_path:
+-                path = Path(self.output_path)
++                # SECURITY: confine the trace destination to the sandbox
++                # before creating its directory.
++                from ....utils import validate_path_with_env_config
++                safe_output = validate_path_with_env_config(self.output_path)
++                path = Path(safe_output)
+                 path.parent.mkdir(parents=True, exist_ok=True)
+                 await context.tracing.stop(path=str(path))
+                 trace_data = path.read_bytes()
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/data/csv_write.py b/src/core/modules/atomic/data/csv_write.py
+--- a/src/core/modules/atomic/data/csv_write.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/data/csv_write.py	2026-10-21 23:48:52.895967803 +0000
+@@ -92,8 +92,9 @@
+     if not file_path:
+         raise ValidationError("Missing required parameter: file_path", field="file_path")
+ 
+-    if '..' in file_path:
+-        raise Exception('Invalid file path')
++    # SECURITY: confine the destination to the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    file_path = validate_path_with_env_config(file_path)
+ 
+     if not isinstance(data, list):
+         raise InvalidTypeError(
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/data/dedup.py b/src/core/modules/atomic/data/dedup.py
+--- a/src/core/modules/atomic/data/dedup.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/data/dedup.py	2026-10-21 23:48:52.899967799 +0000
+@@ -116,6 +116,17 @@
+             raise ValueError("items must be an array")
+ 
+     async def execute(self) -> Dict[str, Any]:
++        # SECURITY: the hash file is rewritten on every run, so a caller value
++        # that resolves outside the sandbox must fail before anything is read
++        # or written.
++        if self.storage_mode == 'disk' and self.hash_file:
++            from ....utils import validate_path_with_env_config
++            self.hash_file = validate_path_with_env_config(self.hash_file)
++            # the atomic save writes a .tmp sibling beside the hash file
++            validate_path_with_env_config(
++                str(Path(self.hash_file).with_suffix('.tmp'))
++            )
++
+         # Load existing hashes (dict preserves insertion order for correct eviction)
+         seen: Dict[str, None] = {}
+         if self.storage_mode == 'context':
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/data/json_to_csv.py b/src/core/modules/atomic/data/json_to_csv.py
+--- a/src/core/modules/atomic/data/json_to_csv.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/data/json_to_csv.py	2026-10-21 23:48:52.895967803 +0000
+@@ -157,14 +157,17 @@
+                 all_keys.update(item.keys())
+         columns = sorted(all_keys)
+ 
++    # SECURITY: confine the resolved destination (including the module's
++    # derived default) before creating its directory.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     # Create output directory if needed
+     output_dir = os.path.dirname(output_path)
+     if output_dir and not os.path.exists(output_dir):
+         os.makedirs(output_dir)
+ 
+     # Write CSV
+-    if '..' in output_path:
+-        raise Exception('Invalid file path')
+     with open(output_path, 'w', newline='', encoding='utf-8') as f:
+         writer = csv.writer(f, delimiter=delimiter)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/excel_write.py b/src/core/modules/atomic/document/excel_write.py
+--- a/src/core/modules/atomic/document/excel_write.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/document/excel_write.py	2026-10-21 23:48:52.895967803 +0000
+@@ -105,6 +105,10 @@
+     if not data:
+         raise ValueError("Data cannot be empty")
+ 
++    # SECURITY: confine the destination to the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    path = validate_path_with_env_config(path)
++
+     Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
+ 
+     wb = openpyxl.Workbook()
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/pdf_fill_form.py b/src/core/modules/atomic/document/pdf_fill_form.py
+--- a/src/core/modules/atomic/document/pdf_fill_form.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/document/pdf_fill_form.py	2026-10-21 23:48:52.895967803 +0000
+@@ -119,6 +119,10 @@
+     fields = params.get('fields', {})
+     images = params.get('images', [])
+ 
++    # SECURITY: confine the destination to the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     if not os.path.exists(template_path):
+         return {'ok': False, 'error': f'Template file not found: {template_path}'}
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/pdf_generate.py b/src/core/modules/atomic/document/pdf_generate.py
+--- a/src/core/modules/atomic/document/pdf_generate.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/document/pdf_generate.py	2026-10-21 23:48:52.895967803 +0000
+@@ -120,6 +120,10 @@
+     if orientation == 'landscape':
+         page_size = landscape(page_size)
+ 
++    # SECURITY: confine the destination to the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _generate():
+         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/pdf_metadata.py b/src/core/modules/atomic/document/pdf_metadata.py
+--- a/src/core/modules/atomic/document/pdf_metadata.py	2026-10-18 19:14:13.922115708 +0000
++++ b/src/core/modules/atomic/document/pdf_metadata.py	2026-10-21 23:48:52.895967803 +0000
+@@ -209,10 +209,18 @@
+             raise ModuleError(str(e), code="PATH_TRAVERSAL")
+ 
+         if self.keep_backup:
+-            backup_dir = os.path.dirname(self.backup_path)
++            # SECURITY: the backup is an extra file the run writes beside the
++            # result; it gets the same sandbox confinement as the main output
++            # and is validated before its directory is created.
++            try:
++                safe_backup = validate_path_with_env_config(self.backup_path)
++            except PathTraversalError as e:
++                raise ModuleError(str(e), code="PATH_TRAVERSAL")
++            backup_dir = os.path.dirname(safe_backup)
+             if backup_dir and not os.path.exists(backup_dir):
+                 os.makedirs(backup_dir, exist_ok=True)
+-            shutil.copy2(self.input_path, self.backup_path)
++            shutil.copy2(self.input_path, safe_backup)
++            self.backup_path = safe_backup
+ 
+         output_dir = os.path.dirname(output_path)
+         if output_dir and not os.path.exists(output_dir):
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/pdf_to_word.py b/src/core/modules/atomic/document/pdf_to_word.py
+--- a/src/core/modules/atomic/document/pdf_to_word.py	2026-10-17 04:27:57.088186451 +0000
++++ b/src/core/modules/atomic/document/pdf_to_word.py	2026-10-21 23:48:52.895967803 +0000
+@@ -109,6 +109,11 @@
+ 
+     if not os.path.exists(input_path):
+         raise FileNotFoundError(f"PDF file not found: {input_path}")
++
++    # SECURITY: confine the resolved destination (including one derived from
++    # the input path) to the operator's sandbox before creating it.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
+     _ensure_output_dir(output_path)
+ 
+     if ".." in input_path:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/word_parse.py b/src/core/modules/atomic/document/word_parse.py
+--- a/src/core/modules/atomic/document/word_parse.py	2026-10-17 04:27:57.092186447 +0000
++++ b/src/core/modules/atomic/document/word_parse.py	2026-10-21 23:48:52.895967803 +0000
+@@ -117,6 +117,12 @@
+     if not os.path.exists(file_path):
+         raise FileNotFoundError(f"File not found: {file_path}")
+ 
++    if extract_images and images_output_dir:
++        # SECURITY: extracted images are extra files the run writes; confine
++        # their output directory before it is created.
++        from ....utils import validate_path_with_env_config
++        images_output_dir = validate_path_with_env_config(images_output_dir)
++
+     def _parse():
+         try:
+             doc = Document(file_path)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/document/word_to_pdf.py b/src/core/modules/atomic/document/word_to_pdf.py
+--- a/src/core/modules/atomic/document/word_to_pdf.py	2026-10-17 04:27:57.092186447 +0000
++++ b/src/core/modules/atomic/document/word_to_pdf.py	2026-10-21 23:48:52.895967803 +0000
+@@ -94,6 +94,12 @@
+     method = params.get('method', 'auto')
+ 
+     output_path = _resolve_output_path(params, input_path, '.pdf')
++
++    # SECURITY: confine the resolved destination (including one derived from
++    # the input path) to the operator's sandbox before creating it.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     _validate_input_and_prepare_output(input_path, output_path, 'Word')
+ 
+     success, method_used = await _run_conversion(method, input_path, output_path)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/file/copy.py b/src/core/modules/atomic/file/copy.py
+--- a/src/core/modules/atomic/file/copy.py	2026-10-17 04:27:57.092186447 +0000
++++ b/src/core/modules/atomic/file/copy.py	2026-10-21 23:48:52.895967803 +0000
+@@ -91,20 +91,25 @@
+             raise ValueError("source and destination are required")
+ 
+     async def execute(self) -> Any:
++        # SECURITY: the destination (a location the run creates/overwrites) is
++        # confined to the operator's sandbox before any directory is created.
++        from ....utils import validate_path_with_env_config
++        safe_destination = validate_path_with_env_config(self.destination)
++
+         try:
+             if not os.path.exists(self.source):
+                 raise FileNotFoundError(f"Source file not found: {self.source}")
+ 
+-            if os.path.exists(self.destination) and not self.overwrite:
++            if os.path.exists(safe_destination) and not self.overwrite:
+                 raise FileExistsError(f"Destination already exists: {self.destination}")
+ 
+             # Create destination directory if needed
+-            dest_dir = os.path.dirname(self.destination)
++            dest_dir = os.path.dirname(safe_destination)
+             if dest_dir and not os.path.exists(dest_dir):
+                 os.makedirs(dest_dir, exist_ok=True)
+ 
+-            shutil.copy2(self.source, self.destination)
+-            file_size = os.path.getsize(self.destination)
++            shutil.copy2(self.source, safe_destination)
++            file_size = os.path.getsize(safe_destination)
+ 
+             return {
+                 "copied": True,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/file/delete.py b/src/core/modules/atomic/file/delete.py
+--- a/src/core/modules/atomic/file/delete.py	2026-10-17 04:27:57.092186447 +0000
++++ b/src/core/modules/atomic/file/delete.py	2026-10-21 23:48:52.895967803 +0000
+@@ -82,9 +82,14 @@
+             raise ValueError("file_path is required")
+ 
+     async def execute(self) -> Any:
++        # SECURITY: removal is confined to the operator's sandbox.  Validate
++        # before touching the filesystem so a refused run removes nothing.
++        from ....utils import validate_path_with_env_config
++        safe_path = validate_path_with_env_config(self.file_path)
++
+         try:
+-            if os.path.exists(self.file_path):
+-                os.remove(self.file_path)
++            if os.path.exists(safe_path):
++                os.remove(safe_path)
+                 return {
+                     "deleted": True,
+                     "file_path": self.file_path
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/file/move.py b/src/core/modules/atomic/file/move.py
+--- a/src/core/modules/atomic/file/move.py	2026-10-17 04:27:57.092186447 +0000
++++ b/src/core/modules/atomic/file/move.py	2026-10-21 23:48:52.895967803 +0000
+@@ -85,16 +85,23 @@
+             raise ValueError("source and destination are required")
+ 
+     async def execute(self) -> Any:
++        # SECURITY: a move both creates the destination and removes the
++        # source, so both are confined to the operator's sandbox before any
++        # filesystem change (a refused run moves nothing).
++        from ....utils import validate_path_with_env_config
++        safe_source = validate_path_with_env_config(self.source)
++        safe_destination = validate_path_with_env_config(self.destination)
++
+         try:
+-            if not os.path.exists(self.source):
++            if not os.path.exists(safe_source):
+                 raise FileNotFoundError(f"Source file not found: {self.source}")
+ 
+             # Create destination directory if needed
+-            dest_dir = os.path.dirname(self.destination)
++            dest_dir = os.path.dirname(safe_destination)
+             if dest_dir and not os.path.exists(dest_dir):
+                 os.makedirs(dest_dir, exist_ok=True)
+ 
+-            shutil.move(self.source, self.destination)
++            shutil.move(safe_source, safe_destination)
+ 
+             return {
+                 "moved": True,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/git/clone.py b/src/core/modules/atomic/git/clone.py
+--- a/src/core/modules/atomic/git/clone.py	2026-10-17 04:27:57.096186442 +0000
++++ b/src/core/modules/atomic/git/clone.py	2026-10-21 23:48:52.895967803 +0000
+@@ -213,6 +213,11 @@
+     depth = params.get('depth')
+     token = params.get('token')
+ 
++    # SECURITY: cloning creates a directory tree at a caller-supplied
++    # location; confine it to the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    destination = validate_path_with_env_config(destination)
++
+     # SECURITY: reject ext::/file://, option-injecting, and disallowed-scheme URLs
+     # before they reach `git clone` (ext:: transport = arbitrary command execution).
+     try:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/compress.py b/src/core/modules/atomic/image/compress.py
+--- a/src/core/modules/atomic/image/compress.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/compress.py	2026-10-21 23:48:52.895967803 +0000
+@@ -167,6 +167,11 @@
+     original_size = os.path.getsize(input_path)
+     output_path = _resolve_compress_output(input_path, output_path, output_format)
+ 
++    # SECURITY: the resolved destination (including one derived beside the
++    # input) must stay inside the sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _compress():
+         with Image.open(input_path) as img:
+             if img.mode in ('RGBA', 'P') and output_format == 'jpeg':
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/convert.py b/src/core/modules/atomic/image/convert.py
+--- a/src/core/modules/atomic/image/convert.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/convert.py	2026-10-21 23:48:52.895967803 +0000
+@@ -53,7 +53,6 @@
+         base_name = os.path.splitext(input_path)[0]
+         extension = SUPPORTED_FORMATS[output_format][0]
+         output_path = f"{base_name}{extension}"
+-    Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+     return output_path, output_format
+ 
+ 
+@@ -176,6 +175,11 @@
+ 
+     output_path, output_format = _resolve_convert_paths(input_path, output_path, output_format)
+ 
++    # SECURITY: confine the resolved destination before creating anything.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++    Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
++
+     with Image.open(input_path) as img:
+         if resize:
+             img = _apply_resize(img, resize)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/crop.py b/src/core/modules/atomic/image/crop.py
+--- a/src/core/modules/atomic/image/crop.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/crop.py	2026-10-21 23:48:52.895967803 +0000
+@@ -188,6 +188,10 @@
+ 
+     _validate_crop_params(input_path, output_path, left, top, right, bottom)
+ 
++    # SECURITY: the destination must stay inside the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _crop():
+         with Image.open(input_path) as img:
+             original_width, original_height = img.size
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/download.py b/src/core/modules/atomic/image/download.py
+--- a/src/core/modules/atomic/image/download.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/download.py	2026-10-21 23:48:52.895967803 +0000
+@@ -14,7 +14,12 @@
+ 
+ from ...registry import register_module
+ from ...schema import compose, presets
+-from ....utils import validate_url_with_env_config, SSRFError
++from ....utils import (
++    validate_url_with_env_config,
++    validate_path_with_env_config,
++    SSRFError,
++    PathTraversalError,
++)
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -33,7 +38,6 @@
+             filename += '.jpg'
+         output_path = os.path.join(output_dir, filename)
+ 
+-    Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+     return output_path, default_headers
+ 
+ 
+@@ -136,11 +140,17 @@
+         url, parsed, output_path, output_dir, headers
+     )
+ 
+-    # Validate output_path to prevent path traversal
+-    base_real = os.path.realpath(output_dir)
+-    target_real = os.path.realpath(output_path)
+-    if os.path.commonpath([base_real, target_real]) != base_real:
+-        raise Exception('Invalid file path')
++    # SECURITY: the destination must stay inside the operator's sandbox.
++    # A self-referential check against the caller-supplied output_dir is not
++    # enough: both values are attacker-controlled.
++    try:
++        target_real = validate_path_with_env_config(output_path)
++    except PathTraversalError as e:
++        raise ValueError(f"Invalid output path: {e}")
++
++    parent_dir = os.path.dirname(target_real)
++    if parent_dir:
++        os.makedirs(parent_dir, exist_ok=True)
+ 
+     async with aiohttp.ClientSession() as session:
+         async with session.get(
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/gallery_export.py b/src/core/modules/atomic/image/gallery_export.py
+--- a/src/core/modules/atomic/image/gallery_export.py	2026-10-18 19:13:43.002137595 +0000
++++ b/src/core/modules/atomic/image/gallery_export.py	2026-10-21 23:48:52.895967803 +0000
+@@ -152,23 +152,25 @@
+         if not self.output_dir:
+             raise ValueError("output_dir is required")
+ 
+-    def _clear_existing_files(self) -> None:
+-        if not os.path.isdir(self.output_dir):
++    def _clear_existing_files(self, safe_dir: str) -> None:
++        if not os.path.isdir(safe_dir):
+             return
+-        for entry in os.listdir(self.output_dir):
+-            path = os.path.join(self.output_dir, entry)
++        for entry in os.listdir(safe_dir):
++            path = os.path.join(safe_dir, entry)
+             if os.path.isfile(path) or os.path.islink(path):
+                 os.remove(path)
+ 
+     async def execute(self) -> Dict[str, Any]:
+-        if self.clear_existing:
+-            await asyncio.to_thread(self._clear_existing_files)
+-
+         try:
+             safe_dir = validate_path_with_env_config(self.output_dir)
+         except PathTraversalError as e:
+             raise ModuleError(str(e), code="PATH_TRAVERSAL")
+ 
++        # SECURITY: validate before any destructive work.  Clearing must only
++        # ever touch the confirmed-inside-sandbox directory.
++        if self.clear_existing:
++            await asyncio.to_thread(self._clear_existing_files, safe_dir)
++
+         os.makedirs(safe_dir, exist_ok=True)
+ 
+         written = []
+@@ -176,7 +178,14 @@
+             if not os.path.exists(image_path):
+                 raise FileNotFoundError(f"Image not found: {image_path}")
+             base_name = os.path.basename(image_path)
+-            target = os.path.join(safe_dir, f'{self.prefix}{base_name}')
++            try:
++                # SECURITY: prefix is joined into the file name, so it is
++                # confined exactly like a path (absolute or `..` escapes).
++                target = validate_path_with_env_config(
++                    os.path.join(safe_dir, f'{self.prefix}{base_name}')
++                )
++            except PathTraversalError as e:
++                raise ModuleError(str(e), code="PATH_TRAVERSAL")
+             shutil.copy2(image_path, target)
+             written.append(target)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/qrcode_generate.py b/src/core/modules/atomic/image/qrcode_generate.py
+--- a/src/core/modules/atomic/image/qrcode_generate.py	2026-10-17 04:27:57.100186438 +0000
++++ b/src/core/modules/atomic/image/qrcode_generate.py	2026-10-21 23:48:52.895967803 +0000
+@@ -53,6 +53,12 @@
+     output_path = p['output_path']
+     if p['output_format'] == 'svg' and output_path.endswith('.png'):
+         output_path = output_path[:-4] + '.svg'
++
++    # SECURITY: confine the resolved destination (including the module's
++    # derived default) before creating its directory.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     output_dir = os.path.dirname(output_path)
+     if output_dir and not os.path.exists(output_dir):
+         os.makedirs(output_dir)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/resize.py b/src/core/modules/atomic/image/resize.py
+--- a/src/core/modules/atomic/image/resize.py	2026-10-17 04:27:57.104186434 +0000
++++ b/src/core/modules/atomic/image/resize.py	2026-10-21 23:48:52.895967803 +0000
+@@ -150,6 +150,11 @@
+         base, ext = os.path.splitext(input_path)
+         output_path = f"{base}_resized{ext}"
+ 
++    # SECURITY: the resolved destination (including one derived beside the
++    # input) must stay inside the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _resize():
+         with Image.open(input_path) as img:
+             original_width, original_height = img.size
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/rotate.py b/src/core/modules/atomic/image/rotate.py
+--- a/src/core/modules/atomic/image/rotate.py	2026-10-17 04:27:57.104186434 +0000
++++ b/src/core/modules/atomic/image/rotate.py	2026-10-21 23:48:52.895967803 +0000
+@@ -175,6 +175,10 @@
+ 
+     _validate_rotate_params(input_path, output_path, angle)
+ 
++    # SECURITY: the destination must stay inside the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _rotate():
+         with Image.open(input_path) as img:
+             fill_rgb = _hex_to_rgb(fill_color)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/thumbnail.py b/src/core/modules/atomic/image/thumbnail.py
+--- a/src/core/modules/atomic/image/thumbnail.py	2026-10-18 19:13:37.446141526 +0000
++++ b/src/core/modules/atomic/image/thumbnail.py	2026-10-21 23:48:52.895967803 +0000
+@@ -167,12 +167,14 @@
+ 
+     try:
+         safe_dir = validate_path_with_env_config(output_dir)
++        stem = _thumbnail_stem(input_path, name)
++        # SECURITY: `name` is joined into the output location, so it gets the
++        # same confinement as a spelled-out path (absolute or `..` escapes).
++        target = validate_path_with_env_config(os.path.join(safe_dir, f'{stem}.png'))
+     except PathTraversalError as e:
+         raise ModuleError(str(e), code="PATH_TRAVERSAL")
+ 
+     os.makedirs(safe_dir, exist_ok=True)
+-    stem = _thumbnail_stem(input_path, name)
+-    target = os.path.join(safe_dir, f'{stem}.png')
+ 
+     await asyncio.to_thread(_render_thumbnail, input_path, target, size)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/image/watermark.py b/src/core/modules/atomic/image/watermark.py
+--- a/src/core/modules/atomic/image/watermark.py	2026-10-17 04:27:57.104186434 +0000
++++ b/src/core/modules/atomic/image/watermark.py	2026-10-21 23:48:52.895967803 +0000
+@@ -246,6 +246,10 @@
+     _validate_watermark_params(input_path, output_path, text, watermark_image_path)
+     opacity = max(0.0, min(1.0, float(opacity)))
+ 
++    # SECURITY: the destination must stay inside the operator's sandbox.
++    from ....utils import validate_path_with_env_config
++    output_path = validate_path_with_env_config(output_path)
++
+     def _apply_watermark():
+         with Image.open(input_path) as base_img:
+             if base_img.mode != 'RGBA':
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/llm/code_fix.py b/src/core/modules/atomic/llm/code_fix.py
+--- a/src/core/modules/atomic/llm/code_fix.py	2026-10-17 04:27:57.104186434 +0000
++++ b/src/core/modules/atomic/llm/code_fix.py	2026-10-21 23:48:52.899967799 +0000
+@@ -217,9 +217,12 @@
+ 
+             if fix_mode == 'apply':
+                 path = Path(file_path).expanduser()
+-                
+-                if '..' in file_path:
+-                    raise Exception('Invalid file path')
++
++                # SECURITY: the fixed file and its backup are locations the
++                # run overwrites/creates; confine them to the sandbox.
++                from ....utils import validate_path_with_env_config
++                path = Path(validate_path_with_env_config(str(path)))
++                file_path = str(path)
+ 
+                 # Create backup
+                 if backup:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/meta/update_docs.py b/src/core/modules/atomic/meta/update_docs.py
+--- a/src/core/modules/atomic/meta/update_docs.py	2026-10-17 04:27:57.108186428 +0000
++++ b/src/core/modules/atomic/meta/update_docs.py	2026-10-21 23:48:52.899967799 +0000
+@@ -100,6 +100,11 @@
+         # Generate markdown
+         content = self._generate_markdown(by_category)
+ 
++        # SECURITY: confine the destination (including the module's derived
++        # default) to the operator's sandbox.
++        from ....utils import validate_path_with_env_config
++        self.output_path = validate_path_with_env_config(self.output_path)
++
+         # Write to file
+         with open(self.output_path, 'w', encoding='utf-8') as f:
+             f.write(content)
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/process/start.py b/src/core/modules/atomic/process/start.py
+--- a/src/core/modules/atomic/process/start.py	2026-10-17 04:27:57.108186428 +0000
++++ b/src/core/modules/atomic/process/start.py	2026-10-21 23:48:52.899967799 +0000
+@@ -186,8 +186,10 @@
+     # Open log file if specified
+     log_handle = None
+     if log_file:
+-        if '..' in log_file:
+-            raise Exception('Invalid file path')
++        # SECURITY: the log file is appended to by this run, so it is
++        # confined to the operator's sandbox.
++        from ....utils import validate_path_with_env_config
++        log_file = validate_path_with_env_config(log_file)
+         log_handle = open(log_file, 'a', encoding='utf-8')
+ 
+     try:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/ssh/sftp_download.py b/src/core/modules/atomic/ssh/sftp_download.py
+--- a/src/core/modules/atomic/ssh/sftp_download.py	2026-10-17 04:27:57.112186424 +0000
++++ b/src/core/modules/atomic/ssh/sftp_download.py	2026-10-21 23:48:52.899967799 +0000
+@@ -113,6 +113,13 @@
+     remote_path = params['remote_path']
+     local_path = params['local_path']
+ 
++    # SECURITY: the downloaded file is a location the run creates/overwrites;
++    # confine it to the operator's sandbox before any other work.
++    from ....utils import validate_path_with_env_config
++    local_path = validate_path_with_env_config(
++        os.path.abspath(os.path.expanduser(local_path))
++    )
++
+     if not password and not private_key:
+         return {
+             'ok': False,
+@@ -121,7 +128,6 @@
+         }
+ 
+     # Ensure local directory exists
+-    local_path = os.path.abspath(os.path.expanduser(local_path))
+     local_dir = os.path.dirname(local_path)
+     if not os.path.isdir(local_dir):
+         try:
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/verify/annotate.py b/src/core/modules/atomic/verify/annotate.py
+--- a/src/core/modules/atomic/verify/annotate.py	2026-10-17 04:27:57.120186416 +0000
++++ b/src/core/modules/atomic/verify/annotate.py	2026-10-21 23:48:52.899967799 +0000
+@@ -197,6 +197,11 @@
+         if not Path(self.image_path).exists():
+             return {'ok': False, 'error': f'Image not found: {self.image_path}'}
+ 
++        # SECURITY: the annotated image is written to a caller-supplied (or
++        # derived) location; confine it to the sandbox before drawing.
++        from ....utils import validate_path_with_env_config
++        self.output_path = validate_path_with_env_config(self.output_path)
++
+         result = draw_annotations(self.image_path, self.annotations, self.output_path)
+ 
+         return {
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/verify/report.py b/src/core/modules/atomic/verify/report.py
+--- a/src/core/modules/atomic/verify/report.py	2026-10-17 04:27:57.120186416 +0000
++++ b/src/core/modules/atomic/verify/report.py	2026-10-21 23:48:52.899967799 +0000
+@@ -78,6 +78,11 @@
+             self.results = [result.to_dict() if hasattr(result, 'to_dict') else result]
+ 
+     async def execute(self) -> Dict[str, Any]:
++        # SECURITY: the output directory and the report name joined into it
++        # are both confined to the sandbox before anything is created.
++        from ....utils import validate_path_with_env_config
++        safe_dir = validate_path_with_env_config(str(self.output_dir))
++        self.output_dir = Path(safe_dir)
+         self.output_dir.mkdir(parents=True, exist_ok=True)
+ 
+         # Calculate summary
+@@ -111,17 +116,17 @@
+         report_paths = {}
+ 
+         if self.format in ('html', 'all'):
+-            path = self.output_dir / f'{self.name}.html'
++            path = Path(validate_path_with_env_config(str(self.output_dir / f'{self.name}.html')))
+             path.write_text(self._generate_html(report_data), encoding='utf-8')
+             report_paths['html'] = str(path)
+ 
+         if self.format in ('json', 'all'):
+-            path = self.output_dir / f'{self.name}.json'
++            path = Path(validate_path_with_env_config(str(self.output_dir / f'{self.name}.json')))
+             path.write_text(json.dumps(report_data, indent=2, ensure_ascii=False), encoding='utf-8')
+             report_paths['json'] = str(path)
+ 
+         if self.format in ('markdown', 'all'):
+-            path = self.output_dir / f'{self.name}.md'
++            path = Path(validate_path_with_env_config(str(self.output_dir / f'{self.name}.md')))
+             path.write_text(self._generate_markdown(report_data), encoding='utf-8')
+             report_paths['markdown'] = str(path)
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/verify/visual_diff.py b/src/core/modules/atomic/verify/visual_diff.py
+--- a/src/core/modules/atomic/verify/visual_diff.py	2026-10-17 04:27:57.120186416 +0000
++++ b/src/core/modules/atomic/verify/visual_diff.py	2026-10-21 23:48:52.899967799 +0000
+@@ -344,6 +344,10 @@
+             raise ValueError("dev_url is required")
+ 
+     async def execute(self) -> Dict[str, Any]:
++        # SECURITY: all screenshots and the report are written under
++        # output_dir; confine it to the sandbox before creating anything.
++        from ....utils import validate_path_with_env_config
++        self.output_dir = Path(validate_path_with_env_config(str(self.output_dir)))
+         self.output_dir.mkdir(parents=True, exist_ok=True)
+         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+ 
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/atomic/warroom/report.py b/src/core/modules/atomic/warroom/report.py
+--- a/src/core/modules/atomic/warroom/report.py	2026-10-17 04:27:57.124186411 +0000
++++ b/src/core/modules/atomic/warroom/report.py	2026-10-21 23:48:52.899967799 +0000
+@@ -60,6 +60,10 @@
+         report = evidence_to_markdown(pack) if self.format == "markdown" else to_json(pack)
+         path_value = self.params.get("output_path") or ""
+         if path_value:
++            # SECURITY: confine the report destination to the sandbox before
++            # creating its directory.
++            from ....utils import validate_path_with_env_config
++            path_value = validate_path_with_env_config(path_value)
+             path = Path(path_value)
+             path.parent.mkdir(parents=True, exist_ok=True)
+             path.write_text(report, encoding="utf-8")
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/base.py b/src/core/modules/base.py
+--- a/src/core/modules/base.py	2026-10-17 04:27:57.124186411 +0000
++++ b/src/core/modules/base.py	2026-10-21 23:48:52.899967799 +0000
+@@ -93,11 +93,20 @@
+         self.params = params
+         self.context = context
+ 
++        # SECURITY: refuse caller-declared output locations that escape the
++        # operator's sandbox before validate_params() can create anything.
++        self._enforce_output_sandbox()
++
+         if self.auto_validate_schema and self.module_id:
+             self._auto_validate_schema()
+ 
+         self.validate_params()
+ 
++    def _enforce_output_sandbox(self) -> None:
++        """Confine caller-declared output location parameters to the sandbox."""
++        from ..utils import validate_output_params
++        validate_output_params(self.params)
++
+     def _auto_validate_schema(self) -> None:
+         """Validate params against registry schema if available."""
+         from .registry import ModuleRegistry
+@@ -231,6 +240,12 @@
+         # Get module metadata for Phase 2 settings
+         metadata = ModuleRegistry.get_metadata(self.module_id) or {}
+ 
++        # SECURITY: re-check the output-location parameters at the single
++        # execution chokepoint.  Function-style modules use a wrapper that
++        # bypasses __init__, and item execution mutates params, so the check
++        # must run again here, before any module code touches the filesystem.
++        self._enforce_output_sandbox()
++
+         # SECURITY: single execution chokepoint. Every module — including those
+         # reached via flow.invoke / template.invoke / flow.subflow / foreach /
+         # composite sub-nodes / agent-chosen tools — runs through here, so a
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/registry/decorators.py b/src/core/modules/registry/decorators.py
+--- a/src/core/modules/registry/decorators.py	2026-10-17 04:27:57.132186402 +0000
++++ b/src/core/modules/registry/decorators.py	2026-10-21 23:48:52.899967799 +0000
+@@ -89,6 +89,9 @@
+         def __init__(self, params: Dict[str, Any], context: Dict[str, Any]):
+             self.params = params
+             self.context = context
++            # SECURITY: function-style modules bypass BaseModule.__init__;
++            # enforce the sandbox on declared output locations here.
++            self._enforce_output_sandbox()
+ 
+         def validate_params(self) -> None:
+             pass
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/modules/third_party/cloud/storage.py b/src/core/modules/third_party/cloud/storage.py
+--- a/src/core/modules/third_party/cloud/storage.py	2026-10-17 04:27:57.140186393 +0000
++++ b/src/core/modules/third_party/cloud/storage.py	2026-10-21 23:48:52.899967799 +0000
+@@ -398,6 +398,11 @@
+     key = params['key']
+     file_path = params.get('file_path')
+ 
++    if file_path:
++        # SECURITY: a download destination is a location the run creates.
++        from ....utils import validate_path_with_env_config
++        file_path = validate_path_with_env_config(file_path)
++
+     session = aioboto3.Session(
+         aws_access_key_id=aws_access_key_id,
+         aws_secret_access_key=aws_secret_access_key,
+diff -ruN '--exclude=__pycache__' '--exclude=*.pyc' a/src/core/utils.py b/src/core/utils.py
+--- a/src/core/utils.py	2026-10-17 04:27:57.148186383 +0000
++++ b/src/core/utils.py	2026-10-21 23:48:52.899967799 +0000
+@@ -639,6 +639,16 @@
+     if not path:
+         raise ValueError("Path cannot be empty")
+ 
++    if isinstance(path, os.PathLike):
++        path = os.fspath(path)
++    if not isinstance(path, str):
++        raise ValueError(f"Path must be a string, got {type(path).__name__}")
++
++    # A NUL byte can truncate the path at the syscall boundary; refuse it
++    # rather than letting the OS see a different location than we validated.
++    if "\x00" in path:
++        raise PathTraversalError(f"Path contains a NUL byte: {path!r}")
++
+     # Expand user home directory
+     expanded_path = os.path.expanduser(path)
+ 
+@@ -658,9 +668,17 @@
+     if base_dir:
+         base_canonical = os.path.realpath(os.path.expanduser(base_dir))
+ 
+-        # Ensure canonical path starts with base directory
+-        # Add trailing separator to prevent /tmp/evil matching /tmp/
+-        if not canonical_path.startswith(base_canonical + os.sep) and canonical_path != base_canonical:
++        # Ensure canonical path starts with base directory.
++        # Compare path components (not raw text) so that sibling prefixes
++        # such as /srv/sandbox-evil cannot masquerade as /srv/sandbox.
++        if base_canonical == os.sep:
++            within_base = canonical_path.startswith(os.sep)
++        else:
++            within_base = (
++                canonical_path == base_canonical
++                or canonical_path.startswith(base_canonical + os.sep)
++            )
++        if not within_base:
+             raise PathTraversalError(
+                 f"Path escapes base directory: {path} "
+                 f"(resolves to {canonical_path}, outside {base_canonical})"
+@@ -723,6 +741,71 @@
+     return validate_path_safe(path, **config)
+ 
+ 
++def resolve_sandbox_path(path: str) -> str:
++    """Validate a caller-supplied location and return its canonical form.
++
++    Convenience wrapper used by modules that create, overwrite, append to or
++    remove a file/directory: the returned path is guaranteed to live inside
++    the operator's sandbox (FLYTO_SANDBOX_DIR, or the working directory when
++    it is unset).  Raises PathTraversalError otherwise.
++    """
++    return validate_path_with_env_config(path)
++
++
++def join_sandbox_path(base_dir: str, *parts: str) -> str:
++    """Join caller-supplied name parts onto ``base_dir`` and confine the result.
++
++    Use this whenever a name, label, prefix or file name is concatenated into
++    a location: an absolute value, ``..`` segment or symlink in ``parts`` must
++    not move the write outside the sandbox.
++    """
++    return validate_path_with_env_config(os.path.join(base_dir, *parts))
++
++
++# Parameters that unambiguously name a location a module creates, overwrites,
++# appends to or removes.  Modules declare their own schema, but this list is
++# also enforced centrally before execution so a module can never grow a new
++# file-writing path that forgets to validate it.  Read-only parameters
++# (input_path, source, template, files, archive_path, ...) are deliberately
++# excluded: reading input files is out of scope.
++OUTPUT_LOCATION_PARAMS = frozenset({
++    'output_path',
++    'output_dir',
++    'output_file',
++    'output',
++    'destination',
++    'destination_path',
++    'save_path',
++    'backup_path',
++    'images_output_dir',
++    'log_file',
++    'hash_file',
++})
++
++
++def validate_output_params(params: Optional[Dict[str, Any]]) -> None:
++    """Refuse a run whose declared output locations escape the sandbox.
++
++    Called before module code runs (see ``BaseModule``), so a refused run
++    cannot create directories or files first.
++    """
++    if not isinstance(params, dict):
++        return
++
++    for name in sorted(OUTPUT_LOCATION_PARAMS):
++        value = params.get(name)
++        if isinstance(value, os.PathLike):
++            value = os.fspath(value)
++        if not isinstance(value, str) or not value:
++            continue
++        try:
++            validate_path_with_env_config(value)
++        except PathTraversalError as exc:
++            raise PathTraversalError(
++                f"Refusing {name} outside the sandbox: {exc}"
++            ) from exc
++
++
+ # =============================================================================
+ # SQL Identifier Validation
+ # =============================================================================

@@ -1,0 +1,249 @@
+diff -ruN a/playlist/playlist.go b/playlist/playlist.go
+--- a/playlist/playlist.go	2026-10-26 02:17:23.000000000 +0000
++++ b/playlist/playlist.go	2026-10-26 05:06:05.345199378 +0000
+@@ -19,6 +19,7 @@
+ 	ErrInvalidPathFormat = errors.New("invalid path format")
+ 	ErrInvalidBasePath   = errors.New("invalid base path")
+ 	ErrNoUserPrefix      = errors.New("no user prefix")
++	ErrOutsideStore      = errors.New("path is outside the playlist store")
+ )
+ 
+ const (
+@@ -57,6 +58,58 @@
+ 	return s.basePath
+ }
+ 
++// resolve maps a caller-supplied relative playlist path onto the location the
++// store will operate on. It returns the absolute path and the same path in its
++// cleaned, store-relative form. Every operation takes both its filesystem
++// target and the playlist's stored metadata (user id, name) from this one
++// value, so "." and ".." segments can neither leave the store nor disguise the
++// user a playlist is filed under. Paths that stay outside the store, and the
++// store directory itself, are refused.
++func (s *Store) resolve(relPath string) (absPath, cleanRel string, err error) {
++	baseAbs, err := filepath.Abs(s.basePath)
++	if err != nil {
++		return "", "", fmt.Errorf("resolve playlist base: %w", err)
++	}
++	absPath, err = filepath.Abs(filepath.Join(baseAbs, relPath))
++	if err != nil {
++		return "", "", fmt.Errorf("resolve playlist path: %w", err)
++	}
++	cleanRel, err = filepath.Rel(baseAbs, absPath)
++	if err != nil {
++		return "", "", fmt.Errorf("resolve playlist path: %w", err)
++	}
++	if cleanRel == "." {
++		return "", "", fmt.Errorf("%w: empty path", ErrInvalidPathFormat)
++	}
++	if cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(filepath.Separator)) {
++		return "", "", fmt.Errorf("%w: %q", ErrOutsideStore, relPath)
++	}
++	return absPath, cleanRel, nil
++}
++
++// AbsPath returns the absolute location relPath names inside the store, or an
++// error when it would leave the store. Callers outside the store that need to
++// look at a playlist's neighbourhood (its cover image, say) should use this
++// rather than joining BasePath themselves.
++func (s *Store) AbsPath(relPath string) (string, error) {
++	absPath, _, err := s.resolve(relPath)
++	if err != nil {
++		return "", err
++	}
++	return absPath, nil
++}
++
++// PathOwner reports the user id that the storage layout assigns to relPath,
++// using the same cleaning the store's own operations use. It errors when
++// relPath leaves the store.
++func (s *Store) PathOwner(relPath string) (int, error) {
++	_, cleanRel, err := s.resolve(relPath)
++	if err != nil {
++		return 0, err
++	}
++	return userIDFromPath(cleanRel)
++}
++
+ // List finds playlist items in s.basePath.
+ // the expected format is <base path>/<user id>/**/<playlist name>.m3u
+ func (s *Store) List() ([]string, error) {
+@@ -92,7 +145,10 @@
+ 		return nil, err
+ 	}
+ 
+-	absPath := filepath.Join(s.basePath, relPath)
++	absPath, cleanRel, err := s.resolve(relPath)
++	if err != nil {
++		return nil, err
++	}
+ 	stat, err := os.Stat(absPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("stat m3u: %w", err)
+@@ -105,12 +161,12 @@
+ 	var playlist Playlist
+ 	playlist.UpdatedAt = stat.ModTime()
+ 
+-	playlist.UserID, err = userIDFromPath(relPath)
++	playlist.UserID, err = userIDFromPath(cleanRel)
+ 	if err != nil {
+ 		playlist.UserID = 1
+ 	}
+ 
+-	playlist.Name = strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
++	playlist.Name = strings.TrimSuffix(filepath.Base(cleanRel), filepath.Ext(cleanRel))
+ 
+ 	file, err := os.Open(absPath)
+ 	if err != nil {
+@@ -150,7 +206,10 @@
+ 		return err
+ 	}
+ 
+-	absPath := filepath.Join(s.basePath, relPath)
++	absPath, _, err := s.resolve(relPath)
++	if err != nil {
++		return err
++	}
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0o777); err != nil {
+ 		return fmt.Errorf("make m3u base dir: %w", err)
+ 	}
+@@ -203,7 +262,11 @@
+ 		return err
+ 	}
+ 
+-	return os.Remove(filepath.Join(s.basePath, relPath))
++	absPath, _, err := s.resolve(relPath)
++	if err != nil {
++		return err
++	}
++	return os.Remove(absPath)
+ }
+ 
+ func firstPathEl(path string) string {
+diff -ruN a/server/ctrlsubsonic/handlers_playlist.go b/server/ctrlsubsonic/handlers_playlist.go
+--- a/server/ctrlsubsonic/handlers_playlist.go	2026-10-26 02:17:23.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_playlist.go	2026-10-26 05:06:25.613181166 +0000
+@@ -35,7 +35,7 @@
+ 		if err != nil {
+ 			return spec.NewError(0, "error reading playlist %q: %v", path, err)
+ 		}
+-		if playlist.UserID != user.ID && !playlist.IsPublic {
++		if !playlistVisible(playlist, user.ID) {
+ 			continue
+ 		}
+ 		playlistID := playlistIDEncode(path)
+@@ -49,6 +49,7 @@
+ }
+ 
+ func (c *Controller) ServeGetPlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+@@ -58,6 +59,9 @@
+ 	if err != nil {
+ 		return spec.NewError(70, "playlist with id %s not found", playlistID)
+ 	}
++	if !playlistVisible(playlist, user.ID) {
++		return spec.NewError(50, "you aren't allowed to read that user's playlist")
++	}
+ 	sub := spec.NewResponse()
+ 	rendered, err := playlistRender(c, params, playlist, playlistID, true)
+ 	if err != nil {
+@@ -76,15 +80,26 @@
+ 
+ 	var playlist playlistp.Playlist
+ 	if playlistPath != "" {
+-		if pl, err := c.playlistStore.Read(playlistPath); err != nil && pl != nil {
+-			playlist = *pl
++		stored, err := c.playlistStore.Read(playlistPath)
++		switch {
++		case err == nil:
++			// an existing playlist may only be changed by its owner, and who
++			// that is comes from the playlist as stored
++			if stored.UserID != user.ID {
++				return spec.NewError(50, "you aren't allowed update that user's playlist")
++			}
++			playlist = *stored
++		default:
++			// nothing stored here yet, so this call would create the playlist
++			// at a caller-chosen spot. The storage layout files playlists
++			// under their owner's id; that owner has to be the caller.
++			owner, err := c.playlistStore.PathOwner(playlistPath)
++			if err != nil || owner != user.ID {
++				return spec.NewError(50, "you aren't allowed write that user's playlist")
++			}
+ 		}
+ 	}
+ 
+-	if playlist.UserID != 0 && playlist.UserID != user.ID {
+-		return spec.NewError(50, "you aren't allowed update that user's playlist")
+-	}
+-
+ 	playlist.UserID = user.ID
+ 	playlist.UpdatedAt = time.Now()
+ 
+@@ -135,8 +150,8 @@
+ 	}
+ 
+ 	// update meta info
+-	if playlist.UserID != 0 && playlist.UserID != user.ID {
+-		return spec.NewResponse()
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed update that user's playlist")
+ 	}
+ 
+ 	if val, err := params.Get("name"); err == nil {
+@@ -175,17 +190,33 @@
+ }
+ 
+ func (c *Controller) ServeDeletePlaylist(r *http.Request) *spec.Response {
++	user := r.Context().Value(CtxUser).(*db.User)
+ 	params := r.Context().Value(CtxParams).(params.Params)
+ 	playlistID, err := params.GetFirstID("id", "playlistId")
+ 	if err != nil {
+ 		return spec.NewError(10, "please provide an `id` or `playlistId` parameter")
+ 	}
+-	if err := c.playlistStore.Delete(playlistIDDecode(playlistID)); err != nil {
++	playlistPath := playlistIDDecode(playlistID)
++	playlist, err := c.playlistStore.Read(playlistPath)
++	if err != nil {
++		return spec.NewError(70, "playlist with id %s not found", playlistID)
++	}
++	if playlist.UserID != user.ID {
++		return spec.NewError(50, "you aren't allowed to delete that user's playlist")
++	}
++	if err := c.playlistStore.Delete(playlistPath); err != nil {
+ 		return spec.NewError(0, "delete playlist: %v", err)
+ 	}
+ 	return spec.NewResponse()
+ }
+ 
++// playlistVisible reports whether userID may see the playlist at all. Reading
++// one playlist by id and listing every playlist have to answer this the same
++// way, so both go through here.
++func playlistVisible(playlist *playlistp.Playlist, userID int) bool {
++	return playlist.UserID == userID || playlist.IsPublic
++}
++
+ func playlistIDEncode(path string) specid.ID {
+ 	return specid.ID{
+ 		Type:        specid.Playlist,
+diff -ruN a/server/ctrlsubsonic/handlers_raw.go b/server/ctrlsubsonic/handlers_raw.go
+--- a/server/ctrlsubsonic/handlers_raw.go	2026-10-26 02:17:23.000000000 +0000
++++ b/server/ctrlsubsonic/handlers_raw.go	2026-10-26 05:06:27.997179023 +0000
+@@ -242,8 +242,12 @@
+ 
+ func coverForPlaylist(playlistStore *playlist.Store, id specid.ID) (*os.File, error) {
+ 	playlistPath := playlistIDDecode(id)
+-	playlistDir := filepath.Join(playlistStore.BasePath(), filepath.Dir(playlistPath))
+-	playlistBase := strings.TrimSuffix(filepath.Base(playlistPath), filepath.Ext(playlistPath))
++	absPlaylistPath, err := playlistStore.AbsPath(playlistPath)
++	if err != nil {
++		return nil, fmt.Errorf("contain playlist path: %w", err)
++	}
++	playlistDir := filepath.Dir(absPlaylistPath)
++	playlistBase := strings.TrimSuffix(filepath.Base(absPlaylistPath), filepath.Ext(absPlaylistPath))
+ 
+ 	entries, err := os.ReadDir(playlistDir)
+ 	if err != nil {

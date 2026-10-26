@@ -1,0 +1,328 @@
+diff --git a/src/mcp/server/experimental/task_context.py b/src/mcp/server/experimental/task_context.py
+index e6e14fc..037ee9b 100644
+--- a/src/mcp/server/experimental/task_context.py
++++ b/src/mcp/server/experimental/task_context.py
+@@ -12,6 +12,7 @@ from typing import Any
+ import anyio
+ 
+ from mcp.server.experimental.task_result_handler import TaskResultHandler
++from mcp.server.experimental import task_watch
+ from mcp.server.session import ServerSession
+ from mcp.server.validation import validate_sampling_tools, validate_tool_use_result_messages
+ from mcp.shared.exceptions import McpError
+@@ -161,21 +162,22 @@ class ServerTaskContext:
+     async def _send_notification(self) -> None:
+         """Send a task status notification to the client."""
+         task = self._ctx.task
+-        await self._session.send_notification(
+-            ServerNotification(
+-                TaskStatusNotification(
+-                    params=TaskStatusNotificationParams(
+-                        taskId=task.taskId,
+-                        status=task.status,
+-                        statusMessage=task.statusMessage,
+-                        createdAt=task.createdAt,
+-                        lastUpdatedAt=task.lastUpdatedAt,
+-                        ttl=task.ttl,
+-                        pollInterval=task.pollInterval,
+-                    )
++        notification = ServerNotification(
++            TaskStatusNotification(
++                params=TaskStatusNotificationParams(
++                    taskId=task.taskId,
++                    status=task.status,
++                    statusMessage=task.statusMessage,
++                    createdAt=task.createdAt,
++                    lastUpdatedAt=task.lastUpdatedAt,
++                    ttl=task.ttl,
++                    pollInterval=task.pollInterval,
+                 )
+             )
+         )
++        await self._session.send_notification(notification)
++        # Clients that asked to follow this task instead of polling also hear about it.
++        await task_watch.publish(notification, task.taskId, sender=self._session)
+ 
+     # Server-specific methods: elicitation and sampling
+ 
+diff --git a/src/mcp/server/experimental/task_housekeeping.py b/src/mcp/server/experimental/task_housekeeping.py
+new file mode 100644
+index 0000000..3fef91f
+--- /dev/null
++++ b/src/mcp/server/experimental/task_housekeeping.py
+@@ -0,0 +1,67 @@
++"""
++Default handlers for task housekeeping.
++
++A finished task keeps occupying the store until its TTL runs out. ``tasks/delete``
++lets a client drop a task it no longer needs, together with its stored result and
++queued messages, as soon as it is done with it.
++
++WARNING: These APIs are experimental and may change without notice.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Awaitable, Callable
++from typing import TYPE_CHECKING
++
++from mcp.server.experimental.task_watch import registry as watch_registry
++from mcp.shared.exceptions import McpError
++from mcp.shared.experimental.tasks.store import TaskStore
++from mcp.types import (
++    INVALID_PARAMS,
++    DeleteTaskRequest,
++    DeleteTaskResult,
++    ErrorData,
++    ServerResult,
++)
++
++if TYPE_CHECKING:
++    from mcp.server.lowlevel.server import Server
++
++logger = logging.getLogger(__name__)
++
++
++def register_housekeeping_handlers(
++    server: Server,
++    request_handlers: dict[type, Callable[..., Awaitable[ServerResult]]],
++    store: TaskStore,
++) -> None:
++    """Register the default tasks/delete handler.
++
++    The application keeps control: a handler it registered itself is left alone.
++
++    Args:
++        server: The low-level server (for the current request context)
++        request_handlers: The server's request handler table
++        store: The task store to remove tasks from
++    """
++    if DeleteTaskRequest in request_handlers:
++        return
++
++    async def _default_delete_task(req: DeleteTaskRequest) -> ServerResult:
++        session = server.request_context.session
++        deleted = await store.delete_task(req.params.taskId)
++        if not deleted:
++            raise McpError(
++                ErrorData(
++                    code=INVALID_PARAMS,
++                    message=f"Task not found: {req.params.taskId}",
++                )
++            )
++        client_name = session.client_params.clientInfo.name if session.client_params else "uninitialized client"
++        logger.debug("Deleted task %s at the request of %s", req.params.taskId, client_name)
++        # A removed task has no more status changes to report.
++        watch_registry.forget(req.params.taskId)
++        return ServerResult(DeleteTaskResult(taskId=req.params.taskId))
++
++    request_handlers[DeleteTaskRequest] = _default_delete_task
+diff --git a/src/mcp/server/experimental/task_watch.py b/src/mcp/server/experimental/task_watch.py
+new file mode 100644
+index 0000000..33d3d25
+--- /dev/null
++++ b/src/mcp/server/experimental/task_watch.py
+@@ -0,0 +1,109 @@
++"""
++Default handlers for task status subscriptions.
++
++A client that does not want to long-poll ``tasks/result`` can ask to be told
++when a task's status changes instead: ``tasks/watch`` subscribes the calling
++session to that task's status notifications, which are then delivered as
++``notifications/tasks/status`` messages until the task reaches a terminal state.
++
++WARNING: These APIs are experimental and may change without notice.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Awaitable, Callable
++from typing import TYPE_CHECKING
++
++from mcp.shared.exceptions import McpError
++from mcp.shared.experimental.tasks.store import TaskStore
++from mcp.types import (
++    INVALID_PARAMS,
++    ErrorData,
++    ServerNotification,
++    ServerResult,
++    WatchTaskRequest,
++    WatchTaskResult,
++)
++
++if TYPE_CHECKING:
++    from mcp.server.lowlevel.server import Server
++    from mcp.server.session import ServerSession
++
++logger = logging.getLogger(__name__)
++
++
++class TaskWatchRegistry:
++    """Sessions that asked to be told when a task's status changes."""
++
++    def __init__(self) -> None:
++        self._sessions: dict[str, list[ServerSession]] = {}
++
++    def add(self, task_id: str, session: ServerSession) -> None:
++        """Subscribe a session to a task's status notifications."""
++        sessions = self._sessions.setdefault(task_id, [])
++        if session not in sessions:
++            sessions.append(session)
++
++    def sessions_for(self, task_id: str) -> list[ServerSession]:
++        """Return the sessions subscribed to a task."""
++        return list(self._sessions.get(task_id, ()))
++
++    def forget(self, task_id: str) -> None:
++        """Drop every subscription for a task that no longer exists."""
++        self._sessions.pop(task_id, None)
++
++
++registry = TaskWatchRegistry()
++
++
++async def publish(
++    notification: ServerNotification,
++    task_id: str,
++    *,
++    sender: ServerSession,
++) -> None:
++    """Forward a task status notification to the task's subscribers.
++
++    The session that ran the task already receives the notification through its
++    own task context, so it is skipped here.
++    """
++    for session in registry.sessions_for(task_id):
++        if session is sender:
++            continue
++        try:
++            await session.send_notification(notification)
++        except Exception:  # pragma: no cover - a closed peer must not break the task
++            logger.debug("Dropping task notification for an unreachable session", exc_info=True)
++
++
++def register_watch_handlers(
++    server: Server,
++    request_handlers: dict[type, Callable[..., Awaitable[ServerResult]]],
++    store: TaskStore,
++) -> None:
++    """Register the default tasks/watch handler.
++
++    The application keeps control: a handler it registered itself is left alone.
++
++    Args:
++        server: The low-level server (for the current request context)
++        request_handlers: The server's request handler table
++        store: The task store the watched tasks live in
++    """
++    if WatchTaskRequest in request_handlers:
++        return
++
++    async def _default_watch_task(req: WatchTaskRequest) -> ServerResult:
++        task = await store.get_task(req.params.taskId)
++        if task is None:
++            raise McpError(
++                ErrorData(
++                    code=INVALID_PARAMS,
++                    message=f"Task not found: {req.params.taskId}",
++                )
++            )
++        registry.add(req.params.taskId, server.request_context.session)
++        return ServerResult(WatchTaskResult(taskId=req.params.taskId, watching=True))
++
++    request_handlers[WatchTaskRequest] = _default_watch_task
+diff --git a/src/mcp/server/lowlevel/experimental.py b/src/mcp/server/lowlevel/experimental.py
+index 42353e4..b72d120 100644
+--- a/src/mcp/server/lowlevel/experimental.py
++++ b/src/mcp/server/lowlevel/experimental.py
+@@ -9,7 +9,9 @@ import logging
+ from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
+ 
++from mcp.server.experimental.task_housekeeping import register_housekeeping_handlers
+ from mcp.server.experimental.task_support import TaskSupport
++from mcp.server.experimental.task_watch import register_watch_handlers
+ from mcp.server.lowlevel.func_inspection import create_call_wrapper
+ from mcp.shared.exceptions import McpError
+ from mcp.shared.experimental.tasks.helpers import cancel_task
+@@ -122,6 +124,8 @@ class ExperimentalHandlers:
+ 
+         # Auto-register default handlers
+         self._register_default_task_handlers()
++        register_housekeeping_handlers(self._server, self._request_handlers, store)
++        register_watch_handlers(self._server, self._request_handlers, store)
+ 
+         return self._task_support
+ 
+diff --git a/src/mcp/types.py b/src/mcp/types.py
+index 654c006..0d11c6f 100644
+--- a/src/mcp/types.py
++++ b/src/mcp/types.py
+@@ -642,6 +642,47 @@ class CancelTaskResult(Result, Task):
+     """The response to a tasks/cancel request."""
+ 
+ 
++class DeleteTaskRequestParams(RequestParams):
++    model_config = ConfigDict(extra="allow")
++
++    taskId: str
++    """The task identifier to remove."""
++
++
++class DeleteTaskRequest(Request[DeleteTaskRequestParams, Literal["tasks/delete"]]):
++    """A request to remove a task and everything stored for it."""
++
++    method: Literal["tasks/delete"] = "tasks/delete"
++    params: DeleteTaskRequestParams
++
++
++class DeleteTaskResult(Result):
++    """The response to a tasks/delete request."""
++
++    taskId: str
++
++
++class WatchTaskRequestParams(RequestParams):
++    model_config = ConfigDict(extra="allow")
++
++    taskId: str
++    """The task identifier to follow."""
++
++
++class WatchTaskRequest(Request[WatchTaskRequestParams, Literal["tasks/watch"]]):
++    """A request to receive status notifications for a task."""
++
++    method: Literal["tasks/watch"] = "tasks/watch"
++    params: WatchTaskRequestParams
++
++
++class WatchTaskResult(Result):
++    """The response to a tasks/watch request."""
++
++    taskId: str
++    watching: bool
++
++
+ class ListTasksRequest(PaginatedRequest[Literal["tasks/list"]]):
+     """A request to retrieve a list of tasks."""
+ 
+@@ -1808,6 +1849,8 @@ ClientRequestType: TypeAlias = (
+     | GetTaskPayloadRequest
+     | ListTasksRequest
+     | CancelTaskRequest
++    | DeleteTaskRequest
++    | WatchTaskRequest
+ )
+ 
+ 
+@@ -1991,6 +2034,8 @@ ServerResultType: TypeAlias = (
+     | GetTaskPayloadResult
+     | ListTasksResult
+     | CancelTaskResult
++    | DeleteTaskResult
++    | WatchTaskResult
+     | CreateTaskResult
+ )
+ 

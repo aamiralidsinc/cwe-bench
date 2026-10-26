@@ -1,0 +1,242 @@
+diff --git a/yt_dlp/YoutubeDL.py b/yt_dlp/YoutubeDL.py
+--- a/yt_dlp/YoutubeDL.py
++++ b/yt_dlp/YoutubeDL.py
+@@ -159,7 +159,12 @@
+     write_json_file,
+     write_string,
+ )
+-from .utils._utils import _YDLLogger
++from .utils._utils import (
++    _DANGEROUS_EXTENSIONS,
++    _SAFE_DOWNLOAD_EXTENSIONS,
++    _UnsafeExtensionError,
++    _YDLLogger,
++)
+ from .utils.networking import (
+     HTTPHeaderDict,
+     clean_headers,
+@@ -172,6 +177,41 @@
+     import ctypes
+ 
+ 
++def _refuse_unsafe_file_name(func):
++    """Turn an unsafe-extension refusal into a reported download error."""
++    @functools.wraps(func)
++    def run(self, *args, **kwargs):
++        try:
++            return func(self, *args, **kwargs)
++        except _UnsafeExtensionError as err:
++            self.report_error(
++                f'The file extension {err.extension!r} is not allowed: it is chosen by the '
++                f'remote site and would make yt-dlp write an unsafe file type'
++                f'{bug_reports_message(",")}')
++
++    return run
++
++
++# One output-template field, e.g. %(title)s, %(id)03d or %(title&replacement)s
++_OUTTMPL_FIELD_RE = re.compile(r'%\([^)]*\)(?:[#0\-+ ]*\d*(?:\.\d+)?[hlL]?[a-zA-Z])')
++
++
++def _extension_origin(outtmpl):
++    """Classify where the final path component's extension in an output template comes from.
++
++    ``'literal'``  - the dot and the extension are template text (``clip.txt``)
++    ``'field'``    - the extension is (at least partly) the value of a template field
++    ``'whole'``    - the last component is entirely field output
++    """
++    tail = outtmpl.rsplit('/', 1)[-1]
++    # '%%' is an escaped percent sign, not the opening of a field
++    masked = _OUTTMPL_FIELD_RE.sub('\x00', tail.replace('%%', '\x01'))
++    last_field, last_dot = masked.rfind('\x00'), masked.rfind('.')
++    if last_field < 0 or last_dot > last_field:
++        return 'literal'
++    return 'field' if last_dot >= 0 else 'whole'
++
++
+ class YoutubeDL:
+     """YoutubeDL class.
+ 
+@@ -1400,6 +1440,26 @@
+         outtmpl, info_dict = self.prepare_outtmpl(outtmpl, info_dict, *args, **kwargs)
+         return self.escape_outtmpl(outtmpl) % info_dict
+ 
++    def _reject_unsafe_extension(self, outtmpl, filename):
++        """Refuse a name whose file type was chosen by the remote site rather than the user."""
++        if not filename or filename == '-':
++            return
++        ext = os.path.splitext(filename)[1][1:]
++        if not ext or ext == self.params.get('outtmpl_na_placeholder', 'NA'):
++            return
++
++        origin = _extension_origin(outtmpl)
++        if origin == 'literal':
++            return
++        if origin == 'field':
++            # The extension is metadata: only a known-safe type may pass
++            if ext.lower() not in _SAFE_DOWNLOAD_EXTENSIONS:
++                raise _UnsafeExtensionError(ext)
++        elif ext.lower() in _DANGEROUS_EXTENSIONS:
++            # The whole final component is metadata, so only reject known-bad types
++            raise _UnsafeExtensionError(ext)
++
++    @_refuse_unsafe_file_name
+     def _prepare_filename(self, info_dict, *, outtmpl=None, tmpl_type=None):
+         assert None in (outtmpl, tmpl_type), 'outtmpl and tmpl_type are mutually exclusive'
+         if outtmpl is None:
+@@ -1425,6 +1485,7 @@
+                 no_ext, *ext = filename.rsplit('.', 2)
+                 filename = join_nonempty(no_ext[:trim_file_name], *ext, delim='.')
+ 
++            self._reject_unsafe_extension(outtmpl, filename)
+             return filename
+         except ValueError as err:
+             self.report_error('Error in output template: ' + str(err) + ' (encoding: ' + repr(preferredencoding()) + ')')
+@@ -3192,6 +3253,7 @@
+             os.remove(file)
+         return None
+ 
++    @_refuse_unsafe_file_name
+     def process_info(self, info_dict):
+         """Process a single resolved IE result. (Modifies it in-place)"""
+ 
+@@ -3296,7 +3358,9 @@
+                 self.report_warning(
+                     f'Cannot write internet shortcut file because the actual URL of "{info_dict["webpage_url"]}" is unknown')
+                 return True
+-            linkfn = replace_extension(self.prepare_filename(info_dict, 'link'), link_type, info_dict.get('ext'))
++            linkfn = replace_extension(
++                self.prepare_filename(info_dict, 'link'), link_type, info_dict.get('ext'),
++                allowed_exts=tuple(LINK_TEMPLATES))
+             if not self._ensure_dir_exists(encodeFilename(linkfn)):
+                 return False
+             if self.params.get('overwrites', True) and os.path.exists(encodeFilename(linkfn)):
+diff --git a/yt_dlp/utils/_utils.py b/yt_dlp/utils/_utils.py
+--- a/yt_dlp/utils/_utils.py
++++ b/yt_dlp/utils/_utils.py
+@@ -661,6 +661,9 @@
+         result = result.lstrip('.')
+         if not result:
+             result = '_'
++    if result in ('.', '..'):
++        # A lone dot is a relative directory reference; it is never a file name
++        result = '_' * len(result)
+     return result
+ 
+ 
+@@ -2085,17 +2088,55 @@
+         (days, 86400), (hours, 3600), (mins, 60), (secs, 1), (ms, 1)))
+ 
+ 
++def _checked_extension(ext, allowed=()):
++    """Validate an extension that will end up as a file type on disk.
++
++    The extension is refused unless its last dot-separated part is a known-safe type. A
++    shorter extension such as ``en.vtt`` is therefore judged by ``vtt``.
++    """
++    if ext is None:
++        return None
++
++    if not isinstance(ext, str):
++        ext = str(ext)
++    if '/' in ext or '\\' in ext:
++        raise _UnsafeExtensionError(ext)
++
++    head, _, leaf = ext.rpartition('.')
++    if leaf == 'bin':
++        # A generic container; the real type is unknown but certainly not an executable
++        return 'unknown_video'
++    if leaf.lower() not in _SAFE_DOWNLOAD_EXTENSIONS.union(allowed):
++        raise _UnsafeExtensionError(ext)
++    return ext
++
++
++def _checked_infix(ext):
++    """Validate a string that is only inserted into a name, not used as the file type."""
++    if ext is None:
++        return None
++    if not isinstance(ext, str):
++        ext = str(ext)
++    if '/' in ext or '\\' in ext:
++        raise _UnsafeExtensionError(ext)
++    return ext
++
++
+ def prepend_extension(filename, ext, expected_real_ext=None):
+     name, real_ext = os.path.splitext(filename)
+-    return (
+-        f'{name}.{ext}{real_ext}'
+-        if not expected_real_ext or real_ext[1:] == expected_real_ext
+-        else f'{filename}.{ext}')
++    if (not expected_real_ext or real_ext[1:] == expected_real_ext) and real_ext:
++        # `ext` is an infix here; the type of the file is still `real_ext`
++        return f'{name}.{_checked_infix(ext)}{real_ext}'
++    if not expected_real_ext or real_ext[1:] == expected_real_ext:
++        filename = name
++    return f'{filename}.{_checked_extension(ext)}'
+ 
+ 
+-def replace_extension(filename, ext, expected_real_ext=None):
++def replace_extension(filename, ext, expected_real_ext=None, *, allowed_exts=()):
+     name, real_ext = os.path.splitext(filename)
+-    return f'{name if not expected_real_ext or real_ext[1:] == expected_real_ext else filename}.{ext}'
++    if not expected_real_ext or real_ext[1:] == expected_real_ext:
++        filename = name
++    return f'{filename}.{_checked_extension(ext, allowed_exts)}'
+ 
+ 
+ def check_executable(exe, args=[]):
+@@ -5035,6 +5076,53 @@
+ KNOWN_EXTENSIONS = (*MEDIA_EXTENSIONS.video, *MEDIA_EXTENSIONS.audio, *MEDIA_EXTENSIONS.manifests)
+ 
+ 
++# The only file types a download may take when the remote site proposes the extension. This
++# covers media, subtitles, thumbnails, manifests/storyboards and yt-dlp's own working files;
++# anything else (in particular anything executable) is refused before the file is opened.
++_SAFE_DOWNLOAD_EXTENSIONS = frozenset({
++    # yt-dlp's own working files and placeholders
++    'description', 'json', 'meta', 'orig', 'part', 'temp', 'uncut', 'unknown_video', 'ytdl',
++
++    # video
++    *MEDIA_EXTENSIONS.video,
++    'avif', 'ismv', 'm2ts', 'm4s', 'mng', 'mpeg', 'qt', 'swf', 'ts', 'vp9', 'wvm',
++
++    # audio
++    *MEDIA_EXTENSIONS.audio,
++    'isma', 'mid', 'mpga', 'ra',
++
++    # images
++    *MEDIA_EXTENSIONS.thumbnails,
++    'bmp', 'gif', 'heic', 'ico', 'jng', 'jpeg', 'jxl', 'svg', 'tif', 'wbmp',
++
++    # subtitles
++    *MEDIA_EXTENSIONS.subtitles,
++    'dfxp', 'fs', 'ismt', 'sami', 'scc', 'ssa', 'tt', 'ttml',
++
++    # manifests, storyboards and structured sidecars
++    *MEDIA_EXTENSIONS.manifests,
++    *MEDIA_EXTENSIONS.storyboards,
++    'ism', 'm3u', 'sbv', 'xml',
++})
++
++# Types that must never be the result of a download. This applies even when the whole name is
++# produced by remote metadata, where there is no template field boundary to judge an extension
++# against an allow-list.
++_DANGEROUS_EXTENSIONS = frozenset({
++    'apk', 'app', 'bat', 'cmd', 'com', 'cpl', 'desktop', 'dll', 'dylib', 'exe', 'hta', 'inf',
++    'ini', 'jar', 'js', 'jse', 'lnk', 'msi', 'msp', 'pif', 'plist', 'ps1', 'psm1', 'py', 'reg',
++    'scf', 'scr', 'service', 'sh', 'so', 'url', 'vbe', 'vbs', 'webloc', 'wsf', 'wsh',
++})
++
++
++class _UnsafeExtensionError(Exception):
++    """A remote-supplied extension would make yt-dlp create an unsafe file type."""
++
++    def __init__(self, extension):
++        super().__init__(f'unsafe file extension: {extension!r}')
++        self.extension = extension
++
++
+ class RetryManager:
+     """Usage:
+         for retry in RetryManager(...):

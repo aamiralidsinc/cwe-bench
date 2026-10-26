@@ -1,0 +1,70 @@
+diff --git a/python/djust/websocket.py b/python/djust/websocket.py
+index 706cbe4b..0abf992a 100644
+--- a/python/djust/websocket.py
++++ b/python/djust/websocket.py
+@@ -1792,6 +1792,11 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+ 
+         # Instantiate the view
+         try:
++            # Remember whichever view this consumer was serving before this
++            # attempt, so a refused mount inside a multiplexed batch can put
++            # the surviving sibling back instead of leaving the consumer with
++            # no event target at all.
++            self._pre_mount_view = getattr(self, "view_instance", None)
+             self.view_instance = view_class()
+ 
+             # Store reference to WS consumer for streaming support
+@@ -1977,12 +1982,19 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+                 await self.close(code=4403)
+                 return
+             if redirect_url:
++                # The view never mounted. Send the redirect frame so a browser
++                # navigates, then make sure the consumer's event target is not
++                # the refused view: restore the previous (batch sibling) or
++                # clear it, and terminate the transport outside a batch.
+                 await self.send_json(
+                     {
+                         "type": "navigate",
+                         "to": redirect_url,
+                     }
+                 )
++                self.view_instance = getattr(self, "_pre_mount_view", None)
++                if not getattr(self, "_mounting_in_batch", False):
++                    await self.close(code=4403)
+                 return
+             # --- End auth check ---
+ 
+@@ -2003,7 +2015,13 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+                 self.view_instance, request, **params
+             )
+             if hook_redirect:
++                # Same shape as the auth refusal above: the view is not
++                # mounted, so it must not remain the consumer's event target
++                # and the transport is terminated outside a batch.
+                 await self.send_json({"type": "navigate", "to": hook_redirect})
++                self.view_instance = getattr(self, "_pre_mount_view", None)
++                if not getattr(self, "_mounting_in_batch", False):
++                    await self.close(code=4403)
+                 return
+             # --- End on_mount hooks ---
+ 
+@@ -2525,6 +2543,11 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+             captured.append(payload)
+ 
+         self.send_json = _collect  # type: ignore[assignment]
++        # A refusal inside a batch must not terminate the shared socket: the
++        # batch reports it as a redirect and keeps serving its siblings. The
++        # previous value is restored on every exit path below.
++        prev_mounting_in_batch = getattr(self, "_mounting_in_batch", False)
++        self._mounting_in_batch = True
+         # Mount-batch is never combined with sticky preservation (sticky
+         # only runs through live_redirect_mount which doesn't batch) or
+         # state_snapshot (snapshot is for popstate restoration, also
+@@ -2554,6 +2577,7 @@ class LiveViewConsumer(AsyncWebsocketConsumer):
+             # Only restore if the try-block didn't already restore (else
+             # we'd double-restore harmlessly). Idempotent.
+             self.send_json = orig_send_json  # type: ignore[assignment]
++            self._mounting_in_batch = prev_mounting_in_batch
+ 
+         # Extract the successful mount frame; any "error" frame means failure.
+         # Fix #4: capture "navigate" frames too — those are emitted when

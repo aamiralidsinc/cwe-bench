@@ -1,0 +1,108 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18114",
+  "advisory_ids": ["GHSA-JCVH-XF52-2CWM", "CVE-2026-73232", "GO-2026-6369"],
+  "repo": "ffuf/ffuf",
+  "pinned_commit": "57da720af7d1b66066cbbde685b49948f886b29c",
+  "fix_commits": ["fb0da86c60443b0dddbc9a86e91e3a6487dff79b"],
+  "trust_decision": {
+    "summary": "ffuf's SimpleRunner.Execute decides how many (possibly decompressed) response bytes it pulls into memory, and the only bound is the compressed Content-Length header, so the answer is 'unbounded' whenever that header is absent, small, or stripped by the transport's transparent gzip decode.",
+    "evidence": ["pkg/runner/simple.go:165-172", "pkg/runner/simple.go:154-157", "pkg/runner/simple.go:202-205"]
+  },
+  "landing_point": {
+    "where": "pkg/runner/simple.go:179-202",
+    "why": "The advisory summary says 'response decompression bomb', so an engineer looks first at the Content-Encoding gzip/br/deflate branches and the io.ReadAll that consumes the decoded stream."
+  },
+  "fix_sites": [
+    {
+      "where": "pkg/runner/simple.go:179-205",
+      "entry_point": "RunnerProvider.Execute as used by the ffuf CLI fuzzing run (main.go:272 -> pkg/ffuf/job.go:409); also reached by autocalibration (pkg/ffuf/autocalibration.go:92) and replay-proxy (pkg/ffuf/job.go:500) through the same method",
+      "module_kind": "runner (HTTP client execution)"
+    }
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "pkg/runner/simple.go:174-178"
+  },
+  "O3_reason_to_dismiss": "The -od / -audit-log raw response dump is optional logging/diagnostic output that never feeds resp.Data, so a solver can call it a neighbouring output feature rather than the response-body read the advisory describes.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Compressed responses under the cap must still be fully decoded so -fs/-fw/-fl matchers and ContentWords/ContentLines see decompressed content, and a body mislabelled 'Content-Encoding: gzip' must still fall back to the raw bytes instead of erroring; an over-broad fix that caps compressed bytes, refuses on decoder error, or stops storing the body breaks both.",
+    "where": "pkg/runner/simple.go:180-191, pkg/runner/simple.go:202-210"
+  },
+  "O6_input_shapes": [
+    "Content-Encoding: gzip with a decodable gzip stream (manual gzip.NewReader branch) - fix.diff:29-32",
+    "Content-Encoding: gzip where gzip.NewReader fails (must fall back to the raw body, not error) - fix.diff:29-32",
+    "Content-Encoding: br (brotli.NewReader) - fix.diff:33-34",
+    "Content-Encoding: deflate (flate.NewReader) - fix.diff:35-36",
+    "no Content-Encoding, plain body - fix.diff:27",
+    "transport-transparently-decoded gzip where the transport strips Content-Encoding and Content-Length - fix.diff:50-53",
+    "chunked response with no Content-Length so the Atoi guard is skipped - fix.diff:50-53",
+    "compressed body whose Content-Length is the small compressed size and passes the 5 MiB header guard - fix.diff:50-53",
+    "body that decompresses to more than MAX_DOWNLOAD_SIZE (capped and marked Cancelled) - fix.diff:54-59",
+    "body that decompresses to at most MAX_DOWNLOAD_SIZE (unchanged, must not be cancelled) - fix.diff:174-194"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "pkg/runner/simple.go:154-157",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "The raw response dump written when -od or -audit-log is set calls httputil.DumpResponse(httpresp, true), which reads the whole body into a bytes.Buffer unbounded, before the new LimitReader is reached; on the default path the transport has already transparently gunzipped, so this is an unbounded decompressed read of the same sink.",
+      "where": "pkg/runner/simple.go:175",
+      "reason_to_dismiss": "Output-directory and audit-log dumping is an optional diagnostic/recording feature, not the fetch path the report describes, and it does not populate resp.Data.",
+      "distance": "same file, ~27 lines above the patched read; reached through the separate -od/-audit-log output feature (main.go:130, main.go:132) whose result writer stores resp.Raw (pkg/output/stdout.go:358)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "pkg/runner/simple.go:175",
+      "sibling": "Route the -od/-audit-log raw response dump through the same bounded reader (dump at most MAX_DOWNLOAD_SIZE bytes) instead of httputil.DumpResponse's unbounded read.",
+      "why_realistic": "A maintainer fixing the decompression bomb would naturally follow the response-dump path in the same function, since the audit log and -od feature also record the response; a follow-up commit adding a cap here is exactly what a second reviewer would file."
+    },
+    {
+      "where": "pkg/runner/simple.go:217-241",
+      "sibling": "A response-side counterpart to Dump(), materialising the response body for replay/reproduction (main.go:430-432 already uses Dump for requests).",
+      "why_realistic": "ffuf already has a public Dump method used to reproduce a request; adding a matching response dump that reads resp.Body would repeat the same unbounded read without the runner's cap."
+    },
+    {
+      "where": "pkg/ffuf/response.go:82-93",
+      "sibling": "NewResponse is the single place an ffuf.Response is built from an *http.Response, so a body-copying or streaming variant added here would re-read the (possibly decompressed) stream without going through Execute's LimitReader.",
+      "why_realistic": "The Response construction point is the obvious place for a maintainer to prefetch or re-materialise the body; the size check lives in the runner, not in this constructor, so the cap would not apply."
+    }
+  ],
+  "O9_family": "CWE-409 decompression bomb / unbounded decompressed-response read (resource exhaustion)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "Go 1.17 module (go.mod:3); `go build ./...` / `go test ./...`; deps declared in go.mod:5-18 and go.sum, no vendor directory",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "No test files in pkg/runner at the pinned commit (only pkg/runner/simple.go and pkg/runner/runner.go); existing suites are in pkg/ffuf, pkg/filter, pkg/output and pkg/input, e.g. pkg/output/audit_test.go:10 and pkg/filter/size_test.go:10; the fix adds the new pkg/runner/simple_test.go (fix.diff:64-194), so it is not in the pinned tree."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/runner/simple.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap the io.ReadAll at pkg/runner/simple.go:202 in io.LimitReader inside the gzip/br/deflate branches (or add a decompressed-size check next to the Content-Length guard), which leaves the -od/-audit-log httputil.DumpResponse read at pkg/runner/simple.go:175 unbounded."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb: repository size was not measured (no shell access under the screening limits); tiny_repo is inferred from the tree listing of ~60 Go files plus a handful of PNGs in _img, with no vendored or fixture data.",
+    "present_in_latest for the O8 route: no latest-release tree was provided, so it is unknown whether the httputil.DumpResponse read at pkg/runner/simple.go:175 is still unbounded today.",
+    "O7: the producer of the decompressed body is net/http's Transport transparent gzip decoder, which is stdlib and not in this tree; pkg/runner/simple.go:154-157 is cited as the call site where that body is produced into the process."
+  ]
+}

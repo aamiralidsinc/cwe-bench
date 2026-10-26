@@ -1,0 +1,205 @@
+diff --git a/filters/filters.go b/filters/filters.go
+index f8316e6..ff11422 100644
+--- a/filters/filters.go
++++ b/filters/filters.go
+@@ -378,6 +378,7 @@ const (
+ 	ConsistentHashBalanceFactorName            = "consistentHashBalanceFactor"
+ 	OpaAuthorizeRequestName                    = "opaAuthorizeRequest"
+ 	OpaAuthorizeRequestWithBodyName            = "opaAuthorizeRequestWithBody"
++	OpaAuthorizeRequestBodyPrefixName          = "opaAuthorizeRequestBodyPrefix"
+ 	OpaServeResponseName                       = "opaServeResponse"
+ 	OpaServeResponseWithReqBodyName            = "opaServeResponseWithReqBody"
+ 	TLSName                                    = "tlsPassClientCertificates"
+diff --git a/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go b/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go
+new file mode 100644
+index 0000000..a84fd04
+--- /dev/null
++++ b/filters/openpolicyagent/internal/envoy/bodyprefixadapter.go
+@@ -0,0 +1,41 @@
++package envoy
++
++import (
++	"fmt"
++	"net/http"
++	"strings"
++
++	ext_authz_v3_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
++	ext_authz_v3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
++)
++
++// AdaptBodyPrefixToExtAuthRequest composes the ext_authz CheckRequest for a
++// filter that evaluates only a bounded prefix of the request body.
++func AdaptBodyPrefixToExtAuthRequest(req *http.Request, metadata *ext_authz_v3_core.Metadata, contextExtensions map[string]string, rawBody []byte) (*ext_authz_v3.CheckRequest, error) {
++	if err := validateURLForInvalidUTF8(req.URL); err != nil {
++		return nil, fmt.Errorf("invalid url: %w", err)
++	}
++
++	headers := make(map[string]string, len(req.Header))
++	for h, vv := range req.Header {
++		headers[strings.ToLower(h)] = strings.Join(vv, ", ")
++	}
++
++	ereq := &ext_authz_v3.CheckRequest{
++		Attributes: &ext_authz_v3.AttributeContext{
++			Request: &ext_authz_v3.AttributeContext_Request{
++				Http: &ext_authz_v3.AttributeContext_HttpRequest{
++					Host:    req.Host,
++					Method:  req.Method,
++					Path:    req.URL.RequestURI(),
++					Headers: headers,
++					RawBody: rawBody,
++				},
++			},
++			ContextExtensions: contextExtensions,
++			MetadataContext:   metadata,
++		},
++	}
++
++	return ereq, nil
++}
+diff --git a/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
+new file mode 100644
+index 0000000..56317e4
+--- /dev/null
++++ b/filters/openpolicyagent/opaauthorizerequest/bodyprefix.go
+@@ -0,0 +1,128 @@
++package opaauthorizerequest
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"net/http"
++	"runtime/pprof"
++	"time"
++
++	"github.com/zalando/skipper/filters"
++	"github.com/zalando/skipper/filters/openpolicyagent"
++	"github.com/zalando/skipper/filters/openpolicyagent/internal/envoy"
++)
++
++// DefaultBodyPrefixSize is the number of leading request-body bytes that the
++// opaAuthorizeRequestBodyPrefix filter hands to the policy. A request may carry
++// a much larger body; the rest is forwarded upstream untouched.
++const DefaultBodyPrefixSize = 32 * 1024
++
++type bodyPrefixSpec struct {
++	registry *openpolicyagent.OpenPolicyAgentRegistry
++}
++
++// NewOpaAuthorizeRequestBodyPrefixSpec returns the spec for the
++// opaAuthorizeRequestBodyPrefix filter.
++func NewOpaAuthorizeRequestBodyPrefixSpec(registry *openpolicyagent.OpenPolicyAgentRegistry) filters.Spec {
++	return &bodyPrefixSpec{registry: registry}
++}
++
++func (s *bodyPrefixSpec) Name() string { return filters.OpaAuthorizeRequestBodyPrefixName }
++
++func (s *bodyPrefixSpec) CreateFilter(args []interface{}) (filters.Filter, error) {
++	if len(args) != 1 {
++		return nil, filters.ErrInvalidFilterParameters
++	}
++
++	bundleName, ok := args[0].(string)
++	if !ok {
++		return nil, filters.ErrInvalidFilterParameters
++	}
++
++	opa, err := s.registry.GetOrStartInstance(bundleName)
++	if err != nil {
++		return nil, fmt.Errorf("open policy agent instance for bundle name '%s' could not be obtained: %w", bundleName, err)
++	}
++
++	return &opaAuthorizeRequestBodyPrefixFilter{opa: opa}, nil
++}
++
++type opaAuthorizeRequestBodyPrefixFilter struct {
++	opa *openpolicyagent.OpenPolicyAgentInstance
++}
++
++func (f *opaAuthorizeRequestBodyPrefixFilter) Request(fc filters.FilterContext) {
++	req := fc.Request()
++
++	parentCtx := req.Context()
++	labels := openpolicyagent.BuildLabelSet(f.opa.BundleName(), nil)
++	labelCtx := pprof.WithLabels(parentCtx, labels)
++	defer pprof.SetGoroutineLabels(parentCtx)
++	pprof.SetGoroutineLabels(labelCtx)
++
++	span, ctx := f.opa.StartSpanFromContext(labelCtx)
++	defer span.Finish()
++
++	if !f.opa.Healthy() {
++		f.opa.HandleInstanceNotReadyError(fc, span, !f.opa.EnvoyPluginConfig().DryRun)
++		return
++	}
++
++	var rawBodyBytes []byte
++	if req.Body != nil {
++		buf := make([]byte, DefaultBodyPrefixSize+1)
++		n, _ := io.ReadFull(req.Body, buf)
++		rawBodyBytes = buf[:n]
++		if len(rawBodyBytes) > DefaultBodyPrefixSize {
++			rawBodyBytes = rawBodyBytes[:DefaultBodyPrefixSize]
++		}
++		// Hand the whole body to the rest of the chain, including the byte that
++		// was read only to see whether the prefix was complete.
++		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf[:n]), req.Body))
++	}
++
++	authzreq, err := envoy.AdaptBodyPrefixToExtAuthRequest(req, f.opa.InstanceConfig().GetEnvoyMetadata(), nil, rawBodyBytes)
++	if err != nil {
++		f.opa.HandleEvaluationError(fc, span, nil, err, !f.opa.EnvoyPluginConfig().DryRun, http.StatusBadRequest)
++		return
++	}
++
++	start := time.Now()
++	result, err := f.opa.Eval(ctx, authzreq)
++	fc.Metrics().MeasureSince(f.opa.MetricsKey("eval_time"), start)
++
++	if err != nil {
++		pprof.SetGoroutineLabels(pprof.WithLabels(labelCtx, pprof.Labels("opa.decision", "error")))
++		f.opa.HandleInvalidDecisionError(fc, span, result, err, !f.opa.EnvoyPluginConfig().DryRun)
++		return
++	}
++
++	if f.opa.EnvoyPluginConfig().DryRun {
++		return
++	}
++
++	allowed, err := result.IsAllowed()
++	if err != nil {
++		pprof.SetGoroutineLabels(pprof.WithLabels(labelCtx, pprof.Labels("opa.decision", "error")))
++		f.opa.HandleInvalidDecisionError(fc, span, result, err, !f.opa.EnvoyPluginConfig().DryRun)
++		return
++	}
++	span.SetTag("opa.decision.allowed", allowed)
++
++	if !allowed {
++		pprof.SetGoroutineLabels(pprof.WithLabels(labelCtx, pprof.Labels("opa.decision", "deny")))
++		fc.Metrics().IncCounter(f.opa.MetricsKey("decision.deny"))
++		f.opa.ServeResponse(fc, span, result)
++		return
++	}
++
++	pprof.SetGoroutineLabels(pprof.WithLabels(labelCtx, pprof.Labels("opa.decision", "allow")))
++	fc.Metrics().IncCounter(f.opa.MetricsKey("decision.allow"))
++}
++
++func (f *opaAuthorizeRequestBodyPrefixFilter) Response(fc filters.FilterContext) {}
++
++func (f *opaAuthorizeRequestBodyPrefixFilter) OpenPolicyAgent() *openpolicyagent.OpenPolicyAgentInstance {
++	return f.opa
++}
+diff --git a/skipper.go b/skipper.go
+index de94f23..82e3943 100644
+--- a/skipper.go
++++ b/skipper.go
+@@ -2316,6 +2316,7 @@ func run(o Options, sig chan os.Signal, idleConnsCH chan struct{}) error {
+ 		o.CustomFilters = append(o.CustomFilters,
+ 			opaauthorizerequest.NewOpaAuthorizeRequestSpec(opaRegistry),
+ 			opaauthorizerequest.NewOpaAuthorizeRequestWithBodySpec(opaRegistry),
++			opaauthorizerequest.NewOpaAuthorizeRequestBodyPrefixSpec(opaRegistry),
+ 			opaserveresponse.NewOpaServeResponseSpec(opaRegistry),
+ 			opaserveresponse.NewOpaServeResponseWithReqBodySpec(opaRegistry),
+ 		)

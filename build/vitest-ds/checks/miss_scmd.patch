@@ -1,0 +1,417 @@
+diff --git a/packages/browser/src/node/commands/fs.ts b/packages/browser/src/node/commands/fs.ts
+index a0b40f9..695d81b 100644
+--- a/packages/browser/src/node/commands/fs.ts
++++ b/packages/browser/src/node/commands/fs.ts
+@@ -3,12 +3,13 @@ import type { BrowserCommand, TestProject } from 'vitest/node'
+ import fs, { promises as fsp } from 'node:fs'
+ import { basename, dirname, resolve } from 'node:path'
+ import mime from 'mime/lite'
+-import { isFileServingAllowed } from 'vitest/node'
++import { isFileLoadingAllowed } from 'vitest/node'
++import { slash } from '../utils'
+ 
+ function assertFileAccess(path: string, project: TestProject) {
+   if (
+-    !isFileServingAllowed(path, project.vite)
+-    && !isFileServingAllowed(path, project.vitest.vite)
++    !isFileLoadingAllowed(project.vite.config, path)
++    && !isFileLoadingAllowed(project.vitest.vite.config, path)
+   ) {
+     throw new Error(
+       `Access denied to "${path}". See Vite config documentation for "server.fs": https://vitejs.dev/config/server-options.html#server-fs-strict.`,
+@@ -16,11 +17,27 @@ function assertFileAccess(path: string, project: TestProject) {
+   }
+ }
+ 
++function assertWrite(path: string, project: TestProject) {
++  if (!project.config.browser.api.allowWrite || !project.vitest.config.api.allowWrite) {
++    throw new Error(`Cannot modify file "${path}". File writing is disabled because server is exposed to the internet, see https://vitest.dev/config/browser/api.`)
++  }
++}
++
++function assertInsideProjectRoot(path: string, project: TestProject) {
++  const root = slash(resolve(project.config.root))
++  const target = slash(resolve(path))
++  if (target !== root && !target.startsWith(`${root}/`)) {
++    throw new Error(
++      `Access denied to "${path}". The path is outside of the project root.`,
++    )
++  }
++}
++
+ export const readFile: BrowserCommand<
+   Parameters<BrowserCommands['readFile']>
+ > = async ({ project }, path, options = {}) => {
+   const filepath = resolve(project.config.root, path)
+-  assertFileAccess(filepath, project)
++  assertFileAccess(slash(filepath), project)
+   // never return a Buffer
+   if (typeof options === 'object' && !options.encoding) {
+     options.encoding = 'utf-8'
+@@ -31,8 +48,10 @@ export const readFile: BrowserCommand<
+ export const writeFile: BrowserCommand<
+   Parameters<BrowserCommands['writeFile']>
+ > = async ({ project }, path, data, options) => {
++  assertWrite(path, project)
+   const filepath = resolve(project.config.root, path)
+-  assertFileAccess(filepath, project)
++  assertFileAccess(slash(filepath), project)
++  assertInsideProjectRoot(filepath, project)
+   const dir = dirname(filepath)
+   if (!fs.existsSync(dir)) {
+     await fsp.mkdir(dir, { recursive: true })
+@@ -43,8 +62,10 @@ export const writeFile: BrowserCommand<
+ export const removeFile: BrowserCommand<
+   Parameters<BrowserCommands['removeFile']>
+ > = async ({ project }, path) => {
++  assertWrite(path, project)
+   const filepath = resolve(project.config.root, path)
+-  assertFileAccess(filepath, project)
++  assertFileAccess(slash(filepath), project)
++  assertInsideProjectRoot(filepath, project)
+   await fsp.rm(filepath)
+ }
+ 
+@@ -52,7 +73,8 @@ export const appendFile: BrowserCommand<
+   [path: string, data: string]
+ > = async ({ project }, path, data) => {
+   const filepath = resolve(project.config.root, path)
+-  assertFileAccess(filepath, project)
++  assertFileAccess(slash(filepath), project)
++  assertInsideProjectRoot(filepath, project)
+   const dir = dirname(filepath)
+   if (!fs.existsSync(dir)) {
+     await fsp.mkdir(dir, { recursive: true })
+@@ -62,7 +84,7 @@ export const appendFile: BrowserCommand<
+ 
+ export const _fileInfo: BrowserCommand<[path: string, encoding: BufferEncoding]> = async ({ project }, path, encoding) => {
+   const filepath = resolve(project.config.root, path)
+-  assertFileAccess(filepath, project)
++  assertFileAccess(slash(filepath), project)
+   const content = await fsp.readFile(filepath, encoding || 'base64')
+   return {
+     content,
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+index 200ddb5..1733afd 100644
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -12,7 +12,7 @@ import { ServerMockResolver } from '@vitest/mocker/node'
+ import { createBirpc } from 'birpc'
+ import { parse, stringify } from 'flatted'
+ import { dirname, join, resolve } from 'pathe'
+-import { createDebugger, isFileServingAllowed, isValidApiRequest } from 'vitest/node'
++import { createDebugger, isFileLoadingAllowed, isValidApiRequest } from 'vitest/node'
+ import { WebSocketServer } from 'ws'
+ 
+ const debug = createDebugger('vitest:browser:api')
+@@ -113,13 +113,22 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+   }
+ 
+   function checkFileAccess(path: string) {
+-    if (!isFileServingAllowed(path, vite)) {
++    if (!isFileLoadingAllowed(vite.config, path)) {
+       throw new Error(
+         `Access denied to "${path}". See Vite config documentation for "server.fs": https://vitejs.dev/config/server-options.html#server-fs-strict.`,
+       )
+     }
+   }
+ 
++  function canWrite(project: TestProject) {
++    return (
++      project.config.browser.api.allowWrite
++      && project.vitest.config.browser.api.allowWrite
++      && project.config.api.allowWrite
++      && project.vitest.config.api.allowWrite
++    )
++  }
++
+   function setupClient(project: TestProject, rpcId: string, ws: WebSocket) {
+     const mockResolver = new ServerMockResolver(globalServer.vite, {
+       moduleDirectories: project.config?.deps?.moduleDirectories,
+@@ -152,6 +161,23 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+           }
+         },
+         async onTaskArtifactRecord(id, artifact) {
++          if (!canWrite(project)) {
++            if (artifact.type === 'internal:annotation' && artifact.annotation.attachment) {
++              artifact.annotation.attachment = undefined
++              vitest.logger.error(
++                `[vitest] Cannot record annotation attachment because file writing is disabled. See https://vitest.dev/config/browser/api.`,
++              )
++            }
++            // remove attachments if cannot write
++            if (artifact.attachments?.length) {
++              const attachments = artifact.attachments.map(n => n.path).filter(r => !!r).join('", "')
++              artifact.attachments = []
++              vitest.logger.error(
++                `[vitest] Cannot record attachments ("${attachments}") because file writing is disabled, removing attachments from artifact "${artifact.type}". See https://vitest.dev/config/browser/api.`,
++              )
++            }
++          }
++
+           return vitest._testRun.recordArtifact(id, artifact)
+         },
+         async onTaskUpdate(method, packs, events) {
+@@ -193,15 +219,27 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+         },
+         async saveSnapshotFile(id, content) {
+           checkFileAccess(id)
++          if (!canWrite(project)) {
++            vitest.logger.error(
++              `[vitest] Cannot save snapshot file "${id}". File writing is disabled because server is exposed to the internet, see https://vitest.dev/config/browser/api.`,
++            )
++            return
++          }
+           await fs.mkdir(dirname(id), { recursive: true })
+-          return fs.writeFile(id, content, 'utf-8')
++          await fs.writeFile(id, content, 'utf-8')
+         },
+         async removeSnapshotFile(id) {
+           checkFileAccess(id)
++          if (!canWrite(project)) {
++            vitest.logger.error(
++              `[vitest] Cannot remove snapshot file "${id}". File writing is disabled because server is exposed to the internet, see https://vitest.dev/config/browser/api.`,
++            )
++            return
++          }
+           if (!existsSync(id)) {
+             throw new Error(`Snapshot file "${id}" does not exist.`)
+           }
+-          return fs.unlink(id)
++          await fs.unlink(id)
+         },
+         getBrowserFileSourceMap(id) {
+           const mod = globalServer.vite.moduleGraph.getModuleById(id)
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index caa3027..3429536 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -60,9 +60,6 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   function setupClient(ws: WebSocket) {
+     const rpc = createBirpc<WebSocketEvents, WebSocketHandlers>(
+       {
+-        async onTaskUpdate(packs, events) {
+-          await ctx._testRun.updated(packs, events)
+-        },
+         getFiles() {
+           return ctx.state.getFiles()
+         },
+@@ -81,12 +78,24 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+             )
+           }
++          // silently ignore write attempts if not allowed
++          if (!ctx.config.api.allowWrite) {
++            return
++          }
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          // silently ignore exec attempts if not allowed
++          if (!ctx.config.api.allowExec) {
++            return
++          }
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          // silently ignore exec attempts if not allowed
++          if (!ctx.config.api.allowExec) {
++            return
++          }
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -156,6 +165,10 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+               `Test file "${id}" was not registered, so its snapshots cannot be updated using the API.`,
+             )
+           }
++          // silently ignore write attempts if not allowed
++          if (!ctx.config.api.allowWrite) {
++            return
++          }
+           const snapshotPath = ctx.snapshot.resolvePath(id, {
+             config: ctx.getRootProject().serializedConfig,
+           })
+@@ -163,6 +176,11 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(snapshotPath, content, 'utf-8')
+         },
+         async updateSnapshot(file?: File) {
++          // silently ignore exec/write attempts if not allowed
++          // this function both executes the code and write snapshots
++          if (!ctx.config.api.allowExec || !ctx.config.api.allowWrite) {
++            return
++          }
+           if (!file) {
+             await ctx.updateSnapshot()
+           }
+diff --git a/packages/vitest/src/api/types.ts b/packages/vitest/src/api/types.ts
+index ca77bbd..7fd7771 100644
+--- a/packages/vitest/src/api/types.ts
++++ b/packages/vitest/src/api/types.ts
+@@ -36,7 +36,6 @@ export interface TransformResultWithSource {
+ }
+ 
+ export interface WebSocketHandlers {
+-  onTaskUpdate: (packs: TaskResultPack[], events: TaskEventPack[]) => void
+   getFiles: () => File[]
+   getTestFiles: () => Promise<SerializedTestSpecification[]>
+   getPaths: () => string[]
+diff --git a/packages/vitest/src/node/cli/cli-config.ts b/packages/vitest/src/node/cli/cli-config.ts
+index 97af02e..2eb744f 100644
+--- a/packages/vitest/src/node/cli/cli-config.ts
++++ b/packages/vitest/src/node/cli/cli-config.ts
+@@ -46,6 +46,12 @@ const apiConfig: (port: number) => CLIOptions<ApiConfig> = (port: number) => ({
+     description:
+       'Set to true to exit if port is already in use, instead of automatically trying the next available port',
+   },
++  allowExec: {
++    description: 'Allow API to execute code. (Be careful when enabling this option in untrusted environments)',
++  },
++  allowWrite: {
++    description: 'Allow API to edit files. (Be careful when enabling this option in untrusted environments)',
++  },
+   middlewareMode: null,
+ })
+ 
+@@ -106,6 +112,12 @@ export const cliOptionsConfig: VitestCLIOptions = {
+     argument: '[port]',
+     description: `Specify server port. Note if the port is already being used, Vite will automatically try the next available port so this may not be the actual port the server ends up listening on. If true will be set to ${defaultPort}`,
+     subcommands: apiConfig(defaultPort),
++    transform(portOrOptions) {
++      if (typeof portOrOptions === 'number') {
++        return { port: portOrOptions }
++      }
++      return portOrOptions
++    },
+   },
+   silent: {
+     description: 'Silent console output from tests. Use `\'passed-only\'` to see logs from failing tests only.',
+diff --git a/packages/vitest/src/node/config/resolveConfig.ts b/packages/vitest/src/node/config/resolveConfig.ts
+index 665f6ef..14005c0 100644
+--- a/packages/vitest/src/node/config/resolveConfig.ts
++++ b/packages/vitest/src/node/config/resolveConfig.ts
+@@ -1,5 +1,6 @@
+ import type { ResolvedConfig as ResolvedViteConfig } from 'vite'
+ import type { Vitest } from '../core'
++import type { Logger } from '../logger'
+ import type { BenchmarkBuiltinReporters } from '../reporters'
+ import type { ResolvedBrowserOptions } from '../types/browser'
+ import type {
+@@ -55,9 +56,14 @@ function parseInspector(inspect: string | undefined | boolean | number) {
+   return { host, port: Number(port) || defaultInspectPort }
+ }
+ 
++/**
++ * @deprecated Internal function
++ */
+ export function resolveApiServerConfig<Options extends ApiConfig & Omit<UserConfig, 'expect'>>(
+   options: Options,
+   defaultPort: number,
++  parentApi?: ApiConfig,
++  logger?: Logger,
+ ): ApiConfig | undefined {
+   let api: ApiConfig | undefined
+ 
+@@ -97,6 +103,26 @@ export function resolveApiServerConfig<Options extends ApiConfig & Omit<UserConf
+     api = { middlewareMode: true }
+   }
+ 
++  // if the API server is exposed to network, disable write operations by default
++  if (!api.middlewareMode && api.host && api.host !== 'localhost' && api.host !== '127.0.0.1') {
++    // assigned to browser
++    if (parentApi) {
++      if (api.allowWrite == null && api.allowExec == null) {
++        logger?.error(
++          c.yellow(
++            `${c.yellowBright(' WARNING ')} API server is exposed to network, disabling write and exec operations by default for security reasons. This can cause some APIs to not work as expected. Set \`browser.api.allowExec\` manually to hide this warning. See https://vitest.dev/config/browser/api for more details.`,
++          ),
++        )
++      }
++    }
++    api.allowWrite ??= parentApi?.allowWrite ?? false
++    api.allowExec ??= parentApi?.allowExec ?? false
++  }
++  else {
++    api.allowWrite ??= parentApi?.allowWrite ?? true
++    api.allowExec ??= parentApi?.allowExec ?? true
++  }
++
+   return api
+ }
+ 
+@@ -801,6 +827,8 @@ export function resolveConfig(
+   resolved.browser.api = resolveApiServerConfig(
+     resolved.browser,
+     defaultBrowserPort,
++    resolved.api,
++    logger,
+   ) || {
+     port: defaultBrowserPort,
+   }
+diff --git a/packages/vitest/src/node/config/serializeConfig.ts b/packages/vitest/src/node/config/serializeConfig.ts
+index e4472d2..7c1a794 100644
+--- a/packages/vitest/src/node/config/serializeConfig.ts
++++ b/packages/vitest/src/node/config/serializeConfig.ts
+@@ -1,5 +1,5 @@
+ import type { TestProject } from '../project'
+-import type { SerializedConfig } from '../types/config'
++import type { ApiConfig, SerializedConfig } from '../types/config'
+ 
+ export function serializeConfig(project: TestProject): SerializedConfig {
+   const { config, globalConfig } = project
+@@ -32,6 +32,12 @@ export function serializeConfig(project: TestProject): SerializedConfig {
+     pool: config.pool,
+     expect: config.expect,
+     snapshotSerializers: config.snapshotSerializers,
++    api: ((api: ApiConfig | undefined) => {
++      return {
++        allowExec: api?.allowExec,
++        allowWrite: api?.allowWrite,
++      }
++    })(project.isBrowserEnabled() ? config.browser.api : config.api),
+     // TODO: non serializable function?
+     diff: config.diff,
+     retry: config.retry,
+diff --git a/packages/vitest/src/node/types/config.ts b/packages/vitest/src/node/types/config.ts
+index 219bf6b..49e5cae 100644
+--- a/packages/vitest/src/node/types/config.ts
++++ b/packages/vitest/src/node/types/config.ts
+@@ -44,7 +44,22 @@ export type CSSModuleScopeStrategy = 'stable' | 'scoped' | 'non-scoped'
+ export type ApiConfig = Pick<
+   ServerOptions,
+   'port' | 'strictPort' | 'host' | 'middlewareMode'
+->
++> & {
++  /**
++   * Allow any write operations from the API server.
++   *
++   * @default true if `api.host` is exposed to network, false otherwise
++   */
++  allowWrite?: boolean
++  /**
++   * Allow running test files via the API.
++   * If `api.host` is exposed to network and `allowWrite` is true,
++   * anyone connected to the API server can run arbitrary code on your machine.
++   *
++   * @default true if `api.host` is exposed to network, false otherwise
++   */
++  allowExec?: boolean
++}
+ 
+ export interface EnvironmentOptions {
+   /**
+diff --git a/packages/vitest/src/runtime/config.ts b/packages/vitest/src/runtime/config.ts
+index 4426d8d..18f7dd9 100644
+--- a/packages/vitest/src/runtime/config.ts
++++ b/packages/vitest/src/runtime/config.ts
+@@ -76,6 +76,10 @@ export interface SerializedConfig {
+     showDiff?: boolean
+     truncateThreshold?: number
+   } | undefined
++  api: {
++    allowExec: boolean | undefined
++    allowWrite: boolean | undefined
++  }
+   diff: string | SerializedDiffOptions | undefined
+   retry: SerializableRetry
+   includeTaskLocation: boolean | undefined

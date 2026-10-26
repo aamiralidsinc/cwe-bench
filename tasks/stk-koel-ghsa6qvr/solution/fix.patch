@@ -1,0 +1,391 @@
+diff -ruN base/app/Ai/Tools/AddPodcast.php koel/app/Ai/Tools/AddPodcast.php
+--- a/app/Ai/Tools/AddPodcast.php	2026-10-26 02:47:35.608713177 +0000
++++ b/app/Ai/Tools/AddPodcast.php	2026-10-26 02:30:18.837641119 +0000
+@@ -4,6 +4,7 @@
+ 
+ use App\Ai\AiAssistantResult;
+ use App\Ai\AiRequestContext;
++use App\Helpers\Network;
+ use App\Services\Podcast\PodcastService;
+ use Illuminate\Contracts\JsonSchema\JsonSchema;
+ use Laravel\Ai\Contracts\Tool;
+@@ -32,7 +33,13 @@
+ 
+     public function handle(Request $request): Stringable|string
+     {
+-        $podcast = $this->podcastService->addPodcast($request['url'], $this->context->user);
++        $url = (string) $request['url'];
++
++        if (!Network::isSafeUrl($url)) {
++            return 'Cannot add podcast: the feed URL must point to a public address.';
++        }
++
++        $podcast = $this->podcastService->addPodcast($url, $this->context->user);
+ 
+         $this->result->action = 'add_podcast';
+         $this->result->data = [
+diff -ruN base/app/Ai/Tools/AddRadioStation.php koel/app/Ai/Tools/AddRadioStation.php
+--- a/app/Ai/Tools/AddRadioStation.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Ai/Tools/AddRadioStation.php	2026-10-26 02:30:17.741642082 +0000
+@@ -4,6 +4,7 @@
+ 
+ use App\Ai\AiAssistantResult;
+ use App\Ai\AiRequestContext;
++use App\Helpers\Network;
+ use App\Services\RadioService;
+ use App\Values\Radio\RadioStationCreateData;
+ use Illuminate\Contracts\JsonSchema\JsonSchema;
+@@ -34,8 +35,14 @@
+ 
+     public function handle(Request $request): Stringable|string
+     {
++        $url = (string) $request['url'];
++
++        if (!Network::isSafeUrl($url)) {
++            return 'Cannot add radio station: the URL must point to a public address.';
++        }
++
+         $station = $this->radioService->createRadioStation(
+-            RadioStationCreateData::make(url: $request['url'], name: $request['name'], description: ''),
++            RadioStationCreateData::make(url: $url, name: $request['name'], description: ''),
+             $this->context->user,
+         );
+ 
+diff -ruN base/app/Exceptions/UnsafeUrlException.php koel/app/Exceptions/UnsafeUrlException.php
+--- a/app/Exceptions/UnsafeUrlException.php	1970-01-01 00:00:00.000000000 +0000
++++ b/app/Exceptions/UnsafeUrlException.php	2026-10-26 02:29:53.881663040 +0000
+@@ -0,0 +1,13 @@
++<?php
++
++namespace App\Exceptions;
++
++use RuntimeException;
++
++class UnsafeUrlException extends RuntimeException
++{
++    public static function forUrl(string $url): self
++    {
++        return new self(sprintf('Refusing to fetch a URL that does not point to a public host: %s', $url));
++    }
++}
+diff -ruN base/app/Helpers/Network.php koel/app/Helpers/Network.php
+--- a/app/Helpers/Network.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Helpers/Network.php	2026-10-26 02:29:58.321659142 +0000
+@@ -2,10 +2,34 @@
+ 
+ namespace App\Helpers;
+ 
++use Illuminate\Support\Uri;
+ use Throwable;
+ 
+ class Network
+ {
++    private const array SAFE_URL_SCHEMES = ['http', 'https'];
++
++    /**
++     * Check that a URL uses HTTP(S) and points at a host that resolves only to public addresses.
++     * This performs no request beyond name resolution.
++     */
++    public static function isSafeUrl(string $url): bool
++    {
++        try {
++            $uri = Uri::of($url);
++        } catch (Throwable) {
++            return false;
++        }
++
++        if (!in_array($uri->scheme(), self::SAFE_URL_SCHEMES, true)) {
++            return false;
++        }
++
++        $host = $uri->host();
++
++        return $host !== '' && self::isPublicHost($host);
++    }
++
+     /**
+      * Check if a host resolves only to public (non-private, non-reserved) IP addresses.
+      * Validates both A (IPv4) and AAAA (IPv6) records. All resolved IPs must be public.
+diff -ruN base/app/Helpers/SafeHttp.php koel/app/Helpers/SafeHttp.php
+--- a/app/Helpers/SafeHttp.php	1970-01-01 00:00:00.000000000 +0000
++++ b/app/Helpers/SafeHttp.php	2026-10-26 02:29:55.373661730 +0000
+@@ -0,0 +1,57 @@
++<?php
++
++namespace App\Helpers;
++
++use App\Exceptions\UnsafeUrlException;
++use GuzzleHttp\Client;
++use GuzzleHttp\HandlerStack;
++use GuzzleHttp\Middleware;
++use Psr\Http\Message\RequestInterface;
++use Psr\Http\Message\ResponseInterface;
++use Psr\Http\Message\UriInterface;
++
++/**
++ * Defenses for outgoing HTTP requests: every request, and every redirect hop, must point at a
++ * public host. An attacker-controlled URL can pass an initial check and then redirect somewhere
++ * only the server can reach, so the decision is made again before each hop is requested.
++ */
++class SafeHttp
++{
++    /** @return array<string, mixed> */
++    public static function redirectOptions(int $max = 5): array
++    {
++        return [
++            'allow_redirects' => [
++                'max' => $max,
++                'on_redirect' => static function (
++                    RequestInterface $request,
++                    ResponseInterface $response,
++                    UriInterface $uri,
++                ): void {
++                    if (!Network::isSafeUrl((string) $uri)) {
++                        throw UnsafeUrlException::forUrl((string) $uri);
++                    }
++                },
++            ],
++        ];
++    }
++
++    public static function guzzleClient(int $timeoutInSeconds = 30): Client
++    {
++        $stack = HandlerStack::create();
++
++        $stack->push(Middleware::mapRequest(static function (RequestInterface $request): RequestInterface {
++            if (!Network::isSafeUrl((string) $request->getUri())) {
++                throw UnsafeUrlException::forUrl((string) $request->getUri());
++            }
++
++            return $request;
++        }));
++
++        return new Client([
++            'handler' => $stack,
++            'timeout' => $timeoutInSeconds,
++            ...self::redirectOptions(),
++        ]);
++    }
++}
+diff -ruN base/app/Rules/HasAudioContentType.php koel/app/Rules/HasAudioContentType.php
+--- a/app/Rules/HasAudioContentType.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Rules/HasAudioContentType.php	2026-10-26 02:30:05.469652865 +0000
+@@ -2,6 +2,8 @@
+ 
+ namespace App\Rules;
+ 
++use App\Exceptions\UnsafeUrlException;
++use App\Helpers\SafeHttp;
+ use Closure;
+ use Illuminate\Contracts\Validation\ValidationRule;
+ use Illuminate\Support\Facades\Http;
+@@ -22,6 +24,10 @@
+ 
+         try {
+             $contentType = $this->resolveContentType($url);
++        } catch (UnsafeUrlException) {
++            $fail('The :attribute must point to a public URL.');
++
++            return;
+         } catch (Throwable) {
+             $fail("The $attribute couldn't be reached.");
+ 
+@@ -42,16 +48,21 @@
+     {
+         // Try HEAD first — fast and lightweight
+         try {
+-            $response = Http::head($url);
++            $response = Http::withOptions(SafeHttp::redirectOptions())->head($url);
+ 
+             if ($response->successful()) {
+                 return $response->header('Content-Type');
+             }
++        } catch (UnsafeUrlException $e) {
++            throw $e;
+         } catch (Throwable) { // @mago-expect lint:no-empty-catch-clause -- HEAD may time out or fail on streaming servers; fall through to GET below.
+         }
+ 
+         // Fall back to GET with ICY headers — streaming servers often only respond to GET
+-        $response = Http::withHeaders(['Icy-MetaData' => '1'])->withOptions(['stream' => true])->get($url);
++        $response = Http::withHeaders(['Icy-MetaData' => '1'])->withOptions([
++            ...SafeHttp::redirectOptions(),
++            'stream' => true,
++        ])->get($url);
+ 
+         return $response->header('Content-Type');
+     }
+diff -ruN base/app/Rules/SafeUrl.php koel/app/Rules/SafeUrl.php
+--- a/app/Rules/SafeUrl.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Rules/SafeUrl.php	2026-10-26 02:30:01.569656290 +0000
+@@ -2,7 +2,9 @@
+ 
+ namespace App\Rules;
+ 
++use App\Exceptions\UnsafeUrlException;
+ use App\Helpers\Network;
++use App\Helpers\SafeHttp;
+ use Closure;
+ use Illuminate\Contracts\Validation\ValidationRule;
+ use Illuminate\Support\Facades\Http;
+@@ -43,11 +45,22 @@
+         }
+ 
+         try {
+-            $response = Http::head((string) $value);
++            $response = Http::withOptions(SafeHttp::redirectOptions())->head((string) $value);
++        } catch (UnsafeUrlException) {
++            $fail('The :attribute must point to a public URL.');
++
++            return;
+         } catch (Throwable) {
+             // Some streaming servers don't support HEAD — try GET
+             try {
+-                $response = Http::withOptions(['stream' => true])->get((string) $value);
++                $response = Http::withOptions([
++                    ...SafeHttp::redirectOptions(),
++                    'stream' => true,
++                ])->get((string) $value);
++            } catch (UnsafeUrlException) {
++                $fail('The :attribute must point to a public URL.');
++
++                return;
+             } catch (Throwable) {
+                 $fail("The $attribute couldn't be reached.");
+ 
+diff -ruN base/app/Services/Podcast/PodcastService.php koel/app/Services/Podcast/PodcastService.php
+--- a/app/Services/Podcast/PodcastService.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Services/Podcast/PodcastService.php	2026-10-26 02:30:10.441648497 +0000
+@@ -5,6 +5,8 @@
+ use App\Events\UserUnsubscribedFromPodcast;
+ use App\Exceptions\FailedToParsePodcastFeedException;
+ use App\Exceptions\UserAlreadySubscribedToPodcastException;
++use App\Helpers\Network;
++use App\Helpers\SafeHttp;
+ use App\Helpers\Uuid;
+ use App\Models\Podcast;
+ use App\Models\PodcastUserPivot;
+@@ -136,6 +138,18 @@
+                 continue;
+             }
+ 
++            $enclosureUrl = (string) $episodeValue->enclosure->url;
++
++            if (!Network::isSafeUrl($enclosureUrl)) {
++                Log::warning(sprintf(
++                    'Skipping podcast episode "%s" with an unsafe enclosure URL: %s',
++                    $episodeValue->title,
++                    $enclosureUrl,
++                ));
++
++                continue;
++            }
++
+             $id = Uuid::generate();
+             $ids[] = $id;
+             $records[] = [
+@@ -143,7 +157,7 @@
+                 'podcast_id' => $podcast->id,
+                 'title' => $episodeValue->title,
+                 'lyrics' => '',
+-                'path' => $episodeValue->enclosure->url,
++                'path' => $enclosureUrl,
+                 'created_at' => $episodeValue->metadata->pubDate ?: now(),
+                 'updated_at' => $episodeValue->metadata->pubDate ?: now(),
+                 'episode_metadata' => $episodeValue->metadata->toJson(),
+@@ -226,6 +240,11 @@
+     public function getStreamableUrl(string|Episode $url, ?Client $client = null, string $method = 'OPTIONS'): ?string
+     {
+         $url = $url instanceof Episode ? $url->path : $url;
++
++        if (!Network::isSafeUrl($url)) {
++            return null;
++        }
++
+         $client ??= new Client();
+ 
+         try {
+@@ -235,7 +254,10 @@
+                     'Origin' => '*',
+                 ],
+                 RequestOptions::HTTP_ERRORS => false,
+-                RequestOptions::ALLOW_REDIRECTS => ['track_redirects' => true],
++                RequestOptions::ALLOW_REDIRECTS => [
++                    ...SafeHttp::redirectOptions()['allow_redirects'],
++                    'track_redirects' => true,
++                ],
+             ]);
+ 
+             $redirects = Arr::wrap($response->getHeader(RedirectMiddleware::HISTORY_HEADER));
+diff -ruN base/app/Services/Radio/RadioStreamProxy.php koel/app/Services/Radio/RadioStreamProxy.php
+--- a/app/Services/Radio/RadioStreamProxy.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Services/Radio/RadioStreamProxy.php	2026-10-26 02:30:15.101644403 +0000
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Services\Radio;
+ 
++use App\Helpers\Network;
+ use App\Models\RadioStation;
+ 
+ class RadioStreamProxy
+@@ -14,10 +15,24 @@
+      */
+     public function openStream(string $url)
+     {
++        if (!Network::isSafeUrl($url)) {
++            return false;
++        }
++
+         $context = stream_context_create([
+             'http' => [
+                 'header' => "Icy-MetaData: 1\r\n",
+                 'timeout' => 5,
++                'follow_location' => 0,
++                'max_redirects' => 0,
++            ],
++        ]);
++
++        $plainContext = stream_context_create([
++            'http' => [
++                'timeout' => 5,
++                'follow_location' => 0,
++                'max_redirects' => 0,
+             ],
+         ]);
+ 
+@@ -30,7 +45,7 @@
+                 return $stream;
+             }
+ 
+-            return fopen($url, 'r');
++            return fopen($url, 'r', false, $plainContext);
+         } finally {
+             restore_error_handler();
+         }
+diff -ruN base/app/Values/Podcast/EpisodePlayable.php koel/app/Values/Podcast/EpisodePlayable.php
+--- a/app/Values/Podcast/EpisodePlayable.php	2026-05-18 20:05:40.000000000 +0000
++++ b/app/Values/Podcast/EpisodePlayable.php	2026-10-26 02:30:13.573645745 +0000
+@@ -2,6 +2,9 @@
+ 
+ namespace App\Values\Podcast;
+ 
++use App\Exceptions\UnsafeUrlException;
++use App\Helpers\Network;
++use App\Helpers\SafeHttp;
+ use App\Models\Song as Episode;
+ use Illuminate\Contracts\Support\Arrayable;
+ use Illuminate\Contracts\Support\Jsonable;
+@@ -39,7 +42,13 @@
+         $file = artifact_path("episodes/{$episode->id}.mp3");
+ 
+         if (!File::exists($file)) {
+-            Http::sink($file)->get($episode->path)->throw();
++            $url = (string) $episode->path;
++
++            if (!Network::isSafeUrl($url)) {
++                throw UnsafeUrlException::forUrl($url);
++            }
++
++            Http::sink($file)->withOptions(SafeHttp::redirectOptions())->get($url)->throw();
+         }
+ 
+         $playable = new self($file, File::hash($file));

@@ -1,0 +1,701 @@
+diff --git a/builtin/logical/pki/cert_util.go b/builtin/logical/pki/cert_util.go
+index 49fd9a6..25e3f7d 100644
+--- a/builtin/logical/pki/cert_util.go
++++ b/builtin/logical/pki/cert_util.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/openbao/openbao/sdk/v2/framework"
+ 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
+ 	"github.com/openbao/openbao/sdk/v2/helper/errutil"
++	"github.com/openbao/openbao/sdk/v2/helper/identitytpl"
+ 	"github.com/openbao/openbao/sdk/v2/logical"
+ 	"github.com/ryanuber/go-glob"
+ 	"golang.org/x/crypto/cryptobyte"
+@@ -272,11 +273,31 @@ func validateURISAN(b *backend, data *inputBundle, uri string) bool {
+ 		if data.role.AllowedURISANsTemplate {
+ 			isTemplate, _ := framework.ValidateIdentityTemplate(allowed)
+ 			if isTemplate && data.req.EntityID != "" {
+-				tmpAllowed, err := framework.PopulateIdentityTemplate(allowed, data.req.EntityID, b.System())
++				entity, err := b.System().EntityInfo(data.req.EntityID)
++				if err != nil || entity == nil {
++					continue
++				}
++
++				groups, err := b.System().GroupsForEntity(data.req.EntityID)
++				if err != nil {
++					continue
++				}
++
++				input := identitytpl.PopulateStringInput{
++					String: allowed,
++					Entity: entity,
++					Groups: groups,
++					Mode:   identitytpl.ACLTemplating,
++				}
++
++				if !data.role.AllowGlobsInSubstitutions {
++					input.BlockedSubstitutions = []string{"*"}
++				}
++
++				_, allowed, err = identitytpl.PopulateString(input)
+ 				if err != nil {
+ 					continue
+ 				}
+-				allowed = tmpAllowed
+ 			}
+ 		}
+ 		validURI := glob.Glob(allowed, uri)
+@@ -564,12 +585,27 @@ func validateNames(b *backend, data *inputBundle, names []string) string {
+ 				if data.role.AllowedDomainsTemplate {
+ 					isTemplate, _ := framework.ValidateIdentityTemplate(currDomain)
+ 					if isTemplate && data.req.EntityID != "" {
+-						tmpCurrDomain, err := framework.PopulateIdentityTemplate(currDomain, data.req.EntityID, b.System())
++						entity, err := b.System().EntityInfo(data.req.EntityID)
++						if err != nil || entity == nil {
++							continue
++						}
++
++						groups, err := b.System().GroupsForEntity(data.req.EntityID)
+ 						if err != nil {
+ 							continue
+ 						}
+ 
+-						currDomain = tmpCurrDomain
++						input := identitytpl.PopulateStringInput{
++							String: currDomain,
++							Entity: entity,
++							Groups: groups,
++							Mode:   identitytpl.ACLTemplating,
++						}
++
++						_, currDomain, err = identitytpl.PopulateString(input)
++						if err != nil {
++							continue
++						}
+ 					}
+ 				}
+ 
+@@ -708,11 +744,27 @@ func validateSerialNumber(b *backend, data *inputBundle, serialNumber string) st
+ 			if data.role.AllowedSerialNumbersTemplate {
+ 				isTemplate, _ := framework.ValidateIdentityTemplate(currSerialNumber)
+ 				if isTemplate && data.req.EntityID != "" {
+-					rendered, err := framework.PopulateIdentityTemplate(currSerialNumber, data.req.EntityID, b.System())
++					entity, err := b.System().EntityInfo(data.req.EntityID)
++					if err != nil || entity == nil {
++						continue
++					}
++					groups, err := b.System().GroupsForEntity(data.req.EntityID)
++					if err != nil {
++						continue
++					}
++					input := identitytpl.PopulateStringInput{
++						String: currSerialNumber,
++						Entity: entity,
++						Groups: groups,
++						Mode:   identitytpl.ACLTemplating,
++					}
++					if !data.role.AllowGlobsInSubstitutions {
++						input.BlockedSubstitutions = []string{"*"}
++					}
++					_, currSerialNumber, err = identitytpl.PopulateString(input)
+ 					if err != nil {
+ 						continue
+ 					}
+-					currSerialNumber = rendered
+ 				}
+ 			}
+ 
+diff --git a/builtin/logical/pki/path_roles.go b/builtin/logical/pki/path_roles.go
+index 95ae7ff..164960e 100644
+--- a/builtin/logical/pki/path_roles.go
++++ b/builtin/logical/pki/path_roles.go
+@@ -114,6 +114,15 @@ accepts a comma-separated string or list of domains.`,
+ 			Description: `If set, Allowed domains can be specified using identity template policies.
+ 				Non-templated domains are also permitted.`,
+ 		},
++		"allow_globs_in_substitutions": {
++			Type:     framework.TypeBool,
++			Required: true,
++			Description: `If set and templating is enabled, the values substituted in
++				for allowed_uri_sans_template and allowed_domains template expression
++				might contain a wildcard characters ('*' and '+'). This can enable
++				injection attacks. Only use this, if the data used by the templates
++				is trusted.`,
++		},
+ 		"allow_bare_domains": {
+ 			Type:     framework.TypeBool,
+ 			Required: true,
+@@ -513,6 +522,15 @@ accepts a comma-separated string or list of domains.`,
+ 				Non-templated domains are also permitted.`,
+ 				Default: false,
+ 			},
++			"allow_globs_in_substitutions": {
++				Type: framework.TypeBool,
++				Description: `If set and templating is enabled, the values substituted in
++					for allowed_uri_sans_template and allowed_domains template expression
++					might contain a wildcard characters ('*' and '+'). This can enable
++					injection attacks. Only use this, if the data used by the templates
++					is trusted.`,
++				Default: false,
++			},
+ 			"allow_bare_domains": {
+ 				Type: framework.TypeBool,
+ 				Description: `If set, clients can request certificates
+@@ -1154,6 +1172,7 @@ func (b *backend) pathRoleCreate(ctx context.Context, req *logical.Request, data
+ 		AllowLocalhost:                data.Get("allow_localhost").(bool),
+ 		AllowedDomains:                data.Get("allowed_domains").([]string),
+ 		AllowedDomainsTemplate:        data.Get("allowed_domains_template").(bool),
++		AllowGlobsInSubstitutions:     data.Get("allow_globs_in_substitutions").(bool),
+ 		AllowBareDomains:              data.Get("allow_bare_domains").(bool),
+ 		AllowSubdomains:               data.Get("allow_subdomains").(bool),
+ 		AllowGlobDomains:              data.Get("allow_glob_domains").(bool),
+@@ -1408,6 +1427,7 @@ func (b *backend) pathRolePatch(ctx context.Context, req *logical.Request, data
+ 		AllowLocalhost:                data.GetWithExplicitDefault("allow_localhost", oldEntry.AllowLocalhost).(bool),
+ 		AllowedDomains:                data.GetWithExplicitDefault("allowed_domains", oldEntry.AllowedDomains).([]string),
+ 		AllowedDomainsTemplate:        data.GetWithExplicitDefault("allowed_domains_template", oldEntry.AllowedDomainsTemplate).(bool),
++		AllowGlobsInSubstitutions:     data.GetWithExplicitDefault("allow_globs_in_substitutions", oldEntry.AllowGlobsInSubstitutions).(bool),
+ 		AllowBareDomains:              data.GetWithExplicitDefault("allow_bare_domains", oldEntry.AllowBareDomains).(bool),
+ 		AllowSubdomains:               data.GetWithExplicitDefault("allow_subdomains", oldEntry.AllowSubdomains).(bool),
+ 		AllowGlobDomains:              data.GetWithExplicitDefault("allow_glob_domains", oldEntry.AllowGlobDomains).(bool),
+@@ -1649,6 +1669,7 @@ type roleEntry struct {
+ 	AllowedDomainsOld             string        `json:"allowed_domains,omitempty"`
+ 	AllowedDomains                []string      `json:"allowed_domains_list"`
+ 	AllowedDomainsTemplate        bool          `json:"allowed_domains_template"`
++	AllowGlobsInSubstitutions     bool          `json:"allow_globs_in_substitutions"`
+ 	AllowBaseDomain               bool          `json:"allow_base_domain"`
+ 	AllowBareDomains              bool          `json:"allow_bare_domains"`
+ 	AllowTokenDisplayName         bool          `json:"allow_token_displayname"`
+@@ -1718,6 +1739,7 @@ func (r *roleEntry) ToResponseData() map[string]interface{} {
+ 		"allow_localhost":                    r.AllowLocalhost,
+ 		"allowed_domains":                    r.AllowedDomains,
+ 		"allowed_domains_template":           r.AllowedDomainsTemplate,
++		"allow_globs_in_substitutions":       r.AllowGlobsInSubstitutions,
+ 		"allow_bare_domains":                 r.AllowBareDomains,
+ 		"allow_token_displayname":            r.AllowTokenDisplayName,
+ 		"allow_subdomains":                   r.AllowSubdomains,
+diff --git a/builtin/logical/ssh/path_issue_sign.go b/builtin/logical/ssh/path_issue_sign.go
+index 1d84e2a..057039e 100644
+--- a/builtin/logical/ssh/path_issue_sign.go
++++ b/builtin/logical/ssh/path_issue_sign.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/hashicorp/go-secure-stdlib/strutil"
+ 	"github.com/openbao/openbao/sdk/v2/framework"
+ 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
++	"github.com/openbao/openbao/sdk/v2/helper/identitytpl"
+ 	"github.com/openbao/openbao/sdk/v2/logical"
+ 	"github.com/ryanuber/go-glob"
+ 	"golang.org/x/crypto/ssh"
+@@ -80,7 +81,7 @@ func (b *backend) pathSignIssueCertificateHelper(sc *storageContext, req *logica
+ 	} else {
+ 		defaultPrincipal := role.DefaultUser
+ 		if role.DefaultUserTemplate {
+-			defaultPrincipal, err = b.renderPrincipal(role.DefaultUser, req)
++			defaultPrincipal, err = b.renderPrincipal(role.DefaultUser, req, true)
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -164,21 +165,53 @@ func (b *backend) pathSignIssueCertificateHelper(sc *storageContext, req *logica
+ 	return response, nil
+ }
+ 
+-func (b *backend) renderPrincipal(principal string, req *logical.Request) (string, error) {
++func (b *backend) renderPrincipal(principal string, req *logical.Request, allowCommasInSubstitutions bool) (string, error) {
++	if req.EntityID == "" {
++		return principal, nil
++	}
++
+ 	// Look for templating markers {{ .* }}
+ 	matched := containsTemplateRegex.MatchString(principal)
+-	if matched {
+-		if req.EntityID != "" {
+-			// Retrieve principal based on template + entityID from request.
+-			renderedPrincipal, err := framework.PopulateIdentityTemplate(principal, req.EntityID, b.System())
+-			if err != nil {
+-				return "", fmt.Errorf("template '%s' could not be rendered -> %s", principal, err)
+-			}
+-			return renderedPrincipal, nil
+-		}
++	if !matched {
++		// Static principal
++		return principal, nil
+ 	}
+-	// Static principal
+-	return principal, nil
++
++	// Retrieve principal based on template + entityID from request.
++	entity, err := b.System().EntityInfo(req.EntityID)
++	if err != nil {
++		return "", err
++	}
++	if entity == nil {
++		return "", errors.New("no entity found")
++	}
++
++	groups, err := b.System().GroupsForEntity(req.EntityID)
++	if err != nil {
++		return "", err
++	}
++
++	input := identitytpl.PopulateStringInput{
++		String: principal,
++		Entity: entity,
++		Groups: groups,
++		Mode:   identitytpl.ACLTemplating,
++	}
++	// Substituted values feed a comma-separated allow-list and, for host
++	// certificates, a pattern matcher. Refuse list separators and pattern
++	// metacharacters unless the administrator opted in to separators.
++	blocked := []string{"*", "+"}
++	if !allowCommasInSubstitutions {
++		blocked = append(blocked, ",")
++	}
++	input.BlockedSubstitutions = blocked
++
++	_, renderedPrincipal, err := identitytpl.PopulateString(input)
++	if err != nil {
++		return "", fmt.Errorf("template '%s' could not be rendered -> %s", principal, err)
++	}
++
++	return renderedPrincipal, nil
+ }
+ 
+ func (b *backend) calculateValidPrincipals(data *framework.FieldData, req *logical.Request, role *sshRole, defaultPrincipal, principalsAllowedByRole string, enableTemplating bool, validatePrincipal func([]string, string) bool) ([]string, error) {
+@@ -194,7 +227,7 @@ func (b *backend) calculateValidPrincipals(data *framework.FieldData, req *logic
+ 	// Build list of allowed Principals from template and static principalsAllowedByRole
+ 	var allowedPrincipals []string
+ 	if enableTemplating {
+-		rendered, err := b.renderPrincipal(principalsAllowedByRole, req)
++		rendered, err := b.renderPrincipal(principalsAllowedByRole, req, role.AllowCommasInSubstitutions)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -325,7 +358,7 @@ func (b *backend) calculateCriticalOptions(data *framework.FieldData, role *sshR
+ }
+ 
+ func (b *backend) calculateExtensions(data *framework.FieldData, req *logical.Request, role *sshRole) (map[string]string, bool, error) {
+-	unparsedExtensions := data.Get("extensions").(map[string]interface{})
++	unparsedExtensions := data.Get("extensions").(map[string]any)
+ 	extensions := make(map[string]string)
+ 
+ 	if len(unparsedExtensions) > 0 {
+@@ -349,32 +382,58 @@ func (b *backend) calculateExtensions(data *framework.FieldData, req *logical.Re
+ 		return extensions, false, nil
+ 	}
+ 
++	if !role.DefaultExtensionsTemplate {
++		return role.DefaultExtensions, false, nil
++	}
++
+ 	haveMissingEntityInfoWithTemplatedExt := false
++	var (
++		// entity and groups are lazy loaded
++		entity *logical.Entity
++		groups []*logical.Group
++		err    error
++	)
++
++	for extensionKey, extensionValue := range role.DefaultExtensions {
++		// Look for templating markers {{ .* }}
++		matched := containsTemplateRegex.MatchString(extensionValue)
++		if !matched {
++			// Static extension value or err template
++			extensions[extensionKey] = extensionValue
++			continue
++		}
+ 
+-	if role.DefaultExtensionsTemplate {
+-		for extensionKey, extensionValue := range role.DefaultExtensions {
+-			// Look for templating markers {{ .* }}
+-			matched := containsTemplateRegex.MatchString(extensionValue)
+-			if matched {
+-				if req.EntityID != "" {
+-					// Retrieve extension value based on template + entityID from request.
+-					templateExtensionValue, err := framework.PopulateIdentityTemplate(extensionValue, req.EntityID, b.System())
+-					if err == nil {
+-						// Template returned an extension value that we can use
+-						extensions[extensionKey] = templateExtensionValue
+-					} else {
+-						return nil, false, fmt.Errorf("template '%s' could not be rendered -> %s", extensionValue, err)
+-					}
+-				} else {
+-					haveMissingEntityInfoWithTemplatedExt = true
+-				}
+-			} else {
+-				// Static extension value or err template
+-				extensions[extensionKey] = extensionValue
++		if req.EntityID == "" {
++			haveMissingEntityInfoWithTemplatedExt = true
++			continue
++		}
++
++		// Retrieve extension value based on template + entityID from request.
++		if entity == nil {
++			entity, err = b.System().EntityInfo(req.EntityID)
++			if err != nil {
++				return nil, false, err
++			}
++			if entity == nil {
++				return nil, false, errors.New("no entity found")
++			}
++
++			groups, err = b.System().GroupsForEntity(req.EntityID)
++			if err != nil {
++				return nil, false, err
+ 			}
+ 		}
+-	} else {
+-		extensions = role.DefaultExtensions
++
++		input := identitytpl.PopulateStringInput{
++			String: extensionValue,
++			Entity: entity,
++			Groups: groups,
++			Mode:   identitytpl.ACLTemplating,
++		}
++		_, extensions[extensionKey], err = identitytpl.PopulateString(input)
++		if err != nil {
++			return nil, false, fmt.Errorf("template '%s' could not be rendered -> %s", extensionValue, err)
++		}
+ 	}
+ 
+ 	return extensions, haveMissingEntityInfoWithTemplatedExt, nil
+diff --git a/builtin/logical/ssh/path_roles.go b/builtin/logical/ssh/path_roles.go
+index 6e62d60..af09f71 100644
+--- a/builtin/logical/ssh/path_roles.go
++++ b/builtin/logical/ssh/path_roles.go
+@@ -63,6 +63,7 @@ type sshRole struct {
+ 	AllowGlobDomains           bool              `mapstructure:"allow_glob_domains" json:"allow_glob_domains"`
+ 	AllowUserKeyIDs            bool              `mapstructure:"allow_user_key_ids" json:"allow_user_key_ids"`
+ 	AllowEmptyPrincipals       bool              `mapstructure:"allow_empty_principals" json:"allow_empty_principals"`
++	AllowCommasInSubstitutions bool              `mapstructure:"allow_commas_in_substitutions" json:"allow_commas_in_substitutions"`
+ 	KeyIDFormat                string            `mapstructure:"key_id_format" json:"key_id_format"`
+ 	OldAllowedUserKeyLengths   map[string]int    `mapstructure:"allowed_user_key_lengths" json:"allowed_user_key_lengths,omitempty"`
+ 	AllowedUserKeyTypesLengths map[string][]int  `mapstructure:"allowed_user_key_types_lengths" json:"allowed_user_key_types_lengths"`
+@@ -389,6 +390,21 @@ func pathRoles(b *backend) *framework.Path {
+ 					Value: 30,
+ 				},
+ 			},
++			"allow_commas_in_substitutions": {
++				Type: framework.TypeBool,
++				Description: `
++				If true and templating is enabled, the values substituted in for
++				allowed_users and allowed_domains template expressions might contain a
++				comma (','). As these values are comma separated lists, this can enable
++				injection attacks. Only use this, if the data used by the templates is
++				trusted.`,
++				Default: false,
++				DisplayAttrs: &framework.DisplayAttributes{
++					Name:  "Allow Commas in Substitutions",
++					Value: false,
++				},
++			},
++
+ 			"allow_empty_principals": {
+ 				Type: framework.TypeBool,
+ 				Description: `
+@@ -546,7 +562,8 @@ func (b *backend) createCARole(allowedUsers, defaultUser, signer string, data *f
+ 		DefaultUserTemplate:       data.Get("default_user_template").(bool),
+ 		AllowBareDomains:          data.Get("allow_bare_domains").(bool),
+ 		AllowSubdomains:           data.Get("allow_subdomains").(bool),
+-		AllowGlobDomains:          data.Get("allow_glob_domains").(bool),
++		AllowGlobDomains:           data.Get("allow_glob_domains").(bool),
++		AllowCommasInSubstitutions: data.Get("allow_commas_in_substitutions").(bool),
+ 		AllowUserKeyIDs:           data.Get("allow_user_key_ids").(bool),
+ 		AllowEmptyPrincipals:      data.Get("allow_empty_principals").(bool),
+ 		DefaultExtensionsTemplate: data.Get("default_extensions_template").(bool),
+@@ -753,7 +770,8 @@ func (b *backend) parseRole(role *sshRole) (map[string]interface{}, error) {
+ 			"allow_host_certificates":     role.AllowHostCertificates,
+ 			"allow_bare_domains":          role.AllowBareDomains,
+ 			"allow_subdomains":            role.AllowSubdomains,
+-			"allow_glob_domains":          role.AllowGlobDomains,
++			"allow_glob_domains":           role.AllowGlobDomains,
++			"allow_commas_in_substitutions": role.AllowCommasInSubstitutions,
+ 			"allow_user_key_ids":          role.AllowUserKeyIDs,
+ 			"allow_empty_principals":      role.AllowEmptyPrincipals,
+ 			"key_id_format":               role.KeyIDFormat,
+diff --git a/sdk/framework/identity.go b/sdk/framework/identity.go
+index f32f02d..a268c84 100644
+--- a/sdk/framework/identity.go
++++ b/sdk/framework/identity.go
+@@ -15,6 +15,9 @@ import (
+ // instance of system view. It will query system view for information about the
+ // entity and use the resulting identity information to populate the template
+ // string.
++//
++// Deprecated: This function does not expose all options of
++// [identitytpl.PopulateString] consider inlining
+ func PopulateIdentityTemplate(tpl string, entityID string, sysView logical.SystemView) (string, error) {
+ 	entity, err := sysView.EntityInfo(entityID)
+ 	if err != nil {
+diff --git a/sdk/helper/identitytpl/templating.go b/sdk/helper/identitytpl/templating.go
+index 214af79..9b96e0f 100644
+--- a/sdk/helper/identitytpl/templating.go
++++ b/sdk/helper/identitytpl/templating.go
+@@ -20,6 +20,7 @@ var (
+ 	ErrNoEntityAttachedToToken       = errors.New("string contains entity template directives but no entity was provided")
+ 	ErrNoGroupsAttachedToToken       = errors.New("string contains groups template directives but no groups were provided")
+ 	ErrTemplateValueNotFound         = errors.New("no value could be found for one of the template directives")
++	ErrTemplateWildcard              = `template substitution contains forbidden value %q`
+ )
+ 
+ const (
+@@ -28,13 +29,14 @@ const (
+ )
+ 
+ type PopulateStringInput struct {
+-	String            string
+-	ValidityCheckOnly bool
+-	Entity            *logical.Entity
+-	Groups            []*logical.Group
+-	NamespaceID       string
+-	Mode              int       // processing mode, ACLTemplate or JSONTemplating
+-	Now               time.Time // optional, defaults to current time
++	String               string
++	ValidityCheckOnly    bool
++	Entity               *logical.Entity
++	Groups               []*logical.Group
++	NamespaceID          string
++	Mode                 int       // processing mode, ACLTemplate or JSONTemplating
++	Now                  time.Time // optional, defaults to current time
++	BlockedSubstitutions []string  // optional, defaults to ["*", "+"] if (.Mode == ACLTemplate) and [] otherwise
+ 
+ 	templateHandler templateHandlerFunc
+ 	groupIDs        []string
+@@ -155,6 +157,11 @@ func PopulateString(p PopulateStringInput) (bool, string, error) {
+ 				if err != nil {
+ 					return false, "", err
+ 				}
++				for _, blocked := range p.BlockedSubstitutions {
++					if strings.Contains(tmplStr, blocked) {
++						return false, "", fmt.Errorf(ErrTemplateWildcard, blocked)
++					}
++				}
+ 				b.WriteString(tmplStr)
+ 				b.WriteString(splitPiece[1])
+ 			}
+diff --git a/vault/logical_system.go b/vault/logical_system.go
+index 5d4e6db..78a0bf6 100644
+--- a/vault/logical_system.go
++++ b/vault/logical_system.go
+@@ -2522,10 +2522,12 @@ func (b *SystemBackend) handlePoliciesRead(policyType policy.Type) framework.Ope
+ 
+ func readPolicyResponse(policy *policy.Policy) map[string]interface{} {
+ 	data := map[string]interface{}{
+-		"name":         policy.Name,
+-		"version":      policy.DataVersion,
+-		"cas_required": policy.CASRequired,
+-		"policy":       policy.Raw,
++		"name":                             policy.Name,
++		"version":                          policy.DataVersion,
++		"cas_required":                     policy.CASRequired,
++		"policy":                           policy.Raw,
++		"allow_wildcards_in_substitutions": policy.AllowWildcardsInSubstitutions,
++		"allow_slashes_in_substitutions":   policy.AllowSlashesInSubstitutions,
+ 	}
+ 
+ 	if !policy.Expiration.IsZero() {
+@@ -2616,6 +2618,9 @@ func (b *SystemBackend) handlePoliciesSet(policyType policy.Type) framework.Oper
+ 		casRequired := data.Get("cas_required").(bool)
+ 		pol.CASRequired = casRequired
+ 
++		pol.AllowWildcardsInSubstitutions = data.Get("allow_wildcards_in_substitutions").(bool)
++		pol.AllowSlashesInSubstitutions = data.Get("allow_slashes_in_substitutions").(bool)
++
+ 		// Update the policy
+ 		if err := b.Core.policyStore.SetPolicy(ctx, pol, cas); err != nil {
+ 			return handleError(err)
+diff --git a/vault/logical_system_paths.go b/vault/logical_system_paths.go
+index 3d583d7..6301c42 100644
+--- a/vault/logical_system_paths.go
++++ b/vault/logical_system_paths.go
+@@ -3620,6 +3620,14 @@ func (b *SystemBackend) policyPaths() []*framework.Path {
+ 					Type:        framework.TypeBool,
+ 					Description: strings.TrimSpace(sysHelp["policy-rules"][0]),
+ 				},
++				"allow_wildcards_in_substitutions": {
++					Type:    framework.TypeBool,
++					Default: false,
++				},
++				"allow_slashes_in_substitutions": {
++					Type:    framework.TypeBool,
++					Default: false,
++				},
+ 			},
+ 
+ 			Operations: map[logical.Operation]framework.OperationHandler{
+@@ -3657,6 +3665,14 @@ func (b *SystemBackend) policyPaths() []*framework.Path {
+ 									Type:     framework.TypeBool,
+ 									Required: true,
+ 								},
++								"allow_wildcards_in_substitutions": {
++									Type:     framework.TypeBool,
++									Required: true,
++								},
++								"allow_slashes_in_substitutions": {
++									Type:     framework.TypeBool,
++									Required: true,
++								},
+ 							},
+ 						}},
+ 					},
+@@ -3770,6 +3786,14 @@ func (b *SystemBackend) policyPaths() []*framework.Path {
+ 					Type:        framework.TypeBool,
+ 					Description: strings.TrimSpace(sysHelp["policy-rules"][0]),
+ 				},
++				"allow_wildcards_in_substitutions": {
++					Type:    framework.TypeBool,
++					Default: false,
++				},
++				"allow_slashes_in_substitutions": {
++					Type:    framework.TypeBool,
++					Default: false,
++				},
+ 			},
+ 
+ 			Operations: map[logical.Operation]framework.OperationHandler{
+@@ -3807,6 +3831,14 @@ func (b *SystemBackend) policyPaths() []*framework.Path {
+ 									Type:     framework.TypeBool,
+ 									Required: true,
+ 								},
++								"allow_wildcards_in_substitutions": {
++									Type:     framework.TypeBool,
++									Required: true,
++								},
++								"allow_slashes_in_substitutions": {
++									Type:     framework.TypeBool,
++									Required: true,
++								},
+ 							},
+ 						}},
+ 					},
+diff --git a/vault/policy/policy.go b/vault/policy/policy.go
+index 2f22fd4..2615e4f 100644
+--- a/vault/policy/policy.go
++++ b/vault/policy/policy.go
+@@ -94,30 +94,34 @@ var cap2Int = map[string]uint32{
+ 
+ // Policy is used to represent the policy specified by an ACL configuration.
+ type Policy struct {
+-	Name        string `hcl:"name"`
+-	DataVersion int
+-	CASRequired bool
+-	Paths       []*PathRules `hcl:"-"`
+-	Raw         string
+-	Type        Type
+-	Templated   bool
+-	Expiration  time.Time
+-	Modified    time.Time
+-	Namespace   *namespace.Namespace
++	Name                          string `hcl:"name"`
++	DataVersion                   int
++	CASRequired                   bool
++	Paths                         []*PathRules `hcl:"-"`
++	Raw                           string
++	Type                          Type
++	Templated                     bool
++	Expiration                    time.Time
++	Modified                      time.Time
++	Namespace                     *namespace.Namespace
++	AllowWildcardsInSubstitutions bool
++	AllowSlashesInSubstitutions   bool
+ }
+ 
+ // ShallowClone returns a shallow clone of the policy. This should not be used
+ // if any of the reference-typed fields are going to be modified
+ func (p *Policy) ShallowClone() *Policy {
+ 	return &Policy{
+-		Name:        p.Name,
+-		DataVersion: p.DataVersion,
+-		CASRequired: p.CASRequired,
+-		Paths:       p.Paths,
+-		Raw:         p.Raw,
+-		Type:        p.Type,
+-		Templated:   p.Templated,
+-		Namespace:   p.Namespace,
++		Name:                          p.Name,
++		DataVersion:                   p.DataVersion,
++		CASRequired:                   p.CASRequired,
++		Paths:                         p.Paths,
++		Raw:                           p.Raw,
++		Type:                          p.Type,
++		Templated:                     p.Templated,
++		Namespace:                     p.Namespace,
++		AllowWildcardsInSubstitutions: p.AllowWildcardsInSubstitutions,
++		AllowSlashesInSubstitutions:   p.AllowSlashesInSubstitutions,
+ 	}
+ }
+ 
+@@ -291,14 +295,14 @@ func addGrantingPoliciesToMap(m map[uint32][]logical.PolicyInfo, policy *Policy,
+ // intermediary set of policies, before being compiled into
+ // the ACL
+ func ParseACLPolicy(ns *namespace.Namespace, rules string) (*Policy, error) {
+-	return ParseACLPolicyWithTemplating(ns, rules, false, nil, nil)
++	return ParseACLPolicyWithTemplating(ns, rules, false, nil, nil, nil)
+ }
+ 
+ // ParseACLPolicyWithTemplating performs the actual work and checks whether we
+ // should perform substitutions. If performTemplating is true we know that it
+ // is templated so we don't check again, otherwise we check to see if it's a
+ // templated policy.
+-func ParseACLPolicyWithTemplating(ns *namespace.Namespace, rules string, performTemplating bool, entity *identity.Entity, groups []*identity.Group) (*Policy, error) {
++func ParseACLPolicyWithTemplating(ns *namespace.Namespace, rules string, performTemplating bool, blockedSubstitutions []string, entity *identity.Entity, groups []*identity.Group) (*Policy, error) {
+ 	// Parse the rules
+ 	root, err := hclutil.ParseConfig([]byte(rules))
+ 	if err != nil {
+@@ -331,7 +335,7 @@ func ParseACLPolicyWithTemplating(ns *namespace.Namespace, rules string, perform
+ 	}
+ 
+ 	if o := list.Filter("path"); len(o.Items) > 0 {
+-		if err := parsePaths(&p, o, performTemplating, entity, groups); err != nil {
++		if err := parsePaths(&p, o, performTemplating, blockedSubstitutions, entity, groups); err != nil {
+ 			return nil, fmt.Errorf("failed to parse policy: %w", err)
+ 		}
+ 	}
+@@ -339,7 +343,7 @@ func ParseACLPolicyWithTemplating(ns *namespace.Namespace, rules string, perform
+ 	return &p, nil
+ }
+ 
+-func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, entity *identity.Entity, groups []*identity.Group) error {
++func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, blockedSubstitutions []string, entity *identity.Entity, groups []*identity.Group) error {
+ 	paths := make([]*PathRules, 0, len(list.Items))
+ 	for _, item := range list.Items {
+ 		key := "path"
+@@ -350,11 +354,12 @@ func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, en
+ 		// Check the path
+ 		if performTemplating {
+ 			_, templated, err := identitytpl.PopulateString(identitytpl.PopulateStringInput{
+-				Mode:        identitytpl.ACLTemplating,
+-				String:      key,
+-				Entity:      identity.ToSDKEntity(entity),
+-				Groups:      identity.ToSDKGroups(groups),
+-				NamespaceID: result.Namespace.ID,
++				Mode:                 identitytpl.ACLTemplating,
++				String:               key,
++				Entity:               identity.ToSDKEntity(entity),
++				Groups:               identity.ToSDKGroups(groups),
++				NamespaceID:          result.Namespace.ID,
++				BlockedSubstitutions: blockedSubstitutions,
+ 			})
+ 			if err != nil {
+ 				continue
+diff --git a/vault/policy/policy_store.go b/vault/policy/policy_store.go
+index 600cee1..be23db8 100644
+--- a/vault/policy/policy_store.go
++++ b/vault/policy/policy_store.go
+@@ -676,7 +676,16 @@ func (ps *Store) ACL(ctx context.Context, entity *identity.Entity, policyNames m
+ 					groups = append(directGroups, inheritedGroups...)
+ 				}
+ 			}
+-			p, err := ParseACLPolicyWithTemplating(pol.Namespace, pol.Raw, true, entity, groups)
++
++			blockedSubstitutions := make([]string, 0, 3)
++			if !pol.AllowSlashesInSubstitutions {
++				blockedSubstitutions = append(blockedSubstitutions, "/")
++			}
++			if !pol.AllowWildcardsInSubstitutions {
++				blockedSubstitutions = append(blockedSubstitutions, "*", "+")
++			}
++
++			p, err := ParseACLPolicyWithTemplating(pol.Namespace, pol.Raw, true, blockedSubstitutions, entity, groups)
+ 			if err != nil {
+ 				return nil, fmt.Errorf("error parsing templated policy %q: %w", pol.Name, err)
+ 			}

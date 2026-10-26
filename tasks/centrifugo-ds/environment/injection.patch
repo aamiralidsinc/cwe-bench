@@ -1,0 +1,127 @@
+diff --git a/internal/client/handler.go b/internal/client/handler.go
+index c43dc417..35e61123 100644
+--- a/internal/client/handler.go
++++ b/internal/client/handler.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"net/http"
+ 	"sync"
+ 	"time"
+ 	"unicode"
+@@ -14,6 +15,7 @@ import (
+ 	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+ 	"github.com/centrifugal/centrifugo/v6/internal/jwtverify"
+ 	"github.com/centrifugal/centrifugo/v6/internal/logging"
++	"github.com/centrifugal/centrifugo/v6/internal/middleware"
+ 	"github.com/centrifugal/centrifugo/v6/internal/proxy"
+ 	"github.com/centrifugal/centrifugo/v6/internal/subsource"
+ 
+@@ -386,7 +388,24 @@ func (h *Handler) OnClientConnecting(
+ 
+ 		processClientChannels = true
+ 	} else if connectProxyHandler != nil {
+-		connectReply, _, err := connectProxyHandler(clientcontext.SetEmulatedHeadersToContext(ctx, e.Headers), e)
++		connectCtx := ctx
++		if len(e.Headers) > 0 {
++			// Clients of unidirectional and emulation transports have no real
++			// request headers, so expose the headers they send with the connect
++			// frame to header-aware middleware and proxy backends as well. Real
++			// transport headers keep priority over emulated values.
++			headers := make(http.Header, len(e.Headers))
++			for k, v := range e.Headers {
++				headers.Set(k, v)
++			}
++			if transportHeaders, ok := middleware.GetHeadersFromContext(ctx); ok {
++				for k, vv := range transportHeaders {
++					headers[k] = vv
++				}
++			}
++			connectCtx = middleware.SetHeadersToContext(connectCtx, headers)
++		}
++		connectReply, _, err := connectProxyHandler(clientcontext.SetEmulatedHeadersToContext(connectCtx, e.Headers), e)
+ 		if err != nil {
+ 			return centrifuge.ConnectReply{}, err
+ 		}
+diff --git a/internal/proxy/subscribe_stream_grpc.go b/internal/proxy/subscribe_stream_grpc.go
+index 26eaa269..201f47b0 100644
+--- a/internal/proxy/subscribe_stream_grpc.go
++++ b/internal/proxy/subscribe_stream_grpc.go
+@@ -3,10 +3,15 @@ package proxy
+ import (
+ 	"context"
+ 	"fmt"
++	"slices"
++	"strings"
+ 
++	"github.com/centrifugal/centrifugo/v6/internal/clientcontext"
++	"github.com/centrifugal/centrifugo/v6/internal/middleware"
+ 	"github.com/centrifugal/centrifugo/v6/internal/proxyproto"
+ 
+ 	"google.golang.org/grpc"
++	"google.golang.org/grpc/metadata"
+ )
+ 
+ type SubscribeStreamProxy struct {
+@@ -34,12 +39,58 @@ func NewSubscribeStreamProxy(name string, p Config) (*SubscribeStreamProxy, erro
+ 	}, nil
+ }
+ 
++// subscribeStreamRequestContext builds outgoing metadata for a subscribe stream
++// call. The subscribe stream proxy is constructed apart from the shared proxy
++// helpers, so it resolves its own header configuration here.
++func subscribeStreamRequestContext(ctx context.Context, p Config) context.Context {
++	md := metadata.MD{}
++
++	// Set static metadata first, so that dynamic metadata can override it.
++	for k, v := range p.GRPC.StaticMetadata {
++		md.Set(k, v)
++	}
++
++	allowedHeader := func(name string) bool {
++		for _, header := range p.HttpHeaders {
++			if strings.EqualFold(header, name) {
++				return true
++			}
++		}
++		return false
++	}
++
++	emulatedHeaders, _ := clientcontext.GetEmulatedHeadersFromContext(ctx)
++	for k, v := range emulatedHeaders {
++		if allowedHeader(k) {
++			md.Set(k, v)
++		}
++	}
++
++	httpHeaders, hasHTTPHeaders := middleware.GetHeadersFromContext(ctx)
++	for k, vv := range httpHeaders {
++		if allowedHeader(k) {
++			md.Set(k, vv...)
++		}
++	}
++
++	if !hasHTTPHeaders {
++		incomingMD, _ := metadata.FromIncomingContext(ctx)
++		for k, vv := range incomingMD {
++			if slices.Contains(p.GrpcMetadata, k) {
++				md[k] = vv
++			}
++		}
++	}
++
++	return metadata.NewOutgoingContext(ctx, md)
++}
++
+ // SubscribeUnidirectional ...
+ func (p *SubscribeStreamProxy) SubscribeUnidirectional(ctx context.Context, req *proxyproto.SubscribeRequest) (proxyproto.CentrifugoProxy_SubscribeUnidirectionalClient, error) {
+-	return p.client.SubscribeUnidirectional(grpcRequestContext(ctx, p.config), req)
++	return p.client.SubscribeUnidirectional(subscribeStreamRequestContext(ctx, p.config), req)
+ }
+ 
+ // SubscribeBidirectional ...
+ func (p *SubscribeStreamProxy) SubscribeBidirectional(ctx context.Context) (proxyproto.CentrifugoProxy_SubscribeBidirectionalClient, error) {
+-	return p.client.SubscribeBidirectional(grpcRequestContext(ctx, p.config))
++	return p.client.SubscribeBidirectional(subscribeStreamRequestContext(ctx, p.config))
+ }

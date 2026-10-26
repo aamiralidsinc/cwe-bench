@@ -1,0 +1,212 @@
+diff -ruN a/src/cli/reset_admin.go b/src/cli/reset_admin.go
+--- a/src/cli/reset_admin.go	2026-10-24 05:26:55.168849789 +0000
++++ b/src/cli/reset_admin.go	2026-10-24 05:30:45.276630020 +0000
+@@ -30,7 +30,7 @@
+ 	}
+ 	hash := strings.TrimSpace(cfg.Coordinator.Auth.AdminPasswordHash)
+ 	if hash == "" {
+-		hash = config.DefaultInternalAuthPasswordHash
++		return fmt.Errorf("coordinator.auth.admin_password_hash is required for --reset-admin-password")
+ 	}
+ 	user := strings.TrimSpace(cfg.Coordinator.Auth.AdminUser)
+ 	if user == "" {
+diff -ruN a/src/cli/wizard_cmd.go b/src/cli/wizard_cmd.go
+--- a/src/cli/wizard_cmd.go	2026-10-24 05:26:55.128849824 +0000
++++ b/src/cli/wizard_cmd.go	2026-10-24 05:30:45.276630020 +0000
+@@ -203,7 +203,6 @@
+ 				Type:                   "internal",
+ 				AuthFromInternalString: true,
+ 				AdminUser:              "admin",
+-				AdminPasswordHash:      config.DefaultInternalAuthPasswordHash,
+ 			},
+ 		},
+ 		Log: config.LogConfig{
+@@ -417,8 +416,8 @@
+ 	inputs[wfAdminUser].SetValue("admin")
+ 
+ 	inputs[wfAdminPass].Prompt = "Admin Password:  "
+-	inputs[wfAdminPass].Placeholder = "sipcapture"
+-	inputs[wfAdminPass].SetValue("sipcapture")
++	inputs[wfAdminPass].Placeholder = "(auto-generated if empty)"
++	inputs[wfAdminPass].SetValue("")
+ 	inputs[wfAdminPass].EchoMode = textinput.EchoPassword
+ 
+ 	inputs[wfSettingsDB].Prompt = "Settings DB:     "
+@@ -726,12 +725,9 @@
+ 	}
+ 	adminPass := m.inputs[wfAdminPass].Value()
+ 	if adminPass == "" {
+-		adminPass = "sipcapture"
+-	}
+-	adminHash := config.DefaultInternalAuthPasswordHash
+-	if adminPass != "sipcapture" {
+-		adminHash = passwordhash.MustHash(adminPass)
++		adminPass = randomHex(24)
+ 	}
++	adminHash := passwordhash.MustHash(adminPass)
+ 
+ 	settingsDB := m.inputs[wfSettingsDB].Value()
+ 	if settingsDB == "" {
+diff -ruN a/src/config/config.go b/src/config/config.go
+--- a/src/config/config.go	2026-10-24 05:26:55.168849789 +0000
++++ b/src/config/config.go	2026-10-24 05:30:45.276630020 +0000
+@@ -894,7 +894,7 @@
+ 		if u := strings.TrimSpace(a.AdminUser); u != "" && u != "admin" {
+ 			o.AdminUser = a.AdminUser
+ 		}
+-		if h := strings.TrimSpace(a.AdminPasswordHash); h != "" && h != DefaultInternalAuthPasswordHash {
++		if h := strings.TrimSpace(a.AdminPasswordHash); h != "" {
+ 			o.AdminPasswordHash = a.AdminPasswordHash
+ 		}
+ 		if fb := strings.TrimSpace(a.FallbackAuthType); fb != "" {
+@@ -942,7 +942,6 @@
+ 		return AuthConfig{
+ 			Type:                   "internal",
+ 			AdminUser:              "admin",
+-			AdminPasswordHash:      DefaultInternalAuthPasswordHash,
+ 			AuthFromInternalString: true,
+ 		}, nil
+ 	}
+@@ -965,9 +964,6 @@
+ 		if strings.TrimSpace(auth.AdminUser) == "" {
+ 			auth.AdminUser = "admin"
+ 		}
+-		if strings.TrimSpace(auth.AdminPasswordHash) == "" {
+-			auth.AdminPasswordHash = DefaultInternalAuthPasswordHash
+-		}
+ 	case "ldap", "oauth":
+ 		auth.AuthFromInternalString = false
+ 	default:
+@@ -1033,14 +1029,14 @@
+ 
+ 	// Authorization code flow (RFC 6749). When ClientID, AuthURL, TokenURL, RedirectURL, and ProfileURL
+ 	// are all non-empty, the coordinator runs the full flow (state + optional PKCE, server-side code exchange).
+-	ClientID      string   `json:"client_id" mapstructure:"client_id"`
+-	ClientSecret  string   `json:"client_secret" mapstructure:"client_secret"`
+-	AuthURL       string   `json:"auth_url" mapstructure:"auth_url"`
+-	TokenURL      string   `json:"token_url" mapstructure:"token_url"`
+-	RedirectURL   string   `json:"redirect_url" mapstructure:"redirect_url"`
+-	ProfileURL    string   `json:"profile_url" mapstructure:"profile_url"`
+-	Scopes        []string `json:"scopes" mapstructure:"scopes"`
+-	UsePKCE       bool     `json:"use_pkce" mapstructure:"use_pkce"`
++	ClientID     string   `json:"client_id" mapstructure:"client_id"`
++	ClientSecret string   `json:"client_secret" mapstructure:"client_secret"`
++	AuthURL      string   `json:"auth_url" mapstructure:"auth_url"`
++	TokenURL     string   `json:"token_url" mapstructure:"token_url"`
++	RedirectURL  string   `json:"redirect_url" mapstructure:"redirect_url"`
++	ProfileURL   string   `json:"profile_url" mapstructure:"profile_url"`
++	Scopes       []string `json:"scopes" mapstructure:"scopes"`
++	UsePKCE      bool     `json:"use_pkce" mapstructure:"use_pkce"`
+ 	// SkipAutoProvision when true: user must already exist in DuckDB (matched by username or email).
+ 	SkipAutoProvision bool     `json:"skip_auto_provision" mapstructure:"skip_auto_provision"`
+ 	AdminGroups       []string `json:"admin_groups" mapstructure:"admin_groups"`
+@@ -1846,7 +1842,7 @@
+ 			},
+ 			Auth: AuthConfig{
+ 				AdminUser:         "admin",
+-				AdminPasswordHash: passwordhash.MustHash("sipcapture"),
++				AdminPasswordHash: "",
+ 			},
+ 			LDAP: LDAPConfig{},
+ 		},
+diff -ruN a/src/coordinator/coordinator.go b/src/coordinator/coordinator.go
+--- a/src/coordinator/coordinator.go	2026-10-24 05:26:55.132849821 +0000
++++ b/src/coordinator/coordinator.go	2026-10-24 05:30:45.284630014 +0000
+@@ -11,7 +11,9 @@
+ 
+ import (
+ 	"context"
++	"crypto/rand"
+ 	"database/sql"
++	"encoding/base64"
+ 	"embed"
+ 	"fmt"
+ 	"mime"
+@@ -28,6 +30,7 @@
+ 	"github.com/sipcapture/homer-core/src/coordinator/games/netris"
+ 	"github.com/sipcapture/homer-core/src/coordinator/handlers"
+ 	"github.com/sipcapture/homer-core/src/coordinator/services"
++	"github.com/sipcapture/homer-core/src/passwordhash"
+ 	"github.com/sipcapture/homer-core/src/homerconfig"
+ 	mcppkg "github.com/sipcapture/homer-core/src/mcp"
+ 	"github.com/sipcapture/homer-core/src/scripting/correlation"
+@@ -100,7 +103,7 @@
+ 	}
+ 	// Always log how coordinator.auth was interpreted (no secrets). If
+ 	// auth_internal_string_form is false, JSON "internal" was not used
+-	// and bootstrap admin user for default sipcapture is skipped.
++	// and bootstrap admin user is skipped.
+ 	logger.Info("coordinator: auth settings snapshot",
+ 		"auth_type", cfg.Auth.Type,
+ 		"auth_internal_bootstrap", cfg.Auth.AuthFromInternalString,
+@@ -108,11 +111,32 @@
+ 		"admin_password_hash_configured", strings.TrimSpace(cfg.Auth.AdminPasswordHash) != "",
+ 		"settings_db_path", cfg.SettingsDBPath)
+ 	if cfg.Auth.AuthFromInternalString {
++		hash := strings.TrimSpace(cfg.Auth.AdminPasswordHash)
++		generated := ""
++		if hash == "" {
++			buf := make([]byte, 32)
++			if _, rerr := rand.Read(buf); rerr != nil {
++				_ = settingsDB.Close()
++				return nil, fmt.Errorf("internal auth bootstrap: %w", rerr)
++			}
++			generated = base64.RawURLEncoding.EncodeToString(buf)
++			hashed, herr := passwordhash.Hash(generated)
++			if herr != nil {
++				_ = settingsDB.Close()
++				return nil, fmt.Errorf("internal auth bootstrap: %w", herr)
++			}
++			hash = hashed
++		}
+ 		if err := services.EnsureBootstrapAdminUser(context.Background(), settingsDB,
+-			cfg.Auth.AdminUser, cfg.Auth.AdminPasswordHash); err != nil {
++			cfg.Auth.AdminUser, hash); err != nil {
+ 			_ = settingsDB.Close()
+ 			return nil, fmt.Errorf("internal auth bootstrap: %w", err)
+ 		}
++		if generated != "" {
++			logger.Warn("coordinator: generated one-time bootstrap admin password - change after first login",
++				"admin_user", cfg.Auth.AdminUser,
++				"bootstrap_password", generated)
++		}
+ 		logger.Info("coordinator: internal authentication enabled",
+ 			"settings_db_path", cfg.SettingsDBPath,
+ 			"admin_user", cfg.Auth.AdminUser)
+@@ -541,21 +565,21 @@
+ 	}
+ 	adminGroups := append([]string(nil), p.AdminGroups...)
+ 	return []handlers.OAuthProvider{{
+-		Enable:              true,
+-		Name:                strings.TrimSpace(p.Name),
+-		Position:            p.Position,
+-		Type:                typ,
+-		ProviderImage:       p.ProviderImage,
+-		ProviderName:        displayName,
+-		URL:                 "",
+-		AutoRedirect:        p.AutoRedirect,
+-		CallbackURL:         p.CallbackURL,
+-		OAuth2Config:        oauthCfg,
+-		ProfileURL:          strings.TrimSpace(p.ProfileURL),
+-		UsePKCE:             p.UsePKCE,
+-		SkipAutoProvision:   p.SkipAutoProvision,
+-		AdminGroups:         adminGroups,
+-		GroupClaim:          groupClaim,
++		Enable:            true,
++		Name:              strings.TrimSpace(p.Name),
++		Position:          p.Position,
++		Type:              typ,
++		ProviderImage:     p.ProviderImage,
++		ProviderName:      displayName,
++		URL:               "",
++		AutoRedirect:      p.AutoRedirect,
++		CallbackURL:       p.CallbackURL,
++		OAuth2Config:      oauthCfg,
++		ProfileURL:        strings.TrimSpace(p.ProfileURL),
++		UsePKCE:           p.UsePKCE,
++		SkipAutoProvision: p.SkipAutoProvision,
++		AdminGroups:       adminGroups,
++		GroupClaim:        groupClaim,
+ 	}}
+ }
+ 

@@ -1,0 +1,334 @@
+diff --git a/api/plugin_helpers.go b/api/plugin_helpers.go
+index 584ee5fe8..1a5354548 100644
+--- a/api/plugin_helpers.go
++++ b/api/plugin_helpers.go
+@@ -256,7 +256,7 @@ func IsSudoPath(path string) bool {
+ 	}
+ 
+ 	// Some sudo paths have templated fields in them.
+-	// (e.g. /sys/revoke-prefix/{prefix})
++	// (e.g. /sys/leases/revoke-prefix/{prefix})
+ 	// The values in the sudoPaths map are actually regular expressions,
+ 	// so we can check if our path matches against them.
+ 	for _, sudoPathRegexp := range sudoPaths {
+diff --git a/vault/expiration.go b/vault/expiration.go
+index b6218f0c0..d1ca7004f 100644
+--- a/vault/expiration.go
++++ b/vault/expiration.go
+@@ -1230,14 +1230,6 @@ func (m *ExpirationManager) Renew(ctx context.Context, leaseID string, increment
+ 		return logical.ErrorResponse("lease does not correspond to a secret"), nil
+ 	}
+ 
+-	ns, err := namespace.FromContext(ctx)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if ns.ID != le.namespace.ID {
+-		return nil, errors.New("cannot renew a lease across namespaces")
+-	}
+-
+ 	sysViewCtx := namespace.ContextWithNamespace(ctx, le.namespace)
+ 	sysView := m.router.MatchingSystemView(sysViewCtx, le.Path)
+ 	if sysView == nil {
+@@ -1701,14 +1693,17 @@ func (m *ExpirationManager) FetchLeaseTimesByToken(ctx context.Context, te *logi
+ func (m *ExpirationManager) FetchLeaseInfo(ctx context.Context, leaseID string) (*leaseEntry, error) {
+ 	defer metrics.MeasureSince([]string{"expire", "fetch-lease-times"}, time.Now())
+ 
+-	info, ok := m.pending.Load(leaseID)
+-	if ok && info.(pendingInfo).cachedLeaseInfo != nil {
+-		return m.leaseInfoForExport(info.(pendingInfo).cachedLeaseInfo), nil
+-	}
+-
+-	info, ok = m.irrevocable.Load(leaseID)
+-	if ok && info.(*leaseEntry) != nil {
+-		return m.leaseInfoForExport(info.(*leaseEntry)), nil
++	le := m.fetchCachedLease(leaseID)
++	if le != nil {
++		ns, err := namespace.FromContext(ctx)
++		switch {
++		case err != nil:
++			return nil, err
++		case ns.ID != le.namespace.ID:
++			return nil, nil
++		default:
++			return le, nil
++		}
+ 	}
+ 
+ 	// Load the entry
+@@ -1723,6 +1718,22 @@ func (m *ExpirationManager) FetchLeaseInfo(ctx context.Context, leaseID string)
+ 	return m.leaseInfoForExport(le), nil
+ }
+ 
++// fetchCachedLease attempts to look up a lease ID by pending or irrevocable
++// leases to skip a storage read.
++func (m *ExpirationManager) fetchCachedLease(leaseID string) *leaseEntry {
++	info, ok := m.pending.Load(leaseID)
++	if ok && info.(pendingInfo).cachedLeaseInfo != nil {
++		return m.leaseInfoForExport(info.(pendingInfo).cachedLeaseInfo)
++	}
++
++	info, ok = m.irrevocable.Load(leaseID)
++	if ok && info.(*leaseEntry) != nil {
++		return m.leaseInfoForExport(info.(*leaseEntry))
++	}
++
++	return nil
++}
++
+ // Returns redacted leaseEntry for outside callers based on the full leaseEntry passed in
+ func (m *ExpirationManager) leaseInfoForExport(le *leaseEntry) *leaseEntry {
+ 	ret := &leaseEntry{
+@@ -1998,19 +2009,6 @@ func (m *ExpirationManager) loadEntry(ctx context.Context, leaseID string) (*lea
+ 		}
+ 	}
+ 
+-	_, nsID := namespace.SplitIDFromString(leaseID)
+-	if nsID != "" {
+-		leaseNS, err := m.core.NamespaceByID(ctx, nsID)
+-		if err != nil {
+-			return nil, err
+-		}
+-		if leaseNS != nil {
+-			ctx = namespace.ContextWithNamespace(ctx, leaseNS)
+-		}
+-	} else {
+-		ctx = namespace.ContextWithNamespace(ctx, namespace.RootNamespace)
+-	}
+-
+ 	// If a lease entry is nil, proactively delete the lease lock, in case we
+ 	// created one erroneously.
+ 	// If there was an error, we don't know whether the lease entry exists or not.
+diff --git a/vault/logical_system_paths.go b/vault/logical_system_paths.go
+index 1d937b21d..d4db069d7 100644
+--- a/vault/logical_system_paths.go
++++ b/vault/logical_system_paths.go
+@@ -2672,7 +2672,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?renew" + framework.OptionalParamRegex("url_lease_id"),
++			Pattern: "leases/renew" + framework.OptionalParamRegex("url_lease_id"),
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2712,7 +2712,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke" + framework.OptionalParamRegex("url_lease_id"),
++			Pattern: "leases/revoke" + framework.OptionalParamRegex("url_lease_id"),
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2753,7 +2753,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke-force/(?P<prefix>.+)",
++			Pattern: "leases/revoke-force/(?P<prefix>.+)",
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2786,7 +2786,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke-prefix/(?P<prefix>.+)",
++			Pattern: "leases/revoke-prefix/(?P<prefix>.+)",
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+diff --git a/vault/policy/policy_store.go b/vault/policy/policy_store.go
+index 83d621258..600cee16c 100644
+--- a/vault/policy/policy_store.go
++++ b/vault/policy/policy_store.go
+@@ -90,9 +90,6 @@ path "sys/internal/ui/resultant-acl" {
+ 
+ # Allow a token to renew a lease via lease_id in the request body; old path for
+ # old clients, new path for newer
+-path "sys/renew" {
+-    capabilities = ["update"]
+-}
+ path "sys/leases/renew" {
+     capabilities = ["update"]
+ }
+diff --git a/vault/request_handling.go b/vault/request_handling.go
+index 55b261821..1376c77b2 100644
+--- a/vault/request_handling.go
++++ b/vault/request_handling.go
+@@ -888,7 +888,7 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
+ 		// using the token's embedded nsID if a relative path was provided.
+ 		// The operation will still be gated by ACLs, which are checked later.
+ 		case "auth/token/lookup", "auth/token/renew", "auth/token/revoke", "auth/token/revoke-orphan":
+-			token, ok := req.Data["token"]
++			raw, ok := req.Data["token"]
+ 			// If the token is not present (e.g. a bad request), break out and let the backend
+ 			// handle the error
+ 			if !ok {
+@@ -900,14 +900,15 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
+ 				}
+ 				break
+ 			}
+-			if token == nil {
++			token, ok := raw.(string)
++			if !ok {
+ 				return logical.ErrorResponse("invalid token"), logical.ErrPermissionDenied
+ 			}
+ 			// We don't care if the token is a server side consistent token or not. Either way, we're going
+ 			// to be returning it for these paths instead of the short token stored in vault.
+-			requestBodyToken = token.(string)
+-			if IsSSCToken(token.(string)) {
+-				token, err = c.CheckSSCToken(ctx, token.(string), c.isLoginRequest(ctx, req))
++			requestBodyToken = token
++			if IsSSCToken(token) {
++				token, err = c.CheckSSCToken(ctx, token, c.isLoginRequest(ctx, req))
+ 				// If we receive an error from CheckSSCToken, we can assume the token is bad somehow, and the client
+ 				// should receive a 403 bad token error like they do for all other invalid tokens, unless the error
+ 				// specifies that we should forward the request or retry the request.
+@@ -919,7 +920,7 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
+ 				}
+ 				req.Data["token"] = token
+ 			}
+-			_, nsID := namespace.SplitIDFromString(token.(string))
++			_, nsID := namespace.SplitIDFromString(token)
+ 			if nsID != "" {
+ 				ns, err := c.NamespaceByID(ctx, nsID)
+ 				if err != nil {
+@@ -935,29 +936,57 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
+ 	// The following relative sys/leases/ paths handles re-routing requests
+ 	// to the proper namespace using the lease ID on applicable paths.
+ 	case strings.HasPrefix(req.Path, "sys/leases/"):
+-		switch req.Path {
+ 		// For the following operations, we can set the proper namespace context
+-		// using the lease's embedded nsID if a relative path was provided.
+-		// The operation will still be gated by ACLs, which are checked later.
+-		case "sys/leases/lookup", "sys/leases/renew", "sys/leases/revoke", "sys/leases/revoke-force":
+-			leaseID, ok := req.Data["lease_id"]
+-			// If lease ID is not present, break out and let the backend handle the error
+-			if !ok || leaseID == nil {
+-				break
+-			}
+-			_, nsID := namespace.SplitIDFromString(leaseID.(string))
+-			if nsID != "" {
+-				ns, err := c.NamespaceByID(ctx, nsID)
+-				if err != nil {
+-					c.Logger().Warn("error looking up namespace from the lease's namespace ID", "error", err)
+-					return nil, err
+-				}
+-				if ns != nil {
+-					ctx = namespace.ContextWithNamespace(ctx, ns)
++		// using the lease's embedded nsID if a relative path was provided. The
++		// operation will still be gated by ACLs, which are checked later.
++		//
++		// sys/leases/lookup takes 'lease_id' by request data only, but
++		// sys/leases/renew and sys/leases/revoke take it by path segment, too.
++		// Request data takes precedence in any case.
++		byData, byPath := any(nil), ""
++		switch req.Path {
++		case "sys/leases/lookup", "sys/leases/renew", "sys/leases/revoke":
++			byData = req.Data["lease_id"]
++		default:
++			for _, prefix := range []string{
++				"sys/leases/renew/", "sys/leases/revoke/",
++			} {
++				if suffix, ok := strings.CutPrefix(req.Path, prefix); ok {
++					byData, byPath = req.Data["lease_id"], suffix
+ 				}
+ 			}
+ 		}
+ 
++		leaseID, ok := "", false
++		if byData != nil {
++			leaseID, ok = byData.(string)
++		} else {
++			leaseID, ok = byPath, true
++		}
++
++		// Check for a failed conversion and error if so.
++		if !ok {
++			return logical.ErrorResponse("invalid lease ID"), logical.ErrInvalidRequest
++		}
++
++		// If lease ID is not present or empty, break out and let the backend
++		// handle the error.
++		if leaseID == "" {
++			break
++		}
++
++		_, nsID := namespace.SplitIDFromString(leaseID)
++		if nsID != "" {
++			ns, err := c.NamespaceByID(ctx, nsID)
++			if err != nil {
++				c.Logger().Warn("error looking up namespace from the lease's namespace ID", "error", err)
++				return nil, err
++			}
++			if ns != nil {
++				ctx = namespace.ContextWithNamespace(ctx, ns)
++			}
++		}
++
+ 	// Prevent any metrics requests to be forwarded from a standby node.
+ 	// Instead, we return an error since we cannot be sure if we have an
+ 	// active token store to validate the provided token.
+@@ -1290,8 +1319,7 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
+ 
+ 	// If there is a secret, we must register it with the expiration manager.
+ 	// We exclude renewal of a lease, since it does not need to be re-registered
+-	if resp != nil && resp.Secret != nil && !strings.HasPrefix(req.Path, "sys/renew") &&
+-		!strings.HasPrefix(req.Path, "sys/leases/renew") {
++	if resp != nil && resp.Secret != nil && !strings.HasPrefix(req.Path, "sys/leases/renew") {
+ 		// KV mounts should return the TTL but not register
+ 		// for a lease as this provides a massive slowdown
+ 		registerLease := true
+diff --git a/vault/token_store.go b/vault/token_store.go
+index 46386e2b5..0703f635d 100644
+--- a/vault/token_store.go
++++ b/vault/token_store.go
+@@ -3192,14 +3192,14 @@ func (ts *TokenStore) handleCreateCommon(ctx context.Context, req *logical.Reque
+ }
+ 
+ // handleRevokeSelf handles the auth/token/revoke-self path for revocation of tokens
+-// in a way that revokes all child tokens. Normally, using sys/revoke/leaseID will revoke
++// in a way that revokes all child tokens. Normally, using sys/leases/revoke/leaseID will revoke
+ // the token and all children anyways, but that is only available when there is a lease.
+ func (ts *TokenStore) handleRevokeSelf(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+ 	return ts.revokeCommon(ctx, req, data, req.ClientToken)
+ }
+ 
+-// handleRevokeTree handles the auth/token/revoke/id path for revocation of tokens
+-// in a way that revokes all child tokens. Normally, using sys/revoke/leaseID will revoke
++// handleRevokeTree handles the auth/token/revoke path for revocation of tokens
++// in a way that revokes all child tokens. Normally, using sys/leases/revoke/leaseID will revoke
+ // the token and all children anyways, but that is only available when there is a lease.
+ func (ts *TokenStore) handleRevokeTree(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+ 	id := data.Get("token").(string)
+@@ -3249,8 +3249,8 @@ func (ts *TokenStore) revokeCommon(ctx context.Context, req *logical.Request, da
+ 	return nil, nil
+ }
+ 
+-// handleRevokeOrphan handles the auth/token/revoke-orphan/id path for revocation of tokens
+-// in a way that leaves child tokens orphaned. Normally, using sys/revoke/leaseID will revoke
++// handleRevokeOrphan handles the auth/token/revoke-orphan path for revocation of tokens
++// in a way that leaves child tokens orphaned. Normally, using sys/leases/revoke/leaseID will revoke
+ // the token and all children.
+ func (ts *TokenStore) handleRevokeOrphan(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+ 	// Parse the id
+@@ -3294,7 +3294,7 @@ func (ts *TokenStore) handleLookupSelf(ctx context.Context, req *logical.Request
+ 	return ts.handleLookup(ctx, req, data)
+ }
+ 
+-// handleLookup handles the auth/token/lookup/id path for querying information about
++// handleLookup handles the auth/token/lookup path for querying information about
+ // a particular token. This can be used to see which policies are applicable.
+ func (ts *TokenStore) handleLookup(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+ 	id := data.Get("token").(string)
+@@ -3407,7 +3407,7 @@ func (ts *TokenStore) handleRenewSelf(ctx context.Context, req *logical.Request,
+ 	return ts.handleRenew(ctx, req, data)
+ }
+ 
+-// handleRenew handles the auth/token/renew/id path for renewal of tokens.
++// handleRenew handles the auth/token/renew path for renewal of tokens.
+ // This is used to prevent token expiration and revocation.
+ func (ts *TokenStore) handleRenew(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+ 	id := data.Get("token").(string)

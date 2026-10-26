@@ -1,0 +1,271 @@
+diff --git a/frontend/src/i18n/lang/en.json b/frontend/src/i18n/lang/en.json
+index 551349ef7..4f3ac11b2 100644
+--- a/frontend/src/i18n/lang/en.json
++++ b/frontend/src/i18n/lang/en.json
+@@ -81,6 +81,8 @@
+       "authenticating": "Authenticating…",
+       "openIdStateError": "State does not match, refusing to continue!",
+       "openIdGeneralError": "An error occurred while authenticating against the third party.",
++      "openIdTotpRequired": "Your account requires two-factor authentication. Enter your TOTP code and sign in again.",
++      "openIdTotpSubmit": "Continue",
+       "oauthMissingParams": "Missing required OAuth parameters: {params}",
+       "oauthRedirectedToApp": "You have been redirected to the app. You can close this tab now.",
+       "desktopTryDemo": "Try the Demo",
+diff --git a/frontend/src/views/user/OpenIdAuth.vue b/frontend/src/views/user/OpenIdAuth.vue
+index e581aaee2..b163ba4e5 100644
+--- a/frontend/src/views/user/OpenIdAuth.vue
++++ b/frontend/src/views/user/OpenIdAuth.vue
+@@ -13,9 +13,38 @@
+ 		>
+ 			{{ errorMessageFromQuery }}
+ 		</Message>
+-		<Message v-if="loading">
++		<Message v-if="loading && !needsTotp">
+ 			{{ $t('user.auth.authenticating') }}
+ 		</Message>
++
++		<form
++			v-if="needsTotp"
++			@submit.prevent="submitTotpAndRestart"
++		>
++			<Message class="mbe-2">
++				{{ $t('user.auth.openIdTotpRequired') }}
++			</Message>
++			<FormField
++				id="openIdTotpPasscode"
++				ref="totpInput"
++				v-model="totpPasscode"
++				v-focus
++				:label="$t('user.auth.totpTitle')"
++				autocomplete="one-time-code"
++				:placeholder="$t('user.auth.totpPlaceholder')"
++				required
++				type="text"
++				inputmode="numeric"
++			/>
++			<XButton
++				:loading="loading"
++				:disabled="!totpPasscode"
++				class="mbs-2"
++				@click="submitTotpAndRestart"
++			>
++				{{ $t('user.auth.openIdTotpSubmit') }}
++			</XButton>
++		</form>
+ 	</div>
+ </template>
+ 
+@@ -27,9 +56,13 @@ import {useI18n} from 'vue-i18n'
+ 
+ import {getErrorText} from '@/message'
+ import Message from '@/components/misc/Message.vue'
++import FormField from '@/components/input/FormField.vue'
+ import {useRedirectToLastVisited} from '@/composables/useRedirectToLastVisited'
++import {redirectToProvider} from '@/helpers/redirectToProvider'
+ 
+ import {useAuthStore} from '@/stores/auth'
++import {useConfigStore} from '@/stores/config'
++import type {IProvider} from '@/types/IProvider'
+ 
+ defineOptions({name: 'Auth'})
+ 
+@@ -39,11 +72,23 @@ const route = useRoute()
+ const {redirectIfSaved} = useRedirectToLastVisited()
+ 
+ const authStore = useAuthStore()
++const configStore = useConfigStore()
+ 
+ const loading = computed(() => authStore.isLoading)
+ const errorMessage = ref('')
+ const errorMessageFromQuery = computed(() => route.query.error)
+ 
++const needsTotp = ref(false)
++const totpPasscode = ref('')
++
++function pendingTotpKey(provider: string): string {
++	return `openid_pending_totp_${provider}`
++}
++
++function findProvider(providerKey: string): IProvider | undefined {
++	return configStore.auth.openidConnect.providers?.find((p: IProvider) => p.key === providerKey)
++}
++
+ async function authenticateWithCode() {
+ 	// This component gets mounted twice: The first time when the actual auth request hits the frontend,
+ 	// the second time after that auth request succeeded and the outer component "content-no-auth" isn't used
+@@ -60,8 +105,11 @@ async function authenticateWithCode() {
+ 
+ 	errorMessage.value = ''
+ 
++	const providerKey = route.params.provider as string
++
+ 	if (typeof route.query.error !== 'undefined') {
+ 		localStorage.removeItem('authenticating')
++		sessionStorage.removeItem(pendingTotpKey(providerKey))
+ 		errorMessage.value = typeof route.query.message !== 'undefined'
+ 			? route.query.message as string
+ 			: t('user.auth.openIdGeneralError')
+@@ -71,23 +119,53 @@ async function authenticateWithCode() {
+ 	const state = localStorage.getItem('state')
+ 	if (typeof route.query.state === 'undefined' || route.query.state !== state) {
+ 		localStorage.removeItem('authenticating')
++		sessionStorage.removeItem(pendingTotpKey(providerKey))
+ 		errorMessage.value = t('user.auth.openIdStateError')
+ 		return
+ 	}
+ 
++	// sessionStorage (not localStorage): per-tab, cleared on tab close.
++	const pendingPasscode = sessionStorage.getItem(pendingTotpKey(providerKey)) ?? undefined
++	if (pendingPasscode) {
++		sessionStorage.removeItem(pendingTotpKey(providerKey))
++	}
++
+ 	try {
+ 		await authStore.openIdAuth({
+-			provider: route.params.provider,
+-			code: route.query.code,
++			provider: providerKey,
++			code: route.query.code as string,
++			totpPasscode: pendingPasscode,
+ 		})
+ 
+ 		redirectIfSaved()
+ 	} catch (e) {
++		const err = e as {response?: {data?: {code?: number}}}
++		if (err?.response?.data?.code === 1017) {
++			needsTotp.value = true
++			return
++		}
+ 		errorMessage.value = getErrorText(e)
+ 	} finally {
+ 		localStorage.removeItem('authenticating')
+ 	}
+ }
+ 
++async function submitTotpAndRestart() {
++	if (!totpPasscode.value) {
++		return
++	}
++
++	const providerKey = route.params.provider as string
++	const provider = findProvider(providerKey)
++	if (!provider) {
++		errorMessage.value = t('user.auth.openIdGeneralError')
++		return
++	}
++
++	sessionStorage.setItem(pendingTotpKey(providerKey), totpPasscode.value)
++	// The auth code is single-use; restart the OIDC flow so the next callback reads the stashed passcode.
++	redirectToProvider(provider)
++}
++
+ onMounted(() => authenticateWithCode())
+ </script>
+diff --git a/pkg/modules/auth/openid/openid.go b/pkg/modules/auth/openid/openid.go
+index 381570f42..7fcc96052 100644
+--- a/pkg/modules/auth/openid/openid.go
++++ b/pkg/modules/auth/openid/openid.go
+@@ -72,8 +72,29 @@ type Provider struct {
+ 	Oauth2Config        *oauth2.Config `json:"-"`
+ }
+ 
++// boolish decodes a JSON bool or the strings "true"/"false"/"1"/"0" — some
++// providers emit flags such as email_verified as a string.
++type boolish bool
++
++func (b *boolish) UnmarshalJSON(data []byte) error {
++	var raw any
++	if err := json.Unmarshal(data, &raw); err != nil {
++		return err
++	}
++	switch v := raw.(type) {
++	case bool:
++		*b = boolish(v)
++	case string:
++		*b = boolish(v == "true" || v == "1")
++	default:
++		*b = false
++	}
++	return nil
++}
++
+ type claims struct {
+ 	Email              string                   `json:"email"`
++	EmailVerified      boolish                  `json:"email_verified"`
+ 	Name               string                   `json:"name"`
+ 	PreferredUsername  string                   `json:"preferred_username"`
+ 	Nickname           string                   `json:"nickname"`
+@@ -360,33 +381,41 @@ func getOrCreateUser(s *xorm.Session, cl *claims, provider *Provider, idToken *o
+ 
+ 	if !alreadyCreatedFromIssuer && (provider.EmailFallback || provider.UsernameFallback) {
+ 
+-		// try finding the user on fallback mappingproperties
++		// Email fallback is only safe when the provider asserts that the address is
++		// verified. Without that assertion an unverified address could name someone
++		// else's account, so it must never be used to attach this sign-in to an
++		// existing account.
++		emailFallbackAllowed := provider.EmailFallback && bool(cl.EmailVerified)
+ 
+-		searchUser := &user.User{
+-			Issuer: user.IssuerLocal,
+-		}
+-		if provider.UsernameFallback {
+-			// Match oidc subject on username as each is unique identifier in its own referential
+-			// Discouraged if multiple account providers are used.
+-			searchUser.Username = idToken.Subject
+-		}
+-		if provider.EmailFallback {
+-			// Used alone, allow for someone to connect from various provider to the same account
+-			// Discouraged for untrusted provider where someone can set email without verification
+-			// Note : mapping on email prevent from auto-updating user email
+-			searchUser.Email = cl.Email
+-		}
+ 
+-		// Check if the user exists for the given fallback matching options
+-		u, err = user.GetUserWithEmail(s, searchUser)
+-		if err != nil && !user.IsErrUserDoesNotExist(err) && !user.IsErrUserStatusError(err) {
+-			return nil, err
+-		}
+-		fallbackMatchFound = err == nil || user.IsErrUserStatusError(err)
++		canSearch := emailFallbackAllowed || provider.UsernameFallback
++		if canSearch {
++			searchUser := &user.User{
++				Issuer: user.IssuerLocal,
++			}
++			if provider.UsernameFallback {
++				// Match oidc subject on username as each is unique identifier in its own referential
++				// Discouraged if multiple account providers are used.
++				searchUser.Username = idToken.Subject
++			}
++			if emailFallbackAllowed {
++				// Used alone, allow for someone to connect from various provider to the same account
++				// Note : mapping on email prevent from auto-updating user email
++				searchUser.Email = cl.Email
++			}
++
++			// Check if the user exists for the given fallback matching options
++			u, err = user.GetUserWithEmail(s, searchUser)
++			if err != nil && !user.IsErrUserDoesNotExist(err) && !user.IsErrUserStatusError(err) {
++				return nil, err
++			}
++			fallbackMatchFound = err == nil || user.IsErrUserStatusError(err)
++
++			// Same as above: disabled/locked user found via fallback — return early.
++			if fallbackMatchFound && user.IsErrUserStatusError(err) {
++				return u, nil
++			}
+ 
+-		// Same as above: disabled/locked user found via fallback — return early.
+-		if fallbackMatchFound && user.IsErrUserStatusError(err) {
+-			return u, nil
+ 		}
+ 	}
+ 
+@@ -439,6 +468,7 @@ func getOrCreateUser(s *xorm.Session, cl *claims, provider *Provider, idToken *o
+ func mergeClaims(cl *claims, cl2 *claims, forceUserInfo bool) error {
+ 	if (forceUserInfo && cl2.Email != "") || cl.Email == "" {
+ 		cl.Email = cl2.Email
++		cl.EmailVerified = cl2.EmailVerified
+ 	}
+ 
+ 	if (forceUserInfo && cl2.Name != "") || cl.Name == "" {

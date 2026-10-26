@@ -1,0 +1,125 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "7456",
+  "advisory_ids": ["GHSA-29HQ-23M2-2J47", "CVE-2026-58272"],
+  "repo": "sync-in/server",
+  "pinned_commit": "8f553445df332272a1593d5afab133ff43cf5f0a",
+  "fix_commits": ["b80efe04574039a7a302c0e1007f03a7dbe6a633"],
+  "trust_decision": {
+    "summary": "The decision 'is this login/password pair valid?' is made by a bcrypt comparison of the supplied password against the stored hash inside UsersManager.logUser (users-manager.service.ts:87-99); the advisory's property - an unknown login costs the same as a wrong password - holds only if every rejecting branch on the way there still performs one bcrypt compare (comparePassword, common/functions.ts:71-78, already burns against a dummy hash when the hash is null).",
+    "evidence": [
+      "backend/src/common/functions.ts:71-78",
+      "backend/src/applications/users/services/users-manager.service.ts:87-100",
+      "backend/src/authentication/providers/mysql/auth-provider-mysql.service.ts:25-28",
+      "backend/src/authentication/providers/oidc/auth-provider-oidc.service.ts:68-81"
+    ]
+  },
+  "landing_point": {
+    "where": "backend/src/authentication/providers/mysql/auth-provider-mysql.service.ts:25-28",
+    "why": "This is the default AuthProvider (auth-providers.ts:17-22) reached from POST /api/auth/login via AuthLocalStrategy (auth-local.strategy.ts:21); the early 'if (!user) return null' is the branch that skips bcrypt entirely, so an unknown login answers in ~1 ms while an existing one pays a full bcrypt work factor."
+  },
+  "fix_sites": [
+    {
+      "where": "backend/src/applications/users/services/users-manager.service.ts:80-100",
+      "entry_point": "POST /api/auth/login and POST /api/auth/token (AuthLocalGuard), all AuthProviders",
+      "module_kind": "core domain service (user authentication manager)"
+    },
+    {
+      "where": "backend/src/applications/users/services/users-manager.service.ts:287-308",
+      "entry_point": "HTTP Basic on WebDAV routes (webdav-context.decorator.ts:9) and POST /api/sync/clients/register, both scoped, which reach validateAppPassword through logUser:91",
+      "module_kind": "second credential-verification path (app passwords) - looks out of scope next to the login form"
+    },
+    {
+      "where": "backend/src/authentication/providers/mysql/auth-provider-mysql.service.ts:14-30",
+      "entry_point": "POST /api/auth/login, POST /api/auth/token, WebDAV Basic, POST /api/sync/clients/register when auth.provider=mysql (default)",
+      "module_kind": "auth provider implementation (default)"
+    },
+    {
+      "where": "backend/src/authentication/providers/ldap/auth-provider-ldap.service.ts:36-96",
+      "entry_point": "same four routes when auth.provider=ldap; local-password branches at 41-44 and 65-68",
+      "module_kind": "auth provider implementation (LDAP, break-glass/local fallback)"
+    },
+    {
+      "where": "backend/src/authentication/providers/oidc/auth-provider-oidc.service.ts:64-82",
+      "entry_point": "same four routes when auth.provider=oidc; local-password branch gated by isGuest/isAdmin/scope/enablePasswordAuth",
+      "module_kind": "auth provider implementation (OIDC local-password fallback)"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "backend/src/authentication/providers/oidc/auth-provider-oidc.service.ts:64-82"
+  },
+  "O3_reason_to_dismiss": "The OIDC (and equally the LDAP) provider branch is only live when configuration.auth.provider selects it (auth-providers.ts:10-15), so on the default MySQL deployment it reads as dead code that the reported POST /api/auth/login flow never executes; the same shape of argument - 'app passwords are a separate scoped feature, the login form sends no scope' - covers the validateAppPassword site at users-manager.service.ts:287-308.",
+  "O4_distance": {"files": 4, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Local-password policy denial must stay a denial: with enablePasswordAuth off, a non-guest/non-admin user (and with LDAP, a non-admin when enablePasswordAuthFallback is off) must still be refused - an over-broad 'just call logUser so the timing matches' fix converts the timing mitigation into a real local-password authentication bypass. Second coupled contract: logUser's HttpException('Account locked', 403) must survive the provider's try/catch instead of becoming a 500, which is why the fix added the `e instanceof HttpException` rethrow in the MySQL provider.",
+    "where": "backend/src/authentication/providers/oidc/auth-provider-oidc.service.ts:72-81"
+  },
+  "O6_input_shapes": [
+    "login or email identifier (users-queries.service.ts:103 matches either column)",
+    "no user row at all for the identifier",
+    "user found but local password auth denied by policy (not guest/admin/scoped, enablePasswordAuth off; LDAP: non-admin with fallback disabled)",
+    "scoped credential (AUTH_SCOPE.WEBDAV or AUTH_SCOPE.CLIENT) where an app password is also tried after the local hash fails (users-manager.service.ts:90-92)",
+    "secrets row missing or appPasswords not an array (users-queries.service.ts:130-133 returns {})",
+    "app password present but filtered out by scope mismatch or by expiration (users-manager.service.ts:291-294)",
+    "role without USER permission (guest/link accounts, haveRole at user.model.ts:218-220) on a scoped route"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "backend/src/authentication/providers/auth-providers.ts:8-23",
+      "sibling": "a fourth AuthProvider (SAML/Kerberos/API-key) added to the selectAuthProvider switch with its own findUser-then-logUser and its own early return",
+      "why_realistic": "This switch is the plugin point and already holds three near-identical implementations; adding a provider by copying auth-provider-mysql.service.ts is exactly how a maintainer would do it, and the copy would omit the burn."
+    },
+    {
+      "where": "backend/src/authentication/guards/auth-digest.strategy.ts:1-42",
+      "sibling": "a revived HTTP Digest strategy that resolves the user and checks a digest secret itself",
+      "why_realistic": "The file is a complete but commented-out strategy kept in-tree; enabling it produces a second credential-verification route into the same login decision with no dummy-bcrypt burn."
+    },
+    {
+      "where": "backend/src/authentication/constants/scope.ts:1-4",
+      "sibling": "a third AUTH_SCOPE (e.g. an editors scope) feeding validateAppPassword through a new guard",
+      "why_realistic": "The editors subsystem (Collabora/OnlyOffice) already authenticates separately; adding a scope for it is the natural extension and lands straight in the app-password sink."
+    },
+    {
+      "where": "backend/src/applications/links/services/links-manager.service.ts:103-122",
+      "sibling": "a link-password check against the owner's stored hash that branches on link/user state before comparing",
+      "why_realistic": "linkAuthentication already verifies a credential against the owner's user row via compareUserPassword; a maintainer adding a link-scoped variant would copy this shape and could add an existence branch before the compare."
+    }
+  ],
+  "O9_family": "Username/login enumeration through an observable timing discrepancy in credential verification (CWE-208/CWE-203), as an incomplete fix of a prior timing-enumeration advisory",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript (Node.js, NestJS 11)",
+    "toolchain": "npm workspaces (root package-lock.json) with backend/package.json; nest build (tsc + swc), vitest for unit and e2e specs",
+    "services": ["MySQL (drizzle-orm + mysql2; migrations in backend/migrations) for running the app", "Redis (cache service + socket.io adapter)", "LDAP and/or OIDC server only if those providers are exercised"],
+    "offline_after_build": true,
+    "project_tests": "Vitest unit specs colocated with sources: backend/src/applications/users/services/users-manager.service.spec.ts (mocks comparePassword and counts calls), auth-provider-mysql/ldap/oidc.service.spec.ts, auth.controller.spec.ts, plus backend/src/authentication/auth.e2e-spec.ts; run with `npm test` (unit) and `npm run test:e2e` in backend/."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "backend/src/applications/users/services/users-manager.service.ts, backend/src/authentication/providers/mysql/auth-provider-mysql.service.ts, backend/src/authentication/providers/ldap/auth-provider-ldap.service.ts, backend/src/authentication/providers/oidc/auth-provider-oidc.service.ts",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add one `await comparePassword(password, null)` before the `if (!user) return null` early return in AuthProviderMySQL (and the same in findUser) - which equalises the default /api/auth/login route but leaves the LDAP/OIDC providers, the policy-denied branch (canAuthenticate) and the app-password branches (role-denied, non-array secrets, scope/expiry-filtered lists on the WebDAV and sync-client routes) answering fast."
+  },
+  "out_of_scope_notes": [
+    "The LDAP provider throws a distinct HttpException('User not found', 401) at auth-provider-ldap.service.ts:87-90 after a successful directory bind when autoCreateUser is off - an explicit local-account oracle through an error message rather than timing; a different mechanism from this advisory, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell in this session); 1463 tracked files including a ~22k-line root package-lock puts it well above 5 MB and far below 1.5 GB, so neither tiny_repo nor giant_repo was set.",
+    "O13 recall_risk is estimated from the published GHSA/CVE and the in-repo CHANGELOG.md:155 entry for the prior fix; no network access to gauge write-ups.",
+    "Whether /api/auth/login or the Basic-auth route has any rate limiting elsewhere in the stack was not checked; it would change real-world impact but not the benchmark.",
+    "Residual leak not addressed by the published fix: validateAppPassword performs one bcrypt per same-scope app password, so the number of matching app passwords stays observable - unknown whether hidden tests cover it."
+  ]
+}

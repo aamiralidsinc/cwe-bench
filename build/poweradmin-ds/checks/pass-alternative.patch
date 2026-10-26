@@ -1,0 +1,163 @@
+--- a/lib/Application/Service/UserProvisioningService.php
++++ b/lib/Application/Service/UserProvisioningService.php
+@@ -134,6 +134,17 @@
+         }
+     }
+ 
++    /**
++     * Keep only the rows whose stored identity equals the asserted identity exactly.
++     */
++    private function exactIdentityRows(array $rows, string $subjectColumn, string $subject, string $providerId): array
++    {
++        return array_values(array_filter($rows, static function (array $row) use ($subjectColumn, $subject, $providerId): bool {
++            return (string) ($row[$subjectColumn] ?? '') === $subject
++                && (string) ($row['provider_id'] ?? '') === $providerId;
++        }));
++    }
++
+     private function findUserByOidcSubject(string $subject, string $providerId): ?int
+     {
+         try {
+@@ -143,11 +154,12 @@
+             ]);
+ 
+             $stmt = $this->db->prepare("
+-                SELECT user_id FROM oidc_user_links
+-                WHERE oidc_subject = ? AND provider_id = ?
++                SELECT user_id, oidc_subject, provider_id FROM oidc_user_links
++                WHERE provider_id = ?
+             ");
+-            $stmt->execute([$subject, $providerId]);
+-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $matches = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'oidc_subject', $subject, $providerId);
++            $result = $matches[0] ?? null;
+ 
+             if ($result) {
+                 $userId = (int)$result['user_id'];
+@@ -370,11 +382,12 @@
+         try {
+             // Keep a single link row for each external identity
+             $stmt = $this->db->prepare("
+-                SELECT id FROM oidc_user_links
+-                WHERE oidc_subject = ? AND provider_id = ?
++                SELECT id, oidc_subject, provider_id FROM oidc_user_links
++                WHERE provider_id = ?
+             ");
+-            $stmt->execute([$userInfo->getSubject(), $providerId]);
+-            $existingLink = $stmt->fetch(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $matches = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'oidc_subject', $userInfo->getSubject(), $providerId);
++            $existingLink = $matches[0] ?? null;
+ 
+             if ($existingLink) {
+                 // Move the identity to the account that just signed in
+@@ -420,11 +433,12 @@
+             ]);
+ 
+             $stmt = $this->db->prepare("
+-                SELECT user_id FROM saml_user_links
+-                WHERE saml_subject = ? AND provider_id = ?
++                SELECT user_id, saml_subject, provider_id FROM saml_user_links
++                WHERE provider_id = ?
+             ");
+-            $stmt->execute([$subject, $providerId]);
+-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $matches = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'saml_subject', $subject, $providerId);
++            $result = $matches[0] ?? null;
+ 
+             if ($result) {
+                 $userId = (int)$result['user_id'];
+@@ -457,11 +471,12 @@
+         try {
+             // Keep a single link row for each external identity
+             $stmt = $this->db->prepare("
+-                SELECT id FROM saml_user_links
+-                WHERE saml_subject = ? AND provider_id = ?
++                SELECT id, saml_subject, provider_id FROM saml_user_links
++                WHERE provider_id = ?
+             ");
+-            $stmt->execute([$userInfo->getSubject(), $providerId]);
+-            $existingLink = $stmt->fetch(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $matches = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'saml_subject', $userInfo->getSubject(), $providerId);
++            $existingLink = $matches[0] ?? null;
+ 
+             if ($existingLink) {
+                 // Move the identity to the account that just signed in
+@@ -826,13 +841,13 @@
+ 
+             // Find orphaned links for this specific subject
+             $stmt = $this->db->prepare("
+-                SELECT sul.id, sul.user_id
++                SELECT sul.id, sul.user_id, sul.saml_subject, sul.provider_id
+                 FROM saml_user_links sul
+                 LEFT JOIN users u ON sul.user_id = u.id
+-                WHERE sul.saml_subject = ? AND sul.provider_id = ? AND u.id IS NULL
++                WHERE sul.provider_id = ? AND u.id IS NULL
+             ");
+-            $stmt->execute([$subject, $providerId]);
+-            $orphanedLinks = $stmt->fetchAll(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $orphanedLinks = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'saml_subject', $subject, $providerId);
+ 
+             if (!empty($orphanedLinks)) {
+                 $this->logWarning('Found {count} orphaned SAML links for subject {subject}, cleaning up...', [
+@@ -862,13 +877,13 @@
+ 
+             // Find orphaned links for this specific subject
+             $stmt = $this->db->prepare("
+-                SELECT oul.id, oul.user_id
++                SELECT oul.id, oul.user_id, oul.oidc_subject, oul.provider_id
+                 FROM oidc_user_links oul
+                 LEFT JOIN users u ON oul.user_id = u.id
+-                WHERE oul.oidc_subject = ? AND oul.provider_id = ? AND u.id IS NULL
++                WHERE oul.provider_id = ? AND u.id IS NULL
+             ");
+-            $stmt->execute([$subject, $providerId]);
+-            $orphanedLinks = $stmt->fetchAll(PDO::FETCH_ASSOC);
++            $stmt->execute([$providerId]);
++            $orphanedLinks = $this->exactIdentityRows($stmt->fetchAll(PDO::FETCH_ASSOC), 'oidc_subject', $subject, $providerId);
+ 
+             if (!empty($orphanedLinks)) {
+                 $this->logWarning('Found {count} orphaned OIDC links for subject {subject}, cleaning up...', [
+--- a/sql/poweradmin-mysql-db-structure.sql
++++ b/sql/poweradmin-mysql-db-structure.sql
+@@ -340,8 +340,8 @@
+ CREATE TABLE `oidc_user_links` (
+   `id` INT(11) NOT NULL AUTO_INCREMENT,
+   `user_id` INT(11) NOT NULL,
+-  `provider_id` VARCHAR(50) NOT NULL,
+-  `oidc_subject` VARCHAR(255) NOT NULL,
++  `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++  `oidc_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin,
+   `username` VARCHAR(255) NOT NULL,
+   `email` VARCHAR(255) DEFAULT NULL,
+   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+@@ -357,8 +357,8 @@
+ CREATE TABLE `saml_user_links` (
+   `id` INT(11) NOT NULL AUTO_INCREMENT,
+   `user_id` INT(11) NOT NULL,
+-  `provider_id` VARCHAR(50) NOT NULL,
+-  `saml_subject` VARCHAR(255) NOT NULL,
++  `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++  `saml_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin,
+   `username` VARCHAR(255) NOT NULL,
+   `email` VARCHAR(255) DEFAULT NULL,
+   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--- /dev/null
++++ b/sql/poweradmin-mysql-update-to-4.3.4.sql
+@@ -0,0 +1,12 @@
++-- Poweradmin schema update to 4.3.4
++-- OIDC/SAML external subject identifiers must match one-for-one. The default
++-- utf8mb4_unicode_ci collation is case- and accent-insensitive, so distinct
++-- subjects compare as equal and resolve to the same local account. Force a
++-- binary collation on the identity columns.
++
++ALTER TABLE `oidc_user_links`
++    MODIFY COLUMN `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++    MODIFY COLUMN `oidc_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin;
++ALTER TABLE `saml_user_links`
++    MODIFY COLUMN `provider_id` VARCHAR(50) NOT NULL COLLATE utf8mb4_bin,
++    MODIFY COLUMN `saml_subject` VARCHAR(255) NOT NULL COLLATE utf8mb4_bin;

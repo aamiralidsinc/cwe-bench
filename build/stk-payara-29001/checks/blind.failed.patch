@@ -1,0 +1,350 @@
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/ClientStubsContentSource.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/ClientStubsContentSource.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/ClientStubsContentSource.java	2026-10-26 04:07:21.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/ClientStubsContentSource.java	2026-10-26 04:30:50.631081381 +0000
+@@ -81,15 +81,22 @@
+         // Set the extension so it can be mapped to a MIME type
+         ctx.setAttribute(DownloadServlet.EXTENSION, "CLIENT-STUBS");
+ 
+-        // Get appName
+         HttpServletRequest request = (HttpServletRequest) ctx.getServletRequest();
+-        String appName = request.getParameter("appName");
+-        String restUrl = request.getParameter("restUrl");
+-        
++        // Both values are checked before anything is fetched: the application name has to be
++        // a single safe resource segment and the endpoint is the session's own admin base.
++        String appName = DownloadSecurity.resourceName(ctx, "appName");
++        if (appName == null) {
++            return null;
++        }
++        String endpoint = DownloadSecurity.consoleEndpoint(ctx,
++                "/applications/application/" + appName + "/get-client-stubs");
++        if (endpoint == null) {
++            return null;
++        }
++
+         // Create the tmpFile
+         InputStream tmpFile = null;
+         try {
+-            String endpoint = restUrl + "/applications/application/" + appName + "/get-client-stubs";
+             DateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmmss");
+             Date date = new Date();
+             Map attrsMap = new HashMap();
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadSecurity.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadSecurity.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadSecurity.java	1970-01-01 00:00:00.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadSecurity.java	2026-10-26 04:30:46.211085421 +0000
+@@ -0,0 +1,142 @@
++/*
++ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS HEADER.
++ *
++ * Copyright (c) 2026 Payara Foundation and/or its affiliates. All rights reserved.
++ *
++ * The contents of this file are subject to the terms of either the GNU
++ * General Public License Version 2 only ("GPL") or the Common Development
++ * and Distribution License("CDDL") (collectively, the "License").  You
++ * may not use this file except in compliance with the License.  You can
++ * obtain a copy of the License at
++ * https://github.com/payara/Payara/blob/main/LICENSE.txt
++ * See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ * When distributing the software, include this License Header Notice in each
++ * file and include the License file at legal/OPEN-SOURCE-LICENSE.txt.
++ *
++ * GPL Classpath Exception:
++ * Oracle designates this particular file as subject to the "Classpath"
++ * exception as provided by Oracle in the GPL Version 2 section of the License
++ * file that accompanied this code.
++ *
++ * Modifications:
++ * If applicable, add the following below the License Header, with the fields
++ * enclosed by brackets [] replaced by your own identifying information:
++ * "Portions Copyright [year] [name of copyright owner]"
++ *
++ * Contributor(s):
++ * If you wish your version of this file to be governed by only the CDDL or
++ * only the GPL Version 2, indicate your decision by adding "[Contributor]
++ * elects to include this software in this distribution under the [CDDL or GPL
++ * Version 2] license."  If you don't indicate a single choice of license, a
++ * recipient has the option to distribute your version of this file under
++ * either the CDDL, the GPL Version 2 or to extend the choice of license to
++ * its licensees as provided above.  However, if you add GPL Version 2 code
++ * and therefore, elected the GPL Version 2 license, then the option applies
++ * only if the new code is made subject to such option by the copyright
++ * holder.
++ */
++
++package org.glassfish.admingui.common.servlet;
++
++import java.io.IOException;
++import java.util.regex.Pattern;
++
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import jakarta.servlet.http.HttpSession;
++
++/**
++ *  <p> Shared decisions for the console's download providers.  A download is always carried
++ *      out against the administration endpoint the console recorded for the signed-in
++ *      session, and against resource names the console itself composes.  A value that
++ *      arrived with the request never selects the endpoint, addresses an administration
++ *      resource, or changes any other server-side decision made for the download.</p>
++ */
++final class DownloadSecurity {
++
++    /** Session attribute holding the administration endpoint the console talks to. */
++    private static final String REST_URL_ATTR = "REST_URL";
++
++    /**
++     *  <p> Request parameter that the console's own pages used to echo the session's
++     *      administration endpoint back to the servlet.  It is accepted only when it agrees
++     *      with the session; it never supplies the endpoint.</p>
++     */
++    private static final String REST_URL_PARAM = "restUrl";
++
++    /**
++     *  <p> One resource segment as the console composes it: an application name or a log
++     *      target.  Anchored so that the value cannot carry a path separator, a parent
++     *      reference, or any other path syntax.</p>
++     */
++    private static final Pattern SEGMENT = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,127}");
++
++    private DownloadSecurity() {
++    }
++
++    /**
++     *  <p> Returns the console's own administration endpoint followed by {@code suffix}.</p>
++     *
++     *  <p> A request that names a different administration endpoint gets a client error and
++     *      no REST call is made; the same is true when the session carries no endpoint.</p>
++     *
++     *  @return the endpoint, or {@code null} after the request has been answered with an
++     *          error
++     */
++    static String consoleEndpoint(DownloadServlet.Context ctx, String suffix) {
++        HttpServletRequest request = (HttpServletRequest) ctx.getServletRequest();
++        String base = sessionEndpoint(request);
++        String supplied = request.getParameter(REST_URL_PARAM);
++        if (base == null || (supplied != null && !trimSlashes(supplied).equals(trimSlashes(base)))) {
++            refuse(ctx, "a download uses the console's own administration endpoint");
++            return null;
++        }
++        return base + suffix;
++    }
++
++    /**
++     *  <p> Returns the value of {@code parameter} when it is a single safe resource segment,
++     *      or {@code null} after the request has been answered with a client error.</p>
++     */
++    static String resourceName(DownloadServlet.Context ctx, String parameter) {
++        HttpServletRequest request = (HttpServletRequest) ctx.getServletRequest();
++        String value = request.getParameter(parameter);
++        if (value == null || !SEGMENT.matcher(value).matches()) {
++            refuse(ctx, "a download may not choose its own " + parameter);
++            return null;
++        }
++        return value;
++    }
++
++    /** The administration endpoint recorded for the session, or {@code null}. */
++    private static String sessionEndpoint(HttpServletRequest request) {
++        HttpSession session = request.getSession(false);
++        Object value = session == null ? null : session.getAttribute(REST_URL_ATTR);
++        if (value instanceof String && !((String) value).isEmpty()) {
++            return (String) value;
++        }
++        return null;
++    }
++
++    private static String trimSlashes(String value) {
++        int end = value.length();
++        while (end > 0 && value.charAt(end - 1) == '/') {
++            end--;
++        }
++        return value.substring(0, end);
++    }
++
++    /** Answers the request with an ordinary client error and leaves nothing behind. */
++    private static void refuse(DownloadServlet.Context ctx, String reason) {
++        Object response = ctx.getServletResponse();
++        if (response instanceof HttpServletResponse) {
++            try {
++                ((HttpServletResponse) response).sendError(HttpServletResponse.SC_BAD_REQUEST, reason);
++            } catch (IOException ignored) {
++                // the response is already committed; nothing more can be sent
++            }
++        }
++    }
++}
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadServlet.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadServlet.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadServlet.java	2026-10-26 04:07:21.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/DownloadServlet.java	2026-10-26 04:30:57.515075089 +0000
+@@ -402,15 +402,11 @@
+ 		return null;
+ 	    }
+ 
+-	    // First check the local attribute Map
+-	    Object value = _att.get(name);
+-	    if (value == null) {
+-		// Not found, check the Request attributes...
+-		value = getServletRequest().getParameter(name);
+-	    }
+-
+-	    // Return the value (if any)
+-	    return value;
++	    // The attributes of a download belong to the servlet and to the content source that
++	    // provides the content.  A request parameter never stands in for one: a value that
++	    // arrived with the request must not choose the representation (or anything else) the
++	    // console produces for the download.
++	    return _att.get(name);
+ 	}
+ 
+ 	/**
+@@ -676,9 +672,9 @@
+     /**
+      *	<p> The Content-type ("ContentType").  This is the
+      *	    {@link DownloadServlet#Context} attribute used to specify an
+-     *	    explicit "Content-type".  It may be set by the
+-     *	    {@link DownloadServlet#ContentSource}, or may be passed in via a
+-     *	    request parameter.  If not specified, the {@link #EXTENSION} will
++     *	    explicit "Content-type".  It is set by the
++     *	    {@link DownloadServlet#ContentSource}; a request parameter does
++     *	    not supply it.  If not specified, the {@link #EXTENSION} will
+      *	    be used.  If that fails, the {@link #DEFAULT_CONTENT_TYPE} will
+      *	    apply.</p>
+      */
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogFilesContentSource.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogFilesContentSource.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogFilesContentSource.java	2026-10-26 04:07:21.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogFilesContentSource.java	2026-10-26 04:30:49.667082262 +0000
+@@ -83,15 +83,21 @@
+         // Set the extension so it can be mapped to a MIME type
+         ctx.setAttribute(DownloadServlet.EXTENSION, "CLIENT-STUBS");
+ 
+-        // Get appName
+         HttpServletRequest request = (HttpServletRequest) ctx.getServletRequest();
+-        String target = request.getParameter("target");
+-        String restUrl = request.getParameter("restUrl");
+-        
++        // Both values are checked before anything is fetched: the target has to be a single
++        // safe resource segment and the endpoint is the session's own administration base.
++        String target = DownloadSecurity.resourceName(ctx, "target");
++        if (target == null) {
++            return null;
++        }
++        String endpoint = DownloadSecurity.consoleEndpoint(ctx, "/collect-log-files");
++        if (endpoint == null) {
++            return null;
++        }
++
+         // Create the tmpFile
+         InputStream tmpFile = null;
+         try {
+-            String endpoint = restUrl + "/collect-log-files";
+             DateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmmss");
+             Date date = new Date();
+             Map attrsMap = new HashMap();
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogViewerContentSource.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogViewerContentSource.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogViewerContentSource.java	2026-10-26 04:07:21.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/servlet/LogViewerContentSource.java	2026-10-26 04:30:53.959078339 +0000
+@@ -81,14 +81,18 @@
+ 
+         HttpServletRequest request = (HttpServletRequest) ctx.getServletRequest();
+         //http://localhost:4848/management/domain/view-log/?start=180427&instanceName=server
+-        String restUrl = request.getParameter("restUrl");
+         String start = request.getParameter("start");
+         String instanceName = request.getParameter("instanceName");
++        // The endpoint is the session's own administration base; a request that names a
++        // different one is refused before any REST call is made.
++        String endpoint = DownloadSecurity.consoleEndpoint(ctx, "/view-log/");
++        if (endpoint == null) {
++            return null;
++        }
+ 
+         // Create the tmpFile
+         InputStream tmpFile = null;
+         try {
+-            String endpoint = restUrl + "/view-log/";
+             Map<String, Object> attrsMap = new HashMap<String, Object>();
+             attrsMap.put("start", start);
+             attrsMap.put("instanceName", instanceName);
+diff -ruN pristine/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/util/RestUtil.java app/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/util/RestUtil.java
+--- a/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/util/RestUtil.java	2026-10-26 04:07:21.000000000 +0000
++++ b/appserver/admingui/common/src/main/java/org/glassfish/admingui/common/util/RestUtil.java	2026-10-26 04:31:16.071058129 +0000
+@@ -827,9 +827,42 @@
+         return token;
+     }
+ 
++    /**
++     * <p> Resolves the endpoint of a REST call made on behalf of a servlet.  Such a call
++     * authenticates with the console's stored credential, so it may only address the
++     * administration endpoint recorded for the same session.  A path (starting with "/")
++     * is resolved against that endpoint; an absolute endpoint is accepted only when it is
++     * under it.</p>
++     */
++    private static String servletEndpoint(HttpServletRequest request, String endpoint) {
++        Object value = request.getSession(false) == null
++                ? null : request.getSession(false).getAttribute("REST_URL");
++        String base = value instanceof String ? stripTrailingSlashes((String) value) : null;
++        if (base == null || base.isEmpty()) {
++            throw new IllegalArgumentException(
++                    "no administration endpoint is recorded for this session");
++        }
++        if (endpoint != null && endpoint.startsWith("/")) {
++            return base + endpoint;
++        }
++        if (endpoint == null || !endpoint.startsWith(base + "/")) {
++            throw new IllegalArgumentException(
++                    "a servlet REST call may only address the console's own administration endpoint");
++        }
++        return endpoint;
++    }
++
++    private static String stripTrailingSlashes(String value) {
++        int end = value.length();
++        while (end > 0 && value.charAt(end - 1) == '/') {
++            end--;
++        }
++        return value.substring(0, end);
++    }
++
+     public static Response getRequestFromServlet(HttpServletRequest request, String endpoint, Map<String, Object> attrs) {
+         String token = (String) request.getSession().getAttribute(AdminConsoleAuthModule.REST_TOKEN);
+-        WebTarget target = targetWithQueryParams(JERSEY_CLIENT.target(endpoint), attrs);
++        WebTarget target = targetWithQueryParams(JERSEY_CLIENT.target(servletEndpoint(request, endpoint)), attrs);
+         Response cr = target
+                 .request().cookie(new Cookie(REST_TOKEN_COOKIE, token))
+                 .get(Response.class);
+@@ -839,13 +872,14 @@
+ 
+     public static void getRestRequestFromServlet(HttpServletRequest request, String endpoint, Map<String, Object> attrs, boolean quiet, boolean throwException) {
+         String token = (String) request.getSession().getAttribute(AdminConsoleAuthModule.REST_TOKEN);
+-        WebTarget target = targetWithQueryParams(JERSEY_CLIENT.target(endpoint), attrs);
++        String address = servletEndpoint(request, endpoint);
++        WebTarget target = targetWithQueryParams(JERSEY_CLIENT.target(address), attrs);
+         Response cr = target
+                 .request(RESPONSE_TYPE)
+                 .cookie(new Cookie(REST_TOKEN_COOKIE, token))
+                 .get(Response.class);
+         RestResponse rr = RestResponse.getRestResponse(cr);
+-        parseResponse(rr, null, endpoint, attrs, quiet, throwException);
++        parseResponse(rr, null, address, attrs, quiet, throwException);
+ 
+     }
+ 
+@@ -990,14 +1024,15 @@
+ 
+     public static void postRestRequestFromServlet(HttpServletRequest request, String endpoint, Map<String, Object> attrs, boolean quiet, boolean throwException) {
+         String token = (String) request.getSession().getAttribute(AdminConsoleAuthModule.REST_TOKEN);
+-        WebTarget target = JERSEY_CLIENT.target(endpoint);
++        String address = servletEndpoint(request, endpoint);
++        WebTarget target = JERSEY_CLIENT.target(address);
+         MultivaluedMap<String, Object> formData = buildMultivalueMap(attrs);
+         Response cr = target
+                 .request(RESPONSE_TYPE)
+                 .cookie(new Cookie(REST_TOKEN_COOKIE, token))
+                 .post(Entity.entity(formData, MediaType.APPLICATION_FORM_URLENCODED), Response.class);
+         RestResponse rr = RestResponse.getRestResponse(cr);
+-        parseResponse(rr, null, endpoint, attrs, quiet, throwException);
++        parseResponse(rr, null, address, attrs, quiet, throwException);
+     }
+ 
+     private static class RequiredHeadersFilter implements ClientRequestFilter {

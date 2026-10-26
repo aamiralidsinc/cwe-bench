@@ -1,0 +1,229 @@
+diff --git a/vault/expiration.go b/vault/expiration.go
+index b6218f0c0..94aab09e7 100644
+--- a/vault/expiration.go
++++ b/vault/expiration.go
+@@ -1701,14 +1701,17 @@ func (m *ExpirationManager) FetchLeaseTimesByToken(ctx context.Context, te *logi
+ func (m *ExpirationManager) FetchLeaseInfo(ctx context.Context, leaseID string) (*leaseEntry, error) {
+ 	defer metrics.MeasureSince([]string{"expire", "fetch-lease-times"}, time.Now())
+ 
+-	info, ok := m.pending.Load(leaseID)
+-	if ok && info.(pendingInfo).cachedLeaseInfo != nil {
+-		return m.leaseInfoForExport(info.(pendingInfo).cachedLeaseInfo), nil
+-	}
+-
+-	info, ok = m.irrevocable.Load(leaseID)
+-	if ok && info.(*leaseEntry) != nil {
+-		return m.leaseInfoForExport(info.(*leaseEntry)), nil
++	le := m.fetchCachedLease(leaseID)
++	if le != nil {
++		ns, err := namespace.FromContext(ctx)
++		switch {
++		case err != nil:
++			return nil, err
++		case ns.ID != le.namespace.ID:
++			return nil, nil
++		default:
++			return le, nil
++		}
+ 	}
+ 
+ 	// Load the entry
+@@ -1723,6 +1726,22 @@ func (m *ExpirationManager) FetchLeaseInfo(ctx context.Context, leaseID string)
+ 	return m.leaseInfoForExport(le), nil
+ }
+ 
++// fetchCachedLease attempts to look up a lease ID by pending or irrevocable
++// leases to skip a storage read.
++func (m *ExpirationManager) fetchCachedLease(leaseID string) *leaseEntry {
++	info, ok := m.pending.Load(leaseID)
++	if ok && info.(pendingInfo).cachedLeaseInfo != nil {
++		return m.leaseInfoForExport(info.(pendingInfo).cachedLeaseInfo)
++	}
++
++	info, ok = m.irrevocable.Load(leaseID)
++	if ok && info.(*leaseEntry) != nil {
++		return m.leaseInfoForExport(info.(*leaseEntry))
++	}
++
++	return nil
++}
++
+ // Returns redacted leaseEntry for outside callers based on the full leaseEntry passed in
+ func (m *ExpirationManager) leaseInfoForExport(le *leaseEntry) *leaseEntry {
+ 	ret := &leaseEntry{
+@@ -1998,19 +2017,6 @@ func (m *ExpirationManager) loadEntry(ctx context.Context, leaseID string) (*lea
+ 		}
+ 	}
+ 
+-	_, nsID := namespace.SplitIDFromString(leaseID)
+-	if nsID != "" {
+-		leaseNS, err := m.core.NamespaceByID(ctx, nsID)
+-		if err != nil {
+-			return nil, err
+-		}
+-		if leaseNS != nil {
+-			ctx = namespace.ContextWithNamespace(ctx, leaseNS)
+-		}
+-	} else {
+-		ctx = namespace.ContextWithNamespace(ctx, namespace.RootNamespace)
+-	}
+-
+ 	// If a lease entry is nil, proactively delete the lease lock, in case we
+ 	// created one erroneously.
+ 	// If there was an error, we don't know whether the lease entry exists or not.
+diff --git a/vault/logical_system.go b/vault/logical_system.go
+index 6fc30003d..079506a4b 100644
+--- a/vault/logical_system.go
++++ b/vault/logical_system.go
+@@ -2047,6 +2047,13 @@ func (b *SystemBackend) handleRevoke(ctx context.Context, req *logical.Request,
+ 	if err != nil {
+ 		return nil, err
+ 	}
++
++	// A lease identifier with no embedded namespace part names a lease in the
++	// root namespace. Only a request made in the root namespace may act on it.
++	if _, nsID := namespace.SplitIDFromString(leaseID); nsID == "" && ns.ID != namespace.RootNamespaceID {
++		return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++	}
++
+ 	revokeCtx := namespace.ContextWithNamespace(b.Core.activeContext.Load(), ns)
+ 	if data.Get("sync").(bool) {
+ 		// Invoke the expiration manager directly
+@@ -2088,6 +2095,18 @@ func (b *SystemBackend) handleRevokePrefixCommon(ctx context.Context,
+ 		return nil, err
+ 	}
+ 
++	// A prefix with no trailing slash may name a single lease. When it does and
++	// that lease has no embedded namespace part, it lives in the root namespace,
++	// which only a request made in the root namespace may touch.
++	if !strings.HasSuffix(prefix, "/") && ns.ID != namespace.RootNamespaceID {
++		if _, nsID := namespace.SplitIDFromString(prefix); nsID == "" {
++			rootCtx := namespace.ContextWithNamespace(ctx, namespace.RootNamespace)
++			if le, err := b.Core.expiration.loadEntry(rootCtx, prefix); err == nil && le != nil {
++				return logical.ErrorResponse("lease does not belong to this namespace"), logical.ErrPermissionDenied
++			}
++		}
++	}
++
+ 	// Invoke the expiration manager directly
+ 	revokeCtx := namespace.ContextWithNamespace(b.Core.activeContext.Load(), ns)
+ 	if force {
+diff --git a/vault/logical_system_paths.go b/vault/logical_system_paths.go
+index 1d937b21d..d4db069d7 100644
+--- a/vault/logical_system_paths.go
++++ b/vault/logical_system_paths.go
+@@ -2672,7 +2672,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?renew" + framework.OptionalParamRegex("url_lease_id"),
++			Pattern: "leases/renew" + framework.OptionalParamRegex("url_lease_id"),
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2712,7 +2712,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke" + framework.OptionalParamRegex("url_lease_id"),
++			Pattern: "leases/revoke" + framework.OptionalParamRegex("url_lease_id"),
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2753,7 +2753,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke-force/(?P<prefix>.+)",
++			Pattern: "leases/revoke-force/(?P<prefix>.+)",
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+@@ -2786,7 +2786,7 @@ func (b *SystemBackend) leasePaths() []*framework.Path {
+ 		},
+ 
+ 		{
+-			Pattern: "(leases/)?revoke-prefix/(?P<prefix>.+)",
++			Pattern: "leases/revoke-prefix/(?P<prefix>.+)",
+ 
+ 			DisplayAttrs: &framework.DisplayAttributes{
+ 				OperationPrefix: "leases",
+diff --git a/vault/request_handling.go b/vault/request_handling.go
+index 55b261821..aa9c476b0 100644
+--- a/vault/request_handling.go
++++ b/vault/request_handling.go
+@@ -935,29 +935,56 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
+ 	// The following relative sys/leases/ paths handles re-routing requests
+ 	// to the proper namespace using the lease ID on applicable paths.
+ 	case strings.HasPrefix(req.Path, "sys/leases/"):
+-		switch req.Path {
+ 		// For the following operations, we can set the proper namespace context
+-		// using the lease's embedded nsID if a relative path was provided.
+-		// The operation will still be gated by ACLs, which are checked later.
+-		case "sys/leases/lookup", "sys/leases/renew", "sys/leases/revoke", "sys/leases/revoke-force":
+-			leaseID, ok := req.Data["lease_id"]
+-			// If lease ID is not present, break out and let the backend handle the error
+-			if !ok || leaseID == nil {
+-				break
+-			}
+-			_, nsID := namespace.SplitIDFromString(leaseID.(string))
+-			if nsID != "" {
+-				ns, err := c.NamespaceByID(ctx, nsID)
+-				if err != nil {
+-					c.Logger().Warn("error looking up namespace from the lease's namespace ID", "error", err)
+-					return nil, err
+-				}
+-				if ns != nil {
+-					ctx = namespace.ContextWithNamespace(ctx, ns)
++		// using the lease's embedded nsID if a relative path was provided. The
++		// operation will still be gated by ACLs, which are checked later.
++		//
++		// sys/leases/lookup takes 'lease_id' by request data only, while the
++		// others take it by path segment too. Request data takes precedence.
++		byData, byPath := any(nil), ""
++		switch req.Path {
++		case "sys/leases/lookup", "sys/leases/renew", "sys/leases/revoke":
++			byData = req.Data["lease_id"]
++		default:
++			for _, prefix := range []string{
++				"sys/leases/revoke-prefix/", "sys/leases/revoke-force/",
++			} {
++				if suffix, ok := strings.CutPrefix(req.Path, prefix); ok {
++					byData, byPath = req.Data["lease_id"], suffix
+ 				}
+ 			}
+ 		}
+ 
++		leaseID, ok := "", false
++		if byData != nil {
++			leaseID, ok = byData.(string)
++		} else {
++			leaseID, ok = byPath, true
++		}
++
++		// Check for a failed conversion and error if so.
++		if !ok {
++			return logical.ErrorResponse("invalid lease ID"), logical.ErrInvalidRequest
++		}
++
++		// If the lease ID is not present or empty, break out and let the
++		// backend handle the error.
++		if leaseID == "" {
++			break
++		}
++
++		_, nsID := namespace.SplitIDFromString(leaseID)
++		if nsID != "" {
++			ns, err := c.NamespaceByID(ctx, nsID)
++			if err != nil {
++				c.Logger().Warn("error looking up namespace from the lease's namespace ID", "error", err)
++				return nil, err
++			}
++			if ns != nil {
++				ctx = namespace.ContextWithNamespace(ctx, ns)
++			}
++		}
++
+ 	// Prevent any metrics requests to be forwarded from a standby node.
+ 	// Instead, we return an error since we cannot be sure if we have an
+ 	// active token store to validate the provided token.

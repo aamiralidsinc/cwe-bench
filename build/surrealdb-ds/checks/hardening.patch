@@ -1,0 +1,1243 @@
+diff --git a/surrealdb/core/src/api/invocation.rs b/surrealdb/core/src/api/invocation.rs
+index f21dd13..91f0cff 100644
+--- a/surrealdb/core/src/api/invocation.rs
++++ b/surrealdb/core/src/api/invocation.rs
+@@ -135,8 +135,8 @@ pub async fn process_api_request_with_stack(
+ 				}
+ 				Permission::Full => (),
+ 				Permission::Specific(e) => {
+-					// Disable permissions
+-					let opt = &opt.new_with_perms(false);
++					// Disable permission recursion and block side effects
++					let opt = &opt.new_for_permission_predicate();
+ 					// Process the PERMISSION clause
+ 					if !stk
+ 						.run(|stk| e.compute(stk, ctx, opt, None))
+diff --git a/surrealdb/core/src/buc/controller.rs b/surrealdb/core/src/buc/controller.rs
+index b5ab8f8..f024673 100644
+--- a/surrealdb/core/src/buc/controller.rs
++++ b/surrealdb/core/src/buc/controller.rs
+@@ -287,8 +287,8 @@ impl<'a> BucketController<'a> {
+ 				}
+ 				Permission::Full => (),
+ 				Permission::Specific(e) => {
+-					// Disable permissions
+-					let opt = &self.opt.new_with_perms(false);
++					// Disable permission recursion and block side effects
++					let opt = &self.opt.new_for_permission_predicate();
+ 
+ 					// Add $action, $file and $target to context
+ 					let mut ctx = Context::new_child(self.ctx);
+diff --git a/surrealdb/core/src/catalog/schema/mod.rs b/surrealdb/core/src/catalog/schema/mod.rs
+index 3aa38ad..2faa1d4 100644
+--- a/surrealdb/core/src/catalog/schema/mod.rs
++++ b/surrealdb/core/src/catalog/schema/mod.rs
+@@ -55,6 +55,15 @@ impl Permission {
+ 		matches!(self, Self::Specific(_))
+ 	}
+ 
++	/// Whether this permission clause directly contains a data-modifying
++	/// statement, which is not allowed (GHSA-66r2-5gwj-gxm2).
++	pub(crate) fn has_direct_write(&self) -> bool {
++		match self {
++			Permission::None | Permission::Full => false,
++			Permission::Specific(e) => e.has_direct_write(),
++		}
++	}
++
+ 	fn to_sql_definition(&self) -> crate::sql::Permission {
+ 		match self {
+ 			Permission::None => crate::sql::Permission::None,
+@@ -108,6 +117,15 @@ impl Permissions {
+ 	pub(crate) fn to_sql_definition(&self) -> crate::sql::Permissions {
+ 		self.clone().into()
+ 	}
++
++	/// Whether any of the select/create/update/delete clauses directly contains
++	/// a data-modifying statement (GHSA-66r2-5gwj-gxm2).
++	pub(crate) fn has_direct_write(&self) -> bool {
++		self.select.has_direct_write()
++			|| self.create.has_direct_write()
++			|| self.update.has_direct_write()
++			|| self.delete.has_direct_write()
++	}
+ }
+ 
+ impl InfoStructure for Permissions {
+diff --git a/surrealdb/core/src/dbs/options.rs b/surrealdb/core/src/dbs/options.rs
+index 824ad81..b551432 100644
+--- a/surrealdb/core/src/dbs/options.rs
++++ b/surrealdb/core/src/dbs/options.rs
+@@ -33,6 +33,14 @@ pub struct Options {
+ 	pub(crate) force: Force,
+ 	/// Should we run permissions checks?
+ 	pub(crate) perms: bool,
++	/// Are we evaluating a `PERMISSIONS` predicate (WHERE clause)?
++	///
++	/// Permission predicates are computed with `perms` disabled so they don't
++	/// recurse into their own table's gates. While that is in effect, mutating
++	/// statements (CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT and DDL) must be
++	/// rejected so a predicate cannot produce observable side effects
++	/// (see `SECURITY_GUIDE.md`).
++	pub(crate) permission_predicate: bool,
+ 	/// Should we process field queries?
+ 	pub(crate) import: bool,
+ 	/// The data version as a timestamp
+@@ -55,6 +63,7 @@ impl Options {
+ 			db: None,
+ 			dive: config.max_computation_depth,
+ 			perms: true,
++			permission_predicate: false,
+ 			force: Force::None,
+ 			import: false,
+ 			auth: Arc::new(Auth::default()),
+@@ -182,6 +191,35 @@ impl Options {
+ 		}
+ 	}
+ 
++	/// Create a new Options object for evaluating a `PERMISSIONS` predicate.
++	///
++	/// Disables permission recursion (like `new_with_perms(false)`) and marks
++	/// the frame as a permission-predicate evaluation, so any attempt to run a
++	/// mutating statement within the predicate is rejected by `Expr::compute`.
++	/// Use this instead of `new_with_perms(false)` at every site that computes
++	/// a stored `Permission::Specific(..)` clause.
++	pub fn new_for_permission_predicate(&self) -> Self {
++		Self {
++			perms: false,
++			permission_predicate: true,
++			..self.clone()
++		}
++	}
++
++	/// Create a new Options object for evaluating a stored schema expression
++	/// (for example a computed field or a DEFAULT clause).
++	///
++	/// Keeps the caller's permission enforcement unchanged -- unlike
++	/// [`Options::new_for_permission_predicate`] -- but marks the evaluation as
++	/// a stored-expression evaluation, so any attempt to run a mutating
++	/// statement inside it is rejected by `Expr::compute`.
++	pub fn new_for_stored_expression(&self) -> Self {
++		Self {
++			permission_predicate: true,
++			..self.clone()
++		}
++	}
++
+ 	/// Create a new Options object for a subquery
+ 	pub fn new_with_force(&self, force: Force) -> Self {
+ 		Self {
+diff --git a/surrealdb/core/src/doc/check.rs b/surrealdb/core/src/doc/check.rs
+index 514ef08..248e5e0 100644
+--- a/surrealdb/core/src/doc/check.rs
++++ b/surrealdb/core/src/doc/check.rs
+@@ -457,8 +457,8 @@ impl Document {
+ 			Permission::None => Err(IgnoreError::Ignore),
+ 			Permission::Full => Ok(()),
+ 			Permission::Specific(e) => {
+-				// Disable permissions
+-				let opt = &opt.new_with_perms(false);
++				// Disable permission recursion and block side effects
++				let opt = &opt.new_for_permission_predicate();
+ 				// Process the PERMISSION clause
+ 				if !stk
+ 					.run(|stk| e.compute(stk, ctx, opt, Some(doc)))
+diff --git a/surrealdb/core/src/doc/compute.rs b/surrealdb/core/src/doc/compute.rs
+index c41cebd..eff6f63 100644
+--- a/surrealdb/core/src/doc/compute.rs
++++ b/surrealdb/core/src/doc/compute.rs
+@@ -182,6 +182,10 @@ impl Document {
+ 				}
+ 			}
+ 
++			// A computed field is a stored schema expression: evaluating it
++			// must not change data. Keep the caller's permission enforcement
++			// (unlike a PERMISSIONS predicate) but refuse writes.
++			let opt = &opt.new_for_stored_expression();
+ 			let mut val = computed.compute(stk, ctx, opt, Some(doc)).await.catch_return()?;
+ 			if let Some(kind) = fd.field_kind.as_ref() {
+ 				val = val.coerce_to_kind(kind).map_err(|e| Error::FieldCoerce {
+diff --git a/surrealdb/core/src/doc/event.rs b/surrealdb/core/src/doc/event.rs
+index 93ed1dc..f48ccf0 100644
+--- a/surrealdb/core/src/doc/event.rs
++++ b/surrealdb/core/src/doc/event.rs
+@@ -107,9 +107,12 @@ impl Document {
+ 			ctx.add_value("input", input.clone().unwrap_or_default());
+ 			// Freeze the context
+ 			let ctx = ctx.freeze();
+-			// Process conditional clause
++			// Process conditional clause. A stored condition is not an action:
++			// it must not modify data, while the action below keeps the
++			// permission-free options it needs in order to write.
++			let cond_opt = &opt.new_for_permission_predicate();
+ 			let val = stk
+-				.run(|stk| ev.when.compute(stk, &ctx, &opt, Some(doc)))
++				.run(|stk| ev.when.compute(stk, &ctx, cond_opt, Some(doc)))
+ 				.await
+ 				.catch_return()
+ 				.map_err(|e| anyhow::anyhow!("Error while processing event {}: {e}", ev.name))?;
+diff --git a/surrealdb/core/src/doc/field.rs b/surrealdb/core/src/doc/field.rs
+index db28517..1e7d3b0 100644
+--- a/surrealdb/core/src/doc/field.rs
++++ b/surrealdb/core/src/doc/field.rs
+@@ -569,9 +569,12 @@ impl FieldEditContext<'_> {
+ 			};
+ 			// Freeze the new context
+ 			let ctx = ctx.freeze();
+-			// Process the VALUE clause
++			// Process the DEFAULT / static VALUE clause. It is a stored schema
++			// expression, so evaluating it must not change data; the writer's
++			// permission enforcement stays in force.
++			let opt = &self.opt.new_for_stored_expression();
+ 			let val =
+-				self.stk.run(|stk| expr.compute(stk, &ctx, self.opt, doc)).await.catch_return()?;
++				self.stk.run(|stk| expr.compute(stk, &ctx, opt, doc)).await.catch_return()?;
+ 			// Unfreeze the new context
+ 			self.context = Some(Context::unfreeze(ctx)?);
+ 			// Return the modified value
+@@ -610,7 +613,7 @@ impl FieldEditContext<'_> {
+ 			// Process the VALUE clause
+ 			// Schema expressions are evaluated without permission checks
+ 			// so derived values behave the same for every writer.
+-			let opt = &self.opt.new_with_perms(false);
++			let opt = &self.opt.new_for_permission_predicate();
+ 			let val =
+ 				self.stk.run(|stk| expr.compute(stk, &ctx, opt, doc)).await.catch_return()?;
+ 			// Unfreeze the new context
+@@ -657,7 +660,7 @@ impl FieldEditContext<'_> {
+ 			// Process the ASSERT clause. Schema expressions are evaluated
+ 			// without permission checks so validation behaves the same for
+ 			// every writer.
+-			let opt = &self.opt.new_with_perms(false);
++			let opt = &self.opt.new_for_permission_predicate();
+ 			let res =
+ 				self.stk.run(|stk| expr.compute(stk, &ctx, opt, doc)).await.catch_return()?;
+ 			// Unfreeze the new context
+@@ -712,8 +715,8 @@ impl FieldEditContext<'_> {
+ 					let now = Arc::new(val.clone());
+ 					// Get the current document
+ 					let doc = Some(&self.doc.current);
+-					// Disable permissions
+-					let opt = &self.opt.new_with_perms(false);
++					// Disable permission recursion and block side effects
++					let opt = &self.opt.new_for_permission_predicate();
+ 					// Configure the context
+ 					// Configure the context
+ 					let ctx = match self.context.take() {
+diff --git a/surrealdb/core/src/doc/lives.rs b/surrealdb/core/src/doc/lives.rs
+index 07f83e3..55deb7a 100644
+--- a/surrealdb/core/src/doc/lives.rs
++++ b/surrealdb/core/src/doc/lives.rs
+@@ -573,8 +573,8 @@ impl Document {
+ 						&self.current
+ 					};
+ 
+-					// Disable permissions
+-					let opt = &opt.new_with_perms(false);
++					// Disable permission recursion and block side effects
++					let opt = &opt.new_for_permission_predicate();
+ 					// Process the PERMISSION clause
+ 					if !stk
+ 						.run(|stk| e.compute(stk, ctx, opt, Some(doc)))
+diff --git a/surrealdb/core/src/doc/output.rs b/surrealdb/core/src/doc/output.rs
+index 8c0392d..7d53f33 100644
+--- a/surrealdb/core/src/doc/output.rs
++++ b/surrealdb/core/src/doc/output.rs
+@@ -354,8 +354,8 @@ impl Document {
+ 					let original = snapshot.get_or_insert_with(|| out.clone());
+ 					// SECURITY: iterate in reverse (see the None arm above, #7356).
+ 					for k in original.each(&fd.name).iter().rev() {
+-						// Disable permissions
+-						let opt = &opt.new_with_perms(false);
++						// Disable permission recursion and block side effects
++						let opt = &opt.new_for_permission_predicate();
+ 						// Get the projected value from the snapshot
+ 						let val = Arc::new(original.pick(k));
+ 						// Configure the context
+diff --git a/surrealdb/core/src/doc/reduce.rs b/surrealdb/core/src/doc/reduce.rs
+index fb4e9cd..0fdb96f 100644
+--- a/surrealdb/core/src/doc/reduce.rs
++++ b/surrealdb/core/src/doc/reduce.rs
+@@ -185,8 +185,8 @@ impl Document {
+ 				}
+ 				Permission::Specific(e) => {
+ 					for k in original.doc.as_ref().each(&fd.name).iter().rev() {
+-						// Disable permissions
+-						let opt = &opt.new_with_perms(false);
++						// Disable permission recursion and block side effects
++						let opt = &opt.new_for_permission_predicate();
+ 						// Get the computed value
+ 						let val = Arc::new(original.doc.as_ref().pick(k));
+ 						// Configure the context
+@@ -243,8 +243,8 @@ impl Document {
+ 					Permission::Full => (),
+ 					Permission::None => reduced.to_mut().cut(k),
+ 					Permission::Specific(e) => {
+-						// Disable permissions
+-						let opt = &opt.new_with_perms(false);
++						// Disable permission recursion and block side effects
++						let opt = &opt.new_for_permission_predicate();
+ 						// Get the initial value
+ 						let val = Arc::new(full.doc.as_ref().pick(k));
+ 						// Configure the context
+diff --git a/surrealdb/core/src/doc/table.rs b/surrealdb/core/src/doc/table.rs
+index 138be1a..2c0e6de 100644
+--- a/surrealdb/core/src/doc/table.rs
++++ b/surrealdb/core/src/doc/table.rs
+@@ -95,11 +95,14 @@ impl Document {
+ 				condition,
+ 				..
+ 			} => {
++				// A view condition is a stored predicate, not part of the view's
++				// own write: it must not be able to modify data.
++				let cond_opt = &opt.new_for_permission_predicate();
+ 				// Id of the document on the view
+ 				let id = &self.id()?.key;
+ 
+ 				let set = if let Some(cond) = condition {
+-					stk.run(|stk| cond.compute(stk, ctx, opt, Some(&self.current)))
++					stk.run(|stk| cond.compute(stk, ctx, cond_opt, Some(&self.current)))
+ 						.await
+ 						.catch_return()?
+ 						.is_truthy()
+@@ -110,7 +113,7 @@ impl Document {
+ 				let db = self.doc_ctx.db();
+ 
+ 				if set {
+-					let data = fields.compute(stk, ctx, opt, Some(&self.current)).await?;
++					let data = fields.compute(stk, ctx, cond_opt, Some(&self.current)).await?;
+ 					let record = Arc::new(Record::new(data));
+ 
+ 					ctx.tx()
+@@ -126,8 +129,20 @@ impl Document {
+ 				condition,
+ 				..
+ 			} => {
+-				self.process_aggregate_view(stk, ctx, opt, table_name, analysis, condition, action)
+-					.await
++				// A view condition is a stored predicate, not the view's own
++				// write: it must not be able to modify data.
++				let cond_opt = &opt.new_for_permission_predicate();
++				self.process_aggregate_view(
++					stk,
++					ctx,
++					cond_opt,
++					opt,
++					table_name,
++					analysis,
++					condition,
++					action,
++				)
++				.await
+ 			}
+ 		}
+ 	}
+@@ -138,6 +153,7 @@ impl Document {
+ 		&self,
+ 		stk: &mut Stk,
+ 		ctx: &FrozenContext,
++		cond_opt: &Options,
+ 		opt: &Options,
+ 		view_table_name: &TableName,
+ 		aggr: &AggregationAnalysis,
+@@ -148,7 +164,7 @@ impl Document {
+ 			Action::Create => {
+ 				if let Some(cond) = condition
+ 					&& !cond
+-						.compute(stk, ctx, opt, Some(&self.current))
++						.compute(stk, ctx, cond_opt, Some(&self.current))
+ 						.await
+ 						.catch_return()?
+ 						.is_truthy()
+@@ -167,7 +183,7 @@ impl Document {
+ 			}
+ 			Action::Update => {
+ 				let before_cond = if let Some(cond) = condition {
+-					cond.compute(stk, ctx, opt, Some(&self.initial))
++					cond.compute(stk, ctx, cond_opt, Some(&self.initial))
+ 						.await
+ 						.catch_return()?
+ 						.is_truthy()
+@@ -188,7 +204,7 @@ impl Document {
+ 				};
+ 
+ 				let after_cond = if let Some(cond) = condition {
+-					cond.compute(stk, ctx, opt, Some(&self.current))
++					cond.compute(stk, ctx, cond_opt, Some(&self.current))
+ 						.await
+ 						.catch_return()?
+ 						.is_truthy()
+@@ -272,7 +288,7 @@ impl Document {
+ 			Action::Delete => {
+ 				if let Some(cond) = condition
+ 					&& !cond
+-						.compute(stk, ctx, opt, Some(&self.initial))
++						.compute(stk, ctx, cond_opt, Some(&self.initial))
+ 						.await
+ 						.catch_return()?
+ 						.is_truthy()
+diff --git a/surrealdb/core/src/err/mod.rs b/surrealdb/core/src/err/mod.rs
+index 5192c61..17af685 100644
+--- a/surrealdb/core/src/err/mod.rs
++++ b/surrealdb/core/src/err/mod.rs
+@@ -514,6 +514,23 @@ pub(crate) enum Error {
+ 		op: BucketOperation,
+ 	},
+ 
++	/// A permission predicate attempted to perform a write or other side effect
++	/// while being evaluated (GHSA-66r2-5gwj-gxm2). Permission expressions are
++	/// evaluated with permission enforcement disabled, so they must be free of
++	/// observable side effects.
++	#[error("A PERMISSIONS clause cannot contain a statement that modifies data")]
++	PermissionPredicateSideEffect,
++
++	/// A DEFINE/ALTER (or import) supplied a permission clause that directly
++	/// contains a data-modifying statement, which is not allowed.
++	#[error(
++		"Found a non-read-only expression in the PERMISSIONS clause for {kind} `{name}`, but a PERMISSIONS clause must not modify data"
++	)]
++	PermissionClauseNotReadonly {
++		kind: &'static str,
++		name: String,
++	},
++
+ 	/// A database entry for the specified record already exists
+ 	#[error("Database record `{record}` already exists", record = record.to_sql())]
+ 	RecordExists {
+diff --git a/surrealdb/core/src/exec/context.rs b/surrealdb/core/src/exec/context.rs
+index 73466af..1f6760a 100644
+--- a/surrealdb/core/src/exec/context.rs
++++ b/surrealdb/core/src/exec/context.rs
+@@ -620,6 +620,48 @@ impl ExecutionContext {
+ 		new
+ 	}
+ 
++	/// Derive a context for evaluating a stored `PERMISSIONS` predicate on an
++	/// execution plan.
++	///
++	/// Disables nested permission enforcement on the derived `Options` (as the
++	/// legacy predicate path always did) and marks the frame as a stored
++	/// predicate evaluation, so any data-modifying statement reached while the
++	/// predicate is computed is refused -- including through a custom-function
++	/// body or a legacy compute fallback.
++	pub fn with_permission_predicate_marker(self) -> Self {
++		let mut new = self;
++		let root = match &mut new {
++			Self::Root(r) => r,
++			Self::Namespace(n) => &mut n.root,
++			Self::Database(d) => &mut d.ns_ctx.root,
++		};
++		if let Some(options) = root.options.take() {
++			root.options = Some(options.new_for_permission_predicate());
++		}
++		root.skip_fetch_perms = true;
++		new
++	}
++
++	/// Derive a context whose legacy options are marked as evaluating a stored
++	/// schema expression (for example a computed field), so any legacy compute
++	/// fallback reached from it refuses data-modifying statements.
++	///
++	/// Unlike [`ExecutionContext::with_skip_fetch_perms`], this does not change
++	/// how record dereferences are fetched: the caller's permission enforcement
++	/// stays exactly as it was.
++	pub fn with_stored_expression_marker(self) -> Self {
++		let mut new = self;
++		let root = match &mut new {
++			Self::Root(r) => r,
++			Self::Namespace(n) => &mut n.root,
++			Self::Database(d) => &mut d.ns_ctx.root,
++		};
++		if let Some(options) = root.options.take() {
++			root.options = Some(options.new_for_stored_expression());
++		}
++		new
++	}
++
+ 	/// Set the evaluated VERSION timestamp for time-travel queries.
+ 	///
+ 	/// Used by `VersionScope` to propagate the version to downstream
+diff --git a/surrealdb/core/src/exec/operators/scan/pipeline.rs b/surrealdb/core/src/exec/operators/scan/pipeline.rs
+index 4c782eb..5ee91a6 100644
+--- a/surrealdb/core/src/exec/operators/scan/pipeline.rs
++++ b/surrealdb/core/src/exec/operators/scan/pipeline.rs
+@@ -888,7 +888,11 @@ pub(crate) async fn compute_fields_for_value(
+ 		return Ok(());
+ 	}
+ 
+-	let mut eval_ctx = EvalContext::from_exec_ctx(ctx);
++	// A computed field is a stored schema expression: evaluating it must not
++	// change data, so mark the execution context for the legacy compute
++	// fallbacks without altering how record dereferences are fetched.
++	let marked_ctx = ctx.clone().with_stored_expression_marker();
++	let mut eval_ctx = EvalContext::from_exec_ctx(&marked_ctx);
+ 	eval_ctx.skip_fetch_perms = skip_fetch_perms;
+ 
+ 	// Extract the record ID before entering the loop so that field
+diff --git a/surrealdb/core/src/exec/operators/sequence.rs b/surrealdb/core/src/exec/operators/sequence.rs
+index 01e1487..ce2834a 100644
+--- a/surrealdb/core/src/exec/operators/sequence.rs
++++ b/surrealdb/core/src/exec/operators/sequence.rs
+@@ -197,16 +197,16 @@ async fn execute_block_with_context(
+ 				// `depth` rather than handing it a fresh budget.
+ 				let (opt, frozen) = legacy_context_for_fallback(&current_ctx)
+ 					.context("Legacy compute fallback context unavailable")?;
+-				let opt = &opt.with_dive_consumed(depth);
++				let opt = opt.with_dive_consumed(depth);
+ 
+ 				if let Expr::Let(set_stmt) = expr {
+-					let value = legacy_compute(&set_stmt.what, &frozen, opt, None).await?;
++					let value = legacy_compute(&set_stmt.what, &frozen, &opt, None).await?;
+ 
+ 					// Update context with the new variable
+ 					current_ctx = current_ctx.with_param(set_stmt.name.clone(), value.clone());
+ 					result = Value::None;
+ 				} else {
+-					result = legacy_compute(expr, &frozen, opt, None).await?;
++					result = legacy_compute(expr, &frozen, &opt, None).await?;
+ 				}
+ 			}
+ 			Err(e) => return Err(ControlFlow::Err(e.into())),
+@@ -223,10 +223,22 @@ async fn execute_block_with_context(
+ /// (issue #7131).
+ fn legacy_context_for_fallback(
+ 	exec_ctx: &ExecutionContext,
+-) -> Result<(&crate::dbs::Options, FrozenContext), Error> {
++) -> Result<(crate::dbs::Options, FrozenContext), Error> {
+ 	let options = exec_ctx.options().ok_or_else(|| {
+ 		Error::Internal("Options not available for legacy compute fallback".into())
+ 	})?;
++	// Block write side effects when this sequence is evaluated inside a
++	// PERMISSIONS predicate (signalled by `skip_fetch_perms`), so a predicate
++	// cannot mutate data via the legacy compute fallback (GHSA-66r2-5gwj-gxm2).
++	let options = if exec_ctx.root().skip_fetch_perms {
++		options.new_for_permission_predicate()
++	} else if options.permission_predicate {
++		// A stored schema expression (computed field / DEFAULT): refuse writes
++		// but keep the caller's permission enforcement as it was.
++		options.new_for_stored_expression()
++	} else {
++		options.clone()
++	};
+ 	Ok((options, Arc::clone(exec_ctx.ctx())))
+ }
+ 
+diff --git a/surrealdb/core/src/exec/permission.rs b/surrealdb/core/src/exec/permission.rs
+index 56e5bde..4da1d7e 100644
+--- a/surrealdb/core/src/exec/permission.rs
++++ b/surrealdb/core/src/exec/permission.rs
+@@ -224,7 +224,7 @@ pub(crate) async fn evaluate_table_select_for_doc(
+ 		Permission::None => Ok(false),
+ 		Permission::Full => Ok(true),
+ 		Permission::Specific(e) => {
+-			let opt_no_perms = opt.new_with_perms(false);
++			let opt_no_perms = opt.new_for_permission_predicate();
+ 			Ok(stk
+ 				.run(|stk| e.compute(stk, ctx, &opt_no_perms, Some(cursor_doc)))
+ 				.await
+diff --git a/surrealdb/core/src/exec/physical_expr/block.rs b/surrealdb/core/src/exec/physical_expr/block.rs
+index fcff2f1..d42eb36 100644
+--- a/surrealdb/core/src/exec/physical_expr/block.rs
++++ b/surrealdb/core/src/exec/physical_expr/block.rs
+@@ -70,14 +70,29 @@ fn create_planning_context(
+ ///
+ /// Since the ExecutionContext's FrozenContext is the single source of truth
+ /// for parameters, we can use it directly without reconstruction.
+-fn get_legacy_context<'a>(
+-	exec_ctx: &'a crate::exec::ExecutionContext,
++fn get_legacy_context(
++	exec_ctx: &crate::exec::ExecutionContext,
+ 	cached_ctx: &mut Option<FrozenContext>,
+-) -> anyhow::Result<(&'a crate::dbs::Options, FrozenContext)> {
++	permission_predicate: bool,
++) -> anyhow::Result<(crate::dbs::Options, FrozenContext)> {
+ 	let options = exec_ctx
+ 		.options()
+ 		.ok_or_else(|| anyhow::anyhow!("Options not available for legacy compute fallback"))?;
+ 
++	// When this block is evaluated inside a PERMISSIONS predicate (signalled by
++	// `skip_fetch_perms`), block write side effects on the legacy compute
++	// fallback so a predicate cannot mutate data via a custom function body or
++	// nested statement (GHSA-66r2-5gwj-gxm2).
++	let options = if permission_predicate {
++		options.new_for_permission_predicate()
++	} else if options.permission_predicate {
++		// A stored schema expression (computed field / DEFAULT): refuse writes
++		// but keep the caller's permission enforcement as it was.
++		options.new_for_stored_expression()
++	} else {
++		options.clone()
++	};
++
+ 	// Use or create a cached context for legacy compute
+ 	let frozen = if let Some(ctx) = cached_ctx.take() {
+ 		ctx
+@@ -232,7 +247,11 @@ impl BlockPhysicalExpr {
+ 								}
+ 								_ => {}
+ 							}
+-							let (opt, frozen) = get_legacy_context(current_exec_ctx, legacy_ctx)?;
++							let (opt, frozen) = get_legacy_context(
++								current_exec_ctx,
++								legacy_ctx,
++								ctx.skip_fetch_perms,
++							)?;
+ 							let opt = &opt.with_dive_consumed(depth);
+ 							let doc = current_value_for_legacy
+ 								.map(|v| CursorDoc::new(None, None, v.clone()));
+@@ -314,7 +333,8 @@ impl BlockPhysicalExpr {
+ 							}
+ 							_ => {}
+ 						}
+-						let (opt, frozen) = get_legacy_context(current_exec_ctx, legacy_ctx)?;
++						let (opt, frozen) =
++							get_legacy_context(current_exec_ctx, legacy_ctx, ctx.skip_fetch_perms)?;
+ 						let opt = &opt.with_dive_consumed(depth);
+ 						let doc =
+ 							current_value_for_legacy.map(|v| CursorDoc::new(None, None, v.clone()));
+diff --git a/surrealdb/core/src/exec/physical_expr/function/helpers.rs b/surrealdb/core/src/exec/physical_expr/function/helpers.rs
+index c95ce75..ba86136 100644
+--- a/surrealdb/core/src/exec/physical_expr/function/helpers.rs
++++ b/surrealdb/core/src/exec/physical_expr/function/helpers.rs
+@@ -38,7 +38,18 @@ pub(crate) async fn check_permission(
+ 			// Plan and evaluate the permission expression
+ 			match expr_to_physical_expr(expr.clone(), ctx.exec_ctx.ctx()).await {
+ 				Ok(phys_expr) => {
+-					let result = phys_expr.evaluate(ctx.clone()).await?;
++					// A stored PERMISSIONS predicate is presented with the
++					// caller's context, but it must be evaluated as a stored
++					// predicate: nested permission enforcement is disabled and
++					// any data-modifying statement reached from it is refused.
++					// The body of the function being called keeps the caller's
++					// context, so its own legitimate writes still run.
++					let marked = ctx.exec_ctx.clone().with_permission_predicate_marker();
++					let perm_ctx = EvalContext {
++						exec_ctx: &marked,
++						..ctx.clone()
++					};
++					let result = phys_expr.evaluate(perm_ctx).await?;
+ 					if !result.is_truthy() {
+ 						Err(Error::FunctionPermissions {
+ 							name: func_name.to_string(),
+diff --git a/surrealdb/core/src/exec/physical_expr/literal.rs b/surrealdb/core/src/exec/physical_expr/literal.rs
+index 7b8d698..f4d9f6e 100644
+--- a/surrealdb/core/src/exec/physical_expr/literal.rs
++++ b/surrealdb/core/src/exec/physical_expr/literal.rs
+@@ -85,7 +85,17 @@ impl Param {
+ 							.await
+ 							{
+ 								Ok(phys_expr) => {
+-									match phys_expr.evaluate(ctx.clone()).await {
++									// A stored PERMISSIONS predicate must not
++									// modify data while it is evaluated.
++									let marked = ctx
++										.exec_ctx
++										.clone()
++										.with_permission_predicate_marker();
++									let perm_ctx = EvalContext {
++										exec_ctx: &marked,
++										..ctx.clone()
++									};
++									match phys_expr.evaluate(perm_ctx).await {
+ 										Ok(result) if result.is_truthy() => {
+ 											// Permission granted
+ 										}
+diff --git a/surrealdb/core/src/exec/plan_or_compute.rs b/surrealdb/core/src/exec/plan_or_compute.rs
+index 1a446fd..8ff8e03 100644
+--- a/surrealdb/core/src/exec/plan_or_compute.rs
++++ b/surrealdb/core/src/exec/plan_or_compute.rs
+@@ -32,25 +32,48 @@ use crate::val::Value;
+ /// parameters, transactions, capabilities, and all legacy context fields.
+ pub(crate) fn get_legacy_context(
+ 	exec_ctx: &ExecutionContext,
+-) -> Result<(&crate::dbs::Options, FrozenContext), Error> {
++) -> Result<(crate::dbs::Options, FrozenContext), Error> {
+ 	let options = exec_ctx
+ 		.options()
+ 		.ok_or_else(|| Error::Thrown("Options not available for legacy compute fallback".into()))?;
++	let options = legacy_fallback_options(exec_ctx, options);
+ 	Ok((options, Arc::clone(exec_ctx.ctx())))
+ }
+ 
++/// Derive the `Options` to use for a legacy compute fallback.
++///
++/// When the streaming context is evaluating a `PERMISSIONS` predicate
++/// (signalled by `skip_fetch_perms`), the fallback must block write side
++/// effects so a predicate cannot mutate data through the legacy compute path
++/// (GHSA-66r2-5gwj-gxm2).
++fn legacy_fallback_options(
++	exec_ctx: &ExecutionContext,
++	options: &crate::dbs::Options,
++) -> crate::dbs::Options {
++	if exec_ctx.root().skip_fetch_perms {
++		options.new_for_permission_predicate()
++	} else if options.permission_predicate {
++		// A stored schema expression (computed field / DEFAULT): refuse writes
++		// but keep the caller's permission enforcement as it was.
++		options.new_for_stored_expression()
++	} else {
++		options.clone()
++	}
++}
++
+ /// Extract the `Options` and `FrozenContext` for legacy fallback, adding a loop
+ /// variable to the context.
+ ///
+ /// Used by the `ForeachPlan` operator to inject the current iteration value.
+-pub(crate) fn get_legacy_context_with_param<'a>(
+-	exec_ctx: &'a ExecutionContext,
++pub(crate) fn get_legacy_context_with_param(
++	exec_ctx: &ExecutionContext,
+ 	param_name: &str,
+ 	param_value: &Value,
+-) -> Result<(&'a crate::dbs::Options, FrozenContext), Error> {
++) -> Result<(crate::dbs::Options, FrozenContext), Error> {
+ 	let options = exec_ctx
+ 		.options()
+ 		.ok_or_else(|| Error::Thrown("Options not available for legacy compute fallback".into()))?;
++	let options = legacy_fallback_options(exec_ctx, options);
+ 
+ 	let mut ctx = crate::ctx::Context::new_child(exec_ctx.ctx());
+ 	ctx.add_value(param_name.to_string(), std::sync::Arc::new(param_value.clone()));
+@@ -170,7 +193,7 @@ pub(crate) async fn evaluate_body_expr(
+ 			let (opt, frozen) = get_legacy_context_with_param(ctx, param_name, param_value)
+ 				.context("Legacy compute fallback context unavailable")?;
+ 			// Continue the depth count into the legacy path from `depth`.
+-			let opt = &opt.with_dive_consumed(depth);
++			let opt = opt.with_dive_consumed(depth);
+ 
+ 			if let Expr::Let(set_stmt) = expr {
+ 				if set_stmt.is_protected_set() {
+@@ -180,7 +203,7 @@ pub(crate) async fn evaluate_body_expr(
+ 					.into());
+ 				}
+ 
+-				let value = legacy_compute(&set_stmt.what, &frozen, opt, None).await?;
++				let value = legacy_compute(&set_stmt.what, &frozen, &opt, None).await?;
+ 
+ 				let value = if let Some(kind) = &set_stmt.kind {
+ 					value.coerce_to_kind(kind).map_err(|e| Error::SetCoerce {
+@@ -194,7 +217,7 @@ pub(crate) async fn evaluate_body_expr(
+ 				*ctx = ctx.with_param(set_stmt.name.clone(), value);
+ 				Ok(Value::None)
+ 			} else {
+-				legacy_compute(expr, &frozen, opt, None).await
++				legacy_compute(expr, &frozen, &opt, None).await
+ 			}
+ 		}
+ 		Err(e) => Err(ControlFlow::Err(e.into())),
+diff --git a/surrealdb/core/src/expr/block.rs b/surrealdb/core/src/expr/block.rs
+index 2a0b1e4..7debe5c 100644
+--- a/surrealdb/core/src/expr/block.rs
++++ b/surrealdb/core/src/expr/block.rs
+@@ -71,6 +71,11 @@ impl Block {
+ 		self.0.iter().all(|x| x.read_only())
+ 	}
+ 
++	/// Check if this block directly contains a data-modifying statement.
++	pub(crate) fn has_direct_write(&self) -> bool {
++		self.0.iter().any(|x| x.has_direct_write())
++	}
++
+ 	/// Process this type returning a computed simple Value
+ 	#[instrument(level = "trace", name = "Block::compute", skip_all)]
+ 	pub(crate) async fn compute(
+diff --git a/surrealdb/core/src/expr/expression.rs b/surrealdb/core/src/expr/expression.rs
+index b1a5aeb..d9c0704 100644
+--- a/surrealdb/core/src/expr/expression.rs
++++ b/surrealdb/core/src/expr/expression.rs
+@@ -156,6 +156,64 @@ impl Expr {
+ 		}
+ 	}
+ 
++	/// Check whether this expression's own tree *directly* contains a
++	/// data-modifying statement (CREATE/UPDATE/DELETE/RELATE/INSERT/UPSERT or
++	/// DDL).
++	///
++	/// Used to reject side-effecting `PERMISSIONS` clauses at definition time
++	/// (GHSA-66r2-5gwj-gxm2). Unlike [`Expr::read_only`], a function or closure
++	/// *call* is treated as opaque — a custom function may itself write, but
++	/// that is enforced at runtime via [`crate::dbs::Options::new_for_permission_predicate`]
++	/// — so common read-only helper predicates such as
++	/// `PERMISSIONS WHERE fn::is_owner()` remain valid. Writes buried inside a
++	/// subquery or idiom are likewise left to the runtime guard.
++	pub(crate) fn has_direct_write(&self) -> bool {
++		match self {
++			// Data-modifying statements: a direct write.
++			Expr::Create(_)
++			| Expr::Update(_)
++			| Expr::Delete(_)
++			| Expr::Relate(_)
++			| Expr::Insert(_)
++			| Expr::Define(_)
++			| Expr::Remove(_)
++			| Expr::Rebuild(_)
++			| Expr::Upsert(_)
++			| Expr::Alter(_) => true,
++
++			// Combinators: recurse into nested expressions.
++			Expr::Prefix {
++				expr,
++				..
++			}
++			| Expr::Postfix {
++				expr,
++				..
++			}
++			| Expr::Throw(expr) => expr.has_direct_write(),
++			Expr::Binary {
++				left,
++				right,
++				..
++			} => left.has_direct_write() || right.has_direct_write(),
++			Expr::Return(s) => s.what.has_direct_write(),
++			Expr::Let(s) => s.what.has_direct_write(),
++			Expr::Block(block) => block.has_direct_write(),
++			Expr::IfElse(s) => s.has_direct_write(),
++			Expr::Foreach(s) => s.has_direct_write(),
++			Expr::Explain {
++				statement,
++				..
++			} => statement.has_direct_write(),
++			// Call arguments are evaluated in place, so inspect them; the callee
++			// body is opaque and handled by the runtime guard.
++			Expr::FunctionCall(function) => function.arguments.iter().any(|x| x.has_direct_write()),
++
++			// Leaves, closures, subqueries and idioms contain no *direct* write.
++			_ => false,
++		}
++	}
++
+ 	pub fn from_public_value(value: PublicValue) -> Self {
+ 		match value {
+ 			surrealdb_types::Value::None => Expr::Literal(Literal::None),
+@@ -365,6 +423,29 @@ impl Expr {
+ 	) -> FlowResult<Value> {
+ 		let opt = opt.dive(1).map_err(anyhow::Error::new)?;
+ 
++		// While evaluating a PERMISSIONS predicate (which runs with permission
++		// enforcement disabled) no statement may modify data — otherwise a
++		// stored permission expression could perform unauthorized writes during
++		// a permission check (GHSA-66r2-5gwj-gxm2). This catches writes reached
++		// directly, through nested subqueries, or through function/closure
++		// bodies, on both the legacy and streaming execution paths.
++		if opt.permission_predicate
++			&& matches!(
++				self,
++				Expr::Create(_)
++					| Expr::Update(_)
++					| Expr::Upsert(_)
++					| Expr::Delete(_)
++					| Expr::Relate(_)
++					| Expr::Insert(_)
++					| Expr::Define(_)
++					| Expr::Remove(_)
++					| Expr::Rebuild(_)
++					| Expr::Alter(_)
++			) {
++			return Err(ControlFlow::Err(anyhow::Error::new(Error::PermissionPredicateSideEffect)));
++		}
++
+ 		match self {
+ 			Expr::Literal(literal) => literal.compute(stk, ctx, &opt, doc).await,
+ 			Expr::Param(param) => {
+diff --git a/surrealdb/core/src/expr/function.rs b/surrealdb/core/src/expr/function.rs
+index 1b9ea18..3300aa2 100644
+--- a/surrealdb/core/src/expr/function.rs
++++ b/surrealdb/core/src/expr/function.rs
+@@ -281,8 +281,8 @@ async fn check_perms(
+ 			})))
+ 		}
+ 		Permission::Specific(e) => {
+-			// Disable permissions
+-			let opt = &opt.new_with_perms(false);
++			// Disable permission recursion and block side effects
++			let opt = &opt.new_for_permission_predicate();
+ 			// Process the PERMISSION clause
+ 			if !stk.run(|stk| e.compute(stk, ctx, opt, doc)).await?.is_truthy() {
+ 				Err(ControlFlow::from(anyhow::Error::new(Error::FunctionPermissions {
+diff --git a/surrealdb/core/src/expr/model.rs b/surrealdb/core/src/expr/model.rs
+index 321bb22..1ec3385 100644
+--- a/surrealdb/core/src/expr/model.rs
++++ b/surrealdb/core/src/expr/model.rs
+@@ -87,8 +87,8 @@ impl Model {
+ 					)));
+ 				}
+ 				Permission::Specific(e) => {
+-					// Disable permissions
+-					let opt = &opt.new_with_perms(false);
++					// Disable permission recursion and block side effects
++					let opt = &opt.new_for_permission_predicate();
+ 					// Process the PERMISSION clause
+ 					if !stk.run(|stk| e.compute(stk, ctx, opt, doc)).await?.is_truthy() {
+ 						return Err(ControlFlow::from(anyhow::Error::new(
+diff --git a/surrealdb/core/src/expr/param.rs b/surrealdb/core/src/expr/param.rs
+index 3020ff4..55c3c7f 100644
+--- a/surrealdb/core/src/expr/param.rs
++++ b/surrealdb/core/src/expr/param.rs
+@@ -153,8 +153,8 @@ impl Param {
+ 								})
+ 							}
+ 							Permission::Specific(e) => {
+-								// Disable permissions
+-								let opt = &opt.new_with_perms(false);
++								// Disable permission recursion and block side effects
++								let opt = &opt.new_for_permission_predicate();
+ 								// Process the PERMISSION clause
+ 								if !stk
+ 									.run(|stk| e.compute(stk, ctx, opt, doc))
+diff --git a/surrealdb/core/src/expr/statements/alter/bucket.rs b/surrealdb/core/src/expr/statements/alter/bucket.rs
+index 75abec0..a5e1acb 100644
+--- a/surrealdb/core/src/expr/statements/alter/bucket.rs
++++ b/surrealdb/core/src/expr/statements/alter/bucket.rs
+@@ -75,6 +75,13 @@ impl AlterBucketStatement {
+ 		}
+ 
+ 		if let Some(ref p) = self.permissions {
++			if p.has_direct_write() {
++				return Err(Error::PermissionClauseNotReadonly {
++					kind: "bucket",
++					name: name.to_string(),
++				}
++				.into());
++			}
+ 			bu.permissions = p.clone();
+ 		}
+ 
+diff --git a/surrealdb/core/src/expr/statements/alter/field.rs b/surrealdb/core/src/expr/statements/alter/field.rs
+index 8e11f06..80003da 100644
+--- a/surrealdb/core/src/expr/statements/alter/field.rs
++++ b/surrealdb/core/src/expr/statements/alter/field.rs
+@@ -149,6 +149,13 @@ impl AlterFieldStatement {
+ 		}
+ 
+ 		if let Some(permissions) = &self.permissions {
++			if permissions.has_direct_write() {
++				return Err(Error::PermissionClauseNotReadonly {
++					kind: "field",
++					name: df.name.to_sql(),
++				}
++				.into());
++			}
+ 			df.select_permission = convert_permission(&permissions.select);
+ 			df.create_permission = convert_permission(&permissions.create);
+ 			df.update_permission = convert_permission(&permissions.update);
+diff --git a/surrealdb/core/src/expr/statements/alter/function.rs b/surrealdb/core/src/expr/statements/alter/function.rs
+index 9447d8a..a457ec9 100644
+--- a/surrealdb/core/src/expr/statements/alter/function.rs
++++ b/surrealdb/core/src/expr/statements/alter/function.rs
+@@ -61,6 +61,13 @@ impl AlterFunctionStatement {
+ 		}
+ 
+ 		if let Some(ref p) = self.permissions {
++			if p.has_direct_write() {
++				return Err(crate::err::Error::PermissionClauseNotReadonly {
++					kind: "function",
++					name: format!("fn::{}", self.name),
++				}
++				.into());
++			}
+ 			fc.permissions = p.clone();
+ 		}
+ 
+diff --git a/surrealdb/core/src/expr/statements/alter/param.rs b/surrealdb/core/src/expr/statements/alter/param.rs
+index f3dc6bc..4f4ec26 100644
+--- a/surrealdb/core/src/expr/statements/alter/param.rs
++++ b/surrealdb/core/src/expr/statements/alter/param.rs
+@@ -59,6 +59,13 @@ impl AlterParamStatement {
+ 		}
+ 
+ 		if let Some(ref p) = self.permissions {
++			if p.has_direct_write() {
++				return Err(crate::err::Error::PermissionClauseNotReadonly {
++					kind: "param",
++					name: self.name.to_string(),
++				}
++				.into());
++			}
+ 			pa.permissions = p.clone();
+ 		}
+ 
+diff --git a/surrealdb/core/src/expr/statements/alter/table.rs b/surrealdb/core/src/expr/statements/alter/table.rs
+index 77090ef..4ff0c8d 100644
+--- a/surrealdb/core/src/expr/statements/alter/table.rs
++++ b/surrealdb/core/src/expr/statements/alter/table.rs
+@@ -116,6 +116,13 @@ impl AlterTableStatement {
+ 		}
+ 
+ 		if let Some(permissions) = &self.permissions {
++			if permissions.has_direct_write() {
++				return Err(Error::PermissionClauseNotReadonly {
++					kind: "table",
++					name: name.as_str().to_string(),
++				}
++				.into());
++			}
+ 			dt.permissions = permissions.clone();
+ 		}
+ 
+diff --git a/surrealdb/core/src/expr/statements/define/bucket.rs b/surrealdb/core/src/expr/statements/define/bucket.rs
+index a6ee4e8..154717f 100644
+--- a/surrealdb/core/src/expr/statements/define/bucket.rs
++++ b/surrealdb/core/src/expr/statements/define/bucket.rs
+@@ -48,6 +48,13 @@ impl DefineBucketStatement {
+ 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Bucket, Base::Db)?;
+ 		// Process the name
+ 		let name = expr_to_ident(stk, ctx, opt, doc, &self.name, "bucket name").await?;
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "bucket",
++				name: name.clone(),
++			});
++		}
+ 		// Fetch the transaction
+ 		let txn = ctx.tx();
+ 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
+diff --git a/surrealdb/core/src/expr/statements/define/config/api.rs b/surrealdb/core/src/expr/statements/define/config/api.rs
+index 0ae51f1..6fffdbe 100644
+--- a/surrealdb/core/src/expr/statements/define/config/api.rs
++++ b/surrealdb/core/src/expr/statements/define/config/api.rs
+@@ -45,6 +45,15 @@ impl ApiConfig {
+ 			});
+ 		}
+ 
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			return Err(crate::err::Error::PermissionClauseNotReadonly {
++				kind: "config",
++				name: "api".to_string(),
++			}
++			.into());
++		}
++
+ 		Ok(ApiConfigDefinition {
+ 			middleware,
+ 			permissions: self.permissions.clone(),
+diff --git a/surrealdb/core/src/expr/statements/define/field.rs b/surrealdb/core/src/expr/statements/define/field.rs
+index 5f974a5..2e8422a 100644
+--- a/surrealdb/core/src/expr/statements/define/field.rs
++++ b/surrealdb/core/src/expr/statements/define/field.rs
+@@ -162,6 +162,15 @@ impl DefineFieldStatement {
+ 		// Allowed to run?
+ 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Field, Base::Db)?;
+ 
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			return Err(Error::PermissionClauseNotReadonly {
++				kind: "field",
++				name: definition.name.to_sql(),
++			}
++			.into());
++		}
++
+ 		// Validate any GRAPHQL_ALIAS at definition time so typos surface here
+ 		// rather than silently falling back at schema-generation time.
+ 		super::validate_graphql_alias(&self.graphql_alias, "field")?;
+diff --git a/surrealdb/core/src/expr/statements/define/function.rs b/surrealdb/core/src/expr/statements/define/function.rs
+index 5842b0c..971ae86 100644
+--- a/surrealdb/core/src/expr/statements/define/function.rs
++++ b/surrealdb/core/src/expr/statements/define/function.rs
+@@ -42,6 +42,13 @@ impl DefineFunctionStatement {
+ 		// Validate any GRAPHQL_ALIAS at definition time so typos surface here
+ 		// rather than silently falling back at schema-generation time.
+ 		super::validate_graphql_alias(&self.graphql_alias, "function")?;
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "function",
++				name: format!("fn::{}", self.name),
++			});
++		}
+ 		// Fetch the transaction
+ 		let txn = ctx.tx();
+ 		// Check if the definition exists
+diff --git a/surrealdb/core/src/expr/statements/define/model.rs b/surrealdb/core/src/expr/statements/define/model.rs
+index 9ff916a..f493799 100644
+--- a/surrealdb/core/src/expr/statements/define/model.rs
++++ b/surrealdb/core/src/expr/statements/define/model.rs
+@@ -36,6 +36,13 @@ impl DefineModelStatement {
+ 	) -> Result<Value> {
+ 		// Allowed to run?
+ 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Model, Base::Db)?;
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "model",
++				name: self.name.to_string(),
++			});
++		}
+ 		// Fetch the transaction
+ 		let txn = ctx.tx();
+ 		// Check if the definition exists
+diff --git a/surrealdb/core/src/expr/statements/define/module.rs b/surrealdb/core/src/expr/statements/define/module.rs
+index e101830..009a4fd 100644
+--- a/surrealdb/core/src/expr/statements/define/module.rs
++++ b/surrealdb/core/src/expr/statements/define/module.rs
+@@ -40,6 +40,13 @@ impl DefineModuleStatement {
+ 		// Check if the definition exists
+ 		let (ns, db) = ctx.get_ns_db_ids(opt).await?;
+ 		let storage_name = ModuleName::try_from(self)?.get_storage_name();
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "module",
++				name: storage_name.clone(),
++			});
++		}
+ 		if txn.get_db_module(ns, db, &storage_name, None).await.is_ok() {
+ 			match self.kind {
+ 				DefineKind::Default => {
+diff --git a/surrealdb/core/src/expr/statements/define/param.rs b/surrealdb/core/src/expr/statements/define/param.rs
+index b0e51a5..2d5d0e6 100644
+--- a/surrealdb/core/src/expr/statements/define/param.rs
++++ b/surrealdb/core/src/expr/statements/define/param.rs
+@@ -35,6 +35,14 @@ impl DefineParamStatement {
+ 		// Allowed to run?
+ 		ctx.is_allowed(opt, Action::Edit, ResourceKind::Parameter, Base::Db)?;
+ 
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "param",
++				name: self.name.to_string(),
++			});
++		}
++
+ 		let value = stk.run(|stk| self.value.compute(stk, ctx, opt, doc)).await.catch_return()?;
+ 
+ 		// Fetch the transaction
+diff --git a/surrealdb/core/src/expr/statements/define/table.rs b/surrealdb/core/src/expr/statements/define/table.rs
+index c846920..1107a1b 100644
+--- a/surrealdb/core/src/expr/statements/define/table.rs
++++ b/surrealdb/core/src/expr/statements/define/table.rs
+@@ -87,6 +87,14 @@ impl DefineTableStatement {
+ 		let name =
+ 			TableName::new(expr_to_ident(stk, ctx, opt, doc, &self.name, "table name").await?);
+ 
++		// A PERMISSIONS clause must not perform writes (GHSA-66r2-5gwj-gxm2).
++		if self.permissions.has_direct_write() {
++			bail!(Error::PermissionClauseNotReadonly {
++				kind: "table",
++				name: name.as_str().to_string(),
++			});
++		}
++
+ 		// Get the NS and DB
+ 		let (ns_name, db_name) = opt.ns_db()?;
+ 
+diff --git a/surrealdb/core/src/expr/statements/foreach.rs b/surrealdb/core/src/expr/statements/foreach.rs
+index 2f44232..427f784 100644
+--- a/surrealdb/core/src/expr/statements/foreach.rs
++++ b/surrealdb/core/src/expr/statements/foreach.rs
+@@ -36,6 +36,11 @@ impl ForeachStatement {
+ 	pub(crate) fn read_only(&self) -> bool {
+ 		self.range.read_only() && self.block.read_only()
+ 	}
++
++	/// Check if the range or body directly contains a data-modifying statement.
++	pub(crate) fn has_direct_write(&self) -> bool {
++		self.range.has_direct_write() || self.block.has_direct_write()
++	}
+ 	/// Process this type returning a computed simple Value
+ 	#[instrument(level = "trace", name = "ForeachStatement::compute", skip_all)]
+ 	pub(crate) async fn compute(
+diff --git a/surrealdb/core/src/expr/statements/ifelse.rs b/surrealdb/core/src/expr/statements/ifelse.rs
+index 886051e..59b082c 100644
+--- a/surrealdb/core/src/expr/statements/ifelse.rs
++++ b/surrealdb/core/src/expr/statements/ifelse.rs
+@@ -23,6 +23,12 @@ impl IfelseStatement {
+ 			&& self.close.as_ref().map(|x| x.read_only()).unwrap_or(true)
+ 	}
+ 
++	/// Check if any branch directly contains a data-modifying statement.
++	pub(crate) fn has_direct_write(&self) -> bool {
++		self.exprs.iter().any(|x| x.0.has_direct_write() || x.1.has_direct_write())
++			|| self.close.as_ref().map(|x| x.has_direct_write()).unwrap_or(false)
++	}
++
+ 	/// Process this type returning a computed simple Value
+ 	#[instrument(level = "trace", name = "IfelseStatement::compute", skip_all)]
+ 	pub(crate) async fn compute(
+diff --git a/surrealdb/core/src/iam/access.rs b/surrealdb/core/src/iam/access.rs
+index 479a67d..b9b2b57 100644
+--- a/surrealdb/core/src/iam/access.rs
++++ b/surrealdb/core/src/iam/access.rs
+@@ -20,7 +20,7 @@ pub(crate) async fn authenticate_record(
+ 	session: &Session,
+ 	authenticate: &Expr,
+ ) -> Result<PublicRecordId> {
+-	match kvs.evaluate(authenticate, session, None).await {
++	match kvs.evaluate_readonly(authenticate, session, None).await {
+ 		Ok(val) => match val.into_record() {
+ 			// If the AUTHENTICATE clause returns a record, authentication continues with that
+ 			// record
+@@ -64,7 +64,7 @@ pub(crate) async fn authenticate_generic(
+ 	session: &Session,
+ 	authenticate: &Expr,
+ ) -> Result<()> {
+-	match kvs.evaluate(authenticate, session, None).await {
++	match kvs.evaluate_readonly(authenticate, session, None).await {
+ 		Ok(val) => {
+ 			match val {
+ 				// If the AUTHENTICATE clause returns nothing, authentication continues
+diff --git a/surrealdb/core/src/iam/signin.rs b/surrealdb/core/src/iam/signin.rs
+index adad3ff..eb017cb 100644
+--- a/surrealdb/core/src/iam/signin.rs
++++ b/surrealdb/core/src/iam/signin.rs
+@@ -303,7 +303,7 @@ pub async fn db_access(
+ 					sess.ip.clone_from(&session.ip);
+ 					sess.or.clone_from(&session.or);
+ 					// Compute the value with the params
+-					match kvs.evaluate(val, &sess, Some(vars)).await {
++					match kvs.evaluate_readonly(val, &sess, Some(vars)).await {
+ 						// The signin value succeeded
+ 						Ok(val) => {
+ 							match val.into_record() {
+diff --git a/surrealdb/core/src/kvs/ds.rs b/surrealdb/core/src/kvs/ds.rs
+index d1f142a..7c837af 100644
+--- a/surrealdb/core/src/kvs/ds.rs
++++ b/surrealdb/core/src/kvs/ds.rs
+@@ -3938,13 +3938,41 @@ impl Datastore {
+ 		val: &Expr,
+ 		sess: &Session,
+ 		vars: Option<PublicVariables>,
++	) -> Result<PublicValue> {
++		self.evaluate_with(val, sess, vars, false).await
++	}
++
++	/// Evaluate a stored access clause that must not modify data: the SIGNIN
++	/// and AUTHENTICATE clauses. They run before the client's session exists,
++	/// so a write reached from them is a side effect of the evaluation itself.
++	/// SIGNUP keeps `evaluate` because creating the account record is the
++	/// operation's own work.
++	pub(crate) async fn evaluate_readonly(
++		&self,
++		val: &Expr,
++		sess: &Session,
++		vars: Option<PublicVariables>,
++	) -> Result<PublicValue> {
++		self.evaluate_with(val, sess, vars, true).await
++	}
++
++	async fn evaluate_with(
++		&self,
++		val: &Expr,
++		sess: &Session,
++		vars: Option<PublicVariables>,
++		stored_expression: bool,
+ 	) -> Result<PublicValue> {
+ 		// Check if the session has expired
+ 		ensure!(!sess.expired(), Error::ExpiredSession);
+ 		// Create a new memory stack
+ 		let mut stack = TreeStack::new();
+ 		// Create a new query options
+-		let opt = self.setup_options(sess);
++		let opt = if stored_expression {
++			self.setup_options(sess).new_for_permission_predicate()
++		} else {
++			self.setup_options(sess)
++		};
+ 		// Create a default context
+ 		let mut ctx = self.setup_ctx()?;
+ 		// Set the global query timeout

@@ -1,0 +1,218 @@
+--- a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -1,26 +1,171 @@
++import { readFileSync } from 'fs';
++import { isAbsolute, resolve as resolvePath } from 'path';
++
+ import type { SimpleGitPlugin } from './simple-git-plugin';
+ 
+ import { GitPluginError } from '../errors/git-plugin-error';
+ import type { SimpleGitPluginConfig } from '../types';
+ 
+-function isConfigSwitch(arg: string) {
+-   return arg.trim().toLowerCase() === '-c';
+-}
++type ConfigAssignment = {
++   key: string;
++   value: string;
++};
++
++const configSwitches = new Set(['-c', '--config', '--config-env']);
++const configSwitchWithValue = /^(?:--config|--config-env)=(.*)$/i;
++const configSwitchAttached = /^-c([^=].*)$/;
++const protocolAllow = /^\s*protocol(\.[a-z0-9_-]+)?\.allow/i;
++const configInclude = /^\s*include(if\.[^.]+)?\.path\s*$/i;
++const unsafeRemoteCommand = /^--(?:upload|receive)-pack(?:=|$)/i;
++
++const configValueOptions = new Set(['--file', '-f', '--blob', '--type', '--default', '--comment']);
++const configReadOptions = new Set([
++   '--get',
++   '--get-all',
++   '--get-regexp',
++   '--get-urlmatch',
++   '--list',
++   '-l',
++   '--show-origin',
++   '--show-scope',
++   '--name-only',
++   '--includes',
++   '--no-includes',
++]);
++const configWriteOptions = new Set([
++   '--add',
++   '--replace-all',
++   '--unset',
++   '--unset-all',
++   '--rename-section',
++   '--remove-section',
++   '--edit',
++   '-e',
++]);
+ 
+-function preventProtocolOverride(arg: string, next: string) {
+-   if (!isConfigSwitch(arg)) {
++const protocolMessage =
++   'Configuring protocol.allow is not permitted without enabling allowUnsafeProtocolOverride';
++
++function asConfigAssignment(raw: string | undefined): ConfigAssignment | undefined {
++   if (!raw) {
+       return;
+    }
+ 
+-   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
++   const separator = raw.indexOf('=');
++   if (separator < 0) {
+       return;
+    }
+ 
+-   throw new GitPluginError(
+-      undefined,
+-      'unsafe',
+-      'Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol'
+-   );
++   return {
++      key: raw.slice(0, separator).trim(),
++      value: raw.slice(separator + 1),
++   };
++}
++
++function configAssignments(args: string[]): ConfigAssignment[] {
++   const assignments: ConfigAssignment[] = [];
++
++   for (let index = 0; index < args.length; index++) {
++      const token = args[index].trim();
++      let raw: string | undefined;
++
++      if (configSwitches.has(token.toLowerCase())) {
++         raw = args[++index];
++      } else {
++         const match = configSwitchWithValue.exec(token) || configSwitchAttached.exec(token);
++         raw = match && match[1];
++      }
++
++      const assignment = asConfigAssignment(raw);
++      if (assignment) {
++         assignments.push(assignment);
++      }
++   }
++
++   return assignments;
++}
++
++function protocolOverrideInFile(target: string): boolean {
++   let contents: string;
++
++   try {
++      const file = isAbsolute(target) ? target : resolvePath(process.cwd(), target);
++      contents = readFileSync(file, 'utf8');
++   } catch (e) {
++      return false;
++   }
++
++   let section = '';
++
++   for (const line of contents.split(/\r?\n/)) {
++      const text = line.trim();
++
++      if (!text || text.startsWith('#') || text.startsWith(';')) {
++         continue;
++      }
++
++      const header = /^\[([^\]]+)\]/.exec(text);
++      if (header) {
++         section = header[1]
++            .trim()
++            .toLowerCase()
++            .replace(/\s+"/g, '.')
++            .replace(/"/g, '');
++         continue;
++      }
++
++      const assignment = asConfigAssignment(text);
++      if (!assignment) {
++         continue;
++      }
++
++      const key = section ? `${section}.${assignment.key.toLowerCase()}` : assignment.key;
++      if (protocolAllow.test(key)) {
++         return true;
++      }
++   }
++
++   return false;
++}
++
++function configWriteKeys(args: string[]): string[] {
++   let index = 0;
++
++   while (index < args.length && args[index].startsWith('-')) {
++      index += configSwitches.has(args[index].trim().toLowerCase()) ? 2 : 1;
++   }
++
++   if ((args[index] || '').toLowerCase() !== 'config') {
++      return [];
++   }
++
++   const positionals: string[] = [];
++   let read = false;
++   let write = false;
++
++   for (let position = index + 1; position < args.length; position++) {
++      const token = args[position];
++
++      if (token.startsWith('-')) {
++         const name = token.toLowerCase();
++         if (configValueOptions.has(name)) {
++            position++;
++         } else if (configWriteOptions.has(name)) {
++            write = true;
++         } else if (configReadOptions.has(name)) {
++            read = true;
++         }
++         continue;
++      }
++
++      positionals.push(token);
++   }
++
++   if (read || !positionals.length || (!write && positionals.length < 2)) {
++      return [];
++   }
++
++   return [positionals[0]];
+ }
+ 
+ export function blockUnsafeOperationsPlugin({
+@@ -29,10 +174,28 @@
+    return {
+       type: 'spawn.args',
+       action(args, _context) {
+-         args.forEach((current, index) => {
+-            const next = index < args.length ? args[index + 1] : '';
+-
+-            allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
++         if (!allowUnsafeProtocolOverride) {
++            for (const { key, value } of configAssignments(args)) {
++               if (protocolAllow.test(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++               }
++            }
++
++            for (const key of configWriteKeys(args)) {
++               if (protocolAllow.test(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++               }
++            }
++         }
++
++         args.forEach((arg) => {
++            if (unsafeRemoteCommand.test(arg.trim())) {
++               throw new GitPluginError(
++                  undefined,
++                  'unsafe',
++                  `Use of ${arg.trim().split('=')[0]} is not permitted`
++               );
++            }
+          });
+ 
+          return args;

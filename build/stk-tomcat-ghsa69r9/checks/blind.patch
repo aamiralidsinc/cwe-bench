@@ -1,0 +1,312 @@
+diff -ruN a/java/org/apache/catalina/tribes/ChannelInterceptor.java b/java/org/apache/catalina/tribes/ChannelInterceptor.java
+--- a/java/org/apache/catalina/tribes/ChannelInterceptor.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/ChannelInterceptor.java	2026-10-26 05:28:47.351951300 +0000
+@@ -82,6 +82,18 @@
+     ChannelInterceptor getPrevious();
+ 
+     /**
++     * Indicates whether this interceptor creates channel messages of its own accord (for example on a timer or during
++     * membership maintenance) rather than only forwarding messages handed to it by another interceptor. Such a message
++     * is passed to the next interceptor in the chain instead of being handed down from the application, so any
++     * interceptor that must inspect every outgoing message has to be positioned downstream of every originator.
++     *
++     * @return <code>true</code> if this interceptor can put messages of its own creation on the wire
++     */
++    default boolean originatesMessages() {
++        return false;
++    }
++
++    /**
+      * The <code>sendMessage</code> method is called when a message is being sent to one more destinations. The
+      * interceptor can modify any of the parameters and then pass on the message down the stack by invoking
+      * <code>getNext().sendMessage(destination,msg,payload)</code>.
+diff -ruN a/java/org/apache/catalina/tribes/group/ChannelInterceptorBase.java b/java/org/apache/catalina/tribes/group/ChannelInterceptorBase.java
+--- a/java/org/apache/catalina/tribes/group/ChannelInterceptorBase.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/ChannelInterceptorBase.java	2026-10-26 05:28:27.047969929 +0000
+@@ -186,6 +186,20 @@
+         // empty operation
+     }
+ 
++    /**
++     * Indicates whether this interceptor creates channel messages of its own accord (for example on a timer or during
++     * membership maintenance) rather than only forwarding messages handed to it by another interceptor. Messages an
++     * originating interceptor builds itself are passed to the next interceptor in the chain, so an interceptor that
++     * must see every message before it leaves the node has to be positioned downstream of all originators.
++     * <p>
++     * The default implementation returns <code>false</code>. Interceptors that generate messages override it.
++     *
++     * @return <code>true</code> if this interceptor can put messages of its own creation on the wire.
++     */
++    public boolean originatesMessages() {
++        return false;
++    }
++
+     @Override
+     public Channel getChannel() {
+         return channel;
+diff -ruN a/java/org/apache/catalina/tribes/group/interceptors/EncryptInterceptor.java b/java/org/apache/catalina/tribes/group/interceptors/EncryptInterceptor.java
+--- a/java/org/apache/catalina/tribes/group/interceptors/EncryptInterceptor.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/interceptors/EncryptInterceptor.java	2026-10-26 05:29:12.715928036 +0000
+@@ -17,14 +17,18 @@
+ package org.apache.catalina.tribes.group.interceptors;
+ 
+ import java.io.Serial;
++import java.nio.charset.StandardCharsets;
+ import java.security.GeneralSecurityException;
++import java.security.MessageDigest;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.NoSuchProviderException;
+ import java.security.SecureRandom;
+ import java.security.spec.AlgorithmParameterSpec;
++import java.util.Arrays;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ 
+ import javax.crypto.Cipher;
++import javax.crypto.Mac;
+ import javax.crypto.NoSuchPaddingException;
+ import javax.crypto.spec.GCMParameterSpec;
+ import javax.crypto.spec.IvParameterSpec;
+@@ -92,6 +96,19 @@
+ 
+             interceptor = interceptor.getPrevious();
+         }
++
++        // Interceptors that generate messages of their own pass them to their next interceptor rather
++        // than through this one. If any such interceptor is downstream of this one, its messages would
++        // reach the transport without being encrypted.
++        interceptor = getNext();
++        while (null != interceptor) {
++            if (interceptor.originatesMessages()) {
++                throw new ChannelConfigException(sm.getString("encryptInterceptor.producer.ordering",
++                        interceptor.getClass().getName()));
++            }
++
++            interceptor = interceptor.getNext();
++        }
+     }
+ 
+     @Override
+@@ -143,6 +160,10 @@
+             super.messageReceived(msg);
+         } catch (GeneralSecurityException gse) {
+             log.error(sm.getString("encryptInterceptor.decrypt.failed"), gse);
++        } catch (RuntimeException re) {
++            // A frame that cannot be a valid protected message must be discarded just like one that
++            // fails authentication. Nothing may escape the receive path.
++            log.error(sm.getString("encryptInterceptor.decrypt.failed"), re);
+         }
+     }
+ 
+@@ -345,6 +366,26 @@
+     }
+ 
+     private static class BaseEncryptionManager {
++
++        /**
++         * The algorithm used to authenticate every message. Applied with encrypt-then-MAC over the initialization
++         * vector and the ciphertext so that any modification, substitution or forgery is detected before the
++         * ciphertext is decrypted or the plaintext is delivered.
++         */
++        private static final String MAC_ALGORITHM = "HmacSHA256";
++
++        /**
++         * The length, in bytes, of the authentication tag appended to every message.
++         */
++        private static final int MAC_LENGTH = 32;
++
++        /**
++         * A fixed label used to derive the authentication key from the encryption key so that the two keys are
++         * independent even when the operator supplies a single pre-shared secret.
++         */
++        private static final byte[] MAC_KEY_LABEL =
++                "Tomcat EncryptInterceptor message authentication".getBytes(StandardCharsets.UTF_8);
++
+         /**
+          * The fully-specified algorithm e.g. AES/CBC/PKCS5Padding.
+          */
+@@ -366,6 +407,11 @@
+         private final SecretKeySpec secretKey;
+ 
+         /**
++         * The key used to authenticate messages. Derived once from the encryption key.
++         */
++        private final SecretKeySpec macKey;
++
++        /**
+          * A pool of Cipher objects. Ciphers are expensive to create, but not to re-initialize, so we use a pool of them
+          * which grows as necessary.
+          */
+@@ -382,6 +428,7 @@
+             this.algorithm = algorithm;
+             this.providerName = providerName;
+             this.secretKey = secretKey;
++            this.macKey = deriveMacKey(secretKey);
+ 
+             cipherPool = new ConcurrentLinkedQueue<>();
+             Cipher cipher = createCipher();
+@@ -405,6 +452,47 @@
+         }
+ 
+         /**
++         * Derives the message authentication key from the encryption key. A distinct key is used so that the same
++         * bytes are never used directly by both the cipher and the MAC.
++         *
++         * @param encryptionKey The encryption key.
++         *
++         * @return The authentication key.
++         *
++         * @throws NoSuchAlgorithmException If the MAC algorithm is not available.
++         */
++        private static SecretKeySpec deriveMacKey(SecretKeySpec encryptionKey) throws NoSuchAlgorithmException {
++            Mac mac = Mac.getInstance(MAC_ALGORITHM);
++            try {
++                mac.init(new SecretKeySpec(encryptionKey.getEncoded(), MAC_ALGORITHM));
++            } catch (java.security.InvalidKeyException ike) {
++                // Cannot happen: the key is non-empty and HmacSHA256 accepts any non-empty key
++                throw new NoSuchAlgorithmException(ike);
++            }
++            mac.update(MAC_KEY_LABEL);
++            return new SecretKeySpec(mac.doFinal(), MAC_ALGORITHM);
++        }
++
++        /**
++         * Computes the authentication tag for a message. The tag covers both the initialization vector and the
++         * ciphertext so that tampering with either is detected.
++         *
++         * @param iv         The initialization vector.
++         * @param cipherText The ciphertext.
++         *
++         * @return The authentication tag.
++         *
++         * @throws GeneralSecurityException If the tag cannot be computed.
++         */
++        private byte[] createMac(byte[] iv, byte[] cipherText) throws GeneralSecurityException {
++            Mac mac = Mac.getInstance(MAC_ALGORITHM);
++            mac.init(macKey);
++            mac.update(iv);
++            mac.update(cipherText);
++            return mac.doFinal();
++        }
++
++        /**
+          * Gets the size, in bytes, of the initialization vector for the cipher being used. The IV size is often, but
+          * not always, the block size for the cipher.
+          *
+@@ -480,10 +568,18 @@
+                 cipher = getCipher();
+                 cipher.init(Cipher.ENCRYPT_MODE, getSecretKey(), generateIV(iv, 0, getIVSize()));
+ 
+-                // Prepend the IV to the beginning of the encrypted data
++                byte[] cipherText = cipher.doFinal(bytes);
++                byte[] mac = createMac(iv, cipherText);
++
++                // Prepend the IV to the beginning of the encrypted data and append the authentication
++                // tag. The tag covers the IV and the ciphertext so neither can be changed in transit.
++                byte[] authenticated = new byte[cipherText.length + mac.length];
++                System.arraycopy(cipherText, 0, authenticated, 0, cipherText.length);
++                System.arraycopy(mac, 0, authenticated, cipherText.length, mac.length);
++
+                 byte[][] data = new byte[2][];
+                 data[0] = iv;
+-                data[1] = cipher.doFinal(bytes);
++                data[1] = authenticated;
+ 
+                 return data;
+             } finally {
+@@ -503,18 +599,33 @@
+          * @throws GeneralSecurityException If the input data cannot be decrypted.
+          */
+         private byte[] decrypt(byte[] bytes) throws GeneralSecurityException {
++            int ivSize = getIVSize();
++
++            // A frame that cannot even hold an IV and an authentication tag is not a protected message.
++            if (bytes.length < ivSize + MAC_LENGTH) {
++                throw new GeneralSecurityException(sm.getString("encryptInterceptor.decrypt.error.short-message"));
++            }
++
++            byte[] ivBytes = Arrays.copyOfRange(bytes, 0, ivSize);
++            byte[] cipherText = Arrays.copyOfRange(bytes, ivSize, bytes.length - MAC_LENGTH);
++            byte[] receivedMac = Arrays.copyOfRange(bytes, bytes.length - MAC_LENGTH, bytes.length);
++
++            // Verify before decrypting so that nothing derived from a changed message is ever used.
++            if (!MessageDigest.isEqual(receivedMac, createMac(ivBytes, cipherText))) {
++                throw new GeneralSecurityException(sm.getString("encryptInterceptor.decrypt.failed"));
++            }
++
+             Cipher cipher = null;
+ 
+-            int ivSize = getIVSize();
+-            AlgorithmParameterSpec IV = generateIV(bytes, 0, ivSize);
++            AlgorithmParameterSpec IV = generateIV(ivBytes, 0, ivSize);
+ 
+             try {
+                 cipher = getCipher();
+ 
+                 cipher.init(Cipher.DECRYPT_MODE, getSecretKey(), IV);
+ 
+-                // Decrypt remainder of the message.
+-                return cipher.doFinal(bytes, ivSize, bytes.length - ivSize);
++                // Decrypt the authenticated ciphertext.
++                return cipher.doFinal(cipherText);
+             } finally {
+                 if (null != cipher) {
+                     returnCipher(cipher);
+diff -ruN a/java/org/apache/catalina/tribes/group/interceptors/LocalStrings.properties b/java/org/apache/catalina/tribes/group/interceptors/LocalStrings.properties
+--- a/java/org/apache/catalina/tribes/group/interceptors/LocalStrings.properties	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/interceptors/LocalStrings.properties	2026-10-26 05:29:16.051924978 +0000
+@@ -26,6 +26,7 @@
+ encryptInterceptor.encrypt.failed=Failed to encrypt message
+ encryptInterceptor.init.failed=Failed to initialize EncryptInterceptor
+ encryptInterceptor.key.required=Encryption key is required
++encryptInterceptor.producer.ordering=EncryptInterceptor must be downstream of every interceptor that creates its own messages. The interceptor [{0}] is positioned below EncryptInterceptor and its messages would reach the transport without being encrypted. Please re-order EncryptInterceptor to be listed after [{0}] in your channel interceptor pipeline.
+ encryptInterceptor.tcpFailureDetector.ordering=EncryptInterceptor must be upstream of TcpFailureDetector. Please re-order EncryptInterceptor to be listed before TcpFailureDetector in your channel interceptor pipeline.
+ 
+ fragmentationInterceptor.fragments.missing=Fragments are missing.
+diff -ruN a/java/org/apache/catalina/tribes/group/interceptors/NonBlockingCoordinator.java b/java/org/apache/catalina/tribes/group/interceptors/NonBlockingCoordinator.java
+--- a/java/org/apache/catalina/tribes/group/interceptors/NonBlockingCoordinator.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/interceptors/NonBlockingCoordinator.java	2026-10-26 05:28:35.395962269 +0000
+@@ -192,6 +192,12 @@
+         super();
+     }
+ 
++    @Override
++    public boolean originatesMessages() {
++        // Coordination and election messages are built here and handed to the next interceptor.
++        return true;
++    }
++
+     // ============================================================================================================
+     // COORDINATION HANDLING
+     // ============================================================================================================
+diff -ruN a/java/org/apache/catalina/tribes/group/interceptors/StaticMembershipInterceptor.java b/java/org/apache/catalina/tribes/group/interceptors/StaticMembershipInterceptor.java
+--- a/java/org/apache/catalina/tribes/group/interceptors/StaticMembershipInterceptor.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/interceptors/StaticMembershipInterceptor.java	2026-10-26 05:28:34.891962732 +0000
+@@ -51,6 +51,12 @@
+         super();
+     }
+ 
++    @Override
++    public boolean originatesMessages() {
++        // Member start and shutdown notifications are built here and handed to the next interceptor.
++        return true;
++    }
++
+     public void addStaticMember(Member member) {
+         synchronized (members) {
+             if (!members.contains(member)) {
+diff -ruN a/java/org/apache/catalina/tribes/group/interceptors/TcpPingInterceptor.java b/java/org/apache/catalina/tribes/group/interceptors/TcpPingInterceptor.java
+--- a/java/org/apache/catalina/tribes/group/interceptors/TcpPingInterceptor.java	2026-10-26 03:13:26.000000000 +0000
++++ b/java/org/apache/catalina/tribes/group/interceptors/TcpPingInterceptor.java	2026-10-26 05:28:34.435963150 +0000
+@@ -58,6 +58,12 @@
+     WeakReference<StaticMembershipInterceptor> staticMembers = null;
+ 
+     @Override
++    public boolean originatesMessages() {
++        // Heartbeat pings are built here and handed to the next interceptor.
++        return true;
++    }
++
++    @Override
+     public synchronized void start(int svc) throws ChannelException {
+         super.start(svc);
+         running = true;

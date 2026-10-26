@@ -1,0 +1,105 @@
+diff -ruN a/src/controllers/AppController.php b/src/controllers/AppController.php
+--- a/src/controllers/AppController.php	2026-10-26 02:35:01.109391150 +0000
++++ b/src/controllers/AppController.php	2026-10-26 02:35:01.109391150 +0000
+@@ -31,6 +31,9 @@
+ use craft\web\Controller;
+ use craft\web\ServiceUnavailableHttpException;
+ use DateInterval;
++use GuzzleHttp\Psr7\Uri;
++use GuzzleHttp\Psr7\UriResolver;
++use GuzzleHttp\RequestOptions;
+ use Throwable;
+ use yii\base\InvalidConfigException;
+ use yii\web\BadRequestHttpException;
+@@ -110,14 +113,48 @@
+     {
+         $this->requireCpRequest();
+ 
+-        if (!str_starts_with($url, Craft::$app->getAssetManager()->baseUrl)) {
++        $configuredBase = rtrim((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), '/') . '/cpresources';
++        $ownOrigin = static function (string $candidate) use ($configuredBase): bool {
++            $candidateParts = parse_url($candidate);
++            $baseParts = parse_url($configuredBase);
++            if (!is_array($candidateParts) || !is_array($baseParts) || empty($candidateParts['host']) || empty($baseParts['host'])) {
++                return false;
++            }
++            if (!empty($candidateParts['user']) || !empty($candidateParts['pass'])) {
++                return false;
++            }
++            $scheme = strtolower((string)($candidateParts['scheme'] ?? ''));
++            if ($scheme !== strtolower((string)($baseParts['scheme'] ?? ''))) {
++                return false;
++            }
++            if (strtolower((string)$candidateParts['host']) !== strtolower((string)$baseParts['host'])) {
++                return false;
++            }
++            $defaultPort = $scheme === 'https' ? 443 : 80;
++            if ((int)($candidateParts['port'] ?? $defaultPort) !== (int)($baseParts['port'] ?? $defaultPort)) {
++                return false;
++            }
++            $path = (string)($candidateParts['path'] ?? '/');
++            $basePath = rtrim((string)($baseParts['path'] ?? '/'), '/');
++            return $path === $basePath || str_starts_with($path, $basePath . '/');
++        };
++        if (!$ownOrigin($url)) {
+             throw new BadRequestHttpException("$url does not appear to be a resource URL");
+         }
+ 
+         // Close the PHP session in case this takes a while
+         Session::close();
+ 
+-        $response = Craft::createGuzzleClient()->get($url);
++        $response = Craft::createGuzzleClient()->get($url, [
++            RequestOptions::ALLOW_REDIRECTS => [
++                'max' => 5,
++                'on_redirect' => function ($request, $response, $uri) use ($ownOrigin) {
++                    if (!$ownOrigin((string)$uri)) {
++                        throw new BadRequestHttpException('Redirect left the resource origin');
++                    }
++                },
++            ],
++        ]);
+         $this->response->setCacheHeaders();
+         $this->response->getHeaders()->set('content-type', 'application/javascript');
+         return $this->asRaw($response->getBody());
+diff -ruN a/src/gql/resolvers/mutations/Asset.php b/src/gql/resolvers/mutations/Asset.php
+--- a/src/gql/resolvers/mutations/Asset.php	2026-10-26 02:35:01.101391157 +0000
++++ b/src/gql/resolvers/mutations/Asset.php	2026-10-26 02:35:01.101391157 +0000
+@@ -24,6 +24,7 @@
+ use GraphQL\Error\UserError;
+ use GraphQL\Type\Definition\ResolveInfo;
+ use GuzzleHttp\Client;
++use GuzzleHttp\RequestOptions;
+ use Throwable;
+ use yii\base\Exception;
+ use yii\base\InvalidArgumentException;
+@@ -253,9 +254,28 @@
+                 throw new AssetDisallowedExtensionException(Craft::t('app', "“{$extension}” is not an allowed file extension."));
+             }
+ 
++            $parts = parse_url($url);
++            $scheme = is_array($parts) ? strtolower((string)($parts['scheme'] ?? '')) : '';
++            $host = is_array($parts) ? strtolower((string)($parts['host'] ?? '')) : '';
++            if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
++                throw new UserError("$url is not a supported URL.");
++            }
++            $addresses = filter_var($host, FILTER_VALIDATE_IP) !== false ? [$host] : (gethostbynamel($host) ?: []);
++            if ($addresses === []) {
++                throw new UserError("$url could not be resolved.");
++            }
++            foreach ($addresses as $address) {
++                if (filter_var($address, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
++                    throw new UserError("$url resolves to a disallowed address.");
++                }
++            }
++
+             // Download the file
+             $tempPath = AssetsHelper::tempFilePath($extension);
+-            $this->createGuzzleClient()->request('GET', $url, ['sink' => $tempPath]);
++            $this->createGuzzleClient()->request('GET', $url, [
++                RequestOptions::ALLOW_REDIRECTS => false,
++                RequestOptions::SINK => $tempPath,
++            ]);
+         }
+ 
+         if (!$tempPath || !$filename) {

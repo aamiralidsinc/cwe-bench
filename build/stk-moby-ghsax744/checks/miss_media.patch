@@ -1,0 +1,62 @@
+diff --git a/pkg/authorization/authz.go b/pkg/authorization/authz.go
+index f63b885..77f2b94 100644
+--- a/pkg/authorization/authz.go
++++ b/pkg/authorization/authz.go
+@@ -11,6 +11,7 @@ import (
+ 	"regexp"
+ 	"strings"
+ 
++	"github.com/docker/docker/errdefs"
+ 	"github.com/docker/docker/pkg/ioutils"
+ 	"github.com/sirupsen/logrus"
+ )
+@@ -70,12 +71,22 @@ func isChunked(r *http.Request) bool {
+ // AuthZRequest authorized the request to the docker daemon using authZ plugins
+ func (ctx *Ctx) AuthZRequest(w http.ResponseWriter, r *http.Request) error {
+ 	var body []byte
+-	if sendBody(ctx.requestURI, r.Header) && (r.ContentLength > 0 || isChunked(r)) && r.ContentLength < maxBodySize {
+-		var err error
+-		body, r.Body, err = drainBody(r.Body)
+-		if err != nil {
++	if sendBody(ctx.requestURI, r.Header) {
++		// Inspect the request body without consuming it: peek up to one byte
++		// beyond the plugin limit. A body that is larger than the limit cannot
++		// be shown to the plugins, so the request is refused rather than
++		// forwarded to them as if it had no body.
++		origBody := r.Body
++		bufBody := bufio.NewReaderSize(origBody, maxBodySize+1)
++		r.Body = ioutils.NewReadCloserWrapper(bufBody, origBody.Close)
++
++		peeked, err := bufBody.Peek(maxBodySize + 1)
++		if err == nil {
++			return errdefs.InvalidParameter(fmt.Errorf("request body too large for authorization plugin: size exceeds %d bytes", maxBodySize))
++		} else if err != io.EOF {
+ 			return err
+ 		}
++		body = peeked
+ 	}
+ 
+ 	var h bytes.Buffer
+@@ -162,7 +173,7 @@ func drainBody(body io.ReadCloser) ([]byte, io.ReadCloser, error) {
+ 
+ func isAuthEndpoint(urlPath string) (bool, error) {
+ 	// eg www.test.com/v1.24/auth/optional?optional1=something&optional2=something (version optional)
+-	matched, err := regexp.MatchString(`^[^\/]+\/(v\d[\d\.]*\/)?auth.*`, urlPath)
++	matched, err := regexp.MatchString(`^[^\/]*\/(v\d[\d\.]*\/)?auth.*`, urlPath)
+ 	if err != nil {
+ 		return false, err
+ 	}
+diff --git a/pkg/authorization/response.go b/pkg/authorization/response.go
+index 6b674bc..8cff62d 100644
+--- a/pkg/authorization/response.go
++++ b/pkg/authorization/response.go
+@@ -122,9 +122,6 @@ func (rm *responseModifier) Write(b []byte) (int, error) {
+ 		return rm.rw.Write(b)
+ 	}
+ 
+-	if len(rm.body)+len(b) > maxBufferSize {
+-		rm.Flush()
+-	}
+ 	rm.body = append(rm.body, b...)
+ 	return len(b), nil
+ }

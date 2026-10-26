@@ -1,0 +1,66 @@
+diff -ruN a/bbot/core/modules.py b/bbot/core/modules.py
+--- a/bbot/core/modules.py	2026-10-26 12:14:27.853868055 +0000
++++ b/bbot/core/modules.py	2026-10-26 12:33:17.240805239 +0000
+@@ -31,6 +31,11 @@
+ 
+ log = logging.getLogger("bbot.module_loader")
+ 
++
++class _SafeUnpickler(pickle.Unpickler):
++    def find_class(self, module, name):
++        raise pickle.UnpicklingError(f"Forbidden class: {module}.{name}")
++
+ bbot_code_dir = Path(__file__).parent.parent
+ 
+ 
+@@ -217,7 +222,7 @@
+             if self.preload_cache_file.is_file():
+                 with suppress(Exception):
+                     with open(self.preload_cache_file, "rb") as f:
+-                        self._preload_cache = pickle.load(f)
++                        self._preload_cache = _SafeUnpickler(f).load()
+         return self._preload_cache
+ 
+     @preload_cache.setter
+diff -ruN a/bbot/modules/internal/unarchive.py b/bbot/modules/internal/unarchive.py
+--- a/bbot/modules/internal/unarchive.py	2026-10-26 12:14:27.857868051 +0000
++++ b/bbot/modules/internal/unarchive.py	2026-10-26 12:33:17.240805239 +0000
+@@ -13,6 +13,8 @@
+         "author": "@domwhewell-sage",
+     }
+ 
++    _max_extracted_size = 1_000_000_000  # 1 GB
++
+     async def setup(self):
+         self.ignore_compressions = ["application/java-archive", "application/vnd.android.package-archive"]
+         self.compression_methods = {
+@@ -47,7 +49,13 @@
+     async def handle_event(self, event):
+         path = Path(event.data["path"])
+         # include random string in output directory to avoid collisions
+-        output_dir = path.parent / f"{path.name.replace('.', '_')}_{self.helpers.rand_string(10)}"
++        output_dir = path.parent / f"{path.name.replace('.', '_')}"
++
++        try:
++            output_dir.mkdir(exist_ok=False)
++        except Exception as e:
++            self.warning(f"Destination directory {output_dir} already exists, aborting unarchive for {path}")
++            return
+ 
+         # Use the appropriate extraction method based on the file type
+         self.info(f"Extracting {path} to {output_dir}")
+@@ -75,6 +83,14 @@
+             command = [s.format(filename=path, extract_dir=output_dir) for s in cmd_list]
+             try:
+                 await self.run_process(command, check=True)
++                extracted_size = sum(f.stat().st_size for f in output_dir.rglob("*") if f.is_file())
++                if extracted_size > self._max_extracted_size:
++                    self.helpers.rm_rf(output_dir)
++                    self.warning(
++                        f"Extracted size {extracted_size:,} bytes exceeds limit "
++                        f"({self._max_extracted_size:,} bytes), removing {output_dir}"
++                    )
++                    return False
+                 for item in output_dir.iterdir():
+                     if item.is_file():
+                         await self.extract_file(item, output_dir / item.stem)

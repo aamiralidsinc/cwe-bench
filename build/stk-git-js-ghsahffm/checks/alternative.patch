@@ -1,0 +1,160 @@
+--- a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -1,26 +1,115 @@
++import { readFileSync } from 'fs';
++import { isAbsolute, resolve as resolvePath } from 'path';
++
+ import type { SimpleGitPlugin } from './simple-git-plugin';
+ 
+ import { GitPluginError } from '../errors/git-plugin-error';
+ import type { SimpleGitPluginConfig } from '../types';
+ 
+-function isConfigSwitch(arg: string) {
+-   return arg.trim().toLowerCase() === '-c';
++const separator = '\u0000';
++const message =
++   'Configuring protocol.allow is not permitted without enabling allowUnsafeProtocolOverride';
++const protocolKey = /^\s*protocol(\.[a-z0-9_-]+)?\.allow/i;
++const includeKey = /^\s*include(if\.[^.]+)?\.path\s*$/i;
++const unsafeRemoteFlag = /(?:^|\u0000)--(?:upload|receive)-pack(?:=|\u0000)/i;
++
++const valueOptions = ['--file', '-f', '--blob', '--type', '--default', '--comment'];
++const readOptions = [
++   '--get',
++   '--get-all',
++   '--get-regexp',
++   '--get-urlmatch',
++   '--list',
++   '-l',
++   '--show-origin',
++   '--show-scope',
++   '--name-only',
++];
++const writeOptions = [
++   '--add',
++   '--replace-all',
++   '--unset',
++   '--unset-all',
++   '--rename-section',
++   '--remove-section',
++   '--edit',
++   '-e',
++];
++
++type Assignment = [key: string, value: string];
++
++function assignments(argv: string): Assignment[] {
++   const found: Assignment[] = [];
++   const carriers = [
++      new RegExp(`${separator}(?:-c|--config|--config-env)${separator}([^${separator}]+)${separator}`, 'gi'),
++      new RegExp(`(?:^|${separator})--config(?:-env)?=([^${separator}]+)`, 'gi'),
++      new RegExp(`(?:^|${separator})-c([^=${separator}][^${separator}]*)`, 'g'),
++   ];
++
++   for (const carrier of carriers) {
++      let match: RegExpExecArray | null;
++      while ((match = carrier.exec(argv))) {
++         const raw = match[1];
++         const separatorAt = raw.indexOf('=');
++         if (separatorAt > 0) {
++            found.push([raw.slice(0, separatorAt).trim(), raw.slice(separatorAt + 1)]);
++         }
++      }
++   }
++
++   return found;
++}
++
++function protocolOverrideInFile(target: string): boolean {
++   try {
++      const file = isAbsolute(target) ? target : resolvePath(process.cwd(), target);
++      const contents = readFileSync(file, 'utf8');
++
++      return (
++         /\[\s*protocol(?:\s+"[^"]*")?\s*\][\s\S]*?\ballow\s*=/i.test(contents) ||
++         /^\s*protocol(?:\.[\w-]+)?\.allow\s*=/im.test(contents)
++      );
++   } catch (e) {
++      return false;
++   }
+ }
+ 
+-function preventProtocolOverride(arg: string, next: string) {
+-   if (!isConfigSwitch(arg)) {
+-      return;
++function writtenConfigKeys(argv: string): string[] {
++   const task = new RegExp(`${separator}config${separator}(.*)$`, 'i').exec(argv);
++   if (!task) {
++      return [];
++   }
++
++   const positionals: string[] = [];
++   const tokens = task[1].split(separator);
++   let read = false;
++   let write = false;
++
++   for (let index = 0; index < tokens.length; index++) {
++      const token = tokens[index];
++      const name = token.toLowerCase();
++
++      if (name.startsWith('-')) {
++         if (valueOptions.includes(name)) {
++            index++;
++         } else if (readOptions.includes(name)) {
++            read = true;
++         } else if (writeOptions.includes(name)) {
++            write = true;
++         }
++         continue;
++      }
++
++      if (token) {
++         positionals.push(token);
++      }
+    }
+ 
+-   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
+-      return;
++   if (read || !positionals.length || (!write && positionals.length < 2)) {
++      return [];
+    }
+ 
+-   throw new GitPluginError(
+-      undefined,
+-      'unsafe',
+-      'Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol'
+-   );
++   return [positionals[0]];
+ }
+ 
+ export function blockUnsafeOperationsPlugin({
+@@ -29,11 +118,25 @@
+    return {
+       type: 'spawn.args',
+       action(args, _context) {
+-         args.forEach((current, index) => {
+-            const next = index < args.length ? args[index + 1] : '';
++         const argv = separator + args.join(separator) + separator;
+ 
+-            allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
+-         });
++         if (!allowUnsafeProtocolOverride) {
++            for (const [key, value] of assignments(argv)) {
++               if (protocolKey.test(key) || (includeKey.test(key) && protocolOverrideInFile(value))) {
++                  throw new GitPluginError(undefined, 'unsafe', message);
++               }
++            }
++
++            for (const key of writtenConfigKeys(argv)) {
++               if (protocolKey.test(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', message);
++               }
++            }
++         }
++
++         if (unsafeRemoteFlag.test(argv)) {
++            throw new GitPluginError(undefined, 'unsafe', 'Use of a remote pack command is not permitted');
++         }
+ 
+          return args;
+       },

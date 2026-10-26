@@ -1,0 +1,558 @@
+diff -ruN a/src/Core/DOMSerializer.php b/src/Core/DOMSerializer.php
+--- a/src/Core/DOMSerializer.php
++++ b/src/Core/DOMSerializer.php
+@@ -5,6 +5,7 @@
+ use DOMDocument;
+ use stdClass;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class DOMSerializer
+ {
+@@ -22,8 +23,11 @@
+         $html = [];
+         $markTagsToClose = [];
+ 
+-        if (isset($node->marks)) {
+-            foreach ($node->marks as $mark) {
++        // Marks are a list; a value that is not a list carries no marks.
++        $marks = isset($node->marks) && is_array($node->marks) ? $node->marks : [];
++
++        if ($marks !== []) {
++            foreach ($marks as $mark) {
+                 foreach ($this->schema->marks as $class) {
+                     $renderClass = $class;
+ 
+@@ -59,7 +63,7 @@
+             $html[$lastKey] = $lastElement['content'];
+         }
+         // child nodes
+-        elseif (isset($node->content)) {
++        elseif (is_array($node->content ?? null)) {
+             $nestedNodeMarkStack = [];
+             foreach ($node->content as $index => $nestedNode) {
+                 $previousNestedNode = $node->content[$index - 1] ?? null;
+@@ -74,7 +78,12 @@
+         }
+         // text
+         elseif (isset($node->text)) {
+-            $html[] = htmlspecialchars($node->text, ENT_QUOTES, 'UTF-8');
++            // A text value without a textual form (a list, a map) is left out.
++            $escapedText = Text::escaped($node->text);
++
++            if ($escapedText !== null) {
++                $html[] = $escapedText;
++            }
+         }
+ 
+         foreach ($this->schema->nodes as $extension) {
+@@ -85,8 +94,8 @@
+             $html[] = $this->renderClosingTag($extension->renderHTML($node));
+         }
+ 
+-        if (isset($node->marks)) {
+-            foreach (array_reverse($node->marks) as $mark) {
++        if ($marks !== []) {
++            foreach (array_reverse($marks) as $mark) {
+                 foreach ($this->schema->marks as $extension) {
+                     if (! $this->isMarkOrNode($mark, $extension)) {
+                         continue;
+@@ -184,7 +193,7 @@
+             return true;
+         }
+ 
+-        if (! property_exists($node, 'marks')) {
++        if (! is_array($node->marks ?? null)) {
+             return true;
+         }
+ 
+@@ -216,6 +225,9 @@
+          */
+         $HTMLAttributes = [];
+ 
++        // Attributes live on an object; any other value carries no attributes.
++        $attrs = is_object($nodeOrMark->attrs ?? null) ? $nodeOrMark->attrs : null;
++
+         foreach ($this->schema->getAttributeConfigurations($extension) as $attribute => $configuration) {
+             // 'rendered' => false
+             if (isset($configuration['rendered']) && $configuration['rendered'] === false) {
+@@ -223,20 +235,21 @@
+             }
+ 
+             // 'default' => 'foobar'
+-            if (! isset($nodeOrMark->attrs->{$attribute}) && isset($configuration['default'])) {
+-                if (! isset($nodeOrMark->attrs)) {
+-                    $nodeOrMark->attrs = new stdClass;
++            if (! isset($attrs->{$attribute}) && isset($configuration['default'])) {
++                if ($attrs === null) {
++                    $attrs = new stdClass;
++                    $nodeOrMark->attrs = $attrs;
+                 }
+ 
+-                $nodeOrMark->attrs->{$attribute} = $configuration['default'];
++                $attrs->{$attribute} = $configuration['default'];
+             }
+ 
+             // 'renderHTML' => fn($attributes) …
+             if (isset($configuration['renderHTML'])) {
+-                $value = $configuration['renderHTML']($nodeOrMark->attrs ?? new stdClass);
++                $value = $configuration['renderHTML']($attrs ?? new stdClass);
+             } else {
+                 $value = [
+-                    $attribute => $nodeOrMark->attrs->{$attribute} ?? null,
++                    $attribute => $attrs->{$attribute} ?? null,
+                 ];
+             }
+ 
+diff -ruN a/src/Core/Schema.php b/src/Core/Schema.php
+--- a/src/Core/Schema.php
++++ b/src/Core/Schema.php
+@@ -67,7 +67,7 @@
+ 
+     public function apply($document)
+     {
+-        if (! is_array($document['content'])) {
++        if (! is_array($document) || ! is_array($document['content'] ?? null)) {
+             return $document;
+         }
+ 
+@@ -98,9 +98,13 @@
+ 
+     public function filterMarks(&$node)
+     {
++        if (! is_array($node)) {
++            return $node;
++        }
++
+         unset($node['marks']);
+ 
+-        if (isset($node['content'])) {
++        if (is_array($node['content'] ?? null)) {
+             $node['content'] = array_map(function ($child) {
+                 return $this->filterMarks($child);
+             }, $node['content']);
+diff -ruN a/src/Core/TextSerializer.php b/src/Core/TextSerializer.php
+--- a/src/Core/TextSerializer.php
++++ b/src/Core/TextSerializer.php
+@@ -2,6 +2,8 @@
+ 
+ namespace Tiptap\Core;
+ 
++use Tiptap\Utils\Text;
++
+ class TextSerializer
+ {
+     protected $document;
+@@ -38,12 +40,17 @@
+     {
+         $text = [];
+ 
+-        if (isset($node->content)) {
++        if (is_array($node->content ?? null)) {
+             foreach ($node->content as $nestedNode) {
+                 $text[] = $this->renderNode($nestedNode);
+             }
+         } elseif (isset($node->text)) {
+-            $text[] = htmlspecialchars($node->text, ENT_QUOTES, 'UTF-8');
++            // A text value without a textual form (a list, a map) is left out.
++            $escapedText = Text::escaped($node->text);
++
++            if ($escapedText !== null) {
++                $text[] = $escapedText;
++            }
+         }
+ 
+         return join($this->configuration['blockSeparator'], $text);
+diff -ruN a/src/Editor.php b/src/Editor.php
+--- a/src/Editor.php
++++ b/src/Editor.php
+@@ -67,12 +67,21 @@
+ 
+     public function getHTML(): string
+     {
+-        return (new DOMSerializer($this->schema))->process($this->document);
++        return (new DOMSerializer($this->schema))->process($this->documentToRender());
+     }
+ 
+     public function getText($configuration = []): string
+     {
+-        return (new TextSerializer($this->schema, $configuration))->process($this->document);
++        return (new TextSerializer($this->schema, $configuration))->process($this->documentToRender());
++    }
++
++    /**
++     * The serialisers walk a document; anything that is not a document has no
++     * nodes to walk.
++     */
++    private function documentToRender(): array
++    {
++        return is_array($this->document) ? $this->document : [];
+     }
+ 
+     public function sanitize($value)
+diff -ruN a/src/Extensions/Color.php b/src/Extensions/Color.php
+--- a/src/Extensions/Color.php
++++ b/src/Extensions/Color.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Extension;
+ use Tiptap\Utils\InlineStyle;
++use Tiptap\Utils\Text;
+ 
+ class Color extends Extension
+ {
+@@ -34,7 +35,7 @@
+                             return preg_replace('/[\'"]+/', '', $attribute);
+                         },
+                         'renderHTML' => function ($attributes) {
+-                            $color = $attributes?->color ?? null;
++                            $color = Text::plain($attributes?->color ?? null);
+ 
+                             if ($color === null) {
+                                 return null;
+diff -ruN a/src/Extensions/FontFamily.php b/src/Extensions/FontFamily.php
+--- a/src/Extensions/FontFamily.php
++++ b/src/Extensions/FontFamily.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Extension;
+ use Tiptap\Utils\InlineStyle;
++use Tiptap\Utils\Text;
+ 
+ class FontFamily extends Extension
+ {
+@@ -34,7 +35,7 @@
+                             return $attribute;
+                         },
+                         'renderHTML' => function ($attributes) {
+-                            $fontFamily = $attributes?->fontFamily ?? null;
++                            $fontFamily = Text::plain($attributes?->fontFamily ?? null);
+ 
+                             if ($fontFamily === null) {
+                                 return null;
+diff -ruN a/src/Extensions/TextAlign.php b/src/Extensions/TextAlign.php
+--- a/src/Extensions/TextAlign.php
++++ b/src/Extensions/TextAlign.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Extension;
+ use Tiptap\Utils\InlineStyle;
++use Tiptap\Utils\Text;
+ 
+ class TextAlign extends Extension
+ {
+@@ -29,11 +30,13 @@
+                     'parseHTML' => fn ($DOMNode) =>
+                         InlineStyle::getAttribute($DOMNode, 'text-align') ?? $this->options['defaultAlignment'],
+                     'renderHTML' => function ($attributes) {
+-                        if ($attributes->textAlign === $this->options['defaultAlignment']) {
++                        $alignment = Text::plain($attributes->textAlign ?? null);
++
++                        if ($alignment === null || $alignment === $this->options['defaultAlignment']) {
+                             return null;
+                         }
+ 
+-                        return ['style' => "text-align: {$attributes->textAlign}"];
++                        return ['style' => "text-align: {$alignment}"];
+                     },
+                 ],
+               ],
+diff -ruN a/src/Marks/Highlight.php b/src/Marks/Highlight.php
+--- a/src/Marks/Highlight.php
++++ b/src/Marks/Highlight.php
+@@ -5,6 +5,7 @@
+ use Tiptap\Core\Mark;
+ use Tiptap\Utils\HTML;
+ use Tiptap\Utils\InlineStyle;
++use Tiptap\Utils\Text;
+ 
+ class Highlight extends Mark
+ {
+@@ -43,13 +44,15 @@
+                     return InlineStyle::getAttribute($DOMNode, 'background-color') ?: null;
+                 },
+                 'renderHTML' => function ($attributes) {
+-                    if (! $attributes->color) {
++                    $color = Text::plain($attributes->color ?? null);
++
++                    if (! $color) {
+                         return null;
+                     }
+ 
+                     return [
+-                        'data-color' => $attributes->color,
+-                        'style' => "background-color: {$attributes->color}",
++                        'data-color' => $color,
++                        'style' => "background-color: {$color}",
+                     ];
+                 },
+             ],
+diff -ruN a/src/Marks/Link.php b/src/Marks/Link.php
+--- a/src/Marks/Link.php
++++ b/src/Marks/Link.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Mark;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class Link extends Mark
+ {
+@@ -33,6 +34,13 @@
+             return true;
+         }
+ 
++        // An address without a textual form (a list, a map) is no address at all.
++        $uri = Text::plain($uri);
++
++        if ($uri === null) {
++            return false;
++        }
++
+         $sanitised = preg_replace(self::ATTR_WHITESPACE, '', $uri);
+ 
+         $pattern = '/^(?:(?:' . implode('|', array_map('preg_quote', $this->options['allowedProtocols']))
+diff -ruN a/src/Nodes/CodeBlock.php b/src/Nodes/CodeBlock.php
+--- a/src/Nodes/CodeBlock.php
++++ b/src/Nodes/CodeBlock.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Node;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class CodeBlock extends Node
+ {
+@@ -50,14 +51,16 @@
+ 
+     public function renderHTML($node, $HTMLAttributes = [])
+     {
++        $language = Text::plain($node->attrs->language ?? null);
++
+         return [
+             'pre',
+             HTML::mergeAttributes($this->options['HTMLAttributes'], $HTMLAttributes),
+             [
+                 'code',
+                 [
+-                    'class' => $node->attrs->language ?? null
+-                        ? $this->options['languageClassPrefix'] . $node->attrs->language
++                    'class' => $language
++                        ? $this->options['languageClassPrefix'] . $language
+                         : null,
+                 ],
+                 0,
+diff -ruN a/src/Nodes/CodeBlockHighlight.php b/src/Nodes/CodeBlockHighlight.php
+--- a/src/Nodes/CodeBlockHighlight.php
++++ b/src/Nodes/CodeBlockHighlight.php
+@@ -5,6 +5,7 @@
+ use DomainException;
+ use Highlight\Highlighter;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class CodeBlockHighlight extends CodeBlock
+ {
+@@ -18,13 +19,14 @@
+ 
+     public function renderHTML($node, $HTMLAttributes = [])
+     {
+-        $code = $node->content[0]->text ?? '';
++        $code = Text::plain($node->content[0]->text ?? null) ?? '';
++        $language = Text::plain($node->attrs->language ?? null);
+ 
+         try {
+             $highlighter = new Highlighter();
+ 
+-            if ($node->attrs->language ?? null) {
+-                $result = $highlighter->highlight($node->attrs->language, $code);
++            if ($language) {
++                $result = $highlighter->highlight($language, $code);
+             } else {
+                 $result = $highlighter->highlightAuto($code);
+             }
+diff -ruN a/src/Nodes/CodeBlockShiki.php b/src/Nodes/CodeBlockShiki.php
+--- a/src/Nodes/CodeBlockShiki.php
++++ b/src/Nodes/CodeBlockShiki.php
+@@ -7,6 +7,7 @@
+ use Highlight\Highlighter;
+ use Spatie\ShikiPhp\Shiki;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class CodeBlockShiki extends CodeBlock
+ {
+@@ -23,7 +24,7 @@
+ 
+     public function renderHTML($node, $HTMLAttributes = [])
+     {
+-        $code = $node->content[0]->text ?? '';
++        $code = Text::plain($node->content[0]->text ?? null) ?? '';
+ 
+         // Language is set
+         if ($node->attrs->language === null) {
+diff -ruN a/src/Nodes/Heading.php b/src/Nodes/Heading.php
+--- a/src/Nodes/Heading.php
++++ b/src/Nodes/Heading.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Node;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class Heading extends Node
+ {
+@@ -31,11 +32,12 @@
+ 
+     public function renderHTML($node, $HTMLAttributes = [])
+     {
+-        $hasLevel = in_array($node->attrs->level, $this->options['levels']);
++        // A level without a textual form falls back to the first configured one.
++        $level = Text::plain($node->attrs->level ?? null);
+ 
+-        $level = $hasLevel ?
+-            $node->attrs->level :
+-            $this->options['levels'][0];
++        if ($level === null || ! in_array($level, $this->options['levels'])) {
++            $level = $this->options['levels'][0];
++        }
+ 
+         return [
+             "h{$level}",
+diff -ruN a/src/Nodes/TableCell.php b/src/Nodes/TableCell.php
+--- a/src/Nodes/TableCell.php
++++ b/src/Nodes/TableCell.php
+@@ -4,6 +4,7 @@
+ 
+ use Tiptap\Core\Node;
+ use Tiptap\Utils\HTML;
++use Tiptap\Utils\Text;
+ 
+ class TableCell extends Node
+ {
+@@ -49,12 +50,15 @@
+                     return $widths;
+                 },
+                 'renderHTML' => function ($attributes) {
+-                    if (! isset($attributes->colwidth)) {
++                    // Widths are a list of numbers; anything else is no list at all.
++                    $widths = Text::entries($attributes->colwidth ?? null);
++
++                    if (empty($widths)) {
+                         return null;
+                     }
+ 
+                     return [
+-                        'data-colwidth' => join(',', $attributes->colwidth),
++                        'data-colwidth' => join(',', $widths),
+                     ];
+                 },
+             ],
+diff -ruN a/src/Utils/HTML.php b/src/Utils/HTML.php
+--- a/src/Utils/HTML.php
++++ b/src/Utils/HTML.php
+@@ -18,15 +18,27 @@
+             foreach ($moreAttributes as $key => $value) {
+                 // class="foo bar"
+                 if ($key === 'class') {
+-                    $attributes['class'] = trim(($attributes['class'] ?? '') . ' ' . $value);
++                    $class = Text::plain($value);
++
++                    // A class without a textual form is left out, the existing one stays.
++                    if ($class !== null) {
++                        $currentClass = Text::plain($attributes['class'] ?? '') ?? '';
++                        $attributes['class'] = trim($currentClass . ' ' . $class);
++                    }
+ 
+                     continue;
+                 }
+ 
+                 // style="color: red;"
+                 if ($key === 'style') {
+-                    $style = rtrim($attributes['style'] ?? '', '; ') . '; ' . rtrim($value ?? '', ';') . '; ';
+-                    $attributes['style'] = ltrim(trim($style), '; ');
++                    $style = Text::plain($value);
++
++                    // A style without a textual form is left out, the existing one stays.
++                    if ($style !== null) {
++                        $currentStyle = Text::plain($attributes['style'] ?? '') ?? '';
++                        $mergedStyle = rtrim($currentStyle, '; ') . '; ' . rtrim($style, ';') . '; ';
++                        $attributes['style'] = ltrim(trim($mergedStyle), '; ');
++                    }
+ 
+                     continue;
+                 }
+@@ -61,7 +73,14 @@
+ 
+         // class="custom"
+         foreach (array_filter($attrs) as $name => $value) {
+-            $escapedValue = htmlentities($value);
++            // Values without a textual form (a list, a map) are treated as absent.
++            $plainValue = Text::plain($value);
++
++            if ($plainValue === null) {
++                continue;
++            }
++
++            $escapedValue = htmlentities($plainValue);
+ 
+             $attributes[] = " {$name}=\"{$escapedValue}\"";
+         }
+diff -ruN a/src/Utils/Text.php b/src/Utils/Text.php
+--- a/src/Utils/Text.php
++++ b/src/Utils/Text.php
+@@ -0,0 +1,54 @@
++<?php
++
++namespace Tiptap\Utils;
++
++/**
++ * Documents arrive from clients as plain data, so every value in them can have
++ * any type. Only scalars have a textual form; everything else (a list, a map)
++ * is treated as absent by the renderers instead of being handed to a string
++ * function. This helper is the single place that decides what a value's text
++ * is, so the HTML renderer, the attribute renderer and the plain-text renderer
++ * all behave the same way.
++ */
++class Text
++{
++    /**
++     * Whether a value can be represented as text at all.
++     */
++    public static function isRenderable($value): bool
++    {
++        return is_scalar($value);
++    }
++
++    /**
++     * The escaped text for a value, or NULL when the value has no textual form.
++     */
++    public static function escaped($value): ?string
++    {
++        $plain = self::plain($value);
++
++        return $plain === null ? null : htmlspecialchars($plain, ENT_QUOTES, 'UTF-8');
++    }
++
++    /**
++     * The unescaped text for a value, or NULL when the value has no textual form.
++     */
++    public static function plain($value): ?string
++    {
++        return self::isRenderable($value) ? (string) $value : null;
++    }
++
++    /**
++     * The renderable entries of a list value, in their original order.
++     *
++     * @return array<int, mixed>
++     */
++    public static function entries($value): array
++    {
++        if (! is_array($value)) {
++            return [];
++        }
++
++        return array_values(array_filter($value, fn ($entry) => self::isRenderable($entry)));
++    }
++}

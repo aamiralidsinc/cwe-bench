@@ -1,0 +1,278 @@
+diff -ruN pristine/social_core/backends/base.py app/social_core/backends/base.py
+--- a/social_core/backends/base.py	2026-10-25 23:11:48.000000000 +0000
++++ b/social_core/backends/base.py	2026-10-25 23:27:51.047612185 +0000
+@@ -6,9 +6,19 @@
+ 
+ import requests
+ 
+-from social_core.exceptions import AuthConnectionError, AuthUnknownError
++from social_core.exceptions import (
++    AuthConnectionError,
++    AuthForbidden,
++    AuthUnknownError,
++)
+ from social_core.registry import REGISTRY
+-from social_core.utils import module_member, parse_qs, social_logger, user_agent
++from social_core.utils import (
++    module_member,
++    parse_qs,
++    partial_pipeline_resume_allowed,
++    social_logger,
++    user_agent,
++)
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Mapping
+@@ -270,6 +280,8 @@
+         self, partial: PartialMixin
+     ) -> UserProtocol | HttpResponseProtocol | None:
+         """Continue previous halted pipeline"""
++        if not partial_pipeline_resume_allowed(self.strategy, partial):
++            raise AuthForbidden(self)
+         return self.strategy.authenticate(
+             self, *partial.args, pipeline_index=partial.next_step, **partial.kwargs
+         )
+diff -ruN pristine/social_core/backends/open_id.py app/social_core/backends/open_id.py
+--- a/social_core/backends/open_id.py	2026-10-25 23:11:48.000000000 +0000
++++ b/social_core/backends/open_id.py	2026-10-25 23:27:54.851608741 +0000
+@@ -11,11 +11,12 @@
+     AuthCanceled,
+     AuthException,
+     AuthFailed,
++    AuthForbidden,
+     AuthMissingParameter,
+     AuthUnknownError,
+     AuthUnreachableProvider,
+ )
+-from social_core.utils import url_add_parameters
++from social_core.utils import partial_pipeline_resume_allowed, url_add_parameters
+ 
+ from .base import BaseAuth
+ 
+@@ -188,6 +189,8 @@
+ 
+     def continue_pipeline(self, partial):
+         """Continue previous halted pipeline"""
++        if not partial_pipeline_resume_allowed(self.strategy, partial):
++            raise AuthForbidden(self)
+         response = self.consumer().complete(
+             dict(self.data.items()), self.get_return_to()
+         )
+diff -ruN pristine/social_core/pipeline/mail.py app/social_core/pipeline/mail.py
+--- a/social_core/pipeline/mail.py	2026-10-25 23:11:48.000000000 +0000
++++ b/social_core/pipeline/mail.py	2026-10-25 23:27:45.855616885 +0000
+@@ -4,13 +4,16 @@
+ 
+ from social_core.exceptions import InvalidEmail
+ 
+-from .partial import partial
++from .partial import partial_step
+ 
+ if TYPE_CHECKING:
+     from social_core.backends.base import BaseAuth
+ 
+ 
+-@partial
++# A validation flow is deliberately completed from the link sent by email, so
++# it may be continued by a session that did not start it -- but only when that
++# request presents the one-time verification code it recorded as its proof.
++@partial_step(save_to_session=True, out_of_band_fields=("verification_code",))
+ def mail_validation(backend: BaseAuth, details, is_new=False, *args, **kwargs):
+     requires_validation = backend.REQUIRES_EMAIL_VALIDATION or backend.setting(
+         "FORCE_EMAIL_VALIDATION", False
+diff -ruN pristine/social_core/pipeline/partial.py app/social_core/pipeline/partial.py
+--- a/social_core/pipeline/partial.py	2026-10-25 23:11:48.000000000 +0000
++++ b/social_core/pipeline/partial.py	2026-10-25 23:27:43.795618750 +0000
+@@ -1,11 +1,14 @@
+ from functools import wraps
+ 
+-from social_core.utils import PARTIAL_TOKEN_SESSION_NAME
++from social_core.utils import (
++    PARTIAL_PIPELINE_EXTERNAL_RESUME_FIELDS,
++    PARTIAL_TOKEN_SESSION_NAME,
++)
+ 
+ from .utils import partial_prepare
+ 
+ 
+-def partial_step(save_to_session):
++def partial_step(save_to_session, out_of_band_fields=()):
+     """Wraps func to behave like a partial pipeline step, any output
+     that's not None or {} will be considered a response object and
+     will be returned to user.
+@@ -21,6 +24,11 @@
+     The token is also stored in the session under the
+     PARTIAL_TOKEN_SESSION_NAME (partial_pipeline_token) key when the
+     save_to_session parameter is True.
++
++    A step that pauses so the visitor can complete it elsewhere (for example
++    from an email link in a fresh browser) lists the request fields that carry
++    its out-of-band proof in out_of_band_fields. The stored flow records those
++    field names; without that record no other session may continue it.
+     """
+ 
+     def decorator(func):
+@@ -43,6 +51,15 @@
+             )
+ 
+             if not isinstance(out, dict):
++                proof_fields = tuple(
++                    field
++                    for field in (out_of_band_fields or ())
++                    if isinstance(field, str) and field
++                )
++                if proof_fields:
++                    current_partial.data[PARTIAL_PIPELINE_EXTERNAL_RESUME_FIELDS] = (
++                        proof_fields
++                    )
+                 strategy.storage.partial.store(current_partial)
+                 if save_to_session:
+                     strategy.session_set(
+diff -ruN pristine/social_core/utils.py app/social_core/utils.py
+--- a/social_core/utils.py	2026-10-25 23:11:48.000000000 +0000
++++ b/social_core/utils.py	2026-10-25 23:27:37.363624573 +0000
+@@ -32,6 +32,11 @@
+ 
+ PARTIAL_TOKEN_SESSION_NAME = "partial_pipeline_token"
+ 
++# Stored on a flow whose halting step expects it to be completed from a session
++# other than the one that started it. The value names the request fields that
++# carry the out-of-band proof; the resume check reads this record only.
++PARTIAL_PIPELINE_EXTERNAL_RESUME_FIELDS = "external_resume_fields"
++
+ 
+ social_logger = logging.getLogger("social")
+ 
+@@ -170,6 +175,38 @@
+     return out
+ 
+ 
++def _recorded_external_resume_fields(partial: PartialMixin) -> tuple[str, ...]:
++    recorded = partial.data.get(PARTIAL_PIPELINE_EXTERNAL_RESUME_FIELDS)
++    if not isinstance(recorded, (list, tuple)):
++        return ()
++    return tuple(field for field in recorded if isinstance(field, str) and field)
++
++
++def partial_pipeline_resume_allowed(
++    strategy: BaseStrategy,
++    partial: PartialMixin,
++    request_data: dict[str, Any] | None = None,
++) -> bool:
++    """Whether the current request may continue the given stored flow.
++
++    A session may always continue the flow whose token it recorded. Any other
++    flow may be continued only when the flow itself was stored with an
++    out-of-band completion and the request carries every recorded proof field;
++    a field is never trusted just because the request happened to supply it.
++    """
++    session_token = strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
++    if session_token and session_token == partial.token:
++        return True
++
++    proof_fields = _recorded_external_resume_fields(partial)
++    if not proof_fields:
++        return False
++
++    if request_data is None:
++        request_data = strategy.request_data()
++    return all(request_data.get(field) not in (None, "") for field in proof_fields)
++
++
+ def partial_pipeline_data(
+     backend: BaseAuth,
+     user: UserProtocol | None = None,
+@@ -177,44 +214,61 @@
+     *args,
+     **kwargs,
+ ) -> PartialMixin | None:
+-    request_data = backend.strategy.request_data()
++    strategy = backend.strategy
++    request_data = strategy.request_data()
+ 
+     partial_argument_name = backend.setting(
+         "PARTIAL_PIPELINE_TOKEN_NAME", "partial_token"
+     )
+-    partial_token = (
+-        partial_token
+-        or request_data.get(partial_argument_name)
+-        or backend.strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
+-    )
++    # A token taken from the explicit argument or from the configured request
++    # field is supplied by the request. Anything else comes from the session,
++    # which recorded it when it started the flow.
++    request_token = partial_token or request_data.get(partial_argument_name)
++    session_token = strategy.session_get(PARTIAL_TOKEN_SESSION_NAME, None)
++    resolved_token = request_token or session_token
+ 
+-    if partial_token:
+-        partial: PartialMixin | None = backend.strategy.partial_load(partial_token)
+-        partial_matches_request = False
+-
+-        if partial and partial.backend == backend.name:
+-            partial_matches_request = True
+-
+-            # Normally when resuming a pipeline, request_data will be empty. We
+-            # only need to check for a uid match if new data was provided (i.e.
+-            # if current request specifies the ID_KEY).
+-            id_key = backend.id_key()
+-            if id_key and id_key in request_data:
+-                id_from_partial = partial.kwargs.get("uid")
+-                id_from_request = request_data.get(id_key)
+-
+-                if id_from_partial != id_from_request:
+-                    partial_matches_request = False
+-
+-        if partial and partial_matches_request:
+-            if user:  # don't update user if it's None
+-                kwargs.setdefault("user", user)
+-            kwargs.setdefault("request", request_data)
+-            partial.extend_kwargs(kwargs)
+-            return partial
+-        backend.strategy.clean_partial_pipeline(partial_token)
++    if not resolved_token:
+         return None
+-    return None
++    if request_token is not None and not isinstance(request_token, str):
++        # A non-text identifier cannot name a stored flow; refuse without crashing.
++        return None
++
++    external = request_token is not None and request_token != session_token
++
++    partial: PartialMixin | None = strategy.partial_load(resolved_token)
++    partial_matches_request = False
++
++    if partial and partial.backend == backend.name:
++        partial_matches_request = True
++
++        # Normally when resuming a pipeline, request_data will be empty. We
++        # only need to check for a uid match if new data was provided (i.e.
++        # if current request specifies the ID_KEY).
++        id_key = backend.id_key()
++        if id_key and id_key in request_data:
++            id_from_partial = partial.kwargs.get("uid")
++            id_from_request = request_data.get(id_key)
++
++            if id_from_partial != id_from_request:
++                partial_matches_request = False
++
++    if not (partial and partial_matches_request):
++        # A request that names a flow it does not own is refused without
++        # destroying a flow another session may still need.
++        if not external:
++            strategy.clean_partial_pipeline(resolved_token)
++        return None
++
++    if external and not partial_pipeline_resume_allowed(
++        strategy, partial, request_data
++    ):
++        return None
++
++    if user:  # don't update user if it's None
++        kwargs.setdefault("user", user)
++    kwargs.setdefault("request", request_data)
++    partial.extend_kwargs(kwargs)
++    return partial
+ 
+ 
+ def build_absolute_uri(host_url: str, path: str | None = None) -> str:

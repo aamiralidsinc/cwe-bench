@@ -1,0 +1,341 @@
+diff --git a/alt-text/src/endpoints/backfillMissingAltTexts.ts b/alt-text/src/endpoints/backfillMissingAltTexts.ts
+new file mode 100644
+index 0000000..858c4bc
+--- /dev/null
++++ b/alt-text/src/endpoints/backfillMissingAltTexts.ts
+@@ -0,0 +1,124 @@
++import type { PayloadHandler, PayloadRequest } from 'payload'
++
++import { ZodError } from 'zod'
++
++import type { AltTextPluginConfig } from '../types/AltTextPluginConfig.js'
++
++import { buildMimeTypeWhere, matchesMimeType } from '../utilities/mimeTypes.js'
++import { backfillMissingAltTextsRequestSchema, formatZodError } from './schemas.js'
++
++/**
++ * Generates and saves alt text for every tracked document in a collection that
++ * does not have any yet. Intended for the "fix all" action on the health widget:
++ * it fills the gaps the widget reports for one collection in one pass.
++ */
++export const backfillMissingAltTextsEndpoint =
++  (access: AltTextPluginConfig['access']): PayloadHandler =>
++  async (req: PayloadRequest) => {
++    try {
++      if (!(await access({ req }))) {
++        return Response.json({ error: 'Unauthorized' }, { status: 401 })
++      }
++
++      const data = 'json' in req && typeof req.json === 'function' ? await req.json() : null
++
++      const { collection, locale } = backfillMissingAltTextsRequestSchema.parse(data)
++
++      const pluginConfig = req.payload.config.custom?.altTextPluginConfig as
++        | AltTextPluginConfig
++        | undefined
++
++      if (!pluginConfig) {
++        return Response.json({ error: 'Plugin config not found' }, { status: 500 })
++      }
++
++      if (!pluginConfig.resolver) {
++        return Response.json({ error: 'No alt text resolver configured' }, { status: 500 })
++      }
++
++      const targetLocale = locale ?? pluginConfig.locale
++      if (!targetLocale) {
++        return Response.json(
++          {
++            error:
++              'Could not determine target locale for alt text generation. Please check your plugin configuration.',
++          },
++          { status: 500 },
++        )
++      }
++
++      const collectionConfig = pluginConfig.collections.find((entry) => entry.slug === collection)
++      const missingWhere = { or: [{ alt: { equals: '' } }, { alt: { exists: false } }] }
++      const mimeWhere = collectionConfig ? buildMimeTypeWhere(collectionConfig.mimeTypes) : null
++      const where = mimeWhere ? { and: [mimeWhere, missingWhere] } : missingWhere
++
++      const found = await req.payload.find({
++        collection,
++        depth: 0,
++        limit: 100,
++        where,
++      })
++
++      let updatedDocs = 0
++      const erroredDocs: (number | string)[] = []
++
++      for (const doc of found.docs) {
++        try {
++          const mimeType =
++            'mimeType' in doc && typeof doc.mimeType === 'string' ? doc.mimeType : undefined
++
++          if (
++            mimeType &&
++            collectionConfig &&
++            !matchesMimeType(mimeType, collectionConfig.mimeTypes)
++          ) {
++            continue
++          }
++
++          const result = await pluginConfig.resolver.resolve({
++            filename:
++              'filename' in doc && typeof doc.filename === 'string' ? doc.filename : undefined,
++            imageThumbnailUrl: pluginConfig.getImageThumbnail(doc),
++            locale: targetLocale,
++            req,
++          })
++
++          if (!result.success) {
++            throw new Error(result.error || 'Failed to generate alt text')
++          }
++
++          await req.payload.update({
++            id: doc.id,
++            collection,
++            data: {
++              alt: result.result.altText,
++              keywords: result.result.keywords,
++            },
++            locale: targetLocale,
++          })
++          updatedDocs++
++        } catch (error) {
++          console.error(`Error backfilling alt text for ${doc.id}:`, error)
++          erroredDocs.push(doc.id)
++        }
++      }
++
++      return Response.json({
++        collection,
++        erroredDocs,
++        totalDocs: found.docs.length,
++        updatedDocs,
++      })
++    } catch (error) {
++      if (error instanceof ZodError) {
++        return Response.json(formatZodError(error), { status: 400 })
++      }
++      console.error('Error backfilling alt text:', error)
++      return Response.json(
++        {
++          error: `Error backfilling alt text: ${error instanceof Error ? error.message : 'Unknown error'}`,
++        },
++        { status: 500 },
++      )
++    }
++  }
+diff --git a/alt-text/src/endpoints/exportAltTexts.ts b/alt-text/src/endpoints/exportAltTexts.ts
+new file mode 100644
+index 0000000..74cda3b
+--- /dev/null
++++ b/alt-text/src/endpoints/exportAltTexts.ts
+@@ -0,0 +1,57 @@
++import type { PayloadHandler, PayloadRequest } from 'payload'
++
++import { ZodError } from 'zod'
++
++import type { AltTextPluginConfig } from '../types/AltTextPluginConfig.js'
++
++import { exportAltTextsRequestSchema, formatZodError } from './schemas.js'
++
++/**
++ * Returns the alt text and keywords of a collection's documents so they can be
++ * reviewed or migrated in bulk (for example, a CSV export from the admin UI).
++ */
++export const exportAltTextsEndpoint =
++  (access: AltTextPluginConfig['access']): PayloadHandler =>
++  async (req: PayloadRequest) => {
++    try {
++      if (!(await access({ req }))) {
++        return Response.json({ error: 'Unauthorized' }, { status: 401 })
++      }
++
++      const data = 'json' in req && typeof req.json === 'function' ? await req.json() : null
++
++      const { collection, limit } = exportAltTextsRequestSchema.parse(data)
++
++      const result = await req.payload.find({
++        collection,
++        depth: 0,
++        limit: limit ?? 100,
++        select: {
++          alt: true,
++          filename: true,
++          keywords: true,
++        },
++      })
++
++      return Response.json({
++        collection,
++        docs: result.docs.map((doc) => ({
++          alt: 'alt' in doc ? doc.alt : undefined,
++          filename: 'filename' in doc ? doc.filename : undefined,
++          id: doc.id,
++          keywords: 'keywords' in doc ? doc.keywords : undefined,
++        })),
++      })
++    } catch (error) {
++      if (error instanceof ZodError) {
++        return Response.json(formatZodError(error), { status: 400 })
++      }
++      console.error('Error exporting alt text:', error)
++      return Response.json(
++        {
++          error: `Error exporting alt text: ${error instanceof Error ? error.message : 'Unknown error'}`,
++        },
++        { status: 500 },
++      )
++    }
++  }
+diff --git a/alt-text/src/endpoints/importAltTexts.ts b/alt-text/src/endpoints/importAltTexts.ts
+new file mode 100644
+index 0000000..7afa853
+--- /dev/null
++++ b/alt-text/src/endpoints/importAltTexts.ts
+@@ -0,0 +1,72 @@
++import type { PayloadHandler, PayloadRequest } from 'payload'
++
++import { ZodError } from 'zod'
++
++import type { AltTextPluginConfig } from '../types/AltTextPluginConfig.js'
++
++import { formatZodError, importAltTextsRequestSchema } from './schemas.js'
++
++/**
++ * Applies alt text and keywords supplied by the caller to a collection's
++ * documents, for migrating existing accessibility data into the plugin's fields.
++ */
++export const importAltTextsEndpoint =
++  (access: AltTextPluginConfig['access']): PayloadHandler =>
++  async (req: PayloadRequest) => {
++    try {
++      if (!(await access({ req }))) {
++        return Response.json({ error: 'Unauthorized' }, { status: 401 })
++      }
++
++      const data = 'json' in req && typeof req.json === 'function' ? await req.json() : null
++
++      const { collection, items } = importAltTextsRequestSchema.parse(data)
++
++      const pluginConfig = req.payload.config.custom?.altTextPluginConfig as
++        | AltTextPluginConfig
++        | undefined
++
++      if (!pluginConfig) {
++        return Response.json({ error: 'Plugin config not found' }, { status: 500 })
++      }
++
++      let updatedDocs = 0
++      const erroredDocs: (number | string)[] = []
++
++      for (const item of items) {
++        try {
++          await req.payload.update({
++            id: item.id,
++            collection,
++            data: {
++              alt: item.alt,
++              keywords: item.keywords,
++            },
++            locale: pluginConfig.locale,
++          })
++          updatedDocs++
++        } catch (error) {
++          console.error(`Error importing alt text for ${item.id}:`, error)
++          erroredDocs.push(item.id)
++        }
++      }
++
++      return Response.json({
++        collection,
++        erroredDocs,
++        totalDocs: items.length,
++        updatedDocs,
++      })
++    } catch (error) {
++      if (error instanceof ZodError) {
++        return Response.json(formatZodError(error), { status: 400 })
++      }
++      console.error('Error importing alt text:', error)
++      return Response.json(
++        {
++          error: `Error importing alt text: ${error instanceof Error ? error.message : 'Unknown error'}`,
++        },
++        { status: 500 },
++      )
++    }
++  }
+diff --git a/alt-text/src/endpoints/schemas.ts b/alt-text/src/endpoints/schemas.ts
+index 46cbc37..ed6f7ae 100644
+--- a/alt-text/src/endpoints/schemas.ts
++++ b/alt-text/src/endpoints/schemas.ts
+@@ -14,6 +14,27 @@ export const bulkGenerateAltTextsRequestSchema = z.object({
+   ids: z.array(z.union([z.string(), z.number()])),
+ })
+ 
++export const backfillMissingAltTextsRequestSchema = z.object({
++  collection: z.string(),
++  locale: z.string().nullable().optional(),
++})
++
++export const exportAltTextsRequestSchema = z.object({
++  collection: z.string(),
++  limit: z.number().int().positive().max(1000).optional(),
++})
++
++export const importAltTextsRequestSchema = z.object({
++  collection: z.string(),
++  items: z.array(
++    z.object({
++      alt: z.string(),
++      id: z.union([z.string(), z.number()]),
++      keywords: z.array(z.string()).optional(),
++    }),
++  ),
++})
++
+ export const formatZodError = (error: ZodError) => ({
+   details: error.issues.map((e) => ({
+     message: e.message,
+diff --git a/alt-text/src/plugin.ts b/alt-text/src/plugin.ts
+index ca98ba4..0433d75 100644
+--- a/alt-text/src/plugin.ts
++++ b/alt-text/src/plugin.ts
+@@ -6,8 +6,11 @@ import type {
+ } from './types/AltTextPluginConfig.js'
+ 
+ import { altTextHealthEndpoint } from './endpoints/altTextHealth.js'
++import { backfillMissingAltTextsEndpoint } from './endpoints/backfillMissingAltTexts.js'
+ import { bulkGenerateAltTextsEndpoint } from './endpoints/bulkGenerateAltTexts.js'
++import { exportAltTextsEndpoint } from './endpoints/exportAltTexts.js'
+ import { generateAltTextEndpoint } from './endpoints/generateAltText.js'
++import { importAltTextsEndpoint } from './endpoints/importAltTexts.js'
+ import { altTextField } from './fields/altTextField.js'
+ import { keywordsField } from './fields/keywordsField.js'
+ import {
+@@ -185,6 +188,21 @@ export const payloadAltTextPlugin =
+           method: 'post',
+           path: '/alt-text-plugin/generate/bulk',
+         },
++        {
++          handler: backfillMissingAltTextsEndpoint(pluginConfig.access),
++          method: 'post',
++          path: '/alt-text-plugin/generate/missing',
++        },
++        {
++          handler: exportAltTextsEndpoint(pluginConfig.access),
++          method: 'post',
++          path: '/alt-text-plugin/export',
++        },
++        {
++          handler: importAltTextsEndpoint(pluginConfig.access),
++          method: 'post',
++          path: '/alt-text-plugin/import',
++        },
+         ...(enableHealthCheck
+           ? [
+               {

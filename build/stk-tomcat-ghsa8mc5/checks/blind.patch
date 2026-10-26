@@ -1,0 +1,222 @@
+diff -ruN pristine/java/org/apache/catalina/connector/CoyoteAdapter.java app/java/org/apache/catalina/connector/CoyoteAdapter.java
+--- a/java/org/apache/catalina/connector/CoyoteAdapter.java	2026-10-26 03:58:02.000000000 +0000
++++ b/java/org/apache/catalina/connector/CoyoteAdapter.java	2026-10-26 05:31:00.611829179 +0000
+@@ -41,6 +41,7 @@
+ import org.apache.catalina.util.URLEncoder;
+ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.Adapter;
++import org.apache.coyote.http11.AbstractHttp11Protocol;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
+@@ -674,6 +675,22 @@
+             serverName = req.serverName();
+         }
+ 
++        /*
++         * The TLS configuration is selected from the connection's handshake (SNI) and cannot change for the life of
++         * the connection, while the virtual host that serves a request is selected from the request's host - which
++         * the connector may have overridden (proxyName / useIPVHosts). Serving a request under a host whose TLS
++         * configuration differs from the one the connection negotiated would expose that host under another
++         * configuration, so refuse the request before anything else happens.
++         */
++        if (connector.getProtocolHandler() instanceof AbstractHttp11Protocol) {
++            AbstractHttp11Protocol<?> protocol = (AbstractHttp11Protocol<?>) connector.getProtocolHandler();
++            String servedHostName = serverName.isNull() ? null : serverName.toString();
++            if (!protocol.isSameTlsHostConfig(req.getTlsHostName(), servedHostName)) {
++                response.sendError(HttpServletResponse.SC_MISDIRECTED_REQUEST);
++                return false;
++            }
++        }
++
+         // Version for the second mapping loop and
+         // Context that we expect to get for that version
+         String version = null;
+diff -ruN pristine/java/org/apache/coyote/AbstractProcessor.java app/java/org/apache/coyote/AbstractProcessor.java
+--- a/java/org/apache/coyote/AbstractProcessor.java	2026-10-26 03:58:02.000000000 +0000
++++ b/java/org/apache/coyote/AbstractProcessor.java	2026-10-26 05:30:44.299844115 +0000
+@@ -153,6 +153,8 @@
+      */
+     protected void setSocketWrapper(SocketWrapperBase<?> socketWrapper) {
+         this.socketWrapper = socketWrapper;
++        // Connection state: the TLS host name was fixed by the handshake before the processor saw this connection.
++        request.setTlsHostName(socketWrapper == null ? null : socketWrapper.getNegotiatedTlsHostName());
+     }
+ 
+ 
+diff -ruN pristine/java/org/apache/coyote/Request.java app/java/org/apache/coyote/Request.java
+--- a/java/org/apache/coyote/Request.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/coyote/Request.java	2026-10-26 05:30:41.759846440 +0000
+@@ -86,6 +86,14 @@
+     private int remotePort;
+     private int localPort;
+ 
++    /**
++     * The host name the client named via the TLS SNI extension for the connection this request arrived on. This is
++     * connection state rather than request state, which is why {@link #recycle()} intentionally leaves it alone: a
++     * keep-alive connection serves several requests under the same TLS configuration and the value is refreshed from
++     * the socket wrapper whenever the processor is (re)assigned a connection.
++     */
++    private String tlsHostName = null;
++
+     private final MessageBytes schemeMB = MessageBytes.newInstance();
+ 
+     private final MessageBytes methodMB = MessageBytes.newInstance();
+@@ -363,6 +371,24 @@
+         return serverNameMB;
+     }
+ 
++    /**
++     * @return the host name the client named via the TLS SNI extension for the connection this request arrived on, or
++     *         {@code null} if the client sent no such name (or the connection is not a TLS connection)
++     */
++    public String getTlsHostName() {
++        return tlsHostName;
++    }
++
++    /**
++     * Set the host name the client named via the TLS SNI extension. This is connection state and is refreshed from the
++     * socket wrapper whenever the processor that owns this request is assigned a connection.
++     *
++     * @param tlsHostName the SNI host name, or {@code null} if the client sent none
++     */
++    public void setTlsHostName(String tlsHostName) {
++        this.tlsHostName = tlsHostName;
++    }
++
+     public int getServerPort() {
+         return serverPort;
+     }
+diff -ruN pristine/java/org/apache/coyote/http11/AbstractHttp11Protocol.java app/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java	2026-10-26 05:30:53.247835921 +0000
+@@ -759,6 +759,20 @@
+     }
+ 
+ 
++    /**
++     * Check whether the TLS configuration in force for a connection is the one that belongs to the virtual host that
++     * will serve the request.
++     *
++     * @param connectionHostName the host name the client named during the TLS handshake, may be {@code null}
++     * @param servedHostName     the host name the request will be served under, may be {@code null}
++     *
++     * @return {@code true} if both resolve to the same TLS configuration, or if TLS is not enabled
++     */
++    public boolean isSameTlsHostConfig(String connectionHostName, String servedHostName) {
++        return getEndpoint().isSameTlsHostConfig(connectionHostName, servedHostName);
++    }
++
++
+     // ------------------------------------------------------------- Common code
+ 
+     @Override
+diff -ruN pristine/java/org/apache/tomcat/util/net/AbstractEndpoint.java app/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java	2026-10-26 05:30:50.735838221 +0000
+@@ -715,6 +715,35 @@
+ 
+ 
+     /**
++     * Check whether two host names resolve to the same TLS configuration.
++     * <p>
++     * The comparison follows the virtual host mapper: host names are case-insensitive, wildcard TLS host
++     * configurations are honoured and a missing host name (the client sent no SNI extension, or the request carried no
++     * host) resolves to the default configuration.
++     *
++     * @param connectionHostName the host name the client named during the TLS handshake, may be {@code null}
++     * @param servedHostName     the host name the request will be served under, may be {@code null}
++     *
++     * @return {@code true} if both names resolve to the same TLS configuration, or if this endpoint has TLS disabled
++     */
++    public boolean isSameTlsHostConfig(String connectionHostName, String servedHostName) {
++        if (!isSSLEnabled()) {
++            return true;
++        }
++        return getSSLHostConfig(toLowercaseHostName(connectionHostName)) ==
++                getSSLHostConfig(toLowercaseHostName(servedHostName));
++    }
++
++
++    private static String toLowercaseHostName(String hostName) {
++        if (hostName == null) {
++            return null;
++        }
++        return hostName.toLowerCase(Locale.ENGLISH);
++    }
++
++
++    /**
+      * Has the user requested that send file be used where possible?
+      */
+     private boolean useSendfile = true;
+diff -ruN pristine/java/org/apache/tomcat/util/net/SecureNio2Channel.java app/java/org/apache/tomcat/util/net/SecureNio2Channel.java
+--- a/java/org/apache/tomcat/util/net/SecureNio2Channel.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/tomcat/util/net/SecureNio2Channel.java	2026-10-26 05:30:31.499855837 +0000
+@@ -443,6 +443,10 @@
+                 throw new IOException(sm.getString("channel.nio.ssl.foundHttp"));
+         }
+ 
++        // Remember the name the client used to select the TLS configuration. It may be null (no SNI extension) or the
++        // default host name (SNI could not be parsed) in which case the default configuration was selected.
++        socketWrapper.setNegotiatedTlsHostName(hostName);
++
+         if (log.isTraceEnabled()) {
+             log.trace(sm.getString("channel.nio.ssl.sniHostName", sc, hostName));
+         }
+diff -ruN pristine/java/org/apache/tomcat/util/net/SecureNioChannel.java app/java/org/apache/tomcat/util/net/SecureNioChannel.java
+--- a/java/org/apache/tomcat/util/net/SecureNioChannel.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/tomcat/util/net/SecureNioChannel.java	2026-10-26 05:30:29.123858013 +0000
+@@ -304,6 +304,10 @@
+                 throw new IOException(sm.getString("channel.nio.ssl.foundHttp"));
+         }
+ 
++        // Remember the name the client used to select the TLS configuration. It may be null (no SNI extension) or the
++        // default host name (SNI could not be parsed) in which case the default configuration was selected.
++        socketWrapper.setNegotiatedTlsHostName(hostName);
++
+         if (log.isTraceEnabled()) {
+             log.trace(sm.getString("channel.nio.ssl.sniHostName", sc, hostName));
+         }
+diff -ruN pristine/java/org/apache/tomcat/util/net/SocketWrapperBase.java app/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java	2026-10-26 03:58:03.000000000 +0000
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java	2026-10-26 05:30:24.799861974 +0000
+@@ -86,6 +86,13 @@
+     protected volatile ServletConnection servletConnection = null;
+ 
+     /**
++     * The host name the client named during the TLS handshake (SNI), or {@code null} if the client did not send the
++     * SNI extension. This is connection state: it is set once the handshake has selected the TLS configuration and it
++     * must not change for the lifetime of the connection.
++     */
++    protected String negotiatedTlsHostName = null;
++
++    /**
+      * Used to record the first IOException that occurs during non-blocking read/writes that can't be usefully
+      * propagated up the stack since there is no user code or appropriate container code in the stack to handle it.
+      */
+@@ -209,6 +216,24 @@
+     }
+ 
+     /**
++     * @return the host name the client named via the TLS SNI extension for this connection, or {@code null} if none was
++     *         sent
++     */
++    public String getNegotiatedTlsHostName() {
++        return negotiatedTlsHostName;
++    }
++
++    /**
++     * Record the host name the client named via the TLS SNI extension. Called once the handshake has selected the TLS
++     * configuration for the connection.
++     *
++     * @param negotiatedTlsHostName the SNI host name, or {@code null} if the client sent none
++     */
++    public void setNegotiatedTlsHostName(String negotiatedTlsHostName) {
++        this.negotiatedTlsHostName = negotiatedTlsHostName;
++    }
++
++    /**
+      * Set the timeout for reading. Values of zero or less will be changed to -1.
+      *
+      * @param readTimeout The timeout in milliseconds. A value of -1 indicates an infinite timeout.

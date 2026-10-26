@@ -1,0 +1,180 @@
+diff --git a/src/virtualenv/seed/embed/via_app_data/via_app_data.py b/src/virtualenv/seed/embed/via_app_data/via_app_data.py
+index 48f2767c..90d476d6 100644
+--- a/src/virtualenv/seed/embed/via_app_data/via_app_data.py
++++ b/src/virtualenv/seed/embed/via_app_data/via_app_data.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import logging
+ import sys
+ import traceback
+@@ -64,7 +65,7 @@ class FromAppData(BaseEmbed):
+             def _install(name: str, wheel: Wheel) -> None:
+                 LOGGER.debug("install %s from wheel %s via %s", name, wheel, installer_class.__name__)
+                 try:
+-                    key = Path(installer_class.__name__) / wheel.path.stem
++                    key = Path(installer_class.__name__) / f"{wheel.path.stem}-{_wheel_digest(wheel.path)}"
+                     wheel_img = self.app_data.wheel_image(creator.interpreter.version_release_str, key)
+                     installer = installer_class(wheel.path, creator, wheel_img)
+                     _build_wheel_image(self.app_data.lock / wheel_img.parent, wheel_img.name, installer)
+@@ -153,6 +154,14 @@ class FromAppData(BaseEmbed):
+         return f"{base[:-1]}{msg}{base[-1]}"
+ 
+ 
++def _wheel_digest(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
+ def _build_wheel_image(parent: PathLockBase, name: str, installer: PipInstall) -> None:
+     with parent.non_reentrant_lock_for_key(name):
+         if not installer.has_image():
+diff --git a/src/virtualenv/seed/wheels/acquire.py b/src/virtualenv/seed/wheels/acquire.py
+index 9659b57f..0f980f83 100644
+--- a/src/virtualenv/seed/wheels/acquire.py
++++ b/src/virtualenv/seed/wheels/acquire.py
+@@ -11,7 +11,7 @@ from subprocess import PIPE, CalledProcessError, Popen
+ from typing import TYPE_CHECKING
+ 
+ from .bundle import from_bundle
+-from .periodic_update import add_wheel_to_update_log
++from .periodic_update import add_wheel_to_update_log, verify_wheel_digest
+ from .util import Version, Wheel, discover_wheels
+ 
+ if TYPE_CHECKING:
+@@ -19,6 +19,16 @@ if TYPE_CHECKING:
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
++# A private index can legitimately serve a rebuilt wheel under the same distribution, version and filename the
++# public index also uses - an internal mirror re-packaging a release for policy reasons, for example. Comparing such
++# a file against the public digest would reject a wheel that came from exactly the source it was configured to come
++# from, so when the caller points pip at its own index the public record cannot speak for the download.
++_CUSTOM_INDEX_ENV_VARS = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")
++
++
++def _uses_default_index(env: dict[str, str]) -> bool:
++    return not any(env.get(var) for var in _CUSTOM_INDEX_ENV_VARS)
++
+ # PEP 503 normalized distribution name. Anything outside this character set on the way to ``pip download`` means
+ # somebody is smuggling pip options or extras, so reject it before we build the command line.
+ _DISTRIBUTION_RE = re.compile(
+@@ -130,6 +140,7 @@ def download_wheel(  # ruff:ignore[too-many-arguments]
+         str(to_folder),
+         to_download,
+     ]
++    verify_against_public_record = _uses_default_index(env)
+     # pip has no interface in python - must be a new sub-process
+     env = pip_wheel_env_run(search_dirs, app_data, env)
+     process = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, universal_newlines=True, encoding="utf-8")
+@@ -138,8 +149,13 @@ def download_wheel(  # ruff:ignore[too-many-arguments]
+         kwargs = {"output": out, "stderr": err}
+         raise CalledProcessError(process.returncode, cmd, **kwargs)
+     result = _find_downloaded_wheel(distribution, version_spec, for_py_version, to_folder, out)
+-    LOGGER.debug("downloaded wheel %s", result.name)  # ty: ignore[unresolved-attribute]
+-    return result  # ty: ignore[invalid-return-type]
++    if result is None:
++        msg = f"could not find downloaded wheel for {to_download}"
++        raise RuntimeError(msg)
++    LOGGER.debug("downloaded wheel %s", result.name)
++    if verify_against_public_record:
++        verify_wheel_digest(result)
++    return result
+ 
+ 
+ def _find_downloaded_wheel(
+diff --git a/src/virtualenv/seed/wheels/bundle.py b/src/virtualenv/seed/wheels/bundle.py
+index 3a3700e0..04684114 100644
+--- a/src/virtualenv/seed/wheels/bundle.py
++++ b/src/virtualenv/seed/wheels/bundle.py
+@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
+ 
+ from virtualenv.seed.wheels.embed import get_embed_wheel
+ 
+-from .periodic_update import periodic_update
++from .periodic_update import periodic_update, verify_wheel_digest
+ from .util import Version, Wheel, discover_wheels
+ 
+ if TYPE_CHECKING:
+@@ -55,6 +55,7 @@ def from_dir(distribution: str, version: str | None, for_py_version: str, direct
+     """Load a compatible wheel from a given folder."""
+     for folder in directories:
+         for wheel in discover_wheels(folder, distribution, version, for_py_version):
++            verify_wheel_digest(wheel)
+             return wheel
+     return None
+ 
+diff --git a/src/virtualenv/seed/wheels/periodic_update.py b/src/virtualenv/seed/wheels/periodic_update.py
+index 5294c549..37babdb2 100644
+--- a/src/virtualenv/seed/wheels/periodic_update.py
++++ b/src/virtualenv/seed/wheels/periodic_update.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import logging
+ import os
+@@ -52,6 +53,8 @@ def periodic_update(  # ruff:ignore[too-many-arguments]
+ 
+     def _update_wheel(ver: NewVersion) -> Wheel:
+         updated_wheel = Wheel(app_data.house / ver.filename)
++        if updated_wheel.path.exists():
++            verify_wheel_digest(updated_wheel)
+         LOGGER.debug("using %supdated wheel %s", "periodically " if updated_wheel else "", updated_wheel)
+         return updated_wheel
+ 
+@@ -366,6 +369,41 @@ def release_date_for_wheel_path(dest: Path) -> datetime | None:
+ _INSECURE_FALLBACK_ENV = "VIRTUALENV_PERIODIC_UPDATE_INSECURE"
+ 
+ 
++def verify_wheel_digest(wheel: Wheel) -> None:
++    """Check a seed wheel's bytes against the digest the authoritative release record publishes for its filename.
++
++    The wheel may come from any acquisition route, so nothing guarantees it is the file its name claims. When the
++    release index has no record for this exact filename - a private distribution, an internal build, an offline
++    mirror - there is nothing to compare against and the wheel is used as before. When it does publish a sha256 and
++    the bytes differ, the wheel is not the artefact the name claims and must not be installed.
++
++    :raises RuntimeError: the release index publishes a sha256 for this filename and the wheel does not match it.
++
++    """
++    entry = _release_entry_for_wheel(wheel)
++    if entry is None:
++        LOGGER.debug("could not verify %s: no matching release record", wheel.name)
++        return
++    digests = entry.get("digests")
++    expected = digests.get("sha256") if isinstance(digests, dict) else None
++    if not isinstance(expected, str):
++        LOGGER.debug("could not verify %s: no sha256 published", wheel.name)
++        return
++    actual = hashlib.sha256(wheel.path.read_bytes()).hexdigest()
++    if actual != expected:
++        msg = f"seed wheel {wheel.name} has sha256 {actual}, but the release record reports {expected}"
++        raise RuntimeError(msg)
++
++
++def _release_entry_for_wheel(wheel: Wheel) -> dict[str, object] | None:
++    content = _pypi_get_distribution_info_cached(wheel.distribution)
++    releases = content.get("releases") if isinstance(content, dict) else None
++    entries = releases.get(wheel.version) if isinstance(releases, dict) else None
++    if not isinstance(entries, list):
++        return None
++    return next((entry for entry in entries if isinstance(entry, dict)), None)
++
++
+ def _request_context() -> Generator[ssl.SSLContext | None, None, None]:
+     yield None
+     if os.environ.get(_INSECURE_FALLBACK_ENV):
+@@ -470,4 +508,5 @@ __all__ = [
+     "periodic_update",
+     "release_date_for_wheel_path",
+     "trigger_update",
++    "verify_wheel_digest",
+ ]

@@ -1,0 +1,324 @@
+diff --git a/libs/providers/langchain-redis/src/filter_object.ts b/libs/providers/langchain-redis/src/filter_object.ts
+new file mode 100644
+index 0000000..95a54b5
+--- /dev/null
++++ b/libs/providers/langchain-redis/src/filter_object.ts
+@@ -0,0 +1,89 @@
++/**
++ * Plain-object metadata filters for {@link FluentRedisVectorStore}.
++ *
++ * A plain object maps metadata field names to values and is rendered with the
++ * store's metadata schema. It is a shorthand for the `FilterExpression`
++ * builders when the filter is assembled from data instead of written by hand.
++ *
++ * @example
++ * ```typescript
++ * const store = new FluentRedisVectorStore(embeddings, {
++ *   redisClient: client,
++ *   indexName: "products",
++ *   customSchema: [
++ *     { name: "category", type: "tag" },
++ *     { name: "price", type: "numeric" },
++ *     { name: "title", type: "text" },
++ *   ],
++ * });
++ *
++ * await store.similaritySearch("laptop", 5, {
++ *   category: "electronics",
++ *   price: { max: 1000 },
++ * });
++ * ```
++ */
++import type { MetadataFieldSchema } from "./schema.js";
++
++/**
++ * A value for one metadata field in a plain-object filter.
++ *
++ * Tag fields accept a single value or an array of values; text fields accept a
++ * string; numeric fields accept a number or a `{ min, max }` range.
++ */
++export type MetadataFilterValue =
++  | string
++  | number
++  | string[]
++  | { min?: number; max?: number };
++
++/**
++ * A plain-object metadata filter: field name to value.
++ */
++export type MetadataFilterObject = Record<string, MetadataFilterValue>;
++
++/**
++ * Renders a plain-object metadata filter as a RediSearch query fragment using
++ * the metadata schema of the store. Unknown field names are ignored.
++ *
++ * @param metadataFilter - field name to value
++ * @param schema - the store's metadata schema
++ * @returns a query fragment, or `*` when no field matched
++ */
++export function filtersFromObject(
++  metadataFilter: MetadataFilterObject,
++  schema: MetadataFieldSchema[]
++): string {
++  const fields = new Map(schema.map((field) => [field.name, field]));
++  const clauses: string[] = [];
++
++  for (const [fieldName, value] of Object.entries(metadataFilter)) {
++    const fieldSchema = fields.get(fieldName);
++    if (!fieldSchema) {
++      continue;
++    }
++
++    if (fieldSchema.type === "tag") {
++      const values = Array.isArray(value) ? value : [String(value)];
++      clauses.push(`@${fieldName}:{${values.join("|")}}`);
++    } else if (fieldSchema.type === "text") {
++      clauses.push(`@${fieldName}:(${String(value)})`);
++    } else if (fieldSchema.type === "numeric") {
++      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
++        const min = "min" in value ? value.min : undefined;
++        const max = "max" in value ? value.max : undefined;
++        if (min !== undefined && max !== undefined) {
++          clauses.push(`@${fieldName}:[${min} ${max}]`);
++        } else if (min !== undefined) {
++          clauses.push(`@${fieldName}:[${min} +inf]`);
++        } else if (max !== undefined) {
++          clauses.push(`@${fieldName}:[-inf ${max}]`);
++        }
++      } else {
++        clauses.push(`@${fieldName}:[${value} ${value}]`);
++      }
++    }
++  }
++
++  return clauses.length > 0 ? clauses.join(" ") : "*";
++}
+diff --git a/libs/providers/langchain-redis/src/filter_stored.ts b/libs/providers/langchain-redis/src/filter_stored.ts
+new file mode 100644
+index 0000000..107b76a
+--- /dev/null
++++ b/libs/providers/langchain-redis/src/filter_stored.ts
+@@ -0,0 +1,60 @@
++/**
++ * Tag filtering for stored separator-joined values.
++ *
++ * Tag fields written to Redis are joined with a separator (`,` by default, or
++ * the separator configured for the field in the metadata schema). This filter
++ * accepts the stored representation directly: the supplied value is split on
++ * the field's separator so that `"red,blue"` matches either of the two stored
++ * tags, and the resulting tags are combined with OR.
++ *
++ * @example
++ * ```typescript
++ * // A field stored as "red,blue" matches a document tagged "blue".
++ * const filter = StoredTag("tags", "red,blue");
++ * // Generates: @tags:{red|blue}
++ *
++ * // A custom separator configured on the field.
++ * const filter2 = StoredTag("labels", "a;b", ";");
++ * // Generates: @labels:{a|b}
++ * ```
++ */
++import { FilterExpression } from "./filters.js";
++import { DEFAULT_TAG_SEPARATOR } from "./schema.js";
++
++/**
++ * Tag filter that splits each supplied value on the field's separator.
++ */
++export class StoredTagFilter extends FilterExpression {
++  readonly filterType = "stored_tag" as const;
++
++  constructor(
++    private field: string,
++    private values: string | string[],
++    private separator: string = DEFAULT_TAG_SEPARATOR
++  ) {
++    super();
++  }
++
++  toString(): string {
++    const supplied = Array.isArray(this.values) ? this.values : [this.values];
++    const tags = supplied.flatMap((value) => value.split(this.separator));
++    const filter = `@${this.field}:{${tags.join("|")}}`;
++    return filter;
++  }
++}
++
++/**
++ * Creates a tag filter for a value stored as a separator-joined list.
++ *
++ * @param field - the name of the tag field
++ * @param values - the stored value, or an array of stored values
++ * @param separator - the separator used for the field (default `,`)
++ * @returns a StoredTagFilter
++ */
++export function StoredTag(
++  field: string,
++  values: string | string[],
++  separator: string = DEFAULT_TAG_SEPARATOR
++): FilterExpression {
++  return new StoredTagFilter(field, values, separator);
++}
+diff --git a/libs/providers/langchain-redis/src/filters.ts b/libs/providers/langchain-redis/src/filters.ts
+index f598578..1e38dc1 100644
+--- a/libs/providers/langchain-redis/src/filters.ts
++++ b/libs/providers/langchain-redis/src/filters.ts
+@@ -546,17 +546,30 @@ export class GeoFilter extends FilterExpression {
+  *
+  * // Using the convenience function
+  * const filter = Custom("(@brand:{Apple} @year:[2020 +inf])");
++ *
++ * // With placeholders: `$name` is replaced by the matching parameter
++ * const filter2 = Custom("@category:{$category}", { category: "electronics" });
+  * ```
+  */
+ export class CustomFilter extends FilterExpression {
+   readonly filterType = "custom" as const;
+ 
+-  constructor(private query: string) {
++  constructor(
++    private query: string,
++    private params?: Record<string, unknown>
++  ) {
+     super();
+   }
+ 
+   toString(): string {
+-    return this.query;
++    if (!this.params) {
++      return this.query;
++    }
++    return this.query.replace(/\$(\w+)/g, (match, name: string) =>
++      Object.prototype.hasOwnProperty.call(this.params, name)
++        ? String(this.params[name])
++        : match
++    );
+   }
+ }
+ 
+@@ -879,7 +892,9 @@ export function Timestamp(field: string) {
+  *
+  * **Warning**: You are responsible for ensuring the query syntax is valid RediSearch syntax.
+  *
+- * @param query - The raw RediSearch query string
++ * @param query - The raw RediSearch query string; `$name` placeholders are
++ *   replaced with the matching parameter value
++ * @param params - Optional values for `$name` placeholders
+  * @returns A CustomFilter instance
+  *
+  * @see https://redis.io/docs/latest/develop/ai/search-and-query/query/
+@@ -900,6 +915,9 @@ export function Timestamp(field: string) {
+  *   .and(Num("price").lt(100));
+  * ```
+  */
+-export function Custom(query: string): CustomFilter {
+-  return new CustomFilter(query);
++export function Custom(
++  query: string,
++  params?: Record<string, unknown>
++): CustomFilter {
++  return new CustomFilter(query, params);
+ }
+diff --git a/libs/providers/langchain-redis/src/index.ts b/libs/providers/langchain-redis/src/index.ts
+index f1f4d34..a540bdc 100644
+--- a/libs/providers/langchain-redis/src/index.ts
++++ b/libs/providers/langchain-redis/src/index.ts
+@@ -3,4 +3,6 @@ export * from "./vectorstores.js";
+ export * from "./vectorstores_fluent.js";
+ export * from "./caches.js";
+ export * from "./filters.js";
++export * from "./filter_object.js";
++export * from "./filter_stored.js";
+ export * from "./schema.js";
+diff --git a/libs/providers/langchain-redis/src/vectorstores_fluent.ts b/libs/providers/langchain-redis/src/vectorstores_fluent.ts
+index 2b3b39d..c4e0db6 100644
+--- a/libs/providers/langchain-redis/src/vectorstores_fluent.ts
++++ b/libs/providers/langchain-redis/src/vectorstores_fluent.ts
+@@ -40,6 +40,9 @@ import {
+   inferMetadataSchema,
+   checkForSchemaMismatch,
+ } from "./schema.js";
++import { filtersFromObject } from "./filter_object.js";
++import { StoredTag, StoredTagFilter } from "./filter_stored.js";
++import type { MetadataFilterObject } from "./filter_object.js";
+ import type { RedisAddOptions } from "./vectorstores.js";
+ 
+ // Re-export filter classes and functions
+@@ -59,6 +62,8 @@ export {
+   Timestamp,
+   Custom,
+   CustomFilter,
++  StoredTag,
++  StoredTagFilter,
+ };
+ 
+ // Re-export MetadataFieldSchema from schema (not exported from vectorstores.ts)
+@@ -107,7 +112,9 @@ export interface FluentRedisVectorStoreConfig {
+  *
+  * For legacy string[] | string filters, use the basic RedisVectorStore instead.
+  */
+-export type FluentRedisVectorStoreFilterType = FilterExpression;
++export type FluentRedisVectorStoreFilterType =
++  | FilterExpression
++  | MetadataFilterObject;
+ 
+ /**
+  * Advanced Redis Vector Store with structured metadata filtering.
+@@ -298,7 +305,7 @@ export class FluentRedisVectorStore extends VectorStore {
+   async similaritySearchVectorWithScore(
+     query: number[],
+     k: number,
+-    filter?: FilterExpression
++    filter?: FilterExpression | MetadataFilterObject
+   ): Promise<[Document, number][]> {
+     if (filter && this.filter) {
+       throw new Error("cannot provide both `filter` and `this.filter`");
+@@ -539,7 +546,7 @@ export class FluentRedisVectorStore extends VectorStore {
+   private buildQuery(
+     query: number[],
+     k: number,
+-    filter?: FilterExpression
++    filter?: FilterExpression | MetadataFilterObject
+   ): [string, SearchOptions] {
+     const vectorScoreField = "vector_score";
+ 
+@@ -575,24 +582,31 @@ export class FluentRedisVectorStore extends VectorStore {
+     return [baseQuery, options];
+   }
+ 
+-  private prepareFilter(filter?: FilterExpression): string {
++  private prepareFilter(
++    filter?: FilterExpression | MetadataFilterObject
++  ): string {
+     if (!filter) {
+       return "*";
+     }
+ 
+-    // Only FilterExpression is supported in the advanced version
++    // A filter expression renders itself.
++    if (filter instanceof FilterExpression) {
++      return filter.toString();
++    }
++
++    // A plain object is rendered with the store's metadata schema.
+     if (
+       typeof filter === "object" &&
+-      "toString" in filter &&
+-      typeof filter.toString === "function"
++      !Array.isArray(filter) &&
++      this.customSchema
+     ) {
+-      // Use the filter expression's toString method
+-      return filter.toString();
++      return filtersFromObject(filter as MetadataFilterObject, this.customSchema);
+     }
+ 
+-    // If we get here, the filter is not a valid FilterExpression
++    // If we get here, the filter is not supported
+     throw new Error(
+-      "FluentRedisVectorStore only supports FilterExpression filters. " +
++      "FluentRedisVectorStore supports FilterExpression filters and " +
++        "plain metadata objects when a customSchema is defined. " +
+         "Use Tag(), Num(), Text(), Geo(), or Timestamp() to create filters. " +
+         "For simple string[] or string filters, use the basic RedisVectorStore instead."
+     );

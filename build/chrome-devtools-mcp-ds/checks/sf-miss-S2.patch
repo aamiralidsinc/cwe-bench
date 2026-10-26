@@ -1,0 +1,468 @@
+diff --git a/src/HeapSnapshotManager.ts b/src/HeapSnapshotManager.ts
+index c26f097..9fe5b83 100644
+--- a/src/HeapSnapshotManager.ts
++++ b/src/HeapSnapshotManager.ts
+@@ -35,6 +35,8 @@ export class HeapSnapshotManager {
+     }
+   >();
+ 
++  #pathGuard?: (filePath: string) => Promise<void>;
++
+   async getSnapshot(
+     filePath: string,
+   ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotProxy.HeapSnapshotProxy> {
+@@ -116,15 +118,17 @@ export class HeapSnapshotManager {
+     return `${path.resolve(filePath)}${suffix}`;
+   }
+ 
++  setPathGuard(guard: (filePath: string) => Promise<void>): void {
++    this.#pathGuard = guard;
++  }
++
+   async #readSummaryCache<T>(
+     filePath: string,
+     suffix: string,
+   ): Promise<T | undefined> {
++    const cachePath = this.#summaryCachePath(filePath, suffix);
+     try {
+-      const content = await fs.readFile(
+-        this.#summaryCachePath(filePath, suffix),
+-        'utf-8',
+-      );
++      const content = await fs.readFile(cachePath, 'utf-8');
+       return JSON.parse(content) as T;
+     } catch {
+       return undefined;
+@@ -136,12 +140,9 @@ export class HeapSnapshotManager {
+     suffix: string,
+     value: unknown,
+   ): Promise<void> {
++    const cachePath = this.#summaryCachePath(filePath, suffix);
+     try {
+-      await fs.writeFile(
+-        this.#summaryCachePath(filePath, suffix),
+-        JSON.stringify(value),
+-        'utf-8',
+-      );
++      await fs.writeFile(cachePath, JSON.stringify(value), 'utf-8');
+     } catch {
+       // Summary caching is best effort.
+     }
+diff --git a/src/McpContext.ts b/src/McpContext.ts
+index 8fd8327..6a63794 100644
+--- a/src/McpContext.ts
++++ b/src/McpContext.ts
+@@ -45,7 +45,7 @@ import type {
+   GeolocationOptions,
+   ExtensionServiceWorker,
+ } from './types.js';
+-import {ensureExtension, getTempFilePath} from './utils/files.js';
++import {ensureExtension, getTempFilePath, resolveCanonicalPath} from './utils/files.js';
+ import {getNetworkMultiplierFromString} from './WaitForHelper.js';
+ 
+ interface McpContextOptions {
+@@ -122,6 +122,9 @@ export class McpContext implements Context {
+       } as ListenerMap;
+     });
+     this.#devtoolsUniverseManager = new UniverseManager(this.browser);
++    this.#heapSnapshotManager.setPathGuard(async (candidate: string) => {
++      await this.validatePath(candidate);
++    });
+   }
+ 
+   async #init() {
+@@ -175,7 +178,7 @@ export class McpContext implements Context {
+     this.#roots = roots;
+   }
+ 
+-  validatePath(filePath?: string): void {
++  async validatePath(filePath?: string): Promise<void> {
+     if (filePath === undefined) {
+       return;
+     }
+@@ -183,12 +186,28 @@ export class McpContext implements Context {
+     if (roots === undefined) {
+       return;
+     }
+-    const absolutePath = path.resolve(filePath);
++
++    let canonicalPath: string;
++    try {
++      canonicalPath = await resolveCanonicalPath(filePath);
++    } catch (err) {
++      const message = err instanceof Error ? err.message : String(err);
++      throw new Error(
++        `Access denied: cannot resolve path ${filePath}: ${message}`,
++      );
++    }
++
+     for (const root of roots) {
+-      const rootPath = path.resolve(fileURLToPath(root.uri));
++      let canonicalRoot: string;
++      try {
++        canonicalRoot = await resolveCanonicalPath(fileURLToPath(root.uri));
++      } catch {
++        // A root that cannot be resolved is ignored; the others still apply.
++        continue;
++      }
+       if (
+-        absolutePath === rootPath ||
+-        absolutePath.startsWith(rootPath + path.sep)
++        canonicalPath === canonicalRoot ||
++        canonicalPath.startsWith(canonicalRoot + path.sep)
+       ) {
+         return;
+       }
+@@ -708,7 +727,7 @@ export class McpContext implements Context {
+     filename: string,
+   ): Promise<{filepath: string}> {
+     const filepath = await getTempFilePath(filename);
+-    this.validatePath(filepath);
++    await this.validatePath(filepath);
+     try {
+       await fs.writeFile(filepath, data);
+     } catch (err) {
+@@ -722,12 +741,12 @@ export class McpContext implements Context {
+     clientProvidedFilePath: string,
+     extension: SupportedExtensions,
+   ): Promise<{filename: string}> {
+-    this.validatePath(clientProvidedFilePath);
+     try {
+       const filePath = ensureExtension(
+         path.resolve(clientProvidedFilePath),
+         extension,
+       );
++      await this.validatePath(filePath);
+       await fs.mkdir(path.dirname(filePath), {recursive: true});
+       await fs.writeFile(filePath, data);
+       return {filename: filePath};
+@@ -794,12 +813,13 @@ export class McpContext implements Context {
+   }
+ 
+   async installExtension(extensionPath: string): Promise<string> {
+-    this.validatePath(extensionPath);
++    await this.validatePath(extensionPath);
+     const id = await this.browser.installExtension(extensionPath);
+     return id;
+   }
+ 
+   async reinstallExtension(extensionPath: string): Promise<string> {
++    await this.validatePath(extensionPath);
+     const id = await this.browser.installExtension(extensionPath);
+     return id;
+   }
+@@ -830,21 +850,21 @@ export class McpContext implements Context {
+   async getHeapSnapshotAggregates(
+     filePath: string,
+   ): Promise<Record<string, AggregatedInfoWithId>> {
+-    this.validatePath(filePath);
++    await this.validatePath(filePath);
+     return await this.#heapSnapshotManager.getAggregates(filePath);
+   }
+ 
+   async getHeapSnapshotStats(
+     filePath: string,
+   ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.Statistics> {
+-    this.validatePath(filePath);
++    await this.validatePath(filePath);
+     return await this.#heapSnapshotManager.getStats(filePath);
+   }
+ 
+   async getHeapSnapshotStaticData(
+     filePath: string,
+   ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.StaticData | null> {
+-    this.validatePath(filePath);
++    await this.validatePath(filePath);
+     return await this.#heapSnapshotManager.getStaticData(filePath);
+   }
+ 
+@@ -852,7 +872,7 @@ export class McpContext implements Context {
+     filePath: string,
+     id: number,
+   ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange> {
+-    this.validatePath(filePath);
++    await this.validatePath(filePath);
+     return await this.#heapSnapshotManager.getNodesById(filePath, id);
+   }
+ 
+@@ -860,6 +880,7 @@ export class McpContext implements Context {
+     filePath: string,
+     nodeId: number,
+   ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange> {
++    await this.validatePath(filePath);
+     return await this.#heapSnapshotManager.getRetainers(filePath, nodeId);
+   }
+ }
+diff --git a/src/tools/ToolDefinition.ts b/src/tools/ToolDefinition.ts
+index 1157280..abf385b 100644
+--- a/src/tools/ToolDefinition.ts
++++ b/src/tools/ToolDefinition.ts
+@@ -173,7 +173,7 @@ export type SupportedExtensions =
+  * Only add methods used by tools/*.
+  */
+ export type Context = Readonly<{
+-  validatePath(filePath?: string): void;
++  validatePath(filePath?: string): Promise<void>;
+   isRunningPerformanceTrace(): boolean;
+   setIsRunningPerformanceTrace(x: boolean): void;
+   isCruxEnabled(): boolean;
+diff --git a/src/tools/input.ts b/src/tools/input.ts
+index 7aa3ab1..7ff11e4 100644
+--- a/src/tools/input.ts
++++ b/src/tools/input.ts
+@@ -463,7 +463,7 @@ export const uploadFile = definePageTool({
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+     const {uid, filePath} = request.params;
+-    context.validatePath(filePath);
++    await context.validatePath(filePath);
+     const handle = (await request.page.getElementByUid(
+       uid,
+     )) as ElementHandle<HTMLInputElement>;
+diff --git a/src/tools/lighthouse.ts b/src/tools/lighthouse.ts
+index 84aacc7..da0a726 100644
+--- a/src/tools/lighthouse.ts
++++ b/src/tools/lighthouse.ts
+@@ -59,7 +59,7 @@ export const lighthouseAudit = definePageTool({
+       outputDirPath,
+     } = request.params;
+ 
+-    context.validatePath(outputDirPath);
++    await context.validatePath(outputDirPath);
+ 
+     const flags: Flags = {
+       onlyCategories: categories,
+diff --git a/src/tools/memory.ts b/src/tools/memory.ts
+index 3b9552d..d7d57e0 100644
+--- a/src/tools/memory.ts
++++ b/src/tools/memory.ts
+@@ -4,6 +4,8 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++import path from 'node:path';
++
+ import {zod} from '../third_party/index.js';
+ import {ensureExtension} from '../utils/files.js';
+ 
+@@ -25,10 +27,13 @@ export const takeHeapSnapshot = definePageTool({
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+     const page = request.page;
+-    context.validatePath(request.params.filePath);
++    const heapSnapshotPath = path.resolve(
++      ensureExtension(request.params.filePath, '.heapsnapshot'),
++    );
++    await context.validatePath(heapSnapshotPath);
+ 
+     await page.pptrPage.captureHeapSnapshot({
+-      path: ensureExtension(request.params.filePath, '.heapsnapshot'),
++      path: heapSnapshotPath,
+     });
+ 
+     response.appendResponseLine(
+@@ -51,7 +56,7 @@ export const getHeapSnapshotSummary = defineTool({
+   },
+   blockedByDialog: false,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     const stats = await context.getHeapSnapshotStats(request.params.filePath);
+     const staticData = await context.getHeapSnapshotStaticData(
+       request.params.filePath,
+@@ -83,7 +88,7 @@ export const getHeapSnapshotDetails = defineTool({
+   },
+   blockedByDialog: false,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     const aggregates = await context.getHeapSnapshotAggregates(
+       request.params.filePath,
+     );
+@@ -112,7 +117,7 @@ export const getHeapSnapshotClassNodes = defineTool({
+   },
+   blockedByDialog: false,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     const nodes = await context.getHeapSnapshotNodesById(
+       request.params.filePath,
+       request.params.id,
+@@ -142,7 +147,7 @@ export const getHeapSnapshotRetainers = defineTool({
+     pageSize: zod.number().optional().describe('The page size for pagination.'),
+   },
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+ 
+     const retainers = await context.getHeapSnapshotRetainers(
+       request.params.filePath,
+diff --git a/src/tools/network.ts b/src/tools/network.ts
+index ca17d47..1df56a8 100644
+--- a/src/tools/network.ts
++++ b/src/tools/network.ts
+@@ -116,8 +116,8 @@ export const getNetworkRequest = definePageTool({
+   },
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.requestFilePath);
+-    context.validatePath(request.params.responseFilePath);
++    await context.validatePath(request.params.requestFilePath);
++    await context.validatePath(request.params.responseFilePath);
+     if (request.params.reqid) {
+       response.attachNetworkRequest(request.params.reqid, {
+         requestFilePath: request.params.requestFilePath,
+diff --git a/src/tools/performance.ts b/src/tools/performance.ts
+index edd1bdf..a061c31 100644
+--- a/src/tools/performance.ts
++++ b/src/tools/performance.ts
+@@ -49,7 +49,7 @@ export const startTrace = definePageTool({
+   },
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     if (context.isRunningPerformanceTrace()) {
+       response.appendResponseLine(
+         'Error: a performance trace is already running. Use performance_stop_trace to stop it. Only one trace can be running at any given time.',
+@@ -128,7 +128,7 @@ export const stopTrace = definePageTool({
+   },
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     if (!context.isRunningPerformanceTrace()) {
+       return;
+     }
+diff --git a/src/tools/screencast.ts b/src/tools/screencast.ts
+index bb0583c..820007b 100644
+--- a/src/tools/screencast.ts
++++ b/src/tools/screencast.ts
+@@ -40,7 +40,6 @@ export const startScreencast = definePageTool(args => ({
+   },
+   blockedByDialog: false,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
+     if (context.getScreenRecorder() !== null) {
+       response.appendResponseLine(
+         'Error: a screencast recording is already in progress. Use screencast_stop to stop it before starting a new one.',
+@@ -64,6 +63,7 @@ export const startScreencast = definePageTool(args => ({
+       path.resolve(filePath),
+       enforcedExtension,
+     ) as `${string}.webm`;
++    await context.validatePath(resolvedPath);
+ 
+     const page = request.page;
+ 
+diff --git a/src/tools/screenshot.ts b/src/tools/screenshot.ts
+index d9476aa..746a6c1 100644
+--- a/src/tools/screenshot.ts
++++ b/src/tools/screenshot.ts
+@@ -52,7 +52,7 @@ export const screenshot = definePageTool({
+   },
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     if (request.params.uid && request.params.fullPage) {
+       throw new Error('Providing both "uid" and "fullPage" is not allowed.');
+     }
+diff --git a/src/tools/script.ts b/src/tools/script.ts
+index 0d5bb9e..a188ed2 100644
+--- a/src/tools/script.ts
++++ b/src/tools/script.ts
+@@ -81,7 +81,7 @@ Example with arguments: \`(el) => {
+         filePath,
+       } = request.params;
+ 
+-      context.validatePath(filePath);
++      await context.validatePath(filePath);
+ 
+       if (cliArgs?.categoryExtensions && serviceWorkerId) {
+         if (uidArgs && uidArgs.length > 0) {
+diff --git a/src/tools/snapshot.ts b/src/tools/snapshot.ts
+index 93f6937..8c0c90e 100644
+--- a/src/tools/snapshot.ts
++++ b/src/tools/snapshot.ts
+@@ -35,7 +35,7 @@ in the DevTools Elements panel (if any).`,
+   },
+   blockedByDialog: true,
+   handler: async (request, response, context) => {
+-    context.validatePath(request.params.filePath);
++    await context.validatePath(request.params.filePath);
+     response.includeSnapshot({
+       verbose: request.params.verbose ?? false,
+       filePath: request.params.filePath,
+diff --git a/src/utils/files.ts b/src/utils/files.ts
+index 00083df..6eec841 100644
+--- a/src/utils/files.ts
++++ b/src/utils/files.ts
+@@ -22,3 +22,68 @@ export function ensureExtension(
+   const ext = path.extname(filepath);
+   return filepath.slice(0, filepath.length - ext.length) + extension;
+ }
++
++const MAX_LINK_HOPS = 40;
++
++function isMissing(err: unknown): boolean {
++  return (
++    !!err &&
++    typeof err === 'object' &&
++    'code' in err &&
++    (err as {code?: string}).code === 'ENOENT'
++  );
++}
++
++/**
++ * Resolves every link along `absolutePath` and returns the location the
++ * filesystem would actually use. Unlike realpath(), this also resolves a link
++ * whose target does not exist yet: the write that follows must be checked
++ * against the location it would create, not against the link's own name.
++ */
++async function resolveCanonical(
++  absolutePath: string,
++  hops: number,
++): Promise<string> {
++  if (hops > MAX_LINK_HOPS) {
++    throw new Error(`Too many links while resolving ${absolutePath}`);
++  }
++
++  try {
++    return await fs.realpath(absolutePath);
++  } catch (err) {
++    if (!isMissing(err)) {
++      throw err;
++    }
++  }
++
++  // The final component does not exist (or is a link to something that does
++  // not exist). Inspect the component itself before falling back to its parent.
++  let stat;
++  try {
++    stat = await fs.lstat(absolutePath);
++  } catch (err) {
++    if (!isMissing(err)) {
++      throw err;
++    }
++    stat = undefined;
++  }
++
++  if (stat?.isSymbolicLink()) {
++    const target = await fs.readlink(absolutePath);
++    return await resolveCanonical(
++      path.resolve(path.dirname(absolutePath), target),
++      hops + 1,
++    );
++  }
++
++  const parent = path.dirname(absolutePath);
++  if (parent === absolutePath) {
++    throw new Error(`Cannot resolve path ${absolutePath}`);
++  }
++  const canonicalParent = await resolveCanonical(parent, hops + 1);
++  return path.join(canonicalParent, path.basename(absolutePath));
++}
++
++export async function resolveCanonicalPath(filePath: string): Promise<string> {
++  return await resolveCanonical(path.resolve(filePath), 0);
++}

@@ -1,0 +1,225 @@
+diff -ruN a/libs/langchain_v1/langchain/agents/middleware/file_search.py b/libs/langchain_v1/langchain/agents/middleware/file_search.py
+--- a/libs/langchain_v1/langchain/agents/middleware/file_search.py	2026-10-18 08:31:35.821501085 +0000
++++ b/libs/langchain_v1/langchain/agents/middleware/file_search.py	2026-10-18 08:32:55.277442356 +0000
+@@ -84,6 +84,11 @@
+     return any(fnmatch.fnmatch(basename, candidate) for candidate in expanded)
+ 
+ 
++def _has_parent_segment(value: str) -> bool:
++    """Return True if any path segment of `value` is exactly `..`."""
++    return any(segment == ".." for segment in re.split(r"[\\/]", value))
++
++
+ class FilesystemFileSearchMiddleware(AgentMiddleware[AgentState[ResponseT], ContextT, ResponseT]):
+     """Provides Glob and Grep search over filesystem files.
+ 
+@@ -157,12 +162,31 @@
+             if not base_full.exists() or not base_full.is_dir():
+                 return "No files found"
+ 
++            # Reject patterns that are absolute or walk upward out of the base
++            if (
++                not pattern
++                or pattern.startswith(("/", "\\"))
++                or Path(pattern).is_absolute()
++                or _has_parent_segment(pattern)
++            ):
++                return "No files found"
++
+             # Use pathlib glob
+             matching: list[tuple[str, str]] = []
+-            for match in base_full.glob(pattern):
++            try:
++                candidates = list(base_full.glob(pattern))
++            except (ValueError, NotImplementedError, OSError):
++                return "No files found"
++            for match in candidates:
++                # Skip anything (e.g. via symlinks) that resolves outside root
++                if not self._is_within_root(match):
++                    continue
+                 if match.is_file():
+                     # Convert to virtual path
+-                    virtual_path = "/" + str(match.relative_to(self.root_path))
++                    try:
++                        virtual_path = "/" + match.relative_to(self.root_path).as_posix()
++                    except ValueError:
++                        continue
+                     stat = match.stat()
+                     modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+                     matching.append((virtual_path, modified_at))
+@@ -240,7 +264,7 @@
+             path = "/" + path
+ 
+         # Check for path traversal
+-        if ".." in path or "~" in path:
++        if _has_parent_segment(path) or "~" in path or "\x00" in path:
+             msg = "Path traversal not allowed"
+             raise ValueError(msg)
+ 
+@@ -257,6 +281,14 @@
+ 
+         return full_path
+ 
++    def _is_within_root(self, candidate: Path) -> bool:
++        """Return True if `candidate` (after resolving symlinks) is inside root."""
++        try:
++            candidate.resolve().relative_to(self.root_path)
++        except (ValueError, OSError, RuntimeError):
++            return False
++        return True
++
+     def _ripgrep_search(
+         self, pattern: str, base_path: str, include: str | None
+     ) -> dict[str, list[tuple[int, str]]]:
+@@ -297,8 +329,15 @@
+                 data = json.loads(line)
+                 if data["type"] == "match":
+                     path = data["data"]["path"]["text"]
++                    match_path = Path(path)
++                    # Skip anything that resolves outside root (e.g. symlinks)
++                    if not self._is_within_root(match_path):
++                        continue
+                     # Convert to virtual path
+-                    virtual_path = "/" + str(Path(path).relative_to(self.root_path))
++                    try:
++                        virtual_path = "/" + match_path.relative_to(self.root_path).as_posix()
++                    except ValueError:
++                        continue
+                     line_num = data["data"]["line_number"]
+                     line_text = data["data"]["lines"]["text"].rstrip("\n")
+ 
+@@ -327,6 +366,10 @@
+ 
+         # Walk directory tree
+         for file_path in base_full.rglob("*"):
++            # Skip anything (e.g. via symlinks) that resolves outside root
++            if not self._is_within_root(file_path):
++                continue
++
+             if not file_path.is_file():
+                 continue
+ 
+@@ -346,7 +389,7 @@
+             # Search content
+             for line_num, line in enumerate(content.splitlines(), 1):
+                 if regex.search(line):
+-                    virtual_path = "/" + str(file_path.relative_to(self.root_path))
++                    virtual_path = "/" + file_path.relative_to(self.root_path).as_posix()
+                     if virtual_path not in results:
+                         results[virtual_path] = []
+                     results[virtual_path].append((line_num, line))
+diff -ruN a/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py b/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py
+--- a/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py	2026-10-18 08:31:35.877501044 +0000
++++ b/libs/partners/anthropic/langchain_anthropic/middleware/anthropic_tools.py	2026-10-18 08:33:09.877431583 +0000
+@@ -93,6 +93,27 @@
+     """Virtual file system for memory tools."""
+ 
+ 
++def _has_parent_segment(path: str) -> bool:
++    """Return `True` if any path segment is exactly `..`.
++
++    Names that merely contain dots (e.g. `v1..2.txt`) are not traversal.
++    """
++    return any(segment == ".." for segment in path.replace("\\", "/").split("/"))
++
++
++def _is_within_prefix(path: str, prefix: str) -> bool:
++    """Return `True` if `path` is `prefix` itself or a genuine descendant of it.
++
++    A sibling that merely shares leading characters (e.g. `/memories_evil` for
++    the prefix `/memories`) is not within the prefix.
++    """
++    base = prefix.rstrip("/")
++    if not base:
++        # Prefix is the root, everything (absolute) is inside it
++        return path.startswith("/")
++    return path == base or path.startswith(base + "/")
++
++
+ def _validate_path(path: str, *, allowed_prefixes: Sequence[str] | None = None) -> str:
+     """Validate and normalize file path for security.
+ 
+@@ -107,23 +128,24 @@
+         ValueError: If path contains traversal sequences or violates prefix rules.
+     """
+     # Reject paths with traversal attempts
+-    if ".." in path or path.startswith("~"):
++    if _has_parent_segment(path) or path.startswith("~") or "\x00" in path:
+         msg = f"Path traversal not allowed: {path}"
+         raise ValueError(msg)
+ 
+-    # Normalize path (resolve ., //, etc.)
+-    normalized = os.path.normpath(path)
+-
+     # Convert to forward slashes for consistency
+-    normalized = normalized.replace("\\", "/")
++    normalized = path.replace("\\", "/")
++
++    # Normalize path (resolve ., //, etc.)
++    normalized = os.path.normpath(normalized)
+ 
+-    # Ensure path starts with /
+-    if not normalized.startswith("/"):
+-        normalized = f"/{normalized}"
++    # Collapse any leading run of slashes (POSIX normpath keeps a leading `//`)
++    normalized = "/" + normalized.lstrip("/")
++    if normalized == "/.":
++        normalized = "/"
+ 
+     # Check allowed prefixes if specified
+     if allowed_prefixes is not None and not any(
+-        normalized.startswith(prefix) for prefix in allowed_prefixes
++        _is_within_prefix(normalized, prefix) for prefix in allowed_prefixes
+     ):
+         msg = f"Path must start with one of {allowed_prefixes}: {path}"
+         raise ValueError(msg)
+@@ -829,7 +851,7 @@
+             path = "/" + path
+ 
+         # Check for path traversal
+-        if ".." in path or "~" in path:
++        if _has_parent_segment(path) or "~" in path or "\x00" in path:
+             msg = "Path traversal not allowed"
+             raise ValueError(msg)
+ 
+@@ -838,18 +860,19 @@
+         relative = path.lstrip("/")
+         full_path = (self.root_path / relative).resolve()
+ 
+-        # Ensure path is within root
++        # Ensure path (after following symlinks) is within root
+         try:
+-            full_path.relative_to(self.root_path)
++            relative_resolved = full_path.relative_to(self.root_path)
+         except ValueError:
+             msg = f"Path outside root directory: {path}"
+             raise ValueError(msg) from None
+ 
+-        # Check allowed prefixes
+-        virtual_path = "/" + str(full_path.relative_to(self.root_path))
++        # Check allowed prefixes against the resolved location
++        rel_posix = relative_resolved.as_posix()
++        virtual_path = "/" if rel_posix in {"", "."} else "/" + rel_posix
+         if self.allowed_prefixes:
+             allowed = any(
+-                virtual_path.startswith(prefix) or virtual_path == prefix.rstrip("/")
++                _is_within_prefix(virtual_path, prefix)
+                 for prefix in self.allowed_prefixes
+             )
+             if not allowed:
+diff -ruN a/libs/partners/anthropic/langchain_anthropic/middleware/file_search.py b/libs/partners/anthropic/langchain_anthropic/middleware/file_search.py
+--- a/libs/partners/anthropic/langchain_anthropic/middleware/file_search.py	2026-10-18 08:31:35.877501044 +0000
++++ b/libs/partners/anthropic/langchain_anthropic/middleware/file_search.py	2026-10-18 08:33:17.961425621 +0000
+@@ -296,8 +296,11 @@
+         files = cast("dict[str, Any]", state.get(self.state_key, {}))
+         results: dict[str, list[tuple[int, str]]] = {}
+ 
++        base_dir = base_path.rstrip("/")
+         for file_path, file_data in files.items():
+-            if not file_path.startswith(base_path):
++            if base_dir and not (
++                file_path == base_dir or file_path.startswith(base_dir + "/")
++            ):
+                 continue
+ 
+             # Check include filter

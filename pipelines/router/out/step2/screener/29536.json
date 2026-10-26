@@ -1,0 +1,62 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "29536", "advisory_ids": ["GHSA-7PWQ-Q9JF-539H", "CVE-2026-55107"], "repo": "elct9620/kobako",
+  "pinned_commit": "97e3e9cc18b5230327690d2dcf66f25158cc5a7f",
+  "fix_commits": ["64f84700c81f44902bed9211318d5362f44987b3"],
+  "trust_decision": {
+    "summary": "At the host dispatch boundary a guest-supplied method name is untrusted: it must only select a method the bound object itself defines, never Ruby's ambient reflection surface (send/public_send/instance_eval/method/instance_variable_get/...), because public_send(:send, :eval, code) reaches private Kernel#eval and host RCE. Decided once, in Kobako::Transport::Dispatcher#invoke (fix.diff:30-41, guard added at fix.diff:49-58).",
+    "evidence": ["lib/kobako/transport/dispatcher.rb:111-117", "lib/kobako/transport/request.rb:38", "docs/security.md:29", "fix.diff:30-41"]
+  },
+  "landing_point": {
+    "where": "lib/kobako/transport/dispatcher.rb:114",
+    "why": "The summary's chain is 'method_missing -> public_send'; the only host-side public_send on a guest-supplied name is here (grep finds exactly two call sites, :114 and :116, both in invoke). The word 'method_missing' first sends a reader into the guest bridge (wasm/kobako/src/runtime/bridges.rs:113-138), which only builds the request and cannot invoke host code, so the sink is the Ruby dispatcher."
+  },
+  "fix_sites": [
+    {"where": "lib/kobako/transport/dispatcher.rb:111-118", "entry_point": "Kobako::Sandbox#eval / Sandbox#run guest code -> Runtime#on_dispatch lambda -> Kobako::Transport::Dispatcher.dispatch (public module function) -> invoke", "module_kind": "host transport dispatch boundary (guest->host call sink)"},
+    {"where": "fix.diff:49-58", "entry_point": "new reject_meta_method! called from invoke at the same boundary", "module_kind": "same file, new private module function (guard)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "docs/security.md:29 states the guarantee as 'only public methods of a bound object are reachable; send/public_send do not bypass this', so a solver can argue the named method IS public and the documented contract is already met; and because every guest name, from both Member classes and Handle instances, funnels through the single invoke sink, hardening that one place looks complete and the unvalidated guest-side request producer (wasm/kobako-core) looks outside the gem's trust boundary.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A dispatch to a name the bound object does not implement is documented to surface as host NoMethodError -> ServiceError type=\"runtime\" (E-11), explicitly distinct from type=\"undefined\" (E-12 target resolution); the published fix routes 'no public method and no respond_to?' into UndefinedTargetError, i.e. type=\"undefined\", changing that documented taxonomy (docs/behavior.md:405, and encode_caught_error at lib/kobako/transport/dispatcher.rb:89-96). Second, near-sink break: docs/security.md:65 legitimately binds a Class (AppConfig); with Module/Class in META_OWNERS (fix.diff:21) every Module-owned method of such a Service (name, ancestors, ===) becomes uncallable, so a target-kind-aware fix is needed rather than a blanket owner check.",
+    "where": "docs/behavior.md:405"
+  },
+  "O6_input_shapes": [
+    "method name arriving as an arbitrary String on the wire (Request#method_name is only type-checked as a String at lib/kobako/transport/request.rb:38), converted with to_sym before either call",
+    "both invoke branches: empty kwargs (no ** splat) and non-empty kwargs, which were two separate public_send call sites at lib/kobako/transport/dispatcher.rb:114 and :116",
+    "both target kinds that reach the same invoke: String Member path (resolve_path) and Kobako::Handle target (resolve_handle), lib/kobako/transport/dispatcher.rb:140-157",
+    "concretely-defined meta methods (public_method(name).owner in META_OWNERS: send, __send__, public_send, instance_eval, instance_exec, eval, method, tap, instance_variable_get, class) versus a name with no public method (NameError branch -> respond_to? opt-in for dynamic method_missing Services)"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "wasm/kobako-core/src/transport/proxy.rs:155-162", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "lib/kobako/sandbox.rb:171", "sibling": "a host-side Sandbox#call(member, method, *args) convenience that invokes a bound Member directly without the wire", "why_realistic": "the gem already has the symmetric #run for host->guest entrypoints (lib/kobako/transport/run.rb), so a directly-invoking counterpart on the host side reads as the obvious ergonomic addition, and it would re-implement invocation outside Dispatcher#invoke where the guard lives"},
+    {"where": "lib/kobako/transport/yielder.rb:70", "sibling": "a Yielder that hands the guest a proxy for the yielding Service back into the same object (guest-block callback into the host object)", "why_realistic": "the block round-trip already re-enters the guest (B-23/B-24); letting the guest call methods on the yielding Service from inside the yield is the natural next feature, and its invocation path would be a second caller of a public_send-style sink"},
+    {"where": "wasm/kobako-core/src/transport/proxy.rs:148", "sibling": "the same name check placed guest-side in forward_to_dispatch/proxy::invoke, ahead of the wire", "why_realistic": "the guest proxy already blocks construction of Member/Handle locally (B-38/B-39, wasm/kobako/src/runtime/bridges.rs:146-184), so a maintainer hardening the same property would plausibly add a guest-side reserved-name filter and leave the host-side check to be re-derived"},
+    {"where": "lib/kobako/catalog/handles.rb:72", "sibling": "a Handles#call(id, method, *args) helper that resolves an id and invokes the object", "why_realistic": "fetch already returns the live host object and dispatch already treats a Handle as a target (lib/kobako/transport/dispatcher.rb:155-157); a table-level invoke is the kind of small refactor a maintainer makes when another layer needs 'call this handle'"}
+  ],
+  "O9_family": "unsafe reflection / guest-controlled method selection into a host object (CWE-470) leading to host code injection (CWE-94), i.e. sandbox escape to host RCE",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Ruby host gem plus Rust (magnus/wasmtime) native ext and a Rust->wasm32 guest crate",
+    "toolchain": "Ruby + bundler (msgpack, rb_sys per kobako.gemspec:72-76); cargo for ext/kobako (wasmtime/magnus, long native compile); beni + wasi-sdk + vendored mruby via rake beni:build to produce data/kobako.wasm, which is gitignored and absent at the pinned commit (only data/.keep), see Rakefile:18-60",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/transport/test_dispatcher.rb is a pure-Ruby unit suite over Dispatcher.dispatch that runs without the native ext (test/test_helper.rb:10-28 requires kobako/sandbox on LoadError) and covers this exact sink; test/test_e2e_journeys.rb needs the built data/kobako.wasm; test/catalog/* covers the registries"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["tiny_repo", "single_site", "protection_documented_without_exceptions"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 0, "j_sites_touched": "lib/kobako/transport/dispatcher.rb", "j_sibling_sites": "no", "j_cause_other_layer": 0, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Denylist a handful of literal method names (send, public_send, instance_eval, eval) by string comparison and guard only the empty-kwargs public_send branch at lib/kobako/transport/dispatcher.rb:114."},
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo size in MB: no shell available to measure, so repo_mb is null; tiny_repo is asserted from the ~300-file Ruby/Rust/Markdown tree (well under 5 MB), not from a measured byte count",
+    "latest code: the task supplies no latest release/tree, so present_in_latest is 'unknown' for O8 and no latest_where could be cited",
+    "O4 files/packages measure distance to the request producer (wasm/kobako/src/runtime/bridges.rs -> wasm/kobako-core/src/transport/proxy.rs) because O2 is none and O8 is empty",
+    "whether any existing test at the pinned commit depends on the documented type=\"runtime\" path for an unimplemented method: no such test was found by grep, but the full e2e suite was not read",
+    "build time and whether rake beni:build / the wasmtime ext compile succeed in a container: not attempted (no running of project code permitted)"
+  ]
+}

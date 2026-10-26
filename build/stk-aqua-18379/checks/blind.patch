@@ -1,0 +1,116 @@
+diff -ruN a/pkg/unarchive/archives.go b/pkg/unarchive/archives.go
+--- a/pkg/unarchive/archives.go	2026-10-26 03:33:10.000000000 +0000
++++ b/pkg/unarchive/archives.go	2026-10-26 03:55:18.569042505 +0000
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -15,6 +16,24 @@
+ 	"github.com/suzuki-shunsuke/slog-error/slogerr"
+ )
+ 
++// errOutsideDest is returned when an entry of a downloaded archive would create a
++// file, a directory or a link outside the package's install directory.
++var errOutsideDest = errors.New("an archive entry points outside the install directory")
++
++// confined reports whether p stays within root once both are cleaned, so that a
++// directory whose name merely shares root's prefix (root-sibling) does not count
++// as being inside root.
++func confined(root, p string) bool {
++	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(p))
++	if err != nil {
++		return false
++	}
++	if rel == "." {
++		return true
++	}
++	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
++}
++
+ type handler struct {
+ 	fs       afero.Fs
+ 	dest     string
+@@ -23,11 +42,19 @@
+ }
+ 
+ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
++	// Decide containment on the joined, cleaned path that is actually used below,
++	// and do it before anything is created, so that a refused entry leaves no
++	// directory or file behind outside the install directory.
+ 	dstPath := filepath.Join(h.dest, h.normalizePath(f.NameInArchive))
++	if !confined(h.dest, dstPath) {
++		return fmt.Errorf("%w: %q", errOutsideDest, f.NameInArchive)
++	}
+ 	parentDir := filepath.Dir(dstPath)
+-	if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
+-		slogerr.WithError(h.logger, err).Warn("create a directory")
+-		return nil
++	if confined(h.dest, parentDir) {
++		if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
++			slogerr.WithError(h.logger, err).Warn("create a directory")
++			return nil
++		}
+ 	}
+ 
+ 	if f.IsDir() {
+@@ -39,15 +66,8 @@
+ 	}
+ 
+ 	if f.LinkTarget != "" {
+-		if f.Mode()&os.ModeSymlink != 0 {
+-			if err := os.Symlink(f.LinkTarget, dstPath); err != nil {
+-				slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", f.LinkTarget, "link_dest", dstPath)
+-				return nil
+-			}
+-			return nil
+-		}
+-		if err := os.Link(filepath.Join(h.dest, h.normalizePath(f.LinkTarget)), dstPath); err != nil {
+-			slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", f.LinkTarget, "link_dest", dstPath)
++		if err := h.handleLink(dstPath, f.LinkTarget, f.Mode()&os.ModeSymlink != 0); err != nil {
++			return err
+ 		}
+ 		return nil
+ 	}
+@@ -83,6 +103,38 @@
+ 	}
+ 	return nil
+ }
++
++// handleLink creates a link entry. The link target is checked before the link is
++// created: a symlink target is interpreted the way the operating system will
++// interpret it, relative to the directory that holds the link, while a hard link
++// target is a name relative to the install directory. A link that would point
++// outside the install directory is refused, because a later entry could otherwise
++// be written through it. Targets that do not exist yet are still accepted, as
++// packages legitimately ship dangling relative links.
++func (h *handler) handleLink(linkPath, linkTarget string, symlink bool) error {
++	target := h.normalizePath(linkTarget)
++	if symlink {
++		pointedAt := target
++		if !filepath.IsAbs(pointedAt) {
++			pointedAt = filepath.Join(filepath.Dir(linkPath), pointedAt)
++		}
++		if !confined(h.dest, pointedAt) {
++			return fmt.Errorf("%w: symlink %q -> %q", errOutsideDest, linkPath, linkTarget)
++		}
++		if err := os.Symlink(linkTarget, linkPath); err != nil {
++			slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", linkTarget, "link_dest", linkPath)
++		}
++		return nil
++	}
++	targetPath := filepath.Join(h.dest, target)
++	if !confined(h.dest, targetPath) {
++		return fmt.Errorf("%w: hard link %q -> %q", errOutsideDest, linkPath, linkTarget)
++	}
++	if err := os.Link(targetPath, linkPath); err != nil {
++		slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", linkTarget, "link_dest", linkPath)
++	}
++	return nil
++}
+ 
+ func (h *handler) normalizePath(nameInArchive string) string {
+ 	slashCount := strings.Count(nameInArchive, "/")

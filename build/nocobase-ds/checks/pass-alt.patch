@@ -1,0 +1,380 @@
+diff --git a/packages/core/server/src/plugin-manager/options/plugin-info.ts b/packages/core/server/src/plugin-manager/options/plugin-info.ts
+index bc58bfa24..2e0509b46 100644
+--- a/packages/core/server/src/plugin-manager/options/plugin-info.ts
++++ b/packages/core/server/src/plugin-manager/options/plugin-info.ts
+@@ -10,6 +10,7 @@
+ import { Context, Next } from '@nocobase/actions';
+ import fse from 'fs-extra';
+ import path from 'path';
++import { assertSafePluginPackageName } from '../utils';
+ 
+ export async function pluginInfo(ctx: Context, next: Next) {
+   const { filterByTk, values = {} } = ctx.action.params;
+@@ -18,6 +19,12 @@ export async function pluginInfo(ctx: Context, next: Next) {
+     ctx.throw(400, 'plugin name invalid');
+   }
+ 
++  try {
++    assertSafePluginPackageName(packageName);
++  } catch (error) {
++    return ctx.throw(400, (error as Error).message);
++  }
++
+   const packageFile = path.resolve(process.env.NODE_MODULES_PATH, packageName, 'package.json');
+   if (!(await fse.exists(packageFile))) {
+     ctx.throw(404, 'plugin package not found');
+diff --git a/packages/core/server/src/plugin-manager/plugin-manager.ts b/packages/core/server/src/plugin-manager/plugin-manager.ts
+index 52a664e7f..4dfce8685 100644
+--- a/packages/core/server/src/plugin-manager/plugin-manager.ts
++++ b/packages/core/server/src/plugin-manager/plugin-manager.ts
+@@ -25,6 +25,7 @@ import resourceOptions from './options/resource';
+ import { PluginManagerRepository } from './plugin-manager-repository';
+ import { PluginData } from './types';
+ import {
++  assertSafePluginPackageName,
+   checkAndGetCompatible,
+   copyTempPackageToStorageAndLinkToNodeModules,
+   downloadAndUnzipToTempDir,
+@@ -210,6 +211,7 @@ export class PluginManager {
+    */
+   static async resolvePlugin(pluginName: string | typeof Plugin, isUpgrade = false, isPkg = false) {
+     if (typeof pluginName === 'string') {
++      assertSafePluginPackageName(pluginName);
+       const { packageName } = await this.parseName(pluginName);
+       return await importModule(packageName);
+     } else {
+@@ -547,6 +549,11 @@ export class PluginManager {
+ 
+   async enable(nameOrPkg: string | string[]) {
+     let pluginNames = nameOrPkg;
++    if (nameOrPkg !== '*') {
++      for (const item of _.castArray(nameOrPkg)) {
++        assertSafePluginPackageName(item);
++      }
++    }
+     if (nameOrPkg === '*') {
+       const plugin = this.get('nocobase') as any;
+       pluginNames = await plugin.findLocalPlugins();
+@@ -728,6 +735,9 @@ export class PluginManager {
+ 
+   async remove(name: string | string[], options?: { removeDir?: boolean; force?: boolean }) {
+     const names = _.castArray(name);
++    for (const nameOrPkg of names) {
++      assertSafePluginPackageName(nameOrPkg);
++    }
+     const pluginNames = [];
+     const records = [];
+     for (const nameOrPkg of names) {
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/attachments.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/attachments.ts
+index 936cd57ec..358dd9106 100644
+--- a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/attachments.ts
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/attachments.ts
+@@ -23,7 +23,7 @@ import {
+   STORAGE_TYPE_LOCAL,
+ } from '../../constants';
+ import { StorageClassType, StorageType } from '../storages';
+-import { getDocumentRoot, resolveSafePath } from '../storages/local';
++import { getDocumentRoot, normalizeLocalStoragePath, resolveSafePath } from '../storages/local';
+ 
+ function makeMulterStorage(storage: StorageType) {
+   const innerStorage = storage.make();
+@@ -229,10 +229,10 @@ export async function createMiddleware(ctx: Context, next: Next) {
+       const filePath = values?.path ?? '';
+       const filename = values?.filename ?? '';
+       try {
+-        resolveSafePath(getDocumentRoot(storage), filePath, filename);
++        resolveSafePath(getDocumentRoot(storage), normalizeLocalStoragePath(filePath), filename);
+       } catch (error) {
+         if ((error as NodeJS.ErrnoException).code === 'PATH_TRAVERSAL') {
+-          return ctx.throw(400, error);
++          return ctx.throw(400, (error as Error).message);
+         }
+         throw error;
+       }
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/index.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/index.ts
+index bca927d51..118a0e42e 100644
+--- a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/index.ts
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/index.ts
+@@ -9,6 +9,7 @@
+ 
+ import actions from '@nocobase/actions';
+ import { createMiddleware } from './attachments';
++import { validateStorageMiddleware } from './storage-validation';
+ import * as storageActions from './storages';
+ 
+ export default function ({ app }) {
+@@ -16,6 +17,19 @@ export default function ({ app }) {
+     name: 'storages',
+     actions: storageActions,
+   });
++  app.resourcer.use(
++    async (ctx, next) => {
++      const { resourceName, actionName } = ctx.action;
++      if (
++        resourceName === 'storages' &&
++        ['create', 'update', 'updateOrCreate', 'firstOrCreate'].includes(actionName)
++      ) {
++        return validateStorageMiddleware(ctx, next);
++      }
++      return next();
++    },
++    { after: 'auth' },
++  );
+   app.resourcer.use(createMiddleware, { tag: 'createMiddleware', after: 'auth' });
+   app.resourcer.registerActionHandler('upload', actions.create);
+   app.resourcer.use(
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storage-validation.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storage-validation.ts
+new file mode 100644
+index 000000000..0ccd6627f
+--- /dev/null
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storage-validation.ts
+@@ -0,0 +1,74 @@
++/**
++ * This file is part of the NocoBase (R) project.
++ * Copyright (c) 2020-2024 NocoBase Co., Ltd.
++ * Authors: NocoBase Team.
++ *
++ * This project is dual-licensed under AGPL-3.0 and NocoBase Commercial License.
++ * For more information, please refer to: https://www.nocobase.com/agreement.
++ */
++
++import { Context, Next } from '@nocobase/actions';
++
++import { validateLocalStorageConfig } from '../storages/local';
++
++const WRITE_ACTIONS = ['create', 'update', 'updateOrCreate', 'firstOrCreate'];
++
++export async function validateStorageMiddleware(ctx: Context, next: Next) {
++  const { actionName, params } = ctx.action;
++  if (!WRITE_ACTIONS.includes(actionName)) {
++    return next();
++  }
++
++  const values = params.values || {};
++  const submittedOptions = values.options && typeof values.options === 'object' ? values.options : {};
++  const hasSubmittedDocumentRoot = Object.prototype.hasOwnProperty.call(submittedOptions, 'documentRoot');
++
++  let storage: any = { ...values };
++
++  if (actionName !== 'create') {
++    const repository = ctx.db.getRepository('storages');
++    let existing: any;
++    if (params.filterByTk) {
++      existing = await repository.findById(params.filterByTk);
++      if (!existing) {
++        existing = await repository.findOne({
++          filter: {
++            name: params.filterByTk,
++          },
++        });
++      }
++    } else if (Array.isArray(params.filterKeys) && params.filterKeys.length) {
++      const filter = {};
++      for (const key of params.filterKeys) {
++        if (key in values) {
++          filter[key] = values[key];
++        }
++      }
++      if (Object.keys(filter).length) {
++        existing = await repository.findOne({ filter });
++      }
++    }
++    if (existing) {
++      const existingValues = existing.toJSON();
++      storage = {
++        ...existingValues,
++        ...values,
++        options: {
++          ...(existingValues.options || {}),
++          ...submittedOptions,
++        },
++      };
++    }
++  }
++
++  try {
++    validateLocalStorageConfig(storage, { validateDocumentRoot: hasSubmittedDocumentRoot });
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'PATH_TRAVERSAL') {
++      return ctx.throw(400, (error as Error).message);
++    }
++    throw error;
++  }
++
++  await next();
++}
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storages.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storages.ts
+index 2b21f70c3..cce7ab628 100644
+--- a/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storages.ts
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/actions/storages.ts
+@@ -10,7 +10,12 @@
+ import { promises as fs } from 'fs';
+ import path from 'path';
+ import Plugin from '..';
+-import { getDocumentRoot } from '../storages/local';
++import {
++  getDocumentRoot,
++  isAllowedDocumentRoot,
++  normalizeLocalStoragePath,
++  resolveSafePath,
++} from '../storages/local';
+ 
+ export async function getBasicInfo(context, next) {
+   const { storagesCache } = context.app.pm.get(Plugin) as Plugin;
+@@ -99,7 +104,21 @@ export async function probe(context, next) {
+   }
+ 
+   const documentRoot = values.documentRoot || getDocumentRoot(storage);
+-  const targetPath = path.resolve(documentRoot, values.path || '');
++  let targetPath: string;
++  try {
++    if (values.documentRoot && !isAllowedDocumentRoot(values.documentRoot)) {
++      const error = new Error('Invalid local storage document root') as NodeJS.ErrnoException;
++      error.code = 'PATH_TRAVERSAL';
++      throw error;
++    }
++    targetPath = resolveSafePath(documentRoot, normalizeLocalStoragePath(values.path));
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'PATH_TRAVERSAL') {
++      return context.throw(400, (error as Error).message);
++    }
++    throw error;
++  }
++
+   await fs.mkdir(targetPath, { recursive: true });
+   await fs.writeFile(path.join(targetPath, '.nocobase-storage-probe'), String(Date.now()));
+ 
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/server.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/server.ts
+index 5e36b3a77..4eba53cd6 100644
+--- a/packages/plugins/@nocobase/plugin-file-manager/src/server/server.ts
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/server.ts
+@@ -20,7 +20,7 @@ import initActions from './actions';
+ import { AttachmentInterface } from './interfaces/attachment-interface';
+ import { AttachmentModel, GetFileStreamOptions, StorageClassType, StorageModel } from './storages';
+ import StorageTypeAliOss from './storages/ali-oss';
+-import StorageTypeLocal from './storages/local';
++import StorageTypeLocal, { validateLocalStorageConfig } from './storages/local';
+ import StorageTypeS3 from './storages/s3';
+ import StorageTypeTxCos from './storages/tx-cos';
+ import { encodeURL } from './utils';
+@@ -232,6 +232,9 @@ export class PluginFileManagerServer extends Plugin {
+     this.storageTypes.register(STORAGE_TYPE_TX_COS, StorageTypeTxCos);
+ 
+     const Storage = this.db.getModel('storages');
++    Storage.beforeSave((m) => {
++      validateLocalStorageConfig(m.toJSON());
++    });
+     Storage.afterSave(async (m, { transaction }) => {
+       await this.loadStorages({ transaction });
+       this.sendSyncMessage({ type: 'reloadStorages' }, { transaction });
+diff --git a/packages/plugins/@nocobase/plugin-file-manager/src/server/storages/local.ts b/packages/plugins/@nocobase/plugin-file-manager/src/server/storages/local.ts
+index 987120706..be9b3dd04 100644
+--- a/packages/plugins/@nocobase/plugin-file-manager/src/server/storages/local.ts
++++ b/packages/plugins/@nocobase/plugin-file-manager/src/server/storages/local.ts
+@@ -20,25 +20,83 @@ import { diskFilenameGetter } from '../utils';
+ 
+ const DEFAULT_BASE_URL = '/storage/uploads';
+ 
++function pathError(message: string) {
++  const error = new Error(message) as NodeJS.ErrnoException;
++  error.code = 'PATH_TRAVERSAL';
++  return error;
++}
++
++function isInside(base: string, target: string) {
++  const relative = path.relative(base, target);
++  return !relative.startsWith('..') && !path.isAbsolute(relative);
++}
++
++function resolveDocumentRoot(documentRoot: unknown) {
++  if (typeof documentRoot !== 'string' || !documentRoot || documentRoot.includes('\0')) {
++    throw pathError('Invalid local storage document root');
++  }
++  return path.resolve(path.isAbsolute(documentRoot) ? documentRoot : path.join(process.cwd(), documentRoot));
++}
++
++function allowedRoots() {
++  const roots = [path.resolve(process.cwd(), 'storage')];
++  const extra = [process.env.LOCAL_STORAGE_DEST, ...(process.env.LOCAL_STORAGE_ALLOWED_ROOTS?.split(',') ?? [])];
++  for (const item of extra) {
++    if (item?.trim()) {
++      roots.push(resolveDocumentRoot(item.trim()));
++    }
++  }
++  return roots;
++}
++
++export function isAllowedDocumentRoot(documentRoot: unknown) {
++  const root = resolveDocumentRoot(documentRoot);
++  return allowedRoots().some((allowed) => isInside(allowed, root));
++}
++
++export function normalizeLocalStoragePath(storagePath?: unknown) {
++  if (storagePath == null || storagePath === '') {
++    return '';
++  }
++  if (typeof storagePath !== 'string' || storagePath.includes('\0')) {
++    throw pathError('Invalid local storage path');
++  }
++  return storagePath.replace(/\\/g, '/').replace(/^\/+/, '');
++}
++
+ export function getDocumentRoot(storage): string {
+   const { documentRoot = process.env.LOCAL_STORAGE_DEST || path.join(process.cwd(), 'storage', 'uploads') } =
+     storage.options || {};
+   // TODO(feature): 后面考虑以字符串模板的方式使用，可注入 req/action 相关变量，以便于区分文件夹
+-  return path.resolve(path.isAbsolute(documentRoot) ? documentRoot : path.join(process.cwd(), documentRoot));
++  return resolveDocumentRoot(documentRoot);
+ }
+ 
+ export function resolveSafePath(documentRoot: string, filePath?: string, filename?: string) {
+   const root = path.resolve(documentRoot);
+   const target = path.resolve(root, filePath || '', filename || '');
+-  const relative = path.relative(root, target);
+-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+-    const error = new Error('Access denied');
+-    (error as NodeJS.ErrnoException).code = 'PATH_TRAVERSAL';
+-    throw error;
++  if (!isInside(root, target)) {
++    throw pathError('Access denied');
+   }
+   return target;
+ }
+ 
++export function validateLocalStorageConfig(
++  storage: { type?: string; options?: any; path?: unknown },
++  { validateDocumentRoot = false }: { validateDocumentRoot?: boolean } = {},
++) {
++  const isLocal = storage.type === STORAGE_TYPE_LOCAL;
++  if (!isLocal && !validateDocumentRoot) {
++    return;
++  }
++  const root = getDocumentRoot(storage);
++  if (validateDocumentRoot && !allowedRoots().some((allowed) => isInside(allowed, root))) {
++    throw pathError('Invalid local storage document root');
++  }
++  if (isLocal) {
++    resolveSafePath(root, normalizeLocalStoragePath(storage.path));
++  }
++}
++
+ export default class extends StorageType {
+   static defaults() {
+     return {
+@@ -59,7 +117,15 @@ export default class extends StorageType {
+   make() {
+     return multer.diskStorage({
+       destination: (req, file, cb) => {
+-        const destPath = path.join(getDocumentRoot(this.storage), this.storage.path || '');
++        let destPath: string;
++        try {
++          destPath = resolveSafePath(
++            getDocumentRoot(this.storage),
++            normalizeLocalStoragePath(this.storage.path),
++          );
++        } catch (error) {
++          return cb(error);
++        }
+         const mkdirp = require('mkdirp');
+         mkdirp(destPath, (err: Error | null) => cb(err, destPath));
+       },

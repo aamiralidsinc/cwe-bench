@@ -1,0 +1,125 @@
+diff --git a/kafka/codec.py b/kafka/codec.py
+index e523f422..479fe9fc 100644
+--- a/kafka/codec.py
++++ b/kafka/codec.py
+@@ -8,6 +8,21 @@ _XERIAL_V1_HEADER = (-126, b'S', b'N', b'A', b'P', b'P', b'Y', 0, 1, 1)
+ _XERIAL_V1_FORMAT = 'bccccccBii'
+ ZSTD_MAX_OUTPUT_SIZE = 1024 * 1024
+ 
++# Upper bound on the output of any single decompression call.  A broker's
++# response is bounded by the frame size, but compressed data can expand without
++# limit; a small payload must not be able to make the client allocate an
++# arbitrarily large buffer.  The bound is generous enough for the largest
++# batches a consumer legitimately asks for (fetch_max_bytes defaults to 50 MB).
++MAX_DECOMPRESSED_SIZE = 1024 * 1024
++
++
++def _check_decompressed_size(data):
++    if len(data) > MAX_DECOMPRESSED_SIZE:
++        raise ValueError(
++            'Decompressed payload exceeds the maximum allowed size '
++            '(%d > %d bytes)' % (len(data), MAX_DECOMPRESSED_SIZE))
++    return data
++
+ try:
+     import snappy
+ except ImportError:
+@@ -98,7 +113,10 @@ def gzip_decode(payload):
+     # so old-fashioned way until we decide to not support 2.6
+     gzipper = gzip.GzipFile(fileobj=buf, mode='r')
+     try:
+-        return gzipper.read()
++        # Read at most one byte past the bound, so a decompression bomb is
++        # refused before the whole expanded stream is materialized.
++        data = gzipper.read(MAX_DECOMPRESSED_SIZE + 1)
++        return _check_decompressed_size(data)
+     finally:
+         gzipper.close()
+ 
+@@ -217,9 +235,9 @@ def snappy_decode(payload):
+             cursor = end
+ 
+         out.seek(0)
+-        return out.read()
++        return _check_decompressed_size(out.read())
+     else:
+-        return snappy.decompress(payload)
++        return _check_decompressed_size(snappy.decompress(payload))
+ 
+ 
+ if lz4:
+@@ -243,11 +261,12 @@ def lz4f_decode(payload):
+     # actually read if the decompression was only partial.
+     if data['next'] != 0:
+         raise RuntimeError('lz4f unable to decompress full payload')
+-    return data['decomp']
++    return _check_decompressed_size(data['decomp'])
+ 
+ 
+ if lz4:
+-    lz4_decode = lz4.decompress # pylint: disable-msg=no-member
++    def lz4_decode(payload):
++        return _check_decompressed_size(lz4.decompress(payload))
+ elif lz4f:
+     lz4_decode = lz4f_decode
+ elif lz4framed:
+@@ -320,4 +339,5 @@ def zstd_decode(payload):
+     if not zstd:
+         raise NotImplementedError("Zstd codec is not available")
+     with zstd.ZstdDecompressor().stream_reader(io.BytesIO(payload), read_across_frames=True) as reader:
+-        return reader.read()
++        data = reader.read(MAX_DECOMPRESSED_SIZE + 1)
++    return _check_decompressed_size(data)
+diff --git a/kafka/record/legacy_records.py b/kafka/record/legacy_records.py
+index b0aff1c1..2953d072 100644
+--- a/kafka/record/legacy_records.py
++++ b/kafka/record/legacy_records.py
+@@ -229,7 +229,11 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
+         while pos < buffer_len:
+             header = self._read_header(pos)
+             msgs.append((header, pos))
+-            pos += self.LOG_OVERHEAD + header[1]  # length
++            length = header[1]
++            if length < 0 or pos + self.LOG_OVERHEAD + length > buffer_len:
++                raise CorruptRecordError(
++                    "Invalid message length %d in compressed message set" % (length,))
++            pos += self.LOG_OVERHEAD + length
+         return msgs
+ 
+     def _read_key_value(self, pos):
+diff --git a/kafka/sasl/scram.py b/kafka/sasl/scram.py
+index 57624ec0..e1677be8 100644
+--- a/kafka/sasl/scram.py
++++ b/kafka/sasl/scram.py
+@@ -10,6 +10,12 @@ from kafka.sasl.abc import SaslMechanism
+ 
+ log = logging.getLogger(__name__)
+ 
++# Bounds on the work a broker-chosen SCRAM handshake may request.  Real
++# deployments use salts of 16-64 bytes and iteration counts in the thousands to
++# tens of thousands; anything beyond these bounds is a resource-exhaustion attempt.
++MAX_SCRAM_ITERATIONS = 1000000
++MAX_SCRAM_SALT_SIZE = 4096
++
+ 
+ def xor_bytes(left, right):
+     return bytes(lb ^ rb for lb, rb in zip(left, right))
+@@ -99,7 +105,17 @@ class ScramClient:
+         self.auth_message += b',c=biws,r=' + self.nonce
+ 
+         salt = base64.b64decode(params['s'].encode('utf-8'))
+-        iterations = int(params['i'])
++        if len(salt) > MAX_SCRAM_SALT_SIZE:
++            raise ValueError(
++                'Invalid value (too large) for Salt in server-first-message')
++        try:
++            iterations = int(params['i'])
++        except (TypeError, ValueError):
++            raise ValueError(
++                'Invalid value (not integer) for Iteration count in server-first-message')
++        if iterations < 1 or iterations > MAX_SCRAM_ITERATIONS:
++            raise ValueError(
++                'Invalid value (out of range) for Iteration count in server-first-message')
+         self.create_salted_password(salt, iterations)
+ 
+         self.client_key = self.hmac(self.salted_password, b'Client Key')

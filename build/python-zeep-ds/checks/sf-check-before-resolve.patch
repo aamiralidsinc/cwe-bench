@@ -1,0 +1,241 @@
+diff -ruN a/src/zeep/exceptions.py b/src/zeep/exceptions.py
+--- a/src/zeep/exceptions.py	2026-06-18 16:00:03.000000000 +0000
++++ b/src/zeep/exceptions.py	2026-10-24 05:26:55.992849054 +0000
+@@ -114,3 +114,12 @@
+     def __str__(self):
+         tpl = "EntitiesForbidden(name='{}', content={!r})"
+         return tpl.format(self.name, self.content)
++
++
++class ExternalReferenceForbidden(Error):
++    def __init__(self, url):
++        super().__init__("External reference to %r is forbidden" % (url,))
++        self.url = url
++
++    def __str__(self):
++        return "ExternalReferenceForbidden(url=%r)" % (self.url,)
+diff -ruN a/src/zeep/loader.py b/src/zeep/loader.py
+--- a/src/zeep/loader.py	2026-06-18 16:00:03.000000000 +0000
++++ b/src/zeep/loader.py	2026-10-24 05:30:04.960669443 +0000
+@@ -5,18 +5,26 @@
+ from lxml import etree
+ from lxml.etree import Resolver, XMLParser, XMLSyntaxError, fromstring
+ 
+-from zeep.exceptions import DTDForbidden, EntitiesForbidden, XMLSyntaxError
++from zeep.exceptions import (
++    DTDForbidden,
++    EntitiesForbidden,
++    ExternalReferenceForbidden,
++    XMLSyntaxError,
++)
+ from zeep.settings import Settings
+ 
+ 
+ class ImportResolver(Resolver):
+     """Custom lxml resolve to use the transport object"""
+ 
+-    def __init__(self, transport):
++    def __init__(self, transport, settings=None):
+         self.transport = transport
++        self.settings = settings or Settings()
+ 
+     def resolve(self, url, pubid, context):
+         if urlparse(url).scheme in ("http", "https"):
++            if self.settings.forbid_external:
++                raise ExternalReferenceForbidden(url)
+             content = self.transport.load(url)
+             return self.resolve_string(content, context)
+ 
+@@ -45,7 +53,7 @@
+         recover=recover,
+         huge_tree=settings.xml_huge_tree,
+     )
+-    parser.resolvers.add(ImportResolver(transport))
++    parser.resolvers.add(ImportResolver(transport, settings))
+     try:
+         elementtree = fromstring(content, parser=parser, base_url=base_url)
+         docinfo = elementtree.getroottree().docinfo
+@@ -69,7 +77,12 @@
+ 
+ 
+ def load_external(
+-    url: typing.Union[typing.IO, str], transport, base_url=None, settings=None
++    url: typing.Union[typing.IO, str],
++    transport,
++    base_url=None,
++    settings=None,
++    *,
++    _initial: bool = False,
+ ):
+     """Load an external XML document.
+ 
+@@ -78,19 +91,32 @@
+     :param base_url:
+     :param settings: A zeep.settings.Settings object containing parse settings.
+     :type settings: zeep.settings.Settings
++    :param _initial: Internal flag set by zeep when loading the user-supplied
++      entry-point document; transitive imports leave it False so that
++      ``settings.forbid_external`` can block them.
+ 
+     """
+     settings = settings or Settings()
+     if hasattr(url, "read"):
+         content = url.read()
+     else:
++        if not _initial and settings.forbid_external:
++            if urlparse(str(url)).scheme in ("http", "https"):
++                raise ExternalReferenceForbidden(url)
+         if base_url:
+             url = absolute_location(url, base_url)
+         content = transport.load(url)
+     return parse_xml(content, transport, base_url, settings=settings)
+ 
+ 
+-async def load_external_async(url: typing.IO, transport, base_url=None, settings=None):
++async def load_external_async(
++    url: typing.IO,
++    transport,
++    base_url=None,
++    settings=None,
++    *,
++    _initial: bool = False,
++):
+     """Load an external XML document.
+ 
+     :param url:
+@@ -98,12 +124,18 @@
+     :param base_url:
+     :param settings: A zeep.settings.Settings object containing parse settings.
+     :type settings: zeep.settings.Settings
++    :param _initial: Internal flag set by zeep when loading the user-supplied
++      entry-point document; transitive imports leave it False so that
++      ``settings.forbid_external`` can block them.
+ 
+     """
+     settings = settings or Settings()
+     if hasattr(url, "read"):
+         content = url.read()
+     else:
++        if not _initial and settings.forbid_external:
++            if urlparse(str(url)).scheme in ("http", "https"):
++                raise ExternalReferenceForbidden(url)
+         if base_url:
+             url = absolute_location(url, base_url)
+         content = await transport.load(url)
+diff -ruN a/src/zeep/settings.py b/src/zeep/settings.py
+--- a/src/zeep/settings.py	2026-06-18 16:00:03.000000000 +0000
++++ b/src/zeep/settings.py	2026-10-24 05:26:55.980849064 +0000
+@@ -19,9 +19,15 @@
+     :type forbid_dtd: bool
+     :param forbid_entities: disallow XML with <!ENTITY> declarations inside the DTD
+     :type forbid_entities: bool
+-    :param forbid_external: disallow any access to remote or local resources
+-      in external entities or DTD and raising an ExternalReferenceForbidden
+-      exception when a DTD or entity references an external resource.
++    :param forbid_external: disallow transitive fetches of external resources
++      (``http``/``https`` URLs reached via ``xsd:import``, ``xsd:include``,
++      ``wsdl:import`` or lxml entity/DTD resolution) while parsing the
++      user-supplied entry-point document. The entry-point WSDL or schema
++      itself is always loaded. Defaults to ``False`` for backwards
++      compatibility; enable when loading WSDLs from untrusted sources to
++      mitigate SSRF via attacker-controlled import targets.
++      An :class:`zeep.exceptions.ExternalReferenceForbidden` is raised when a
++      blocked fetch is attempted.
+     :type forbid_external: bool
+     :param xml_huge_tree: disable lxml/libxml2 security restrictions and
+                           support very deep trees and very long text content
+@@ -51,7 +57,7 @@
+     xml_huge_tree = attr.ib(default=False)
+     forbid_dtd = attr.ib(default=False)
+     forbid_entities = attr.ib(default=True)
+-    forbid_external = attr.ib(default=True)
++    forbid_external = attr.ib(default=False)
+ 
+     # xsd workarounds
+     xsd_ignore_sequence_order = attr.ib(default=False)
+diff -ruN a/src/zeep/wsdl/wsdl.py b/src/zeep/wsdl/wsdl.py
+--- a/src/zeep/wsdl/wsdl.py	2026-06-18 16:00:03.000000000 +0000
++++ b/src/zeep/wsdl/wsdl.py	2026-10-24 05:26:56.008849039 +0000
+@@ -86,7 +86,7 @@
+         self.load(location)
+ 
+     def load(self, location):
+-        document = self._get_xml_document(location)
++        document = self._get_xml_document(location, _initial=True)
+ 
+         root_definitions = Definition(self, document, self.location)
+         root_definitions.resolve_imports()
+@@ -138,16 +138,25 @@
+                     print("%s%s" % (" " * 12, str(operation)))
+                 print("")
+ 
+-    def _get_xml_document(self, location: typing.IO) -> etree._Element:
++    def _get_xml_document(
++        self, location: typing.IO, *, _initial: bool = False
++    ) -> etree._Element:
+         """Load the XML content from the given location and return an
+         lxml.Element object.
+ 
+         :param location: The URL of the document to load
+         :type location: string
++        :param _initial: True when loading the user-supplied entry-point WSDL;
++          False for transitive ``wsdl:import`` documents (which are gated by
++          ``settings.forbid_external``).
+ 
+         """
+         return load_external(
+-            location, self.transport, self.location, settings=self.settings
++            location,
++            self.transport,
++            self.location,
++            settings=self.settings,
++            _initial=_initial,
+         )
+ 
+     def _add_definition(self, definition: "Definition"):
+diff -ruN a/src/zeep/xsd/visitor.py b/src/zeep/xsd/visitor.py
+--- a/src/zeep/xsd/visitor.py	2026-10-24 05:26:32.900869658 +0000
++++ b/src/zeep/xsd/visitor.py	2026-10-24 05:28:58.492734956 +0000
+@@ -5,12 +5,7 @@
+ from lxml import etree
+ 
+ from zeep.exceptions import XMLParseError
+-from zeep.loader import (
+-    absolute_location,
+-    load_external,
+-    normalize_location,
+-    parse_xml,
+-)
++from zeep.loader import absolute_location, load_external, normalize_location
+ from zeep.utils import as_qname, qname_attr
+ from zeep.xsd import elements as xsd_elements
+ from zeep.xsd import types as xsd_types
+@@ -68,7 +63,6 @@
+         self.document = document
+         self.schema = schema
+         self._includes = set()
+-        self._import_cache = {}
+ 
+     def register_element(self, qname: etree.QName, instance: xsd_elements.Element):
+         self.document.register_element(qname, instance)
+@@ -244,18 +238,8 @@
+                 logger.debug("Unable to retrieve schema for namespace %r", namespace)
+             return
+ 
+-        # Load the XML. The same location may be imported more than once with
+-        # different namespaces, so keep the parsed node per visitor.
+-        schema_node = self._import_cache.get(location)
+-        if schema_node is None:
+-            content = self.schema._transport.load(location)
+-            schema_node = parse_xml(
+-                content,
+-                self.schema._transport,
+-                base_url=location,
+-                settings=self.schema.settings,
+-            )
+-            self._import_cache[location] = schema_node
++        # Load the XML
++        schema_node = self._retrieve_data(location, base_url=self.document._location)
+ 
+         # Check if the xsd:import namespace matches the targetNamespace. If
+         # the xsd:import statement didn't specify a namespace then make sure

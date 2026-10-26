@@ -1,0 +1,511 @@
+diff -ruN a/keras/src/legacy/saving/legacy_h5_format.py b/keras/src/legacy/saving/legacy_h5_format.py
+--- a/keras/src/legacy/saving/legacy_h5_format.py	2026-10-18 22:29:14.000000000 +0000
++++ b/keras/src/legacy/saving/legacy_h5_format.py	2026-10-20 22:41:03.077958290 +0000
+@@ -10,6 +10,7 @@
+ from keras.src.legacy.saving import json_utils
+ from keras.src.legacy.saving import saving_options
+ from keras.src.legacy.saving import saving_utils
++from keras.src.saving import h5_safety
+ from keras.src.saving import object_registration
+ from keras.src.saving import serialization_lib
+ from keras.src.utils import io_utils
+@@ -119,8 +120,12 @@
+     else:
+         f = filepath
+ 
++    # Refuse any entry (dataset or group) that would read data from a file
++    # outside of this artifact, whatever position it occupies.
+     model = None
+     try:
++        h5_safety.validate_h5_artifact(f)
++
+         # instantiate model
+         model_config = f.attrs.get("model_config")
+         if model_config is None:
+@@ -139,7 +144,9 @@
+             )
+ 
+             # set weights
+-            load_weights_from_hdf5_group(f["model_weights"], model)
++            load_weights_from_hdf5_group(
++                h5_safety.get_validated_entry(f, "model_weights"), model
++            )
+ 
+         if compile:
+             # instantiate optimizer
+@@ -349,6 +356,8 @@
+     else:
+         original_backend = None
+ 
++    h5_safety.validate_h5_artifact(f)
++
+     filtered_layers = []
+     for layer in model.layers:
+         weights = _legacy_weights(layer)
+@@ -358,7 +367,7 @@
+     layer_names = load_attributes_from_hdf5_group(f, "layer_names")
+     filtered_layer_names = []
+     for name in layer_names:
+-        g = f[name]
++        g = h5_safety.get_validated_entry(f, name)
+         weight_names = load_attributes_from_hdf5_group(g, "weight_names")
+         if weight_names:
+             filtered_layer_names.append(name)
+@@ -371,7 +380,7 @@
+         )
+ 
+     for k, name in enumerate(layer_names):
+-        g = f[name]
++        g = h5_safety.get_validated_entry(f, name)
+         layer = filtered_layers[k]
+         symbolic_weights = _legacy_weights(layer)
+         weight_values = load_subset_weights_from_hdf5_group(g)
+@@ -398,7 +407,7 @@
+             if v in model.weights
+         )
+         weight_values = load_subset_weights_from_hdf5_group(
+-            f["top_level_model_weights"]
++            h5_safety.get_validated_entry(f, "top_level_model_weights")
+         )
+         if len(weight_values) != len(symbolic_weights):
+             raise ValueError(
+@@ -492,6 +501,7 @@
+         original_backend = None
+ 
+     # New file format.
++    h5_safety.validate_h5_artifact(f)
+     layer_names = load_attributes_from_hdf5_group(f, "layer_names")
+ 
+     # Reverse index of layer name to list of layers with name.
+@@ -501,7 +511,7 @@
+             index.setdefault(layer.name, []).append(layer)
+ 
+     for k, name in enumerate(layer_names):
+-        g = f[name]
++        g = h5_safety.get_validated_entry(f, name)
+         weight_values = load_subset_weights_from_hdf5_group(g)
+         for layer in index.get(name, []):
+             symbolic_weights = _legacy_weights(layer)
+@@ -535,7 +545,7 @@
+             model._trainable_variables + model._non_trainable_variables
+         )
+         weight_values = load_subset_weights_from_hdf5_group(
+-            f["top_level_model_weights"]
++            h5_safety.get_validated_entry(f, "top_level_model_weights")
+         )
+ 
+         if len(weight_values) != len(symbolic_weights):
+@@ -579,7 +589,10 @@
+             and weights file.
+     """
+     weight_names = load_attributes_from_hdf5_group(f, "weight_names")
+-    return [np.asarray(f[weight_name]) for weight_name in weight_names]
++    return [
++        np.asarray(h5_safety.get_validated_entry(f, weight_name))
++        for weight_name in weight_names
++    ]
+ 
+ 
+ def load_optimizer_weights_from_hdf5_group(hdf5_group):
+@@ -591,12 +604,15 @@
+     Returns:
+         data: List of optimizer weight names.
+     """
+-    weights_group = hdf5_group["optimizer_weights"]
++    weights_group = h5_safety.get_validated_entry(
++        hdf5_group, "optimizer_weights"
++    )
+     optimizer_weight_names = load_attributes_from_hdf5_group(
+         weights_group, "weight_names"
+     )
+     return [
+-        weights_group[weight_name] for weight_name in optimizer_weight_names
++        h5_safety.get_validated_entry(weights_group, weight_name)
++        for weight_name in optimizer_weight_names
+     ]
+ 
+ 
+diff -ruN a/keras/src/saving/file_editor.py b/keras/src/saving/file_editor.py
+--- a/keras/src/saving/file_editor.py	2026-10-18 22:29:14.000000000 +0000
++++ b/keras/src/saving/file_editor.py	2026-10-20 22:41:09.217952725 +0000
+@@ -10,6 +10,7 @@
+ 
+ from keras.src import backend
+ from keras.src.api_export import keras_export
++from keras.src.saving import h5_safety
+ from keras.src.saving import saving_lib
+ from keras.src.saving.saving_lib import H5IOStore
+ from keras.src.utils import naming
+@@ -512,11 +513,8 @@
+             if not isinstance(value, h5py.Dataset):
+                 continue
+ 
+-            if value.external:
+-                raise ValueError(
+-                    "Not allowed: H5 file Dataset with external links: "
+-                    f"{value.external}"
+-                )
++            # Refuse datasets whose values live in another file.
++            h5_safety.validate_h5_dataset(value, current_inner_path)
+ 
+             shape = value.shape
+             dtype = value.dtype
+diff -ruN a/keras/src/saving/h5_safety.py b/keras/src/saving/h5_safety.py
+--- a/keras/src/saving/h5_safety.py	1970-01-01 00:00:00.000000000 +0000
++++ b/keras/src/saving/h5_safety.py	2026-10-20 22:46:29.461662435 +0000
+@@ -0,0 +1,169 @@
++"""Safety checks for HDF5 files holding model or weight data.
++
++An HDF5 file can express indirection to data that is not stored in the file
++itself:
++
++* external links (``h5py.ExternalLink``) make an entry resolve to an object
++  kept in a different file, resolved relative to the file holding the link;
++* datasets can declare *external storage*, so that their raw bytes live in a
++  different file;
++* virtual datasets (VDS) read their values from one or more other files.
++
++A model or weights artifact obtained from a third party must never be allowed
++to pull in data from outside the artifact. These helpers reject each of the
++constructs above before any value is dereferenced or read.
++"""
++
++try:
++    import h5py
++except ImportError:
++    h5py = None
++
++
++class H5ArtifactError(ValueError):
++    """Raised when an H5 artifact references data outside of itself.
++
++    Subclasses `ValueError` so that it is reported to callers as a regular
++    client-side error, while still being distinguishable from recoverable
++    weight-loading errors (`skip_mismatch` must never hide it).
++    """
++
++
++def validate_h5_dataset(dataset, path=None):
++    """Rejects datasets whose values are read from outside the file.
++
++    Args:
++        dataset: An `h5py.Dataset` instance.
++        path: Optional human-readable location of the dataset, used in the
++            error message.
++
++    Returns:
++        The dataset, unchanged, when it only holds data of its own file.
++    """
++    if dataset.external:
++        raise H5ArtifactError(
++            "Not allowed: H5 file Dataset with external links: "
++            f"{dataset.external}"
++        )
++    if getattr(dataset, "is_virtual", False):
++        try:
++            sources = [
++                (source.file_name, source.dset_name)
++                for source in dataset.virtual_sources()
++            ]
++        except Exception:
++            sources = []
++        location = f" at '{path}'" if path else ""
++        raise H5ArtifactError(
++            "Not allowed: H5 file Dataset with virtual sources pointing to "
++            f"other files: {sources}{location}"
++        )
++    return dataset
++
++
++def _validate_link(link, path):
++    """Rejects link objects that are not plain hard links."""
++    if isinstance(link, h5py.ExternalLink):
++        raise H5ArtifactError(
++            "Not allowed: H5 file entry is a link to another file: "
++            f"'{path}' -> '{link.filename}':{link.path}"
++        )
++    if isinstance(link, h5py.SoftLink):
++        raise H5ArtifactError(
++            "Not allowed: H5 file entry is a soft link, which may resolve "
++            f"outside of the file: '{path}' -> {link.path}"
++        )
++
++
++def _resolve_path(group, path):
++    """Resolves an HDF5 path while checking every link on the way.
++
++    Unlike `h5py.Group.get`, this walks the path one component at a time so
++    that an external link in the middle of a path cannot be silently followed.
++    """
++    if path.startswith("/"):
++        current = group.file["/"]
++        components = path.split("/")
++    else:
++        current = group
++        components = path.split("/")
++    for component in components:
++        if component in ("", "."):
++            continue
++        if component == "..":
++            raise H5ArtifactError(
++                "Not allowed: H5 file path contains a parent reference: "
++                f"{path}"
++            )
++        if not isinstance(current, h5py.Group):
++            raise KeyError(path)
++        link = current.get(component, getlink=True)
++        if link is None:
++            raise KeyError(path)
++        _validate_link(link, component)
++        current = current[component]
++    return current
++
++
++def get_validated_entry(group, name):
++    """Returns `group[name]` after checking every link on the path.
++
++    Args:
++        group: An `h5py.Group` (or `h5py.File`) instance.
++        name: The name or HDF5 path of the entry to resolve.
++
++    Returns:
++        The resolved object (group or dataset). Datasets are additionally
++        checked for external storage and virtual sources.
++    """
++    if h5py is None:
++        raise ImportError("h5py must be installed to load H5 files.")
++    if isinstance(name, bytes):
++        name = name.decode("utf8")
++    name = str(name)
++    value = _resolve_path(group, name)
++    if isinstance(value, h5py.Dataset):
++        validate_h5_dataset(value, path=name)
++    return value
++
++
++def validate_h5_artifact(h5_obj):
++    """Rejects any entry of an HDF5 file that reaches outside of it.
++
++    The whole object tree is inspected (only link metadata and dataset layout
++    are read; no dataset values are loaded), so that an out-of-bounds entry is
++    refused no matter where it sits in the artifact: a single value, a group,
++    the top-level container or optimizer state.
++
++    Args:
++        h5_obj: An `h5py.File`, `h5py.Group` or `h5py.Dataset`.
++    """
++    if h5py is None or h5_obj is None:
++        return
++    if isinstance(h5_obj, h5py.Dataset):
++        validate_h5_dataset(h5_obj)
++        return
++    if not isinstance(h5_obj, h5py.Group):
++        return
++
++    seen = set()
++    stack = [(h5_obj, "")]
++    while stack:
++        group, prefix = stack.pop()
++        # Hard links may form cycles (a group linked inside itself); visit
++        # every group only once so that the walk always terminates.
++        seen.add(group.id)
++        for key in list(group.keys()):
++            path = f"{prefix}/{key}" if prefix else key
++            link = group.get(key, getlink=True)
++            if link is None:
++                # Broken / dangling link: nothing can be read through it.
++                continue
++            _validate_link(link, path)
++            child = group[key]
++            if isinstance(child, h5py.Group):
++                if child.id in seen:
++                    continue
++                stack.append((child, path))
++            elif isinstance(child, h5py.Dataset):
++                validate_h5_dataset(child, path=path)
+diff -ruN a/keras/src/saving/saving_api.py b/keras/src/saving/saving_api.py
+--- a/keras/src/saving/saving_api.py	2026-10-18 22:29:14.000000000 +0000
++++ b/keras/src/saving/saving_api.py	2026-10-20 22:41:06.237955426 +0000
+@@ -5,6 +5,7 @@
+ 
+ from keras.src.api_export import keras_export
+ from keras.src.legacy.saving import legacy_h5_format
++from keras.src.saving import h5_safety
+ from keras.src.saving import saving_lib
+ from keras.src.utils import file_utils
+ from keras.src.utils import io_utils
+@@ -298,8 +299,10 @@
+                 f"Received: {filepath}"
+             )
+         with h5py.File(filepath, "r") as f:
++            # Refuse artifacts whose entries reach outside of the file.
++            h5_safety.validate_h5_artifact(f)
+             if "layer_names" not in f.attrs and "model_weights" in f:
+-                f = f["model_weights"]
++                f = h5_safety.get_validated_entry(f, "model_weights")
+             if by_name:
+                 legacy_h5_format.load_weights_from_hdf5_group_by_name(
+                     f, model, skip_mismatch
+diff -ruN a/keras/src/saving/saving_lib.py b/keras/src/saving/saving_lib.py
+--- a/keras/src/saving/saving_lib.py	2026-10-18 22:29:16.000000000 +0000
++++ b/keras/src/saving/saving_lib.py	2026-10-20 22:46:33.157659084 +0000
+@@ -16,6 +16,7 @@
+ 
+ from keras.src import backend
+ from keras.src.backend.common import global_state
++from keras.src.saving import h5_safety
+ from keras.src.saving.serialization_lib import ObjectSharingScope
+ from keras.src.saving.serialization_lib import deserialize_keras_object
+ from keras.src.saving.serialization_lib import serialize_keras_object
+@@ -378,6 +379,8 @@
+     model = _model_from_config(config_json, custom_objects, compile, safe_mode)
+ 
+     all_filenames = file_utils.listdir(dirpath)
++    weights_store = None
++    asset_store = None
+     try:
+         if _VARS_FNAME_H5 in all_filenames:
+             weights_file_path = file_utils.join(dirpath, _VARS_FNAME_H5)
+@@ -410,7 +413,8 @@
+         )
+ 
+     finally:
+-        weights_store.close()
++        if weights_store:
++            weights_store.close()
+         if asset_store:
+             asset_store.close()
+ 
+@@ -796,6 +800,10 @@
+             try:
+                 saveable.load_own_variables(weights_store.get(inner_path))
+             except Exception as e:
++                if isinstance(e, h5_safety.H5ArtifactError):
++                    # A security failure must never be downgraded to a
++                    # recoverable weight mismatch.
++                    raise
+                 if failed_saveables is not None:
+                     failed_saveables.add(id(saveable))
+                 error_msgs[id(saveable)] = saveable, e
+@@ -1022,6 +1030,9 @@
+         self.mode = mode
+         self.archive = archive
+         self.io_file = None
++        # Paths of the H5 files whose links have already been inspected, so
++        # that switching between the shards of a set does not re-walk them.
++        self._validated_h5_paths = set()
+ 
+         # Init H5 file.
+         self.h5_file = self._get_h5_file(self.path_or_io)
+@@ -1049,12 +1060,9 @@
+             raise ValueError(
+                 f"Invalid H5 file, expected Dataset, received {type(dataset)}"
+             )
+-        if dataset.external:
+-            raise ValueError(
+-                "Not allowed: H5 file Dataset with external links: "
+-                f"{dataset.external}"
+-            )
+-        return dataset
++        # Rejects datasets whose bytes live in another file, either through
++        # external storage or through virtual sources.
++        return h5_safety.validate_h5_dataset(dataset)
+ 
+     def _get_h5_file(self, path_or_io, mode=None):
+         mode = mode or self.mode
+@@ -1067,9 +1075,24 @@
+                 self.io_file = io.BytesIO()
+             else:
+                 self.io_file = self.archive.open(str(path_or_io), "r")
+-            return h5py.File(self.io_file, mode=mode)
++            h5_file = h5py.File(self.io_file, mode=mode)
+         else:
+-            return h5py.File(path_or_io, mode=mode)
++            h5_file = h5py.File(path_or_io, mode=mode)
++        if mode == "r":
++            # Refuse any entry (dataset, group, root) that would pull in data
++            # from a file outside of the artifact being loaded.
++            cache_key = None
++            if not self.archive and not isinstance(path_or_io, io.BytesIO):
++                cache_key = str(pathlib.Path(path_or_io).resolve())
++            if cache_key is None or cache_key not in self._validated_h5_paths:
++                try:
++                    h5_safety.validate_h5_artifact(h5_file)
++                except Exception:
++                    h5_file.close()
++                    raise
++                if cache_key is not None:
++                    self._validated_h5_paths.add(cache_key)
++        return h5_file
+ 
+     def make(self, path, metadata=None):
+         """Make a new H5 entry group.
+@@ -1222,6 +1245,7 @@
+         self.mode = mode
+         self.archive = archive
+         self.io_file = None
++        self._validated_h5_paths = set()
+ 
+         self.max_shard_size = float(max_shard_size) * 1024**3  # To bytes.
+         self.base_name = self.path.stem.replace(".weights", "")
+@@ -1263,8 +1287,51 @@
+             else:
+                 with open(self.path, "r") as map_file:
+                     self.sharding_config = json.load(map_file)
++            self._validate_sharding_config()
+         self.h5_file = self._create_new_shard_file()
+ 
++    def _validate_shard_filename(self, filename):
++        """Ensures a shard named by the index file is part of the artifact."""
++        if not isinstance(filename, str) or not filename:
++            raise ValueError(
++                "Invalid sharded weights index: shard names must be "
++                f"non-empty strings. Received: {filename!r}"
++            )
++        if filename in (".", "..") or filename != pathlib.PurePath(
++            filename
++        ).name:
++            raise ValueError(
++                "Invalid sharded weights index: shard names must refer to a "
++                f"single file next to the index. Received: {filename!r}"
++            )
++        if self.mode == "r" and not self.archive:
++            shard_path = self.path.with_name(filename)
++            index_dir = self.path.resolve().parent
++            if shard_path.resolve().parent != index_dir:
++                raise ValueError(
++                    "Invalid sharded weights index: shard file resolves "
++                    "outside of the index directory. Received: "
++                    f"{filename!r}"
++                )
++        return filename
++
++    def _validate_sharding_config(self):
++        if not isinstance(self.sharding_config, dict):
++            raise ValueError(
++                "Invalid sharded weights index: expected a JSON object."
++            )
++        weight_map = self.sharding_config.get("weight_map", {})
++        if not isinstance(weight_map, dict):
++            raise ValueError(
++                "Invalid sharded weights index: `weight_map` must be a JSON "
++                "object."
++            )
++        for filenames in weight_map.values():
++            if not isinstance(filenames, list):
++                filenames = [filenames]
++            for filename in filenames:
++                self._validate_shard_filename(filename)
++
+     def make(self, path, metadata=None):
+         """Make a new H5 entry group.
+ 
+@@ -1436,7 +1503,7 @@
+             if key in self._h5_entry_group:
+                 # The switch above already positioned the entry group on this
+                 # shard; read the value in place.
+-                value = self._h5_entry_group[key]
++                value = self._verify_dataset(self._h5_entry_group[key])
+                 if (
+                     hasattr(value, "attrs")
+                     and "dtype" in value.attrs

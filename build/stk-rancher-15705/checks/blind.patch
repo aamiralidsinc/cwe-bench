@@ -1,0 +1,154 @@
+diff -ruN pristine/pkg/auth/providerrefresh/refresher.go app/pkg/auth/providerrefresh/refresher.go
+--- a/pkg/auth/providerrefresh/refresher.go	2026-10-26 02:48:10.000000000 +0000
++++ b/pkg/auth/providerrefresh/refresher.go	2026-10-26 05:31:56.479778049 +0000
+@@ -266,10 +266,12 @@
+ 							principalID,
+ 							err,
+ 						)
+-						existingPrincipals := attribs.GroupPrincipals[providerName].Items
+-						if existingPrincipals != nil {
+-							newGroupPrincipals = existingPrincipals
+-						}
++						// Do not write the previously stored principals back. They may
++						// contain memberships the provider no longer confirms, and access
++						// must reflect only current membership. Login tokens are still
++						// retained because errorConfirmingLogins is set, so a transient
++						// outage does not sign the user out.
++						newGroupPrincipals = nil
+ 					} else {
+ 						// In the case that the user explicitly cannot login at all to this provider
+ 						// (e.g. they no longer exist) we pretend they have no principal with this provider
+diff -ruN pristine/pkg/auth/providers/common/usermanager.go app/pkg/auth/providers/common/usermanager.go
+--- a/pkg/auth/providers/common/usermanager.go	2026-10-26 02:48:10.000000000 +0000
++++ b/pkg/auth/providers/common/usermanager.go	2026-10-26 05:32:15.091761023 +0000
+@@ -455,8 +455,10 @@
+ 	hitProviders := map[string]bool{}
+ 	if attribs != nil {
+ 		for provider, gps := range attribs.GroupPrincipals {
++			// An entry means the provider's current data is authoritative for it,
++			// even when the recorded principal set is empty.
++			hitProviders[provider] = true
+ 			for _, principal := range gps.Items {
+-				hitProviders[provider] = true
+ 				groups[principal.Name] = true
+ 			}
+ 		}
+@@ -465,6 +467,9 @@
+ 	// fallback to legacy token groupPrincipals
+ 	if _, ok := hitProviders[token.GetAuthProvider()]; !ok {
+ 		for _, principal := range token.GetGroupPrincipals() {
++			if m.supersededTokenGroupPrincipal(principal, token.GetUserID()) {
++				continue
++			}
+ 			groups[principal.Name] = true
+ 		}
+ 	}
+@@ -494,12 +499,43 @@
+ 
+ 	// fallback to legacy token groupPrincipals
+ 	if !hitProvider {
+-		groups = append(groups, token.GetGroupPrincipals()...)
++		for _, principal := range token.GetGroupPrincipals() {
++			if m.supersededTokenGroupPrincipal(principal, token.GetUserID()) {
++				continue
++			}
++			groups = append(groups, principal)
++		}
+ 	}
+ 
+ 	return groups
+ }
+ 
++// supersededTokenGroupPrincipal reports whether a group principal persisted on a token
++// has been superseded by the user's live identity for the same provider. Membership must
++// come from the provider's current data, not from a copy stored when the token was issued.
++// Without the User we cannot confirm an identity for the provider, so the legacy
++// behaviour is kept rather than dropping a possibly legitimate group.
++func (m *userManager) supersededTokenGroupPrincipal(principal v3.Principal, userID string) bool {
++	providerName := principal.Provider
++	if providerName == "" || m.userCache == nil {
++		return false
++	}
++	user, err := m.userCache.Get(userID)
++	if err != nil || user == nil {
++		return false
++	}
++	prefix := providerName + "_user://"
++	if providerName == "local" {
++		prefix = "local://"
++	}
++	for _, id := range user.PrincipalIDs {
++		if strings.HasPrefix(id, prefix) {
++			return true
++		}
++	}
++	return false
++}
++
+ func (m *userManager) CreateNewUserClusterRoleBinding(userName string, userUID apitypes.UID) error {
+ 	if !m.manageBindings {
+ 		return nil
+diff -ruN pristine/pkg/auth/providers/githubapp/github_data.go app/pkg/auth/providers/githubapp/github_data.go
+--- a/pkg/auth/providers/githubapp/github_data.go	2026-10-26 02:48:10.000000000 +0000
++++ b/pkg/auth/providers/githubapp/github_data.go	2026-10-26 05:31:55.663778795 +0000
+@@ -119,10 +119,20 @@
+ func (g *gitHubAppData) listTeamsForUser(username string) []common.GitHubAccount {
+ 	var accounts []common.GitHubAccount
+ 
+-	for orgName := range g.members[username].orgs {
+-		org := g.orgs[orgName]
+-		for teamName, team := range org.teams {
+-			accounts = append(accounts, common.GitHubAccount{Name: teamName, Login: team.login, AvatarURL: org.avatarURL, ID: team.id, HTMLURL: team.htmlURL})
++	for orgName, teamSlugs := range g.members[username].orgs {
++		org, ok := g.orgs[orgName]
++		if !ok || org == nil {
++			continue
++		}
++		for _, slug := range teamSlugs {
++			// Only the slugs the installation data records for this user are
++			// memberships. A slug that this organization does not resolve is
++			// dropped rather than emitted as an account with no identity.
++			team, found := org.teams[slug]
++			if !found {
++				continue
++			}
++			accounts = append(accounts, common.GitHubAccount{Name: slug, Login: team.login, AvatarURL: org.avatarURL, ID: team.id, HTMLURL: team.htmlURL})
+ 		}
+ 	}
+ 
+diff -ruN pristine/pkg/auth/requests/authenticate.go app/pkg/auth/requests/authenticate.go
+--- a/pkg/auth/requests/authenticate.go	2026-10-26 02:48:10.000000000 +0000
++++ b/pkg/auth/requests/authenticate.go	2026-10-26 05:32:06.375768995 +0000
+@@ -219,6 +219,12 @@
+ 	// fallback to legacy token.GroupPrincipals
+ 	if !hitProvider {
+ 		for _, principal := range token.GetGroupPrincipals() {
++			// A copy stored on the token can outlive the membership that produced it.
++			// When the user still has an identity for the principal's provider, that
++			// provider's current data is authoritative, so the copy must not be used.
++			if supersededTokenGroupPrincipal(principal, authUser) {
++				continue
++			}
+ 			// TODO This is a short cut for now. Will actually need to lookup groups in future
+ 			name := strings.TrimPrefix(principal.Name, "local://")
+ 			groups = append(groups, name)
+@@ -289,6 +295,19 @@
+ 	return authResp, nil
+ }
+ 
++// supersededTokenGroupPrincipal reports whether a group principal persisted on a token
++// has been superseded by the user's live identity for the same provider. For a provider
++// whose memberships can be refreshed, current membership is authoritative; a copy made
++// when the token was issued must not grant access. Unrefreshable providers keep the
++// legacy fallback because the stored attribute is their only record of membership.
++func supersededTokenGroupPrincipal(principal apiv3.Principal, authUser *apiv3.User) bool {
++	providerName := principal.Provider
++	if providerName == "" || authUser == nil || providers.UnrefreshableProviders[providerName] {
++		return false
++	}
++	return providerrefresh.GetPrincipalIDForProvider(providerName, authUser) != ""
++}
++
+ func getUserExtraInfo(token accessor.TokenAccessor, user *apiv3.User, attribs *apiv3.UserAttribute) map[string][]string {
+ 	extraInfo := make(map[string][]string)
+ 

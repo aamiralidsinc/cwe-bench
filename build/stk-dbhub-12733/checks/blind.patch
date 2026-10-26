@@ -1,0 +1,471 @@
+diff --git a/src/connectors/mariadb/index.ts b/src/connectors/mariadb/index.ts
+--- a/src/connectors/mariadb/index.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/connectors/mariadb/index.ts	2026-10-26 05:15:30.616690629 +0000
+@@ -598,7 +598,17 @@
+     // Get a dedicated connection from the pool to ensure session consistency
+     // This is critical for session-specific features like LAST_INSERT_ID()
+     const conn = await this.pool.getConnection();
++    const readOnlyExecution = options.readonly === true;
+     try {
++      // Engine-level read-only backstop: admission only reads statement text,
++      // and a function called from an allowed statement can still write. A
++      // READ ONLY transaction makes MariaDB reject DML (INSERT/UPDATE/DELETE/
++      // REPLACE) that the classifier missed. DDL is not covered — MariaDB
++      // implicitly commits before it — so DDL must be refused at admission.
++      if (readOnlyExecution) {
++        await conn.query("START TRANSACTION READ ONLY");
++      }
++
+       // Apply maxRows limit to SELECT queries if specified
+       let processedSQL = sql;
+       if (options.maxRows) {
+@@ -634,8 +644,20 @@
+       // Parse results using shared utility that handles both single and multi-statement queries
+       const rows = parseQueryResults(results);
+       const rowCount = extractAffectedRows(results);
++
++      if (readOnlyExecution) {
++        await conn.query("COMMIT");
++      }
+       return { rows, rowCount };
+     } catch (error) {
++      if (readOnlyExecution) {
++        // Best effort, so a rollback failure can't mask the original error.
++        try {
++          await conn.query("ROLLBACK");
++        } catch {
++          // ignore; the statement error is the useful one
++        }
++      }
+       console.error("Error executing query:", error);
+       throw error;
+     } finally {
+diff --git a/src/connectors/mysql/index.ts b/src/connectors/mysql/index.ts
+--- a/src/connectors/mysql/index.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/connectors/mysql/index.ts	2026-10-26 05:15:36.068685716 +0000
+@@ -611,7 +611,17 @@
+     // Get a dedicated connection from the pool to ensure session consistency
+     // This is critical for session-specific features like LAST_INSERT_ID()
+     const conn = await this.pool.getConnection();
++    const readOnlyExecution = options.readonly === true;
+     try {
++      // Engine-level read-only backstop: admission only reads statement text,
++      // and a function called from an allowed statement can still write. A
++      // READ ONLY transaction makes MySQL reject DML (INSERT/UPDATE/DELETE/
++      // REPLACE) that the classifier missed. DDL is not covered — MySQL
++      // implicitly commits before it — so DDL must be refused at admission.
++      if (readOnlyExecution) {
++        await conn.query("START TRANSACTION READ ONLY");
++      }
++
+       // Apply maxRows limit to SELECT queries if specified
+       let processedSQL = sql;
+       if (options.maxRows) {
+@@ -651,8 +661,20 @@
+       // Parse results using shared utility that handles both single and multi-statement queries
+       const rows = parseQueryResults(firstResult);
+       const rowCount = extractAffectedRows(firstResult);
++
++      if (readOnlyExecution) {
++        await conn.query("COMMIT");
++      }
+       return { rows, rowCount };
+     } catch (error) {
++      if (readOnlyExecution) {
++        // Best effort, so a rollback failure can't mask the original error.
++        try {
++          await conn.query("ROLLBACK");
++        } catch {
++          // ignore; the statement error is the useful one
++        }
++      }
+       console.error("Error executing query:", error);
+       throw error;
+     } finally {
+diff --git a/src/connectors/postgres/index.ts b/src/connectors/postgres/index.ts
+--- a/src/connectors/postgres/index.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/connectors/postgres/index.ts	2026-10-26 05:15:23.444697091 +0000
+@@ -595,6 +595,44 @@
+   }
+ 
+ 
++  /**
++   * Run one statement (or a batch) inside a transaction the server keeps
++   * read-only.
++   *
++   * Admission only inspects statement text, and text is not the whole story:
++   * `SELECT setval('orders_id_seq', 1)` is a SELECT by syntax but changes a
++   * sequence, and any function a statement calls can write too. A transaction
++   * opened READ ONLY makes the server itself reject those writes, so a
++   * classifier miss cannot change data through a read-only execution.
++   */
++  private async runReadOnly(
++    client: pg.PoolClient,
++    statement: string,
++    parameters?: any[]
++  ): Promise<SQLResult> {
++    try {
++      await client.query("BEGIN");
++      // `SET TRANSACTION READ ONLY` must be the first statement of the
++      // transaction; otherwise PostgreSQL raises "SET TRANSACTION ... before
++      // any query or data modification made" and the call fails closed.
++      await client.query("SET TRANSACTION READ ONLY");
++      const result =
++        parameters && parameters.length > 0
++          ? await client.query(statement, parameters)
++          : await client.query(statement);
++      await client.query("COMMIT");
++      return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length };
++    } catch (error) {
++      // Best effort, so a ROLLBACK failure can't mask the original error.
++      try {
++        await client.query("ROLLBACK");
++      } catch {
++        // ignore; the statement error is the useful one
++      }
++      throw error;
++    }
++  }
++
+   async executeSQL(sql: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
+     if (!this.pool) {
+       throw new Error("Not connected to database");
+@@ -609,6 +647,11 @@
+         // Single statement - apply maxRows if applicable
+         const processedStatement = SQLRowLimiter.applyMaxRows(statements[0], options.maxRows);
+ 
++        // A read-only execution never runs outside a READ ONLY transaction.
++        if (options.readonly) {
++          return await this.runReadOnly(client, processedStatement, parameters);
++        }
++
+         // Use parameters if provided
+         let result;
+         if (parameters && parameters.length > 0) {
+@@ -635,9 +678,15 @@
+         let allRows: any[] = [];
+         let totalRowCount = 0;
+ 
+-        // Execute within a transaction to ensure session consistency
++        // Execute within a transaction to ensure session consistency. A
++        // read-only execution additionally opens it READ ONLY, so a write in
++        // any statement of the batch (including one hidden behind an allowed
++        // statement) is rejected by the server.
+         await client.query('BEGIN');
+         try {
++          if (options.readonly) {
++            await client.query('SET TRANSACTION READ ONLY');
++          }
+           for (let statement of statements) {
+             // Apply maxRows limit to SELECT queries if specified
+             const processedStatement = SQLRowLimiter.applyMaxRows(statement, options.maxRows);
+@@ -654,7 +703,13 @@
+           }
+           await client.query('COMMIT');
+         } catch (error) {
+-          await client.query('ROLLBACK');
++          // Best effort: a failed ROLLBACK must not mask the original error
++          // (a read-only violation mid-batch is the expected failure here).
++          try {
++            await client.query('ROLLBACK');
++          } catch {
++            // ignore; the statement error is the useful one
++          }
+           throw error;
+         }
+ 
+diff --git a/src/connectors/sqlite/index.ts b/src/connectors/sqlite/index.ts
+--- a/src/connectors/sqlite/index.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/connectors/sqlite/index.ts	2026-10-26 05:22:51.492279034 +0000
+@@ -144,6 +144,26 @@
+   }
+ 
+   /**
++   * Turn SQLite's `query_only` guard on or off for the shared handle.
++   *
++   * `PRAGMA query_only = ON` makes the engine reject writes to the database
++   * file on this connection — INSERT/UPDATE/DELETE, DDL, and header-setting
++   * pragmas such as `user_version`/`application_id` — so a statement the
++   * admission classifier missed still cannot change rows or schema. This is
++   * the only engine-level protection available: an in-memory database cannot
++   * be opened read-only, and the per-request option is what tells us whether
++   * this execution may write. (Pragma setters that can change the file without
++   * going through a writable-statement path, e.g. `journal_mode`, are refused
++   * at admission by the read-only classifier.)
++   */
++  private setQueryOnly(enabled: boolean): void {
++    if (!this.db) {
++      return;
++    }
++    this.db.exec(`PRAGMA query_only = ${enabled ? "ON" : "OFF"}`);
++  }
++
++  /**
+    * Run an introspection query and return all rows. Integers come back as plain
+    * numbers (no `setReadBigInts`), which is what the schema-reading callers need
+    * for boolean flag comparisons. node:sqlite types `.all()` as a generic record
+@@ -453,6 +473,18 @@
+       throw new Error("Not connected to SQLite database");
+     }
+ 
++    // The handle is process-local and shared by every tool on this source, so
++    // read-only enforcement is a per-execution engine guard that is switched on
++    // for this call and restored afterwards. The body below is synchronous
++    // (node:sqlite is sync), so no other executeSQL call can slip in between.
++    const readOnlyExecution = options.readonly === true;
++    let queryOnlyBefore = false;
++    if (readOnlyExecution) {
++      queryOnlyBefore =
++        Number(this.queryOne<{ query_only: number }>("PRAGMA query_only")?.query_only ?? 0) !== 0;
++      this.setQueryOnly(true);
++    }
++
+     try {
+       // Check if this is a multi-statement query
+       const statements = splitSQLStatements(sql, "sqlite");
+@@ -543,6 +575,13 @@
+         // Execute write statements individually to track changes
+         let totalChanges = 0;
+         for (const statement of writeStatements) {
++          // Re-assert the engine guard before every statement: SQLite lets
++          // `PRAGMA query_only` (both the `=` and the `(value)` form) turn the
++          // guard back off, so a batch that starts with one of those must not
++          // disarm the statements that follow it.
++          if (readOnlyExecution) {
++            this.setQueryOnly(true);
++          }
+           const result = this.prepare(statement).run();
+           totalChanges += Number(result.changes);
+         }
+@@ -550,6 +589,9 @@
+         // Execute read statements individually to collect results
+         let allRows: any[] = [];
+         for (let statement of readStatements) {
++          if (readOnlyExecution) {
++            this.setQueryOnly(true);
++          }
+           // Apply maxRows limit to SELECT queries if specified
+           statement = SQLRowLimiter.applyMaxRows(statement, options.maxRows);
+           const result = this.prepare(statement).all();
+@@ -559,8 +601,18 @@
+         // rowCount is total changes for writes, plus rows returned for reads
+         return { rows: allRows, rowCount: totalChanges + allRows.length };
+       }
+-    } catch (error) {
+-      throw error;
++    } finally {
++      if (readOnlyExecution) {
++        // Put the shared handle back the way it was so writable tools on this
++        // source keep working and a guard the caller had set stays set. Best
++        // effort: a failure here must not mask the execution error (a
++        // read-only rejection is the expected outcome above).
++        try {
++          this.setQueryOnly(queryOnlyBefore);
++        } catch {
++          // ignore; preserve the original error
++        }
++      }
+     }
+   }
+ }
+diff --git a/src/connectors/sqlserver/index.ts b/src/connectors/sqlserver/index.ts
+--- a/src/connectors/sqlserver/index.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/connectors/sqlserver/index.ts	2026-10-26 05:15:59.300664088 +0000
+@@ -16,7 +16,8 @@
+ import { SafeURL } from "../../utils/safe-url.js";
+ import { obfuscateDSNPassword } from "../../utils/dsn-obfuscate.js";
+ import { SQLRowLimiter } from "../../utils/sql-row-limiter.js";
+-import { stripCommentsAndStrings } from "../../utils/sql-parser.js";
++import { stripCommentsAndStrings, splitSQLStatements } from "../../utils/sql-parser.js";
++import { isReadOnlySQL } from "../../utils/allowed-keywords.js";
+ 
+ /**
+  * SQL Server DSN parser
+@@ -606,11 +607,43 @@
+     }
+   }
+ 
++  /**
++   * Refuse a read-only request unless every statement in it is read-only by its
++   * own syntax.
++   *
++   * SQL Server has no READ ONLY transaction mode (and a rolled-back batch is
++   * still not safe: sequences, `EXEC` side effects and several session settings
++   * survive a rollback), so this check is the execution-time enforcement for a
++   * read-only tool. The caller already classified the batch once; re-checking
++   * here keeps a direct connector caller from handing a write to a read-only
++   * execution.
++   */
++  private assertReadOnlyBatch(sqlQuery: string): void {
++    const statements = splitSQLStatements(sqlQuery, "sqlserver");
++    if (statements.length === 0) {
++      throw new Error("Read-only mode is enabled: no SQL statement to execute");
++    }
++    for (const statement of statements) {
++      if (!isReadOnlySQL(statement, "sqlserver")) {
++        throw new Error(
++          `Read-only mode is enabled: statement is not read-only: ${statement.slice(0, 120)}`
++        );
++      }
++    }
++  }
++
+   async executeSQL(sqlQuery: string, options: ExecuteOptions, parameters?: any[]): Promise<SQLResult> {
+     if (!this.connection) {
+       throw new Error("Not connected to SQL Server database");
+     }
+ 
++    // A read-only execution must not reach the server with anything that could
++    // change state. Checked before the EXPLAIN translation so a write cannot
++    // ride along as an explained statement either.
++    if (options.readonly) {
++      this.assertReadOnlyBatch(sqlQuery);
++    }
++
+     // SQL Server has no native EXPLAIN statement. Translate a leading `EXPLAIN`
+     // into a SHOWPLAN_XML request so callers get a Postgres/MySQL-like
+     // experience. SHOWPLAN_XML compiles the statement without executing it, so
+diff --git a/src/utils/allowed-keywords.ts b/src/utils/allowed-keywords.ts
+--- a/src/utils/allowed-keywords.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/utils/allowed-keywords.ts	2026-10-26 05:24:57.332162803 +0000
+@@ -61,6 +61,65 @@
+ 
+ const selectIntoPattern = /\bselect\b[\s\S]+\binto\b/i;
+ 
++/**
++ * `NEXT VALUE FOR` advances a sequence. SQL Server (the dialect that relies on
++ * this classifier instead of an engine-level read-only transaction) allows it
++ * inside a plain SELECT, and the advance is not rolled back, so a read-only
++ * statement must not contain it.
++ */
++const nextValueForPattern = /\bnext\s+value\s+for\b/;
++
++/**
++ * SQLite pragmas whose parenthesized argument is the name of an object to
++ * describe (a table, index or foreign-key owner) rather than a value to set.
++ * `PRAGMA table_info(users)` therefore returns rows and changes nothing.
++ *
++ * Every other pragma that is handed an argument is a setter — SQLite accepts
++ * `PRAGMA name(value)` as an exact synonym of `PRAGMA name = value` — and
++ * mutates durable or session state.
++ */
++const pragmaNameArgumentReadOnly = new Set([
++  "table_info",
++  "table_xinfo",
++  "index_info",
++  "index_xinfo",
++  "index_list",
++  "foreign_key_list",
++]);
++
++/** Splits a comment-stripped, lower-cased `PRAGMA` statement into name and remainder. */
++const pragmaStatementPattern = /^pragma\s+(?:[a-z0-9_]+\.)?([a-z0-9_]+)\s*([\s\S]*)$/;
++
++/**
++ * Decide whether a SQLite `PRAGMA` statement only reads.
++ *
++ * - Bare `PRAGMA name` reads the current value: read-only.
++ * - `PRAGMA name = value` assigns: not read-only.
++ * - `PRAGMA name(value)` assigns too, except for the introspection pragmas in
++ *   `pragmaNameArgumentReadOnly`, where the argument names the object to
++ *   describe: read-only.
++ * - Any other trailing text is not a form SQLite executes; refuse it.
++ */
++function isReadOnlyPragma(cleanedSQL: string): boolean {
++  const statement = cleanedSQL.replace(/[;\s]+$/, "");
++  const match = pragmaStatementPattern.exec(statement);
++  if (!match) {
++    return false;
++  }
++  const [, name, remainder] = match;
++  const argument = remainder.trim();
++  if (!argument) {
++    return true;
++  }
++  if (argument.startsWith("=")) {
++    return false;
++  }
++  if (argument.startsWith("(")) {
++    return pragmaNameArgumentReadOnly.has(name);
++  }
++  return false;
++}
++
+ /** Matches EXPLAIN ANALYZE (or parenthesized form), excluding disabled forms (false/off/0) */
+ const explainAnalyzePattern =
+   /^explain\s+(?:\([^)]*\banalyze\b(?!\s*(?:=\s*)?(?:false|off|0)\b)[^)]*\)|\banalyze\b(?!\s*(?:=\s*)?(?:false|off|0)\b)(?:\s+verbose\b)?)/i;
+@@ -95,6 +154,14 @@
+     return false;
+   }
+ 
++  // SQLite PRAGMA mutates through its setter forms (`PRAGMA name = value` and
++  // the equivalent `PRAGMA name(value)`), which the keyword allow-list alone
++  // cannot see. Only the bare read form and the introspection pragmas that take
++  // an object name are read-only.
++  if (firstWord === "pragma" && connectorType === "sqlite") {
++    return isReadOnlyPragma(cleanedSQL);
++  }
++
+   // WITH statements can embed DML in CTEs (e.g. WITH cte AS (UPDATE ...))
+   if (firstWord === "with") {
+     const pattern = mutatingPatterns[connectorType as ConnectorType] ?? mutatingPattern;
+@@ -103,6 +170,15 @@
+     }
+   }
+ 
++  // SQL Server: a sequence advance hidden in a SELECT changes state.
++  if (
++    (firstWord === "select" || firstWord === "with") &&
++    connectorType === "sqlserver" &&
++    nextValueForPattern.test(cleanedSQL)
++  ) {
++    return false;
++  }
++
+   // SELECT/WITH ... INTO writes data (creates tables or writes to files)
+   if ((firstWord === "select" || firstWord === "with") && selectIntoPattern.test(cleanedSQL)) {
+     return false;
+diff --git a/src/utils/sql-parser.ts b/src/utils/sql-parser.ts
+--- a/src/utils/sql-parser.ts	2026-10-26 02:31:50.000000000 +0000
++++ b/src/utils/sql-parser.ts	2026-10-26 05:14:55.768722027 +0000
+@@ -12,8 +12,30 @@
+   return { type: TokenType.Plain, end: i + 1 };
+ }
+ 
+-function scanSingleLineComment(sql: string, i: number): SQLToken | null {
++/**
++ * Scan a `--` single-line comment.
++ *
++ * ANSI-style dialects (PostgreSQL, SQLite, SQL Server) treat every pair of
++ * dashes as the start of a comment. MySQL and MariaDB are stricter: the two
++ * dashes only open a comment when followed by whitespace, a control character
++ * (my_isspace() || my_iscntrl(), so this includes DEL 0x7F) or the end of the
++ * input. Otherwise they are two minus operators and the rest of the line is
++ * ordinary SQL, e.g. `SELECT 1--1` is `SELECT 1 - (-1)`. Treating that as a
++ * comment would hide a following statement from the read-only classifier
++ * (`SELECT 1--1;DROP TABLE t`) while the server still runs it.
++ */
++function scanSingleLineComment(
++  sql: string,
++  i: number,
++  dashesNeedTrailingSpace = false,
++): SQLToken | null {
+   if (sql[i] !== "-" || sql[i + 1] !== "-") { return null; }
++  if (dashesNeedTrailingSpace) {
++    // NaN when the input ends right after the dashes, which MySQL lexes as a
++    // comment too.
++    const next = sql.charCodeAt(i + 2);
++    if (!Number.isNaN(next) && next > 0x20 && next !== 0x7f) { return null; }
++  }
+   let j = i;
+   while (j < sql.length && sql[j] !== "\n") { j++; }
+   return { type: TokenType.Comment, end: j };
+@@ -133,7 +155,7 @@
+ }
+ 
+ function scanTokenMySQL(sql: string, i: number): SQLToken {
+-  return scanSingleLineComment(sql, i)
++  return scanSingleLineComment(sql, i, true)
+     ?? scanMultiLineCommentMySQL(sql, i)
+     ?? scanSingleQuotedString(sql, i)
+     ?? scanDoubleQuotedString(sql, i)

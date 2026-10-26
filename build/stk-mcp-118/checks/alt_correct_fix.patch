@@ -1,0 +1,121 @@
+diff --git a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/aws/service.py b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/aws/service.py
+index 382b1bc..a5dbab8 100644
+--- a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/aws/service.py
++++ b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/aws/service.py
+@@ -93,6 +93,9 @@ def check_security_policy(
+     ir: IRTranslation, read_only_operations: ReadOnlyOperations, ctx: Context
+ ) -> PolicyDecision:
+     """Check security policy for the given command and return decision."""
++    if read_only_operations is None:
++        return PolicyDecision.DENY
++
+ 
+     def is_read_only_func(service: str, operation: str) -> bool:
+         return read_only_operations.has(service=service, operation=operation)
+diff --git a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/security/policy.py b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/security/policy.py
+index 4499032..5f2c5b7 100644
+--- a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/security/policy.py
++++ b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/core/security/policy.py
+@@ -47,6 +47,7 @@ class SecurityPolicy:
+         self.denylist: Set[str] = set()
+         self.elicit_list: Set[str] = set()
+         self.customizations: Dict[str, List[str]] = {}
++        self.load_failed = False
+ 
+         # Determine elicitation support once during initialization
+         self.supports_elicitation = check_elicitation_support(ctx)
+@@ -70,6 +71,8 @@ class SecurityPolicy:
+                 policy_data = json.load(policy_file)
+ 
+             policy = policy_data.get('policy', {})
++            if not isinstance(policy, dict):
++                raise ValueError('the security policy must contain a "policy" object')
+ 
+             # Load denylist
+             if 'denyList' in policy:
+@@ -83,6 +86,7 @@ class SecurityPolicy:
+ 
+         except Exception as e:
+             logger.error('Failed to load security policy from {}: {}', policy_path, e)
++            self.load_failed = True
+ 
+         self._load_customizations()
+ 
+@@ -113,6 +117,9 @@ class SecurityPolicy:
+ 
+         Priority: deny > elicit > default behavior
+         """
++        if self.load_failed:
++            return PolicyDecision.DENY
++
+         operation_kebab = operation.replace('_', '-')
+         operation_kebab = re.sub('([A-Z])', r'-\1', operation_kebab).lower().lstrip('-')
+ 
+@@ -143,6 +150,9 @@ class SecurityPolicy:
+ 
+         Returns None if no customization matches.
+         """
++        if self.load_failed:
++            return PolicyDecision.DENY
++
+         # Check if IR has the required metadata
+         if (
+             not ir.command_metadata
+diff --git a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/server.py b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/server.py
+index 329dc32..d94e80e 100644
+--- a/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/server.py
++++ b/src/aws-api-mcp-server/awslabs/aws_api_mcp_server/server.py
+@@ -319,26 +319,16 @@ async def call_aws_helper(
+     )
+ 
+     try:
+-        # Check security policy
+-        if READ_OPERATIONS_INDEX is not None:
+-            policy_decision = check_security_policy(ir, READ_OPERATIONS_INDEX, ctx)
+-
+-            if policy_decision == PolicyDecision.DENY:
+-                error_message = 'Execution of this operation is denied by security policy.'
+-                await ctx.error(error_message)
+-                raise AwsApiMcpError(error_message)
+-            elif policy_decision == PolicyDecision.ELICIT:
+-                await request_consent(cli_command, ctx)
+-        else:
+-            if READ_OPERATIONS_ONLY_MODE:
+-                error_message = (
+-                    'Execution of this operation is not allowed because read only mode is enabled. '
+-                    f'It can be disabled by setting the {READ_ONLY_KEY} environment variable to False.'
+-                )
+-                await ctx.error(error_message)
+-                raise AwsApiMcpError(error_message)
+-            elif REQUIRE_MUTATION_CONSENT:
+-                await request_consent(cli_command, ctx)
++        # Check security policy. The decision function refuses when enforcement data is
++        # missing, so the command cannot run unchecked.
++        policy_decision = check_security_policy(ir, READ_OPERATIONS_INDEX, ctx)
++
++        if policy_decision == PolicyDecision.DENY:
++            error_message = 'Execution of this operation is denied by security policy.'
++            await ctx.error(error_message)
++            raise AwsApiMcpError(error_message)
++        elif policy_decision == PolicyDecision.ELICIT:
++            await request_consent(cli_command, ctx)
+ 
+         if ir.command and ir.command.is_help_operation:
+             return await get_help_document(cli_command, ctx)
+@@ -437,12 +427,13 @@ def main():
+     validate_aws_region(DEFAULT_REGION)
+     logger.info('AWS_REGION: {}', DEFAULT_REGION)
+ 
+-    # Always load read operations index for security policy checking
++    # The read operations index is required to enforce the security policy: a failure
++    # to load it must stop the process instead of leaving it serving unchecked.
+     try:
+         READ_OPERATIONS_INDEX = get_read_only_operations()
+     except Exception as e:
+-        logger.warning('Failed to load read operations index: {}', e)
+-        READ_OPERATIONS_INDEX = None
++        logger.error('Failed to load read operations index; refusing to start: {}', e)
++        sys.exit(1)
+ 
+     if TRANSPORT == 'stdio':
+         server.run(

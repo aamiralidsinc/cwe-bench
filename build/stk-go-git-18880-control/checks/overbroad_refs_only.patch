@@ -1,0 +1,150 @@
+diff --git a/repository.go b/repository.go
+index c88ccd40..dfa45430 100644
+--- a/repository.go
++++ b/repository.go
+@@ -1030,7 +1030,7 @@ func (r *Repository) buildTagSignature(tag *object.Tag, signer Signer) (string,
+ //	  // Some other error
+ //	}
+ func (r *Repository) Tag(name string) (*plumbing.Reference, error) {
+-	ref, err := r.Reference(plumbing.ReferenceName(path.Join("refs", "tags", name)), false)
++	ref, err := r.Reference(plumbing.NewTagReferenceName(name), false)
+ 	if err != nil {
+ 		if err == plumbing.ErrReferenceNotFound {
+ 			// Return a friendly error for this one, versus just ReferenceNotFound.
+@@ -1050,7 +1050,7 @@ func (r *Repository) DeleteTag(name string) error {
+ 		return err
+ 	}
+ 
+-	return r.Storer.RemoveReference(plumbing.ReferenceName(path.Join("refs", "tags", name)))
++	return r.Storer.RemoveReference(plumbing.NewTagReferenceName(name))
+ }
+ 
+ func (r *Repository) resolveToCommitHash(h plumbing.Hash) (plumbing.Hash, error) {
+diff --git a/storage/filesystem/dotgit/dotgit.go b/storage/filesystem/dotgit/dotgit.go
+index 73cc2ebf..9895656c 100644
+--- a/storage/filesystem/dotgit/dotgit.go
++++ b/storage/filesystem/dotgit/dotgit.go
+@@ -88,8 +88,60 @@ var (
+ 	// resolve outside the modules/ subtree, mirroring canonical Git's
+ 	// "ignoring suspicious submodule name" defence.
+ 	ErrModuleNameEscape = errors.New("submodule name escapes modules/ directory")
++	// ErrReferenceNameEscape is returned when a reference name would resolve
++	// outside the reference storage once turned into a path under the .git
++	// directory, or onto an entry that holds repository metadata rather than a
++	// reference.
++	ErrReferenceNameEscape = errors.New("reference name escapes the reference storage")
+ )
+ 
++// reservedMetadataNames are the entries of the git directory that are not
++// reference storage. A name that lands on one of them would let a caller
++// overwrite, read or remove repository metadata instead of a reference, so the
++// storage refuses it. The comparison is case-insensitive because a name can be
++// authored on one filesystem and opened on another that folds case.
++var reservedMetadataNames = []string{
++	configPath, configWorktreePath, indexPath, shallowPath, modulePath,
++	objectsPath, branchesPath, hooksPath, infoPath, remotesPath, logsPath,
++	worktreesPath, alternatesPath, packedRefsPath,
++	"commondir", "gitdir", "description",
++	"COMMIT_EDITMSG", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG", "TAG_EDITMSG",
++}
++
++// isReservedMetadataName reports whether a leading path component names an
++// entry of the git directory that does not hold references.
++func isReservedMetadataName(component string) bool {
++	for _, reserved := range reservedMetadataNames {
++		if strings.EqualFold(component, reserved) {
++			return true
++		}
++	}
++	return false
++}
++
++// validReferenceName rejects reference names that cannot safely be turned into
++// a path under the .git directory. A loose reference (and its reflog) is
++// stored verbatim at ".git/<name>", so a crafted name could otherwise climb out
++// of its reference sub-tree or land on unrelated repository metadata such as
++// .git/config, .git/hooks or .git/objects.
++//
++// Path traversal is refused component by component, including the disguises a
++// case-insensitive or Unicode-normalising filesystem would fold back to a dot.
++// A name whose first component is a metadata entry of the git directory is
++// refused as well, whatever its remaining components are.
++func validReferenceName(name plumbing.ReferenceName) error {
++	s := string(name)
++	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == '\\' }) {
++		if part == "." || part == ".." {
++			return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++		}
++	}
++	if s == "HEAD" || strings.HasPrefix(s, "refs/") {
++		return nil
++	}
++	return fmt.Errorf("%w: %q", ErrReferenceNameEscape, s)
++}
++
+ // Options holds configuration for the storage.
+ type Options struct {
+ 	// ExclusiveAccess means that the filesystem is not modified externally
+@@ -268,6 +320,9 @@ func (d *DotGit) Shallow() (billy.File, error) {
+ // ReflogReader returns a file pointer for reading the reflog for the given reference.
+ // Returns nil, nil if the reflog file does not exist.
+ func (d *DotGit) ReflogReader(name plumbing.ReferenceName) (billy.File, error) {
++	if err := validReferenceName(name); err != nil {
++		return nil, err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	f, err := d.fs.Open(p)
+ 	if err != nil {
+@@ -282,6 +337,9 @@ func (d *DotGit) ReflogReader(name plumbing.ReferenceName) (billy.File, error) {
+ // ReflogWriter returns a file pointer for appending to the reflog for the given reference.
+ // It creates the file and any necessary parent directories if they don't exist.
+ func (d *DotGit) ReflogWriter(name plumbing.ReferenceName) (billy.File, error) {
++	if err := validReferenceName(name); err != nil {
++		return nil, err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	if err := d.fs.MkdirAll(filepath.Dir(p), os.ModePerm); err != nil {
+ 		return nil, err
+@@ -291,6 +349,9 @@ func (d *DotGit) ReflogWriter(name plumbing.ReferenceName) (billy.File, error) {
+ 
+ // DeleteReflog removes the reflog file for the given reference.
+ func (d *DotGit) DeleteReflog(name plumbing.ReferenceName) error {
++	if err := validReferenceName(name); err != nil {
++		return err
++	}
+ 	p := d.fs.Join(logsPath, string(name))
+ 	err := d.fs.Remove(p)
+ 	if os.IsNotExist(err) {
+@@ -1045,6 +1106,10 @@ func (d *DotGit) checkReferenceAndTruncate(f billy.File, old *plumbing.Reference
+ 
+ // SetRef stores a reference, optionally checking that old matches the current value.
+ func (d *DotGit) SetRef(r, old *plumbing.Reference) error {
++	if err := validReferenceName(r.Name()); err != nil {
++		return err
++	}
++
+ 	var content string
+ 	switch r.Type() {
+ 	case plumbing.SymbolicReference:
+@@ -1080,6 +1145,10 @@ func (d *DotGit) Refs() ([]*plumbing.Reference, error) {
+ 
+ // Ref returns the reference for a given reference name.
+ func (d *DotGit) Ref(name plumbing.ReferenceName) (*plumbing.Reference, error) {
++	if err := validReferenceName(name); err != nil {
++		return nil, err
++	}
++
+ 	ref, err := d.readReferenceFile(".", name.String())
+ 	if err == nil {
+ 		return ref, nil
+@@ -1143,6 +1212,10 @@ func (d *DotGit) packedRef(name plumbing.ReferenceName) (*plumbing.Reference, er
+ 
+ // RemoveRef removes a reference by name.
+ func (d *DotGit) RemoveRef(name plumbing.ReferenceName) error {
++	if err := validReferenceName(name); err != nil {
++		return err
++	}
++
+ 	path := d.fs.Join(".", name.String())
+ 	_, err := d.fs.Stat(path)
+ 	if err == nil {

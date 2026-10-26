@@ -1,0 +1,199 @@
+diff --git a/files/file.go b/files/file.go
+index 88990fe..3c4fc06 100644
+--- a/files/file.go
++++ b/files/file.go
+@@ -173,6 +173,80 @@ func stat(opts *FileOptions) (*FileInfo, error) {
+ 	return file, nil
+ }
+ 
++// maxResolutionHops bounds how many symbolic links WithinScope follows while
++// resolving one path, so a link loop is refused instead of spinning forever.
++const maxResolutionHops = 255
++
++// splitPathComponents splits an absolute or relative path into its components,
++// discarding empty components and "." entries.
++func splitPathComponents(p string) []string {
++	parts := strings.FieldsFunc(p, func(r rune) bool { return r == filepath.Separator })
++	out := parts[:0]
++	for _, part := range parts {
++		if part != "." {
++			out = append(out, part)
++		}
++	}
++	return out
++}
++
++// resolvePath resolves p the way the operating system resolves it when it
++// opens the file: every symbolic link is followed and each ".." applies to the
++// directory the preceding components actually resolved to, not to where they
++// sit lexically. Unlike filepath.EvalSymlinks it does not require the whole
++// path to exist. Once a component is missing, the remainder cannot exist
++// either, so it is appended to the already-resolved prefix; that keeps
++// brand-new files (and dangling link targets) validatable.
++func resolvePath(p string) (string, error) {
++	if !filepath.IsAbs(p) {
++		p = string(filepath.Separator) + p
++	}
++
++	components := splitPathComponents(p)
++	cur := string(filepath.Separator)
++	hops := 0
++
++	for i := 0; i < len(components); i++ {
++		switch components[i] {
++		case "..":
++			cur = filepath.Dir(cur)
++			continue
++		}
++
++		next := filepath.Join(cur, components[i])
++		info, err := os.Lstat(next)
++		if err != nil {
++			if !errors.Is(err, fs.ErrNotExist) {
++				return "", err
++			}
++			return filepath.Join(cur, filepath.Join(components[i:]...)), nil
++		}
++
++		if info.Mode()&os.ModeSymlink == 0 {
++			cur = next
++			continue
++		}
++
++		target, err := os.Readlink(next)
++		if err != nil {
++			return "", err
++		}
++		hops++
++		if hops > maxResolutionHops {
++			return "", os.ErrPermission
++		}
++
++		targetParts := splitPathComponents(target)
++		if filepath.IsAbs(target) {
++			cur = string(filepath.Separator)
++		}
++		components = append(targetParts, components[i+1:]...)
++		i = -1
++	}
++
++	return cur, nil
++}
++
+ // WithinScope reports whether the on-disk target of p — after resolving any
+ // symbolic links — stays within the scoped root of fsys. It exists to stop a
+ // symlink that lives lexically inside a user's scope but points outside it
+diff --git a/fileutils/dir.go b/fileutils/dir.go
+index 0b127c4..397c1bb 100644
+--- a/fileutils/dir.go
++++ b/fileutils/dir.go
+@@ -21,6 +21,15 @@ func CopyDir(afs afero.Fs, source, dest string, fileMode, dirMode fs.FileMode) e
+ 		return os.ErrPermission
+ 	}
+ 
++	// Each directory created on the way is a destination write sink; a child
++	// of the destination tree may be a link that escapes the scope.
++	if ok, err := files.WithinScope(afs, dest); err != nil || !ok {
++		if err != nil {
++			return err
++		}
++		return os.ErrPermission
++	}
++
+ 	// Get properties of source.
+ 	srcinfo, err := afs.Stat(source)
+ 	if err != nil {
+@@ -48,15 +57,18 @@ func CopyDir(afs afero.Fs, source, dest string, fileMode, dirMode fs.FileMode) e
+ 		if obj.IsDir() {
+ 			// Create sub-directories, recursively.
+ 			err = CopyDir(afs, fsource, fdest, fileMode, dirMode)
+-			if err != nil {
+-				errs = append(errs, err)
+-			}
+ 		} else {
+ 			// Perform the file copy.
+ 			err = CopyFile(afs, fsource, fdest, fileMode, dirMode)
+-			if err != nil {
+-				errs = append(errs, err)
++		}
++		if err != nil {
++			// A containment refusal is not a partial copy to report at the
++			// end: stop before anything else is written and let the caller
++			// return a plain permission error.
++			if errors.Is(err, os.ErrPermission) {
++				return err
+ 			}
++			errs = append(errs, err)
+ 		}
+ 	}
+ 
+diff --git a/fileutils/file.go b/fileutils/file.go
+index ab8c7ff..f95f1a2 100644
+--- a/fileutils/file.go
++++ b/fileutils/file.go
+@@ -41,6 +41,15 @@ func CopyFile(afs afero.Fs, source, dest string, fileMode, dirMode fs.FileMode)
+ 		return os.ErrPermission
+ 	}
+ 
++	// The destination is a write sink of its own: it may sit behind a link
++	// inside the destination tree that escapes the user's scope.
++	if ok, err := files.WithinScope(afs, dest); err != nil || !ok {
++		if err != nil {
++			return err
++		}
++		return os.ErrPermission
++	}
++
+ 	// Open the source file.
+ 	src, err := afs.Open(source)
+ 	if err != nil {
+diff --git a/http/resource.go b/http/resource.go
+index 27eb8b7..caafe52 100644
+--- a/http/resource.go
++++ b/http/resource.go
+@@ -131,6 +131,14 @@ func resourcePostHandler(fileCache FileCache) handleFunc {
+ 
+ 		// Directories creation on POST.
+ 		if strings.HasSuffix(r.URL.Path, "/") {
++			// A directory is still a write: refuse to create it through a link
++			// whose target leaves the user's scope.
++			if ok, scopeErr := files.WithinScope(d.user.Fs, r.URL.Path); scopeErr != nil || !ok {
++				if scopeErr != nil {
++					return errToStatus(scopeErr), scopeErr
++				}
++				return http.StatusForbidden, nil
++			}
+ 			err := d.user.Fs.MkdirAll(r.URL.Path, d.settings.DirMode)
+ 			return errToStatus(err), err
+ 		}
+@@ -408,6 +416,15 @@ var resourceGetRecursiveHandler = withUser(func(w http.ResponseWriter, r *http.R
+ 		rootPath = "/"
+ 	}
+ 
++	// The walk must stay inside the user's scope, including when the requested
++	// root is reached through a symlinked ancestor.
++	if ok, scopeErr := files.WithinScope(d.user.Fs, rootPath); scopeErr != nil || !ok {
++		if scopeErr != nil {
++			return errToStatus(scopeErr), scopeErr
++		}
++		return http.StatusForbidden, nil
++	}
++
+ 	// Make sure the root itself exists and is a directory.
+ 	info, err := d.user.Fs.Stat(rootPath)
+ 	if err != nil {
+@@ -429,6 +446,14 @@ var resourceGetRecursiveHandler = withUser(func(w http.ResponseWriter, r *http.R
+ 			return nil
+ 		}
+ 
++		// Never emit an entry whose resolved target leaves the scope.
++		if ok, scopeErr := files.WithinScope(d.user.Fs, fPath); scopeErr != nil || !ok {
++			if info.IsDir() {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++
+ 		// Respect user rules.
+ 		if !d.Check(fPath) {
+ 			if info.IsDir() {

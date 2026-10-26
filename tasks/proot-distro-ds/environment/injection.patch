@@ -1,0 +1,113 @@
+diff --git a/proot_distro/commands/restore.py b/proot_distro/commands/restore.py
+index da57c1e..5a9dc79 100644
+--- a/proot_distro/commands/restore.py
++++ b/proot_distro/commands/restore.py
+@@ -33,7 +33,9 @@ import stat
+ import sys
+ import tarfile
+ 
+-from proot_distro.constants import CONTAINERS_DIR, PROGRAM_NAME
++from proot_distro.constants import (
++    CONTAINERS_DIR, DEFAULT_PRIMARY_NS, DEFAULT_SECONDARY_NS, PROGRAM_NAME,
++)
+ from proot_distro.message import (
+     C, msg, log_info, log_error, crit_error,
+ )
+@@ -370,6 +372,7 @@ def command_restore(args) -> None:
+ 
+         clear_bar()
+ 
++        _apply_restore_fixups(cleared)
+         log_info("Finished restoring the container.")
+ 
+     except KeyboardInterrupt:
+@@ -387,3 +390,39 @@ def command_restore(args) -> None:
+             raw_fh.close()
+         for lock in pending_locks.values():
+             lock.release()
++
++
++def _apply_restore_fixups(container_names: set) -> None:
++    """Write the container's DNS configuration after a restore.
++
++    Mirrors the configuration a fresh install applies, so a restored
++    container can resolve names without another manual step.
++    """
++    for container_name in sorted(container_names):
++        etc = os.path.join(container_rootfs(container_name), "etc")
++        if not os.path.isdir(etc):
++            continue
++        resolv = os.path.join(etc, "resolv.conf")
++        try:
++            os.remove(resolv)
++        except OSError:
++            pass
++        try:
++            with open(resolv, "w") as fh:
++                fh.write(f"nameserver {DEFAULT_PRIMARY_NS}\n")
++                fh.write(f"nameserver {DEFAULT_SECONDARY_NS}\n")
++        except OSError:
++            pass
++        hosts = os.path.join(etc, "hosts")
++        try:
++            os.remove(hosts)
++        except OSError:
++            pass
++        try:
++            with open(hosts, "w") as fh:
++                fh.write(
++                    "127.0.0.1   localhost.localdomain localhost\n"
++                    "::1         localhost.localdomain localhost\n"
++                )
++        except OSError:
++            pass
+diff --git a/proot_distro/helpers/build_engine/copy_step.py b/proot_distro/helpers/build_engine/copy_step.py
+index edd0f92..7403529 100644
+--- a/proot_distro/helpers/build_engine/copy_step.py
++++ b/proot_distro/helpers/build_engine/copy_step.py
+@@ -427,6 +427,20 @@ def _extract_tar_into_dest(src_full, dest, file_map, uid, gid):
+                     "mode": stat.S_IMODE(m.mode) or 0o644,
+                     "uid": uid, "gid": gid, "mtime": int(m.mtime),
+                 }
++            elif m.islnk():
++                # Hard link inside the added archive: record the member it
++                # points at and let materialisation copy the file body.
++                target = m.linkname
++                while target.startswith("./"):
++                    target = target[2:]
++                target = target.lstrip("/")
++                if any(p in ("..", ".", "") for p in target.split("/")):
++                    continue
++                file_map[arc] = {
++                    "kind": "hardlink", "target": (dest + target).lstrip("/"),
++                    "mode": stat.S_IMODE(m.mode) or 0o644,
++                    "uid": uid, "gid": gid, "mtime": int(m.mtime),
++                }
+ 
+ 
+ def _materialise_files(rootfs_dir, file_map):
+@@ -477,6 +491,24 @@ def _materialise_files(rootfs_dir, file_map):
+                     os.chmod(host, entry.get("mode", 0o644))
+                 except OSError:
+                     pass
++            elif kind == "hardlink":
++                if os.path.lexists(host):
++                    try:
++                        os.remove(host)
++                    except OSError:
++                        pass
++                src = os.path.join(rootfs_dir, entry["target"].lstrip("/"))
++                if os.path.isfile(src):
++                    shutil.copy2(src, host)
++                    # The layer writer only understands file bodies, so
++                    # turn the resolved link into a regular-file entry.
++                    with open(host, "rb") as fh:
++                        entry["kind"] = "content"
++                        entry["data"] = fh.read()
++                try:
++                    os.chmod(host, entry.get("mode", 0o644))
++                except OSError:
++                    pass
+         except OSError as exc:
+             raise BuildError(
+                 f"Failed to write '{arcname}' into rootfs: {exc}"

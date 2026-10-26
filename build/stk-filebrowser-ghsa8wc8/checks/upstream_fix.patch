@@ -1,0 +1,1286 @@
+diff --git a/files/file.go b/files/file.go
+index 88990fe..4102c3c 100644
+--- a/files/file.go
++++ b/files/file.go
+@@ -22,10 +22,9 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/spf13/afero"
+-
+ 	fberrors "github.com/filebrowser/filebrowser/v2/errors"
+ 	"github.com/filebrowser/filebrowser/v2/rules"
++	"github.com/spf13/afero"
+ )
+ 
+ var (
+@@ -129,13 +128,6 @@ func stat(opts *FileOptions) (*FileInfo, error) {
+ 		}
+ 	}
+ 
+-	if file != nil {
+-		ok, scopeErr := WithinScope(opts.Fs, opts.Path)
+-		if scopeErr != nil || !ok {
+-			return nil, os.ErrPermission
+-		}
+-	}
+-
+ 	// regular file
+ 	if file != nil && !file.IsSymlink {
+ 		return file, nil
+@@ -173,60 +165,6 @@ func stat(opts *FileOptions) (*FileInfo, error) {
+ 	return file, nil
+ }
+ 
+-// WithinScope reports whether the on-disk target of p — after resolving any
+-// symbolic links — stays within the scoped root of fsys. It exists to stop a
+-// symlink that lives lexically inside a user's scope but points outside it
+-// from being followed for reads, writes, or shares.
+-//
+-// Paths that do not exist yet (e.g. a brand-new file being created) are
+-// validated against their nearest existing ancestor, so legitimate new files
+-// are always allowed. For a filesystem that is not scoped with BasePathFs the
+-// check is a no-op and returns true.
+-//
+-// Note: a dangling symlink whose target does not yet exist resolves to its
+-// containing directory and is therefore allowed; writing through such a link
+-// could still create a file outside the scope. Callers that create files
+-// should treat this as best-effort and rely on rejecting existing escaping
+-// symlinks, which covers the disclosure and overwrite vectors.
+-func WithinScope(fsys afero.Fs, p string) (bool, error) {
+-	bfs, ok := fsys.(*afero.BasePathFs)
+-	if !ok {
+-		// Not a scoped filesystem; nothing to enforce.
+-		return true, nil
+-	}
+-
+-	root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(bfs, "/"))
+-	if err != nil {
+-		return false, err
+-	}
+-
+-	target := afero.FullBaseFsPath(bfs, p)
+-	resolved, err := filepath.EvalSymlinks(target)
+-	for errors.Is(err, fs.ErrNotExist) {
+-		parent := filepath.Dir(target)
+-		if parent == target {
+-			break
+-		}
+-		target = parent
+-		resolved, err = filepath.EvalSymlinks(target)
+-	}
+-	if err != nil {
+-		return false, err
+-	}
+-
+-	// Compare against root with a trailing separator so a sibling like
+-	// "/srvother" is not treated as being inside "/srv". When root is itself
+-	// the filesystem boundary (e.g. "/"), it already ends in a separator, so
+-	// avoid producing "//" — which no path would match — and accept any path
+-	// under it.
+-	prefix := root
+-	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+-		prefix += string(filepath.Separator)
+-	}
+-
+-	return resolved == root || strings.HasPrefix(resolved, prefix), nil
+-}
+-
+ // Checksum checksums a given File for a given User, using a specific
+ // algorithm. The checksums data is saved on File object.
+ func (i *FileInfo) Checksum(algo string) error {
+@@ -475,15 +413,19 @@ func (i *FileInfo) readListing(checker rules.Checker, readHeader bool, calcImgRe
+ 		isSymlink, isInvalidLink := false, false
+ 		if IsSymlink(f.Mode()) {
+ 			isSymlink = true
+-			if ok, scopeErr := WithinScope(i.Fs, fPath); scopeErr != nil || !ok {
+-				continue
+-			}
+-			// It's a symbolic link. We try to follow it. If it doesn't work,
+-			// we stay with the link information instead of the target's.
++			// It's a symbolic link. We try to follow it. The scoped filesystem
++			// refuses to dereference a link whose target escapes the scope
++			// (permission error); such a link is omitted from the listing
++			// entirely so it cannot leak the target's metadata. Any other
++			// failure means a broken link, which we surface as an invalid link
++			// rather than the target's information.
+ 			info, err := i.Fs.Stat(fPath)
+-			if err == nil {
++			switch {
++			case err == nil:
+ 				f = info
+-			} else {
++			case errors.Is(err, os.ErrPermission):
++				continue
++			default:
+ 				isInvalidLink = true
+ 			}
+ 		}
+diff --git a/files/file_test.go b/files/file_test.go
+index 9b46a85..45b114f 100644
+--- a/files/file_test.go
++++ b/files/file_test.go
+@@ -9,54 +9,46 @@ import (
+ 	"github.com/spf13/afero"
+ )
+ 
+-func TestWithinScope(t *testing.T) {
+-	t.Run("non-scoped filesystem is a no-op", func(t *testing.T) {
+-		ok, err := WithinScope(afero.NewOsFs(), "/anything")
+-		if err != nil || !ok {
+-			t.Fatalf("expected (true, nil), got (%v, %v)", ok, err)
+-		}
+-	})
+-
+-	t.Run("path inside a nested scope is allowed", func(t *testing.T) {
++func TestScopedFs(t *testing.T) {
++	t.Run("path inside scope is allowed", func(t *testing.T) {
+ 		scope := t.TempDir()
+ 		if err := os.WriteFile(filepath.Join(scope, "file.txt"), []byte("x"), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		bfs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++		fs := NewScopedFs(afero.NewOsFs(), scope)
+ 
+-		ok, err := WithinScope(bfs, "/file.txt")
+-		if err != nil || !ok {
+-			t.Fatalf("expected (true, nil), got (%v, %v)", ok, err)
++		if _, err := fs.Stat("/file.txt"); err != nil {
++			t.Fatalf("expected in-scope file to be accessible, got %v", err)
+ 		}
+ 	})
+ 
+-	t.Run("new file inside scope is allowed", func(t *testing.T) {
++	t.Run("new file inside scope can be created", func(t *testing.T) {
+ 		scope := t.TempDir()
+-		bfs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++		fs := NewScopedFs(afero.NewOsFs(), scope)
+ 
+-		ok, err := WithinScope(bfs, "/does-not-exist-yet.txt")
+-		if err != nil || !ok {
+-			t.Fatalf("expected (true, nil), got (%v, %v)", ok, err)
++		f, err := fs.OpenFile("/does-not-exist-yet.txt", os.O_RDWR|os.O_CREATE, 0o644)
++		if err != nil {
++			t.Fatalf("expected to create a new in-scope file, got %v", err)
+ 		}
++		_ = f.Close()
+ 	})
+ 
+ 	// Regression for #5975: when the scope resolves to the filesystem root,
+ 	// root+separator used to be "//", which no path matched, so every write
+ 	// was rejected with os.ErrPermission (HTTP 403).
+-	t.Run("filesystem root scope allows writes", func(t *testing.T) {
++	t.Run("filesystem root scope allows access", func(t *testing.T) {
+ 		f := filepath.Join(t.TempDir(), "file.txt")
+ 		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		bfs := afero.NewBasePathFs(afero.NewOsFs(), "/")
++		fs := NewScopedFs(afero.NewOsFs(), "/")
+ 
+-		ok, err := WithinScope(bfs, f)
+-		if err != nil || !ok {
+-			t.Fatalf("expected (true, nil) for a path under root scope, got (%v, %v)", ok, err)
++		if _, err := fs.Stat(f); err != nil {
++			t.Fatalf("expected a path under root scope to be accessible, got %v", err)
+ 		}
+ 	})
+ 
+-	t.Run("sibling of a nested scope is rejected", func(t *testing.T) {
++	t.Run("escaping symlink to a sibling is rejected", func(t *testing.T) {
+ 		base := t.TempDir()
+ 		scope := filepath.Join(base, "srv")
+ 		sibling := filepath.Join(base, "srvother")
+@@ -65,20 +57,21 @@ func TestWithinScope(t *testing.T) {
+ 				t.Fatal(err)
+ 			}
+ 		}
+-		// A symlink lexically inside the scope pointing at a sibling directory
+-		// must not be followed.
+-		link := filepath.Join(scope, "escape")
+-		if err := os.Symlink(sibling, link); err != nil {
++		if err := os.WriteFile(filepath.Join(sibling, "secret.txt"), []byte("secret"), 0o644); err != nil {
+ 			t.Fatal(err)
+ 		}
+-		bfs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++		// A symlink lexically inside the scope pointing at a sibling directory
++		// must not be followed for reads or stats.
++		if err := os.Symlink(sibling, filepath.Join(scope, "escape")); err != nil {
++			t.Skipf("cannot create symlink: %v", err)
++		}
++		fs := NewScopedFs(afero.NewOsFs(), scope)
+ 
+-		ok, err := WithinScope(bfs, "/escape")
+-		if err != nil {
+-			t.Fatalf("unexpected error: %v", err)
++		if _, err := fs.Stat("/escape"); !os.IsPermission(err) {
++			t.Fatalf("expected stat of escaping symlink to be rejected, got %v", err)
+ 		}
+-		if ok {
+-			t.Fatal("expected escaping symlink to a sibling directory to be rejected")
++		if _, err := fs.Open("/escape/secret.txt"); !os.IsPermission(err) {
++			t.Fatalf("expected read through escaping symlink to be rejected, got %v", err)
+ 		}
+ 	})
+ 
+@@ -93,11 +86,129 @@ func TestWithinScope(t *testing.T) {
+ 		if err := os.Symlink(filepath.Join(scope, "real"), filepath.Join(scope, "link")); err != nil {
+ 			t.Skipf("cannot create symlink: %v", err)
+ 		}
+-		bfs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++		fs := NewScopedFs(afero.NewOsFs(), scope)
++
++		if _, err := fs.Stat("/link/f.txt"); err != nil {
++			t.Fatalf("expected in-scope symlink target to be accessible, got %v", err)
++		}
++	})
++
++	// Regression for the dangling-symlink write escape (GHSA-8wc8-hf36-mjh9 /
++	// GHSA-fh54-6rfh-r8f3): a symlink whose target does not exist yet must not be
++	// followed for writes. Previously within() validated the link's in-scope
++	// parent directory, so OpenFile(O_CREATE) dereferenced the link and created
++	// the file at its out-of-scope target.
++	t.Run("write through a dangling escaping symlink is rejected", func(t *testing.T) {
++		base := t.TempDir()
++		scope := filepath.Join(base, "scope")
++		outside := filepath.Join(base, "outside")
++		for _, d := range []string{scope, outside} {
++			if err := os.MkdirAll(d, 0o755); err != nil {
++				t.Fatal(err)
++			}
++		}
++		outsideTarget := filepath.Join(outside, "created.txt") // does not exist yet
++		if err := os.Symlink(outsideTarget, filepath.Join(scope, "evil")); err != nil {
++			t.Skipf("cannot create symlink: %v", err)
++		}
++		fs := NewScopedFs(afero.NewOsFs(), scope)
++
++		f, err := fs.OpenFile("/evil", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
++		if err == nil {
++			_ = f.Close()
++			t.Fatal("VULNERABLE: write through a dangling escaping symlink was allowed")
++		}
++		if !os.IsPermission(err) {
++			t.Fatalf("expected permission error, got %v", err)
++		}
++		if _, statErr := os.Stat(outsideTarget); statErr == nil {
++			t.Fatal("VULNERABLE: file was created outside the scope")
++		}
++	})
++
++	// A dangling *relative* symlink that lives under an escaping directory
++	// symlink must be resolved against the link's real directory, not its lexical
++	// parent. Otherwise the symlinked ancestor can shift the computed target back
++	// into scope while the real OS write lands outside it.
++	t.Run("write through a dangling relative symlink under a symlinked dir is rejected", func(t *testing.T) {
++		base := t.TempDir()
++		scope := filepath.Join(base, "scope")
++		outside := filepath.Join(base, "outside")
++		for _, d := range []string{scope, outside} {
++			if err := os.MkdirAll(d, 0o755); err != nil {
++				t.Fatal(err)
++			}
++		}
++		// An escaping directory symlink inside the scope: /scope/m -> /base/outside.
++		if err := os.Symlink(outside, filepath.Join(scope, "m")); err != nil {
++			t.Skipf("cannot create symlink: %v", err)
++		}
++		// A relative dangling symlink inside the escaping dir whose target,
++		// resolved against the real directory (/base/outside), is /base/escaped —
++		// outside the scope.
++		if err := os.Symlink("../escaped", filepath.Join(outside, "evil")); err != nil {
++			t.Skipf("cannot create symlink: %v", err)
++		}
++		fs := NewScopedFs(afero.NewOsFs(), scope)
++
++		f, err := fs.OpenFile("/m/evil", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
++		if err == nil {
++			_ = f.Close()
++			t.Fatal("VULNERABLE: write through a dangling relative symlink under a symlinked dir was allowed")
++		}
++		if !os.IsPermission(err) {
++			t.Fatalf("expected permission error, got %v", err)
++		}
++		if _, statErr := os.Stat(filepath.Join(base, "escaped")); statErr == nil {
++			t.Fatal("VULNERABLE: file was created outside the scope")
++		}
++	})
++
++	// Regression for the symlink-following delete escape (GHSA-hq4g-mpch-f9vp /
++	// GHSA-fmm7-x4gx-8jhr): Remove/RemoveAll used to skip guard(), so RemoveAll
++	// followed a symlinked ancestor escaping the scope and deleted an
++	// out-of-scope file.
++	t.Run("RemoveAll through an escaping symlink is rejected", func(t *testing.T) {
++		base := t.TempDir()
++		scope := filepath.Join(base, "scope")
++		outside := filepath.Join(base, "outside")
++		for _, d := range []string{scope, outside} {
++			if err := os.MkdirAll(d, 0o755); err != nil {
++				t.Fatal(err)
++			}
++		}
++		victim := filepath.Join(outside, "victim.txt")
++		if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.Symlink(outside, filepath.Join(scope, "link")); err != nil {
++			t.Skipf("cannot create symlink: %v", err)
++		}
++		fs := NewScopedFs(afero.NewOsFs(), scope)
++
++		if err := fs.RemoveAll("/link/victim.txt"); !os.IsPermission(err) {
++			t.Fatalf("expected RemoveAll through escaping symlink to be rejected, got %v", err)
++		}
++		if _, statErr := os.Stat(victim); statErr != nil {
++			t.Fatalf("VULNERABLE: out-of-scope victim file was deleted: %v", statErr)
++		}
++	})
++
++	// The guard added for the delete escape must not break legitimate deletes of
++	// in-scope files.
++	t.Run("RemoveAll of an in-scope file is allowed", func(t *testing.T) {
++		scope := t.TempDir()
++		target := filepath.Join(scope, "deleteme.txt")
++		if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++		fs := NewScopedFs(afero.NewOsFs(), scope)
+ 
+-		ok, err := WithinScope(bfs, "/link/f.txt")
+-		if err != nil || !ok {
+-			t.Fatalf("expected (true, nil) for an in-scope symlink target, got (%v, %v)", ok, err)
++		if err := fs.RemoveAll("/deleteme.txt"); err != nil {
++			t.Fatalf("expected in-scope RemoveAll to succeed, got %v", err)
++		}
++		if _, statErr := os.Stat(target); statErr == nil {
++			t.Fatal("expected in-scope file to be deleted")
+ 		}
+ 	})
+ }
+@@ -123,7 +234,7 @@ func TestStatRejectsLinkedAncestorEscape(t *testing.T) {
+ 	}
+ 
+ 	// Filesystem scoped to the shared directory, as a public share would be.
+-	bfs := afero.NewBasePathFs(afero.NewOsFs(), filepath.Join(scope, "shared"))
++	bfs := NewScopedFs(afero.NewOsFs(), filepath.Join(scope, "shared"))
+ 
+ 	if _, err := stat(&FileOptions{Fs: bfs, Path: "/link/secret.txt"}); !os.IsPermission(err) {
+ 		t.Fatalf("expected permission error for linked-ancestor escape, got %v", err)
+@@ -220,3 +331,17 @@ func TestReadListingSkipsInaccessibleChildren(t *testing.T) {
+ 		t.Fatalf("expected one listed directory, got %d", got)
+ 	}
+ }
++
++func TestFileInfoRealPathUsesScopedFsRealPath(t *testing.T) {
++	root := t.TempDir()
++	file := &FileInfo{
++		Fs:   NewScopedFs(afero.NewOsFs(), root),
++		Path: "/root/downloads",
++	}
++
++	got := file.RealPath()
++	want := filepath.Join(root, "root", "downloads")
++	if got != want {
++		t.Fatalf("got %q, want %q", got, want)
++	}
++}
+diff --git a/files/scoped.go b/files/scoped.go
+new file mode 100644
+index 0000000..dcc27a1
+--- /dev/null
++++ b/files/scoped.go
+@@ -0,0 +1,230 @@
++package files
++
++import (
++	"errors"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/spf13/afero"
++)
++
++// ScopedFs is an afero.Fs that confines every operation to a base directory and
++// refuses to follow a symbolic link whose on-disk target resolves outside that
++// base. It wraps an *afero.BasePathFs — which already provides the lexical
++// confinement — and adds a per-operation scope check on every call that would
++// dereference a symlink at the OS layer (open, stat, lstat, chmod, …).
++type ScopedFs struct {
++	base *afero.BasePathFs
++}
++
++var (
++	_ afero.Fs      = (*ScopedFs)(nil)
++	_ afero.Lstater = (*ScopedFs)(nil)
++)
++
++// maxSymlinkHops bounds how many dangling symlinks within() will follow before
++// giving up, so a pathological chain cannot loop forever. It mirrors the kernel
++// MAXSYMLINKS limit; the operation is rejected once the bound is exceeded.
++const maxSymlinkHops = 255
++
++func NewScopedFs(source afero.Fs, path string) *ScopedFs {
++	if s, ok := source.(*ScopedFs); ok {
++		source = s.base
++	}
++	return &ScopedFs{base: afero.NewBasePathFs(source, path).(*afero.BasePathFs)}
++}
++
++// Base returns the underlying *afero.BasePathFs.
++func (s *ScopedFs) Base() *afero.BasePathFs { return s.base }
++
++// RealPath resolves a scoped path to the real on-disk path by delegating to
++// the underlying BasePathFs. This is needed by callers that need the actual
++// filesystem path (e.g. disk.UsageWithContext).
++func (s *ScopedFs) RealPath(name string) (string, error) {
++	return s.base.RealPath(name)
++}
++
++// guard returns an error if name's on-disk target resolves outside the scope.
++func (s *ScopedFs) guard(name string) error {
++	ok, err := s.within(name)
++	if err != nil {
++		return err
++	}
++	if !ok {
++		return os.ErrPermission
++	}
++	return nil
++}
++
++// within reports whether the on-disk target of p — after resolving any symbolic
++// links — stays within the scoped root. It exists to stop a symlink that lives
++// lexically inside the scope but points outside it from being followed for
++// reads, writes, or shares.
++//
++// Paths that do not exist yet (e.g. a brand-new file being created) are
++// validated against their nearest existing ancestor, so legitimate new files
++// are always allowed. A dangling symlink — a link whose target does not exist
++// yet — is the exception: it is followed to where it points and validated
++// there, so a write cannot dereference the link to create a file outside the
++// scope.
++func (s *ScopedFs) within(p string) (bool, error) {
++	root, err := filepath.EvalSymlinks(afero.FullBaseFsPath(s.base, "/"))
++	if err != nil {
++		return false, err
++	}
++
++	target := afero.FullBaseFsPath(s.base, p)
++	resolved, err := filepath.EvalSymlinks(target)
++	// When target does not resolve, work out where the operation would actually
++	// land. A non-existent regular path resolves to the file that would be
++	// created inside its containing directory, so walk up to the nearest
++	// existing ancestor and validate that. But when target itself is a dangling
++	// symlink, follow it one level instead: validating its lexical parent would
++	// wrongly accept a link pointing outside the scope, letting a write follow
++	// the link and create the file out of bounds.
++	for hops := 0; errors.Is(err, fs.ErrNotExist); {
++		if fi, lerr := os.Lstat(target); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
++			hops++
++			if hops > maxSymlinkHops {
++				return false, os.ErrPermission
++			}
++			dest, rerr := os.Readlink(target)
++			if rerr != nil {
++				return false, rerr
++			}
++			if !filepath.IsAbs(dest) {
++				// Resolve the link relative to the directory that really contains
++				// it, not its lexical parent: a symlinked ancestor could otherwise
++				// shift the computed target back into scope while the real write
++				// lands outside it. The parent is guaranteed to resolve here
++				// because os.Lstat above already traversed it.
++				base, berr := filepath.EvalSymlinks(filepath.Dir(target))
++				if berr != nil {
++					return false, berr
++				}
++				dest = filepath.Join(base, dest)
++			}
++			target = filepath.Clean(dest)
++		} else {
++			parent := filepath.Dir(target)
++			if parent == target {
++				break
++			}
++			target = parent
++		}
++		resolved, err = filepath.EvalSymlinks(target)
++	}
++	if err != nil {
++		return false, err
++	}
++
++	// Compare against root with a trailing separator so a sibling like
++	// "/srvother" is not treated as being inside "/srv". When root is itself the
++	// filesystem boundary (e.g. "/"), it already ends in a separator, so avoid
++	// producing "//" — which no path would match — and accept any path under it.
++	prefix := root
++	if !strings.HasSuffix(prefix, string(filepath.Separator)) {
++		prefix += string(filepath.Separator)
++	}
++
++	return resolved == root || strings.HasPrefix(resolved, prefix), nil
++}
++
++func (s *ScopedFs) Create(name string) (afero.File, error) {
++	if err := s.guard(name); err != nil {
++		return nil, err
++	}
++	return s.base.Create(name)
++}
++
++func (s *ScopedFs) Mkdir(name string, perm os.FileMode) error {
++	if err := s.guard(name); err != nil {
++		return err
++	}
++	return s.base.Mkdir(name, perm)
++}
++
++func (s *ScopedFs) MkdirAll(path string, perm os.FileMode) error {
++	if err := s.guard(path); err != nil {
++		return err
++	}
++	return s.base.MkdirAll(path, perm)
++}
++
++func (s *ScopedFs) Open(name string) (afero.File, error) {
++	if err := s.guard(name); err != nil {
++		return nil, err
++	}
++	return s.base.Open(name)
++}
++
++func (s *ScopedFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
++	if err := s.guard(name); err != nil {
++		return nil, err
++	}
++	return s.base.OpenFile(name, flag, perm)
++}
++
++func (s *ScopedFs) Remove(name string) error {
++	if err := s.guard(name); err != nil {
++		return err
++	}
++	return s.base.Remove(name)
++}
++
++func (s *ScopedFs) RemoveAll(path string) error {
++	if err := s.guard(path); err != nil {
++		return err
++	}
++	return s.base.RemoveAll(path)
++}
++
++func (s *ScopedFs) Rename(oldname, newname string) error {
++	if err := s.guard(oldname); err != nil {
++		return err
++	}
++	if err := s.guard(newname); err != nil {
++		return err
++	}
++	return s.base.Rename(oldname, newname)
++}
++
++func (s *ScopedFs) Stat(name string) (os.FileInfo, error) {
++	if err := s.guard(name); err != nil {
++		return nil, err
++	}
++	return s.base.Stat(name)
++}
++
++func (s *ScopedFs) Name() string { return "ScopedFs" }
++
++func (s *ScopedFs) Chmod(name string, mode os.FileMode) error {
++	if err := s.guard(name); err != nil {
++		return err
++	}
++	return s.base.Chmod(name, mode)
++}
++
++func (s *ScopedFs) Chown(name string, uid, gid int) error {
++	if err := s.guard(name); err != nil {
++		return err
++	}
++	return s.base.Chown(name, uid, gid)
++}
++
++func (s *ScopedFs) Chtimes(name string, atime, mtime time.Time) error {
++	if err := s.guard(name); err != nil {
++		return err
++	}
++	return s.base.Chtimes(name, atime, mtime)
++}
++
++func (s *ScopedFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
++	if err := s.guard(name); err != nil {
++		return nil, false, err
++	}
++	return s.base.LstatIfPossible(name)
++}
+diff --git a/fileutils/copy_test.go b/fileutils/copy_test.go
+index f9cad6f..ccdcc90 100644
+--- a/fileutils/copy_test.go
++++ b/fileutils/copy_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"path/filepath"
+ 	"testing"
+ 
++	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/spf13/afero"
+ )
+ 
+@@ -31,7 +32,7 @@ func TestCopyDoesNotDereferenceEscapingSymlink(t *testing.T) {
+ 		t.Skipf("cannot create symlink: %v", err)
+ 	}
+ 
+-	afs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++	afs := files.NewScopedFs(afero.NewOsFs(), scope)
+ 
+ 	err := Copy(afs, "/srcdir", "/dstdir", 0o644, 0o755)
+ 	if err == nil {
+@@ -58,7 +59,7 @@ func TestCopyAllowsInScopeSymlink(t *testing.T) {
+ 		t.Skipf("cannot create symlink: %v", err)
+ 	}
+ 
+-	afs := afero.NewBasePathFs(afero.NewOsFs(), scope)
++	afs := files.NewScopedFs(afero.NewOsFs(), scope)
+ 
+ 	if err := Copy(afs, "/srcdir", "/dstdir", 0o644, 0o755); err != nil {
+ 		t.Fatalf("expected copy of an in-scope symlink to succeed, got: %v", err)
+diff --git a/fileutils/dir.go b/fileutils/dir.go
+index 0b127c4..e0b049d 100644
+--- a/fileutils/dir.go
++++ b/fileutils/dir.go
+@@ -3,24 +3,14 @@ package fileutils
+ import (
+ 	"errors"
+ 	"io/fs"
+-	"os"
+ 
+ 	"github.com/spf13/afero"
+-
+-	"github.com/filebrowser/filebrowser/v2/files"
+ )
+ 
+ // CopyDir copies a directory from source to dest and all
+ // of its sub-directories. It doesn't stop if it finds an error
+ // during the copy. Returns an error if any.
+ func CopyDir(afs afero.Fs, source, dest string, fileMode, dirMode fs.FileMode) error {
+-	if ok, err := files.WithinScope(afs, source); err != nil || !ok {
+-		if err != nil {
+-			return err
+-		}
+-		return os.ErrPermission
+-	}
+-
+ 	// Get properties of source.
+ 	srcinfo, err := afs.Stat(source)
+ 	if err != nil {
+diff --git a/fileutils/file.go b/fileutils/file.go
+index ab8c7ff..784f728 100644
+--- a/fileutils/file.go
++++ b/fileutils/file.go
+@@ -8,8 +8,6 @@ import (
+ 	"path/filepath"
+ 
+ 	"github.com/spf13/afero"
+-
+-	"github.com/filebrowser/filebrowser/v2/files"
+ )
+ 
+ // MoveFile moves file from src to dst.
+@@ -34,13 +32,6 @@ func MoveFile(afs afero.Fs, src, dst string, fileMode, dirMode fs.FileMode) erro
+ // CopyFile copies a file from source to dest and returns
+ // an error if any.
+ func CopyFile(afs afero.Fs, source, dest string, fileMode, dirMode fs.FileMode) error {
+-	if ok, err := files.WithinScope(afs, source); err != nil || !ok {
+-		if err != nil {
+-			return err
+-		}
+-		return os.ErrPermission
+-	}
+-
+ 	// Open the source file.
+ 	src, err := afs.Open(source)
+ 	if err != nil {
+diff --git a/http/public.go b/http/public.go
+index fb71d2b..a882f2f 100644
+--- a/http/public.go
++++ b/http/public.go
+@@ -9,11 +9,9 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
+-	"github.com/spf13/afero"
+-	"golang.org/x/crypto/bcrypt"
+-
+ 	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/share"
++	"golang.org/x/crypto/bcrypt"
+ )
+ 
+ var withHashFile = func(fn handleFunc) handleFunc {
+@@ -65,8 +63,11 @@ var withHashFile = func(fn handleFunc) handleFunc {
+ 			filePath = ifPath
+ 		}
+ 
+-		// set fs root to the shared file/folder
+-		d.user.Fs = afero.NewBasePathFs(d.user.Fs, basePath)
++		// set fs root to the shared file/folder. ScopedFs (not a bare
++		// BasePathFs) so the share is also symlink-confined: a link inside the
++		// shared subtree that points elsewhere in the owner's scope — outside
++		// the share — must not be followed.
++		d.user.Fs = files.NewScopedFs(d.user.Fs, basePath)
+ 
+ 		// the filesystem is now rebased onto basePath, so paths handed to the
+ 		// rule checker are relative to it. Resolve them back to the user's
+diff --git a/http/public_symlink_test.go b/http/public_symlink_test.go
+index 89c3bbd..fa631c8 100644
+--- a/http/public_symlink_test.go
++++ b/http/public_symlink_test.go
+@@ -12,13 +12,13 @@ import (
+ 	"testing"
+ 
+ 	"github.com/asdine/storm/v3"
+-	"github.com/spf13/afero"
+-
++	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/settings"
+ 	"github.com/filebrowser/filebrowser/v2/share"
+ 	"github.com/filebrowser/filebrowser/v2/storage"
+ 	"github.com/filebrowser/filebrowser/v2/storage/bolt"
+ 	"github.com/filebrowser/filebrowser/v2/users"
++	"github.com/spf13/afero"
+ )
+ 
+ // symlinkShareStorage builds a storage whose single user is rooted at a real
+@@ -65,7 +65,7 @@ func symlinkShareStorage(t *testing.T) *storage.Storage {
+ 	}
+ 	st.Users = &customFSUser{
+ 		Store: st.Users,
+-		fs:    afero.NewBasePathFs(afero.NewOsFs(), scope),
++		fs:    files.NewScopedFs(afero.NewOsFs(), scope),
+ 	}
+ 	return st
+ }
+diff --git a/http/public_test.go b/http/public_test.go
+index 947ee04..0b0b767 100644
+--- a/http/public_test.go
++++ b/http/public_test.go
+@@ -8,13 +8,13 @@ import (
+ 	"testing"
+ 
+ 	"github.com/asdine/storm/v3"
+-	"github.com/spf13/afero"
+-
++	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/rules"
+ 	"github.com/filebrowser/filebrowser/v2/settings"
+ 	"github.com/filebrowser/filebrowser/v2/share"
+ 	"github.com/filebrowser/filebrowser/v2/storage/bolt"
+ 	"github.com/filebrowser/filebrowser/v2/users"
++	"github.com/spf13/afero"
+ )
+ 
+ func TestPublicShareHandlerAuthentication(t *testing.T) {
+@@ -220,7 +220,7 @@ func TestPublicShareHandlerRules(t *testing.T) {
+ 				t.Fatalf("failed to save settings: %v", err)
+ 			}
+ 
+-			fs := afero.NewBasePathFs(afero.NewOsFs(), t.TempDir())
++			fs := files.NewScopedFs(afero.NewOsFs(), t.TempDir())
+ 			if err := fs.MkdirAll("/projects/private", 0o755); err != nil {
+ 				t.Fatalf("failed to create private dir: %v", err)
+ 			}
+@@ -276,7 +276,9 @@ func (cu *customFSUser) Get(baseScope string, id interface{}) (*users.User, erro
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	user.Fs = cu.fs
++	// Mirror production (users.User init), where a user's filesystem is always a
++	// scoped, symlink-confining ScopedFs rather than a bare afero.Fs.
++	user.Fs = files.NewScopedFs(cu.fs, "/")
+ 
+ 	return user, nil
+ }
+diff --git a/http/raw.go b/http/raw.go
+index ab01eed..860d6aa 100644
+--- a/http/raw.go
++++ b/http/raw.go
+@@ -10,11 +10,10 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
+-	"github.com/mholt/archives"
+-
+ 	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/fileutils"
+ 	"github.com/filebrowser/filebrowser/v2/users"
++	"github.com/mholt/archives"
+ )
+ 
+ func slashClean(name string) string {
+@@ -115,10 +114,6 @@ func getFiles(d *data, path, commonPath string) ([]archives.FileInfo, error) {
+ 		return nil, nil
+ 	}
+ 
+-	if ok, err := files.WithinScope(d.user.Fs, path); err != nil || !ok {
+-		return nil, nil
+-	}
+-
+ 	info, err := d.user.Fs.Stat(path)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/http/resource.go b/http/resource.go
+index 27eb8b7..728bad7 100644
+--- a/http/resource.go
++++ b/http/resource.go
+@@ -15,12 +15,11 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/shirou/gopsutil/v4/disk"
+-	"github.com/spf13/afero"
+-
+ 	fberrors "github.com/filebrowser/filebrowser/v2/errors"
+ 	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/fileutils"
++	"github.com/shirou/gopsutil/v4/disk"
++	"github.com/spf13/afero"
+ )
+ 
+ var resourceGetHandler = withUser(func(w http.ResponseWriter, r *http.Request, d *data) (int, error) {
+@@ -228,15 +227,6 @@ func resourcePatchHandler(fileCache FileCache) handleFunc {
+ 			return http.StatusForbidden, nil
+ 		}
+ 
+-		for _, p := range []string{src, dst} {
+-			if ok, scopeErr := files.WithinScope(d.user.Fs, p); scopeErr != nil || !ok {
+-				if scopeErr != nil {
+-					return errToStatus(scopeErr), scopeErr
+-				}
+-				return http.StatusForbidden, nil
+-			}
+-		}
+-
+ 		err = checkParent(src, dst)
+ 		if err != nil {
+ 			return http.StatusBadRequest, err
+@@ -304,10 +294,6 @@ func addVersionSuffix(source string, afs afero.Fs) string {
+ }
+ 
+ func writeFile(afs afero.Fs, dst string, in io.Reader, fileMode, dirMode fs.FileMode) (os.FileInfo, error) {
+-	if ok, err := files.WithinScope(afs, dst); err != nil || !ok {
+-		return nil, os.ErrPermission
+-	}
+-
+ 	dir, _ := path.Split(dst)
+ 	err := afs.MkdirAll(dir, dirMode)
+ 	if err != nil {
+diff --git a/http/resource_test.go b/http/resource_test.go
+new file mode 100644
+index 0000000..e22d152
+--- /dev/null
++++ b/http/resource_test.go
+@@ -0,0 +1,224 @@
++package fbhttp
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/asdine/storm/v3"
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/spf13/afero"
++
++	"github.com/filebrowser/filebrowser/v2/diskcache"
++	"github.com/filebrowser/filebrowser/v2/settings"
++	"github.com/filebrowser/filebrowser/v2/storage"
++	"github.com/filebrowser/filebrowser/v2/storage/bolt"
++	"github.com/filebrowser/filebrowser/v2/users"
++)
++
++func TestResourceCopyDoesNotDereferenceEscapingSymlink(t *testing.T) {
++	root := t.TempDir()
++	userScope := filepath.Join(root, "user")
++	if err := os.MkdirAll(filepath.Join(userScope, "srcdir"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	// An ordinary in-scope file, to prove a normal copy still works.
++	if err := os.WriteFile(filepath.Join(userScope, "srcdir", "normal.txt"), []byte("in-scope"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// The secret living outside the user's scope.
++	secret := filepath.Join(root, "secret.txt")
++	if err := os.WriteFile(secret, []byte("OUT-OF-SCOPE-SECRET"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// An escaping symlink planted inside the user's scope (out-of-band, as the
++	// advisory's preconditions describe).
++	if err := os.Symlink(secret, filepath.Join(userScope, "srcdir", "link.txt")); err != nil {
++		t.Skipf("cannot create symlink: %v", err)
++	}
++
++	key := []byte("test-signing-key")
++
++	db, err := storm.Open(filepath.Join(t.TempDir(), "db"))
++	if err != nil {
++		t.Fatalf("failed to open db: %v", err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++
++	st, err := bolt.NewStorage(db)
++	if err != nil {
++		t.Fatalf("failed to get storage: %v", err)
++	}
++	perm := users.Permissions{Create: true, Modify: true, Download: true, Rename: true}
++	if err := st.Users.Save(&users.User{Username: "u", Password: "pw", Perm: perm}); err != nil {
++		t.Fatalf("failed to save user: %v", err)
++	}
++	if err := st.Settings.Save(&settings.Settings{Key: key}); err != nil {
++		t.Fatalf("failed to save settings: %v", err)
++	}
++	// The user's scope is the real on-disk userScope. customFSUser.Get wraps it
++	// in a ScopedFs, mirroring production (users.User init).
++	st.Users = &customFSUser{
++		Store: st.Users,
++		fs:    afero.NewBasePathFs(afero.NewOsFs(), userScope),
++	}
++
++	signed := signToken(t, perm, key)
++
++	t.Run("direct raw read is forbidden", func(t *testing.T) {
++		req, _ := http.NewRequest(http.MethodGet, "/srcdir/link.txt", http.NoBody)
++		req.Header.Set("X-Auth", signed)
++		rec := httptest.NewRecorder()
++		handle(rawHandler, "", st, &settings.Server{}).ServeHTTP(rec, req)
++		if rec.Code == http.StatusOK {
++			t.Fatalf("VULNERABLE: direct raw read of escaping symlink returned 200, body=%q", rec.Body.String())
++		}
++	})
++
++	t.Run("recursive copy does not exfiltrate", func(t *testing.T) {
++		req, _ := http.NewRequest(http.MethodPatch, "/srcdir/", http.NoBody)
++		q := req.URL.Query()
++		q.Set("action", "copy")
++		q.Set("destination", "/dstdir")
++		req.URL.RawQuery = q.Encode()
++		req.Header.Set("X-Auth", signed)
++
++		rec := httptest.NewRecorder()
++		handle(resourcePatchHandler(diskcache.NewNoOp()), "", st, &settings.Server{}).ServeHTTP(rec, req)
++		t.Logf("copy status=%d body=%q", rec.Code, rec.Body.String())
++
++		// The escaping symlink's target content must never appear in scope.
++		leaked := filepath.Join(userScope, "dstdir", "link.txt")
++		if data, readErr := os.ReadFile(leaked); readErr == nil {
++			t.Fatalf("VULNERABLE: out-of-scope content landed in scope at %s: %q", leaked, string(data))
++		}
++	})
++}
++
++func signToken(t *testing.T, perm users.Permissions, key []byte) string {
++	t.Helper()
++	claims := &authToken{
++		User: userInfo{ID: 1, Username: "u", Perm: perm},
++		RegisteredClaims: jwt.RegisteredClaims{
++			IssuedAt:  jwt.NewNumericDate(time.Now().Add(-time.Minute)),
++			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
++		},
++	}
++	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
++	if err != nil {
++		t.Fatalf("failed to sign token: %v", err)
++	}
++	return signed
++}
++
++// scopedUserStorage returns a storage whose single user (ID 1) is scoped to
++// userScope through a symlink-confining ScopedFs (via customFSUser), mirroring
++// production. Used by the symlink scope-escape regression tests below.
++func scopedUserStorage(t *testing.T, userScope string, perm users.Permissions, key []byte) *storage.Storage {
++	t.Helper()
++	db, err := storm.Open(filepath.Join(t.TempDir(), "db"))
++	if err != nil {
++		t.Fatalf("failed to open db: %v", err)
++	}
++	t.Cleanup(func() { _ = db.Close() })
++
++	st, err := bolt.NewStorage(db)
++	if err != nil {
++		t.Fatalf("failed to get storage: %v", err)
++	}
++	if err := st.Users.Save(&users.User{Username: "u", Password: "pw", Perm: perm}); err != nil {
++		t.Fatalf("failed to save user: %v", err)
++	}
++	if err := st.Settings.Save(&settings.Settings{Key: key}); err != nil {
++		t.Fatalf("failed to save settings: %v", err)
++	}
++	st.Users = &customFSUser{
++		Store: st.Users,
++		fs:    afero.NewBasePathFs(afero.NewOsFs(), userScope),
++	}
++	return st
++}
++
++// Regression for the dangling-symlink write escape (GHSA-8wc8-hf36-mjh9 /
++// GHSA-fh54-6rfh-r8f3): POSTing to an in-scope dangling symlink whose target is
++// outside the scope must not dereference the link to create the out-of-scope
++// file.
++func TestResourcePostRejectsDanglingSymlinkWriteEscape(t *testing.T) {
++	root := t.TempDir()
++	userScope := filepath.Join(root, "user")
++	outside := filepath.Join(root, "outside")
++	for _, d := range []string{userScope, outside} {
++		if err := os.MkdirAll(d, 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	// A dangling symlink inside the scope pointing at a not-yet-existing file
++	// outside it (planted out-of-band, per the advisory preconditions).
++	outsideTarget := filepath.Join(outside, "created.txt")
++	if err := os.Symlink(outsideTarget, filepath.Join(userScope, "evil")); err != nil {
++		t.Skipf("cannot create symlink: %v", err)
++	}
++
++	key := []byte("test-signing-key")
++	perm := users.Permissions{Create: true, Modify: true}
++	st := scopedUserStorage(t, userScope, perm, key)
++	signed := signToken(t, perm, key)
++
++	req, _ := http.NewRequest(http.MethodPost, "/evil?override=true", strings.NewReader("http-outside"))
++	req.Header.Set("X-Auth", signed)
++	rec := httptest.NewRecorder()
++	handle(resourcePostHandler(diskcache.NewNoOp()), "", st, &settings.Server{}).ServeHTTP(rec, req)
++
++	if _, statErr := os.Stat(outsideTarget); statErr == nil {
++		data, _ := os.ReadFile(outsideTarget)
++		t.Fatalf("VULNERABLE: out-of-scope file created via dangling symlink (status=%d, content=%q)", rec.Code, string(data))
++	}
++	if rec.Code != http.StatusForbidden {
++		t.Errorf("expected 403, got %d body=%q", rec.Code, rec.Body.String())
++	}
++}
++
++// Regression for the symlink-following delete escape (GHSA-hq4g-mpch-f9vp /
++// GHSA-fmm7-x4gx-8jhr): a Create-only user POSTing to a child of an escaping
++// symlinked directory must not delete the out-of-scope target through the
++// failed-upload cleanup RemoveAll.
++func TestResourcePostCleanupDoesNotDeleteThroughSymlink(t *testing.T) {
++	root := t.TempDir()
++	userScope := filepath.Join(root, "user")
++	outside := filepath.Join(root, "outside")
++	for _, d := range []string{userScope, outside} {
++		if err := os.MkdirAll(d, 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	victim := filepath.Join(outside, "victim.txt")
++	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	// An escaping directory symlink inside the scope (planted out-of-band).
++	if err := os.Symlink(outside, filepath.Join(userScope, "link")); err != nil {
++		t.Skipf("cannot create symlink: %v", err)
++	}
++
++	key := []byte("test-signing-key")
++	// Create-only: Perm.Delete is deliberately false — the bug must not need it.
++	perm := users.Permissions{Create: true}
++	st := scopedUserStorage(t, userScope, perm, key)
++	signed := signToken(t, perm, key)
++
++	req, _ := http.NewRequest(http.MethodPost, "/link/victim.txt", strings.NewReader("x"))
++	req.Header.Set("X-Auth", signed)
++	rec := httptest.NewRecorder()
++	handle(resourcePostHandler(diskcache.NewNoOp()), "", st, &settings.Server{}).ServeHTTP(rec, req)
++
++	if _, statErr := os.Stat(victim); statErr != nil {
++		t.Fatalf("VULNERABLE: out-of-scope victim.txt deleted by cleanup RemoveAll (status=%d): %v", rec.Code, statErr)
++	}
++}
+diff --git a/http/share.go b/http/share.go
+index c73f5da..7cd08fa 100644
+--- a/http/share.go
++++ b/http/share.go
+@@ -12,11 +12,9 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"golang.org/x/crypto/bcrypt"
+-
+ 	fberrors "github.com/filebrowser/filebrowser/v2/errors"
+-	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/share"
++	"golang.org/x/crypto/bcrypt"
+ )
+ 
+ func withPermShare(fn handleFunc) handleFunc {
+@@ -103,20 +101,14 @@ var sharePostHandler = withPermShare(func(w http.ResponseWriter, r *http.Request
+ 	// Only allow sharing paths that currently exist. Otherwise a share could be
+ 	// created for a non-existent path and would silently start exposing
+ 	// whatever file later appears there.
++	//
++	// d.user.Fs is scoped, so Stat also refuses to follow a symlink whose target
++	// escapes the user's scope: that returns a permission error here and so
++	// blocks creating a share that points out of scope.
+ 	if _, err := d.user.Fs.Stat(r.URL.Path); err != nil {
+ 		return errToStatus(err), err
+ 	}
+ 
+-	// Refuse to create a share whose on-disk target escapes the user's scope
+-	// (e.g. via a symlink), mirroring the read/write guards. The public serve
+-	// path already rejects these, but blocking creation avoids dangling shares.
+-	if ok, err := files.WithinScope(d.user.Fs, r.URL.Path); err != nil || !ok {
+-		if err != nil {
+-			return errToStatus(err), err
+-		}
+-		return http.StatusForbidden, nil
+-	}
+-
+ 	var s *share.Link
+ 	var body share.CreateBody
+ 	if r.Body != nil {
+diff --git a/http/tus_handlers.go b/http/tus_handlers.go
+index 2629bd0..fe7ae28 100644
+--- a/http/tus_handlers.go
++++ b/http/tus_handlers.go
+@@ -11,9 +11,8 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/spf13/afero"
+-
+ 	"github.com/filebrowser/filebrowser/v2/files"
++	"github.com/spf13/afero"
+ )
+ 
+ // keepUploadActive periodically touches the cache entry to prevent eviction during transfer
+@@ -45,10 +44,6 @@ func tusPostHandler(cache UploadCache) handleFunc {
+ 			return http.StatusForbidden, nil
+ 		}
+ 
+-		if ok, scopeErr := files.WithinScope(d.user.Fs, r.URL.Path); scopeErr != nil || !ok {
+-			return http.StatusForbidden, nil
+-		}
+-
+ 		file, err := files.NewFileInfo(&files.FileOptions{
+ 			Fs:         d.user.Fs,
+ 			Path:       r.URL.Path,
+@@ -167,10 +162,6 @@ func tusPatchHandler(cache UploadCache) handleFunc {
+ 			return http.StatusUnsupportedMediaType, nil
+ 		}
+ 
+-		if ok, scopeErr := files.WithinScope(d.user.Fs, r.URL.Path); scopeErr != nil || !ok {
+-			return http.StatusForbidden, nil
+-		}
+-
+ 		uploadOffset, err := getUploadOffset(r)
+ 		if err != nil {
+ 			return http.StatusBadRequest, fmt.Errorf("invalid upload offset")
+diff --git a/http/tus_symlink_test.go b/http/tus_symlink_test.go
+index ac0b8c3..678347e 100644
+--- a/http/tus_symlink_test.go
++++ b/http/tus_symlink_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/golang-jwt/jwt/v5"
+ 	"github.com/spf13/afero"
+ 
++	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/settings"
+ 	"github.com/filebrowser/filebrowser/v2/storage/bolt"
+ 	"github.com/filebrowser/filebrowser/v2/users"
+@@ -58,7 +59,7 @@ func TestTusHandlersRejectSymlinkScopeEscape(t *testing.T) {
+ 	}
+ 	st.Users = &customFSUser{
+ 		Store: st.Users,
+-		fs:    afero.NewBasePathFs(afero.NewOsFs(), userScope),
++		fs:    files.NewScopedFs(afero.NewOsFs(), userScope),
+ 	}
+ 
+ 	// Forge a valid auth token for user ID 1.
+diff --git a/users/users.go b/users/users.go
+index 7181b29..6be3b09 100644
+--- a/users/users.go
++++ b/users/users.go
+@@ -3,11 +3,10 @@ package users
+ import (
+ 	"path/filepath"
+ 
+-	"github.com/spf13/afero"
+-
+ 	fberrors "github.com/filebrowser/filebrowser/v2/errors"
+ 	"github.com/filebrowser/filebrowser/v2/files"
+ 	"github.com/filebrowser/filebrowser/v2/rules"
++	"github.com/spf13/afero"
+ )
+ 
+ // ViewMode describes a view mode.
+@@ -20,23 +19,23 @@ const (
+ 
+ // User describes a user.
+ type User struct {
+-	ID                    uint          `storm:"id,increment" json:"id"`
+-	Username              string        `storm:"unique" json:"username"`
+-	Password              string        `json:"password"`
+-	Scope                 string        `json:"scope"`
+-	Locale                string        `json:"locale"`
+-	LockPassword          bool          `json:"lockPassword"`
+-	ViewMode              ViewMode      `json:"viewMode"`
+-	SingleClick           bool          `json:"singleClick"`
+-	RedirectAfterCopyMove bool          `json:"redirectAfterCopyMove"`
+-	Perm                  Permissions   `json:"perm"`
+-	Commands              []string      `json:"commands"`
+-	Sorting               files.Sorting `json:"sorting"`
+-	Fs                    afero.Fs      `json:"-" yaml:"-"`
+-	Rules                 []rules.Rule  `json:"rules"`
+-	HideDotfiles          bool          `json:"hideDotfiles"`
+-	DateFormat            bool          `json:"dateFormat"`
+-	AceEditorTheme        string        `json:"aceEditorTheme"`
++	ID                    uint            `storm:"id,increment" json:"id"`
++	Username              string          `storm:"unique" json:"username"`
++	Password              string          `json:"password"`
++	Scope                 string          `json:"scope"`
++	Locale                string          `json:"locale"`
++	LockPassword          bool            `json:"lockPassword"`
++	ViewMode              ViewMode        `json:"viewMode"`
++	SingleClick           bool            `json:"singleClick"`
++	RedirectAfterCopyMove bool            `json:"redirectAfterCopyMove"`
++	Perm                  Permissions     `json:"perm"`
++	Commands              []string        `json:"commands"`
++	Sorting               files.Sorting   `json:"sorting"`
++	Fs                    *files.ScopedFs `json:"-" yaml:"-"`
++	Rules                 []rules.Rule    `json:"rules"`
++	HideDotfiles          bool            `json:"hideDotfiles"`
++	DateFormat            bool            `json:"dateFormat"`
++	AceEditorTheme        string          `json:"aceEditorTheme"`
+ }
+ 
+ // GetRules implements rules.Provider.
+@@ -93,7 +92,7 @@ func (u *User) Clean(baseScope string, fields ...string) error {
+ 	if u.Fs == nil {
+ 		scope := u.Scope
+ 		scope = filepath.Join(baseScope, filepath.Join("/", scope))
+-		u.Fs = afero.NewBasePathFs(afero.NewOsFs(), scope)
++		u.Fs = files.NewScopedFs(afero.NewOsFs(), scope)
+ 	}
+ 
+ 	return nil
+@@ -101,5 +100,5 @@ func (u *User) Clean(baseScope string, fields ...string) error {
+ 
+ // FullPath gets the full path for a user's relative path.
+ func (u *User) FullPath(path string) string {
+-	return afero.FullBaseFsPath(u.Fs.(*afero.BasePathFs), path)
++	return afero.FullBaseFsPath(u.Fs.Base(), path)
+ }

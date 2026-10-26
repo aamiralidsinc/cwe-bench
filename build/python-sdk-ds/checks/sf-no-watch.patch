@@ -1,0 +1,462 @@
+diff --git a/src/mcp/server/experimental/__init__.py b/src/mcp/server/experimental/__init__.py
+index 824bb8b..91c6dcf 100644
+--- a/src/mcp/server/experimental/__init__.py
++++ b/src/mcp/server/experimental/__init__.py
+@@ -8,4 +8,5 @@ Import directly from submodules:
+ - mcp.server.experimental.task_support.TaskSupport
+ - mcp.server.experimental.task_result_handler.TaskResultHandler
+ - mcp.server.experimental.request_context.Experimental
++- mcp.server.experimental.task_scope (session scoping of task IDs)
+ """
+diff --git a/src/mcp/server/experimental/request_context.py b/src/mcp/server/experimental/request_context.py
+index 78e75be..0d69836 100644
+--- a/src/mcp/server/experimental/request_context.py
++++ b/src/mcp/server/experimental/request_context.py
+@@ -7,11 +7,15 @@ features within a request context, such as task-augmented request handling.
+ WARNING: These APIs are experimental and may change without notice.
+ """
+ 
++import warnings
+ from collections.abc import Awaitable, Callable
+ from dataclasses import dataclass, field
+-from typing import Any
++from typing import Any, overload
++
++from typing_extensions import deprecated
+ 
+ from mcp.server.experimental.task_context import ServerTaskContext
++from mcp.server.experimental.task_scope import scoped_task_id
+ from mcp.server.experimental.task_support import TaskSupport
+ from mcp.server.session import ServerSession
+ from mcp.shared.exceptions import McpError
+@@ -29,6 +33,14 @@ from mcp.types import (
+     Tool,
+ )
+ 
++EXPLICIT_TASK_ID_DEPRECATION = (
++    "Passing an explicit task_id to run_task is deprecated. A task created with an "
++    "explicit ID is not associated with the session that created it: any requestor "
++    "that presents the ID can read its status and result or cancel it, and it never "
++    "appears in tasks/list. Omit task_id to let the SDK generate an ID associated "
++    "with the creating session."
++)
++
+ 
+ @dataclass
+ class Experimental:
+@@ -143,6 +155,25 @@ class Experimental:
+             return False
+         return True
+ 
++    @overload
++    async def run_task(
++        self,
++        work: Callable[[ServerTaskContext], Awaitable[Result]],
++        *,
++        task_id: None = None,
++        model_immediate_response: str | None = None,
++    ) -> CreateTaskResult: ...
++
++    @overload
++    @deprecated(EXPLICIT_TASK_ID_DEPRECATION)
++    async def run_task(
++        self,
++        work: Callable[[ServerTaskContext], Awaitable[Result]],
++        *,
++        task_id: str,
++        model_immediate_response: str | None = None,
++    ) -> CreateTaskResult: ...
++
+     async def run_task(
+         self,
+         work: Callable[[ServerTaskContext], Awaitable[Result]],
+@@ -167,9 +198,17 @@ class Experimental:
+         When work() returns a Result, the task is auto-completed with that result.
+         If work() raises an exception, the task is auto-failed.
+ 
++        Generated task IDs embed the session's task scope so that the default
++        task handlers only serve the task to the session that created it. An
++        explicitly provided `task_id` is used verbatim and is not associated
++        with the session, so any session can access it through the default
++        handlers; passing one is deprecated for that reason.
++
+         Args:
+             work: Async function that does the actual work
+-            task_id: Optional task ID (generated if not provided)
++            task_id: Deprecated. Optional task ID, used verbatim and not
++                associated with the creating session. Omit it to let the SDK
++                generate one.
+             model_immediate_response: Optional string to include in _meta as
+                 io.modelcontextprotocol/model-immediate-response
+ 
+@@ -196,6 +235,8 @@ class Experimental:
+ 
+         WARNING: This API is experimental and may change without notice.
+         """
++        if task_id is not None:
++            warnings.warn(EXPLICIT_TASK_ID_DEPRECATION, DeprecationWarning, stacklevel=2)
+         if self._task_support is None:
+             raise RuntimeError("Task support not enabled. Call server.experimental.enable_tasks() first.")
+         if self._session is None:
+@@ -210,6 +251,11 @@ class Experimental:
+         # Access task_group via TaskSupport - raises if not in run() context
+         task_group = support.task_group
+ 
++        if task_id is None:
++            session_scope = self._session.experimental.task_session_scope
++            if session_scope is not None:
++                task_id = scoped_task_id(session_scope)
++
+         task = await support.store.create_task(self.task_metadata, task_id)
+ 
+         task_ctx = ServerTaskContext(
+diff --git a/src/mcp/server/experimental/session_features.py b/src/mcp/server/experimental/session_features.py
+index 4842da5..c118537 100644
+--- a/src/mcp/server/experimental/session_features.py
++++ b/src/mcp/server/experimental/session_features.py
+@@ -40,6 +40,12 @@ class ExperimentalServerSessionFeatures:
+ 
+     def __init__(self, session: "ServerSession") -> None:
+         self._session = session
++        # Opaque marker identifying this session for task scoping. Assigned by
++        # TaskSupport.configure_session(). Task IDs generated by run_task()
++        # embed it so the default task handlers can restrict task access to
++        # the session that created the task. None means tasks created on this
++        # session are not associated with it (e.g. stateless servers).
++        self.task_session_scope: str | None = None
+ 
+     async def get_task(self, task_id: str) -> types.GetTaskResult:
+         """
+diff --git a/src/mcp/server/experimental/task_housekeeping.py b/src/mcp/server/experimental/task_housekeeping.py
+index 3fef91f..b8e42bc 100644
+--- a/src/mcp/server/experimental/task_housekeeping.py
++++ b/src/mcp/server/experimental/task_housekeeping.py
+@@ -14,6 +14,7 @@ import logging
+ from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
+ 
++from mcp.server.experimental.task_scope import task_in_session_scope
+ from mcp.server.experimental.task_watch import registry as watch_registry
+ from mcp.shared.exceptions import McpError
+ from mcp.shared.experimental.tasks.store import TaskStore
+@@ -50,6 +51,13 @@ def register_housekeeping_handlers(
+ 
+     async def _default_delete_task(req: DeleteTaskRequest) -> ServerResult:
+         session = server.request_context.session
++        if not task_in_session_scope(req.params.taskId, session.experimental.task_session_scope):
++            raise McpError(
++                ErrorData(
++                    code=INVALID_PARAMS,
++                    message=f"Task not found: {req.params.taskId}",
++                )
++            )
+         deleted = await store.delete_task(req.params.taskId)
+         if not deleted:
+             raise McpError(
+diff --git a/src/mcp/server/experimental/task_result_handler.py b/src/mcp/server/experimental/task_result_handler.py
+index 0b86921..1cf7f69 100644
+--- a/src/mcp/server/experimental/task_result_handler.py
++++ b/src/mcp/server/experimental/task_result_handler.py
+@@ -46,6 +46,11 @@ class TaskResultHandler:
+     4. Blocks until task reaches terminal state
+     5. Returns the final result
+ 
++    Prefer `server.experimental.enable_tasks()`, whose default tasks/result
++    handler wraps `handle()` and only serves tasks created by the requesting
++    session. A custom handler that calls `handle()` directly is responsible
++    for deciding which requestors may access which tasks.
++
+     Usage:
+         # Create handler with store and queue
+         handler = TaskResultHandler(task_store, message_queue)
+@@ -55,9 +60,6 @@ class TaskResultHandler:
+         async def handle_task_result(req: GetTaskPayloadRequest) -> GetTaskPayloadResult:
+             ctx = server.request_context
+             return await handler.handle(req, ctx.session, ctx.request_id)
+-
+-        # Or use the convenience method
+-        handler.register(server)
+     """
+ 
+     def __init__(
+diff --git a/src/mcp/server/experimental/task_scope.py b/src/mcp/server/experimental/task_scope.py
+new file mode 100644
+index 0000000..c33cf55
+--- /dev/null
++++ b/src/mcp/server/experimental/task_scope.py
+@@ -0,0 +1,75 @@
++"""
++Session scoping for experimental task identifiers.
++
++Task IDs generated by `run_task()` embed an opaque, per-session marker (the
++"session scope") so that the default task handlers can tell which session
++created a task. The default handlers for tasks/get, tasks/result, tasks/list,
++and tasks/cancel only operate on tasks created by the requesting session.
++
++Task IDs without a session scope (explicitly provided IDs, IDs created
++directly through a TaskStore, or IDs created in stateless mode) have no known
++creator. They can be used with tasks/get, tasks/result, and tasks/cancel from
++any session - possession of the ID is what grants access - but they are never
++included in tasks/list responses.
++
++WARNING: These APIs are experimental and may change without notice.
++"""
++
++import re
++from uuid import uuid4
++
++__all__ = [
++    "new_session_scope",
++    "scoped_task_id",
++    "session_scope_of",
++    "task_in_session_scope",
++    "task_listable_in_session_scope",
++]
++
++# A scoped task ID has the form "<32 hex chars>:<uuid4>". Both halves must
++# match exactly so that explicitly chosen task IDs are never mistaken for
++# scoped ones. \Z rather than $ so a trailing newline cannot match.
++_SCOPED_TASK_ID = re.compile(
++    r"\A(?P<scope>[0-9a-f]{32}):"
++    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
++)
++
++
++def new_session_scope() -> str:
++    """Create a new opaque session scope token."""
++    return uuid4().hex
++
++
++def scoped_task_id(session_scope: str) -> str:
++    """Generate a task ID associated with the given session scope."""
++    return f"{session_scope}:{uuid4()}"
++
++
++def session_scope_of(task_id: str) -> str | None:
++    """Return the session scope embedded in a task ID, or None if it has none."""
++    match = _SCOPED_TASK_ID.match(task_id)
++    return match.group("scope") if match else None
++
++
++def task_in_session_scope(task_id: str, session_scope: str | None) -> bool:
++    """Whether a task may be used by a requestor with the given session scope.
++
++    Used by tasks/get, tasks/result, and tasks/cancel. A task whose ID carries
++    no session scope has no known creator, so possession of the ID is what
++    grants access to it: it can be used from any session.
++    """
++    embedded = session_scope_of(task_id)
++    return embedded is None or embedded == session_scope
++
++
++def task_listable_in_session_scope(task_id: str, session_scope: str | None) -> bool:
++    """Whether a task may be included in a tasks/list response for the given session scope.
++
++    Used by tasks/list. Listing is stricter than access by ID: a task is only
++    listed to the session that created it. Tasks with no session scope are
++    never listed because they have no known creator, and requestors with no
++    session scope are never shown any tasks because the server cannot tell
++    them apart.
++    """
++    embedded = session_scope_of(task_id)
++    return embedded is not None and embedded == session_scope
+diff --git a/src/mcp/server/experimental/task_support.py b/src/mcp/server/experimental/task_support.py
+index dbb2ed6..8e91faf 100644
+--- a/src/mcp/server/experimental/task_support.py
++++ b/src/mcp/server/experimental/task_support.py
+@@ -13,6 +13,7 @@ import anyio
+ from anyio.abc import TaskGroup
+ 
+ from mcp.server.experimental.task_result_handler import TaskResultHandler
++from mcp.server.experimental.task_scope import new_session_scope
+ from mcp.server.session import ServerSession
+ from mcp.shared.experimental.tasks.in_memory_task_store import InMemoryTaskStore
+ from mcp.shared.experimental.tasks.message_queue import InMemoryTaskMessageQueue, TaskMessageQueue
+@@ -83,7 +84,7 @@ class TaskSupport:
+             finally:
+                 self._task_group = None
+ 
+-    def configure_session(self, session: ServerSession) -> None:
++    def configure_session(self, session: ServerSession, *, stateless: bool = False) -> None:
+         """
+         Configure a session for task support.
+ 
+@@ -91,12 +92,22 @@ class TaskSupport:
+         responses to queued requests (elicitation, sampling) are routed
+         back to the waiting resolvers.
+ 
++        It also assigns the session a task session scope. Task IDs generated
++        by `run_task()` embed this scope, and the default task handlers only
++        operate on tasks created by the requesting session. Stateless sessions
++        are not assigned a scope: each request runs on a fresh session, so a
++        task created by one request could never be retrieved by a later one if
++        tasks were bound to the session that created them.
++
+         Called automatically by Server.run() for each new session.
+ 
+         Args:
+             session: The session to configure
++            stateless: Whether the session belongs to a stateless server run
+         """
+         session.add_response_router(self.handler)
++        if not stateless and session.experimental.task_session_scope is None:
++            session.experimental.task_session_scope = new_session_scope()
+ 
+     @classmethod
+     def in_memory(cls) -> "TaskSupport":
+diff --git a/src/mcp/server/experimental/task_watch.py b/src/mcp/server/experimental/task_watch.py
+index 33d3d25..7294f32 100644
+--- a/src/mcp/server/experimental/task_watch.py
++++ b/src/mcp/server/experimental/task_watch.py
+@@ -15,6 +15,7 @@ import logging
+ from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
+ 
++from mcp.server.experimental.task_scope import task_in_session_scope
+ from mcp.shared.exceptions import McpError
+ from mcp.shared.experimental.tasks.store import TaskStore
+ from mcp.types import (
+@@ -95,6 +96,7 @@ def register_watch_handlers(
+         return
+ 
+     async def _default_watch_task(req: WatchTaskRequest) -> ServerResult:
++        session = server.request_context.session
+         task = await store.get_task(req.params.taskId)
+         if task is None:
+             raise McpError(
+@@ -103,7 +105,7 @@ def register_watch_handlers(
+                     message=f"Task not found: {req.params.taskId}",
+                 )
+             )
+-        registry.add(req.params.taskId, server.request_context.session)
++        registry.add(req.params.taskId, session)
+         return ServerResult(WatchTaskResult(taskId=req.params.taskId, watching=True))
+ 
+     request_handlers[WatchTaskRequest] = _default_watch_task
+diff --git a/src/mcp/server/lowlevel/experimental.py b/src/mcp/server/lowlevel/experimental.py
+index b72d120..8b0d495 100644
+--- a/src/mcp/server/lowlevel/experimental.py
++++ b/src/mcp/server/lowlevel/experimental.py
+@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
+ from typing import TYPE_CHECKING
+ 
+ from mcp.server.experimental.task_housekeeping import register_housekeeping_handlers
++from mcp.server.experimental.task_scope import task_in_session_scope, task_listable_in_session_scope
+ from mcp.server.experimental.task_support import TaskSupport
+ from mcp.server.experimental.task_watch import register_watch_handlers
+ from mcp.server.lowlevel.func_inspection import create_call_wrapper
+@@ -33,6 +34,7 @@ from mcp.types import (
+     ServerResult,
+     ServerTasksCapability,
+     ServerTasksRequestsCapability,
++    Task,
+     TasksCallCapability,
+     TasksCancelCapability,
+     TasksListCapability,
+@@ -129,8 +131,38 @@ class ExperimentalHandlers:
+ 
+         return self._task_support
+ 
++    def _requestor_session_scope(self) -> str | None:
++        """Return the task session scope of the session making the current request."""
++        return self._server.request_context.session.experimental.task_session_scope
++
++    def _require_task_in_requestor_scope(self, task_id: str) -> None:
++        """Reject task IDs that belong to a different session.
++
++        Task IDs generated by `run_task()` embed the creating session's
++        scope. The default handlers treat a task created by another session
++        exactly like a task that does not exist, so a requestor cannot tell
++        whether such a task exists. Task IDs without an embedded scope are
++        accepted from any session.
++
++        Raises:
++            McpError: With INVALID_PARAMS if the task belongs to another session.
++        """
++        if not task_in_session_scope(task_id, self._requestor_session_scope()):
++            raise McpError(
++                ErrorData(
++                    code=INVALID_PARAMS,
++                    message=f"Task not found: {task_id}",
++                )
++            )
++
+     def _register_default_task_handlers(self) -> None:
+-        """Register default handlers for task operations."""
++        """Register default handlers for task operations.
++
++        Each default handler only operates on tasks created by the requesting
++        session (see `_require_task_in_requestor_scope`), and tasks/list only
++        returns the requesting session's own tasks (see
++        `task_listable_in_session_scope`).
++        """
+         assert self._task_support is not None
+         support = self._task_support
+ 
+@@ -138,6 +170,7 @@ class ExperimentalHandlers:
+         if GetTaskRequest not in self._request_handlers:
+ 
+             async def _default_get_task(req: GetTaskRequest) -> ServerResult:
++                self._require_task_in_requestor_scope(req.params.taskId)
+                 task = await support.store.get_task(req.params.taskId)
+                 if task is None:
+                     raise McpError(
+@@ -164,6 +197,7 @@ class ExperimentalHandlers:
+         if GetTaskPayloadRequest not in self._request_handlers:
+ 
+             async def _default_get_task_result(req: GetTaskPayloadRequest) -> ServerResult:
++                self._require_task_in_requestor_scope(req.params.taskId)
+                 ctx = self._server.request_context
+                 result = await support.handler.handle(req, ctx.session, ctx.request_id)
+                 return ServerResult(result)
+@@ -174,9 +208,26 @@ class ExperimentalHandlers:
+         if ListTasksRequest not in self._request_handlers:
+ 
+             async def _default_list_tasks(req: ListTasksRequest) -> ServerResult:
+-                cursor = req.params.cursor if req.params else None
+-                tasks, next_cursor = await support.store.list_tasks(cursor)
+-                return ServerResult(ListTasksResult(tasks=tasks, nextCursor=next_cursor))
++                requestor_scope = self._requestor_session_scope()
++                if requestor_scope is None:
++                    # The server cannot tell this requestor apart from any
++                    # other, so there are no tasks it can be shown.
++                    return ServerResult(ListTasksResult(tasks=[]))
++                # Return every task that belongs to the requesting session in
++                # a single page. The store's pagination cursor is never sent
++                # to the requestor: it is derived from the unfiltered listing,
++                # so it could identify a task belonging to a different
++                # session. For the same reason the request's cursor is not
++                # forwarded to the store.
++                own_tasks: list[Task] = []
++                cursor: str | None = None
++                while True:
++                    page, cursor = await support.store.list_tasks(cursor)
++                    own_tasks.extend(
++                        task for task in page if task_listable_in_session_scope(task.taskId, requestor_scope)
++                    )
++                    if cursor is None:
++                        return ServerResult(ListTasksResult(tasks=own_tasks))
+ 
+             self._request_handlers[ListTasksRequest] = _default_list_tasks
+ 
+@@ -184,6 +235,7 @@ class ExperimentalHandlers:
+         if CancelTaskRequest not in self._request_handlers:
+ 
+             async def _default_cancel_task(req: CancelTaskRequest) -> ServerResult:
++                self._require_task_in_requestor_scope(req.params.taskId)
+                 result = await cancel_task(support.store, req.params.taskId)
+                 return ServerResult(result)
+ 
+diff --git a/src/mcp/server/lowlevel/server.py b/src/mcp/server/lowlevel/server.py
+index 2dd1a82..7d925de 100644
+--- a/src/mcp/server/lowlevel/server.py
++++ b/src/mcp/server/lowlevel/server.py
+@@ -667,7 +667,7 @@ class Server(Generic[LifespanResultT, RequestT]):
+             # Configure task support for this session if enabled
+             task_support = self._experimental_handlers.task_support if self._experimental_handlers else None
+             if task_support is not None:
+-                task_support.configure_session(session)
++                task_support.configure_session(session, stateless=stateless)
+                 await stack.enter_async_context(task_support.run())
+ 
+             async with anyio.create_task_group() as tg:

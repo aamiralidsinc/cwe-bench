@@ -1,0 +1,294 @@
+diff --git a/yt_dlp/YoutubeDL.py b/yt_dlp/YoutubeDL.py
+index a8d0342d5..3d04a095d 100644
+--- a/yt_dlp/YoutubeDL.py
++++ b/yt_dlp/YoutubeDL.py
+@@ -159,7 +159,7 @@
+     write_json_file,
+     write_string,
+ )
+-from .utils._utils import _YDLLogger
++from .utils._utils import _UnsafeExtensionError, _YDLLogger
+ from .utils.networking import (
+     HTTPHeaderDict,
+     clean_headers,
+@@ -172,6 +172,20 @@
+     import ctypes
+ 
+ 
++def _catch_unsafe_extension_error(func):
++    @functools.wraps(func)
++    def wrapper(self, *args, **kwargs):
++        try:
++            return func(self, *args, **kwargs)
++        except _UnsafeExtensionError as error:
++            self.report_error(
++                f'The extracted extension ({error.extension!r}) is unusual '
++                'and will be skipped for safety reasons. '
++                f'If you believe this is an error{bug_reports_message(",")}')
++
++    return wrapper
++
++
+ class YoutubeDL:
+     """YoutubeDL class.
+ 
+@@ -1400,6 +1414,19 @@ def evaluate_outtmpl(self, outtmpl, info_dict, *args, **kwargs):
+         outtmpl, info_dict = self.prepare_outtmpl(outtmpl, info_dict, *args, **kwargs)
+         return self.escape_outtmpl(outtmpl) % info_dict
+ 
++    @staticmethod
++    def _template_extension_position(outtmpl):
++        """Where the final name's extension comes from: a literal, metadata, or all of the name."""
++        tail = outtmpl.rsplit('/', 1)[-1].replace('%%', '\x01')
++        masked = re.sub(
++            r'%\([^)]*\)(?:[#0\-+ ]*\d*(?:\.\d+)?[hlL]?[a-zA-Z])',
++            lambda _: '\x00', tail)
++        last_field, last_dot = masked.rfind('\x00'), masked.rfind('.')
++        if last_field < 0 or last_dot > last_field:
++            return 'literal'
++        return 'metadata' if last_dot >= 0 else 'name'
++
++    @_catch_unsafe_extension_error
+     def _prepare_filename(self, info_dict, *, outtmpl=None, tmpl_type=None):
+         assert None in (outtmpl, tmpl_type), 'outtmpl and tmpl_type are mutually exclusive'
+         if outtmpl is None:
+@@ -1425,6 +1452,15 @@ def _prepare_filename(self, info_dict, *, outtmpl=None, tmpl_type=None):
+                 no_ext, *ext = filename.rsplit('.', 2)
+                 filename = join_nonempty(no_ext[:trim_file_name], *ext, delim='.')
+ 
++            position = self._template_extension_position(outtmpl)
++            if filename != '-' and position != 'literal':
++                ext = os.path.splitext(filename)[1][1:]
++                if ext != self.params.get('outtmpl_na_placeholder', 'NA'):
++                    if position == 'metadata' and not _UnsafeExtensionError.is_allowed_extension(ext):
++                        raise _UnsafeExtensionError(ext)
++                    elif position == 'name' and ext.lower() in _UnsafeExtensionError.UNSAFE_EXTENSIONS:
++                        raise _UnsafeExtensionError(ext)
++
+             return filename
+         except ValueError as err:
+             self.report_error('Error in output template: ' + str(err) + ' (encoding: ' + repr(preferredencoding()) + ')')
+@@ -3192,6 +3228,7 @@ def existing_file(self, filepaths, *, default_overwrite=True):
+             os.remove(file)
+         return None
+ 
++    @_catch_unsafe_extension_error
+     def process_info(self, info_dict):
+         """Process a single resolved IE result. (Modifies it in-place)"""
+ 
+@@ -3296,7 +3333,9 @@ def _write_link_file(link_type):
+                 self.report_warning(
+                     f'Cannot write internet shortcut file because the actual URL of "{info_dict["webpage_url"]}" is unknown')
+                 return True
+-            linkfn = replace_extension(self.prepare_filename(info_dict, 'link'), link_type, info_dict.get('ext'))
++            linkfn = replace_extension(
++                self.prepare_filename(info_dict, 'link'), link_type,
++                info_dict.get('ext'), _allowed_exts=tuple(LINK_TEMPLATES))
+             if not self._ensure_dir_exists(encodeFilename(linkfn)):
+                 return False
+             if self.params.get('overwrites', True) and os.path.exists(encodeFilename(linkfn)):
+diff --git a/yt_dlp/__init__.py b/yt_dlp/__init__.py
+index c18af7589..ba2313d9b 100644
+--- a/yt_dlp/__init__.py
++++ b/yt_dlp/__init__.py
+@@ -64,6 +64,7 @@
+     write_string,
+ )
+ from .utils.networking import std_headers
++from .utils._utils import _UnsafeExtensionError
+ from .YoutubeDL import YoutubeDL
+ 
+ _IN_CLI = False
+@@ -593,6 +594,14 @@ def report_deprecation(val, old, new=None):
+     if opts.ap_username is not None and opts.ap_password is None:
+         opts.ap_password = getpass.getpass('Type TV provider account password and press [Return]: ')
+ 
++    # compat option changes global state destructively; only allow from cli
++    if 'allow-unsafe-ext' in opts.compat_opts:
++        warnings.append(
++            'Using allow-unsafe-ext opens you up to potential attacks. '
++            'Use with great care!')
++        _UnsafeExtensionError.sanitize_extension = lambda x, prepend=False, _allowed_exts=(): x
++        _UnsafeExtensionError.is_allowed_extension = lambda x, _allowed_exts=(): True
++
+     return warnings, deprecation_warnings
+ 
+ 
+diff --git a/yt_dlp/options.py b/yt_dlp/options.py
+index b97c516ce..1b18575c1 100644
+--- a/yt_dlp/options.py
++++ b/yt_dlp/options.py
+@@ -474,7 +474,7 @@ def _alias_callback(option, opt_str, value, parser, opts, nargs):
+                 'no-attach-info-json', 'embed-thumbnail-atomicparsley', 'no-external-downloader-progress',
+                 'embed-metadata', 'seperate-video-versions', 'no-clean-infojson', 'no-keep-subs', 'no-certifi',
+                 'no-youtube-channel-redirect', 'no-youtube-unavailable-videos', 'no-youtube-prefer-utc-upload-date',
+-                'prefer-legacy-http-handler', 'manifest-filesize-approx',
++                'prefer-legacy-http-handler', 'manifest-filesize-approx', 'allow-unsafe-ext',
+             }, 'aliases': {
+                 'youtube-dl': ['all', '-multistreams', '-playlist-match-filter', '-manifest-filesize-approx'],
+                 'youtube-dlc': ['all', '-no-youtube-channel-redirect', '-no-live-chat', '-playlist-match-filter', '-manifest-filesize-approx'],
+diff --git a/yt_dlp/utils/_utils.py b/yt_dlp/utils/_utils.py
+index 664675a09..e975b62a0 100644
+--- a/yt_dlp/utils/_utils.py
++++ b/yt_dlp/utils/_utils.py
+@@ -661,6 +661,8 @@ def replace_insane(char):
+         result = result.lstrip('.')
+         if not result:
+             result = '_'
++    elif is_id is NO_DEFAULT:
++        result = result.lstrip('.') or '_'
+     return result
+ 
+ 
+@@ -2085,17 +2087,20 @@ def parse_duration(s):
+         (days, 86400), (hours, 3600), (mins, 60), (secs, 1), (ms, 1)))
+ 
+ 
+-def prepend_extension(filename, ext, expected_real_ext=None):
++def _change_extension(prepend, filename, ext, expected_real_ext=None, *, _allowed_exts=()):
+     name, real_ext = os.path.splitext(filename)
+-    return (
+-        f'{name}.{ext}{real_ext}'
+-        if not expected_real_ext or real_ext[1:] == expected_real_ext
+-        else f'{filename}.{ext}')
+ 
++    if not expected_real_ext or real_ext[1:] == expected_real_ext:
++        filename = name
++        if prepend and real_ext:
++            _UnsafeExtensionError.sanitize_extension(ext, prepend=True, _allowed_exts=_allowed_exts)
++            return f'{filename}.{ext}{real_ext}'
+ 
+-def replace_extension(filename, ext, expected_real_ext=None):
+-    name, real_ext = os.path.splitext(filename)
+-    return f'{name if not expected_real_ext or real_ext[1:] == expected_real_ext else filename}.{ext}'
++    return f'{filename}.{_UnsafeExtensionError.sanitize_extension(ext, _allowed_exts=_allowed_exts)}'
++
++
++prepend_extension = functools.partial(_change_extension, True)
++replace_extension = functools.partial(_change_extension, False)
+ 
+ 
+ def check_executable(exe, args=[]):
+@@ -5035,6 +5040,122 @@ def items_(self):
+ KNOWN_EXTENSIONS = (*MEDIA_EXTENSIONS.video, *MEDIA_EXTENSIONS.audio, *MEDIA_EXTENSIONS.manifests)
+ 
+ 
++class _UnsafeExtensionError(Exception):
++    """
++    Mitigation exception for uncommon/malicious file extensions.
++
++    This is caught in YoutubeDL.py alongside a warning; the compat option
++    ``allow-unsafe-ext`` disables the check for CLI users.
++    """
++    ALLOWED_EXTENSIONS = frozenset([
++        # internal
++        'description',
++        'json',
++        'meta',
++        'orig',
++        'part',
++        'temp',
++        'uncut',
++        'unknown_video',
++        'ytdl',
++
++        # video
++        *MEDIA_EXTENSIONS.video,
++        'avif',
++        'ismv',
++        'm2ts',
++        'm4s',
++        'mng',
++        'mpeg',
++        'qt',
++        'swf',
++        'ts',
++        'vp9',
++        'wvm',
++
++        # audio
++        *MEDIA_EXTENSIONS.audio,
++        'isma',
++        'mid',
++        'mpga',
++        'ra',
++
++        # image
++        *MEDIA_EXTENSIONS.thumbnails,
++        'bmp',
++        'gif',
++        'heic',
++        'ico',
++        'jng',
++        'jpeg',
++        'jxl',
++        'svg',
++        'tif',
++        'wbmp',
++
++        # subtitle
++        *MEDIA_EXTENSIONS.subtitles,
++        'dfxp',
++        'fs',
++        'ismt',
++        'sami',
++        'scc',
++        'ssa',
++        'tt',
++        'ttml',
++
++        # others
++        *MEDIA_EXTENSIONS.manifests,
++        *MEDIA_EXTENSIONS.storyboards,
++        'ism',
++        'm3u',
++        'sbv',
++        'xml',
++    ])
++
++    # Types that must never be the result of a download, even when the user's output
++    # template leaves the whole name to metadata
++    UNSAFE_EXTENSIONS = frozenset([
++        'apk', 'app', 'bat', 'cmd', 'com', 'cpl', 'desktop', 'dll', 'dylib', 'exe',
++        'hta', 'inf', 'jar', 'js', 'jse', 'lnk', 'msi', 'msp', 'pif', 'ps1', 'psm1',
++        'py', 'reg', 'scr', 'scf', 'sh', 'so', 'url', 'vbe', 'vbs', 'webloc', 'wsf',
++        'wsh',
++    ])
++
++    def __init__(self, extension, /):
++        super().__init__(f'unsafe file extension: {extension!r}')
++        self.extension = extension
++
++    @classmethod
++    def allowed_extensions(cls, _allowed_exts=()):
++        return _allowed_exts or cls.ALLOWED_EXTENSIONS
++
++    @classmethod
++    def sanitize_extension(cls, extension, /, *, prepend=False, _allowed_exts=()):
++        if extension is None:
++            return None
++
++        if '/' in extension or '\\' in extension:
++            raise cls(extension)
++
++        if not prepend:
++            _, _, last = extension.rpartition('.')
++            if last == 'bin':
++                extension = last = 'unknown_video'
++            if last.lower() not in cls.allowed_extensions(_allowed_exts):
++                raise cls(extension)
++
++        return extension
++
++    @classmethod
++    def is_allowed_extension(cls, extension, /, *, _allowed_exts=()):
++        if not extension:
++            return True
++        if '/' in extension or '\\' in extension:
++            return False
++        return extension.lower() in cls.allowed_extensions(_allowed_exts)
++
++
+ class RetryManager:
+     """Usage:
+         for retry in RetryManager(...):

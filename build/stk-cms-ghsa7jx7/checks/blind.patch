@@ -1,0 +1,209 @@
+diff -ruN pristine/src/controllers/FieldsController.php app/src/controllers/FieldsController.php
+--- a/src/controllers/FieldsController.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/controllers/FieldsController.php	2026-10-26 05:14:53.916723696 +0000
+@@ -478,6 +478,6 @@
+         $settingsNamespace = $this->request->getRequiredBodyParam('settingsNamespace');
+         $settingsStr = $this->request->getRequiredBodyParam('settings');
+         parse_str($settingsStr, $settings);
+-        return array_merge($config, ArrayHelper::getValue($settings, $settingsNamespace, []));
++        return Component::stripAttachKeys(array_merge($config, ArrayHelper::getValue($settings, $settingsNamespace, [])));
+     }
+ }
+diff -ruN pristine/src/helpers/Component.php app/src/helpers/Component.php
+--- a/src/helpers/Component.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/helpers/Component.php	2026-10-26 05:14:41.444734933 +0000
+@@ -99,6 +99,31 @@
+     }
+ 
+     /**
++     * Recursively strips any `as X` and `on X` keys from a config array.
++     *
++     * Yii's [[\yii\base\Component::__set()]] interprets those key prefixes as requests to attach
++     * a behavior or an event handler, instantiating any class the value names. Config that comes
++     * from a request, project config, or any other source outside the application's own code must
++     * be passed through this method before it is handed to a component constructor or
++     * [[\Craft::configure()]].
++     *
++     * @param array $config
++     * @return array
++     * @since 4.16.17
++     */
++    public static function stripAttachKeys(array $config): array
++    {
++        $clean = [];
++        foreach ($config as $key => $value) {
++            if (is_string($key) && (str_starts_with($key, 'as ') || str_starts_with($key, 'on '))) {
++                continue;
++            }
++            $clean[$key] = is_array($value) ? static::stripAttachKeys($value) : $value;
++        }
++        return $clean;
++    }
++
++    /**
+      * Instantiates and populates a component, and ensures that it is an instance of a given interface.
+      *
+      * @template T of ComponentInterface
+diff -ruN pristine/src/models/FieldLayout.php app/src/models/FieldLayout.php
+--- a/src/models/FieldLayout.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/models/FieldLayout.php	2026-10-26 05:14:47.028729903 +0000
+@@ -25,6 +25,7 @@
+ use craft\fieldlayoutelements\Template;
+ use craft\fieldlayoutelements\Tip;
+ use craft\helpers\ArrayHelper;
++use craft\helpers\Component;
+ use craft\helpers\Html;
+ use craft\helpers\StringHelper;
+ use Generator;
+@@ -171,6 +172,10 @@
+      */
+     public static function createFromConfig(array $config): self
+     {
++        // Layout configs can be stored in project config; strip any behavior/event attachment
++        // keys from the layout itself and from every nested tab/element config.
++        $config = Component::stripAttachKeys($config);
++
+         $tabConfigs = ArrayHelper::remove($config, 'tabs');
+         $layout = new self($config);
+ 
+diff -ruN pristine/src/models/FieldLayoutTab.php app/src/models/FieldLayoutTab.php
+--- a/src/models/FieldLayoutTab.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/models/FieldLayoutTab.php	2026-10-26 05:14:44.484732194 +0000
+@@ -17,6 +17,7 @@
+ use craft\fieldlayoutelements\BaseField;
+ use craft\fieldlayoutelements\CustomField;
+ use craft\helpers\ArrayHelper;
++use craft\helpers\Component;
+ use craft\helpers\Cp;
+ use craft\helpers\Json;
+ use craft\helpers\StringHelper;
+@@ -111,6 +112,13 @@
+      */
+     public function __construct($config = [])
+     {
++        // A tab config can come from a request or from stored project config, and the array
++        // may contain sub-configs for its elements. No behavior or event handler may be
++        // named from that data, however deeply it is nested.
++        if (is_array($config)) {
++            $config = Component::stripAttachKeys($config);
++        }
++
+         // Config normalization
+         if (array_key_exists('elements', $config)) {
+             if (is_string($config['elements'])) {
+diff -ruN pristine/src/services/Elements.php app/src/services/Elements.php
+--- a/src/services/Elements.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/services/Elements.php	2026-10-26 05:15:40.760681488 +0000
+@@ -1578,6 +1578,11 @@
+         // Extract any attributes that are meant for other sites
+         $siteAttributes = ArrayHelper::remove($newAttributes, 'siteAttributes') ?? [];
+ 
++        // The attributes come from the public API, so they must not be able to name a class
++        // for Yii to construct/attach as a behavior or event handler.
++        $newAttributes = ComponentHelper::stripAttachKeys($newAttributes);
++        $siteAttributes = ComponentHelper::stripAttachKeys($siteAttributes);
++
+         // Note: must use Craft::configure() rather than setAttributes() here,
+         // so we're not limited to whatever attributes() returns
+         Craft::configure($mainClone, ArrayHelper::merge(
+@@ -1587,10 +1592,7 @@
+ 
+         // Attach behaviors
+         foreach ($behaviors as $name => $behavior) {
+-            if ($behavior instanceof Behavior) {
+-                $behavior = clone $behavior;
+-            }
+-            $mainClone->attachBehavior($name, $behavior);
++            $mainClone->attachBehavior($name, $this->_requireDuplicateBehavior($behavior));
+         }
+ 
+         // Make sure the element actually supports its own site ID
+@@ -1707,10 +1709,7 @@
+ 
+                     // Attach behaviors
+                     foreach ($behaviors as $name => $behavior) {
+-                        if ($behavior instanceof Behavior) {
+-                            $behavior = clone $behavior;
+-                        }
+-                        $siteClone->attachBehavior($name, $behavior);
++                        $siteClone->attachBehavior($name, $this->_requireDuplicateBehavior($behavior));
+                     }
+ 
+                     // Note: must use Craft::configure() rather than setAttributes() here,
+@@ -1786,6 +1785,45 @@
+     }
+ 
+     /**
++     * Returns a fresh, cloned behavior to attach to a duplicated element.
++     *
++     * The duplication API is public, so a behavior spec may come from outside the application.
++     * An already-constructed behavior is safe to clone; a class name or config array would make
++     * Yii instantiate a caller-chosen class, so only the behaviors that Craft itself attaches
++     * while duplicating elements are accepted in config form.
++     *
++     * @param mixed $behavior
++     * @return Behavior
++     * @throws InvalidArgumentException if the behavior spec could instantiate a caller-chosen class
++     */
++    private function _requireDuplicateBehavior(mixed $behavior): Behavior
++    {
++        if ($behavior instanceof Behavior) {
++            return clone $behavior;
++        }
++
++        if (is_array($behavior)) {
++            // Don’t let the allowed behavior’s own config smuggle in another attachment.
++            $behavior = ComponentHelper::stripAttachKeys($behavior);
++            $class = $behavior['class'] ?? null;
++        } else {
++            $class = $behavior;
++        }
++
++        if (!in_array($class, [DraftBehavior::class, RevisionBehavior::class], true)) {
++            throw new InvalidArgumentException('Unsupported behavior configuration.');
++        }
++
++        $behavior = Craft::createObject($behavior);
++
++        if (!$behavior instanceof Behavior) {
++            throw new InvalidArgumentException('Unsupported behavior configuration.');
++        }
++
++        return clone $behavior;
++    }
++
++    /**
+      * Updates an element’s slug and URI, along with any descendants.
+      *
+      * @param ElementInterface $element The element to update.
+diff -ruN pristine/src/services/Fields.php app/src/services/Fields.php
+--- a/src/services/Fields.php	2026-10-26 02:39:12.000000000 +0000
++++ b/src/services/Fields.php	2026-10-26 05:14:53.472724097 +0000
+@@ -1246,6 +1246,7 @@
+      */
+     public function createLayout(array $config): FieldLayout
+     {
++        $config = ComponentHelper::stripAttachKeys($config);
+         $config['class'] = FieldLayout::class;
+         return Craft::createObject($config);
+     }
+@@ -1262,6 +1263,9 @@
+      */
+     public function createLayoutElement(array $config): FieldLayoutElement
+     {
++        // Element configs can arrive in a posted layout document or in stored project config
++        $config = ComponentHelper::stripAttachKeys($config);
++
+         $type = ArrayHelper::remove($config, 'type');
+ 
+         if (!$type || !is_subclass_of($type, FieldLayoutElement::class)) {
+@@ -1284,6 +1288,9 @@
+     {
+         $paramPrefix = $namespace ? rtrim($namespace, '.') . '.' : '';
+         $config = Json::decode(Craft::$app->getRequest()->getBodyParam($paramPrefix . 'fieldLayout'));
++        if (is_array($config)) {
++            $config = ComponentHelper::stripAttachKeys($config);
++        }
+         return $this->createLayout($config);
+     }
+ 

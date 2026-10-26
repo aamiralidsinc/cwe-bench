@@ -1,0 +1,179 @@
+diff --git a/urllib3/connectionpool.py b/urllib3/connectionpool.py
+index b7b757dd..11030189 100644
+--- a/urllib3/connectionpool.py
++++ b/urllib3/connectionpool.py
+@@ -36,6 +36,7 @@ from .request import RequestMethods
+ from .response import HTTPResponse
+ 
+ from .util.connection import is_connection_dropped
++from .util.redirect import is_cross_origin, normalize_origin, remove_credential_headers
+ from .util.request import set_file_position
+ from .util.response import assert_header_parsing
+ from .util.retry import Retry
+@@ -697,6 +698,14 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
+             # drain and return the connection to the pool before recursing
+             drain_and_release_conn(response)
+ 
++            # A redirect to a different origin must not carry the credentials
++            # the caller attached for the original one. Unlike the connection
++            # pool, which stays fixed (and is the proxy when the pool is used
++            # to reach foreign hosts), the redirect target decides the origin.
++            if is_cross_origin(url, redirect_location,
++                               base_origin=normalize_origin(self.scheme, self.host, self.port)):
++                headers = remove_credential_headers(headers.copy())
++
+             retries.sleep_for_retry(response)
+             log.debug("Redirecting %s -> %s", url, redirect_location)
+             return self.urlopen(
+diff --git a/urllib3/contrib/appengine.py b/urllib3/contrib/appengine.py
+index 66922e06..306970c1 100644
+--- a/urllib3/contrib/appengine.py
++++ b/urllib3/contrib/appengine.py
+@@ -57,6 +57,7 @@ from ..packages.six import BytesIO
+ from ..request import RequestMethods
+ from ..response import HTTPResponse
+ from ..util.timeout import Timeout
++from ..util.redirect import is_cross_origin, remove_credential_headers
+ from ..util.retry import Retry
+ 
+ try:
+@@ -134,17 +135,16 @@ class AppEngineManager(RequestMethods):
+         retries = self._get_retries(retries, redirect)
+ 
+         try:
+-            follow_redirects = (
+-                    redirect and
+-                    retries.redirect != 0 and
+-                    retries.total)
++            # The platform's own redirect handling replays the request headers
++            # to every hop without exposing the intermediate URLs, so redirects
++            # are followed below instead.
+             response = urlfetch.fetch(
+                 url,
+                 payload=body,
+                 method=method,
+                 headers=headers or {},
+                 allow_truncated=False,
+-                follow_redirects=self.urlfetch_retries and follow_redirects,
++                follow_redirects=False,
+                 deadline=self._get_absolute_timeout(timeout),
+                 validate_certificate=self.validate_certificate,
+             )
+@@ -181,27 +181,25 @@ class AppEngineManager(RequestMethods):
+         # Handle redirect?
+         redirect_location = redirect and http_response.get_redirect_location()
+         if redirect_location:
+-            # Check for redirect response
+-            if (self.urlfetch_retries and retries.raise_on_redirect):
+-                raise MaxRetryError(self, url, "too many redirects")
+-            else:
+-                if http_response.status == 303:
+-                    method = 'GET'
+-
+-                try:
+-                    retries = retries.increment(method, url, response=http_response, _pool=self)
+-                except MaxRetryError:
+-                    if retries.raise_on_redirect:
+-                        raise MaxRetryError(self, url, "too many redirects")
+-                    return http_response
+-
+-                retries.sleep_for_retry(http_response)
+-                log.debug("Redirecting %s -> %s", url, redirect_location)
+-                redirect_url = urljoin(url, redirect_location)
+-                return self.urlopen(
+-                    method, redirect_url, body, headers,
+-                    retries=retries, redirect=redirect,
+-                    timeout=timeout, **response_kw)
++            if http_response.status == 303:
++                method = 'GET'
++
++            try:
++                retries = retries.increment(method, url, response=http_response, _pool=self)
++            except MaxRetryError:
++                if retries.raise_on_redirect:
++                    raise MaxRetryError(self, url, "too many redirects")
++                return http_response
++
++            retries.sleep_for_retry(http_response)
++            log.debug("Redirecting %s -> %s", url, redirect_location)
++            redirect_url = urljoin(url, redirect_location)
++            if headers and is_cross_origin(url, redirect_url):
++                headers = remove_credential_headers(dict(headers))
++            return self.urlopen(
++                method, redirect_url, body, headers,
++                retries=retries, redirect=redirect,
++                timeout=timeout, **response_kw)
+ 
+         # Check if we should retry the HTTP response.
+         has_retry_after = bool(http_response.getheader('Retry-After'))
+diff --git a/urllib3/util/redirect.py b/urllib3/util/redirect.py
+new file mode 100644
+index 00000000..8d747d2c
+--- /dev/null
++++ b/urllib3/util/redirect.py
+@@ -0,0 +1,65 @@
++from __future__ import absolute_import
++
++from ..packages.six.moves.urllib.parse import urljoin
++
++from .url import parse_url
++
++
++#: Request headers that carry the caller's credentials for one origin and
++#: therefore must not be replayed against another origin.
++DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(['authorization', 'cookie'])
++
++#: Port implied by each scheme when the URL does not spell it out.
++DEFAULT_PORTS = {'http': 80, 'https': 443}
++
++
++def normalize_origin(scheme, host, port):
++    """Return a comparable ``(scheme, host, port)`` tuple for one origin.
++
++    The scheme and host are case-insensitive and an omitted port takes the
++    scheme's default, so ``HTTPS://Example.COM/`` and
++    ``https://example.com:443/`` name the same origin.
++    """
++    scheme = (scheme or 'http').lower()
++    if port is None:
++        port = DEFAULT_PORTS.get(scheme)
++    return (scheme, (host or '').lower(), port)
++
++
++def origin(url):
++    """Return the origin tuple of an absolute *url*, or ``None`` if it has no host."""
++    parts = parse_url(url)
++    if not parts.host:
++        return None
++    return normalize_origin(parts.scheme, parts.host, parts.port)
++
++
++def is_cross_origin(base_url, redirect_url, base_origin=None):
++    """Report whether *redirect_url* leaves the origin of *base_url*.
++
++    *redirect_url* is resolved against *base_url* first, so relative locations
++    stay on the same origin. When *base_url* is itself relative (a plain path
++    handed to a connection pool) *base_origin* supplies the origin it belongs
++    to.
++    """
++    resolved = urljoin(base_url, redirect_url)
++    source = origin(base_url) or base_origin
++    target = origin(resolved) or base_origin
++    return source != target
++
++
++def remove_credential_headers(headers, header_names=None):
++    """Drop the credential headers in *header_names* from *headers* in place.
++
++    Header names are matched case-insensitively. The caller must pass a dict it
++    owns: callers of the request methods often keep and reuse theirs.
++    """
++    if not headers:
++        return headers
++    if header_names is None:
++        header_names = DEFAULT_REMOVE_HEADERS_ON_REDIRECT
++    names = frozenset(name.lower() for name in header_names)
++    for name in list(headers.keys()):
++        if name.lower() in names:
++            headers.pop(name, None)
++    return headers

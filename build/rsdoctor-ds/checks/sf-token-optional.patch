@@ -1,0 +1,732 @@
+diff --git a/packages/ai/src/server/http.ts b/packages/ai/src/server/http.ts
+index f81751e..58a176d 100644
+--- a/packages/ai/src/server/http.ts
++++ b/packages/ai/src/server/http.ts
+@@ -1,5 +1,6 @@
+ import http from 'node:http';
+ import type { AddressInfo } from 'node:net';
++import { isIP } from 'node:net';
+ 
+ export interface AnalysisBridgeOptions {
+   /** Port the bridge listens on. */
+@@ -8,6 +9,56 @@ export interface AnalysisBridgeOptions {
+   reportUrl?: string;
+ }
+ 
++const LOCAL_ORIGIN =
++  /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|\[0:0:0:0:0:0:0:1\])(?::\d+)?$/i;
++const LOCAL_HOSTNAME = /^(?:localhost|[^:]+\.localhost)$/;
++
++function hostnameOfHost(host: string) {
++  if (host.startsWith('[')) {
++    const end = host.indexOf(']');
++    return end === -1 ? '' : host.slice(1, end);
++  }
++
++  return host.split(':')[0];
++}
++
++function isAllowedHost(host: string | string[] | undefined) {
++  if (typeof host !== 'string') {
++    return false;
++  }
++
++  const hostname = hostnameOfHost(host).toLowerCase();
++  return LOCAL_HOSTNAME.test(hostname) || isIP(hostname) !== 0;
++}
++
++function isAllowedOrigin(
++  origin: string | string[] | undefined,
++  host: string | string[] | undefined,
++) {
++  if (origin === undefined) {
++    return true;
++  }
++  if (typeof origin !== 'string' || typeof host !== 'string') {
++    return false;
++  }
++  if (!LOCAL_ORIGIN.test(origin)) {
++    return false;
++  }
++
++  try {
++    const originHostname = new URL(origin).hostname
++      .replace(/^\[|\]$/g, '')
++      .toLowerCase();
++    if (originHostname.endsWith('.localhost')) {
++      return originHostname === hostnameOfHost(host).toLowerCase();
++    }
++  } catch {
++    return false;
++  }
++
++  return true;
++}
++
+ /**
+  * Minimal HTTP front for the build-analysis data, used by web-based agents that
+  * cannot speak the stdio transport.
+@@ -16,9 +67,19 @@ export function createAnalysisBridge(options: AnalysisBridgeOptions = {}) {
+   const reportUrl = options.reportUrl ?? 'http://127.0.0.1:3000';
+ 
+   return http.createServer(async (req, res) => {
+-    res.setHeader('Access-Control-Allow-Origin', '*');
+-    res.setHeader('Access-Control-Allow-Headers', '*');
+-    res.setHeader('Access-Control-Allow-Methods', '*');
++    const host = req.headers.host || req.headers[':authority'];
++    if (!isAllowedHost(host) || !isAllowedOrigin(req.headers.origin, host)) {
++      res.statusCode = 403;
++      res.end();
++      return;
++    }
++
++    if (typeof req.headers.origin === 'string') {
++      res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
++      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
++      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
++      res.setHeader('Vary', 'Origin');
++    }
+ 
+     if (req.method === 'OPTIONS') {
+       res.statusCode = 204;
+@@ -71,10 +132,11 @@ export function createAnalysisBridge(options: AnalysisBridgeOptions = {}) {
+ export async function startAnalysisBridge(options: AnalysisBridgeOptions = {}) {
+   const server = createAnalysisBridge(options);
+   const port = options.port ?? 3867;
++  const host = '127.0.0.1';
+ 
+   await new Promise<void>((resolve, reject) => {
+     server.once('error', reject);
+-    server.listen(port, () => {
++    server.listen(port, host, () => {
+       server.off('error', reject);
+       resolve();
+     });
+diff --git a/packages/cli/src/commands/analyze.ts b/packages/cli/src/commands/analyze.ts
+index b867054..e358af6 100644
+--- a/packages/cli/src/commands/analyze.ts
++++ b/packages/cli/src/commands/analyze.ts
+@@ -87,7 +87,12 @@ example: ${bin} ${Commands.Analyze} --profile "${Constants.RsdoctorOutputManifes
+       sdk.getManifestData = () => json;
+ 
+       const manifestBuffer = Buffer.from(
+-        JSON.stringify({ ...json, __LOCAL__SERVER__: true }),
++        JSON.stringify({
++          ...json,
++          __LOCAL__SERVER__: true,
++          __SOCKET__PORT__: sdk.server.socketUrl.port.toString(),
++          __SOCKET__URL__: sdk.server.socketUrl.socketUrl,
++        }),
+       );
+ 
+       sdk.server.proxy(SDK.ServerAPI.API.Manifest, 'GET', () => manifestBuffer);
+diff --git a/packages/components/src/utils/data/local.ts b/packages/components/src/utils/data/local.ts
+index d5f8838..7249ac2 100644
+--- a/packages/components/src/utils/data/local.ts
++++ b/packages/components/src/utils/data/local.ts
+@@ -70,6 +70,7 @@ export class LocalServerDataLoader extends BaseDataLoader {
+     // request limitation key
+     const key = body ? `${api}_${JSON.stringify(body)}` : `${api}`;
+     const socketPort = this.get('__SOCKET__PORT__') ?? '';
++    const socketUrl = this.get('__SOCKET__URL__') ?? '';
+ 
+     return this.limit(key, async () => {
+       try {
+@@ -77,6 +78,7 @@ export class LocalServerDataLoader extends BaseDataLoader {
+           api,
+           body as SDK.ServerAPI.InferRequestBodyType<T>,
+           socketPort,
++          socketUrl,
+         )) as R;
+       } catch (err) {
+         this.log(`loadAPI error: `, key);
+@@ -121,7 +123,8 @@ export class LocalServerDataLoader extends BaseDataLoader {
+ 
+     subscription.listeners.add(fn);
+     const socketPort = this.get('__SOCKET__PORT__') ?? '';
+-    subscribeServerAPI(api, normalizedBody, fn, socketPort);
++    const socketUrl = this.get('__SOCKET__URL__') ?? '';
++    subscribeServerAPI(api, normalizedBody, fn, socketPort, socketUrl);
+   }
+ 
+   public removeOnDataUpdate<
+@@ -133,7 +136,8 @@ export class LocalServerDataLoader extends BaseDataLoader {
+   ) {
+     const key = `${api}::${JSON.stringify(body ?? null)}`;
+     const socketPort = this.get('__SOCKET__PORT__') ?? '';
+-    unsubscribeServerAPI(api, body, fn, socketPort);
++    const socketUrl = this.get('__SOCKET__URL__') ?? '';
++    unsubscribeServerAPI(api, body, fn, socketPort, socketUrl);
+     this.events.get(key)?.listeners.delete(fn);
+   }
+ }
+diff --git a/packages/components/src/utils/socket.ts b/packages/components/src/utils/socket.ts
+index 8ac102b..ff41392 100644
+--- a/packages/components/src/utils/socket.ts
++++ b/packages/components/src/utils/socket.ts
+@@ -63,7 +63,11 @@ function getDefaultSocketUrl() {
+     : `${socketProtocol}://${location.host}`;
+ }
+ 
+-function getSocketUrl(socketPort?: string) {
++function getSocketUrl(socketPort?: string, socketUrl?: string) {
++  if (socketUrl) {
++    return socketUrl;
++  }
++
+   if (typeof location === 'undefined') {
+     return socketPort ? `ws://localhost:${socketPort}` : '';
+   }
+@@ -201,9 +205,14 @@ export function requestServerAPI<
+     SDK.ServerAPI.InferRequestBodyType<T>,
+   R extends SDK.ServerAPI.InferResponseType<T> =
+     SDK.ServerAPI.InferResponseType<T>,
+->(api: T, body: B | null | undefined, socketPort?: string): Promise<R> {
+-  const socketUrl = getSocketUrl(socketPort);
+-  if (!socketUrl) {
++>(
++  api: T,
++  body: B | null | undefined,
++  socketPort?: string,
++  socketUrl?: string,
++): Promise<R> {
++  const resolvedSocketUrl = getSocketUrl(socketPort, socketUrl);
++  if (!resolvedSocketUrl) {
+     return Promise.reject(new Error('WebSocket URL is not available.'));
+   }
+ 
+@@ -211,7 +220,7 @@ export function requestServerAPI<
+     return Promise.reject(new Error('WebSocket is not available.'));
+   }
+ 
+-  const client = getClient(socketUrl);
++  const client = getClient(resolvedSocketUrl);
+   const id = `${Date.now()}-${++requestId}`;
+ 
+   return new Promise<R>((resolve, reject) => {
+@@ -235,8 +244,9 @@ export function subscribeServerAPI<T extends SocketAPI>(
+   body: SDK.ServerAPI.InferRequestBodyType<T, null> | null,
+   listener: SocketListener<T>,
+   socketPort?: string,
++  socketUrl?: string,
+ ) {
+-  const client = getClient(getSocketUrl(socketPort));
++  const client = getClient(getSocketUrl(socketPort, socketUrl));
+   const bodyValue = body ?? null;
+   const key = getSubscriptionKey(api, bodyValue);
+   if (!client.listeners.has(key)) {
+@@ -253,7 +263,7 @@ export function subscribeServerAPI<T extends SocketAPI>(
+   sendSubscription(client, subscription);
+ 
+   return () => {
+-    unsubscribeServerAPI(api, bodyValue, listener, socketPort);
++    unsubscribeServerAPI(api, bodyValue, listener, socketPort, socketUrl);
+   };
+ }
+ 
+@@ -262,8 +272,9 @@ export function unsubscribeServerAPI<T extends SocketAPI>(
+   body: SDK.ServerAPI.InferRequestBodyType<T, null> | null,
+   listener: SocketListener<T>,
+   socketPort?: string,
++  socketUrl?: string,
+ ) {
+-  const client = getClient(getSocketUrl(socketPort));
++  const client = getClient(getSocketUrl(socketPort, socketUrl));
+   const key = getSubscriptionKey(api, body);
+   const listeners = client.listeners.get(key);
+   listeners?.delete(listener as SocketListener);
+diff --git a/packages/sdk/src/sdk/server/fakeServer.ts b/packages/sdk/src/sdk/server/fakeServer.ts
+index 419b084..f336570 100644
+--- a/packages/sdk/src/sdk/server/fakeServer.ts
++++ b/packages/sdk/src/sdk/server/fakeServer.ts
+@@ -11,5 +11,9 @@ export class RsdoctorFakeServer extends RsdoctorServer {
+     this.sdk = sdk;
+   }
+ 
++  async bootstrap() {}
++
+   async openClientPage() {}
++
++  dispose = async () => {};
+ }
+diff --git a/packages/sdk/src/sdk/server/index.ts b/packages/sdk/src/sdk/server/index.ts
+index f78dd78..2ea142a 100644
+--- a/packages/sdk/src/sdk/server/index.ts
++++ b/packages/sdk/src/sdk/server/index.ts
+@@ -12,10 +12,15 @@ import * as APIs from './apis';
+ import { chalk, logger } from '@rsdoctor/utils/logger';
+ import { openBrowser } from '@/sdk/utils/openBrowser';
+ import path from 'path';
+-import { getLocalIpAddress } from './utils';
+ import { Lodash } from '@rsdoctor/utils/common';
+ import { createRequire } from 'module';
+ import { ServerResponse } from 'http';
++import { randomBytes } from 'crypto';
++import {
++  DEFAULT_ALLOWED_CORS_ORIGINS,
++  isAllowedCorsRequest,
++  isAllowedRequestHost,
++} from './security';
+ 
+ const require = createRequire(import.meta.url);
+ export * from './utils';
+@@ -23,7 +28,13 @@ export * from './utils';
+ /** Path for launch-editor: open file in editor from the UI (see https://github.com/yyx990803/launch-editor) */
+ const OPEN_IN_EDITOR_PATH = '/__open-in-editor';
+ 
+-export type ISocketType = { port: number; socketUrl: string };
++const LISTEN_RETRY_LIMIT = 10;
++
++function isAddressInUseError(error: unknown) {
++  return (error as { code?: string }).code === 'EADDRINUSE';
++}
++
++export type ISocketType = { port: number; socketUrl: string; token: string };
+ 
+ export type RsdoctorServerOptions = {
+   innerClientPath?: string;
+@@ -48,6 +59,10 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+ 
+   private _cors: SDK.RsdoctorServerConfig['cors'];
+ 
++  private _socketToken = randomBytes(16).toString('hex');
++
++  private _routeInsertIndex = 0;
++
+   constructor(
+     protected sdk: SDK.RsdoctorBuilderSDKInstance,
+     port = Server.defaultPort,
+@@ -64,14 +79,46 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+     this._cors = config?.cors;
+   }
+ 
+-  private resolveCorsOptions() {
++  private resolveCorsOptions(): false | SDK.RsdoctorServerCorsOptions {
+     if (this._cors === false) {
+       return false;
+     }
+-    if (this._cors === true || typeof this._cors === 'undefined') {
++    if (this._cors === true) {
+       return {};
+     }
+-    return this._cors;
++    if (typeof this._cors === 'undefined') {
++      return { origin: DEFAULT_ALLOWED_CORS_ORIGINS };
++    }
++    return {
++      ...this._cors,
++      origin:
++        typeof this._cors.origin === 'undefined'
++          ? DEFAULT_ALLOWED_CORS_ORIGINS
++          : this._cors.origin,
++    };
++  }
++
++  private async createInnerServer() {
++    let expectedPort = this.port;
++    let lastError: unknown;
++
++    for (let retry = 0; retry < LISTEN_RETRY_LIMIT; retry++) {
++      const port = Server.getPortSync(expectedPort, this.host);
++      try {
++        return {
++          port,
++          server: await Server.createServer(port, this.host),
++        };
++      } catch (error) {
++        if (!isAddressInUseError(error)) {
++          throw error;
++        }
++        lastError = error;
++        expectedPort = port + 1;
++      }
++    }
++
++    throw lastError;
+   }
+ 
+   public get app(): SDK.RsdoctorServerInstance['app'] {
+@@ -79,8 +126,7 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+   }
+ 
+   public get host(): string {
+-    const host = getLocalIpAddress();
+-    return host;
++    return Server.defaultHost;
+   }
+ 
+   public get origin(): string {
+@@ -90,7 +136,8 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+   public get socketUrl(): ISocketType {
+     return {
+       port: this.port,
+-      socketUrl: `ws://localhost:${this.port}`,
++      socketUrl: `ws://localhost:${this.port}?token=${this._socketToken}`,
++      token: this._socketToken,
+     };
+   }
+ 
+@@ -103,14 +150,15 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+       return;
+     }
+ 
+-    const port = Server.getPortSync(this.port);
++    const { port, server } = await this.createInnerServer();
+     // rewrite port when the default port is unavailable
+     this.port = port;
+-    this._server = await Server.createServer(port);
++    this._server = server;
+     this._socket = new Socket({
+       sdk: this.sdk,
+       server: this._server.server,
+       port: this.port,
++      token: this._socketToken,
+     });
+     await this._socket.bootstrap();
+ 
+@@ -123,10 +171,37 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+     this.disposed = false;
+ 
+     const corsOptions = this.resolveCorsOptions();
++    this.app.use((req, res, next) => {
++      const host = req.headers.host || req.headers[':authority'];
++      if (!isAllowedRequestHost(host)) {
++        res.statusCode = 403;
++        res.end();
++        return;
++      }
++
++      next();
++    });
++    if (
++      corsOptions !== false &&
++      corsOptions.origin === DEFAULT_ALLOWED_CORS_ORIGINS
++    ) {
++      this.app.use((req, res, next) => {
++        const host = req.headers.host || req.headers[':authority'];
++        if (!isAllowedCorsRequest(req.headers.origin, host)) {
++          res.statusCode = 403;
++          res.end();
++          return;
++        }
++
++        next();
++      });
++    }
+     if (corsOptions !== false) {
+       this.app.use(cors(corsOptions));
+     }
+     this.app.use(bodyParser.json({ limit: '500mb' }));
++    this._routeInsertIndex = this.app.stack.length;
++    await this._router.setup();
+     const clientHtmlPath = this._innerClientPath
+       ? this._innerClientPath
+       : require.resolve('@rsdoctor/client');
+@@ -190,8 +265,6 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+       },
+     );
+ 
+-    await this._router.setup();
+-
+     process.once('exit', () => this.dispose());
+     process.once('SIGINT', () => this.dispose(0));
+     process.once('SIGTERM', () => this.dispose(0));
+@@ -222,8 +295,6 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+         try {
+           const body = await cb(req, res, next);
+ 
+-          res.setHeader('Access-Control-Allow-Origin', '*');
+-          res.setHeader('Access-Control-Allow-Credentials', 'true');
+           res.statusCode = 200;
+ 
+           if (Buffer.isBuffer(body)) {
+@@ -279,10 +350,11 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+       ...args: Parameters<Thirdparty.connect.NextHandleFunction>
+     ) => Common.PlainObject | string,
+   ) {
+-    this.app.stack.unshift({
++    this.app.stack.splice(this._routeInsertIndex, 0, {
+       route: api,
+       handle: this.wrapNextHandleFunction(method, cb),
+     });
++    this._routeInsertIndex += 1;
+   }
+ 
+   public get: SDK.RsdoctorServerInstance['get'] = (route, cb) => {
+@@ -362,14 +434,15 @@ export class RsdoctorServer implements SDK.RsdoctorServerInstance {
+     }
+     this.disposed = true;
+ 
+-    if (this._socket) {
+-      this._socket.dispose();
+-    }
+-
+     if (this._server) {
+       await this._server.close();
+     }
+ 
++    // Close sockets after the HTTP server stops accepting new connections.
++    if (this._socket) {
++      this._socket.dispose();
++    }
++
+     if (exitCode !== undefined) {
+       process.exit(exitCode);
+     }
+diff --git a/packages/sdk/src/sdk/server/security.ts b/packages/sdk/src/sdk/server/security.ts
+new file mode 100644
+index 0000000..b588969
+--- /dev/null
++++ b/packages/sdk/src/sdk/server/security.ts
+@@ -0,0 +1,74 @@
++import { isIP } from 'node:net';
++
++export const DEFAULT_ALLOWED_CORS_ORIGINS =
++  /^https?:\/\/(?:(?:[^:]+\.)?localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|\[0:0:0:0:0:0:0:1\])(?::\d+)?$/i;
++
++const LOCAL_HOSTNAMES = /^(?:localhost|[^:]+\.localhost)$/;
++
++export function isAllowedRequestOrigin(origin: string | string[] | undefined) {
++  if (origin === undefined) {
++    return true;
++  }
++
++  return (
++    typeof origin === 'string' && DEFAULT_ALLOWED_CORS_ORIGINS.test(origin)
++  );
++}
++
++function getHostnameFromOrigin(origin: string) {
++  try {
++    const hostname = new URL(origin).hostname.toLowerCase();
++    return hostname.startsWith('[') && hostname.endsWith(']')
++      ? hostname.slice(1, -1)
++      : hostname;
++  } catch {
++    return '';
++  }
++}
++
++function isIpAddress(hostname: string) {
++  return isIP(hostname) !== 0;
++}
++
++function getHostnameFromHost(host: string) {
++  if (host.startsWith('[')) {
++    const endIndex = host.indexOf(']');
++    return endIndex === -1 ? '' : host.slice(1, endIndex);
++  }
++
++  return host.split(':')[0];
++}
++
++export function isAllowedRequestHost(host: string | string[] | undefined) {
++  if (typeof host !== 'string') {
++    return false;
++  }
++
++  const hostname = getHostnameFromHost(host).toLowerCase();
++  return LOCAL_HOSTNAMES.test(hostname) || isIpAddress(hostname);
++}
++
++export function isAllowedCorsRequest(
++  origin: string | string[] | undefined,
++  host: string | string[] | undefined,
++) {
++  if (origin === undefined) {
++    return true;
++  }
++  if (
++    typeof origin !== 'string' ||
++    typeof host !== 'string' ||
++    !isAllowedRequestOrigin(origin)
++  ) {
++    return false;
++  }
++
++  const originHostname = getHostnameFromOrigin(origin);
++  const hostHostname = getHostnameFromHost(host).toLowerCase();
++
++  if (originHostname.endsWith('.localhost')) {
++    return originHostname === hostHostname;
++  }
++
++  return true;
++}
+diff --git a/packages/sdk/src/sdk/server/socket/index.ts b/packages/sdk/src/sdk/server/socket/index.ts
+index bd92a20..99ad4da 100644
+--- a/packages/sdk/src/sdk/server/socket/index.ts
++++ b/packages/sdk/src/sdk/server/socket/index.ts
+@@ -1,12 +1,15 @@
+ import { Common, SDK } from '@rsdoctor/types';
+ import type { Server } from 'http';
+ import WebSocket, { WebSocketServer } from 'ws';
++import type { VerifyClientCallbackSync } from 'ws';
+ import { SocketAPILoader } from './api';
++import { isAllowedRequestHost } from '../security';
+ 
+ interface SocketOptions {
+   sdk: SDK.RsdoctorBuilderSDKInstance;
+   server: Server;
+   port: number;
++  token: string;
+ }
+ 
+ type Subscription = {
+@@ -25,6 +28,15 @@ type ClientMessage = {
+   body?: Common.PlainObject | null;
+ };
+ 
++function isAllowedSocketToken(url: string | undefined, token: string) {
++  if (!url) {
++    return false;
++  }
++
++  const provided = new URL(url, 'http://localhost').searchParams.get('token');
++  return provided === null || provided === token;
++}
++
+ export class Socket {
+   protected server?: WebSocketServer;
+ 
+@@ -41,7 +53,16 @@ export class Socket {
+   }
+ 
+   public bootstrap() {
+-    this.server = new WebSocketServer({ server: this.options.server });
++    this.server = new WebSocketServer({
++      server: this.options.server,
++      verifyClient: (({ req }) => {
++        const host = req.headers.host || req.headers[':authority'];
++        return (
++          isAllowedRequestHost(host) &&
++          isAllowedSocketToken(req.url, this.options.token)
++        );
++      }) satisfies VerifyClientCallbackSync,
++    });
+     this.server.on('connection', (client) => {
+       this.attachClient(client);
+     });
+diff --git a/packages/types/src/sdk/server/index.ts b/packages/types/src/sdk/server/index.ts
+index 8daa0b2..8823025 100644
+--- a/packages/types/src/sdk/server/index.ts
++++ b/packages/types/src/sdk/server/index.ts
+@@ -22,6 +22,7 @@ export interface RsdoctorServerInstance {
+   readonly socketUrl: {
+     port: number;
+     socketUrl: string;
++    token: string;
+   };
+ 
+   innerClientPath?: string;
+diff --git a/packages/utils/src/build/server.ts b/packages/utils/src/build/server.ts
+index 84eacaf..f7ced63 100644
+--- a/packages/utils/src/build/server.ts
++++ b/packages/utils/src/build/server.ts
+@@ -2,13 +2,15 @@ import connect from 'connect';
+ import http from 'http';
+ import os from 'os';
+ import gp from 'get-port';
+-import { execSync } from 'child_process';
++import { execFileSync } from 'child_process';
+ import { Thirdparty } from '@rsdoctor/types';
+ import { random } from '../common/algorithm';
+ 
+ // see https://neo4j.com/developer/kb/list-of-restricted-ports-in-browsers
+ const RESTRICTED_PORTS = [3659, 4045, 6000, 6665, 6666, 6667, 6668, 6669];
+ 
++export const defaultHost = '127.0.0.1';
++
+ function getRandomPort(min: number, max: number) {
+   let port: number;
+   do {
+@@ -19,21 +21,24 @@ function getRandomPort(min: number, max: number) {
+ 
+ export const defaultPort = getRandomPort(3000, 8999);
+ 
+-export async function getPort(expectPort: number) {
+-  return gp({ port: expectPort });
++export async function getPort(expectPort: number, host = defaultHost) {
++  return gp({ port: expectPort, host });
+ }
+ 
+-export const createGetPortSyncFunctionString = (expectPort: number) =>
++export const createGetPortSyncFunctionString = (
++  expectPort: number,
++  host = defaultHost,
++) =>
+   `
+ (() => {
+ const net = require('net');
+ 
+-function getPort(expectPort) {
++function getPort(expectPort, host) {
+   return new Promise((resolve, reject) => {
+     const server = net.createServer();
+     server.unref();
+     server.on('error', reject);
+-    server.listen(expectPort, () => {
++    server.listen(expectPort, host, () => {
+       const { port } = server.address();
+       server.close(() => {
+         resolve(port);
+@@ -46,7 +51,7 @@ async function getAvailablePort(expectPort) {
+   let port = expectPort;
+   while (true) {
+     try {
+-      const res = await getPort(port);
++      const res = await getPort(port, ${JSON.stringify(host)});
+       return res;
+     } catch (error) {
+       port += Math.floor(Math.random() * 100 + 1);
+@@ -58,13 +63,18 @@ getAvailablePort(${expectPort}).then(port => process.stdout.write(port.toString(
+ })();
+ `.trim();
+ 
+-export function getPortSync(expectPort: number): number | never {
++export function getPortSync(
++  expectPort: number,
++  host = defaultHost,
++): number | never {
+   const statement =
+     os.EOL === '\n'
+-      ? createGetPortSyncFunctionString(expectPort)
+-      : createGetPortSyncFunctionString(expectPort).replace(/\n/g, '');
++      ? createGetPortSyncFunctionString(expectPort, host)
++      : createGetPortSyncFunctionString(expectPort, host).replace(/\n/g, '');
+ 
+-  const port = execSync(`node -e "${statement}"`, { encoding: 'utf-8' });
++  const port = execFileSync(process.execPath, ['-e', statement], {
++    encoding: 'utf-8',
++  });
+ 
+   return Number(port);
+ }
+@@ -73,7 +83,10 @@ export function createApp() {
+   return connect();
+ }
+ 
+-export async function createServer(port: number): Promise<{
++export async function createServer(
++  port: number,
++  host = defaultHost,
++): Promise<{
+   app: Thirdparty.connect.Server;
+   server: http.Server;
+   port: number;
+@@ -103,8 +116,13 @@ export async function createServer(port: number): Promise<{
+     },
+   };
+ 
+-  return new Promise<typeof res>((resolve) => {
+-    server.listen(port, () => {
++  return new Promise<typeof res>((resolve, reject) => {
++    const onError = (error: Error) => {
++      reject(error);
++    };
++    server.once('error', onError);
++    server.listen(port, host, () => {
++      server.off('error', onError);
+       resolve(res);
+     });
+   });

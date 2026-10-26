@@ -1,0 +1,150 @@
+diff --git a/guard/pacioli_guard/act.py b/guard/pacioli_guard/act.py
+index c402250..c36ecd5 100644
+--- a/guard/pacioli_guard/act.py
++++ b/guard/pacioli_guard/act.py
+@@ -110,6 +110,10 @@ def _writing_document(frame):
+ # (2) is the load-bearing one and it does not depend on frappe's caching behaviour staying put.
+ _CONSENT_ESTABLISHED = "pacioli_consent_established"
+ 
++# The act the consent above was established for. A consequence carries it so the next consequence
++# is judged against the act actually performed rather than the one that authorised it.
++_CONSENT_ACT = "pacioli_consent_act"
++
+ 
+ def _flag_get(doc, key):
+     flags = getattr(doc, "flags", None)
+@@ -121,15 +125,25 @@ def _flag_get(doc, key):
+         return bool(getattr(flags, key, False))
+ 
+ 
+-def _flag_set(doc, key):
++def _flag_value(doc, key):
++    flags = getattr(doc, "flags", None)
++    if flags is None:
++        return None
++    try:
++        return flags.get(key)
++    except AttributeError:
++        return getattr(flags, key, None)
++
++
++def _flag_set(doc, key, value=True):
+     flags = getattr(doc, "flags", None)
+     if flags is None:
+         return
+     try:
+-        flags[key] = True
++        flags[key] = value
+     except (TypeError, AttributeError):
+         try:
+-            setattr(flags, key, True)
++            setattr(flags, key, value)
+         except Exception:  # noqa: BLE001 — a stamp we cannot record must not break the write
+             pass
+ 
+@@ -231,7 +245,7 @@ def _inside_another_write(doc):
+     while frame is not None:
+         other = _writing_document(frame)
+         if other is not None and not _same_document(other, doc) and _flag_get(other, _CONSENT_ESTABLISHED):
+-            return True
++            return other
+         # A different document IS being written, but this gate never established consent for it.
+         # Keep walking rather than concluding anything: an OUTER frame may still be the governed
+         # act, and a consequence of a consequence legitimately rides the original.
+@@ -239,7 +253,7 @@ def _inside_another_write(doc):
+     return False
+ 
+ 
+-def _may_ride(doc, action):
++def _may_ride(doc, action, enclosing):
+     """May this act ride the consent established for the enclosing act it is a consequence of?
+ 
+     Split by ACT, because the signal that answers "the human could not have named this document"
+@@ -289,11 +303,26 @@ def _may_ride(doc, action):
+     undo. The delete gate added in 0.9.6 therefore rides the enclosing act exactly as the cancel
+     gate does.
+     """
+-    if action in (CANCEL, DELETE):
+-        return True
++    enclosing_act = _flag_value(enclosing, _CONSENT_ACT)
++    if action == DELETE:
++        return _flag_get(doc, "in_insert")
++    if action == CANCEL:
++        return enclosing_act == CANCEL
+     return _flag_get(doc, "in_insert")
+ 
+ 
++def _candidates(presented):
++    """The markers one request presented: one token, or several separated by whitespace or
++    commas. Empty entries are never compared."""
++    if presented is None:
++        return ()
++    if not isinstance(presented, str):
++        items = presented
++    else:
++        items = presented.replace(",", " ").split()
++    return tuple(str(item).strip() for item in items if str(item).strip())
++
++
+ def _gated(user):
+     """Is ``user`` consent-gated? Returns the grant's flag as a bool.
+ 
+@@ -374,17 +403,22 @@ def _require_consent(doc, action):
+     # ...but ONLY on the submit path. `in_insert` is structurally False at every `before_cancel`, so
+     # requiring it there refused every cascaded cancel and took UNDO out with it. `_may_ride` owns
+     # that split and states the residual it leaves.
+-    if _inside_another_write(doc) and _may_ride(doc, action):
+-        # Propagate custody: a cascade of a cascade (a GL Entry inside a Payment Ledger Entry
+-        # inside the consented invoice) must keep riding the original act rather than becoming
+-        # ungoverned once it is two levels deep.
++    enclosing = _inside_another_write(doc)
++    if enclosing and _may_ride(doc, action, enclosing):
++        # The consequence carries the act it performed, so a later consequence of it is judged
++        # against that act and not against whatever authorised the act it rides.
+         _flag_set(doc, _CONSENT_ESTABLISHED)
++        _flag_set(doc, _CONSENT_ACT, action)
+         return
+     doctype = getattr(doc, "doctype", None)
+     docname = getattr(doc, "name", None)
+     record = _consent_record(doctype, docname) if doctype and docname else None
+-    allowed, reason = consent_verdict(_presented_token(), doctype, docname, action, record,
+-                                      time.time(), user)
++    allowed, reason = False, "no consent marker presented"
++    for candidate in _candidates(_presented_token()):
++        allowed, reason = consent_verdict(candidate, doctype, docname, action, record,
++                                          time.time(), user)
++        if allowed:
++            break
+     if not allowed:
+         _deny(
+             "consent (document layer)",
+@@ -420,6 +454,7 @@ def _require_consent(doc, action):
+     # Stamped only after the marker is actually spent: an act that was refused, or whose spend could
+     # not be confirmed, must not license anything nested beneath it.
+     _flag_set(doc, _CONSENT_ESTABLISHED)
++    _flag_set(doc, _CONSENT_ACT, action)
+ 
+ 
+ def before_submit(doc, method=None):
+diff --git a/guard/pacioli_guard/enforce.py b/guard/pacioli_guard/enforce.py
+index 39a13f0..ae14435 100644
+--- a/guard/pacioli_guard/enforce.py
++++ b/guard/pacioli_guard/enforce.py
+@@ -442,17 +442,6 @@ def _consent_record(doctype, docname):
+             ["name", "token_hash", "ref_doctype", "ref_docname", "ref_action",
+              "expires_at", "burned", "minted_by"],
+             as_dict=True)
+-        if not row:
+-            origin = frappe.db.get_value(doctype, docname, "amended_from")
+-            if origin:
+-                row = frappe.db.get_value(
+-                    CONSENT_DOCTYPE, {"ref_doctype": doctype, "ref_docname": origin},
+-                    ["name", "token_hash", "ref_doctype", "ref_docname", "ref_action",
+-                     "expires_at", "burned", "minted_by"],
+-                    as_dict=True)
+-                if row:
+-                    # The marker now stands for the copy, which is the document this act is about.
+-                    row = dict(row, ref_docname=docname)
+     except Exception:  # noqa: BLE001 — a broken lookup must deny, not open the gate
+         return None
+     if not row:

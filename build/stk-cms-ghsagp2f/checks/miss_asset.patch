@@ -1,0 +1,127 @@
+diff -ruN a/src/controllers/AppController.php b/src/controllers/AppController.php
+--- a/src/controllers/AppController.php	2026-10-26 02:35:00.993391254 +0000
++++ b/src/controllers/AppController.php	2026-10-26 02:35:00.993391254 +0000
+@@ -31,6 +31,9 @@
+ use craft\web\Controller;
+ use craft\web\ServiceUnavailableHttpException;
+ use DateInterval;
++use GuzzleHttp\Psr7\Uri;
++use GuzzleHttp\Psr7\UriResolver;
++use GuzzleHttp\RequestOptions;
+ use Throwable;
+ use yii\base\InvalidConfigException;
+ use yii\web\BadRequestHttpException;
+@@ -110,20 +113,111 @@
+     {
+         $this->requireCpRequest();
+ 
+-        if (!str_starts_with($url, Craft::$app->getAssetManager()->baseUrl)) {
++        $baseUrl = $this->resourceJsBaseUrl();
++        if (!$this->isResourceJsUrl($url, $baseUrl)) {
+             throw new BadRequestHttpException("$url does not appear to be a resource URL");
+         }
+ 
+         // Close the PHP session in case this takes a while
+         Session::close();
+ 
+-        $response = Craft::createGuzzleClient()->get($url);
++        $client = Craft::createGuzzleClient();
++        $currentUrl = $url;
++        $response = null;
++
++        for ($hops = 0; $hops <= 5; $hops++) {
++            if (!$this->isResourceJsUrl($currentUrl, $baseUrl)) {
++                throw new BadRequestHttpException("$currentUrl does not appear to be a resource URL");
++            }
++
++            $response = $client->get($currentUrl, [
++                RequestOptions::ALLOW_REDIRECTS => false,
++            ]);
++
++            $status = $response->getStatusCode();
++            if ($status < 300 || $status >= 400) {
++                break;
++            }
++
++            $location = $response->getHeaderLine('Location');
++            if ($location === '') {
++                throw new BadRequestHttpException("$currentUrl redirected without a location");
++            }
++            $currentUrl = (string)UriResolver::resolve(new Uri($currentUrl), new Uri($location));
++            $response = null;
++        }
++
++        if ($response === null) {
++            throw new BadRequestHttpException('Too many redirects');
++        }
++
+         $this->response->setCacheHeaders();
+         $this->response->getHeaders()->set('content-type', 'application/javascript');
+         return $this->asRaw($response->getBody());
+     }
+ 
+     /**
++     * Returns the control panel’s resource base URL, derived from the site’s
++     * configuration rather than the incoming request.
++     */
++    private function resourceJsBaseUrl(): string
++    {
++        $generalConfig = Craft::$app->getConfig()->getGeneral();
++        $baseUrl = (string)$generalConfig->resourceBaseUrl;
++
++        if (str_starts_with($baseUrl, '@')) {
++            try {
++                $siteBaseUrl = rtrim((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), '/');
++            } catch (Throwable) {
++                $siteBaseUrl = '';
++            }
++            if ($siteBaseUrl !== '') {
++                $baseUrl = (string)preg_replace('/^@web(?=\/|$)/', $siteBaseUrl, $baseUrl);
++            }
++            if (str_starts_with($baseUrl, '@')) {
++                $resolved = Craft::getAlias($baseUrl, false);
++                if (is_string($resolved)) {
++                    $baseUrl = $resolved;
++                }
++            }
++        }
++
++        return rtrim($baseUrl, '/');
++    }
++
++    /**
++     * Returns whether the given URL belongs to the control panel’s resource origin.
++     */
++    private function isResourceJsUrl(string $url, string $baseUrl): bool
++    {
++        $urlParts = parse_url($url);
++        $baseParts = parse_url($baseUrl);
++
++        if (!is_array($urlParts) || !is_array($baseParts) || empty($urlParts['host']) || empty($baseParts['host'])) {
++            return false;
++        }
++
++        $scheme = strtolower($urlParts['scheme'] ?? '');
++        if ($scheme !== strtolower($baseParts['scheme'] ?? '')) {
++            return false;
++        }
++
++        if (strtolower($urlParts['host']) !== strtolower($baseParts['host'])) {
++            return false;
++        }
++
++        $defaultPort = $scheme === 'https' ? 443 : 80;
++        if ((int)($urlParts['port'] ?? $defaultPort) !== (int)($baseParts['port'] ?? $defaultPort)) {
++            return false;
++        }
++
++        $basePath = rtrim($baseParts['path'] ?? '/', '/');
++        $urlPath = $urlParts['path'] ?? '/';
++
++        return $urlPath === $basePath || str_starts_with($urlPath, $basePath . '/');
++    }
++
++    /**
+      * Returns the latest Craftnet API headers.
+      *
+      * @return Response

@@ -1,0 +1,265 @@
+diff --git a/internal/api/core/server.go b/internal/api/core/server.go
+index 6e4776f..65672bb 100644
+--- a/internal/api/core/server.go
++++ b/internal/api/core/server.go
+@@ -111,7 +111,7 @@ func NewPersesAPI(dependencyManager dependency.Manager, cfg config.Config) echoU
+ 	return &api{
+ 		apiV1Endpoints: apiV1Endpoints,
+ 		apiEndpoints:   apiEndpoints,
+-		proxyEndpoint: proxy.New(cfg.Datasource, persistenceManager.GetDashboard(), persistenceManager.GetSecret(), persistenceManager.GetGlobalSecret(),
++		proxyEndpoint: proxy.New(cfg.Datasource, persistenceManager.GetDashboard(), persistenceManager.GetEphemeralDashboard(), persistenceManager.GetSecret(), persistenceManager.GetGlobalSecret(),
+ 			persistenceManager.GetDatasource(), persistenceManager.GetGlobalDatasource(), serviceManager.GetCrypto(), serviceManager.GetAuthorization()),
+ 		authorizationMiddlware: serviceManager.GetAuthorization().Middleware(func(_ echo.Context) bool {
+ 			return !cfg.Security.EnableAuth
+diff --git a/internal/api/impl/proxy/ephemeraldatasource.go b/internal/api/impl/proxy/ephemeraldatasource.go
+new file mode 100644
+index 0000000..00615c1
+--- /dev/null
++++ b/internal/api/impl/proxy/ephemeraldatasource.go
+@@ -0,0 +1,74 @@
++// Copyright The Perses Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package proxy
++
++import (
++	"fmt"
++
++	"github.com/labstack/echo/v4"
++	databaseModel "github.com/perses/perses/internal/api/database/model"
++	apiinterface "github.com/perses/perses/internal/api/interface"
++	"github.com/perses/perses/internal/api/utils"
++	v1 "github.com/perses/perses/pkg/model/api/v1"
++	"github.com/perses/perses/pkg/model/api/v1/role"
++	"github.com/perses/spec/go/datasource"
++	"github.com/sirupsen/logrus"
++)
++
++func (e *endpoint) proxyEphemeralDashboardDatasource(ctx echo.Context, projectName, dtsName string, spec datasource.Spec) error {
++	path := ctx.Param("*")
++
++	pr, err := newProxy(dtsName, projectName, spec, path, e.crypto, func(name string) (*v1.SecretSpec, error) {
++		return e.getProjectSecret(projectName, dtsName, name)
++	})
++	if err != nil {
++		return err
++	}
++	return pr.serve(ctx)
++}
++
++func (e *endpoint) proxySavedEphemeralDashboardDatasource(ctx echo.Context) error {
++	projectName := ctx.Param(utils.ParamProject)
++	if err := e.checkPermission(ctx, projectName, role.DatasourceScope, role.ReadAction); err != nil {
++		return err
++	}
++
++	dashboardName := ctx.Param(utils.ParamDashboard)
++	dtsName := ctx.Param(utils.ParamName)
++
++	dts, err := e.getEphemeralDashboardDatasource(projectName, dashboardName, dtsName)
++	if err != nil {
++		return err
++	}
++
++	return e.proxyEphemeralDashboardDatasource(ctx, projectName, dtsName, dts)
++}
++
++func (e *endpoint) getEphemeralDashboardDatasource(projectName string, dashboardName string, name string) (datasource.Spec, error) {
++	db, err := e.ephemeralDashboard.Get(projectName, dashboardName)
++	if err != nil {
++		if databaseModel.IsKeyNotFound(err) {
++			logrus.Debugf("unable to find the EphemeralDashboard %q in project %q", dashboardName, projectName)
++			return datasource.Spec{}, apiinterface.HandleNotFoundError(fmt.Sprintf("unable to forward the request to the datasource %q, datasource doesn't exist", name))
++		}
++		logrus.WithError(err).Errorf("unable to find the datasource %q, something wrong with the database", name)
++		return datasource.Spec{}, apiinterface.InternalError
++	}
++	dtsSpec, ok := db.Spec.Datasources[name]
++	if !ok {
++		logrus.Debugf("unable to find the Datasource %q from EphemeralDashboard %q in project %q", name, dashboardName, projectName)
++		return datasource.Spec{}, apiinterface.HandleNotFoundError(fmt.Sprintf("unable to forward the request to the datasource %q, datasource doesn't exist", name))
++	}
++	return *dtsSpec, nil
++}
+diff --git a/internal/api/impl/proxy/proxy.go b/internal/api/impl/proxy/proxy.go
+index d2b72fd..a51519f 100644
+--- a/internal/api/impl/proxy/proxy.go
++++ b/internal/api/impl/proxy/proxy.go
+@@ -25,6 +25,7 @@ import (
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
++	"regexp"
+ 	"strings"
+ 	"time"
+ 
+@@ -37,6 +38,7 @@ import (
+ 	apiinterface "github.com/perses/perses/internal/api/interface"
+ 	"github.com/perses/perses/internal/api/interface/v1/dashboard"
+ 	"github.com/perses/perses/internal/api/interface/v1/datasource"
++	ephemeraldashboard "github.com/perses/perses/internal/api/interface/v1/ephemeraldashboard"
+ 	"github.com/perses/perses/internal/api/interface/v1/globaldatasource"
+ 	"github.com/perses/perses/internal/api/interface/v1/globalsecret"
+ 	"github.com/perses/perses/internal/api/interface/v1/secret"
+@@ -123,27 +125,29 @@ func (u *unsavedProxyBody) setRequestParams(ctx echo.Context) {
+ const unsavedDatasourceDefaultName = "unsaved-datasource"
+ 
+ type endpoint struct {
+-	cfg          config.DatasourceConfig
+-	dashboard    dashboard.DAO
+-	secret       secret.DAO
+-	globalSecret globalsecret.DAO
+-	dts          datasource.DAO
+-	globalDTS    globaldatasource.DAO
+-	crypto       crypto.Crypto
+-	authz        authorization.Authorization
+-}
+-
+-func New(cfg config.DatasourceConfig, dashboardDAO dashboard.DAO, secretDAO secret.DAO, globalSecretDAO globalsecret.DAO,
++	cfg                config.DatasourceConfig
++	dashboard          dashboard.DAO
++	ephemeralDashboard ephemeraldashboard.DAO
++	secret             secret.DAO
++	globalSecret       globalsecret.DAO
++	dts                datasource.DAO
++	globalDTS          globaldatasource.DAO
++	crypto             crypto.Crypto
++	authz              authorization.Authorization
++}
++
++func New(cfg config.DatasourceConfig, dashboardDAO dashboard.DAO, ephemeralDashboardDAO ephemeraldashboard.DAO, secretDAO secret.DAO, globalSecretDAO globalsecret.DAO,
+ 	dtsDAO datasource.DAO, globalDtsDAO globaldatasource.DAO, crypto crypto.Crypto, authz authorization.Authorization) route.Endpoint {
+ 	return &endpoint{
+-		cfg:          cfg,
+-		dashboard:    dashboardDAO,
+-		secret:       secretDAO,
+-		globalSecret: globalSecretDAO,
+-		dts:          dtsDAO,
+-		globalDTS:    globalDtsDAO,
+-		crypto:       crypto,
+-		authz:        authz,
++		cfg:                cfg,
++		dashboard:          dashboardDAO,
++		ephemeralDashboard: ephemeralDashboardDAO,
++		secret:             secretDAO,
++		globalSecret:       globalSecretDAO,
++		dts:                dtsDAO,
++		globalDTS:          globalDtsDAO,
++		crypto:             crypto,
++		authz:              authz,
+ 	}
+ }
+ 
+@@ -169,6 +173,11 @@ func (e *endpoint) CollectRoutes(g *route.Group) {
+ 
+ 		g.POST(fmt.Sprintf("/%s/%s/:%s/%s/:%s/%s/*", utils.PathUnsaved, utils.PathProject, utils.ParamProject, utils.PathDashboard, utils.ParamDashboard, utils.PathDatasource), e.proxyUnsavedDashboardDatasource, false)
+ 	}
++
++	if !e.cfg.DisableLocal {
++		g.ANY(fmt.Sprintf("/%s/:%s/%s/:%s/%s/:%s/*", utils.PathProject, utils.ParamProject, utils.PathEphemeralDashboard, utils.ParamDashboard, utils.PathDatasource, utils.ParamName), e.proxySavedEphemeralDashboardDatasource, false)
++		g.ANY(fmt.Sprintf("/%s/:%s/%s/:%s/%s/:%s", utils.PathProject, utils.ParamProject, utils.PathEphemeralDashboard, utils.ParamDashboard, utils.PathDatasource, utils.ParamName), e.proxySavedEphemeralDashboardDatasource, false)
++	}
+ }
+ 
+ func (e *endpoint) checkPermission(ctx echo.Context, projectName string, scope role.Scope, action role.Action) error {
+@@ -226,11 +235,16 @@ func newProxy(datasourceName, projectName string, spec datasourceSpec.Spec, path
+ 				return nil, apiinterface.InternalError
+ 			}
+ 		}
++		resolvedHeaders, headersErr := resolveHeaderSecrets(httpConfig.Headers, retrieveSecret, crypto)
++		if headersErr != nil {
++			return nil, headersErr
++		}
+ 		return &httpProxy{
+-			config:         httpConfig,
+-			datasourceName: datasourceName,
+-			path:           path,
+-			secret:         scrt,
++			config:          httpConfig,
++			datasourceName:  datasourceName,
++			path:            path,
++			secret:          scrt,
++			resolvedHeaders: resolvedHeaders,
+ 		}, nil
+ 	case datasourceSQL.ProxyKindName:
+ 		sqlConfig := cfg.(*datasourceSQL.Config)
+@@ -259,11 +273,50 @@ func newProxy(datasourceName, projectName string, spec datasourceSpec.Spec, path
+ 	}
+ }
+ 
++// headerSecretPattern matches a header value that references a stored secret by name.
++var headerSecretPattern = regexp.MustCompile(`\{\{secret:([A-Za-z0-9._-]+)\}\}`)
++
++// resolveHeaderSecrets returns the configured headers with every reference to a stored secret replaced by
++// the credentials of that secret. Headers that contain no reference are returned unchanged.
++func resolveHeaderSecrets(headers map[string]string, retrieveSecret func(name string) (*v1.SecretSpec, error), crypto crypto.Crypto) (map[string]string, error) {
++	if len(headers) == 0 {
++		return nil, nil
++	}
++	resolved := make(map[string]string, len(headers))
++	for header, value := range headers {
++		matches := headerSecretPattern.FindAllStringSubmatch(value, -1)
++		if len(matches) == 0 {
++			resolved[header] = value
++			continue
++		}
++		for _, match := range matches {
++			scrt, err := retrieveSecret(match[1])
++			if err != nil {
++				return nil, err
++			}
++			if _, decryptErr := crypto.Decrypt(scrt); decryptErr != nil {
++				return nil, apiinterface.InternalError
++			}
++			if scrt.Authorization == nil {
++				return nil, fmt.Errorf("secret %q referenced by header %q has no authorization credentials", match[1], header)
++			}
++			credentials, credentialsErr := scrt.Authorization.GetCredentials()
++			if credentialsErr != nil {
++				return nil, credentialsErr
++			}
++			value = strings.ReplaceAll(value, match[0], credentials)
++		}
++		resolved[header] = value
++	}
++	return resolved, nil
++}
++
+ type httpProxy struct {
+-	config         *datasourceHTTP.Config
+-	secret         *v1.SecretSpec
+-	datasourceName string
+-	path           string
++	config          *datasourceHTTP.Config
++	secret          *v1.SecretSpec
++	resolvedHeaders map[string]string
++	datasourceName  string
++	path            string
+ }
+ 
+ func (h *httpProxy) logWithDefaultEntry() *logrus.Entry {
+@@ -343,8 +396,12 @@ func (h *httpProxy) prepareRequest(c echo.Context) error {
+ 		req.Header.Set(echo.HeaderXForwardedProto, c.Scheme())
+ 	}
+ 	// set header according to the configuration
+-	if len(h.config.Headers) > 0 {
+-		for k, v := range h.config.Headers {
++	headers := h.config.Headers
++	if h.resolvedHeaders != nil {
++		headers = h.resolvedHeaders
++	}
++	if len(headers) > 0 {
++		for k, v := range headers {
+ 			if k == echo.HeaderAuthorization {
+ 				// Authorization header cannot be overwritten by the public configuration.
+ 				// It must be set using the Secret configuration.

@@ -1,0 +1,153 @@
+diff --git a/weblate/checks/views.py b/weblate/checks/views.py
+index d20c2bf979..e5e77e0aba 100644
+--- a/weblate/checks/views.py
++++ b/weblate/checks/views.py
+@@ -5,8 +5,10 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING
+ 
++from django.contrib.auth.decorators import login_required
++from django.core.exceptions import PermissionDenied
+ from django.db.models import Count, Q
+-from django.http import Http404
++from django.http import Http404, JsonResponse
+ from django.shortcuts import get_object_or_404, redirect
+ from django.urls import reverse
+ from django.utils.translation import gettext
+@@ -309,3 +311,23 @@ def render_check(request: AuthenticatedHttpRequest, unit_id, check_id):
+         raise Http404(msg)
+ 
+     return obj.check_obj.render(request, obj.unit)
++
++
++@login_required
++def check_summary(request: AuthenticatedHttpRequest, check_id):
++    """Return a summary of a check for the AJAX popup."""
++    obj = get_object_or_404(
++        Check.objects.filter(
++            unit__translation__component__project__in=request.user.allowed_projects
++        ),
++        pk=check_id,
++    )
++    if not request.user.has_perm("unit.check", obj):
++        raise PermissionDenied
++    return JsonResponse(
++        {
++            "name": obj.name,
++            "unit": obj.unit_id,
++            "dismissed": obj.dismissed,
++        }
++    )
+diff --git a/weblate/trans/views/bulk_suggestions.py b/weblate/trans/views/bulk_suggestions.py
+index 146ba49832..d4c7dc3abd 100644
+--- a/weblate/trans/views/bulk_suggestions.py
++++ b/weblate/trans/views/bulk_suggestions.py
+@@ -11,6 +11,7 @@ from django.contrib import messages
+ from django.contrib.auth.decorators import login_required
+ from django.core.exceptions import ValidationError
+ from django.http import JsonResponse
++from django.shortcuts import get_object_or_404
+ from django.utils.translation import gettext, ngettext
+ from django.views.decorators.http import require_POST
+ 
+@@ -145,3 +146,74 @@ def bulk_accept_user_suggestions(
+             "message": message,
+         }
+     )
++
++
++@require_POST
++@login_required
++def delete_suggestions(request: AuthenticatedHttpRequest) -> JsonResponse:
++    """Delete several suggestions at once."""
++    raw_ids = request.POST.get("suggestions", "")
++    try:
++        suggestion_ids = [int(item) for item in raw_ids.split(",") if item]
++    except ValueError:
++        return JsonResponse(
++            {"error": gettext("Invalid suggestions.")}, status=400
++        )
++    if not suggestion_ids:
++        return JsonResponse(
++            {"error": gettext("No suggestions found.")}, status=404
++        )
++
++    suggestions = list(
++        Suggestion.objects.filter(pk__in=suggestion_ids).select_related("unit")
++    )
++    if len(suggestions) != len(set(suggestion_ids)):
++        return JsonResponse(
++            {"error": gettext("No suggestions found.")}, status=404
++        )
++
++    if not all(
++        request.user.has_perm("suggestion.delete", suggestion)
++        for suggestion in suggestions
++    ):
++        return JsonResponse(
++            {
++                "error": gettext(
++                    "You do not have permission to delete suggestions."
++                )
++            },
++            status=403,
++        )
++
++    for suggestion in suggestions:
++        suggestion.delete_log(request.user)
++
++    return JsonResponse({"success": True, "deleted": len(suggestions)})
++
++
++@require_POST
++@login_required
++def accept_suggestion(request: AuthenticatedHttpRequest) -> JsonResponse:
++    """Accept a suggestion within a translation."""
++    translation = get_object_or_404(
++        Translation.objects.filter_access(request.user),
++        pk=request.POST.get("translation"),
++    )
++
++    if not request.user.has_perm("suggestion.accept", translation):
++        return JsonResponse(
++            {"error": gettext("You do not have permission to accept suggestions.")},
++            status=403,
++        )
++
++    try:
++        suggestion = Suggestion.objects.get(
++            pk=int(request.POST.get("suggestion", ""))
++        )
++    except (Suggestion.DoesNotExist, ValueError):
++        return JsonResponse(
++            {"error": gettext("Invalid suggestion.")}, status=404
++        )
++
++    suggestion.accept(request, state=STATE_TRANSLATED)
++    return JsonResponse({"success": True, "target": suggestion.target})
+diff --git a/weblate/urls.py b/weblate/urls.py
+index e9349d375f..b0edab5336 100644
+--- a/weblate/urls.py
++++ b/weblate/urls.py
+@@ -802,6 +802,21 @@ real_patterns = [
+         weblate.machinery.views.translate,
+         name="js-translate",
+     ),
++    path(
++        "js/check/<int:check_id>/summary/",
++        weblate.checks.views.check_summary,
++        name="check-summary",
++    ),
++    path(
++        "js/suggestions/delete/",
++        weblate.trans.views.bulk_suggestions.delete_suggestions,
++        name="delete-suggestions",
++    ),
++    path(
++        "js/suggestions/accept/",
++        weblate.trans.views.bulk_suggestions.accept_suggestion,
++        name="accept-suggestion",
++    ),
+     path(
+         "js/dismiss-automatically-translated/<int:unit_id>/",
+         weblate.trans.views.js.dismiss_automatically_translated,

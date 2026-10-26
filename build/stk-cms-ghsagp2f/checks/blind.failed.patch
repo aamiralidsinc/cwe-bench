@@ -1,0 +1,455 @@
+diff -ruN a/src/controllers/AppController.php b/src/controllers/AppController.php
+--- a/src/controllers/AppController.php	2026-10-26 02:41:06.000000000 +0000
++++ b/src/controllers/AppController.php	2026-10-26 03:52:53.801173221 +0000
+@@ -22,6 +22,7 @@
+ use craft\helpers\DateTimeHelper;
+ use craft\helpers\Html;
+ use craft\helpers\Json;
++use craft\helpers\OutboundRequest;
+ use craft\helpers\Session;
+ use craft\helpers\Update as UpdateHelper;
+ use craft\helpers\UrlHelper;
+@@ -31,6 +32,7 @@
+ use craft\web\Controller;
+ use craft\web\ServiceUnavailableHttpException;
+ use DateInterval;
++use GuzzleHttp\RequestOptions;
+ use Throwable;
+ use yii\base\InvalidConfigException;
+ use yii\web\BadRequestHttpException;
+@@ -110,20 +112,85 @@
+     {
+         $this->requireCpRequest();
+ 
+-        if (!str_starts_with($url, Craft::$app->getAssetManager()->baseUrl)) {
+-            throw new BadRequestHttpException("$url does not appear to be a resource URL");
+-        }
++        $baseUrl = $this->resourceJsBaseUrl();
+ 
+         // Close the PHP session in case this takes a while
+         Session::close();
+ 
+-        $response = Craft::createGuzzleClient()->get($url);
++        $client = Craft::createGuzzleClient();
++        $requestUrl = $url;
++        $response = null;
++
++        // Follow redirects by hand, so that the destination of every hop is checked
++        // against the configured resource origin before it is contacted.
++        for ($hop = 0; $hop <= OutboundRequest::MAX_REDIRECTS; $hop++) {
++            if (!OutboundRequest::isWithinBaseUrl($requestUrl, $baseUrl)) {
++                throw new BadRequestHttpException("$requestUrl does not appear to be a resource URL");
++            }
++
++            $response = $client->get($requestUrl, [
++                RequestOptions::ALLOW_REDIRECTS => false,
++            ]);
++
++            $status = $response->getStatusCode();
++            if ($status < 300 || $status >= 400) {
++                break;
++            }
++
++            $location = $response->getHeaderLine('Location');
++            if ($location === '') {
++                throw new BadRequestHttpException("$requestUrl redirected without a location");
++            }
++
++            $requestUrl = OutboundRequest::resolveLocation($requestUrl, $location);
++            $response = null;
++        }
++
++        if ($response === null) {
++            throw new BadRequestHttpException('Too many redirects');
++        }
++
+         $this->response->setCacheHeaders();
+         $this->response->getHeaders()->set('content-type', 'application/javascript');
+         return $this->asRaw($response->getBody());
+     }
+ 
+     /**
++     * Returns the control panel’s resource base URL.
++     *
++     * The URL is derived from the site configuration rather than the incoming request, so a
++     * spoofed `Host` header cannot make an arbitrary origin look like the resource origin.
++     *
++     * @return string
++     */
++    private function resourceJsBaseUrl(): string
++    {
++        $generalConfig = Craft::$app->getConfig()->getGeneral();
++        $baseUrl = (string)$generalConfig->resourceBaseUrl;
++
++        if ($baseUrl === '@web' || str_starts_with($baseUrl, '@web/')) {
++            $siteUrl = '';
++            try {
++                $siteUrl = rtrim((string)Craft::$app->getSites()->getPrimarySite()->getBaseUrl(), '/');
++            } catch (Throwable) {
++                // No usable primary site; fall back to resolving the alias below.
++            }
++            if ($siteUrl !== '') {
++                $baseUrl = $siteUrl . substr($baseUrl, 4);
++            }
++        }
++
++        if (str_starts_with($baseUrl, '@')) {
++            $resolved = Craft::getAlias($baseUrl, false);
++            if (is_string($resolved)) {
++                $baseUrl = $resolved;
++            }
++        }
++
++        return rtrim($baseUrl, '/');
++    }
++
++    /**
+      * Returns the latest Craftnet API headers.
+      *
+      * @return Response
+diff -ruN a/src/gql/resolvers/mutations/Asset.php b/src/gql/resolvers/mutations/Asset.php
+--- a/src/gql/resolvers/mutations/Asset.php	2026-10-26 02:41:06.000000000 +0000
++++ b/src/gql/resolvers/mutations/Asset.php	2026-10-26 03:52:46.025180241 +0000
+@@ -17,6 +17,7 @@
+ use craft\helpers\Assets as AssetsHelper;
+ use craft\helpers\Db;
+ use craft\helpers\FileHelper;
++use craft\helpers\OutboundRequest;
+ use craft\helpers\UrlHelper;
+ use craft\models\Volume;
+ use craft\services\Assets;
+@@ -253,9 +254,13 @@
+                 throw new AssetDisallowedExtensionException(Craft::t('app', "“{$extension}” is not an allowed file extension."));
+             }
+ 
+-            // Download the file
++            // Download the file, refusing destinations the site must not reach
+             $tempPath = AssetsHelper::tempFilePath($extension);
+-            $this->createGuzzleClient()->request('GET', $url, ['sink' => $tempPath]);
++            try {
++                OutboundRequest::download($this->createGuzzleClient(), $url, $tempPath);
++            } catch (InvalidArgumentException $e) {
++                throw new UserError($e->getMessage());
++            }
+         }
+ 
+         if (!$tempPath || !$filename) {
+diff -ruN a/src/helpers/OutboundRequest.php b/src/helpers/OutboundRequest.php
+--- a/src/helpers/OutboundRequest.php	1970-01-01 00:00:00.000000000 +0000
++++ b/src/helpers/OutboundRequest.php	2026-10-26 03:52:41.541184287 +0000
+@@ -0,0 +1,315 @@
++<?php
++/**
++ * @link https://craftcms.com/
++ * @copyright Copyright (c) Pixel & Tonic, Inc.
++ * @license https://craftcms.github.io/license/
++ */
++
++namespace craft\helpers;
++
++use GuzzleHttp\ClientInterface;
++use GuzzleHttp\Psr7\Uri;
++use GuzzleHttp\Psr7\UriResolver;
++use GuzzleHttp\RequestOptions;
++use yii\base\InvalidArgumentException;
++
++/**
++ * Guards HTTP requests that Craft makes to URLs a caller supplied.
++ *
++ * A request may only be sent to a public destination. Anything that would reach a
++ * loopback, private, link-local, unique-local, unspecified or cloud-metadata address is
++ * refused before a connection is opened. A host name is resolved here and the connection
++ * is pinned to the address that was checked, so a second DNS answer cannot send the
++ * request somewhere else.
++ *
++ * @since 4.0.0
++ */
++final class OutboundRequest
++{
++    /**
++     * @var int The maximum number of redirects that will be followed.
++     */
++    public const MAX_REDIRECTS = 5;
++
++    /**
++     * @var string[] The URL schemes a caller-supplied URL may use.
++     */
++    private const ALLOWED_SCHEMES = ['http', 'https'];
++
++    /**
++     * @var string[] Address ranges that must never be reached on a caller's behalf.
++     */
++    private const BLOCKED_RANGES = [
++        // IPv4
++        '0.0.0.0/8',        // “this” network, incl. the unspecified address
++        '10.0.0.0/8',       // private
++        '100.64.0.0/10',    // shared address space, also used by some metadata services
++        '127.0.0.0/8',      // loopback
++        '169.254.0.0/16',   // link-local, incl. the cloud metadata address
++        '172.16.0.0/12',    // private
++        '192.0.0.0/24',     // IETF protocol assignments
++        '192.0.2.0/24',     // documentation
++        '192.88.99.0/24',   // 6to4 relay anycast
++        '192.168.0.0/16',   // private
++        '198.18.0.0/15',    // benchmarking
++        '198.51.100.0/24',  // documentation
++        '203.0.113.0/24',   // documentation
++        '224.0.0.0/4',      // multicast
++        '240.0.0.0/4',      // reserved, incl. the broadcast address
++        // IPv6
++        '::/96',            // unspecified, loopback and IPv4-compatible
++        '::ffff:0:0/96',    // IPv4-mapped
++        '64:ff9b::/96',     // well-known NAT64 prefix
++        '64:ff9b:1::/48',   // local-use NAT64 prefix
++        '100::/64',         // discard-only
++        '2001::/32',        // Teredo, embeds an IPv4 address
++        '2001:db8::/32',    // documentation
++        '2002::/16',        // 6to4, embeds an IPv4 address
++        'fc00::/7',         // unique local, incl. the IPv6 cloud metadata prefix
++        'fe80::/10',        // link-local
++        'ff00::/8',         // multicast
++    ];
++
++    /**
++     * Refuses a caller-supplied URL unless it points at a public destination.
++     *
++     * @param string $url
++     * @return array{0: string, 1: int, 2: string|null} The host, the port, and the resolved
++     * address the connection should be pinned to (null when the host is an IP literal).
++     * @throws InvalidArgumentException if the URL cannot safely be contacted
++     */
++    public static function assertPublicUrl(string $url): array
++    {
++        $parts = parse_url($url);
++
++        if (!is_array($parts) || empty($parts['host'])) {
++            throw new InvalidArgumentException("“{$url}” is not a valid URL.");
++        }
++
++        $scheme = strtolower($parts['scheme'] ?? '');
++        if (!in_array($scheme, self::ALLOWED_SCHEMES, true)) {
++            throw new InvalidArgumentException("“{$url}” does not use a supported scheme.");
++        }
++
++        $host = strtolower(trim($parts['host'], '[]'));
++        $port = (int)($parts['port'] ?? ($scheme === 'https' ? 443 : 80));
++
++        // An IP literal is checked as-is; a name has to be resolved first, and every
++        // address it resolves to has to be public.
++        $isLiteral = filter_var($host, FILTER_VALIDATE_IP) !== false;
++        $addresses = $isLiteral ? [$host] : self::resolveHost($host);
++
++        if ($addresses === []) {
++            throw new InvalidArgumentException("“{$url}” could not be resolved to an address.");
++        }
++
++        foreach ($addresses as $address) {
++            if (!self::isPublicAddress($address)) {
++                throw new InvalidArgumentException("“{$url}” resolves to a destination that is not allowed.");
++            }
++        }
++
++        return [$host, $port, $isLiteral ? null : $addresses[0]];
++    }
++
++    /**
++     * Downloads a caller-supplied URL, following redirects itself so that every hop is
++     * checked, and writes the response body to the given path.
++     *
++     * @param ClientInterface $client
++     * @param string $url
++     * @param string $destination
++     * @throws InvalidArgumentException if a destination is refused
++     */
++    public static function download(ClientInterface $client, string $url, string $destination): void
++    {
++        $requestUrl = $url;
++
++        for ($hop = 0; $hop <= self::MAX_REDIRECTS; $hop++) {
++            [$host, $port, $address] = self::assertPublicUrl($requestUrl);
++
++            $options = [
++                RequestOptions::ALLOW_REDIRECTS => false,
++                RequestOptions::SINK => $destination,
++            ];
++
++            if ($address !== null) {
++                // Pin the connection to the address that was just checked, so a second
++                // DNS answer cannot send the request to a different destination.
++                $options['curl'] = [
++                    CURLOPT_RESOLVE => [self::resolveEntry($host, $port, $address)],
++                ];
++            }
++
++            $response = $client->request('GET', $requestUrl, $options);
++            $status = $response->getStatusCode();
++
++            if ($status < 300 || $status >= 400) {
++                return;
++            }
++
++            $location = $response->getHeaderLine('Location');
++            if ($location === '') {
++                throw new InvalidArgumentException("“{$requestUrl}” redirected without a location.");
++            }
++
++            $requestUrl = self::resolveLocation($requestUrl, $location);
++        }
++
++        throw new InvalidArgumentException("“{$url}” redirected too many times.");
++    }
++
++    /**
++     * Resolves a redirect target against the URL it was returned for.
++     *
++     * @param string $url
++     * @param string $location
++     * @return string
++     */
++    public static function resolveLocation(string $url, string $location): string
++    {
++        return (string)UriResolver::resolve(new Uri($url), new Uri($location));
++    }
++
++    /**
++     * Returns whether the given URL points inside the given base URL.
++     *
++     * The scheme, host, port and leading path segments all have to agree; a base path is
++     * matched on a segment boundary, so a sibling that merely shares a prefix does not
++     * count as being inside it.
++     *
++     * @param string $url
++     * @param string $baseUrl
++     * @return bool
++     */
++    public static function isWithinBaseUrl(string $url, string $baseUrl): bool
++    {
++        $parts = parse_url($url);
++        $base = parse_url($baseUrl);
++
++        if (!is_array($parts) || !is_array($base) || empty($parts['host']) || empty($base['host'])) {
++            return false;
++        }
++
++        $scheme = strtolower($parts['scheme'] ?? '');
++        if (!in_array($scheme, self::ALLOWED_SCHEMES, true) || $scheme !== strtolower($base['scheme'] ?? '')) {
++            return false;
++        }
++
++        if (strtolower(trim($parts['host'], '[]')) !== strtolower(trim($base['host'], '[]'))) {
++            return false;
++        }
++
++        $defaultPort = $scheme === 'https' ? 443 : 80;
++        if ((int)($parts['port'] ?? $defaultPort) !== (int)($base['port'] ?? $defaultPort)) {
++            return false;
++        }
++
++        $basePath = rtrim($base['path'] ?? '', '/');
++        $path = $parts['path'] ?? '/';
++
++        return $path === $basePath || str_starts_with($path, $basePath . '/');
++    }
++
++    /**
++     * Returns whether the given IP address is a public destination.
++     *
++     * @param string $address
++     * @return bool
++     */
++    public static function isPublicAddress(string $address): bool
++    {
++        if (filter_var($address, FILTER_VALIDATE_IP) === false) {
++            return false;
++        }
++
++        foreach (self::BLOCKED_RANGES as $range) {
++            [$network, $prefix] = explode('/', $range, 2);
++            if (self::isInRange($address, $network, (int)$prefix)) {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
++    /**
++     * Returns every address the given host name resolves to.
++     *
++     * @param string $host
++     * @return string[]
++     */
++    private static function resolveHost(string $host): array
++    {
++        $addresses = [];
++
++        $ipv4 = @gethostbynamel($host);
++        if (is_array($ipv4)) {
++            $addresses = $ipv4;
++        }
++
++        // An IPv6 answer only matters when there is no IPv4 answer; with an IPv4 address
++        // to pin, the connection cannot end up using a different record.
++        if ($addresses === [] && function_exists('dns_get_record')) {
++            $records = @dns_get_record($host, DNS_AAAA);
++            if (is_array($records)) {
++                foreach ($records as $record) {
++                    if (!empty($record['ipv6'])) {
++                        $addresses[] = $record['ipv6'];
++                    }
++                }
++            }
++        }
++
++        return array_values(array_unique($addresses));
++    }
++
++    /**
++     * Returns the CURLOPT_RESOLVE entry for a host, port and address.
++     *
++     * @param string $host
++     * @param int $port
++     * @param string $address
++     * @return string
++     */
++    private static function resolveEntry(string $host, int $port, string $address): string
++    {
++        if (str_contains($address, ':')) {
++            $address = "[$address]";
++        }
++
++        return "$host:$port:$address";
++    }
++
++    /**
++     * Returns whether the given address falls inside the given CIDR range.
++     *
++     * @param string $address
++     * @param string $network
++     * @param int $prefix
++     * @return bool
++     */
++    private static function isInRange(string $address, string $network, int $prefix): bool
++    {
++        $addressBytes = @inet_pton($address);
++        $networkBytes = @inet_pton($network);
++
++        if ($addressBytes === false || $networkBytes === false || strlen($addressBytes) !== strlen($networkBytes)) {
++            return false;
++        }
++
++        $wholeBytes = intdiv($prefix, 8);
++        if ($wholeBytes > 0 && strncmp($addressBytes, $networkBytes, $wholeBytes) !== 0) {
++            return false;
++        }
++
++        $remainingBits = $prefix % 8;
++        if ($remainingBits === 0) {
++            return true;
++        }
++
++        $mask = (0xff << (8 - $remainingBits)) & 0xff;
++
++        return (ord($addressBytes[$wholeBytes]) & $mask) === (ord($networkBytes[$wholeBytes]) & $mask);
++    }
++}

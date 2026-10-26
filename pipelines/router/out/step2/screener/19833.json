@@ -1,0 +1,129 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "19833",
+  "advisory_ids": ["GHSA-XCW9-QMMF-VQXJ", "CVE-2026-62286", "GO-2026-6592"],
+  "repo": "amir20/dozzle",
+  "pinned_commit": "b38117bfaecabf4ade318b93ff06269dbde273e9",
+  "fix_commits": ["19c01e0fb491c170796edba3da2692562c204e77"],
+  "trust_decision": {
+    "summary": "Dozzle's label filter (per-user user.ContainerLabels, else the global --filter) is what decides which containers a caller may observe; at the pinned commit it is applied on the list/find paths but not on the GET /api/events/stream consumer, which forwards every container's stat, lifecycle, update and health payloads regardless of the caller's labels.",
+    "evidence": [
+      "internal/web/events.go:31-39",
+      "internal/web/events.go:63-67",
+      "internal/web/events.go:74-88",
+      "internal/web/events.go:90-108",
+      "internal/container/container_store.go:236-251",
+      "internal/auth/users.go:188-223"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/web/events.go:63-67",
+    "why": "The summary names the statistics stream, so the stat case is the first place an engineer looks; the same handler then forwards the unfiltered lifecycle, update and health branches at :68-108."
+  },
+  "fix_sites": [
+    {"where": "internal/web/events.go:63-67", "entry_point": "GET /api/events/stream (container-stat channel)", "module_kind": "HTTP handler / SSE consumer"},
+    {"where": "internal/web/events.go:74-88", "entry_point": "GET /api/events/stream (container-event channel, plus the containers-changed refresh on start/rename)", "module_kind": "HTTP handler / SSE consumer"},
+    {"where": "internal/web/events.go:90-94", "entry_point": "GET /api/events/stream (container-updated channel)", "module_kind": "HTTP handler / SSE consumer"},
+    {"where": "internal/web/events.go:95-108", "entry_point": "GET /api/events/stream (container-health channel)", "module_kind": "HTTP handler / SSE consumer"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "MCP is an opt-in, server-wide integration (--enable-mcp defaults to false, docs/guide/mcp.md:12) whose documented job is to list all containers across all hosts (docs/guide/mcp.md:40), so a solver can argue per-user label filters were never part of that surface.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Stats for containers the caller may see must keep flowing even though a ContainerStat carries only an ID and metrics and no Host field; an over-broad fix that gates stats on the event's host map drops the whole container-stat channel, which is why the published fix needs an empty-host fallback that scans every host (fix.diff:92-99). The initial containers-changed payload for visible containers must likewise still be emitted.",
+    "where": "internal/container/types.go:206-215"
+  },
+  "O6_input_shapes": [
+    "stat payload with no host field (only id plus cpu/memory/network/disk numbers), so identity must be matched by ID across all hosts",
+    "lifecycle event carrying host and actorId (start, die, destroy, rename, pause, unpause), where both fields must agree",
+    "update event carrying a full *container.Container that may be nil",
+    "health_status event whose identity lives only in actorId while the payload is built locally",
+    "per-host containers-changed refresh list produced by ListContainersForHost with the caller's labels, which must also refresh the visible set",
+    "multi-host fan-in: the same container ID can exist on two hosts, so an ID-only fallback has to scan every host"
+  ],
+  "O7_producer": {"kind": "cache", "where": "internal/container/container_store.go:261-294", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "GET /api/mcp: the MCP tools list_containers (internal/mcp/server.go:105) and get_container_stats (internal/mcp/server.go:324-358) call the host service with the server-wide h.config.Labels handed in at internal/web/routes.go:222 and never with the caller's ContainerLabels, so a label-restricted authenticated user can enumerate other containers and read their stats history.",
+      "where": "internal/mcp/server.go:324",
+      "reason_to_dismiss": "MCP is disabled by default, is described as a server-wide 'list all containers across all hosts' integration, and its docs never mention filters, so it looks like a separate surface rather than a user view.",
+      "distance": "internal/web/events.go -> internal/web/routes.go:221-224 wiring -> internal/mcp/server.go, a separate package (2 files, 1 package boundary)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "POST /api/notifications/preview: previewExpression matches containers fetched with container.ContainerLabels{} (no user filter) and returns matchedContainers (full container.Container including its stats ring buffer, internal/container/types.go:28) plus matchedLogs to any authenticated caller.",
+      "where": "internal/web/notifications.go:572",
+      "reason_to_dismiss": "Notification rules are an authoring/test surface for administrators rather than a container view; the endpoint only exists to preview expressions.",
+      "distance": "same package internal/web, 3 files from the landing point (registered at internal/web/routes.go:205)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "GET /api/debug/store: debugStore lists every container on every host with container.ContainerLabels{} and returns them as JSON, bypassing both the global filter and the caller's labels.",
+      "where": "internal/web/debug.go:13",
+      "reason_to_dismiss": "Debug-only route, mounted only when debug logging is enabled at startup (internal/web/routes.go:186-188), so it reads as a diagnostic tool, not a user surface.",
+      "distance": "same package internal/web, 2 files from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "internal/web/events.go:56-113",
+      "sibling": "A sixth channel added to the same select (e.g. container-mount or an update-progress event) that forwards a Container or an ID payload without consulting the visible set.",
+      "why_realistic": "The handler already forwards five differently shaped channels and the frontend subscribes to each named event (assets/stores/container.ts:58-67); new stream events are added there feature by feature."
+    },
+    {
+      "where": "internal/mcp/server.go:76-100",
+      "sibling": "A new MCP tool (get_container_events, stream_stats, search_logs) registered with the same s.labels field.",
+      "why_realistic": "All four existing tools pass s.labels and tools are added one at a time; nothing in tool registration can see the requesting user."
+    },
+    {
+      "where": "internal/web/logs.go:340-345",
+      "sibling": "A new log or stat stream route whose per-container filter closure is built from h.config.Labels instead of h.resolveLabels(r).",
+      "why_realistic": "streamHostLogs and streamHostGroupLogs already build ad-hoc filter closures passed to streamLogsForContainers; copying one and using h.config.Labels compiles and looks right."
+    },
+    {
+      "where": "internal/web/notifications.go:572",
+      "sibling": "Another preview or diagnostic endpoint that lists containers with an empty ContainerLabels to show what a rule would match.",
+      "why_realistic": "Preview code needs containers regardless of who is asking, and the empty-filter idiom already appears twice in the tree (internal/web/notifications.go:572, internal/web/debug.go:13)."
+    }
+  ],
+  "O9_family": "authorization / information exposure (CWE-285 improper authorization, CWE-200 exposure of container telemetry)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go 1.26.4",
+    "toolchain": "go + make; `make test` runs fake_assets and generate (openssl certs, protoc for pb regeneration) then `go test -cover -race -count 1 -timeout 40s ./...`; pnpm is only needed for the real dist build, fake_assets stubs dist/index.html",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "internal/web/events_test.go drives CreateServer with a mocked Docker client (routes_test.go MockedClient) and asserts abide snapshots in internal/web/__snapshots__/web.snapshot; internal/mcp/server_test.go exercises the MCP host service. No Docker daemon, GPU or network needed for the events/stream tests."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/web/events.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Filter only the container-event payload against a per-request ListContainersForHost set and key everything by the event's host, which leaves container-stat, container-updated and container-health open and silently drops every stat because ContainerStat carries no host."
+  },
+  "out_of_scope_notes": [
+    "internal/docker/stats_collector.go:104,131: the collector lists with its own labels but starts a stats stream for any 'start' event without re-checking them, so unfiltered stats are produced upstream of the web layer (recorded as the sink's producer, not pursued as a separate user route).",
+    "internal/web/download.go:31-35 dereferences auth.UserFromContext output without a nil check inside the authenticated group; a possible nil-pointer panic under simple auth, unrelated to this advisory, not pursued.",
+    "internal/agent/server.go:82,105,132 resolve containers with an empty ContainerLabels on the agent gRPC port; that port is a trusted internal boundary and the main instance resolves visibility before the call, so it was not pursued."
+  ],
+  "unverified": [
+    "Repo size in MB (no shell available in this session; repo_mb left null).",
+    "Reachability of /api/mcp and /api/notifications/preview for a label-restricted user was inferred from internal/web/routes.go:148-224 and internal/auth/users.go:188-223, not executed.",
+    "Whether the Dozzle UI hides /api/notifications/preview from non-admin users (no role check exists in the handler; UI gating was not inspected).",
+    "present_in_latest for the O8 routes: no latest release tree was supplied."
+  ]
+}

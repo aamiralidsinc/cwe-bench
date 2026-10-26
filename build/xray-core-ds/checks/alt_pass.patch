@@ -1,0 +1,119 @@
+diff --git a/app/dns/nameserver_doh.go b/app/dns/nameserver_doh.go
+index f2c3eb6..a2db07c 100644
+--- a/app/dns/nameserver_doh.go
++++ b/app/dns/nameserver_doh.go
+@@ -111,7 +111,17 @@ func NewDoHNameServer(url *url.URL, dispatcher routing.Dispatcher, h2c bool, dis
+ 					if len(s.pinnedPeerCertSha256) > 0 {
+ 						utlsConfig.InsecureSkipVerify = true
+ 						utlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+-							return verifyPinnedPeerChain(rawCerts, s.pinnedPeerCertSha256)
++							if err := verifyPinnedPeerChain(rawCerts, s.pinnedPeerCertSha256); err != nil {
++								return err
++							}
++							if len(rawCerts) == 0 {
++								return errors.New("no peer certificates")
++							}
++							leaf, err := x509.ParseCertificate(rawCerts[0])
++							if err != nil {
++								return err
++							}
++							return leaf.VerifyHostname(url.Hostname())
+ 						}
+ 					}
+ 					conn = utls.UClient(conn, utlsConfig, utls.HelloChrome_Auto)
+diff --git a/transport/internet/finalmask/realm/http.go b/transport/internet/finalmask/realm/http.go
+index 2f58ee8..aaae22d 100644
+--- a/transport/internet/finalmask/realm/http.go
++++ b/transport/internet/finalmask/realm/http.go
+@@ -14,6 +14,7 @@ import (
+ 	"net/url"
+ 	"strings"
+ 
++	xnet "github.com/xtls/xray-core/common/net"
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+ )
+ 
+@@ -85,7 +86,7 @@ func NewClient(scheme, host, port, token string, tlsConfig *tls.Config) *Client
+ 	client := http.DefaultClient
+ 	if tlsConfig != nil {
+ 		tr := http.DefaultTransport.(*http.Transport).Clone()
+-		tr.TLSClientConfig = tlsConfig.GetTLSConfig()
++		tr.TLSClientConfig = tlsConfig.GetTLSConfig(tls.WithDestination(xnet.TCPDestination(xnet.ParseAddress(host), xnet.Port(0))))
+ 		client = &http.Client{Transport: tr}
+ 	}
+ 	return &Client{
+diff --git a/transport/internet/grpc/dial.go b/transport/internet/grpc/dial.go
+index 4883f30..a54d7c0 100644
+--- a/transport/internet/grpc/dial.go
++++ b/transport/internet/grpc/dial.go
+@@ -136,10 +136,7 @@ func getGrpcClient(ctx context.Context, dest net.Destination, streamSettings *in
+ 				}
+ 
+ 				if tlsConfig != nil {
+-					config := tlsConfig.GetTLSConfig()
+-					if config.ServerName == "" && address.Family().IsDomain() {
+-						config.ServerName = address.Domain()
+-					}
++					config := tlsConfig.GetTLSConfig(tls.WithDestination(dest))
+ 					if fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint); fingerprint != nil {
+ 						return tls.UClient(c, config, fingerprint), nil
+ 					} else { // Fallback to normal gRPC TLS
+diff --git a/transport/internet/hysteria/dialer.go b/transport/internet/hysteria/dialer.go
+index a928cac..ed7dd4b 100644
+--- a/transport/internet/hysteria/dialer.go
++++ b/transport/internet/hysteria/dialer.go
+@@ -345,7 +345,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
+ 			c = &client{
+ 				dest:           dest,
+ 				config:         streamSettings.ProtocolSettings.(*Config),
+-				tlsConfig:      tlsConfig.GetTLSConfig(),
++				tlsConfig:      tlsConfig.GetTLSConfig(tls.WithDestination(dest)),
+ 				socketConfig:   streamSettings.SocketSettings,
+ 				udpmaskManager: streamSettings.UdpmaskManager,
+ 				quicParams:     streamSettings.QuicParams,
+diff --git a/transport/internet/tcp/dialer.go b/transport/internet/tcp/dialer.go
+index f707648..1dd2fc0 100644
+--- a/transport/internet/tcp/dialer.go
++++ b/transport/internet/tcp/dialer.go
+@@ -38,7 +38,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
+ 		mitmAlpn11 := session.MitmAlpn11FromContext(ctx)
+ 		var tlsConfig *gotls.Config
+ 		if tls.IsFromMitm(config.ServerName) {
+-			tlsConfig = config.GetTLSConfig(tls.WithOverrideName(mitmServerName))
++			if mitmServerName == "" {
++				tlsConfig = config.GetTLSConfig(tls.WithDestination(dest))
++			} else {
++				tlsConfig = config.GetTLSConfig(tls.WithOverrideName(mitmServerName))
++			}
+ 		} else {
+ 			tlsConfig = config.GetCachedTLSConfig(dest)
+ 		}
+diff --git a/transport/internet/tls/cache.go b/transport/internet/tls/cache.go
+index 2bb84b4..c52196a 100644
+--- a/transport/internet/tls/cache.go
++++ b/transport/internet/tls/cache.go
+@@ -9,15 +9,21 @@ import (
+ 
+ // tlsConfigCache keeps the tls.Config built from a stream's TLS settings, so that the certificate
+ // pool does not have to be rebuilt for every connection.
+-var tlsConfigCache sync.Map // map[*Config]*gotls.Config
++var tlsConfigCache sync.Map // map[tlsConfigCacheKey]*gotls.Config
++
++type tlsConfigCacheKey struct {
++	config *Config
++	name   string
++}
+ 
+ // GetCachedTLSConfig returns the tls.Config for these settings, building it on first use. The
+ // destination is used as the server name when the settings do not override it.
+ func (c *Config) GetCachedTLSConfig(dest net.Destination) *gotls.Config {
+-	if cached, found := tlsConfigCache.Load(c); found {
++	key := tlsConfigCacheKey{config: c, name: dest.Address.String()}
++	if cached, found := tlsConfigCache.Load(key); found {
+ 		return cached.(*gotls.Config)
+ 	}
+ 	config := c.GetTLSConfig(WithDestination(dest))
+-	actual, _ := tlsConfigCache.LoadOrStore(c, config)
++	actual, _ := tlsConfigCache.LoadOrStore(key, config)
+ 	return actual.(*gotls.Config)
+ }

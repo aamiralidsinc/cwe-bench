@@ -1,0 +1,196 @@
+diff --git a/glances/config.py b/glances/config.py
+index e789d0d..0040194 100644
+--- a/glances/config.py
++++ b/glances/config.py
+@@ -24,12 +24,64 @@ _SECURE_BLOCKED_SECTIONS = frozenset(
+     }
+ )
+ 
+-# Key name patterns redacted in any section
++# Key name patterns redacted in any section.
++# A login name is a credential too. The `user` pattern only matches a standalone
++# `user` or a name ending in `_user`, so the CPU/load `user_careful`,
++# `user_warning`... thresholds stay visible.
+ _SECURE_SENSITIVE_KEY_RE = re.compile(
+-    r"password|token|secret|api_key|apikey|ssl_keyfile",
++    r"password|token|secret|api_key|apikey|ssl_keyfile|username|login|(?:^|_)user$",
+     re.IGNORECASE,
+ )
+ 
++# Credentials embedded in an URL value (scheme://user:password@host)
++_SECURE_URL_CREDENTIALS_RE = re.compile(r"(?<=://)[^/?#@\s]+@")
++
++
++def secure_option(key, value):
++    """Return the sanitised value of a configuration option or a command line argument.
++
++    A sensitive key is fully redacted, otherwise only the credentials embedded in
++    an URL value are redacted. Non string values (boolean flags, ports, refresh
++    rates...) can not carry a credential and are returned as is.
++    """
++    if not isinstance(value, str):
++        return value
++    if _SECURE_SENSITIVE_KEY_RE.search(key):
++        return "********"
++    return _SECURE_URL_CREDENTIALS_RE.sub("********@", value)
++
++
++def secure_value(value):
++    """Return a copy of a value with URL credentials redacted, at any depth.
++
++    Values are reproduced as they are (numbers, booleans, None...), lists and
++    dictionaries are walked so a credential nested inside a structure is removed.
++    """
++    if isinstance(value, str):
++        return _SECURE_URL_CREDENTIALS_RE.sub("********@", value)
++    if isinstance(value, list):
++        return [secure_value(item) for item in value]
++    if isinstance(value, dict):
++        return {key: secure_value(item) for key, item in value.items()}
++    if isinstance(value, tuple):
++        return tuple(secure_value(item) for item in value)
++    return value
++
++
++def secure_mapping(values):
++    """Return a copy of a name/value mapping with credentials removed.
++
++    A sensitive name is fully redacted whatever the value type (some mappings store
++    the configuration as lists). Other values keep their type; URLs lose their
++    user information.
++    """
++    return {
++        key: "********"
++        if isinstance(key, str) and _SECURE_SENSITIVE_KEY_RE.search(key)
++        else secure_value(value)
++        for key, value in values.items()
++    }
++
+ 
+ def user_config_dir():
+     r"""Return a list of per-user config dir (full path).
+@@ -311,9 +363,7 @@ class Config:
+         for section, options in self.as_dict().items():
+             if section in _SECURE_BLOCKED_SECTIONS:
+                 continue
+-            sanitized[section] = {
+-                key: "********" if _SECURE_SENSITIVE_KEY_RE.search(key) else value for key, value in options.items()
+-            }
++            sanitized[section] = secure_mapping(options)
+         return sanitized
+ 
+     def sections(self):
+diff --git a/glances/outputs/glances_restful_api.py b/glances/outputs/glances_restful_api.py
+index 6059206..2c32d61 100644
+--- a/glances/outputs/glances_restful_api.py
++++ b/glances/outputs/glances_restful_api.py
+@@ -17,6 +17,7 @@ from typing import Annotated, Any
+ from urllib.parse import urljoin
+ 
+ from glances import __apiversion__, __version__
++from glances.config import secure_mapping, secure_option, secure_value
+ from glances.events_list import glances_events
+ from glances.globals import json_dumps
+ from glances.logger import logger
+@@ -969,20 +970,9 @@ class GlancesRestfulApi:
+ 
+         return GlancesJSONResponse(self._sanitize_limits(limits))
+ 
+-    # Limit keys that must not be exposed by the read-only API
+-    _SENSITIVE_LIMIT_KEYS = ('password', 'token', 'secret', 'api_key', 'apikey', 'ssl_keyfile')
+-
+     def _sanitize_limits(self, limits):
+-        """Return a copy of the limits with credential bearing keys masked."""
+-        sanitized = {}
+-        for plugin, values in limits.items():
+-            sanitized[plugin] = {
+-                key: '********'
+-                if any(pattern in key.lower() for pattern in self._SENSITIVE_LIMIT_KEYS)
+-                else value
+-                for key, value in values.items()
+-            }
+-        return sanitized
++        """Return a copy of the limits with credentials removed."""
++        return {plugin: secure_mapping(values) for plugin, values in limits.items()}
+ 
+     def _api_all_views(self):
+         """Glances API RESTful implementation.
+@@ -1019,7 +1009,7 @@ class GlancesRestfulApi:
+         except Exception as e:
+             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Cannot get plugin {plugin} ({str(e)})")
+ 
+-        return GlancesJSONResponse(statval)
++        return GlancesJSONResponse(secure_value(statval))
+ 
+     def _check_if_plugin_available(self, plugin: str) -> None:
+         if plugin in self.plugins_list:
+@@ -1093,10 +1083,7 @@ class GlancesRestfulApi:
+         except Exception as e:
+             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Cannot get limits for plugin {plugin} ({str(e)})")
+ 
+-        return GlancesJSONResponse(ret)
+-
+-    # Plugin setting keys that must not be exposed by the read-only API
+-    _SENSITIVE_SETTING_KEYS = ('password', 'token', 'secret', 'api_key', 'apikey', 'ssl_keyfile')
++        return GlancesJSONResponse(secure_mapping(ret))
+ 
+     def _api_plugin_settings(self, plugin: str):
+         """Glances API RESTful implementation.
+@@ -1110,16 +1097,11 @@ class GlancesRestfulApi:
+ 
+         try:
+             # Get the configuration options of the plugin
+-            settings = {}
+-            if self.config.has_section(plugin):
+-                for key, value in self.config.items(plugin):
+-                    if any(pattern in key.lower() for pattern in self._SENSITIVE_SETTING_KEYS):
+-                        value = '********'
+-                    settings[key] = value
++            settings = dict(self.config.items(plugin)) if self.config.has_section(plugin) else {}
+         except Exception as e:
+             raise HTTPException(status.HTTP_404_NOT_FOUND, f"Cannot get settings for plugin {plugin} ({str(e)})")
+ 
+-        return GlancesJSONResponse(settings)
++        return GlancesJSONResponse(secure_mapping(settings))
+ 
+     def _api_views(self, plugin: str):
+         """Glances API RESTful implementation.
+@@ -1331,6 +1313,7 @@ class GlancesRestfulApi:
+         HTTP/200 if OK
+         HTTP/404 if others error
+         """
++        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, 'internal error')
+         try:
+             # Get the RAW value of the config' dict
+             args_json = self.config.as_dict() if self.args.password else self.config.as_dict_secure()
+@@ -1347,6 +1330,7 @@ class GlancesRestfulApi:
+         HTTP/400 if item is not found
+         HTTP/404 if others error
+         """
++        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, 'internal error')
+         config_dict = self.config.as_dict() if self.args.password else self.config.as_dict_secure()
+         if section not in config_dict:
+             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown configuration item {section}")
+@@ -1367,6 +1351,7 @@ class GlancesRestfulApi:
+         HTTP/400 if item is not found
+         HTTP/404 if others error
+         """
++        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, 'internal error')
+         config_dict = self.config.as_dict() if self.args.password else self.config.as_dict_secure()
+         if section not in config_dict:
+             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"Unknown configuration item {section}")
+@@ -1407,12 +1392,14 @@ class GlancesRestfulApi:
+ 
+         - password hash is always redacted (even for authenticated users)
+         - other sensitive fields are redacted when no authentication is configured
++        - credentials embedded in an URL value are redacted
+         """
+         args_json = vars(self.args).copy()
+         if not self.args.password:
+             for key in self._SENSITIVE_ARGS:
+                 if key in args_json:
+                     args_json[key] = '********'
++            args_json = {key: secure_option(key, value) for key, value in args_json.items()}
+         else:
+             for key in self._ALWAYS_REDACTED_ARGS:
+                 if key in args_json and args_json[key]:

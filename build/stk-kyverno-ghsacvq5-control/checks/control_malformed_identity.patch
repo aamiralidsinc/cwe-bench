@@ -1,0 +1,192 @@
+diff --git a/pkg/engine/apicall/apiCall.go b/pkg/engine/apicall/apiCall.go
+index dc7503b73..1b357c020 100644
+--- a/pkg/engine/apicall/apiCall.go
++++ b/pkg/engine/apicall/apiCall.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"path"
++	"strings"
+ 
+ 	"github.com/go-logr/logr"
+ 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+@@ -13,11 +15,12 @@ import (
+ )
+ 
+ type apiCall struct {
+-	logger   logr.Logger
+-	jp       jmespath.Interface
+-	entry    kyvernov1.ContextEntry
+-	jsonCtx  enginecontext.Interface
+-	executor Executor
++	logger          logr.Logger
++	jp              jmespath.Interface
++	entry           kyvernov1.ContextEntry
++	jsonCtx         enginecontext.Interface
++	executor        Executor
++	policyNamespace string
+ }
+ 
+ func New(
+@@ -27,7 +30,12 @@ func New(
+ 	jsonCtx enginecontext.Interface,
+ 	client ClientInterface,
+ 	apiCallConfig APICallConfiguration,
++	policyNamespaces ...string,
+ ) (*apiCall, error) {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	if entry.APICall == nil {
+ 		return nil, fmt.Errorf("missing APICall in context entry %v", entry)
+ 	}
+@@ -35,11 +43,12 @@ func New(
+ 	executor := NewExecutor(logger, entry.Name, client, apiCallConfig)
+ 
+ 	return &apiCall{
+-		logger:   logger,
+-		jp:       jp,
+-		entry:    entry,
+-		jsonCtx:  jsonCtx,
+-		executor: executor,
++		logger:          logger,
++		jp:              jp,
++		entry:           entry,
++		jsonCtx:         jsonCtx,
++		executor:        executor,
++		policyNamespace: policyNamespace,
+ 	}, nil
+ }
+ 
+@@ -62,6 +71,13 @@ func (a *apiCall) Fetch(ctx context.Context) ([]byte, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context entry %s %s: %v", a.entry.Name, a.entry.APICall.URLPath, err)
+ 	}
++	if a.policyNamespace != "" && call.APICall.URLPath != "" {
++		cleanPath := path.Clean(call.APICall.URLPath)
++		if !strings.Contains(cleanPath, "/namespaces/"+a.policyNamespace) {
++			return nil, fmt.Errorf("path %s does not target the policy namespace %s", cleanPath, a.policyNamespace)
++		}
++	}
++
+ 	data, err := a.Execute(ctx, &call.APICall)
+ 	if err != nil {
+ 		if data == nil && a.entry.APICall.Default != nil {
+diff --git a/pkg/engine/context/loaders/apicall.go b/pkg/engine/context/loaders/apicall.go
+index 6f09a22bc..81b59d1c2 100644
+--- a/pkg/engine/context/loaders/apicall.go
++++ b/pkg/engine/context/loaders/apicall.go
+@@ -13,14 +13,15 @@ import (
+ )
+ 
+ type apiLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	enginectx enginecontext.Interface
+-	jp        jmespath.Interface
+-	client    engineapi.RawClient
+-	config    apicall.APICallConfiguration
+-	data      []byte
++	ctx             context.Context //nolint:containedctx
++	logger          logr.Logger
++	entry           kyvernov1.ContextEntry
++	enginectx       enginecontext.Interface
++	jp              jmespath.Interface
++	client          engineapi.RawClient
++	config          apicall.APICallConfiguration
++	data            []byte
++	policyNamespace string
+ }
+ 
+ func NewAPILoader(
+@@ -31,15 +32,21 @@ func NewAPILoader(
+ 	jp jmespath.Interface,
+ 	client engineapi.RawClient,
+ 	apiCallConfig apicall.APICallConfiguration,
++	policyNamespaces ...string,
+ ) enginecontext.Loader {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	return &apiLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		enginectx: enginectx,
+-		jp:        jp,
+-		client:    client,
+-		config:    apiCallConfig,
++		ctx:             ctx,
++		logger:          logger,
++		entry:           entry,
++		enginectx:       enginectx,
++		jp:              jp,
++		client:          client,
++		config:          apiCallConfig,
++		policyNamespace: policyNamespace,
+ 	}
+ }
+ 
+@@ -48,7 +55,7 @@ func (a *apiLoader) HasLoaded() bool {
+ }
+ 
+ func (a *apiLoader) LoadData() error {
+-	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config)
++	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config, a.policyNamespace)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initiaize APICal: %w", err)
+ 	}
+diff --git a/pkg/engine/factories/contextloaderfactory.go b/pkg/engine/factories/contextloaderfactory.go
+index 606422303..2a4ddd2ba 100644
+--- a/pkg/engine/factories/contextloaderfactory.go
++++ b/pkg/engine/factories/contextloaderfactory.go
+@@ -18,7 +18,7 @@ import (
+ type ContextLoaderFactoryOptions func(*contextLoader)
+ 
+ func DefaultContextLoaderFactory(cmResolver engineapi.ConfigmapResolver, opts ...ContextLoaderFactoryOptions) engineapi.ContextLoaderFactory {
+-	return func(_ kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
++	return func(policy kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
+ 		cl := &contextLoader{
+ 			logger:     logging.WithName("DefaultContextLoaderFactory"),
+ 			cmResolver: cmResolver,
+@@ -26,6 +26,9 @@ func DefaultContextLoaderFactory(cmResolver engineapi.ConfigmapResolver, opts ..
+ 		for _, o := range opts {
+ 			o(cl)
+ 		}
++		if policy != nil && policy.IsNamespaced() {
++			cl.policyNamespace = policy.GetNamespace()
++		}
+ 		return cl
+ 	}
+ }
+@@ -49,11 +52,12 @@ func WithGlobalContextStore(gctxStore loaders.Store) ContextLoaderFactoryOptions
+ }
+ 
+ type contextLoader struct {
+-	logger        logr.Logger
+-	cmResolver    engineapi.ConfigmapResolver
+-	initializers  []engineapi.Initializer
+-	apiCallConfig apicall.APICallConfiguration
+-	gctxStore     loaders.Store
++	logger          logr.Logger
++	cmResolver      engineapi.ConfigmapResolver
++	initializers    []engineapi.Initializer
++	apiCallConfig   apicall.APICallConfiguration
++	gctxStore       loaders.Store
++	policyNamespace string
+ }
+ 
+ func (l *contextLoader) Load(
+@@ -108,7 +112,7 @@ func (l *contextLoader) newLoader(
+ 		}
+ 	} else if entry.APICall != nil {
+ 		if client != nil {
+-			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig)
++			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig, l.policyNamespace)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of APICall context entry", "name", entry.Name)

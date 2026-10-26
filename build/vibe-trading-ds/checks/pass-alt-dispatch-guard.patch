@@ -1,0 +1,211 @@
+diff -ruN '--exclude=__pycache__' '--exclude=.git' inj/agent/api_server.py pt_pass-alt-dispatch-guard/agent/api_server.py
+--- a/agent/api_server.py	2026-10-21 20:24:08.051051411 +0000
++++ b/agent/api_server.py	2026-10-21 20:31:00.726676241 +0000
+@@ -25,6 +25,7 @@
+ from fastapi.middleware.cors import CORSMiddleware
+ from rich.console import Console
+ 
++from src.tools.path_utils import safe_path
+ from src.ui_services import build_run_analysis, load_run_context
+ 
+ # UTF-8 on Windows
+@@ -755,7 +756,10 @@
+     Returns:
+         Map filename -> source text.
+     """
+-    run_dir = RUNS_DIR / run_id / "code"
++    try:
++        run_dir = safe_path(run_id, RUNS_DIR) / "code"
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="invalid run id") from exc
+     if not run_dir.exists():
+         raise HTTPException(status_code=404, detail=f"Code directory for run {run_id} not found")
+     result = {}
+@@ -776,7 +780,10 @@
+     Returns:
+         Object with pine script content and exists flag.
+     """
+-    pine_path = RUNS_DIR / run_id / "artifacts" / "strategy.pine"
++    try:
++        pine_path = safe_path(run_id, RUNS_DIR) / "artifacts" / "strategy.pine"
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="invalid run id") from exc
+     if not pine_path.exists():
+         return {"exists": False, "content": None}
+     return {
+@@ -788,7 +795,10 @@
+ @app.get("/runs/{run_id}", response_model=RunResponse)
+ async def get_run_result(run_id: str):
+     """Fetch full details for a historical run by ``run_id``."""
+-    run_dir = RUNS_DIR / run_id
++    try:
++        run_dir = safe_path(run_id, RUNS_DIR)
++    except ValueError as exc:
++        raise HTTPException(status_code=400, detail="invalid run id") from exc
+ 
+     if not run_dir.exists():
+         raise HTTPException(
+@@ -1407,7 +1417,18 @@
+     that path back here to show the document before the user asks the agent
+     to analyse it.
+     """
+-    target = Path(path)
++    from pathlib import Path as _P
++    import os as _os
++    resolved = _P(path).expanduser().resolve()
++    _agent = _P(__file__).resolve().parent
++    _roots = [_agent / "uploads", _agent / "runs", _agent / "src" / "skills"]
++    for _item in _os.getenv("VIBE_TRADING_ALLOWED_FILE_ROOTS", "").split(","):
++        _item = _item.strip()
++        if _item:
++            _roots.append(_P(_item).expanduser())
++    if not any(resolved == _r.resolve() or resolved.is_relative_to(_r.resolve()) for _r in _roots):
++        raise HTTPException(status_code=400, detail=f"Stored file outside allowed areas: {path}")
++    target = _P(path)
+     if not target.exists() or not target.is_file():
+         raise HTTPException(status_code=404, detail=f"Stored file not found: {path}")
+     media_type = "application/pdf" if target.suffix.lower() == ".pdf" else "application/octet-stream"
+diff -ruN '--exclude=__pycache__' '--exclude=.git' inj/agent/src/agent/skills.py pt_pass-alt-dispatch-guard/agent/src/agent/skills.py
+--- a/agent/src/agent/skills.py	2026-10-21 20:24:08.051051411 +0000
++++ b/agent/src/agent/skills.py	2026-10-21 20:30:50.782685283 +0000
+@@ -44,7 +44,10 @@
+         """
+         if not self.dir_path:
+             return None
+-        path = self.dir_path / filename
++        base = self.dir_path.resolve()
++        path = (base / filename).resolve()
++        if not path.is_relative_to(base):
++            return None
+         if not path.exists():
+             return None
+         try:
+diff -ruN '--exclude=__pycache__' '--exclude=.git' inj/agent/src/agent/tools.py pt_pass-alt-dispatch-guard/agent/src/agent/tools.py
+--- a/agent/src/agent/tools.py	2026-10-17 06:25:18.000000000 +0000
++++ b/agent/src/agent/tools.py	2026-10-21 20:30:50.782685283 +0000
+@@ -10,6 +10,51 @@
+ from typing import Any, Dict, List, Optional
+ 
+ 
++_FILE_ARGS = ("file_path", "journal_path", "factor_csv", "return_csv")
++_DIR_ARGS = ("run_dir", "output_dir")
++
++
++def _agent_dir():
++    from pathlib import Path
++    return Path(__file__).resolve().parents[2]
++
++
++def _roots(env_name, defaults):
++    import os
++    from pathlib import Path
++    roots = [d.resolve() for d in defaults]
++    for item in os.getenv(env_name, "").split(","):
++        item = item.strip()
++        if item:
++            roots.append(Path(item).expanduser().resolve())
++    return roots
++
++
++def _check_path_args(params):
++    """Return an error message when a path argument leaves the allowed areas."""
++    from pathlib import Path
++    agent = _agent_dir()
++    run_roots = _roots("", [agent / "runs"])
++    file_roots = _roots("VIBE_TRADING_ALLOWED_FILE_ROOTS", [agent / "uploads", agent / "runs"])
++    for key in _FILE_ARGS + _DIR_ARGS:
++        raw = params.get(key)
++        if raw is None or raw == "":
++            continue
++        text = str(raw)
++        if text.startswith(("//", "\\\\")):
++            return f"{key}: UNC paths are not allowed"
++        resolved = Path(text).expanduser().resolve()
++        allowed = run_roots if key in _DIR_ARGS else file_roots
++        if not any(resolved == r or resolved.is_relative_to(r) for r in allowed):
++            return f"{key} {text!r} is outside the allowed areas"
++    skill_file = params.get("file")
++    if skill_file:
++        text = str(skill_file)
++        if Path(text).is_absolute() or ".." in Path(text).parts:
++            return f"file {text!r} is outside the skill directory"
++    return None
++
++
+ class BaseTool(ABC):
+     """Tool base class.
+ 
+@@ -74,6 +119,9 @@
+         tool = self._tools.get(name)
+         if not tool:
+             return json.dumps({"status": "error", "error": f"Tool '{name}' not found"}, ensure_ascii=False)
++        problem = _check_path_args(params)
++        if problem:
++            return json.dumps({"status": "error", "tool": name, "error": problem}, ensure_ascii=False)
+         try:
+             return tool.execute(**params)
+         except Exception as exc:
+diff -ruN '--exclude=__pycache__' '--exclude=.git' inj/agent/src/tools/backtest_tool.py pt_pass-alt-dispatch-guard/agent/src/tools/backtest_tool.py
+--- a/agent/src/tools/backtest_tool.py	2026-10-21 20:24:08.051051411 +0000
++++ b/agent/src/tools/backtest_tool.py	2026-10-21 20:30:50.786685279 +0000
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ from pathlib import Path
+ 
+ import pandas as pd
+@@ -51,6 +52,17 @@
+         data_path = Path(str(local_data))
+         if not data_path.is_absolute():
+             data_path = run_path / data_path
++        _agent = Path(__file__).resolve().parents[2]
++        _roots = [_agent / "runs", _agent / "uploads"]
++        for _item in os.getenv("VIBE_TRADING_ALLOWED_FILE_ROOTS", "").split(","):
++            _item = _item.strip()
++            if _item:
++                _roots.append(Path(_item).expanduser())
++        if not any(data_path.resolve().is_relative_to(_r.resolve()) for _r in _roots):
++            return json.dumps(
++                {"status": "error", "error": f"local_data_file: {local_data!r} is outside the allowed areas"},
++                ensure_ascii=False,
++            )
+         try:
+             frame = pd.read_csv(data_path)
+         except Exception as exc:
+diff -ruN '--exclude=__pycache__' '--exclude=.git' inj/agent/src/tools/shadow_account_tool.py pt_pass-alt-dispatch-guard/agent/src/tools/shadow_account_tool.py
+--- a/agent/src/tools/shadow_account_tool.py	2026-10-21 20:24:16.143044055 +0000
++++ b/agent/src/tools/shadow_account_tool.py	2026-10-21 20:31:00.718676248 +0000
+@@ -183,9 +183,12 @@
+             journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
+         except ValueError as exc:
+             return _err(str(exc))
+-        if journal_path is None:
+-            # Reuse the journal recorded with the profile for attribution.
+-            journal_path = profile.journal_path or None
++        if journal_path is None and profile.journal_path:
++            # Reuse the journal recorded with the profile, re-checked at use.
++            try:
++                journal_path = _validate_optional_journal_path(profile.journal_path)
++            except ValueError as exc:
++                return _err(str(exc))
+         try:
+             result = run_shadow_backtest(
+                 profile,
+@@ -251,9 +254,12 @@
+             journal_path = _validate_optional_journal_path(kwargs.get("journal_path"))
+         except ValueError as exc:
+             return _err(str(exc))
+-        if journal_path is None:
+-            # Reuse the journal recorded with the profile for attribution.
+-            journal_path = profile.journal_path or None
++        if journal_path is None and profile.journal_path:
++            # Reuse the journal recorded with the profile, re-checked at use.
++            try:
++                journal_path = _validate_optional_journal_path(profile.journal_path)
++            except ValueError as exc:
++                return _err(str(exc))
+ 
+         result = load_cached_result(profile.shadow_id)
+         if result is None:

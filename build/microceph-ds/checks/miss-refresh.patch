@@ -1,0 +1,232 @@
+diff -ruN injected/microceph/api/cluster.go variants/miss-refresh/microceph/api/cluster.go
+--- a/microceph/api/cluster.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/api/cluster.go	2026-10-24 04:46:43.018934305 +0000
+@@ -4,7 +4,6 @@
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
+-	"regexp"
+ 
+ 	"github.com/canonical/microceph/microceph/api/types"
+ 	"github.com/canonical/microceph/microceph/ceph"
+@@ -30,9 +29,8 @@
+ 	}
+ 
+ 	// Check that the cluster name is conformant.
+-	isOk, err := regexp.MatchString(constants.ClusterNameRegex, req.RemoteName)
+-	if err != nil || !isOk {
+-		err := fmt.Errorf("cluster names can only have [a-z] or [0-9] characters: %w", err)
++	if !constants.IsValidClusterName(req.RemoteName) {
++		err := fmt.Errorf("cluster names can only have [a-z] or [0-9] characters")
+ 		logger.Error(err.Error())
+ 		return mcTypes.BadRequest(err)
+ 	}
+diff -ruN injected/microceph/api/remote.go variants/miss-refresh/microceph/api/remote.go
+--- a/microceph/api/remote.go	2026-10-24 04:39:31.651328925 +0000
++++ b/microceph/api/remote.go	2026-10-24 04:46:43.018934305 +0000
+@@ -45,6 +45,16 @@
+ 		return mcTypes.InternalError(err)
+ 	}
+ 
++	remoteName, err := url.PathUnescape(mux.Vars(r)["name"])
++	if err != nil {
++		return mcTypes.BadRequest(err)
++	}
++
++	err = validateRemoteImportRequest(remoteName, req)
++	if err != nil {
++		return mcTypes.BadRequest(err)
++	}
++
+ 	err = renderConfAndKeyringFiles(req.Name, req.LocalName, req.Config)
+ 	if err != nil {
+ 		return mcTypes.InternalError(fmt.Errorf("couldn't render files: %w", err))
+@@ -84,6 +94,13 @@
+ 		return mcTypes.InternalError(err)
+ 	}
+ 
++	if remoteName != "" {
++		err = validateRemoteName(remoteName)
++		if err != nil {
++			return mcTypes.BadRequest(err)
++		}
++	}
++
+ 	remotes, err := database.GetRemoteDb(r.Context(), state, remoteName)
+ 	if err != nil {
+ 		return mcTypes.SmartError(err)
+@@ -103,6 +120,11 @@
+ 		return mcTypes.BadRequest(err)
+ 	}
+ 
++	err = validateRemoteName(remoteName)
++	if err != nil {
++		return mcTypes.BadRequest(err)
++	}
++
+ 	if isRemoteConfigured(remoteName) {
+ 		return mcTypes.SmartError(fmt.Errorf("cannot remote remote(%s), disable RBD mirroring", remoteName))
+ 	}
+@@ -124,6 +146,42 @@
+ 
+ /*****************HELPER FUNCTIONS**************************/
+ 
++var reservedRemoteNames = map[string]struct{}{
++	"ceph":    {},
++	"ganesha": {},
++	"radosgw": {},
++}
++
++func validateRemoteName(name string) error {
++	if !constants.IsValidClusterName(name) {
++		return fmt.Errorf("remote names can only have [a-z] or [0-9] characters")
++	}
++
++	_, isReserved := reservedRemoteNames[name]
++	if isReserved {
++		return fmt.Errorf("remote name %q is reserved", name)
++	}
++
++	return nil
++}
++
++func validateRemoteImportRequest(routeName string, req types.RemoteImportRequest) error {
++	err := validateRemoteName(req.Name)
++	if err != nil {
++		return err
++	}
++
++	if routeName != req.Name {
++		return fmt.Errorf("remote name in URL %q does not match request body %q", routeName, req.Name)
++	}
++
++	if !constants.IsValidClusterName(req.LocalName) {
++		return fmt.Errorf("local names can only have [a-z] or [0-9] characters")
++	}
++
++	return nil
++}
++
+ func isRemoteConfigured(remoteName string) bool {
+ 	// check remote configured for RBD mirroring
+ 	return ceph.IsRemoteConfiguredForRbdMirror(remoteName)
+diff -ruN injected/microceph/api/remote_refresh.go variants/miss-refresh/microceph/api/remote_refresh.go
+--- a/microceph/api/remote_refresh.go	2026-10-24 04:39:28.499331805 +0000
++++ b/microceph/api/remote_refresh.go	2026-10-24 04:56:53.522403064 +0000
+@@ -53,6 +53,11 @@
+ 	}
+ 
+ 	for _, remoteName := range req.Names {
++		err = validateRemoteName(remoteName)
++		if err != nil {
++			return mcTypes.BadRequest(err)
++		}
++
+ 		err = database.DeleteRemoteDb(r.Context(), state, remoteName)
+ 		if err != nil {
+ 			return mcTypes.BadRequest(fmt.Errorf("failed to remove remote %q: %w", remoteName, err))
+diff -ruN injected/microceph/ceph/configwriter.go variants/miss-refresh/microceph/ceph/configwriter.go
+--- a/microceph/ceph/configwriter.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/ceph/configwriter.go	2026-10-24 04:56:53.514403070 +0000
+@@ -24,6 +24,14 @@
+ 	return filepath.Join(c.configDir, c.configFile)
+ }
+ 
++func (c *Config) validateConfigFile() error {
++	if !filepath.IsLocal(c.configFile) || filepath.Base(c.configFile) != c.configFile {
++		return fmt.Errorf("invalid config filename %q", c.configFile)
++	}
++
++	return nil
++}
++
+ // WriteConfig writes the configuration file given a data bag and a filemode
+ func (c *Config) WriteConfig(data map[string]any, mode int) error {
+ 	fd, err := os.OpenFile(c.GetPath(), os.O_CREATE|os.O_TRUNC|os.O_RDWR, os.FileMode(mode))
+diff -ruN injected/microceph/ceph/rbd_mirror.go variants/miss-refresh/microceph/ceph/rbd_mirror.go
+--- a/microceph/ceph/rbd_mirror.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/ceph/rbd_mirror.go	2026-10-24 04:46:43.018934305 +0000
+@@ -706,6 +706,10 @@
+ 
+ // writeRemotePeerToken writes the provided string to a newly created token file.
+ func writeRemotePeerToken(token string, remoteName string) error {
++	if !constants.IsValidClusterName(remoteName) {
++		return fmt.Errorf("remote names can only have [a-z] or [0-9] characters")
++	}
++
+ 	// create token Dir
+ 	tokenDirPath := filepath.Join(
+ 		constants.GetPathConst().ConfPath,
+@@ -729,6 +733,7 @@
+ 		logger.Errorf("REPRBD: %s", ne.Error())
+ 		return ne
+ 	}
++	defer file.Close()
+ 
+ 	// write to file
+ 	_, err = file.WriteString(token)
+diff -ruN injected/microceph/constants/constants.go variants/miss-refresh/microceph/constants/constants.go
+--- a/microceph/constants/constants.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/constants/constants.go	2026-10-24 04:46:43.018934305 +0000
+@@ -4,6 +4,7 @@
+ import (
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ )
+ 
+ // Constants for Size Constraints
+@@ -89,5 +90,12 @@
+ 
+ // Regexes
+ 
+-// ClusterNameRegex is the regex for validating cluster names (a-z0-9)
+-const ClusterNameRegex = "^[a-z0-9]+$"
++// ClusterNameRegex is the regex for validating cluster names (a-z0-9, max 63 chars)
++const ClusterNameRegex = "^[a-z0-9]{1,63}$"
++
++var clusterNameRegex = regexp.MustCompile(ClusterNameRegex)
++
++// IsValidClusterName reports whether name is a valid cluster name.
++func IsValidClusterName(name string) bool {
++	return clusterNameRegex.MatchString(name)
++}
+diff -ruN injected/microceph/database/remote_extras.go variants/miss-refresh/microceph/database/remote_extras.go
+--- a/microceph/database/remote_extras.go	2026-10-24 04:21:19.000000000 +0000
++++ b/microceph/database/remote_extras.go	2026-10-24 04:46:43.018934305 +0000
+@@ -71,6 +71,20 @@
+ var DeleteRemoteDb = func(ctx context.Context, s mcTypes.State, remoteName string) error {
+ 	pathConst := constants.GetPathConst()
+ 
++	if !constants.IsValidClusterName(remoteName) {
++		return fmt.Errorf("invalid remote name %q", remoteName)
++	}
++
++	confFile := fmt.Sprintf("%s.conf", remoteName)
++	keyringFile := fmt.Sprintf("%s.keyring", remoteName)
++	if !filepath.IsLocal(confFile) || filepath.Base(confFile) != confFile {
++		return fmt.Errorf("invalid remote name %q", remoteName)
++	}
++
++	if !filepath.IsLocal(keyringFile) || filepath.Base(keyringFile) != keyringFile {
++		return fmt.Errorf("invalid remote name %q", remoteName)
++	}
++
+ 	err := s.Database().Transaction(ctx, func(ctx context.Context, tx *sql.Tx) error {
+ 		// Remove record to database.
+ 		err := DeleteRemote(ctx, tx, remoteName)
+@@ -85,12 +99,12 @@
+ 	}
+ 
+ 	// Remove remote conf and keyring files.
+-	err = os.Remove(filepath.Join(pathConst.ConfPath, fmt.Sprintf("%s.conf", remoteName)))
++	err = os.Remove(filepath.Join(pathConst.ConfPath, confFile))
+ 	if err != nil {
+ 		return err
+ 	}
+ 
+-	err = os.Remove(filepath.Join(pathConst.ConfPath, fmt.Sprintf("%s.keyring", remoteName)))
++	err = os.Remove(filepath.Join(pathConst.ConfPath, keyringFile))
+ 	if err != nil {
+ 		return err
+ 	}

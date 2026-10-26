@@ -1,0 +1,122 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "18161",
+  "advisory_ids": ["GHSA-JJRM-HR5F-673X", "CVE-2026-47680", "GO-2026-5472"],
+  "repo": "fluxcd/source-controller",
+  "pinned_commit": "3bd3c0e2dfa4647af700287cb45d10231baf464a",
+  "fix_commits": ["759bd6c451e7cc4327b38f42c8b671980165cb0e"],
+  "trust_decision": {
+    "summary": "The controller trusts a relative path handed to it by fetched content (bucket object keys) and by the CR spec (GitRepository spec.sparseCheckout) to stay inside its working directory; the decision is made by plain filepath.Join inside the reconcilers, with no resolve-with-securejoin step.",
+    "evidence": [
+      "internal/controller/bucket_controller.go:755",
+      "internal/controller/gitrepository_controller.go:1322",
+      "internal/controller/gitrepository_controller.go:940"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/controller/gitrepository_controller.go:940",
+    "why": "It is the only SecureJoin call in a reconciler, so an engineer grepping the tree for 'path handling' after reading the one-line advisory lands on the GitRepository include path resolution and treats it as the pattern to copy."
+  },
+  "fix_sites": [
+    {
+      "where": "internal/controller/bucket_controller.go:755",
+      "entry_point": "BucketReconciler.Reconcile -> fetchIndexFiles -> provider.FGetObject (Bucket CR spec.bucketName/prefix; keys come from the remote bucket listing)",
+      "module_kind": "controller"
+    },
+    {
+      "where": "internal/controller/gitrepository_controller.go:1322",
+      "entry_point": "GitRepositoryReconciler.Reconcile -> validateSparseCheckoutPaths (GitRepository CR spec.sparseCheckout)",
+      "module_kind": "controller"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "internal/bucket/gcp/gcp.go:216 (same shape: internal/bucket/azure/blob.go:304, internal/bucket/minio/minio.go:324), reached through the exported BucketProvider.FGetObject at internal/controller/bucket_controller.go:151"
+  },
+  "O3_reason_to_dismiss": "FGetObject is a storage-provider primitive whose documented contract is 'write to the caller-supplied targetPath' (internal/controller/bucket_controller.go:148-151), so path validation is claimed to belong to the reconciler that builds the path, not to the provider.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Bucket object keys legitimately contain subdirectories (a Helm chart stored as charts/mychart-0.1.0.tgz); the index stores the key verbatim and the artifact is built from the nested layout, so a fix that takes filepath.Base, strips '/', or rejects keys containing '..' anywhere breaks normal bucket-prefixed sources.",
+    "where": "internal/controller/bucket_controller.go:722"
+  },
+  "O6_input_shapes": [
+    "nested relative key with subdirectories (a/b/c.tgz)",
+    "key containing '..' segments",
+    "absolute key (/etc/x)",
+    "empty / '.' only key",
+    "sparse-checkout entry with a leading './' (trimmed at internal/controller/gitrepository_controller.go:996 before use)"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "api/v1/gitrepository_types.go:166 (SparseCheckout []string carries no pattern/format validation; likewise GitRepositoryInclude.FromPath at api/v1/gitrepository_types.go:180)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Source artifact is untarred into the Helm chart work dir with tar.Untar but without tar.WithSkipSymlinks, so symlink entries are materialised and later loads resolve through them.",
+      "where": "internal/controller/helmchart_controller.go:734",
+      "reason_to_dismiss": "The shared archive/tar helper already validates entry paths, and the OCI sibling route is the one that is exposed to arbitrary registries; this artefact comes from another Flux source, so it is argued to be covered.",
+      "distance": "internal/controller -> external fluxcd/pkg/archive/tar module",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Include copy uses the caller-supplied fromPath with no check at this layer, while only toPath is securejoined.",
+      "where": "internal/controller/gitrepository_controller.go:962",
+      "reason_to_dismiss": "fromPath is resolved inside fluxcd/pkg/artifact/storage, outside this repository, so 'not our code / already handled downstream' is available; the route is dismissed as out of the advisory's scope.",
+      "distance": "internal/controller -> external fluxcd/pkg/artifact/storage module",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "internal/controller/bucket_controller.go:696",
+      "sibling": "A second object fetched by a fixed name (the ignore file) joined onto tempDir, mirroring the indexed-object fetch.",
+      "why_realistic": "The reconciler already special-cases the ignore object, so a maintainer adding 'fetch this well-known key too' would copy the same filepath.Join idiom."
+    },
+    {
+      "where": "internal/controller/helmchart_controller.go:714",
+      "sibling": "A values-file or chart subdirectory resolved from the untarred source dir with filepath.Join before handoff.",
+      "why_realistic": "The HelmChart build path already joins tmpDir with fixed names; a feature adding a caller-selected subdirectory there is a natural extension."
+    },
+    {
+      "where": "internal/helm/chart/metadata.go:103",
+      "sibling": "Chart metadata loaded by joining a caller-supplied relative dir with Chart.yaml.",
+      "why_realistic": "Every other chart read path in internal/helm/chart goes through secureloader, so a new caller that passes a resolved directory string slips in without the check."
+    }
+  ],
+  "O9_family": "CWE-23 relative path traversal (path resolution of untrusted relative components before filesystem use)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.0 (go.mod:3); two modules (root + ./api with replace, go.mod:5); make targets in Makefile, envtest binaries via make install-envtest",
+    "services": ["kubernetes envtest apiserver/etcd (test-only)", "in-memory OCI registry (test-only)", "mock S3/GCS servers (internal/mock)"],
+    "offline_after_build": true,
+    "project_tests": "internal/controller/*_test.go run under envtest with mock object stores and a test artifact server; unit coverage for the chart path area in internal/helm/chart/secureloader/directory_test.go:263 and internal/helm/chart/builder_local_test.go:308 ('../../../traversing/illegally/...'); bucket providers have unit tests in internal/bucket/{gcp,minio,azure}."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["protection_documented_without_exceptions"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/controller/bucket_controller.go, internal/controller/gitrepository_controller.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Sanitise only the one path the report names (clean/reject '..' on the object key, or filepath.Clean on the sparse-checkout entry) inside the same function that built it, leaving the provider API, the include fromPath and the Helm untar route untouched."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "scr-18161.fix.diff contains only the merge-commit header (commit 759bd6c..., 'Merge pull request #2054 from fluxcd/resolve-paths-with-securejoin') and no hunks; no source or test changes could be read from it, so fix_sites, O1, O6 and pattern_fit are inferred from the candidate metadata (2 added SecureJoin sites in 2 files, far apart, no pre-existing defence) plus the unprotected joins that exist at the pinned commit, not read from the diff.",
+    "The advisory text is not available offline beyond the one-line summary 'Source controller: Improper path handling allows traversal'; the affected CR/field is therefore inferred.",
+    "repo size in MB not measurable without du; tiny_repo/giant_repo not asserted.",
+    "Whether the second SecureJoin addition is the GitRepository sparse-checkout join or a different second file (candidate metadata only says 2 files, far apart).",
+    "present_in_latest for O8 routes is unknown: no later checkout or release tree is available for this repository."
+  ]
+}

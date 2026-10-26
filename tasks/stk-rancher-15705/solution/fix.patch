@@ -1,0 +1,131 @@
+diff --git a/pkg/auth/providerrefresh/refresher.go b/pkg/auth/providerrefresh/refresher.go
+index e2472ac..d7907ae 100644
+--- a/pkg/auth/providerrefresh/refresher.go
++++ b/pkg/auth/providerrefresh/refresher.go
+@@ -266,10 +266,11 @@ func (r *refresher) refreshAttributes(attribs *apiv3.UserAttribute) (*v3.UserAtt
+ 							principalID,
+ 							err,
+ 						)
+-						existingPrincipals := attribs.GroupPrincipals[providerName].Items
+-						if existingPrincipals != nil {
+-							newGroupPrincipals = existingPrincipals
+-						}
++						// The previously stored principals may include memberships the
++						// provider no longer confirms. Do not put them back: an empty
++						// set replaces them. Login tokens are kept (errorConfirmingLogins),
++						// so a transient outage does not sign the user out.
++						newGroupPrincipals = nil
+ 					} else {
+ 						// In the case that the user explicitly cannot login at all to this provider
+ 						// (e.g. they no longer exist) we pretend they have no principal with this provider
+diff --git a/pkg/auth/providers/githubapp/github_data.go b/pkg/auth/providers/githubapp/github_data.go
+index 2dbd3cd..dbb0870 100644
+--- a/pkg/auth/providers/githubapp/github_data.go
++++ b/pkg/auth/providers/githubapp/github_data.go
+@@ -119,9 +119,16 @@ func (g *gitHubAppData) listOrgs() []common.GitHubAccount {
+ func (g *gitHubAppData) listTeamsForUser(username string) []common.GitHubAccount {
+ 	var accounts []common.GitHubAccount
+ 
+-	for orgName := range g.members[username].orgs {
+-		org := g.orgs[orgName]
+-		for teamName, team := range org.teams {
++	for orgName, teamNames := range g.members[username].orgs {
++		org, ok := g.orgs[orgName]
++		if !ok || org == nil {
++			continue
++		}
++		for _, teamName := range teamNames {
++			team, ok := org.teams[teamName]
++			if !ok {
++				continue
++			}
+ 			accounts = append(accounts, common.GitHubAccount{Name: teamName, Login: team.login, AvatarURL: org.avatarURL, ID: team.id, HTMLURL: team.htmlURL})
+ 		}
+ 	}
+diff --git a/pkg/auth/providers/githubapp/github_data_test.go b/pkg/auth/providers/githubapp/github_data_test.go
+index f93eebd..2f2c1a1 100644
+--- a/pkg/auth/providers/githubapp/github_data_test.go
++++ b/pkg/auth/providers/githubapp/github_data_test.go
+@@ -216,14 +216,9 @@ func TestGitHubAppData(t *testing.T) {
+ 	})
+ 
+ 	t.Run("teams for user", func(t *testing.T) {
++		// test-user is a member of: dev-team (example), dev-team2 (other-org), admin-team2 (other-org).
++		// test-user is NOT a member of admin-team (example) — it must not appear.
+ 		want := []common.GitHubAccount{
+-			{
+-				ID:        45678,
+-				Login:     "admin-team",
+-				Name:      "admin-team",
+-				AvatarURL: "https://example.com/avatar1.jpg",
+-				HTMLURL:   "https://example.com/org/example/team/admin-team",
+-			},
+ 			{
+ 				ID:        34579,
+ 				Login:     "admin-team2",
+@@ -253,6 +248,7 @@ func TestGitHubAppData(t *testing.T) {
+ 
+ 		assert.Equal(t, want, accounts)
+ 
++		// test-user2 is only a member of admin-team2 (other-org); dev-team2 must not appear.
+ 		want = []common.GitHubAccount{
+ 			{
+ 				ID:        34579,
+@@ -261,13 +257,6 @@ func TestGitHubAppData(t *testing.T) {
+ 				AvatarURL: "https://example.com/avatar2.jpg",
+ 				HTMLURL:   "https://example.com/org/other-org/team-dev-team2",
+ 			},
+-			{
+-				ID:        23468,
+-				Login:     "dev-team2",
+-				Name:      "dev-team2",
+-				AvatarURL: "https://example.com/avatar2.jpg",
+-				HTMLURL:   "https://example.com/org/other-org/team/dev-team2",
+-			},
+ 		}
+ 		accounts = data.listTeamsForUser("test-user2")
+ 		slices.SortFunc(accounts, func(a, b common.GitHubAccount) int {
+@@ -276,6 +265,24 @@ func TestGitHubAppData(t *testing.T) {
+ 		assert.Equal(t, want, accounts)
+ 	})
+ 
++	t.Run("non-member team is not returned", func(t *testing.T) {
++		// A user who belongs to one team in an org
++		// must not be reported as a member of other teams in that same org.
++		accounts := data.listTeamsForUser("test-user")
++		for _, a := range accounts {
++			if a.Login == "admin-team" {
++				t.Errorf("listTeamsForUser returned admin-team but test-user is not a member of it")
++			}
++		}
++
++		accounts = data.listTeamsForUser("test-user2")
++		for _, a := range accounts {
++			if a.Login == "dev-team2" {
++				t.Errorf("listTeamsForUser returned dev-team2 but test-user2 is not a member of it")
++			}
++		}
++	})
++
+ 	t.Run("list all teams", func(t *testing.T) {
+ 		want := []common.GitHubAccount{
+ 			{
+diff --git a/pkg/auth/requests/authenticate.go b/pkg/auth/requests/authenticate.go
+index 2ef2e86..a5db245 100644
+--- a/pkg/auth/requests/authenticate.go
++++ b/pkg/auth/requests/authenticate.go
+@@ -219,6 +219,14 @@ func (a *tokenAuthenticator) Authenticate(req *http.Request) (*AuthenticatorResp
+ 	// fallback to legacy token.GroupPrincipals
+ 	if !hitProvider {
+ 		for _, principal := range token.GetGroupPrincipals() {
++			// A principal copied onto the token can outlive the membership that produced
++			// it. When the user still has an identity for that provider, the provider's
++			// current data is authoritative; never let the copy grant access.
++			providerName := principal.Provider
++			if providerName != "" && !providers.UnrefreshableProviders[providerName] &&
++				providerrefresh.GetPrincipalIDForProvider(providerName, authUser) != "" {
++				continue
++			}
+ 			// TODO This is a short cut for now. Will actually need to lookup groups in future
+ 			name := strings.TrimPrefix(principal.Name, "local://")
+ 			groups = append(groups, name)

@@ -1,0 +1,341 @@
+diff --git a/pkg/apis/core/v1/podspec_safety.go b/pkg/apis/core/v1/podspec_safety.go
+new file mode 100644
+index 00000000..8c4aa6c7
+--- /dev/null
++++ b/pkg/apis/core/v1/podspec_safety.go
+@@ -0,0 +1,120 @@
++/*
++Copyright 2026 The Fission Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++import (
++	"errors"
++	"fmt"
++
++	apiv1 "k8s.io/api/core/v1"
++)
++
++// dangerousCapabilities lists Linux capabilities that effectively grant root
++// or break the container sandbox. Tenants that can write to Environment or
++// Function PodSpec must not be able to add these via securityContext.
++var dangerousCapabilities = map[apiv1.Capability]struct{}{
++	"SYS_ADMIN":       {},
++	"NET_ADMIN":       {},
++	"SYS_PTRACE":      {},
++	"SYS_MODULE":      {},
++	"DAC_READ_SEARCH": {},
++	"DAC_OVERRIDE":    {},
++}
++
++// ValidatePodSpecSafety rejects PodSpec fields that would let a low-privilege
++// tenant escalate to host or cluster level when the executor or buildermgr
++// schedules a pod from a user-supplied podspec.
++//
++// The fission-executor and fission-builder service accounts have the
++// authority to create Deployments and Pods, so any field that crosses
++// the container sandbox boundary (host namespaces, privileged contexts,
++// hostPath mounts, alternate service accounts, dangerous capabilities)
++// would let a Function- or Environment-CRUD tenant escape the boundary
++// of their own RBAC and reach node-level state.
++//
++// Closes GHSA-gx55-f84r-v3r7, GHSA-wmgg-3p4h-48x7, GHSA-v455-mv2v-5g92.
++//
++// The fieldPath argument is used as a prefix in error messages so the
++// caller can identify which podspec failed (e.g.
++// "Environment.spec.runtime.podspec" / "Function.spec.podspec").
++func ValidatePodSpecSafety(fieldPath string, ps *apiv1.PodSpec) error {
++	if ps == nil {
++		return nil
++	}
++	var errs error
++
++	if ps.HostNetwork {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostNetwork is not allowed", fieldPath))
++	}
++	if ps.HostPID {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostPID is not allowed", fieldPath))
++	}
++	if ps.HostIPC {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostIPC is not allowed", fieldPath))
++	}
++	if ps.ServiceAccountName != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccountName override is not allowed", fieldPath))
++	}
++	// DeprecatedServiceAccount is the pre-1.8 alias for ServiceAccountName.
++	// Kubernetes still honors it for backward compatibility so a tenant could
++	// otherwise bypass the ServiceAccountName check by setting this field.
++	if ps.DeprecatedServiceAccount != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccount (deprecated, alias for serviceAccountName) override is not allowed", fieldPath))
++	}
++	for i, v := range ps.Volumes {
++		if v.HostPath != nil {
++			errs = errors.Join(errs, fmt.Errorf("%s.volumes[%d].hostPath (%q) is not allowed", fieldPath, i, v.Name))
++		}
++	}
++
++	for _, c := range ps.Containers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.containers[%s]", fieldPath, c.Name), &c))
++	}
++	for _, c := range ps.InitContainers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.initContainers[%s]", fieldPath, c.Name), &c))
++	}
++
++	return errs
++}
++
++// ValidateContainerSafety rejects container securityContext settings that
++// break the container sandbox: privileged, allowPrivilegeEscalation and
++// dangerous added capabilities. It covers both the containers of a
++// tenant-supplied PodSpec and the single-container overrides
++// (Environment.spec.runtime.container / spec.builder.container), which are
++// merged onto the same runtime and builder pods.
++func ValidateContainerSafety(fieldPath string, c *apiv1.Container) error {
++	if c == nil || c.SecurityContext == nil {
++		return nil
++	}
++	var errs error
++	sc := c.SecurityContext
++	if sc.Privileged != nil && *sc.Privileged {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.privileged=true is not allowed", fieldPath))
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.allowPrivilegeEscalation=true is not allowed", fieldPath))
++	}
++	if sc.Capabilities != nil {
++		for _, cap := range sc.Capabilities.Add {
++			if _, bad := dangerousCapabilities[cap]; bad {
++				errs = errors.Join(errs, fmt.Errorf("%s.securityContext.capabilities.add[%q] is not allowed", fieldPath, cap))
++			}
++		}
++	}
++	return errs
++}
+diff --git a/pkg/apis/core/v1/validation.go b/pkg/apis/core/v1/validation.go
+index 816a3f29..be958738 100644
+--- a/pkg/apis/core/v1/validation.go
++++ b/pkg/apis/core/v1/validation.go
+@@ -296,6 +296,9 @@ func (spec FunctionSpec) Validate() error {
+ 	if spec.InvokeStrategy.ExecutionStrategy.ExecutorType == ExecutorTypeContainer && spec.PodSpec == nil {
+ 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
+ 	}
++	// Reject podspec fields that would let a tenant escalate via the
++	// executor service account. Closes GHSA-v455-mv2v-5g92.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec))
+ 
+ 	// TODO Add below validation warning
+ 	// if spec.FunctionTimeout <= 0 {
+@@ -666,6 +669,13 @@ func (e *Environment) Validate() error {
+ 			}
+ 		}
+ 	}
++	// Reject podspec fields that would let a tenant escalate via the
++	// executor / buildermgr service accounts. Closes GHSA-gx55-f84r-v3r7,
++	// GHSA-wmgg-3p4h-48x7.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.runtime.podspec", e.Spec.Runtime.PodSpec))
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.builder.podspec", e.Spec.Builder.PodSpec))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.runtime.container", e.Spec.Runtime.Container))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.builder.container", e.Spec.Builder.Container))
+ 	return errs
+ }
+ 
+diff --git a/pkg/executor/util/merge.go b/pkg/executor/util/merge.go
+index 244eb021..a93489f5 100644
+--- a/pkg/executor/util/merge.go
++++ b/pkg/executor/util/merge.go
+@@ -51,6 +51,12 @@ func MergeContainer(dst *apiv1.Container, src *apiv1.Container) (*apiv1.Containe
+ 		checkSliceConflicts("Name", dstC.VolumeMounts),
+ 		checkSliceConflicts("Name", dstC.VolumeDevices))
+ 
++	// The override container (Environment.spec.runtime.container /
++	// spec.builder.container, or a podspec container of the same name) is
++	// tenant-supplied; strip privilege-escalation bits from the result so
++	// they never reach the pod even if admission was bypassed.
++	sanitizeContainerSecurityContext(&dstC)
++
+ 	return &dstC, errs
+ }
+ 
+@@ -79,8 +85,29 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
+ 		srcPodSpec.InitContainers = cList
+ 	}
+ 
+-	// For volumes - if duplicate exist, throw error
+-	vols, err := mergeVolumeLists(srcPodSpec.Volumes, targetPodSpec.Volumes)
++	// Sanitize per-container SecurityContext after the merge. The admission
++	// webhook rejects privileged=true / allowPrivilegeEscalation=true and
++	// dangerous capabilities (SYS_ADMIN, NET_ADMIN, etc.) at submit time,
++	// but a webhook-bypass cluster (failurePolicy=Ignore or a stale object
++	// from a pre-webhook upgrade window) could still reach this code path.
++	// Strip the dangerous bits from the merged result so the resulting pod
++	// cannot escape its container even if admission was bypassed. Closes
++	// GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
++	for i := range srcPodSpec.Containers {
++		sanitizeContainerSecurityContext(&srcPodSpec.Containers[i])
++	}
++	for i := range srcPodSpec.InitContainers {
++		sanitizeContainerSecurityContext(&srcPodSpec.InitContainers[i])
++	}
++
++	// For volumes - if duplicate exist, throw error. hostPath volumes are
++	// stripped from the target before merge: a tenant-supplied hostPath
++	// mount is a node-escape primitive (read /etc, the container runtime
++	// socket, etc.). The admission webhook rejects them, and this layer
++	// makes them unreachable even on webhook-bypass clusters. Closes
++	// GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
++	filteredTargetVols := stripHostPathVolumes(targetPodSpec.Volumes)
++	vols, err := mergeVolumeLists(srcPodSpec.Volumes, filteredTargetVols)
+ 	if err != nil {
+ 		multierr = errors.Join(multierr, err)
+ 	} else {
+@@ -113,6 +140,16 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
+ 	}
+ 
+ 	// TODO - Security context should be merged instead of overriding.
++	// Pod-level SecurityContext IS propagated: the chart's
++	// runtimePodSpec.podSpec.securityContext / builderPodSpec.podSpec.
++	// securityContext are operator-supplied hardening (fsGroup,
++	// runAsNonRoot=true, runAsUser=10001, runAsGroup=10001) that must
++	// reach the pool / builder pods. The node-escape primitives flagged
++	// by GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92
++	// live at container-level (privileged, allowPrivilegeEscalation,
++	// dangerous capabilities) and at pod level (hostNetwork, hostPID,
++	// hostIPC, hostPath volumes, serviceAccountName override) — all of
++	// which are denylisted in pkg/apis/core/v1/podspec_safety.go.
+ 	if targetPodSpec.SecurityContext != nil {
+ 		srcPodSpec.SecurityContext = targetPodSpec.SecurityContext
+ 	}
+@@ -142,29 +179,22 @@ func MergePodSpec(srcPodSpec *apiv1.PodSpec, targetPodSpec *apiv1.PodSpec) (*api
+ 		srcPodSpec.DNSPolicy = targetPodSpec.DNSPolicy
+ 	}
+ 
+-	if targetPodSpec.ServiceAccountName != "" {
+-		srcPodSpec.ServiceAccountName = targetPodSpec.ServiceAccountName
+-	}
+-
+-	if targetPodSpec.DeprecatedServiceAccount != "" {
+-		srcPodSpec.DeprecatedServiceAccount = targetPodSpec.DeprecatedServiceAccount
+-	}
++	// ServiceAccountName / DeprecatedServiceAccount intentionally not
++	// propagated: the controller chooses the SA for the pod
++	// (fission-fetcher for runtime pods, fission-builder for build pods).
++	// Letting a user-supplied podspec override it would defeat the SA-token
++	// scoping introduced by GHSA-85g2-pmrx-r49q and GHSA-8wcj-mfrc-jx5q.
++	// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
+ 
+ 	if targetPodSpec.AutomountServiceAccountToken != nil {
+ 		srcPodSpec.AutomountServiceAccountToken = targetPodSpec.AutomountServiceAccountToken
+ 	}
+ 
+-	if targetPodSpec.HostNetwork {
+-		srcPodSpec.HostNetwork = targetPodSpec.HostNetwork
+-	}
+-
+-	if targetPodSpec.HostPID {
+-		srcPodSpec.HostPID = targetPodSpec.HostPID
+-	}
+-
+-	if targetPodSpec.HostIPC {
+-		srcPodSpec.HostIPC = targetPodSpec.HostIPC
+-	}
++	// HostNetwork / HostPID / HostIPC intentionally not propagated.
++	// A pod sharing host namespaces is a node-escape primitive — the
++	// admission webhook rejects these fields, and this layer makes them
++	// unreachable even on webhook-bypass clusters.
++	// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
+ 
+ 	if targetPodSpec.ShareProcessNamespace != nil {
+ 		srcPodSpec.ShareProcessNamespace = targetPodSpec.ShareProcessNamespace
+@@ -288,3 +318,79 @@ func checkSliceConflicts(field string, objs any) (err error) {
+ 	}
+ 	return errs
+ }
++
++// stripHostPathVolumes returns a copy of vols with any volume whose source
++// is a hostPath removed. Defense in depth — the admission webhook already
++// rejects hostPath in tenant-supplied podspecs (see
++// pkg/apis/core/v1/podspec_safety.go), but on webhook-bypass clusters
++// (failurePolicy=Ignore, or stale objects from a pre-webhook upgrade
++// window) this layer makes the dangerous primitive unreachable.
++// Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 / GHSA-v455-mv2v-5g92.
++func stripHostPathVolumes(vols []apiv1.Volume) []apiv1.Volume {
++	if len(vols) == 0 {
++		return vols
++	}
++	out := make([]apiv1.Volume, 0, len(vols))
++	for _, v := range vols {
++		if v.HostPath != nil {
++			continue
++		}
++		out = append(out, v)
++	}
++	return out
++}
++
++// dangerousMergeContainerCapabilities lists the Linux capabilities that
++// effectively bypass the container sandbox. Kept in sync with the
++// authoritative denylist in pkg/apis/core/v1/podspec_safety.go — the
++// admission webhook is the primary defence; this is the merge-layer
++// belt-and-braces for webhook-bypass clusters.
++var dangerousMergeContainerCapabilities = map[apiv1.Capability]struct{}{
++	"SYS_ADMIN":       {},
++	"NET_ADMIN":       {},
++	"SYS_PTRACE":      {},
++	"SYS_MODULE":      {},
++	"DAC_READ_SEARCH": {},
++	"DAC_OVERRIDE":    {},
++}
++
++// sanitizeContainerSecurityContext zeroes out the privilege-escalation bits
++// of a container's SecurityContext after a MergePodSpec call. The merge
++// path uses mergo.WithOverride and unconditionally copies SecurityContext
++// fields from the target container, so a tenant-supplied podspec with
++// privileged=true / allowPrivilegeEscalation=true / Capabilities.Add =
++// [SYS_ADMIN, ...] would otherwise reach the running pod on
++// webhook-bypass clusters (failurePolicy=Ignore or stale objects from a
++// pre-webhook upgrade). The webhook is the primary defence; this is
++// defence in depth. Closes GHSA-gx55-f84r-v3r7 / GHSA-wmgg-3p4h-48x7 /
++// GHSA-v455-mv2v-5g92.
++func sanitizeContainerSecurityContext(c *apiv1.Container) {
++	if c.SecurityContext == nil {
++		return
++	}
++	// Deep-copy before mutating. MergeContainer does a shallow struct copy
++	// (`dstC := *dst`) and mergo.WithOverride aliases src.SecurityContext
++	// onto dstC.SecurityContext, so mutating in place would leak into the
++	// caller's targetPodSpec — which is typically env.Spec.Runtime.PodSpec
++	// from an informer cache. Allocating a fresh SecurityContext (and a
++	// fresh Capabilities.Add slice via a new backing array) keeps the
++	// sanitization local to the merged result.
++	c.SecurityContext = c.SecurityContext.DeepCopy()
++	sc := c.SecurityContext
++	if sc.Privileged != nil && *sc.Privileged {
++		sc.Privileged = new(false)
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		sc.AllowPrivilegeEscalation = new(false)
++	}
++	if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
++		filtered := make([]apiv1.Capability, 0, len(sc.Capabilities.Add))
++		for _, cap := range sc.Capabilities.Add {
++			if _, bad := dangerousMergeContainerCapabilities[cap]; bad {
++				continue
++			}
++			filtered = append(filtered, cap)
++		}
++		sc.Capabilities.Add = filtered
++	}
++}

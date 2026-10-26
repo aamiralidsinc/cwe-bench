@@ -1,0 +1,160 @@
+diff --git a/sentence_transformers/base/modules/transformer.py b/sentence_transformers/base/modules/transformer.py
+index a16c525f..a0971f43 100644
+--- a/sentence_transformers/base/modules/transformer.py
++++ b/sentence_transformers/base/modules/transformer.py
+@@ -1854,7 +1854,13 @@ class Transformer(InputModule):
+         if "processor_class" in config:
+             from sentence_transformers.util import import_from_string
+ 
+-            config["processor_class"] = import_from_string(config["processor_class"])
++            processor_class_ref = config["processor_class"]
++            if trust_remote_code or processor_class_ref.startswith(
++                ("torch.", "transformers.", "sentence_transformers.")
++            ):
++                config["processor_class"] = import_from_string(processor_class_ref)
++            else:
++                config.pop("processor_class")
+ 
+         # 1st priority: kwargs passed to SentenceTransformer
+         if model_kwargs:
+diff --git a/sentence_transformers/base/trainer.py b/sentence_transformers/base/trainer.py
+index caca011a..dbce5f49 100644
+--- a/sentence_transformers/base/trainer.py
++++ b/sentence_transformers/base/trainer.py
+@@ -47,7 +47,7 @@ from sentence_transformers.base.data_collator import BaseDataCollator
+ from sentence_transformers.base.evaluation import BaseEvaluator, SequentialEvaluator
+ from sentence_transformers.base.model import BaseModel
+ from sentence_transformers.base.model_card import BaseModelCardCallback, BaseModelCardData
+-from sentence_transformers.base.modules import Router
++from sentence_transformers.base.modules import Module, Router
+ from sentence_transformers.base.sampler import (
+     DefaultBatchSampler,
+     GroupByLabelBatchSampler,
+@@ -1039,8 +1039,10 @@ class BaseTrainer(Trainer, ABC):
+         return skip
+ 
+     def _load_from_checkpoint(self, checkpoint_path: str) -> None:
++        # This is the checkpoint this trainer just wrote for the model it is training, so the load
++        # may opt in to the custom module classes that checkpoint references.
+         model_class = self.model.__class__
+-        loaded_model = model_class(checkpoint_path, trust_remote_code=self.model.trust_remote_code)
++        loaded_model = model_class(checkpoint_path, trust_remote_code=True)
+         self.model.load_state_dict(loaded_model.state_dict())
+ 
+     def preprocess_dataset(
+diff --git a/sentence_transformers/sentence_transformer/modules/cnn.py b/sentence_transformers/sentence_transformer/modules/cnn.py
+index 7f487dd6..f8619ef6 100644
+--- a/sentence_transformers/sentence_transformer/modules/cnn.py
++++ b/sentence_transformers/sentence_transformer/modules/cnn.py
+@@ -85,6 +85,7 @@ class CNN(Module):
+         cache_folder: str | None = None,
+         revision: str | None = None,
+         local_files_only: bool = False,
++        trust_remote_code: bool = False,
+         **kwargs,
+     ) -> Self:
+         hub_kwargs = {
+@@ -97,7 +98,10 @@ class CNN(Module):
+         config = cls.load_config(model_name_or_path=model_name_or_path, **hub_kwargs)
+         if "activation_function" in config:
+             # Activation functions are stored as a dotted path, mirroring `Dense`.
+-            config["activation_function"] = import_from_string(config["activation_function"])()
++            if trust_remote_code or config["activation_function"].startswith("torch."):
++                config["activation_function"] = import_from_string(config["activation_function"])()
++            else:
++                del config["activation_function"]
+         model = cls(**config)
+         model = cls.load_torch_weights(model_name_or_path=model_name_or_path, model=model, **hub_kwargs)
+         return model
+diff --git a/sentence_transformers/sentence_transformer/modules/word_embeddings.py b/sentence_transformers/sentence_transformer/modules/word_embeddings.py
+index 7a02d04c..bd73f602 100644
+--- a/sentence_transformers/sentence_transformer/modules/word_embeddings.py
++++ b/sentence_transformers/sentence_transformer/modules/word_embeddings.py
+@@ -17,7 +17,7 @@ from torch import nn
+ from tqdm import tqdm
+ 
+ from sentence_transformers.base.modules.input_module import InputModule
+-from sentence_transformers.util import fullname, http_get, import_from_string
++from sentence_transformers.util import fullname, http_get, import_module_class
+ 
+ from .tokenizer import TransformersTokenizerWrapper, WhitespaceTokenizer, WordTokenizer
+ 
+@@ -124,7 +124,17 @@ class WordEmbeddings(InputModule):
+             "local_files_only": local_files_only,
+         }
+         config = cls.load_config(model_name_or_path=model_name_or_path, **hub_kwargs)
+-        tokenizer_class = import_from_string(config.pop("tokenizer_class"))
++        # `tokenizer_class` is a config-controlled dotted path, so resolve it through the same trust gate
++        # as the module `type` field
++        tokenizer_class = import_module_class(
++            config.pop("tokenizer_class"),
++            model_name_or_path=model_name_or_path,
++            trust_remote_code=kwargs.get("trust_remote_code", False),
++            revision=revision,
++            token=token,
++            cache_folder=cache_folder,
++            local_files_only=local_files_only,
++        )
+         tokenizer_local_path = cls.load_dir_path(model_name_or_path=model_name_or_path, **hub_kwargs)
+         tokenizer = tokenizer_class.load(tokenizer_local_path)
+ 
+diff --git a/sentence_transformers/util/misc.py b/sentence_transformers/util/misc.py
+index a8b0d4d7..e8cad582 100644
+--- a/sentence_transformers/util/misc.py
++++ b/sentence_transformers/util/misc.py
+@@ -76,6 +76,20 @@ def import_from_string(dotted_path: str) -> type:
+         raise ImportError(msg)
+ 
+ 
++def _refuse_untrusted_module_class(class_ref: str, model_name_or_path: str) -> None:
++    """Refuse to import a class named by a model's stored configuration without an explicit opt-in."""
++    location = (
++        os.path.abspath(model_name_or_path)
++        if os.path.isdir(model_name_or_path)
++        else f"https://hf.co/{model_name_or_path}"
++    )
++    raise PermissionError(
++        f"The model {model_name_or_path} references the module class {class_ref!r}, which is not part of "
++        f"Sentence Transformers. Importing it executes third-party code. You can inspect the repository "
++        f"content at {location}. Pass `trust_remote_code=True` to allow custom code to be run."
++    )
++
++
+ def import_module_class(
+     class_ref: str,
+     model_name_or_path: str | None = None,
+@@ -97,9 +111,10 @@ def import_module_class(
+     modeling file from the model directory, then falls back to :func:`import_from_string`
+     if dynamic loading is not applicable or fails.
+ 
+-    Dynamic loading is attempted when ``trust_remote_code`` is set, or when
+-    ``model_name_or_path`` resolves to a local directory (i.e. the user already has the
+-    file on disk and is implicitly trusted).
++    Importing a class outside the ``sentence_transformers.*`` namespace runs code selected by the model's
++    configuration (repository-hosted modeling code via dynamic loading, or a locally installed package via
++    direct import). Loading such a class requires ``trust_remote_code=True``, for local directories just
++    like for Hugging Face Hub repositories.
+ 
+     Args:
+         class_ref: Dotted class path. Either a fully-qualified ``sentence_transformers.*``
+@@ -121,9 +136,11 @@ def import_module_class(
+     if class_ref.startswith("sentence_transformers."):
+         return import_from_string(class_ref)
+ 
+-    if model_name_or_path is not None and (trust_remote_code or os.path.exists(model_name_or_path)):
++    if model_name_or_path is not None:
+         from transformers.dynamic_module_utils import get_class_from_dynamic_module
+ 
++        if not trust_remote_code:
++            _refuse_untrusted_module_class(class_ref, model_name_or_path)
+         try:
+             return get_class_from_dynamic_module(
+                 class_ref,
+@@ -135,7 +152,6 @@ def import_module_class(
+                 local_files_only=local_files_only,
+             )
+         except (OSError, ValueError):
+-            # 1) the file does not exist, or 2) the class_ref is not correctly formatted/found
+             pass
+ 
+     return import_from_string(class_ref)

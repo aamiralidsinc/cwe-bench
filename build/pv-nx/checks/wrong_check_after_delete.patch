@@ -1,0 +1,553 @@
+diff -ruN '--exclude=.git' inject/packages/nx/src/native/cache/cache.rs variants/check_after_delete/packages/nx/src/native/cache/cache.rs
+--- a/packages/nx/src/native/cache/cache.rs	2026-10-23 03:30:49.326647709 +0000
++++ b/packages/nx/src/native/cache/cache.rs	2026-10-23 03:50:27.326008371 +0000
+@@ -1,5 +1,5 @@
+ use std::fs::{create_dir_all, read_to_string, write};
+-use std::path::{Path, PathBuf};
++use std::path::{Component, Path, PathBuf};
+ use std::rc::Rc;
+ use std::time::Instant;
+ use tracing::{debug, trace};
+@@ -11,7 +11,7 @@
+ use sysinfo::Disks;
+ 
+ use crate::native::cache::expand_outputs::_expand_outputs;
+-use crate::native::cache::file_ops::_copy;
++use crate::native::cache::file_ops::{_copy, copy_outputs_into_workspace};
+ use crate::native::db::connection::NxDbConnection;
+ use crate::native::utils::Normalize;
+ use napi::bindgen_prelude::External;
+@@ -243,6 +243,7 @@
+         trace!("Successfully wrote terminal outputs ({} bytes)", total_size);
+ 
+         // Expand the outputs
++        let outputs = normalize_outputs(&self.workspace_root, outputs)?;
+         let expanded_outputs = _expand_outputs(&self.workspace_root, outputs)?;
+         trace!("Successfully expanded {} outputs", expanded_outputs.len());
+ 
+@@ -320,16 +321,14 @@
+             let terminal_output = result.terminal_output.clone().unwrap_or_default();
+             let mut size = terminal_output.len() as i64;
+             if result.code == 0 && !outputs.is_empty() {
++                let outputs = normalize_outputs(&self.workspace_root, outputs)?;
+                 let outputs_path = Path::new(&result.outputs_path);
+                 let expanded_outputs = _expand_outputs(outputs_path, outputs)?;
+-                remove_items(
+-                    expanded_outputs
+-                        .iter()
+-                        .map(|p| self.workspace_root.join(p))
+-                        .collect::<Vec<_>>()
+-                        .as_slice(),
++                size += copy_outputs_into_workspace(
++                    &self.workspace_root,
++                    outputs_path,
++                    &expanded_outputs,
+                 )?;
+-                size += _copy(outputs_path, &self.workspace_root)?;
+             }
+             write(self.get_task_outputs_path(hash.clone()), terminal_output)?;
+             self.record_to_cache(hash, result.code, size)?;
+@@ -428,8 +427,7 @@
+     ) -> anyhow::Result<i64> {
+         let outputs_path = Path::new(&cached_result.outputs_path);
+ 
+-        let expanded_outputs = _expand_outputs(outputs_path, outputs)?;
+-
++        let expanded_outputs = _expand_outputs(outputs_path, outputs.clone())?;
+         trace!("Removing expanded outputs: {:?}", &expanded_outputs);
+         remove_items(
+             expanded_outputs
+@@ -439,30 +437,16 @@
+                 .as_slice(),
+         )?;
+ 
++        let outputs = normalize_outputs(&self.workspace_root, outputs)?;
++        let expanded_outputs = _expand_outputs(outputs_path, outputs)?;
++
+         trace!(
+-            "Copying Files from Cache {:?} -> {:?}",
+-            &outputs_path, &self.workspace_root
++            "Restoring {} outputs from cache {:?} -> {:?}",
++            expanded_outputs.len(),
++            &outputs_path,
++            &self.workspace_root
+         );
+-        let sz = _copy(outputs_path, &self.workspace_root);
+-
+-        match sz {
+-            Err(e) => {
+-                let kind = underlying_io_error_kind(&e);
+-                match kind {
+-                    Some(std::io::ErrorKind::NotFound) => {
+-                        trace!("No artifacts to copy: {:?}", e);
+-                        Ok(0)
+-                    }
+-                    _ => {
+-                        return Err(anyhow::anyhow!("Error copying files from cache: {:?}", e));
+-                    }
+-                }
+-            }
+-            Ok(sz) => {
+-                trace!("Copied {} bytes from cache", sz);
+-                Ok(sz)
+-            }
+-        }
++        copy_outputs_into_workspace(&self.workspace_root, outputs_path, &expanded_outputs)
+     }
+ 
+     #[napi]
+@@ -571,12 +555,48 @@
+     }
+ }
+ 
+-// From: https://docs.rs/anyhow/latest/anyhow/struct.Error.html#example-1
+-fn underlying_io_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+-    for cause in error.chain() {
+-        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+-            return Some(io_error.kind());
++/// Normalize declared output paths for cache use: relativize an in-workspace
++/// absolute path to the workspace root. Errors if any path resolves outside the
++/// workspace (absolute elsewhere, or relative climbing out via `..`).
++fn normalize_outputs(workspace_root: &Path, outputs: Vec<String>) -> anyhow::Result<Vec<String>> {
++    outputs
++        .into_iter()
++        .map(|output| {
++            let path = Path::new(&output);
++            let relative = if path.is_absolute() {
++                path.strip_prefix(workspace_root).map_err(|_| {
++                    anyhow::anyhow!("Cache output is outside the workspace: {}", output)
++                })?
++            } else {
++                path
++            };
++            if escapes_workspace(relative) {
++                return Err(anyhow::anyhow!(
++                    "Cache output is outside the workspace: {}",
++                    output
++                ));
++            }
++            Ok(relative.to_normalized_string())
++        })
++        .collect()
++}
++
++/// Whether a relative path climbs above its base via `..`.
++fn escapes_workspace(path: &Path) -> bool {
++    let mut depth: i32 = 0;
++    for component in path.components() {
++        match component {
++            Component::ParentDir => {
++                depth -= 1;
++                if depth < 0 {
++                    return true;
++                }
++            }
++            Component::Normal(_) => depth += 1,
++            Component::CurDir => {}
++            // A relative path shouldn't contain a root/prefix; treat as escaping.
++            Component::RootDir | Component::Prefix(_) => return true,
+         }
+     }
+-    None
++    false
+ }
+diff -ruN '--exclude=.git' inject/packages/nx/src/native/cache/file_ops.rs variants/check_after_delete/packages/nx/src/native/cache/file_ops.rs
+--- a/packages/nx/src/native/cache/file_ops.rs	2026-10-23 03:23:05.000000000 +0000
++++ b/packages/nx/src/native/cache/file_ops.rs	2026-10-23 03:49:56.239349306 +0000
+@@ -21,46 +21,122 @@
+ where
+     P: AsRef<Path>,
+ {
++    _copy_impl(src.as_ref(), dest.as_ref(), None)
++}
++
++/// Copy `src` to `dest`.
++///
++/// With `boundary = Some(root)` the copy is confined to `root` (cache restore):
++/// parents are realized as real dirs (any symlink under `root` is replaced) and
++/// existing entries are removed, not written through. `None` keeps the original.
++pub fn _copy_impl(src: &Path, dest: &Path, boundary: Option<&Path>) -> anyhow::Result<i64> {
+     let dest: PathBuf = remove_trailing_single_dot(dest);
+     let dest_parent = dest.parent().unwrap_or(&dest);
+-    let src: PathBuf = src.as_ref().into();
++    let src: PathBuf = src.into();
+ 
+     trace!("Copying {:?} -> {:?}", &src, &dest);
+ 
+-    if !dest_parent.exists() {
+-        trace!("Creating parent directory: {:?}", dest_parent);
+-        fs::create_dir_all(dest_parent)?;
+-        trace!("Successfully created parent directory: {:?}", dest_parent);
++    match boundary {
++        Some(root) => {
++            create_dir_all_within(root, dest_parent)?;
++            // Never follow or merge into a stale entry at the destination.
++            remove_path(&dest)?;
++        }
++        None => {
++            if !dest_parent.exists() {
++                trace!("Creating parent directory: {:?}", dest_parent);
++                fs::create_dir_all(dest_parent)?;
++            }
++        }
+     }
+ 
+-    let size = if src.is_dir() {
+-        trace!("Copying directory: {:?}", &src);
+-        let copied_size = copy_dir_all(&src, &dest).map_err(anyhow::Error::new)?;
+-        trace!(
+-            "Successfully copied directory: {:?} ({} bytes)",
+-            &src, copied_size
+-        );
+-        copied_size
+-    } else if src.is_symlink() {
++    // Check symlink before dir: `is_dir()` follows symlinks, so a symlinked
++    // output must be recreated as a link, not followed (which would copy its
++    // target's contents in). The link is recreated verbatim even if it points
++    // outside the workspace — it is only a pointer, and we never write *through*
++    // a symlink (create_dir_all_within realizes parents as real directories).
++    let size = if src.is_symlink() {
+         trace!("Copying symlink: {:?}", &src);
+         remove_existing_symlink(&dest)?;
+         symlink(fs::read_link(&src)?, &dest)?;
+-        trace!("Successfully copied symlink: {:?}", &src);
+         0
++    } else if src.is_dir() {
++        trace!("Copying directory: {:?}", &src);
++        copy_dir_all(&src, &dest, boundary).map_err(anyhow::Error::new)?
+     } else {
+         trace!("Copying file: {:?}", &src);
+-        let copied_size = fs::copy(&src, &dest)?;
+-        trace!(
+-            "Successfully copied file: {:?} ({} bytes)",
+-            &src, copied_size
+-        );
+-        copied_size
++        fs::copy(&src, &dest)?
+     };
+ 
+     debug!("Copy completed: {:?} -> {:?} ({} bytes)", &src, &dest, size);
+     Ok(size as i64)
+ }
+ 
++/// Create `dir` and missing ancestors without traversing a symlink at or below
++/// `boundary`: such a symlink/file is replaced with a real directory. Paths at
++/// or above `boundary` are trusted and untouched (e.g. a `/tmp` system symlink).
++fn create_dir_all_within(boundary: &Path, dir: &Path) -> io::Result<()> {
++    // At or above the boundary: trust the existing tree, only create if missing.
++    if dir == boundary || !dir.starts_with(boundary) {
++        return match fs::symlink_metadata(dir) {
++            Ok(_) => Ok(()),
++            Err(_) => fs::create_dir_all(dir),
++        };
++    }
++
++    if let Some(parent) = dir.parent() {
++        create_dir_all_within(boundary, parent)?;
++    }
++
++    match fs::symlink_metadata(dir) {
++        Ok(meta) if meta.file_type().is_dir() => Ok(()),
++        Ok(_) => {
++            // Replace a symlink/file occupying the path with a real directory.
++            remove_path(dir)?;
++            fs::create_dir(dir)
++        }
++        Err(_) => match fs::create_dir(dir) {
++            Ok(()) => Ok(()),
++            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
++            Err(e) => Err(e),
++        },
++    }
++}
++
++/// Remove the entry at `path` without following a final symlink (the link is
++/// unlinked, not its target); directories recurse, a missing path is a no-op.
++fn remove_path(path: &Path) -> io::Result<()> {
++    match fs::symlink_metadata(path) {
++        Ok(meta) if meta.file_type().is_dir() => fs::remove_dir_all(path),
++        Ok(_) => fs::remove_file(path),
++        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
++        Err(e) => Err(e),
++    }
++}
++
++/// Restore the given expanded outputs from `outputs_path` into `workspace_root`.
++/// Only the listed outputs are copied (never the whole cache dir) and each copy
++/// is confined to `workspace_root`, so a malicious artifact can't write beyond
++/// the declared outputs or escape via a symlink.
++pub fn copy_outputs_into_workspace(
++    workspace_root: &Path,
++    outputs_path: &Path,
++    expanded_outputs: &[String],
++) -> anyhow::Result<i64> {
++    let mut size = 0;
++    for output in expanded_outputs {
++        let from = outputs_path.join(output);
++        // Only restore entries the artifact actually contains.
++        if fs::symlink_metadata(&from).is_err() {
++            trace!("No cached artifact for output {}, skipping", output);
++            continue;
++        }
++        let to = workspace_root.join(output);
++        size += _copy_impl(&from, &to, Some(workspace_root))?;
++    }
++    Ok(size)
++}
++
+ fn remove_trailing_single_dot(path: impl AsRef<Path>) -> PathBuf {
+     let mut components = path.as_ref().components().collect::<Vec<_>>();
+ 
+@@ -102,10 +178,16 @@
+     Ok(())
+ }
+ 
+-fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<u64> {
++fn copy_dir_all(
++    src: impl AsRef<Path>,
++    dst: impl AsRef<Path>,
++    boundary: Option<&Path>,
++) -> io::Result<u64> {
+     trace!("Creating directory: {:?}", dst.as_ref());
+-    fs::create_dir_all(&dst)?;
+-    trace!("Successfully created directory: {:?}", dst.as_ref());
++    match boundary {
++        Some(root) => create_dir_all_within(root, dst.as_ref())?,
++        None => fs::create_dir_all(&dst)?,
++    }
+ 
+     trace!("Reading source directory: {:?}", src.as_ref());
+     let mut total_size = 0;
+@@ -121,28 +203,23 @@
+ 
+         let size: u64 = if ty.is_dir() {
+             trace!("Copying subdirectory: {:?}", entry.path());
+-            let subdir_size = copy_dir_all(entry.path(), dest_path)?;
++            let subdir_size = copy_dir_all(entry.path(), dest_path, boundary)?;
+             dirs_copied += 1;
+-            trace!(
+-                "Successfully copied subdirectory: {:?} ({} bytes)",
+-                entry_name, subdir_size
+-            );
+             subdir_size
+         } else if ty.is_symlink() {
+             trace!("Copying symlink: {:?}", entry.path());
+             remove_existing_symlink(&dest_path)?;
+             symlink(fs::read_link(entry.path())?, dest_path)?;
+             symlinks_copied += 1;
+-            trace!("Successfully copied symlink: {:?}", entry_name);
+             0
+         } else {
+             trace!("Copying file: {:?}", entry.path());
++            // On restore, don't follow a pre-existing dest symlink.
++            if boundary.is_some() {
++                remove_existing_symlink(&dest_path)?;
++            }
+             let file_size = fs::copy(entry.path(), dest_path)?;
+             files_copied += 1;
+-            trace!(
+-                "Successfully copied file: {:?} ({} bytes)",
+-                entry_name, file_size
+-            );
+             file_size
+         };
+         total_size += size;
+diff -ruN '--exclude=.git' inject/packages/nx/src/native/cache/http_remote_cache.rs variants/check_after_delete/packages/nx/src/native/cache/http_remote_cache.rs
+--- a/packages/nx/src/native/cache/http_remote_cache.rs	2026-10-23 03:30:49.326425162 +0000
++++ b/packages/nx/src/native/cache/http_remote_cache.rs	2026-10-23 03:31:03.817807235 +0000
+@@ -193,9 +193,24 @@
+         cache_directory: String,
+         hash: String,
+     ) -> anyhow::Result<CachedResult> {
+-        let content = response.bytes().await.unwrap();
++        let content = response
++            .bytes()
++            .await
++            .map_err(|e| anyhow::anyhow!("Failed to read remote cache response body: {}", e))?;
+         trace!("Downloaded {} bytes from remote cache", content.len());
+-        let tar = flate2::read::GzDecoder::new(content.as_ref());
++        Self::extract_tarball(content.as_ref(), &cache_directory, &hash)
++    }
++
++    /// Extract a gzipped cache tarball into `<cache_directory>/<hash>`.
++    ///
++    /// Uses `tar`'s `unpack_in` so a malicious cache server can't escape
++    /// `output_dir` via `..`, absolute paths, or symlinks.
++    fn extract_tarball(
++        content: &[u8],
++        cache_directory: &str,
++        hash: &str,
++    ) -> anyhow::Result<CachedResult> {
++        let tar = flate2::read::GzDecoder::new(content);
+         let mut archive = Archive::new(tar);
+         let entries = archive
+             .entries() // Get the entries in the archive
+@@ -205,7 +220,9 @@
+         let mut terminal_output: Option<String> = None;
+         let mut size: i64 = 0;
+ 
+-        let output_dir = Path::new(&cache_directory).join(&hash);
++        let output_dir = Path::new(cache_directory).join(hash);
++        // `unpack_in` canonicalizes `output_dir`, so it must exist beforehand.
++        fs::create_dir_all(&output_dir)?;
+ 
+         // Extract the archive to the specified cache directory
+         for entry in entries {
+@@ -214,12 +231,18 @@
+ 
+             let entry_path = entry
+                 .path()
+-                .map(|p| p.to_string_lossy().into_owned())
+-                .unwrap();
++                .map_err(|e| anyhow::anyhow!("Invalid entry path in cache artifact: {}", e))?
++                .to_string_lossy()
++                .into_owned();
+ 
+             if entry_path == "code" {
+                 let code_file_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
+-                code = Some(i16::from_be_bytes([code_file_bytes[0], code_file_bytes[1]]));
++                // The exit code is stored as a 4-byte big-endian integer (see `store`).
++                let code_bytes: [u8; 4] = code_file_bytes
++                    .as_slice()
++                    .try_into()
++                    .map_err(|_| anyhow::anyhow!("Invalid exit code in cache artifact"))?;
++                code = Some(u32::from_be_bytes(code_bytes) as i16);
+                 trace!("Retrieved exit code from cache: {}", code.unwrap());
+             } else if entry_path == "terminalOutput" {
+                 let terminal_output_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
+@@ -233,27 +256,35 @@
+                     terminal_output_size
+                 );
+             } else {
+-                let path_on_disk = output_dir.join(entry_path);
+-                trace!("Extracting entry to {}", path_on_disk.display());
+-                fs::create_dir_all(path_on_disk.parent().expect("This will have a parent, we just joined it above so there is at least one dir."))?;
+-                // Ensure the directory exists before extracting
+-                match entry.unpack(&path_on_disk) {
+-                    Err(e) => {
+-                        return Err(anyhow::anyhow!("Failed to unpack entry: {}", e));
+-                    }
+-                    Ok(f) => match f {
+-                        tar::Unpacked::File(f) => size += f.metadata()?.len() as i64,
+-                        _ => (),
+-                    },
++                trace!(
++                    "Extracting entry {} into {}",
++                    entry_path,
++                    output_dir.display()
++                );
++                let is_file = entry.header().entry_type().is_file();
++                let entry_size = entry.size();
++                // Reject entries `unpack_in` skips (`..`) or refuses (symlink escape).
++                let unpacked = entry
++                    .unpack_in(&output_dir)
++                    .map_err(|e| anyhow::anyhow!("Failed to unpack entry: {}", e))?;
++                if !unpacked {
++                    return Err(anyhow::anyhow!(
++                        "Refusing to extract cache entry with unsafe path: {}",
++                        entry_path
++                    ));
++                }
++                if is_file {
++                    size += entry_size as i64;
+                 }
+             }
+         }
+ 
+         trace!("Extracted tarball to {}", output_dir.display());
+ 
++        let code = code.ok_or_else(|| anyhow::anyhow!("Exit code not found in cache artifact"))?;
+         Ok(CachedResult {
+             terminal_output,
+-            code: code.expect("Exit code not found in cache"),
++            code,
+             outputs_path: output_dir.to_string_lossy().into_owned(),
+             size: Some(size),
+         })
+@@ -273,9 +304,16 @@
+             .await;
+         match response {
+             Ok(resp) => match resp.status() {
+-                StatusCode::OK => Ok(Some(
+-                    Self::download_and_extract_legacy(resp, cache_directory, hash).await?,
+-                )),
++                StatusCode::OK => {
++                    let content = resp.bytes().await.map_err(|e| {
++                        anyhow::anyhow!("Failed to read remote cache response body: {}", e)
++                    })?;
++                    Ok(Some(Self::extract_tarball(
++                        content.as_ref(),
++                        cache_directory,
++                        hash,
++                    )?))
++                }
+                 StatusCode::NOT_FOUND => Ok(None),
+                 _ => Err(convert_response_to_error(resp).await.into()),
+             },
+@@ -283,66 +321,4 @@
+         }
+     }
+ 
+-    /// Legacy responses are read with their own extractor so the two protocol
+-    /// versions can change independently of each other.
+-    async fn download_and_extract_legacy(
+-        response: reqwest::Response,
+-        cache_directory: &str,
+-        hash: &str,
+-    ) -> anyhow::Result<CachedResult> {
+-        let content = response.bytes().await.unwrap();
+-        trace!("Downloaded {} bytes from legacy remote cache", content.len());
+-        let tar = flate2::read::GzDecoder::new(content.as_ref());
+-        let mut archive = Archive::new(tar);
+-        let entries = archive
+-            .entries()
+-            .map_err(|_| anyhow::anyhow!("Failed to read entries from tarball"))?;
+-
+-        let mut code: Option<i16> = None;
+-        let mut terminal_output: Option<String> = None;
+-        let mut size: i64 = 0;
+-
+-        let output_dir = Path::new(cache_directory).join(hash);
+-
+-        for entry in entries {
+-            let mut entry =
+-                entry.map_err(|_| anyhow::anyhow!("Failed to read entry from tarball"))?;
+-
+-            let entry_path = entry
+-                .path()
+-                .map(|p| p.to_string_lossy().into_owned())
+-                .unwrap();
+-
+-            if entry_path == "code" {
+-                let code_file_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
+-                code = Some(i16::from_be_bytes([code_file_bytes[0], code_file_bytes[1]]));
+-            } else if entry_path == "terminalOutput" {
+-                let terminal_output_bytes = entry.bytes().collect::<Result<Vec<u8>, _>>()?;
+-                let terminal_output_size = terminal_output_bytes.len();
+-                terminal_output = Some(String::from_utf8(terminal_output_bytes)?);
+-                size += terminal_output_size as i64;
+-            } else {
+-                let path_on_disk = output_dir.join(entry_path);
+-                trace!("Extracting entry to {}", path_on_disk.display());
+-                fs::create_dir_all(path_on_disk.parent().expect("joined path has a parent"))?;
+-                match entry.unpack(&path_on_disk) {
+-                    Err(e) => {
+-                        return Err(anyhow::anyhow!("Failed to unpack entry: {}", e));
+-                    }
+-                    Ok(f) => match f {
+-                        tar::Unpacked::File(f) => size += f.metadata()?.len() as i64,
+-                        _ => (),
+-                    },
+-                }
+-            }
+-        }
+-
+-        Ok(CachedResult {
+-            terminal_output,
+-            code: code.expect("Exit code not found in cache"),
+-            outputs_path: output_dir.to_string_lossy().into_owned(),
+-            size: Some(size),
+-        })
+-    }
+-
+ }

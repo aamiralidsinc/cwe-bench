@@ -1,0 +1,131 @@
+diff --git a/cli/cmd/configserver/configserver.go b/cli/cmd/configserver/configserver.go
+index 18fa8273..a4700989 100644
+--- a/cli/cmd/configserver/configserver.go
++++ b/cli/cmd/configserver/configserver.go
+@@ -3,7 +3,11 @@ package configserver
+ import (
+ 	"context"
+ 	"fmt"
++	"net/http"
++	"net/url"
+ 	"os"
++	"strconv"
++	"strings"
+ 
+ 	"github.com/99designs/gqlgen/graphql"
+ 	"github.com/docker/docker/client"
+@@ -80,6 +84,47 @@ func Command() *cli.Command {
+ 	}
+ }
+ 
++// isDashboardOrigin accepts only the origins the local dashboard is served
++// from: <subdomain>.dashboard.local.nhost.run (one DNS label) or
++// local.dashboard.nhost.run, over http or https, on any port.
++func isDashboardOrigin(origin string) bool {
++	u, err := url.Parse(origin)
++	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
++		return false
++	}
++
++	if u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
++		return false
++	}
++
++	if p := u.Port(); p != "" {
++		if _, err := strconv.ParseUint(p, 10, 16); err != nil {
++			return false
++		}
++	}
++
++	host := u.Hostname()
++	if host == "local.dashboard.nhost.run" {
++		return true
++	}
++
++	sub, ok := strings.CutSuffix(host, ".dashboard.local.nhost.run")
++
++	return ok && sub != "" && !strings.ContainsAny(sub, "./")
++}
++
++func dashboardCORS() gin.HandlerFunc {
++	return cors.New(cors.Options{ //nolint:exhaustruct
++		AllowOriginFunc: isDashboardOrigin,
++		AllowedMethods: []string{
++			http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch,
++			http.MethodDelete, http.MethodHead,
++		},
++		AllowedHeaders:   []string{"*"},
++		AllowCredentials: true,
++	})
++}
++
+ func dummyMiddleware(
+ 	ctx context.Context,
+ 	_ any,
+@@ -167,7 +212,7 @@ func serve(_ context.Context, cmd *cli.Command) error {
+ 		cmd.Root().Version,
+ 		[]graphql.FieldMiddleware{},
+ 		gin.Recovery(),
+-		cors.Default(),
++		dashboardCORS(),
+ 	)
+ 
+ 	if err := setupLogsAPI(
+diff --git a/cli/cmd/configserver/local.go b/cli/cmd/configserver/local.go
+index efda8d02..d8576a07 100644
+--- a/cli/cmd/configserver/local.go
++++ b/cli/cmd/configserver/local.go
+@@ -19,6 +19,9 @@ const zeroUUID = "00000000-0000-0000-0000-000000000000"
+ 
+ var ErrNotImpl = errors.New("not implemented")
+ 
++// maskedSecret stands in for every secret value the service holds in memory.
++const maskedSecret = "********"
++
+ type Local struct {
+ 	// we use paths instead of readers/writers because the intention is that these
+ 	// files will be mounted as volumes in a container and if the file is changed
+@@ -104,6 +107,12 @@ func (l *Local) GetApps(
+ 		)
+ 	}
+ 
++	// The service never hands out real secret values: keep only the names in
++	// memory; UpdateSecrets restores the stored values for untouched entries.
++	for _, s := range secrets {
++		s.Value = maskedSecret
++	}
++
+ 	services, err := l.GetServices(runServicesFiles)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get services: %w", err)
+@@ -162,8 +171,30 @@ func (l *Local) UpdateSystemConfig(_ context.Context, _, _ *graph.App, _ logrus.
+ }
+ 
+ func (l *Local) UpdateSecrets(_ context.Context, _, newApp *graph.App, _ logrus.FieldLogger) error {
++	stored := map[string]string{}
++	if b, err := os.ReadFile(l.secrets); err == nil {
++		var current model.Secrets
++		if err := env.Unmarshal(b, &current); err != nil {
++			return fmt.Errorf("failed to parse secrets file: %w", err)
++		}
++
++		for _, s := range current {
++			stored[s.Name] = s.Value
++		}
++	} else if !errors.Is(err, os.ErrNotExist) {
++		return fmt.Errorf("failed to read secrets file: %w", err)
++	}
++
+ 	m := make(map[string]string)
+ 	for _, v := range newApp.Secrets {
++		if v.Value == maskedSecret {
++			if old, ok := stored[v.Name]; ok {
++				m[v.Name] = old
++			}
++
++			continue
++		}
++
+ 		m[v.Name] = v.Value
+ 	}
+ 

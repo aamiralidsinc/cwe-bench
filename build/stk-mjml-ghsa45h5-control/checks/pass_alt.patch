@@ -1,0 +1,200 @@
+--- a/packages/mjml-parser-xml/src/index.js
++++ b/packages/mjml-parser-xml/src/index.js
+@@ -56,6 +56,54 @@
+     }
+   }
+ 
++  const includeRoot = options.includeRoot || fs.realpathSync(path.resolve(cwd))
++
++  const isPathInsideIncludeRoot = absolutePath => {
++    let realTarget
++    try {
++      realTarget = fs.realpathSync(absolutePath)
++    } catch (e) {
++      if (e.code !== 'ENOENT') return false
++      let dir = path.dirname(absolutePath)
++      let rest = path.basename(absolutePath)
++      while (!fs.existsSync(dir) && path.dirname(dir) !== dir) {
++        rest = path.join(path.basename(dir), rest)
++        dir = path.dirname(dir)
++      }
++      try {
++        realTarget = path.join(fs.realpathSync(dir), rest)
++      } catch (err) {
++        return false
++      }
++    }
++    const relative = path.relative(includeRoot, realTarget)
++    return (
++      relative === '' ||
++      (relative !== '..' &&
++        !relative.startsWith(`..${path.sep}`) &&
++        !path.isAbsolute(relative))
++    )
++  }
++
++  const denyInclude = (line) => {
++    if (!cur) return
++    cur.children.push({
++      line,
++      file: actualPath,
++      absoluteFilePath: path.resolve(cwd, actualPath),
++      parent: cur,
++      tagName: 'mj-raw',
++      content: '<!-- mj-include denied -->',
++      children: [],
++      errors: [
++        {
++          type: 'include-denied',
++          params: {},
++        },
++      ],
++    })
++  }
++
+   let mjml = null
+   let cur = null
+   let inInclude = !!includedIn.length
+@@ -69,8 +117,13 @@
+     const partialPath = path.resolve(cwd, file)
+     const curBeforeInclude = cur
+ 
++    if (!isPathInsideIncludeRoot(partialPath)) {
++      denyInclude(line)
++      return
++    }
++
+     if (find(cur.includedIn, { file: partialPath }))
+-      throw new Error(`Circular inclusion detected on file : ${partialPath}`)
++      throw new Error(`Circular inclusion detected on file : ${file}`)
+ 
+     let content
+ 
+@@ -83,7 +135,7 @@
+         absoluteFilePath: path.resolve(cwd, actualPath),
+         parent: cur,
+         tagName: 'mj-raw',
+-        content: `<!-- mj-include fails to read file : ${file} at ${partialPath} -->`,
++        content: `<!-- mj-include fails to read file : ${file} -->`,
+         children: [],
+         errors: [
+           {
+@@ -108,6 +160,7 @@
+         ...options,
+         filePath: partialPath,
+         actualPath: partialPath,
++        includeRoot,
+       },
+       [
+         ...cur.includedIn,
+--- a/packages/mjml-validator/src/rules/errorAttr.js
++++ b/packages/mjml-validator/src/rules/errorAttr.js
+@@ -8,13 +8,12 @@
+   return errors.map(error => {
+     switch (error.type) {
+       case 'include': {
+-        const { file, partialPath } = error.params
++        const { file } = error.params
+ 
+-        return ruleError(
+-          `mj-include fails to read file : ${file} at ${partialPath}`,
+-          element,
+-        )
++        return ruleError(`mj-include fails to read file : ${file}`, element)
+       }
++      case 'include-denied':
++        return ruleError('mj-include denied', element)
+       default:
+         return null
+     }
+--- a/packages/mjml-validator/src/rules/ruleError.js
++++ b/packages/mjml-validator/src/rules/ruleError.js
+@@ -1,3 +1,8 @@
++import path from 'path'
++
++const displayName = file =>
++  typeof file === 'string' && file ? path.basename(file) : file
++
+ function formatInclude(element) {
+   const { includedIn } = element
+   if (!(includedIn && includedIn.length)) return ''
+@@ -5,7 +10,7 @@
+   const formattedIncluded = includedIn
+     .slice()
+     .reverse()
+-    .map(({ line, file }) => `line ${line} of file ${file}`)
++    .map(({ line, file }) => `line ${line} of file ${displayName(file)}`)
+     .join(', itself included at ')
+ 
+   return `, included at ${formattedIncluded}`
+@@ -18,7 +23,7 @@
+     line,
+     message,
+     tagName,
+-    formattedMessage: `Line ${line} of ${absoluteFilePath}${formatInclude(
++    formattedMessage: `Line ${line} of ${displayName(absoluteFilePath)}${formatInclude(
+       element,
+     )} (${tagName}) — ${message}`,
+   }
+--- a/packages/mjml-cli/src/helpers/fileContext.js
++++ b/packages/mjml-cli/src/helpers/fileContext.js
+@@ -6,6 +6,33 @@
+ const ensureIncludeIsMJMLFile = file =>
+   (file.trim().match(/.mjml/) && file) || `${file}.mjml`
+ const error = e => console.error(e.stack || e) // eslint-disable-line no-console
++
++const isPathInside = (root, target) => {
++  let realTarget
++  try {
++    realTarget = fs.realpathSync(target)
++  } catch (e) {
++    if (e.code !== 'ENOENT') return false
++    let dir = path.dirname(target)
++    let rest = path.basename(target)
++    while (!fs.existsSync(dir) && path.dirname(dir) !== dir) {
++      rest = path.join(path.basename(dir), rest)
++      dir = path.dirname(dir)
++    }
++    try {
++      realTarget = path.join(fs.realpathSync(dir), rest)
++    } catch (err) {
++      return false
++    }
++  }
++  const relative = path.relative(root, realTarget)
++  return (
++    relative === '' ||
++    (relative !== '..' &&
++      !relative.startsWith(`..${path.sep}`) &&
++      !path.isAbsolute(relative))
++  )
++}
+ 
+ export default (baseFile, filePath) => {
+   const filesIncluded = []
+@@ -55,11 +82,23 @@
+ 
+       const includedFilePath = path.resolve(path.join(targetDir, includedFile))
+ 
+-      filesIncluded.push(includedFilePath)
++      if (isPathInside(includeRoot, includedFilePath)) {
++        filesIncluded.push(includedFilePath)
+ 
+-      readIncludes(targetDir, includedFile, currentFile)
++        readIncludes(targetDir, includedFile, currentFile)
++      }
+       matchgroup = includes.exec(content)
+     }
++  }
++
++  const rootDirectory = path.resolve(
++    filePath ? filePathDirectory : path.dirname(path.resolve(baseFile)),
++  )
++  let includeRoot
++  try {
++    includeRoot = fs.realpathSync(rootDirectory)
++  } catch (e) {
++    includeRoot = rootDirectory
+   }
+ 
+   readIncludes(null, baseFile, baseFile)

@@ -1,0 +1,106 @@
+diff --git a/urllib3/poolmanager.py b/urllib3/poolmanager.py
+index ca336748..74b1ebc5 100644
+--- a/urllib3/poolmanager.py
++++ b/urllib3/poolmanager.py
+@@ -9,6 +9,7 @@ from .connectionpool import port_by_scheme
+ from .exceptions import LocationValueError, MaxRetryError, ProxySchemeUnknown
+ from .packages.six.moves.urllib.parse import urljoin
+ from .request import RequestMethods
++from .util.redirect import is_cross_origin, remove_credential_headers
+ from .util.url import parse_url
+ from .util.retry import Retry
+ 
+@@ -313,7 +314,7 @@ class PoolManager(RequestMethods):
+         kw['assert_same_host'] = False
+         kw['redirect'] = False
+         if 'headers' not in kw:
+-            kw['headers'] = self.headers
++            kw['headers'] = self.headers.copy()
+ 
+         if self.proxy is not None and u.scheme == "http":
+             response = conn.urlopen(method, url, **kw)
+@@ -331,6 +332,13 @@ class PoolManager(RequestMethods):
+         if response.status == 303:
+             method = 'GET'
+ 
++        # A redirect to a different origin must not carry the credentials the
++        # caller attached for the original one. The comparison is between the
++        # request URL and the redirect target, not the connection pool: a
++        # proxied request reuses the proxy's pool for every origin.
++        if is_cross_origin(url, redirect_location):
++            kw['headers'] = remove_credential_headers(dict(kw['headers']))
++
+         retries = kw.get('retries')
+         if not isinstance(retries, Retry):
+             retries = Retry.from_int(retries, redirect=redirect)
+diff --git a/urllib3/util/redirect.py b/urllib3/util/redirect.py
+new file mode 100644
+index 00000000..8d747d2c
+--- /dev/null
++++ b/urllib3/util/redirect.py
+@@ -0,0 +1,65 @@
++from __future__ import absolute_import
++
++from ..packages.six.moves.urllib.parse import urljoin
++
++from .url import parse_url
++
++
++#: Request headers that carry the caller's credentials for one origin and
++#: therefore must not be replayed against another origin.
++DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(['authorization', 'cookie'])
++
++#: Port implied by each scheme when the URL does not spell it out.
++DEFAULT_PORTS = {'http': 80, 'https': 443}
++
++
++def normalize_origin(scheme, host, port):
++    """Return a comparable ``(scheme, host, port)`` tuple for one origin.
++
++    The scheme and host are case-insensitive and an omitted port takes the
++    scheme's default, so ``HTTPS://Example.COM/`` and
++    ``https://example.com:443/`` name the same origin.
++    """
++    scheme = (scheme or 'http').lower()
++    if port is None:
++        port = DEFAULT_PORTS.get(scheme)
++    return (scheme, (host or '').lower(), port)
++
++
++def origin(url):
++    """Return the origin tuple of an absolute *url*, or ``None`` if it has no host."""
++    parts = parse_url(url)
++    if not parts.host:
++        return None
++    return normalize_origin(parts.scheme, parts.host, parts.port)
++
++
++def is_cross_origin(base_url, redirect_url, base_origin=None):
++    """Report whether *redirect_url* leaves the origin of *base_url*.
++
++    *redirect_url* is resolved against *base_url* first, so relative locations
++    stay on the same origin. When *base_url* is itself relative (a plain path
++    handed to a connection pool) *base_origin* supplies the origin it belongs
++    to.
++    """
++    resolved = urljoin(base_url, redirect_url)
++    source = origin(base_url) or base_origin
++    target = origin(resolved) or base_origin
++    return source != target
++
++
++def remove_credential_headers(headers, header_names=None):
++    """Drop the credential headers in *header_names* from *headers* in place.
++
++    Header names are matched case-insensitively. The caller must pass a dict it
++    owns: callers of the request methods often keep and reuse theirs.
++    """
++    if not headers:
++        return headers
++    if header_names is None:
++        header_names = DEFAULT_REMOVE_HEADERS_ON_REDIRECT
++    names = frozenset(name.lower() for name in header_names)
++    for name in list(headers.keys()):
++        if name.lower() in names:
++            headers.pop(name, None)
++    return headers

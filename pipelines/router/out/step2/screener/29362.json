@@ -1,0 +1,111 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "29362",
+  "advisory_ids": ["GHSA-4MRV-5P47-P938", "CVE-2026-54522"],
+  "repo": "msgpack/msgpack-ruby",
+  "pinned_commit": "cce24855888162cee947436693e8107a5d187853",
+  "fix_commits": ["5627d71606b565641d2dd501b82aae862f4abe90"],
+  "trust_decision": {
+    "summary": "Trusted: the advisory and its one-hunk fix match the pinned code - when the chunk list becomes empty, _msgpack_buffer_shift_chunk resets tail_buffer_end and read_buffer but leaves rmem_last/rmem_end/rmem_owner pointing into a page the just-destroyed chunk already returned to the process-global rmem pool, so the next small write memcpy's into, and later reads back, a page another buffer can own.",
+    "evidence": [
+      "ext/msgpack/buffer.c:128-149",
+      "ext/msgpack/buffer.c:58-75",
+      "ext/msgpack/buffer.c:344-383",
+      "ext/msgpack/rmem.c:39-92",
+      "fix.diff:9-17"
+    ]
+  },
+  "landing_point": {
+    "where": "ext/msgpack/buffer.c:151-156",
+    "why": "The advisory names MessagePack::Buffer#clear; msgpack_buffer_clear is the only function that loops _msgpack_buffer_shift_chunk, and the three added lines go into that helper's empty branch, so an engineer reading only the summary looks at #clear's implementation and the chunk-teardown loop it drives."
+  },
+  "fix_sites": [
+    {
+      "where": "ext/msgpack/buffer.c:135-137",
+      "entry_point": "MessagePack::Buffer#clear (ext/msgpack/buffer_class.c:254) via msgpack_buffer_clear (ext/msgpack/buffer.c:151)",
+      "module_kind": "C extension core, buffer chunk-list bookkeeping"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "The advisory and the added test are about Buffer#clear, and after partial consumption the buffer is not empty, so a solver can argue the property only covers the clear/empty transition and that a read/skip path which merely consumes a chunk is a different, unsupported scenario.",
+  "O4_distance": {"files": 5, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "An io-backed Buffer and its configured read_reference_threshold / write_reference_threshold / io_buffer_size must survive clear/reset: the empty branch deliberately resets only tail_buffer_end and read_buffer, while msgpack_buffer_init (a full memset) and msgpack_buffer_reset both drop io (b->io = Qnil), so a fix that zeroes the struct also disables the io flush path and the thresholds.",
+    "where": "ext/msgpack/buffer.c:132-138"
+  },
+  "O6_input_shapes": [
+    "strings longer than write_reference_threshold, stored as zero-copy mapped chunks (ext/msgpack/buffer.c:300-328)",
+    "strings shorter than write_reference_threshold, copied into an rmem page (ext/msgpack/buffer.h:238-251)",
+    "writes whose running total crosses MSGPACK_RMEM_PAGE_SIZE, producing several chunks and giving unused tail page space back at ext/msgpack/buffer.c:287-291",
+    "#clear versus a consuming #read/#skip/#write_to that drains the same chunks",
+    "a second buffer with a different write_reference_threshold (4096) whose large write is copied into an rmem page that the pool may share"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "ext/msgpack/buffer.c:351-374 - the buffer caches a partially used rmem page in rmem_last/rmem_end/rmem_owner and lazily re-derives ownership through the process-global page cache at ext/msgpack/rmem.c:39-92",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Buffer#read(n)/#read_all(n)/#skip/#skip_all (also #write_to and #flush) consume the rmem-backed chunk while other chunks remain: the non-empty branch of _msgpack_buffer_shift_chunk frees the page via _msgpack_buffer_chunk_destroy but does not reset rmem_last/rmem_end/rmem_owner, so the next small #write takes the reuse branch and writes into a page the global pool has already handed (or will hand) to another buffer - the same sink the fix hardens for the empty case.",
+      "where": "ext/msgpack/buffer.c:140-148",
+      "reason_to_dismiss": "The report and its test are about #clear; here the buffer is not empty after the read/skip, and the leftover rmem space is a documented buffer-local optimisation, so the route can be argued to be out of the advisory's clear/empty scope.",
+      "distance": "same file, ~10 lines below the fixed branch; the reaching entry points are in ext/msgpack/buffer_class.c:476-533 and the inline consumption in ext/msgpack/buffer.h:286-292",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "ext/msgpack/buffer.c:58-75",
+      "sibling": "invalidate rmem_last/rmem_end/rmem_owner inside _msgpack_buffer_chunk_destroy when the destroyed chunk is the one that owns the cached page",
+      "why_realistic": "the function already frees the rmem page and carries a comment asserting *rmem_owner stays valid, so a maintainer fixing the UAF at its origin would naturally patch here instead of only in the empty branch"
+    },
+    {
+      "where": "ext/msgpack/buffer.c:287-291",
+      "sibling": "verify the page being handed back is still owned by this buffer before doing b->rmem_last -= unused",
+      "why_realistic": "this is the third place rmem_last is moved without re-establishing ownership; the rmem_last == tail_buffer_end equality silently trusts buffer-local state that a chunk move already invalidated"
+    },
+    {
+      "where": "ext/msgpack/packer.c:118-139",
+      "sibling": "the recursive ext-type path saves the whole msgpack_buffer_t by value, re-inits it for the nested pack and restores it, swapping rmem_owner/rmem_last/rmem_end across a nested serialisation",
+      "why_realistic": "a maintainer hardening the clear path would plausibly harden this state save/restore too, and the by-value copy keeps an rmem_owner pointer into the restored struct"
+    },
+    {
+      "where": "ext/java/org/msgpack/jruby/Buffer.java:84-90",
+      "sibling": "the JRuby Buffer#clear implementation",
+      "why_realistic": "same public class implemented twice in-tree, so a sibling here is realistic as a decoy; it is GC-managed and has no equivalent stale-page hazard"
+    }
+  ],
+  "O9_family": "use-after-free / stale pointer into a released pooled page (CWE-416), surfacing as cross-buffer memory disclosure",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C (MRI Ruby extension; a JRuby Java implementation is also in tree)",
+    "toolchain": "Ruby >= 2.5 with headers, a C compiler, rake-compiler + mkmf via ext/msgpack/extconf.rb, rspec; a rake spec:valgrind task using ruby_memcheck exists",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "spec/cruby/buffer_spec.rb (incl. the ObjectSpace.memsize_of case after read_all and the GC.stress case) and spec/cruby/buffer_io_spec.rb (incl. 'random write and clear'); run with bundle exec rake spec (Rakefile:17-18, Rakefile:62-68)"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "ext/msgpack/buffer.c",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Zero the buffer with msgpack_buffer_init/memset in the empty branch of _msgpack_buffer_shift_chunk, which also resets io, io_buffer and the reference thresholds and breaks io-backed Buffers."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "repo_mb was not measured (no shell in this session); the tracked tree is about 100 files with no large fixture directories, so 'tiny_repo' is inferred from that listing rather than measured.",
+    "The O8 partial-consumption route was established by reading the chunk/rmem ownership logic, not by running code (running the project is out of scope), so it is unconfirmed dynamically.",
+    "present_in_latest is unknown for the O8 route: no later tree or release was provided for this advisory."
+  ]
+}

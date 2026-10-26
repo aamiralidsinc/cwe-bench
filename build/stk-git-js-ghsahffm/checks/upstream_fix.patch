@@ -1,0 +1,242 @@
+--- a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -1,26 +1,159 @@
++import { readFileSync } from 'fs';
++import { isAbsolute, resolve as resolvePath } from 'path';
++
+ import type { SimpleGitPlugin } from './simple-git-plugin';
+ 
+ import { GitPluginError } from '../errors/git-plugin-error';
+ import type { SimpleGitPluginConfig } from '../types';
+ 
+-function isConfigSwitch(arg: string) {
+-   return arg.trim().toLowerCase() === '-c';
+-}
++type ConfigAssignment = {
++   key: string;
++   value: string;
++};
++
++const configSwitches = new Set(['-c', '--config', '--config-env']);
++const configSwitchWithValue = /^(?:--config|--config-env)=(.*)$/i;
++const configSwitchAttached = /^-c([^=].*)$/;
++const protocolAllow = /^\s*protocol(\.[a-z0-9_-]+)?\.allow/i;
++const unsafeRemoteCommand = /^--(?:upload|receive)-pack(?:=|$)/i;
++const unsafeConfigKey =
++   /^\s*(?:alias|core\.askpass|core\.editor|core\.fsmonitor|core\.gitproxy|core\.hookspath|core\.pager|core\.sshcommand|diff\.external|init\.templatedir|sequence\.editor)(?:\.|$)/i;
++const unsafeConfigSubkey =
++   /^\s*(?:credential(\..+)?\.helper|diff(\..+)?\.(?:command|textconv)|filter(\..+)?\.(?:clean|smudge)|gpg(\..+)?\.program|merge(\..+)?\.driver|mergetool(\..+)?\.(?:path|cmd)|protocol(\..+)?\.allow|remote(\..+)?\.(?:uploadpack|receivepack))(?:\.|$)/i;
++
++const configValueOptions = new Set(['--file', '-f', '--blob', '--type', '--default', '--comment']);
++const configReadOptions = new Set([
++   '--get',
++   '--get-all',
++   '--get-regexp',
++   '--get-urlmatch',
++   '--list',
++   '-l',
++   '--show-origin',
++   '--show-scope',
++   '--name-only',
++   '--includes',
++   '--no-includes',
++]);
++const configWriteOptions = new Set([
++   '--add',
++   '--replace-all',
++   '--unset',
++   '--unset-all',
++   '--rename-section',
++   '--remove-section',
++   '--edit',
++   '-e',
++]);
++
++const protocolMessage =
++   'Configuring protocol.allow is not permitted without enabling allowUnsafeProtocolOverride';
+ 
+-function preventProtocolOverride(arg: string, next: string) {
+-   if (!isConfigSwitch(arg)) {
++function asConfigAssignment(raw: string | undefined): ConfigAssignment | undefined {
++   if (!raw) {
+       return;
+    }
+ 
+-   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
++   const separator = raw.indexOf('=');
++   if (separator < 0) {
+       return;
+    }
+ 
+-   throw new GitPluginError(
+-      undefined,
+-      'unsafe',
+-      'Configuring protocol.allow is not permitted without enabling allowUnsafeExtProtocol'
+-   );
++   return {
++      key: raw.slice(0, separator).trim(),
++      value: raw.slice(separator + 1),
++   };
++}
++
++function configAssignments(args: string[]): ConfigAssignment[] {
++   const assignments: ConfigAssignment[] = [];
++
++   for (let index = 0; index < args.length; index++) {
++      const token = args[index].trim();
++      let raw: string | undefined;
++
++      if (configSwitches.has(token.toLowerCase())) {
++         raw = args[++index];
++      } else {
++         const match = configSwitchWithValue.exec(token) || configSwitchAttached.exec(token);
++         raw = match && match[1];
++      }
++
++      const assignment = asConfigAssignment(raw);
++      if (assignment) {
++         assignments.push(assignment);
++      }
++   }
++
++   return assignments;
++}
++
++function configWriteKeys(args: string[]): string[] {
++   let index = 0;
++
++   while (index < args.length && args[index].startsWith('-')) {
++      index += configSwitches.has(args[index].trim().toLowerCase()) ? 2 : 1;
++   }
++
++   if ((args[index] || '').toLowerCase() !== 'config') {
++      return [];
++   }
++
++   const positionals: string[] = [];
++   let read = false;
++   let write = false;
++
++   for (let position = index + 1; position < args.length; position++) {
++      const token = args[position];
++
++      if (token.startsWith('-')) {
++         const name = token.toLowerCase();
++         if (configValueOptions.has(name)) {
++            position++;
++         } else if (configWriteOptions.has(name)) {
++            write = true;
++         } else if (configReadOptions.has(name)) {
++            read = true;
++         }
++         continue;
++      }
++
++      positionals.push(token);
++   }
++
++   if (read || !positionals.length || (!write && positionals.length < 2)) {
++      return [];
++   }
++
++   return [positionals[0]];
++}
++
++
++function isUnsafeConfigKey(key: string): boolean {
++   return protocolAllow.test(key) || unsafeConfigKey.test(key) || unsafeConfigSubkey.test(key);
++}
++
++function envConfigValues(env: Record<string, string | undefined>): string[] {
++   const keys: string[] = [];
++   const count = parseInt(String(env.GIT_CONFIG_COUNT ?? env.git_config_count ?? '0'), 10);
++
++   for (let index = 0; index < count; index++) {
++      const key = env[`GIT_CONFIG_KEY_${index}`] ?? env[`git_config_key_${index}`];
++      if (key) {
++         keys.push(String(key));
++      }
++   }
++
++   return keys;
++}
++
++function envNamesUnsafeConfig(env: Record<string, string | undefined>): boolean {
++   if ((env.GIT_CONFIG_COUNT ?? env.git_config_count) !== undefined) {
++      return true;
++   }
++
++   const unsafeEnv = /^(?:editor|git_askpass|git_config|git_config_global|git_config_system|git_editor|git_exec_path|git_external_diff|git_pager|git_proxy_command|git_sequence_editor|git_ssh|git_ssh_command|git_template_dir|pager|prefix|ssh_askpass)$/i;
++   return Object.keys(env).some((name) => unsafeEnv.test(name));
+ }
+ 
+ export function blockUnsafeOperationsPlugin({
+@@ -28,11 +161,39 @@
+ }: SimpleGitPluginConfig['unsafe'] = {}): SimpleGitPlugin<'spawn.args'> {
+    return {
+       type: 'spawn.args',
+-      action(args, _context) {
+-         args.forEach((current, index) => {
+-            const next = index < args.length ? args[index + 1] : '';
+-
+-            allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
++      action(args, { env }) {
++         if (!allowUnsafeProtocolOverride && envNamesUnsafeConfig(env)) {
++            throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++         }
++
++         if (!allowUnsafeProtocolOverride) {
++            for (const key of envConfigValues(env)) {
++               if (isUnsafeConfigKey(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++               }
++            }
++
++            for (const { key, value } of configAssignments(args)) {
++               if (isUnsafeConfigKey(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++               }
++            }
++
++            for (const key of configWriteKeys(args)) {
++               if (protocolAllow.test(key)) {
++                  throw new GitPluginError(undefined, 'unsafe', protocolMessage);
++               }
++            }
++         }
++
++         args.forEach((arg) => {
++            if (unsafeRemoteCommand.test(arg.trim())) {
++               throw new GitPluginError(
++                  undefined,
++                  'unsafe',
++                  `Use of ${arg.trim().split('=')[0]} is not permitted`
++               );
++            }
+          });
+ 
+          return args;
+--- a/simple-git/src/lib/plugins/simple-git-plugin.ts
++++ b/simple-git/src/lib/plugins/simple-git-plugin.ts
+@@ -9,7 +9,9 @@
+ export interface SimpleGitPluginTypes {
+    'spawn.args': {
+       data: string[];
+-      context: SimpleGitTaskPluginContext & {};
++      context: SimpleGitTaskPluginContext & {
++         readonly env: Record<string, string | undefined>;
++      };
+    };
+    'spawn.options': {
+       data: Partial<SpawnOptions>;
+--- a/simple-git/src/lib/runners/git-executor-chain.ts
++++ b/simple-git/src/lib/runners/git-executor-chain.ts
+@@ -87,7 +87,7 @@
+       const args = this._plugins.exec(
+          'spawn.args',
+          [...task.commands],
+-         pluginContext(task, task.commands)
++         { ...pluginContext(task, task.commands), env: this.env || process.env }
+       );
+ 
+       const raw = await this.gitResponse(

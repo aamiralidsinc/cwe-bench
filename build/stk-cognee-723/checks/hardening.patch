@@ -1,0 +1,141 @@
+diff --git a/cognee/api/v1/settings/routers/get_settings_router.py b/cognee/api/v1/settings/routers/get_settings_router.py
+index da9b315..8c485cf 100644
+--- a/cognee/api/v1/settings/routers/get_settings_router.py
++++ b/cognee/api/v1/settings/routers/get_settings_router.py
+@@ -1,6 +1,8 @@
+-from fastapi import APIRouter
++from fastapi import APIRouter, HTTPException
+ from cognee.api.DTO import InDTO, OutDTO
+ from typing import Union, Optional, Literal
++
++from pydantic import field_validator
+ from cognee.modules.users.methods import get_authenticated_user
+ from fastapi import Depends
+ from cognee.modules.users.models import User
+@@ -20,7 +22,14 @@ class SettingsDTO(OutDTO):
+     vector_db: VectorDBConfigOutputDTO
+ 
+ 
+-class LLMConfigInputDTO(InDTO):
++class _CleanKeyMixin(InDTO):
++    @field_validator("api_key", check_fields=False)
++    @classmethod
++    def _clean_api_key(cls, value: str) -> str:
++        return value.strip()
++
++
++class LLMConfigInputDTO(_CleanKeyMixin):
+     provider: Union[
+         Literal["openai"],
+         Literal["ollama"],
+@@ -32,7 +41,7 @@ class LLMConfigInputDTO(InDTO):
+     api_key: str
+ 
+ 
+-class VectorDBConfigInputDTO(InDTO):
++class VectorDBConfigInputDTO(_CleanKeyMixin):
+     provider: Union[
+         Literal["lancedb"],
+         Literal["pgvector"],
+@@ -90,8 +99,15 @@ def get_settings_router() -> APIRouter:
+ 
+         ## Error Codes
+         - **400 Bad Request**: Invalid settings provided
++        - **403 Forbidden**: Caller is not a superuser
+         - **500 Internal Server Error**: Error saving settings
+         """
++        if not getattr(user, "is_superuser", False):
++            raise HTTPException(
++                status_code=403,
++                detail="Superuser privileges required to modify settings",
++            )
++
+         from cognee.modules.settings import save_llm_config, save_vector_db_config
+ 
+         if new_settings.llm is not None:
+diff --git a/cognee/api/v1/users/routers/get_register_router.py b/cognee/api/v1/users/routers/get_register_router.py
+index 8857b01..64c2eb0 100644
+--- a/cognee/api/v1/users/routers/get_register_router.py
++++ b/cognee/api/v1/users/routers/get_register_router.py
+@@ -1,6 +1,24 @@
++import os
++
++from fastapi import APIRouter, HTTPException
++
+ from cognee.modules.users.get_fastapi_users import get_fastapi_users
+ from cognee.modules.users.models.User import UserRead, UserCreate
++from cognee.modules.users.methods.get_authenticated_user import REQUIRE_AUTHENTICATION
++
++
++def _public_registration_enabled() -> bool:
++    return os.environ.get("COGNEE_PUBLIC_REGISTRATION_ENABLED", "").lower() in ("true", "1", "yes")
+ 
+ 
+ def get_register_router():
++    if REQUIRE_AUTHENTICATION and not _public_registration_enabled():
++        disabled_router = APIRouter()
++
++        @disabled_router.post("/register")
++        async def register_disabled():
++            raise HTTPException(status_code=403, detail="Public registration is disabled.")
++
++        return disabled_router
++
+     return get_fastapi_users().get_register_router(UserRead, UserCreate)
+diff --git a/cognee/modules/settings/get_settings.py b/cognee/modules/settings/get_settings.py
+index 4132ba0..b6bd521 100644
+--- a/cognee/modules/settings/get_settings.py
++++ b/cognee/modules/settings/get_settings.py
+@@ -20,7 +20,7 @@ class ModelName(Enum):
+ 
+ 
+ class LLMConfig(BaseModel):
+-    api_key: str
++    api_key: Optional[str]
+     model: str
+     provider: str
+     endpoint: Optional[str]
+@@ -30,12 +30,19 @@ class LLMConfig(BaseModel):
+ 
+ 
+ class VectorDBConfig(BaseModel):
+-    api_key: str
++    api_key: Optional[str]
+     url: str
+     provider: str
+     providers: list[ConfigChoice]
+ 
+ 
++def _masked_secret(value):
++    """Return the display form of a stored credential: no part of it survives."""
++    if not value:
++        return None
++    return "*" * len(str(value))
++
++
+ class SettingsDict(BaseModel):
+     llm: LLMConfig
+     vector_db: VectorDBConfig
+@@ -91,9 +98,7 @@ def get_settings() -> SettingsDict:
+                 "model": llm_config.llm_model,
+                 "endpoint": llm_config.llm_endpoint,
+                 "api_version": llm_config.llm_api_version,
+-                "api_key": (llm_config.llm_api_key[0:10] + "*" * (len(llm_config.llm_api_key) - 10))
+-                if llm_config.llm_api_key
+-                else None,
++                "api_key": _masked_secret(llm_config.llm_api_key),
+                 "providers": llm_providers,
+                 "models": {
+                     "openai": [
+@@ -181,10 +186,7 @@ def get_settings() -> SettingsDict:
+             vector_db={
+                 "provider": vector_config.vector_db_provider,
+                 "url": vector_config.vector_db_url,
+-                "api_key": (
+-                    vector_config.vector_db_key[0:10]
+-                    + "*" * (len(vector_config.vector_db_key) - 10)
+-                ),
++                "api_key": _masked_secret(vector_config.vector_db_key),
+                 "providers": vector_dbs,
+             },
+         )

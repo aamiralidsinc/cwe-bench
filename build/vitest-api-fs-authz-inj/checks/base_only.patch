@@ -1,0 +1,222 @@
+diff --git a/packages/vitest/src/api/setup.ts b/packages/vitest/src/api/setup.ts
+index caa3027..4c44d46 100644
+--- a/packages/vitest/src/api/setup.ts
++++ b/packages/vitest/src/api/setup.ts
+@@ -60,9 +60,6 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+   function setupClient(ws: WebSocket) {
+     const rpc = createBirpc<WebSocketEvents, WebSocketHandlers>(
+       {
+-        async onTaskUpdate(packs, events) {
+-          await ctx._testRun.updated(packs, events)
+-        },
+         getFiles() {
+           return ctx.state.getFiles()
+         },
+@@ -81,12 +78,24 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+               `Test file "${id}" was not registered, so it cannot be updated using the API.`,
+             )
+           }
++          // silently ignore write attempts if not allowed
++          if (!ctx.config.api.allowWrite) {
++            return
++          }
+           return fs.writeFile(id, content, 'utf-8')
+         },
+         async rerun(files, resetTestNamePattern) {
++          // silently ignore exec attempts if not allowed
++          if (!ctx.config.api.allowExec) {
++            return
++          }
+           await ctx.rerunFiles(files, undefined, true, resetTestNamePattern)
+         },
+         async rerunTask(id) {
++          // silently ignore exec attempts if not allowed
++          if (!ctx.config.api.allowExec) {
++            return
++          }
+           await ctx.rerunTask(id)
+         },
+         getConfig() {
+@@ -163,6 +172,11 @@ export function setup(ctx: Vitest, _server?: ViteDevServer): void {
+           return fs.writeFile(snapshotPath, content, 'utf-8')
+         },
+         async updateSnapshot(file?: File) {
++          // silently ignore exec/write attempts if not allowed
++          // this function both executes the code and write snapshots
++          if (!ctx.config.api.allowExec || !ctx.config.api.allowWrite) {
++            return
++          }
+           if (!file) {
+             await ctx.updateSnapshot()
+           }
+diff --git a/packages/vitest/src/api/types.ts b/packages/vitest/src/api/types.ts
+index ca77bbd..7fd7771 100644
+--- a/packages/vitest/src/api/types.ts
++++ b/packages/vitest/src/api/types.ts
+@@ -36,7 +36,6 @@ export interface TransformResultWithSource {
+ }
+ 
+ export interface WebSocketHandlers {
+-  onTaskUpdate: (packs: TaskResultPack[], events: TaskEventPack[]) => void
+   getFiles: () => File[]
+   getTestFiles: () => Promise<SerializedTestSpecification[]>
+   getPaths: () => string[]
+diff --git a/packages/vitest/src/node/cli/cli-config.ts b/packages/vitest/src/node/cli/cli-config.ts
+index 97af02e..2eb744f 100644
+--- a/packages/vitest/src/node/cli/cli-config.ts
++++ b/packages/vitest/src/node/cli/cli-config.ts
+@@ -46,6 +46,12 @@ const apiConfig: (port: number) => CLIOptions<ApiConfig> = (port: number) => ({
+     description:
+       'Set to true to exit if port is already in use, instead of automatically trying the next available port',
+   },
++  allowExec: {
++    description: 'Allow API to execute code. (Be careful when enabling this option in untrusted environments)',
++  },
++  allowWrite: {
++    description: 'Allow API to edit files. (Be careful when enabling this option in untrusted environments)',
++  },
+   middlewareMode: null,
+ })
+ 
+@@ -106,6 +112,12 @@ export const cliOptionsConfig: VitestCLIOptions = {
+     argument: '[port]',
+     description: `Specify server port. Note if the port is already being used, Vite will automatically try the next available port so this may not be the actual port the server ends up listening on. If true will be set to ${defaultPort}`,
+     subcommands: apiConfig(defaultPort),
++    transform(portOrOptions) {
++      if (typeof portOrOptions === 'number') {
++        return { port: portOrOptions }
++      }
++      return portOrOptions
++    },
+   },
+   silent: {
+     description: 'Silent console output from tests. Use `\'passed-only\'` to see logs from failing tests only.',
+diff --git a/packages/vitest/src/node/config/resolveConfig.ts b/packages/vitest/src/node/config/resolveConfig.ts
+index 665f6ef..14005c0 100644
+--- a/packages/vitest/src/node/config/resolveConfig.ts
++++ b/packages/vitest/src/node/config/resolveConfig.ts
+@@ -1,5 +1,6 @@
+ import type { ResolvedConfig as ResolvedViteConfig } from 'vite'
+ import type { Vitest } from '../core'
++import type { Logger } from '../logger'
+ import type { BenchmarkBuiltinReporters } from '../reporters'
+ import type { ResolvedBrowserOptions } from '../types/browser'
+ import type {
+@@ -55,9 +56,14 @@ function parseInspector(inspect: string | undefined | boolean | number) {
+   return { host, port: Number(port) || defaultInspectPort }
+ }
+ 
++/**
++ * @deprecated Internal function
++ */
+ export function resolveApiServerConfig<Options extends ApiConfig & Omit<UserConfig, 'expect'>>(
+   options: Options,
+   defaultPort: number,
++  parentApi?: ApiConfig,
++  logger?: Logger,
+ ): ApiConfig | undefined {
+   let api: ApiConfig | undefined
+ 
+@@ -97,6 +103,26 @@ export function resolveApiServerConfig<Options extends ApiConfig & Omit<UserConf
+     api = { middlewareMode: true }
+   }
+ 
++  // if the API server is exposed to network, disable write operations by default
++  if (!api.middlewareMode && api.host && api.host !== 'localhost' && api.host !== '127.0.0.1') {
++    // assigned to browser
++    if (parentApi) {
++      if (api.allowWrite == null && api.allowExec == null) {
++        logger?.error(
++          c.yellow(
++            `${c.yellowBright(' WARNING ')} API server is exposed to network, disabling write and exec operations by default for security reasons. This can cause some APIs to not work as expected. Set \`browser.api.allowExec\` manually to hide this warning. See https://vitest.dev/config/browser/api for more details.`,
++          ),
++        )
++      }
++    }
++    api.allowWrite ??= parentApi?.allowWrite ?? false
++    api.allowExec ??= parentApi?.allowExec ?? false
++  }
++  else {
++    api.allowWrite ??= parentApi?.allowWrite ?? true
++    api.allowExec ??= parentApi?.allowExec ?? true
++  }
++
+   return api
+ }
+ 
+@@ -801,6 +827,8 @@ export function resolveConfig(
+   resolved.browser.api = resolveApiServerConfig(
+     resolved.browser,
+     defaultBrowserPort,
++    resolved.api,
++    logger,
+   ) || {
+     port: defaultBrowserPort,
+   }
+diff --git a/packages/vitest/src/node/config/serializeConfig.ts b/packages/vitest/src/node/config/serializeConfig.ts
+index e4472d2..7c1a794 100644
+--- a/packages/vitest/src/node/config/serializeConfig.ts
++++ b/packages/vitest/src/node/config/serializeConfig.ts
+@@ -1,5 +1,5 @@
+ import type { TestProject } from '../project'
+-import type { SerializedConfig } from '../types/config'
++import type { ApiConfig, SerializedConfig } from '../types/config'
+ 
+ export function serializeConfig(project: TestProject): SerializedConfig {
+   const { config, globalConfig } = project
+@@ -32,6 +32,12 @@ export function serializeConfig(project: TestProject): SerializedConfig {
+     pool: config.pool,
+     expect: config.expect,
+     snapshotSerializers: config.snapshotSerializers,
++    api: ((api: ApiConfig | undefined) => {
++      return {
++        allowExec: api?.allowExec,
++        allowWrite: api?.allowWrite,
++      }
++    })(project.isBrowserEnabled() ? config.browser.api : config.api),
+     // TODO: non serializable function?
+     diff: config.diff,
+     retry: config.retry,
+diff --git a/packages/vitest/src/node/types/config.ts b/packages/vitest/src/node/types/config.ts
+index 219bf6b..49e5cae 100644
+--- a/packages/vitest/src/node/types/config.ts
++++ b/packages/vitest/src/node/types/config.ts
+@@ -44,7 +44,22 @@ export type CSSModuleScopeStrategy = 'stable' | 'scoped' | 'non-scoped'
+ export type ApiConfig = Pick<
+   ServerOptions,
+   'port' | 'strictPort' | 'host' | 'middlewareMode'
+->
++> & {
++  /**
++   * Allow any write operations from the API server.
++   *
++   * @default true if `api.host` is exposed to network, false otherwise
++   */
++  allowWrite?: boolean
++  /**
++   * Allow running test files via the API.
++   * If `api.host` is exposed to network and `allowWrite` is true,
++   * anyone connected to the API server can run arbitrary code on your machine.
++   *
++   * @default true if `api.host` is exposed to network, false otherwise
++   */
++  allowExec?: boolean
++}
+ 
+ export interface EnvironmentOptions {
+   /**
+diff --git a/packages/vitest/src/runtime/config.ts b/packages/vitest/src/runtime/config.ts
+index 4426d8d..18f7dd9 100644
+--- a/packages/vitest/src/runtime/config.ts
++++ b/packages/vitest/src/runtime/config.ts
+@@ -76,6 +76,10 @@ export interface SerializedConfig {
+     showDiff?: boolean
+     truncateThreshold?: number
+   } | undefined
++  api: {
++    allowExec: boolean | undefined
++    allowWrite: boolean | undefined
++  }
+   diff: string | SerializedDiffOptions | undefined
+   retry: SerializableRetry
+   includeTaskLocation: boolean | undefined

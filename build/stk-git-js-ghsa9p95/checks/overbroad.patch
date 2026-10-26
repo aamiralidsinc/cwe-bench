@@ -1,0 +1,190 @@
+diff -ruN a/simple-git/src/lib/git-factory.ts overbroad/simple-git/src/lib/git-factory.ts
+--- a/simple-git/src/lib/git-factory.ts	2022-03-18 17:14:54.000000000 +0000
++++ overbroad/simple-git/src/lib/git-factory.ts	2026-10-26 02:17:06.958350224 +0000
+@@ -2,6 +2,9 @@
+ 
+ import * as api from './api';
+ import {
++   blockUnsafeOperationsPlugin,
++   blockUnsafePackPlugin,
++   blockUnsafeRemotesPlugin,
+    commandConfigPrefixingPlugin,
+    completionDetectionPlugin,
+    errorDetectionHandler,
+@@ -53,6 +56,10 @@
+       plugins.add(commandConfigPrefixingPlugin(config.config));
+    }
+ 
++   plugins.add(blockUnsafePackPlugin());
++   plugins.add(blockUnsafeOperationsPlugin(config.unsafe));
++   plugins.add(blockUnsafeRemotesPlugin(config.unsafe));
++
+    plugins.add(completionDetectionPlugin(config.completion));
+    config.progress && plugins.add(progressMonitorPlugin(config.progress));
+    config.timeout && plugins.add(timeoutPlugin(config.timeout));
+diff -ruN a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts overbroad/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts
+--- a/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts	1970-01-01 00:00:00.000000000 +0000
++++ overbroad/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts	2026-10-26 02:20:05.206187382 +0000
+@@ -0,0 +1,59 @@
++import type { SimpleGitPlugin } from './simple-git-plugin';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++import type { SimpleGitPluginConfig } from '../types';
++
++const protocolPermission = /^\s*protocol(?:\.allow|\.[a-z0-9_-]+\.allow)\s*=/i;
++
++function isConfigSwitch(arg: string) {
++   return arg.trim() === '-c' || arg.trim() === '--config';
++}
++
++function isInlineConfigSwitch(arg: string) {
++   return /^\s*(?:-c|--config)\s*=/.test(arg);
++}
++
++function configuredValue(arg: string, next: string) {
++   const trimmed = arg.trim();
++
++   if (isConfigSwitch(trimmed)) {
++      return next;
++   }
++
++   if (isInlineConfigSwitch(trimmed)) {
++      return trimmed.slice(trimmed.indexOf('=') + 1);
++   }
++
++   if (/^-c\S/.test(trimmed)) {
++      return trimmed.slice(2);
++   }
++
++   return '';
++}
++
++export function blockUnsafeOperationsPlugin({
++   allowUnsafeProtocolOverride = false,
++}: SimpleGitPluginConfig['unsafe'] = {}): SimpleGitPlugin<'spawn.args'> {
++   return {
++      type: 'spawn.args',
++      action(args) {
++         args.forEach((current, index) => {
++            if (/ext::/.test(current)) {
++               throw new GitPluginError(undefined, 'unsafe', 'transport helper syntax is not permitted');
++            }
++
++            const value = configuredValue(current, index + 1 < args.length ? args[index + 1] : '');
++
++            if (value && protocolPermission.test(value) && !allowUnsafeProtocolOverride) {
++               throw new GitPluginError(
++                  undefined,
++                  'unsafe',
++                  'Configuring protocol permissions is not permitted without enabling allowUnsafeProtocolOverride',
++               );
++            }
++         });
++
++         return args;
++      },
++   };
++}
+diff -ruN a/simple-git/src/lib/plugins/block-unsafe-pack-plugin.ts overbroad/simple-git/src/lib/plugins/block-unsafe-pack-plugin.ts
+--- a/simple-git/src/lib/plugins/block-unsafe-pack-plugin.ts	1970-01-01 00:00:00.000000000 +0000
++++ overbroad/simple-git/src/lib/plugins/block-unsafe-pack-plugin.ts	2026-10-26 02:16:52.182363722 +0000
+@@ -0,0 +1,30 @@
++import type { SimpleGitPlugin } from './simple-git-plugin';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++
++function namesProgram(arg: string) {
++   return /^\s*--(?:upload|receive)-pack(?:=|$)/.test(arg);
++}
++
++function isCloneUploadShorthand(arg: string, method: string) {
++   return method === 'clone' && /^\s*-u(?:\s|$|=)/.test(arg);
++}
++
++export function blockUnsafePackPlugin(): SimpleGitPlugin<'spawn.args'> {
++   return {
++      type: 'spawn.args',
++      action(args, context) {
++         args.forEach((current) => {
++            if (namesProgram(current) || isCloneUploadShorthand(current, context.method)) {
++               throw new GitPluginError(
++                  undefined,
++                  'unsafe',
++                  'Use of a pack program option is not permitted',
++               );
++            }
++         });
++
++         return args;
++      },
++   };
++}
+diff -ruN a/simple-git/src/lib/plugins/block-unsafe-remotes-plugin.ts overbroad/simple-git/src/lib/plugins/block-unsafe-remotes-plugin.ts
+--- a/simple-git/src/lib/plugins/block-unsafe-remotes-plugin.ts	1970-01-01 00:00:00.000000000 +0000
++++ overbroad/simple-git/src/lib/plugins/block-unsafe-remotes-plugin.ts	2026-10-26 02:17:02.870353958 +0000
+@@ -0,0 +1,37 @@
++import type { SimpleGitPlugin } from './simple-git-plugin';
++
++import { GitPluginError } from '../errors/git-plugin-error';
++import type { SimpleGitPluginConfig } from '../types';
++
++const helperAddress = /^\s*[a-z][a-z0-9+.-]*::/i;
++
++function isStoredAddress(args: string[], index: number) {
++   if (args[index] !== 'remote' || args[index + 1] !== 'add') {
++      return false;
++   }
++
++   return args.slice(index + 2).some((value) => helperAddress.test(value));
++}
++
++export function blockUnsafeRemotesPlugin({
++   allowUnsafeProtocolOverride = false,
++}: SimpleGitPluginConfig['unsafe'] = {}): SimpleGitPlugin<'spawn.args'> {
++   return {
++      type: 'spawn.args',
++      action(args) {
++         if (!allowUnsafeProtocolOverride) {
++            args.forEach((_current, index) => {
++               if (isStoredAddress(args, index)) {
++                  throw new GitPluginError(
++                     undefined,
++                     'unsafe',
++                     'Storing a transport helper address is not permitted without enabling allowUnsafeProtocolOverride',
++                  );
++               }
++            });
++         }
++
++         return args;
++      },
++   };
++}
+diff -ruN a/simple-git/src/lib/plugins/index.ts overbroad/simple-git/src/lib/plugins/index.ts
+--- a/simple-git/src/lib/plugins/index.ts	2022-03-18 17:14:54.000000000 +0000
++++ overbroad/simple-git/src/lib/plugins/index.ts	2026-10-26 02:17:06.958350224 +0000
+@@ -1,3 +1,6 @@
++export * from './block-unsafe-operations-plugin';
++export * from './block-unsafe-pack-plugin';
++export * from './block-unsafe-remotes-plugin';
+ export * from './command-config-prefixing-plugin';
+ export * from './completion-detection.plugin';
+ export * from './error-detection.plugin';
+diff -ruN a/simple-git/src/lib/types/index.ts overbroad/simple-git/src/lib/types/index.ts
+--- a/simple-git/src/lib/types/index.ts	2022-03-18 17:14:54.000000000 +0000
++++ overbroad/simple-git/src/lib/types/index.ts	2026-10-26 02:17:06.958350224 +0000
+@@ -106,6 +106,14 @@
+    };
+ 
+    spawnOptions: Pick<SpawnOptions, 'uid' | 'gid'>;
++
++   unsafe: {
++      /**
++       * When enabled, the caller takes responsibility for any transport helper
++       * protocol permissions or helper remote addresses it supplies.
++       */
++      allowUnsafeProtocolOverride?: boolean;
++   };
+ }
+ 
+ /**

@@ -1,0 +1,102 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "15921", "advisory_ids": ["GHSA-5GPM-RGJ3-9Q76", "CVE-2026-86043", "GO-2026-6495"],
+  "repo": "zalando/skipper", "pinned_commit": "23752a2c34cbb7ff8678a261eeaa0f931de80c5d",
+  "fix_commits": ["2cfceabaa6ff0af65b312dcb9bcbe84691b9d507"],
+  "trust_decision": {
+    "summary": "Per request, the proxy decides whether the OPA policy may treat the body it was given as complete: any body truncated to -open-policy-agent-max-request-body-size must reach the policy with truncated_body true, which is decided in the body reader that caps the stream and must be carried into the ext_authz CheckRequest headers.",
+    "evidence": ["filters/openpolicyagent/openpolicyagent.go:1317-1348", "filters/openpolicyagent/openpolicyagent.go:1258-1273", "filters/openpolicyagent/internal/envoy/skipperadapter.go:14-43", "docs/reference/filters.md:2340-2350"]
+  },
+  "landing_point": {
+    "where": "filters/openpolicyagent/openpolicyagent.go:1258",
+    "why": "The summary says the truncated_body mitigation fails open on chunked/HTTP-2; the only place a body is read and capped is bufferedBodyReader.fillBuffer, and it throws away whether it stopped because it hit maxBufferSize, so an engineer looks here first."
+  },
+  "fix_sites": [
+    {"where": "filters/openpolicyagent/openpolicyagent.go:1258-1273", "entry_point": "OpenPolicyAgentInstance.ExtractHttpBodyOptionally, called by both body filters", "module_kind": "shared core library (body reader)"},
+    {"where": "filters/openpolicyagent/openpolicyagent.go:1317-1348", "entry_point": "OpenPolicyAgentInstance.ExtractHttpBodyOptionally (public method on the OPA instance)", "module_kind": "shared core library (public API)"},
+    {"where": "filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go:121", "entry_point": "eskip filter opaAuthorizeRequestWithBody (route filter, registered at skipper.go:2318)", "module_kind": "HTTP request filter"},
+    {"where": "filters/openpolicyagent/opaserveresponse/opaserveresponse.go:116", "entry_point": "eskip filter opaServeResponseWithReqBody (route filter, registered at skipper.go:2320)", "module_kind": "HTTP request filter, second package"},
+    {"where": "filters/openpolicyagent/internal/envoy/skipperadapter.go:14", "entry_point": "envoy.AdaptToExtAuthRequest, called by both body filters", "module_kind": "internal wrapper that composes the ext_authz CheckRequest"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "filters/openpolicyagent/opaserveresponse/opaserveresponse.go:116"},
+  "O3_reason_to_dismiss": "opaServeResponseWithReqBody is a response-serving filter, not an access gate: it always renders the policy's response, so a truncated body there looks like it cannot bypass authorization and can be left unchanged.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "An under-cap body, including a chunked/HTTP-2 request with no Content-Length, must still evaluate as not truncated and be allowed; a solver who marks every ContentLength<0 request truncated (or who rejects chunked bodies) breaks all legitimate streaming uploads, and one who flags any read that filled the buffer also denies a body of exactly the cap.",
+    "where": "filters/openpolicyagent/openpolicyagent.go:1326-1329"
+  },
+  "O6_input_shapes": [
+    "oversized body with a known Content-Length (fillBuffer stops at maxBufferSize)",
+    "chunked Transfer-Encoding or HTTP/2 with no Content-Length (req.ContentLength == -1, driven with expectedSize = maxBodyBytes)",
+    "final read overshooting maxBodyBytes on the last chunk (rawBody sliced down, must be reported truncated)",
+    "under-cap body of either shape (must stay truncated=false)",
+    "no body, or skip-request-body-parse set (no read, flag false)"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "filters/openpolicyagent/openpolicyagent.go:1258-1273", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "A request with a large body on a route using opaAuthorizeRequest or opaServeResponse (bodyParsing=false) is evaluated by the same OPA sink with an empty body and truncated_body=false; the fix now pins x-envoy-auth-partial-body to false for every filter without any body having been read.",
+      "where": "filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go:116-130",
+      "reason_to_dismiss": "Body parsing is opt-in: the docs point body-based policies at the WithBody filter, so a solver can call these routes a misconfiguration rather than an uncovered path.",
+      "distance": "same package tree, different filter package (filters/openpolicyagent/opaauthorizerequest) from the fixed filters",
+      "present_in_latest": "unknown",
+      "latest_where": "none"
+    },
+    {
+      "route": "With skip-request-body-parse enabled, ExtractHttpBodyOptionally returns before reading anything, so an oversized body reaches the same sink as no body at all with truncated_body=false.",
+      "where": "filters/openpolicyagent/openpolicyagent.go:1331-1348",
+      "reason_to_dismiss": "A documented plugin option disables body parsing, so the solver can call it an unsupported combination that the policy author opted into.",
+      "distance": "same file as the landing point, one branch earlier",
+      "present_in_latest": "unknown",
+      "latest_where": "none"
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go:116-130",
+      "sibling": "A third body-carrying filter variant that copies this extract-then-adapt block but builds its CheckRequest without the partial-body signal.",
+      "why_realistic": "The two body filters already duplicate the same six-line extraction and adapter call verbatim, so a maintainer adding another body filter would copy the block and re-introduce the gap."
+    },
+    {
+      "where": "filters/openpolicyagent/internal/envoy/skipperadapter.go:26-39",
+      "sibling": "A second adapter (e.g. for the gRPC ext_authz server or a headers-only mode) that composes a CheckRequest and forgets the synthetic partial-body header.",
+      "why_realistic": "The signal only exists because the plugin reads a header, not a proto field; any new constructor in internal/envoy must remember a convention that is invisible in the type."
+    },
+    {
+      "where": "filters/openpolicyagent/openpolicyagent.go:1317",
+      "sibling": "A second extraction API (ExtractHttpBody without the truncation output) used by a new caller.",
+      "why_realistic": "The published fix changed this method's signature across all existing callers, so a sibling added later by copying an older call site would silently drop the flag."
+    }
+  ],
+  "O9_family": "incorrect authorization / fail-open on an incomplete request body (CWE-863)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.5 (go.mod:330); make targets (Makefile:50 build, Makefile:79 check)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "filters/openpolicyagent/ghsa-8qqm-fp2q-v734_test.go (end-to-end body-cap tests through the proxy), filters/openpolicyagent/openpolicyagent_test.go TestBodyExtraction*, filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest_test.go, filters/openpolicyagent/opaserveresponse/opaserveresponse_test.go; make check = go test ./... (Makefile:79-80). Bundle control plane is mocked in-process with opasdktest, so tests run offline."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "filters/openpolicyagent/openpolicyagent.go, filters/openpolicyagent/internal/envoy/skipperadapter.go, filters/openpolicyagent/opaauthorizerequest/opaauthorizerequest.go, filters/openpolicyagent/opaserveresponse/opaserveresponse.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Return a truncated bool from ExtractHttpBodyOptionally only in the filter the reproducer uses and set it from ContentLength (or deny chunked requests), instead of producing it from the body reader and exposing it through the synthetic ext_authz header the OPA plugin reads."
+  },
+  "out_of_scope_notes": [],
+  "unverified": [
+    "The opa-envoy-plugin v1.15.2-envoy source lives in the Go module cache outside the allowed roots, so the derivation of the policy field from the x-envoy-auth-partial-body header is inferred from the fix (fix.diff:132-136) and the new unit test (fix.diff:161-171), not read directly.",
+    "The docs name the field input.attributes.request.http.truncated_body (docs/reference/filters.md:2343 and :2412) while the repo's own security test reads input.truncated_body (filters/openpolicyagent/ghsa-8qqm-fp2q-v734_test.go:66); which path the plugin actually exposes could not be confirmed.",
+    "O4.repo_mb is null: no shell was available to measure the tree; by file layout the repo is far above 5 MB of source and far below 1.5 GB.",
+    "Whether the hidden behavioural tests call bufferedBodyReader.fillBuffer directly is unknown; the fix's own unit test supplies the truncated bool by hand (fix.diff:157-172) and only the end-to-end test reaches the producer, so O7.check_calls_producer is answered for the unit-level check.",
+    "The project was not built or run (reading and searching only), so buildability is inferred from go.mod:330, Makefile:50/79 and the existing in-package tests."
+  ]
+}

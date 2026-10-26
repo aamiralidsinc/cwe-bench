@@ -1,0 +1,630 @@
+--- a/internal/models/memory.go
++++ b/internal/models/memory.go
+@@ -2,10 +2,14 @@
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"regexp"
+ 	"strings"
+ 	"time"
+ )
+ 
++var memoryIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
++
+ // Memory layer constants.
+ const (
+ 	MemoryLayerProject = "project"
+@@ -177,6 +181,15 @@
+ 	return "memory-" + id + ".md"
+ }
+ 
++// ValidateMemoryID rejects IDs that can change the canonical memory filename
++// or use platform-specific alternate path syntax.
++func ValidateMemoryID(id string) error {
++	if !memoryIDPattern.MatchString(id) || strings.HasSuffix(id, ".") {
++		return fmt.Errorf("invalid memory ID %q", id)
++	}
++	return nil
++}
++
+ // ValidMemoryLayer reports whether layer is a recognised memory layer.
+ func ValidMemoryLayer(layer string) bool {
+ 	return layer == MemoryLayerProject || layer == MemoryLayerGlobal
+--- a/internal/safepath/path.go
++++ b/internal/safepath/path.go
+@@ -0,0 +1,145 @@
++// Package safepath resolves untrusted filesystem paths inside an explicit root.
++package safepath
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"runtime"
++	"strings"
++)
++
++var windowsVolumePath = regexp.MustCompile(`^[A-Za-z]:`)
++
++// Resolve resolves an untrusted relative path inside root. Absolute paths,
++// parent traversal, Windows volume paths, and symlink escapes are rejected.
++func Resolve(root, untrusted string) (string, error) {
++	return resolve(root, untrusted, false)
++}
++
++// ResolveProject resolves a project path inside root. Native absolute paths
++// are accepted only when they still resolve inside root.
++func ResolveProject(root, untrusted string) (string, error) {
++	return resolve(root, untrusted, true)
++}
++
++// ResolveProjectReal is ResolveProject plus canonical symlink resolution. It
++// is useful when callers must enforce policy against the final target path.
++func ResolveProjectReal(root, untrusted string) (string, error) {
++	path, err := resolve(root, untrusted, true)
++	if err != nil {
++		return "", err
++	}
++	return resolveProspectivePath(path)
++}
++
++func resolve(root, untrusted string, allowContainedAbsolute bool) (string, error) {
++	if strings.TrimSpace(untrusted) == "" {
++		return "", fmt.Errorf("path is required")
++	}
++	if strings.IndexByte(untrusted, 0) >= 0 {
++		return "", fmt.Errorf("path contains a NUL byte")
++	}
++
++	normalized := strings.ReplaceAll(untrusted, `\`, "/")
++	if strings.HasPrefix(normalized, "//?/") || strings.HasPrefix(normalized, "//./") {
++		return "", fmt.Errorf("path must not use a Windows device prefix")
++	}
++	windowsAbsolute := windowsVolumePath.MatchString(normalized) || strings.HasPrefix(normalized, "//")
++	if windowsAbsolute && !(allowContainedAbsolute && runtime.GOOS == "windows") {
++		return "", fmt.Errorf("path must not use a volume or UNC prefix")
++	}
++	nativePath := filepath.FromSlash(normalized)
++	if windowsAbsolute && allowContainedAbsolute && runtime.GOOS == "windows" && !filepath.IsAbs(nativePath) {
++		return "", fmt.Errorf("path must not use a drive-relative prefix")
++	}
++	for i, segment := range strings.Split(normalized, "/") {
++		if segment == ".." {
++			return "", fmt.Errorf("path must not contain parent traversal")
++		}
++		// A colon outside the leading drive volume is an NTFS alternate data
++		// stream delimiter. Reject it on Windows so the resolved filename is
++		// always the file the caller intended to authorize.
++		leadingDrive := i == 0 && windowsAbsolute && windowsVolumePath.MatchString(segment)
++		if runtime.GOOS == "windows" && strings.Contains(segment, ":") && !leadingDrive {
++			return "", fmt.Errorf("path must not use an alternate data stream")
++		}
++	}
++
++	rootAbs, err := filepath.Abs(root)
++	if err != nil {
++		return "", fmt.Errorf("resolve root: %w", err)
++	}
++	rootAbs = filepath.Clean(rootAbs)
++
++	var candidate string
++	if filepath.IsAbs(nativePath) {
++		if !allowContainedAbsolute {
++			return "", fmt.Errorf("path must be relative")
++		}
++		candidate = filepath.Clean(nativePath)
++	} else {
++		candidate = filepath.Join(rootAbs, nativePath)
++	}
++	if err := requireWithin(rootAbs, candidate); err != nil {
++		return "", err
++	}
++	if _, err := resolveWithin(rootAbs, candidate); err != nil {
++		return "", err
++	}
++	return candidate, nil
++}
++
++func resolveWithin(root, candidate string) (string, error) {
++	rootResolved, err := resolveProspectivePath(root)
++	if err != nil {
++		return "", fmt.Errorf("resolve root symlinks: %w", err)
++	}
++	candidateResolved, err := resolveProspectivePath(candidate)
++	if err != nil {
++		return "", fmt.Errorf("resolve path symlinks: %w", err)
++	}
++	if err := requireWithin(rootResolved, candidateResolved); err != nil {
++		return "", fmt.Errorf("path escapes root through a symlink: %w", err)
++	}
++	return candidateResolved, nil
++}
++
++func resolveProspectivePath(path string) (string, error) {
++	existing := filepath.Clean(path)
++	for {
++		_, err := os.Lstat(existing)
++		if err == nil {
++			break
++		}
++		if !os.IsNotExist(err) {
++			return "", fmt.Errorf("inspect path: %w", err)
++		}
++		parent := filepath.Dir(existing)
++		if parent == existing {
++			return "", fmt.Errorf("path has no existing ancestor")
++		}
++		existing = parent
++	}
++	existingResolved, err := filepath.EvalSymlinks(existing)
++	if err != nil {
++		return "", err
++	}
++	rel, err := filepath.Rel(existing, path)
++	if err != nil {
++		return "", err
++	}
++	return filepath.Join(existingResolved, rel), nil
++}
++
++func requireWithin(root, candidate string) error {
++	rel, err := filepath.Rel(root, candidate)
++	if err != nil {
++		return fmt.Errorf("compare path to root: %w", err)
++	}
++	if rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
++		return fmt.Errorf("path escapes allowed root")
++	}
++	return nil
++}
+--- a/internal/server/routes/templates.go
++++ b/internal/server/routes/templates.go
+@@ -8,6 +8,7 @@
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"github.com/howznguyen/knowns/internal/storage"
+ )
+ 
+@@ -107,23 +108,23 @@
+ 
+ // templateFile is the UI-friendly shape for template actions/files.
+ type templateFile struct {
+-	Type        string `json:"type"`
+-	Template    string `json:"template,omitempty"`
+-	Destination string `json:"destination,omitempty"`
+-	Path        string `json:"path,omitempty"`
+-	Source      string `json:"source,omitempty"`
+-	GlobPattern string `json:"globPattern,omitempty"`
+-	SkipIfExists bool  `json:"skipIfExists,omitempty"`
+-	When        string `json:"when,omitempty"`
++	Type         string `json:"type"`
++	Template     string `json:"template,omitempty"`
++	Destination  string `json:"destination,omitempty"`
++	Path         string `json:"path,omitempty"`
++	Source       string `json:"source,omitempty"`
++	GlobPattern  string `json:"globPattern,omitempty"`
++	SkipIfExists bool   `json:"skipIfExists,omitempty"`
++	When         string `json:"when,omitempty"`
+ }
+ 
+ // uiPrompt is the UI-friendly shape for template prompts.
+ type uiPrompt struct {
+-	Name     string          `json:"name"`
+-	Message  string          `json:"message"`
+-	Type     string          `json:"type"`
+-	Required bool            `json:"required"`
+-	Default  string          `json:"default,omitempty"`
++	Name     string           `json:"name"`
++	Message  string           `json:"message"`
++	Type     string           `json:"type"`
++	Required bool             `json:"required"`
++	Default  string           `json:"default,omitempty"`
+ 	Choices  []uiPromptChoice `json:"choices,omitempty"`
+ }
+ 
+@@ -301,7 +302,11 @@
+ 		templateFile = "main.hbs"
+ 	}
+ 
+-	hbsPath := filepath.Join(tmpl.Path, templateFile)
++	hbsPath, err := safepath.Resolve(tmpl.Path, templateFile)
++	if err != nil {
++		respondError(w, http.StatusBadRequest, "invalid template file path")
++		return
++	}
+ 	hbsContent, err := os.ReadFile(hbsPath)
+ 	if err != nil {
+ 		respondError(w, http.StatusNotFound, "template file not found: "+templateFile)
+--- a/internal/storage/doc_archive.go
++++ b/internal/storage/doc_archive.go
+@@ -5,21 +5,39 @@
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++
++	"github.com/howznguyen/knowns/internal/safepath"
+ )
+ 
+ // archiveDir returns the directory holding archived documents.
+ func (ds *DocStore) archiveDir() string { return filepath.Join(ds.root, "archive") }
+ 
++// resolveArchivePath confines a caller-supplied document path to root, the same
++// way live document I/O is confined.
++func resolveArchivePath(root, path string) (string, error) {
++	path = strings.TrimSuffix(path, ".md")
++	if strings.TrimSpace(path) == "" {
++		return "", fmt.Errorf("doc path is required")
++	}
++	absPath, err := safepath.Resolve(root, path+".md")
++	if err != nil {
++		return "", fmt.Errorf("invalid doc path %q: %w", path, err)
++	}
++	return absPath, nil
++}
++
+ // Archive moves a document out of the live documentation set into the project's
+ // archive area, mirroring the way tasks are archived. The document keeps its
+ // path so it can be unarchived later.
+ func (ds *DocStore) Archive(path string) error {
+-	if strings.TrimSpace(path) == "" {
+-		return fmt.Errorf("doc path is required")
++	src, err := resolveArchivePath(ds.docsDir(), path)
++	if err != nil {
++		return err
++	}
++	dst, err := resolveArchivePath(ds.archiveDir(), path)
++	if err != nil {
++		return err
+ 	}
+-	path = strings.TrimSuffix(path, ".md")
+-	src := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+-	dst := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
+ 	data, err := os.ReadFile(src)
+ 	if err != nil {
+ 		return fmt.Errorf("archive doc %q: %w", path, err)
+@@ -35,12 +53,14 @@
+ 
+ // Unarchive moves an archived document back into the live documentation set.
+ func (ds *DocStore) Unarchive(path string) error {
+-	if strings.TrimSpace(path) == "" {
+-		return fmt.Errorf("doc path is required")
++	src, err := resolveArchivePath(ds.archiveDir(), path)
++	if err != nil {
++		return err
++	}
++	dst, err := resolveArchivePath(ds.docsDir(), path)
++	if err != nil {
++		return err
+ 	}
+-	path = strings.TrimSuffix(path, ".md")
+-	src := filepath.Join(ds.archiveDir(), filepath.FromSlash(path)+".md")
+-	dst := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+ 	data, err := os.ReadFile(src)
+ 	if err != nil {
+ 		return fmt.Errorf("unarchive doc %q: %w", path, err)
+--- a/internal/storage/doc_store.go
++++ b/internal/storage/doc_store.go
+@@ -9,6 +9,7 @@
+ 
+ 	"github.com/howznguyen/knowns/internal/models"
+ 	"github.com/howznguyen/knowns/internal/references"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+@@ -122,11 +123,12 @@
+ // Get retrieves a doc by its relative path (without .md extension).
+ // Examples: "readme", "patterns/module", "specs/user-auth"
+ func (ds *DocStore) Get(path string) (*models.Doc, error) {
+-	path = strings.TrimPrefix(path, "/")
+-	path = strings.TrimSuffix(path, ".md")
++	path, absPath, err := resolveDocPath(ds.docsDir(), path)
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	// Try local docs first.
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
+ 	if _, err := os.Stat(absPath); err == nil {
+ 		folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 		if folder == "." {
+@@ -143,7 +145,11 @@
+ 		}
+ 		importSource := e.Name()
+ 		// Direct lookup: path already includes the source prefix.
+-		candidate := filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(path)+".md")
++		importDocsDir := filepath.Join(ds.importsDir(), importSource, "docs")
++		candidate, err := safepath.Resolve(importDocsDir, path+".md")
++		if err != nil {
++			continue
++		}
+ 		if _, err := os.Stat(candidate); err == nil {
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(path)))
+ 			if folder == "." {
+@@ -155,7 +161,10 @@
+ 		// source prefix (e.g. @doc/patterns/foo instead of @doc/source/patterns/foo).
+ 		// Try prepending the import source name.
+ 		prefixed := importSource + "/" + path
+-		candidate = filepath.Join(ds.importsDir(), importSource, "docs", filepath.FromSlash(prefixed)+".md")
++		candidate, err = safepath.Resolve(importDocsDir, prefixed+".md")
++		if err != nil {
++			continue
++		}
+ 		if _, err := os.Stat(candidate); err == nil {
+ 			folder := filepath.ToSlash(filepath.Dir(filepath.FromSlash(prefixed)))
+ 			if folder == "." {
+@@ -171,10 +180,14 @@
+ // Create writes a new doc to .knowns/docs/{path}.md.
+ // doc.Path must be set (relative, without .md).
+ func (ds *DocStore) Create(doc *models.Doc) error {
+-	if doc.Path == "" {
++	if doc == nil || doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
++	path, absPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = path
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return fmt.Errorf("create doc dir: %w", err)
+ 	}
+@@ -183,13 +196,17 @@
+ 
+ // Update writes updated doc content.
+ func (ds *DocStore) Update(doc *models.Doc) error {
+-	if doc.Path == "" {
++	if doc == nil || doc.Path == "" {
+ 		return fmt.Errorf("doc path is required")
+ 	}
+-	if existing, err := ds.Get(doc.Path); err == nil {
++	path, absPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = path
++	if existing, err := ds.Get(path); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(doc.Path)+".md")
+ 	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -201,11 +218,18 @@
+ 	if strings.TrimSpace(oldPath) == "" || doc == nil || strings.TrimSpace(doc.Path) == "" {
+ 		return fmt.Errorf("old path and new doc path are required")
+ 	}
++	oldPath, oldAbsPath, err := resolveDocPath(ds.docsDir(), oldPath)
++	if err != nil {
++		return err
++	}
++	newPath, newAbsPath, err := resolveDocPath(ds.docsDir(), doc.Path)
++	if err != nil {
++		return err
++	}
++	doc.Path = newPath
+ 	if existing, err := ds.Get(oldPath); err == nil {
+ 		applyLockedDecisionReviewGate(existing, doc)
+ 	}
+-	oldAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(oldPath, ".md"))+".md")
+-	newAbsPath := filepath.Join(ds.docsDir(), filepath.FromSlash(strings.TrimSuffix(doc.Path, ".md"))+".md")
+ 	if err := os.MkdirAll(filepath.Dir(newAbsPath), 0755); err != nil {
+ 		return err
+ 	}
+@@ -342,11 +366,30 @@
+ 
+ // Delete removes a doc file.
+ func (ds *DocStore) Delete(path string) error {
+-	path = strings.TrimSuffix(path, ".md")
+-	absPath := filepath.Join(ds.docsDir(), filepath.FromSlash(path)+".md")
++	_, absPath, err := resolveDocPath(ds.docsDir(), path)
++	if err != nil {
++		return err
++	}
+ 	return os.Remove(absPath)
+ }
+ 
++func resolveDocPath(root, path string) (string, string, error) {
++	path = strings.TrimSuffix(path, ".md")
++	if strings.TrimSpace(path) == "" {
++		return "", "", fmt.Errorf("doc path is required")
++	}
++	absPath, err := safepath.Resolve(root, filepath.ToSlash(path)+".md")
++	if err != nil {
++		return "", "", fmt.Errorf("invalid doc path %q: %w", path, err)
++	}
++	rel, err := filepath.Rel(root, absPath)
++	if err != nil {
++		return "", "", fmt.Errorf("resolve doc path: %w", err)
++	}
++	canonical := strings.TrimSuffix(filepath.ToSlash(rel), ".md")
++	return canonical, absPath, nil
++}
++
+ // parseFile reads and parses a single doc markdown file.
+ func (ds *DocStore) parseFile(absPath, relPath, folder string, imported bool, importSource string) (*models.Doc, error) {
+ 	data, err := os.ReadFile(absPath)
+--- a/internal/storage/memory_history.go
++++ b/internal/storage/memory_history.go
+@@ -6,6 +6,8 @@
+ 	"os"
+ 	"path/filepath"
+ 	"time"
++
++	"github.com/howznguyen/knowns/internal/models"
+ )
+ 
+ // MemoryRevision is one recorded snapshot of a memory entry. Revisions are
+@@ -38,8 +40,8 @@
+ 
+ // History returns the recorded revisions for a memory entry.
+ func (ms *MemoryStore) History(id string) (*MemoryHistory, error) {
+-	if id == "" {
+-		return nil, fmt.Errorf("memory ID is required")
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
+ 	}
+ 	data, err := os.ReadFile(ms.memoryHistoryPath(id))
+ 	if err != nil {
+@@ -57,8 +59,8 @@
+ 
+ // Checkpoint records the current state of a memory entry as a new revision.
+ func (ms *MemoryStore) Checkpoint(id string, snapshot map[string]any, author string) (*MemoryRevision, error) {
+-	if id == "" {
+-		return nil, fmt.Errorf("memory ID is required")
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
+ 	}
+ 	history, err := ms.History(id)
+ 	if err != nil {
+--- a/internal/storage/memory_store.go
++++ b/internal/storage/memory_store.go
+@@ -133,6 +133,9 @@
+ 
+ // Get retrieves a memory entry by ID. Searches project, then global.
+ func (ms *MemoryStore) Get(id string) (*models.MemoryEntry, error) {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	for _, layer := range []string{models.MemoryLayerProject, models.MemoryLayerGlobal} {
+ 		entry, err := ms.GetInLayer(id, layer)
+ 		if err == nil {
+@@ -201,6 +204,9 @@
+ 
+ // GetInLayer retrieves a memory entry by ID from a specific layer only.
+ func (ms *MemoryStore) GetInLayer(id, layer string) (*models.MemoryEntry, error) {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return nil, err
++	}
+ 	if !models.ValidMemoryLayer(layer) {
+ 		return nil, fmt.Errorf("invalid memory layer: %q", layer)
+ 	}
+@@ -232,6 +238,9 @@
+ 	if entry.ID == "" {
+ 		entry.ID = models.NewTaskID()
+ 	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 	entry.ApplyLifecycleDefaults()
+ 
+ 	now := time.Now().UTC()
+@@ -256,9 +265,15 @@
+ 
+ // Update overwrites an existing memory entry.
+ func (ms *MemoryStore) Update(entry *models.MemoryEntry) error {
++	if entry == nil {
++		return fmt.Errorf("memory entry is required")
++	}
+ 	if entry.ID == "" {
+ 		return fmt.Errorf("memory ID is required")
+ 	}
++	if err := models.ValidateMemoryID(entry.ID); err != nil {
++		return err
++	}
+ 
+ 	// Find the existing file to determine its current location.
+ 	existing, err := ms.Get(entry.ID)
+@@ -330,6 +345,9 @@
+ }
+ 
+ func (ms *MemoryStore) writeExisting(entry, existing *models.MemoryEntry, touch bool) error {
++	if entry == nil || existing == nil {
++		return fmt.Errorf("memory entry and existing memory are required")
++	}
+ 	if touch {
+ 		entry.UpdatedAt = time.Now().UTC()
+ 	}
+@@ -349,6 +367,9 @@
+ 
+ // Delete removes a memory entry by ID.
+ func (ms *MemoryStore) Delete(id string) error {
++	if err := models.ValidateMemoryID(id); err != nil {
++		return err
++	}
+ 	if entry, err := ms.Get(id); err == nil && models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return models.ErrLegacyDecisionMemoryWrite
+ 	}
+@@ -433,6 +454,9 @@
+ 
+ // moveLayer moves a memory entry from its current layer to a new layer.
+ func (ms *MemoryStore) moveLayer(entry *models.MemoryEntry, newLayer string) (*models.MemoryEntry, error) {
++	if entry == nil {
++		return nil, fmt.Errorf("memory entry is required")
++	}
+ 	if models.IsLegacyDecisionMemoryCategory(entry.Category) {
+ 		return nil, models.ErrLegacyDecisionMemoryWrite
+ 	}
+--- a/internal/storage/template_store.go
++++ b/internal/storage/template_store.go
+@@ -7,6 +7,7 @@
+ 	"strings"
+ 
+ 	"github.com/howznguyen/knowns/internal/models"
++	"github.com/howznguyen/knowns/internal/safepath"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+@@ -21,14 +22,14 @@
+ // templateYAML is the raw parsed form of _template.yaml, using the exact field
+ // structure that matches the TypeScript _template.yaml format.
+ type templateYAML struct {
+-	Name        string                  `yaml:"name"`
+-	Description string                  `yaml:"description"`
+-	Version     string                  `yaml:"version"`
+-	Author      string                  `yaml:"author"`
+-	Doc         string                  `yaml:"doc"`
+-	Destination string                  `yaml:"destination"`
+-	Prompts     []models.TemplatePrompt `yaml:"prompts"`
+-	Actions     []models.TemplateAction `yaml:"actions"`
++	Name        string                   `yaml:"name"`
++	Description string                   `yaml:"description"`
++	Version     string                   `yaml:"version"`
++	Author      string                   `yaml:"author"`
++	Doc         string                   `yaml:"doc"`
++	Destination string                   `yaml:"destination"`
++	Prompts     []models.TemplatePrompt  `yaml:"prompts"`
++	Actions     []models.TemplateAction  `yaml:"actions"`
+ 	Messages    *models.TemplateMessages `yaml:"messages"`
+ }
+ 
+@@ -109,10 +110,20 @@
+ 	if idx := strings.Index(name, "/"); idx != -1 {
+ 		importName := name[:idx]
+ 		templateName := name[idx+1:]
+-		templateDir := filepath.Join(ts.importsDir(), importName, "templates", templateName)
++		importDir, err := safepath.Resolve(ts.importsDir(), importName)
++		if err != nil {
++			return nil, fmt.Errorf("invalid import template name: %w", err)
++		}
++		templateDir, err := safepath.Resolve(filepath.Join(importDir, "templates"), templateName)
++		if err != nil {
++			return nil, fmt.Errorf("invalid import template name: %w", err)
++		}
+ 		return ts.parseTemplate(templateName, templateDir, true, importName)
+ 	}
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := safepath.Resolve(ts.templatesDir(), name)
++	if err != nil {
++		return nil, fmt.Errorf("invalid template name: %w", err)
++	}
+ 	return ts.parseTemplate(name, templateDir, false, "")
+ }
+ 
+@@ -168,7 +179,10 @@
+ // Create scaffolds a new template directory with a _template.yaml and a
+ // starter .hbs file.
+ func (ts *TemplateStore) Create(name string, description string) error {
+-	templateDir := filepath.Join(ts.templatesDir(), name)
++	templateDir, err := safepath.Resolve(ts.templatesDir(), name)
++	if err != nil {
++		return fmt.Errorf("invalid template name: %w", err)
++	}
+ 	if err := os.MkdirAll(templateDir, 0755); err != nil {
+ 		return fmt.Errorf("create template dir: %w", err)
+ 	}

@@ -1,0 +1,108 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash[1m]",
+  "entry_id": "16669",
+  "advisory_ids": ["GHSA-8H6X-H86X-75WH", "CVE-2026-77322", "GO-2026-6559"],
+  "repo": "emiago/sipgo",
+  "pinned_commit": "029a4dc8aa2d2e77229fc636cbc3af78fd3dd532",
+  "fix_commits": ["769e4bc958376e2363566c8f7042202b410becdc"],
+  "trust_decision": {
+    "summary": "Whether a peer-declared length may drive an unbounded allocation on the WebSocket read path. The published fix decides that only for the WebSocket frame header, by setting wsutil.Reader.MaxFrameSize in WSConnection.Read; the same decision is NOT made in Parser.Parse, where a SIP Content-Length reaches make([]byte, bodySize) with no bound, and Parser.Parse is exactly the parser the WS transport calls.",
+    "evidence": [
+      "fix.diff:13",
+      "sip/transport_ws.go:364-366",
+      "sip/transport_ws.go:400",
+      "sip/transport_ws.go:250",
+      "sip/parser.go:254",
+      "sip/parser.go:264",
+      "sip/parser.go:278",
+      "sip/parser_stream.go:196"
+    ]
+  },
+  "landing_point": {
+    "where": "sip/transport_ws.go:359",
+    "why": "The advisory summary names the WebSocket frame length, so an engineer opens WSConnection.Read; the unbounded allocation it guards is data := make([]byte, header.Length) at sip/transport_ws.go:400, and the published one-line fix lands in this same function at sip/transport_ws.go:364-365."
+  },
+  "fix_sites": [
+    {
+      "where": "sip/transport_ws.go:364",
+      "entry_point": "Server.ServeWS (server.go:248) / Server.ServeWSS (server.go:253), reached from Server.ListenAndServe(\"ws\") (server.go:147,163) and Server.ListenAndServeTLS(\"ws\") (server.go:196-198); also TransportLayer.ServeWS (sip/transport_layer.go:265) and TransportLayer.ServeWSS (sip/transport_layer.go:288). Client side: TransportWS.CreateConnection (sip/transport_ws.go:269) and TransportWSS.CreateConnection (sip/transport_wss.go:45).",
+      "module_kind": "transport"
+    }
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "For the O8 route: the advisory is scoped to WebSocket frame length, while a SIP Content-Length is a parser-level concern, and Parser.Parse already returns ErrMessageTooLarge for oversized input at sip/parser.go:254 and the TCP/TLS stream parser has its own Content-Length guard at sip/parser_stream.go:196 - so the route reads as already covered and can be argued out of scope.",
+  "O4_distance": {"files": 1, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The WS cap is the package-global ParseMaxMessageLength, which also seeds every Parser's MaxMessageLength (sip/parser.go:56) and is enforced by the TCP/TLS stream parser (sip/parser_stream.go:132,196). A fix that lowers or repurposes that global to bound WS frames silently shrinks the legitimate message-size budget for UDP/TCP/TLS, whose bodies that fit today would start being rejected; the per-transport knob a correct fix should honour instead is Parser.MaxMessageLength (sip/parser.go:46), and the fix ignores it in favour of the mutable global.",
+    "where": "sip/parser.go:33,56; sip/parser_stream.go:196"
+  },
+  "O6_input_shapes": [
+    "one WebSocket frame whose declared 63-bit payload Length exceeds the cap (the guard is set once per Read call and applies to every opcode and to both client-side and server-side connections)",
+    "frames at or below the cap, including a message fragmented across many small frames, which the fix neither aggregates nor bounds"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "sip/parse_header.go:41-62 (header-name to parser map, content-length registered at sip/parse_header.go:56) and its value parser at sip/parse_header.go:173-177",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "A WS text frame carrying a small SIP message with a huge Content-Length header reaches Parser.ParseSIP -> Parse -> make([]byte, bodySize) before any declared-body bound is applied, so the peer still controls a multi-GB allocation from a tiny frame.",
+      "where": "sip/parser.go:278",
+      "reason_to_dismiss": "The advisory is about WebSocket frame length, not SIP Content-Length; Parser.Parse looks guarded because sip/parser.go:254 rejects len(data) > MaxMessageLength, and the stream parser already has a Content-Length guard at sip/parser_stream.go:196, so a solver can plausibly call this covered or out of scope.",
+      "distance": "1 file, same Go package (sip); the WS transport reaches it at sip/transport_ws.go:250, which unlike the TCP transport never uses the guarded stream parser (compare sip/transport_tcp.go:227)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "sip/transport_ws.go:359",
+      "sibling": "An exported WSConnection.ReadMsg/NextMessage that assembles a whole SIP message from successive frame headers, allocating make([]byte, header.Length) itself.",
+      "why_realistic": "WSConnection is exported and already has WriteMsg (sip/transport_ws.go:447) with no read counterpart, so a maintainer adding message-level reads for SIP-over-WS would naturally allocate from the declared frame length and would need the same cap."
+    },
+    {
+      "where": "sip/transport_layer.go:94-100",
+      "sibling": "A per-transport MaxMessageLength field on TransportWS/TransportsConfig that the frame guard honours instead of the package global.",
+      "why_realistic": "TransportsConfig is the documented per-transport configuration route and Parser.MaxMessageLength (sip/parser.go:46) already exists, so moving the cap onto the transport is the obvious next refactor."
+    },
+    {
+      "where": "sip/transport_wss.go:14",
+      "sibling": "A TransportWSS that owns its own frame reader instead of embedding *TransportWS, so the cap has to be applied twice.",
+      "why_realistic": "TransportWSS already duplicates the dialling logic rather than reusing TransportWS.CreateConnection (sip/transport_wss.go:45-124), so a maintainer duplicating the read loop there is in keeping with the existing code."
+    }
+  ],
+  "O9_family": "Uncontrolled memory allocation / resource exhaustion from an attacker-declared length (CWE-789, allocation with excessive size value)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.23.0 with toolchain go1.24.2 (go.mod:3,5); single module github.com/emiago/sipgo, no vendor directory",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "No unit tests for sip/transport_ws.go at all; the only ws/wss coverage is TestIntegrationClientServer over loopback addresses (server_integration_test.go:98,100), skipped unless TEST_INTEGRATION is set (server_integration_test.go:83). Parser behaviour is covered by sip/parser_test.go and sip/parser_stream_test.go."
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "sip/transport_ws.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add reader.MaxFrameSize to the wsutil.Reader in WSConnection.Read (or reject header.Length > 65535 inline), confirm with a fat WebSocket frame, and stop - leaving Parser.Parse's Content-Length allocation, which the very same WS read path calls, unguarded."
+  },
+  "out_of_scope_notes": [
+    "The UDP transport calls the same unguarded Parser.ParseSIP (sip/transport_udp.go:227), but datagram transports are outside this WebSocket advisory's protection, so it was not pursued."
+  ],
+  "unverified": [
+    "Could not read github.com/gobwas/ws v1.3.2 source (module cache is outside the permitted tree) to confirm that wsutil.Reader.NextFrame enforces MaxFrameSize before returning the header; the fix's effectiveness at sip/transport_ws.go:400 rests on that library behaviour.",
+    "repo_mb was not measured (no shell access in this session); tiny_repo is an estimate from the file inventory (~100 Go files plus testdata, no vendor directory).",
+    "present_in_latest is unknown because the task states there is no latest release available for O8."
+  ]
+}

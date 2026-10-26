@@ -1,0 +1,379 @@
+diff -ruN pristine/lib/ansible/module_utils/basic.py app/lib/ansible/module_utils/basic.py
+--- a/lib/ansible/module_utils/basic.py	2026-10-26 03:05:49.000000000 +0000
++++ b/lib/ansible/module_utils/basic.py	2026-10-26 05:24:32.404185793 +0000
+@@ -45,6 +45,7 @@
+ # in lib/ansible/module_common.py
+ 
+ import os
++import ast
+ import re
+ import shlex
+ import subprocess
+@@ -637,37 +638,120 @@
+             else:
+                 self.fail_json(msg="internal error: do not know how to interpret argument_spec")
+ 
+-    def safe_eval(self, str, locals=None, include_exceptions=False):
++    def safe_eval(self, expr, locals=None, include_exceptions=False):
++        '''Read a value as literal data; never execute it.
+ 
+-        # do not allow method calls to modules
+-        if not isinstance(str, basestring):
+-            # already templated to a datastructure, perhaps?
+-            if include_exceptions:
+-                return (str, None)
+-            return str
+-        if re.search(r'\w\.\w+\(', str):
++        This is the copy that is shipped inside every module, so it must stand
++        on its own.  The expression is parsed and the parse tree is walked to
++        build the value directly.  Text that is not literal data is refused:
++        with include_exceptions the caller gets an exception and can decline
++        the value, otherwise the text comes back unchanged.
++        '''
++        # plain arithmetic and comparison over literal operands is still data
++        _ARITHMETIC = {
++            ast.Add:      lambda a, b: a + b,
++            ast.Sub:      lambda a, b: a - b,
++            ast.Mult:     lambda a, b: a * b,
++            ast.Div:      lambda a, b: a / b,
++            ast.Mod:      lambda a, b: a % b,
++            ast.Pow:      lambda a, b: a ** b,
++            ast.FloorDiv: lambda a, b: a // b,
++        }
++        _COMPARISONS = {
++            ast.Eq:    lambda a, b: a == b,
++            ast.NotEq: lambda a, b: a != b,
++            ast.Lt:    lambda a, b: a < b,
++            ast.LtE:   lambda a, b: a <= b,
++            ast.Gt:    lambda a, b: a > b,
++            ast.GtE:   lambda a, b: a >= b,
++        }
++
++        def reject(reason):
++            exc = ValueError(reason)
+             if include_exceptions:
+-                return (str, None)
+-            return str
+-        # do not allow imports
+-        if re.search(r'import \w+', str):
++                return (expr, exc)
++            return expr
++
++        def literal(node):
++            '''build the value a node spells; refuse anything that is not data'''
++            if isinstance(node, ast.Str):
++                return node.s
++            if isinstance(node, ast.Num):
++                return node.n
++            if isinstance(node, ast.Name):
++                if node.id == 'True':
++                    return True
++                if node.id == 'False':
++                    return False
++                if node.id == 'None':
++                    return None
++                if locals is not None and node.id in locals:
++                    return locals[node.id]
++                raise ValueError("unknown name %r" % node.id)
++            if isinstance(node, ast.List):
++                return [literal(x) for x in node.elts]
++            if isinstance(node, ast.Tuple):
++                return tuple(literal(x) for x in node.elts)
++            if isinstance(node, ast.Set):
++                return set(literal(x) for x in node.elts)
++            if isinstance(node, ast.Dict):
++                data = {}
++                for (key, value) in zip(node.keys, node.values):
++                    if key is None:
++                        raise ValueError("dictionary unpacking is not data")
++                    data[literal(key)] = literal(value)
++                return data
++            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
++                operand = literal(node.operand)
++                if isinstance(node.op, ast.USub):
++                    return -operand
++                if isinstance(node.op, ast.UAdd):
++                    return +operand
++                return ~operand
++            if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC:
++                return _ARITHMETIC[type(node.op)](literal(node.left), literal(node.right))
++            if isinstance(node, ast.Compare):
++                left = literal(node.left)
++                for (op, comparator) in zip(node.ops, node.comparators):
++                    if type(op) not in _COMPARISONS:
++                        raise ValueError("comparison operator is not data")
++                    right = literal(comparator)
++                    if not _COMPARISONS[type(op)](left, right):
++                        return False
++                    left = right
++                return True
++            if isinstance(node, ast.Call):
++                # the long-standing set([...]) spelling is the only call allowed
++                if not (isinstance(node.func, ast.Name) and node.func.id == 'set'):
++                    raise ValueError("function calls are not allowed")
++                if node.keywords or getattr(node, 'starargs', None) or getattr(node, 'kwargs', None):
++                    raise ValueError("function calls are not allowed")
++                if len(node.args) == 0:
++                    return set()
++                if len(node.args) != 1:
++                    raise ValueError("function calls are not allowed")
++                return set(literal(node.args[0]))
++            raise ValueError("expression element is not data: %s" % type(node).__name__)
++
++        if not isinstance(expr, basestring):
++            # already templated to a datastructure, perhaps?
+             if include_exceptions:
+-                return (str, None)
+-            return str
++                return (expr, None)
++            return expr
++
+         try:
+-            result = None
+-            if not locals:
+-                result = eval(str)
+-            else:
+-                result = eval(str, None, locals)
+-            if include_exceptions:
+-                return (result, None)
+-            else:
+-                return result
++            tree = ast.parse(expr, mode='eval')
++        except (SyntaxError, TypeError, ValueError):
++            return reject("not a literal expression")
++
++        try:
++            result = literal(tree.body)
+         except Exception, e:
+-            if include_exceptions:
+-                return (str, e)
+-            return str
++            return reject("not a literal expression: %s" % e)
++
++        if include_exceptions:
++            return (result, None)
++        return result
+ 
+ 
+     def _check_argument_types(self):
+diff -ruN pristine/lib/ansible/utils/__init__.py app/lib/ansible/utils/__init__.py
+--- a/lib/ansible/utils/__init__.py	2026-10-26 03:05:49.000000000 +0000
++++ b/lib/ansible/utils/__init__.py	2026-10-26 05:24:23.720193806 +0000
+@@ -18,6 +18,7 @@
+ import sys
+ import re
+ import os
++import ast
+ import shlex
+ import yaml
+ import copy
+@@ -945,51 +946,125 @@
+             return False
+     return True
+ 
+-def safe_eval(str, locals=None, include_exceptions=False):
++def safe_eval(expr, locals=None, include_exceptions=False):
+     '''
+     this is intended for allowing things like:
+     with_items: a_list_variable
+     where Jinja2 would return a string
+     but we do not want to allow it to call functions (outside of Jinja2, where
+     the env is constrained)
++
++    The value is read as literal data and only literal data.  The expression
++    is parsed and the parse tree is walked to build the value directly; the
++    text is never handed to the interpreter, so no part of it can run.  A
++    value that is not literal data is refused (by default it is returned
++    unchanged, which the caller treats as text).
+     '''
+-    # FIXME: is there a more native way to do this?
++    # plain arithmetic and comparison over literal operands is still data
++    _ARITHMETIC = {
++        ast.Add:      lambda a, b: a + b,
++        ast.Sub:      lambda a, b: a - b,
++        ast.Mult:     lambda a, b: a * b,
++        ast.Div:      lambda a, b: a / b,
++        ast.Mod:      lambda a, b: a % b,
++        ast.Pow:      lambda a, b: a ** b,
++        ast.FloorDiv: lambda a, b: a // b,
++    }
++    _COMPARISONS = {
++        ast.Eq:    lambda a, b: a == b,
++        ast.NotEq: lambda a, b: a != b,
++        ast.Lt:    lambda a, b: a < b,
++        ast.LtE:   lambda a, b: a <= b,
++        ast.Gt:    lambda a, b: a > b,
++        ast.GtE:   lambda a, b: a >= b,
++    }
+ 
+-    def is_set(var):
+-        return not var.startswith("$") and not '{{' in var
++    def reject(reason):
++        exc = ValueError(reason)
++        if include_exceptions:
++            return (expr, exc)
++        return expr
+ 
+-    def is_unset(var):
+-        return var.startswith("$") or '{{' in var
++    def literal(node):
++        '''build the value a node spells; refuse anything that is not data'''
++        if isinstance(node, ast.Str):
++            return node.s
++        if isinstance(node, ast.Num):
++            return node.n
++        if isinstance(node, ast.Name):
++            if node.id == 'True':
++                return True
++            if node.id == 'False':
++                return False
++            if node.id == 'None':
++                return None
++            if locals is not None and node.id in locals:
++                return locals[node.id]
++            raise ValueError("unknown name %r" % node.id)
++        if isinstance(node, ast.List):
++            return [literal(x) for x in node.elts]
++        if isinstance(node, ast.Tuple):
++            return tuple(literal(x) for x in node.elts)
++        if isinstance(node, ast.Set):
++            return set(literal(x) for x in node.elts)
++        if isinstance(node, ast.Dict):
++            data = {}
++            for (key, value) in zip(node.keys, node.values):
++                if key is None:
++                    raise ValueError("dictionary unpacking is not data")
++                data[literal(key)] = literal(value)
++            return data
++        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
++            operand = literal(node.operand)
++            if isinstance(node.op, ast.USub):
++                return -operand
++            if isinstance(node.op, ast.UAdd):
++                return +operand
++            return ~operand
++        if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC:
++            return _ARITHMETIC[type(node.op)](literal(node.left), literal(node.right))
++        if isinstance(node, ast.Compare):
++            left = literal(node.left)
++            for (op, comparator) in zip(node.ops, node.comparators):
++                if type(op) not in _COMPARISONS:
++                    raise ValueError("comparison operator is not data")
++                right = literal(comparator)
++                if not _COMPARISONS[type(op)](left, right):
++                    return False
++                left = right
++            return True
++        if isinstance(node, ast.Call):
++            # the long-standing set([...]) spelling is the only call allowed
++            if not (isinstance(node.func, ast.Name) and node.func.id == 'set'):
++                raise ValueError("function calls are not allowed")
++            if node.keywords or getattr(node, 'starargs', None) or getattr(node, 'kwargs', None):
++                raise ValueError("function calls are not allowed")
++            if len(node.args) == 0:
++                return set()
++            if len(node.args) != 1:
++                raise ValueError("function calls are not allowed")
++            return set(literal(node.args[0]))
++        raise ValueError("expression element is not data: %s" % type(node).__name__)
+ 
+-    # do not allow method calls to modules
+-    if not isinstance(str, basestring):
++    if not isinstance(expr, basestring):
+         # already templated to a datastructure, perhaps?
+         if include_exceptions:
+-            return (str, None)
+-        return str
+-    if re.search(r'\w\.\w+\(', str):
+-        if include_exceptions:
+-            return (str, None)
+-        return str
+-    # do not allow imports
+-    if re.search(r'import \w+', str):
+-        if include_exceptions:
+-            return (str, None)
+-        return str
++            return (expr, None)
++        return expr
++
+     try:
+-        result = None
+-        if not locals:
+-            result = eval(str)
+-        else:
+-            result = eval(str, None, locals)
+-        if include_exceptions:
+-            return (result, None)
+-        else:
+-            return result
++        tree = ast.parse(expr, mode='eval')
++    except (SyntaxError, TypeError, ValueError):
++        return reject("not a literal expression")
++
++    try:
++        result = literal(tree.body)
+     except Exception, e:
+-        if include_exceptions:
+-            return (str, e)
+-        return str
++        return reject("not a literal expression: %s" % e)
++
++    if include_exceptions:
++        return (result, None)
++    return result
+ 
+ 
+ def listify_lookup_plugin_terms(terms, basedir, inject):
+diff -ruN pristine/lib/ansible/utils/template.py app/lib/ansible/utils/template.py
+--- a/lib/ansible/utils/template.py	2026-10-26 03:05:49.000000000 +0000
++++ b/lib/ansible/utils/template.py	2026-10-26 05:24:43.364175683 +0000
+@@ -19,6 +19,7 @@
+ import re
+ import codecs
+ import jinja2
++from jinja2.sandbox import SandboxedEnvironment
+ from jinja2.runtime import StrictUndefined
+ from jinja2.exceptions import TemplateSyntaxError
+ import yaml
+@@ -420,6 +421,20 @@
+     def new_context(self, vars=None, shared=False, locals=None):
+         return jinja2.runtime.Context(self.environment, vars.add_locals(locals), self.name, self.blocks)
+ 
++def _new_environment(**kwargs):
++    '''
++    Build the templating environment.
++
++    Variable values are expanded again here, including values that arrived
++    from a managed host, so the environment is sandboxed: a template can use
++    variables, filters and lookups, but it cannot drill into interpreter
++    internals or turn a value into a running program.
++    '''
++    environment = SandboxedEnvironment(**kwargs)
++    environment.filters.update(_get_filters())
++    environment.template_class = J2Template
++    return environment
++
+ def template_from_file(basedir, path, vars):
+     ''' run a file through the templating engine '''
+ 
+@@ -435,8 +450,7 @@
+     def my_finalize(thing):
+         return thing if thing is not None else ''
+ 
+-    environment = jinja2.Environment(loader=loader, trim_blocks=True, extensions=_get_extensions())
+-    environment.filters.update(_get_filters())
++    environment = _new_environment(loader=loader, trim_blocks=True, extensions=_get_extensions())
+     environment.globals['lookup'] = my_lookup
+     environment.globals['finalize'] = my_finalize
+     if fail_on_undefined:
+@@ -527,9 +541,7 @@
+         def my_finalize(thing):
+             return thing if thing is not None else ''
+ 
+-        environment = jinja2.Environment(trim_blocks=True, undefined=StrictUndefined, extensions=_get_extensions(), finalize=my_finalize)
+-        environment.filters.update(_get_filters())
+-        environment.template_class = J2Template
++        environment = _new_environment(trim_blocks=True, undefined=StrictUndefined, extensions=_get_extensions(), finalize=my_finalize)
+ 
+         if '_original_file' in vars:
+             basedir = os.path.dirname(vars['_original_file'])

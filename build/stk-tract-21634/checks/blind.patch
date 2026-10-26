@@ -1,0 +1,208 @@
+--- a/data/src/lib.rs
++++ b/data/src/lib.rs
+@@ -23,7 +23,10 @@
+     pub use crate::tensor::litteral::*;
+     pub use crate::tensor::plain_view::{PlainView, PlainViewMut};
+     pub use crate::tensor::storage::{PlainStorage, TensorStorage};
+-    pub use crate::tensor::{IntoArcTensor, IntoTensor, Tensor, natural_strides};
++    pub use crate::tensor::{
++        IntoArcTensor, IntoTensor, Tensor, checked_shape_byte_len, checked_shape_product,
++        natural_strides,
++    };
+     #[cfg(feature = "complex")]
+     pub use crate::tensor::{reinterpret_complex_as_inner_dim, reinterpret_inner_dim_as_complex};
+     pub use crate::tvec;
+--- a/data/src/tensor.rs
++++ b/data/src/tensor.rs
+@@ -279,7 +279,9 @@
+         shape: &[usize],
+         alignment: usize,
+     ) -> TractResult<Tensor> {
+-        let bytes = shape.iter().cloned().product::<usize>() * dt.size_of();
++        let bytes = checked_shape_byte_len(shape, dt).with_context(|| {
++            format!("Tensor shape {shape:?} is too large to be represented as {dt:?} bytes")
++        })?;
+         let storage = StorageKind::Plain(PlainStorage::from(unsafe {
+             Blob::new_for_size_and_align(bytes, alignment)
+         }));
+@@ -1758,6 +1760,24 @@
+     strides
+ }
+ 
++/// Number of elements held by a tensor of the given shape.
++///
++/// `None` when the product of the dimensions does not fit a `usize`. A shape like that can not
++/// describe a tensor that exists in memory, whatever its datum type, so callers must refuse it
++/// instead of letting the product wrap around.
++pub fn checked_shape_product(shape: &[usize]) -> Option<usize> {
++    shape.iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
++}
++
++/// Byte size of a tensor with the given shape and datum type.
++///
++/// `None` when the element count or the consequent byte count overflows a `usize`. Skipping this
++/// check lets a declared shape wrap back to a small (or zero) allocation that the tensor then
++/// claims to fill.
++pub fn checked_shape_byte_len(shape: &[usize], dt: DatumType) -> Option<usize> {
++    checked_shape_product(shape)?.checked_mul(dt.size_of())
++}
++
+ fn compute_natural_stride_to(strides: &mut TVec<isize>, shape: &[usize]) {
+     match shape.len() {
+         0 => (),
+--- a/linalg/src/frame/block_quant/storage.rs
++++ b/linalg/src/frame/block_quant/storage.rs
+@@ -17,8 +17,11 @@
+ }
+ 
+ impl BlockQuantStorage {
+-    fn expected_bytes(format: &dyn BlockQuant, m: usize, k: usize) -> usize {
+-        m * k / format.block_len() * format.block_bytes()
++    fn expected_bytes(format: &dyn BlockQuant, m: usize, k: usize) -> TractResult<usize> {
++        m.checked_mul(k)
++            .map(|elements| elements / format.block_len())
++            .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
++            .with_context(|| format!("Block quant byte size for m={m}, k={k} overflows a usize"))
+     }
+ 
+     pub fn new(
+@@ -27,7 +30,7 @@
+         k: usize,
+         data: Arc<Blob>,
+     ) -> TractResult<Self> {
+-        let expected = Self::expected_bytes(&*format, m, k);
++        let expected = Self::expected_bytes(&*format, m, k)?;
+         ensure!(
+             data.len() == expected,
+             "BlockQuantStorage::new: blob length {} does not match expected {} (m={}, k={}, format={})",
+--- a/nnef/src/ops/nnef/deser.rs
++++ b/nnef/src/ops/nnef/deser.rs
+@@ -104,7 +104,40 @@
+     }
+     if let Some(bqs) = tensor.storage_as::<BlockQuantStorage>() {
+         // Use the NNEF variable shape directly — the graph's own unsqueeze
+-        // ops will add any group dims as needed.
++        // ops will add any group dims as needed. The shape replaces the one
++        // stored in the tensor file, so it must still describe the same
++        // payload: same number of elements, and a trailing dimension that
++        // the block layout can split.
++        ensure!(
++            !shape.is_empty(),
++            "Block quant tensor {:?} needs a shape of rank 1 or more",
++            label
++        );
++        let block_len = bqs.format().block_len();
++        let block_bytes = bqs.format().block_bytes();
++        let trailing = *shape.last().unwrap();
++        ensure!(
++            trailing % block_len == 0,
++            "Wrong shape for tensor {:?}: last dimension {} is not a multiple of {}",
++            label,
++            trailing,
++            block_len
++        );
++        let elements = checked_shape_product(&shape).with_context(|| {
++            format!("Block quant tensor {:?} shape {:?} overflows the element count", label, shape)
++        })?;
++        let expected_bytes =
++            (elements / block_len).checked_mul(block_bytes).with_context(|| {
++                format!("Block quant tensor {:?} shape {:?} overflows the byte count", label, shape)
++            })?;
++        ensure!(
++            expected_bytes == bqs.value().len(),
++            "Wrong shape for tensor {:?}: graph shape {:?} needs {} bytes, the tensor file holds {}",
++            label,
++            shape,
++            expected_bytes,
++            bqs.value().len()
++        );
+         let tensor =
+             bqs.clone().into_tensor_with_shape(tensor.datum_type(), &shape).into_arc_tensor();
+         let fact: Box<dyn ExoticFact> = Box::new(BlockQuantFact::new(
+--- a/nnef/src/tensors.rs
++++ b/nnef/src/tensors.rs
+@@ -61,12 +61,27 @@
+ pub fn read_tensor(mut reader: impl Read) -> TractResult<Tensor> {
+     let header = Header::read(&mut reader)?;
+     let shape: TVec<usize> = header.dims[0..header.rank as usize].iter().map(|d| *d as _).collect();
+-    let len = shape.iter().product::<usize>();
++    let len = checked_shape_product(&shape)
++        .with_context(|| format!("Tensor shape {shape:?} overflows the element count"))?;
+ 
+     if header.item_type == 5 {
+-        let expected_bit_size = len * header.bits_per_item as usize;
+-        let real_bit_size = header.data_size_bytes as usize * 8;
+-        if !(real_bit_size - 8 <= expected_bit_size && expected_bit_size <= real_bit_size) {
++        let expected_bit_size =
++            len.checked_mul(header.bits_per_item as usize).with_context(|| {
++                format!(
++                    "Tensor shape {shape:?} at {} bits per item overflows the bit count",
++                    header.bits_per_item
++                )
++            })?;
++        let real_bit_size =
++            (header.data_size_bytes as usize).checked_mul(8).with_context(|| {
++                format!("Tensor data size {} overflows the bit count", header.data_size_bytes)
++            })?;
++        // Packed values may trail one partial byte: the payload is never shorter than the
++        // declared values need, and at most one byte longer than them.
++        let payload_fits = real_bit_size
++            .checked_sub(expected_bit_size)
++            .is_some_and(|trailing_bits| trailing_bits <= 8);
++        if !payload_fits {
+             bail!(
+                 "Shape and len mismatch: shape:{:?}, bits_per_item:{}, bytes:{} ",
+                 shape,
+@@ -74,11 +89,11 @@
+                 header.data_size_bytes
+             );
+         }
+-    } else if header.bits_per_item != u32::MAX
+-        && len * (header.bits_per_item as usize / 8) != header.data_size_bytes as usize
+-    {
+-        bail!(
+-            "Shape and len mismatch: shape:{:?}, bits_per_item:{}, bytes:{} ",
++    } else if header.bits_per_item != u32::MAX {
++        ensure!(
++            len.checked_mul(header.bits_per_item as usize / 8)
++                == Some(header.data_size_bytes as usize),
++            "Shape and len mismatch: shape:{:?}, bits_per_item:{}, bytes:{}",
+             shape,
+             header.bits_per_item,
+             header.data_size_bytes
+@@ -281,9 +296,14 @@
+     let shape: TVec<_> =
+         header.dims.iter().take(header.rank as usize).map(|d| *d as usize).collect();
+     let q_m = shape[0];
+-    let q_k = shape.iter().skip(1).product::<usize>();
++    let q_k = shape[1..].iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim)).with_context(
++        || format!("Block quant tensor shape {shape:?} overflows the element count"),
++    )?;
+     ensure!(q_k % format.block_len() == 0);
+-    let expected_len = (q_m * q_k) / format.block_len() * format.block_bytes();
++    let expected_len = q_m
++        .checked_mul(q_k / format.block_len())
++        .and_then(|blocks| blocks.checked_mul(format.block_bytes()))
++        .with_context(|| format!("Block quant tensor shape {shape:?} overflows the byte count"))?;
+     ensure!(expected_len == header.data_size_bytes as usize);
+     let mut blob = unsafe { Blob::new_for_size_and_align(expected_len, 128) };
+     r.read_exact(&mut blob)?;
+--- a/onnx/src/tensor.rs
++++ b/onnx/src/tensor.rs
+@@ -111,6 +111,16 @@
+ }
+ 
+ fn create_tensor(shape: Vec<usize>, dt: DatumType, data: &[u8]) -> TractResult<Tensor> {
++    let expected_len = checked_shape_byte_len(&shape, dt)
++        .with_context(|| format!("Tensor shape {shape:?} overflows the byte count for {dt:?}"))?;
++    ensure!(
++        expected_len == data.len(),
++        "Tensor shape {:?} needs {} bytes for {:?}, the model carries {}",
++        shape,
++        expected_len,
++        dt,
++        data.len()
++    );
+     unsafe {
+         match dt {
+             DatumType::U8 => Tensor::from_raw::<u8>(&shape, data),

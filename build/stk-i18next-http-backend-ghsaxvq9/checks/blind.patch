@@ -1,0 +1,156 @@
+diff -ruN a/lib/guard.js b/lib/guard.js
+--- a/lib/guard.js	1970-01-01 00:00:00.000000000 +0000
++++ b/lib/guard.js	2026-10-26 05:15:07.464711489 +0000
+@@ -0,0 +1,60 @@
++// A caller-supplied value may only fill one path token of the request URL.
++//
++// The language and the namespace reach this backend from outside the
++// application: a visitor picks a language, and i18next hands it (and the
++// namespaces derived from it) to read/readMulti/create. A value that contains
++// URL structure — a scheme delimiter, a path separator, a query or fragment
++// introducer, an authority boundary, an escape sequence or a control
++// character — can move the request to a destination the application never
++// configured, whichever placeholder it fills.
++//
++// So values are checked while they are still values, before a request is
++// built, rather than by inspecting the finished URL: that keeps the rule the
++// same for a string location, a function location and a promise location, for
++// both transports, and for the create/addPath write path. `+` separates the
++// languages (and namespaces) that i18next asks for in one round trip, so a
++// value may hold one or more `+`-joined tokens; each token is checked.
++
++const MAX_TOKEN_LENGTH = 96
++
++// Allowed token characters are ASCII letters, digits, `-`, `_` and `.`.
++// Everything else is refused: `:` (scheme), `/` and `\` (path), `?` and `#`
++// (query/fragment), `@` (authority), `%` (escaped separators), whitespace and
++// control characters.
++function isTokenChar (code) {
++  if (code >= 0x30 && code <= 0x39) return true // 0-9
++  if (code >= 0x41 && code <= 0x5A) return true // A-Z
++  if (code >= 0x61 && code <= 0x7A) return true // a-z
++  return code === 0x2D || code === 0x2E || code === 0x5F // - . _
++}
++
++function isSafeToken (token) {
++  if (token.length === 0 || token.length > MAX_TOKEN_LENGTH) return false
++  // `.` and `..` are directory segments; `..` anywhere is traversal.
++  if (token === '.' || token.indexOf('..') !== -1) return false
++  for (let i = 0; i < token.length; i += 1) {
++    if (!isTokenChar(token.charCodeAt(i))) return false
++  }
++  return true
++}
++
++// True when `value` can be substituted into a location without changing the
++// destination. Numbers are accepted (they were interpolated as text before);
++// anything else that is not a string is refused.
++export function isSafeRequestValue (value) {
++  let text = value
++  if (typeof value === 'number' && Number.isFinite(value)) text = String(value)
++  if (typeof text !== 'string') return false
++  const tokens = text.split('+')
++  for (let i = 0; i < tokens.length; i += 1) {
++    if (!isSafeToken(tokens[i])) return false
++  }
++  return true
++}
++
++// The values themselves never appear in the refusal message: it is reported to
++// the application (and may be logged) and the whole point is that they are not
++// trustworthy.
++export function unsafeRequestValues () {
++  return new Error('i18next-http-backend: refusing to request a location built from an unsafe lng or ns value')
++}
+diff -ruN a/lib/index.js b/lib/index.js
+--- a/lib/index.js	2026-10-26 02:31:42.000000000 +0000
++++ b/lib/index.js	2026-10-26 05:15:15.404704335 +0000
+@@ -1,4 +1,5 @@
+ import { makePromise, interpolate } from './utils.js'
++import { isSafeRequestValue, unsafeRequestValues } from './guard.js'
+ import request from './request.js'
+ 
+ const getDefaults = () => {
+@@ -61,7 +62,15 @@
+ 
+     loadPath.then(resolvedLoadPath => {
+       if (!resolvedLoadPath) return callback(null, {})
+-      const url = interpolate(resolvedLoadPath, { lng: languages.join('+'), ns: namespaces.join('+') })
++      const lng = languages.join('+')
++      const ns = namespaces.join('+')
++      // The resolved location may be a string, or a string built by an
++      // application function — either way the values that fill it come from
++      // the caller and must not be able to leave the configured destination.
++      if (!isSafeRequestValue(lng) || !isSafeRequestValue(ns)) {
++        return callback(unsafeRequestValues(), false /* no retry */)
++      }
++      const url = interpolate(resolvedLoadPath, { lng, ns })
+       this.loadUrl(url, callback, loadUrlLanguages, loadUrlNamespaces)
+     })
+   }
+@@ -112,10 +121,19 @@
+     if (!this.options.addPath) return
+     if (typeof languages === 'string') languages = [languages]
+     const payload = this.options.parsePayload(namespace, key, fallbackValue)
++    const safeNamespace = isSafeRequestValue(namespace)
+     let finished = 0
+     const dataArray = []
+     const resArray = []
+     languages.forEach(lng => {
++      // Same rule as the read path: a value may only contribute a path token.
++      // A refused write is counted as done so the caller still gets an answer,
++      // but nothing is requested.
++      if (!safeNamespace || !isSafeRequestValue(lng)) {
++        finished += 1
++        if (finished === languages.length && typeof callback === 'function') callback(dataArray, resArray)
++        return
++      }
+       let addPath = this.options.addPath
+       if (typeof this.options.addPath === 'function') {
+         addPath = this.options.addPath(lng, namespace)
+diff -ruN a/lib/request.js b/lib/request.js
+--- a/lib/request.js	2026-10-26 02:31:42.000000000 +0000
++++ b/lib/request.js	2026-10-26 05:17:12.572594991 +0000
+@@ -50,6 +50,10 @@
+ 
+ const fetchIt = (url, fetchOptions, callback, altFetch) => {
+   const resolver = (response) => {
++    // `redirect: 'manual'` hands a redirect back as a response instead of
++    // following it (browsers expose an opaque redirect, Node the 3xx itself).
++    // Either way nothing was sent to the destination the redirect named.
++    if (response.type === 'opaqueredirect') return callback('refusing to follow a redirect to another destination', { status: 0 })
+     if (!response.ok) return callback(response.statusText || 'Error', { status: response.status })
+     response.text().then((data) => {
+       callback(null, { status: response.status, data })
+@@ -73,6 +77,9 @@
+ 
+ let omitFetchOptions = false
+ 
++// Redirects are answered, never followed (see the resolver below).
++const REDIRECT_POLICY = 'manual'
++
+ // fetch api stuff
+ const requestWithFetch = (options, url, payload, callback) => {
+   if (options.queryStringParams) {
+@@ -92,6 +99,11 @@
+     headers,
+     ...(omitFetchOptions ? {} : reqOptions)
+   }
++  // The application configured where its resources live; a redirect served by
++  // that destination (or by anything upstream of it) must not be able to move
++  // the request — including a write and its payload — to another destination.
++  // Set after the requestOptions spread so an override cannot re-enable it.
++  fetchOptions.redirect = REDIRECT_POLICY
+   const altFetch = typeof options.alternateFetch === 'function' && options.alternateFetch.length >= 1 ? options.alternateFetch : undefined
+   try {
+     fetchIt(url, fetchOptions, callback, altFetch)
+@@ -103,6 +115,9 @@
+       Object.keys(reqOptions).forEach((opt) => {
+         delete fetchOptions[opt]
+       })
++      // The retry drops the requestOptions that this environment rejected, but
++      // the redirect policy is ours: put it back before sending again.
++      fetchOptions.redirect = REDIRECT_POLICY
+       fetchIt(url, fetchOptions, callback, altFetch)
+       omitFetchOptions = true
+     } catch (err) {

@@ -1,0 +1,177 @@
+diff --git a/api/lib/basemap/probe.ts b/api/lib/basemap/probe.ts
+index 467bc54e7..2a5f11563 100644
+--- a/api/lib/basemap/probe.ts
++++ b/api/lib/basemap/probe.ts
+@@ -1,3 +1,5 @@
++import { fetch as safeFetch, isSafeUrl } from '@tak-ps/node-safeurl';
++
+ /**
+  * Replace the tile-coordinate variables in a template with zeroes so a single
+  * representative tile can be requested.
+@@ -16,10 +18,16 @@ function sampleTileURL(template: string): string {
+  * answers before it is handed back to the caller.
+  *
+  * @param template - Tile template advertised by the source
++ * @param allow    - Origins the operator has explicitly configured
+  */
+-export default async function probeTileTemplate(template: string): Promise<void> {
++export default async function probeTileTemplate(template: string, allow: string[] = []): Promise<void> {
+     try {
+-        const res = await fetch(new URL(sampleTileURL(template)), {
++        const href = new URL(sampleTileURL(template)).href;
++        const { safe } = await isSafeUrl(href, { allow });
++        if (!safe) return;
++
++        const res = await safeFetch(href, {
++            safeUrlAllow: allow,
+             method: 'GET',
+         });
+ 
+diff --git a/api/lib/basemap/warm.ts b/api/lib/basemap/warm.ts
+index 5d2e189e5..02992bdf9 100644
+--- a/api/lib/basemap/warm.ts
++++ b/api/lib/basemap/warm.ts
+@@ -1,12 +1,19 @@
++import { fetch as safeFetch, isSafeUrl } from '@tak-ps/node-safeurl';
++
+ /**
+  * Warm the upstream metadata cache for a TileJSON source so the first proxied
+  * tile request does not pay the full round trip.
+  *
+- * @param href - TileJSON URL to fetch
++ * @param href  - TileJSON URL to fetch
++ * @param allow - Origins the operator has explicitly configured
+  */
+-export default async function warmTileJSON(href: string): Promise<void> {
++export default async function warmTileJSON(href: string, allow: string[] = []): Promise<void> {
+     try {
+-        const res = await fetch(href, {
++        const { safe } = await isSafeUrl(href, { allow });
++        if (!safe) return;
++
++        const res = await safeFetch(href, {
++            safeUrlAllow: allow,
+             headers: { accept: 'application/json' },
+         });
+ 
+diff --git a/api/routes/basemap.ts b/api/routes/basemap.ts
+index 1addc7431..6dca1c3a7 100644
+--- a/api/routes/basemap.ts
++++ b/api/routes/basemap.ts
+@@ -22,7 +22,7 @@ import { Basemap as BasemapParser, Feature } from '@tak-ps/node-cot';
+ import { Basemap } from '../lib/schema.js';
+ import { toEnum, Basemap_Format, Basemap_Protocol, Basemap_Scheme, Basemap_Type, Basemap_FeatureAction, AllBoolean, AllBooleanCast, BasemapTerrain_Encoding } from '../lib/enums.js';
+ import { EsriBase, EsriProxyLayer } from '../lib/esri.js';
+-import { isSafeUrl } from '@tak-ps/node-safeurl';
++import { fetch as safeFetch, isSafeUrl } from '@tak-ps/node-safeurl';
+ import warmTileJSON from '../lib/basemap/warm.js';
+ import probeTileTemplate from '../lib/basemap/probe.js';
+ import * as Default from '../lib/limits.js';
+@@ -70,6 +70,30 @@ function normalizeBasemapFormat(value: string): string {
+     return value === 'jpg' ? 'jpeg' : value;
+ }
+ 
++/**
++ * Origin of the operator-configured tile service.
++ *
++ * @param config - Application configuration
++ */
++function configuredTileOrigin(config: Config): string | null {
++    try {
++        return new URL(config.PMTILES_URL).origin;
++    } catch {
++        return null;
++    }
++}
++
++/**
++ * Refuse a destination unless every address it resolves to is public.
++ *
++ * @param href  - Destination to classify
++ * @param allow - Origins the operator has explicitly configured
++ */
++async function assertSafeDestination(href: string | URL, allow: string[] = []): Promise<void> {
++    const { safe, reason } = await isSafeUrl(String(href), { allow });
++    if (!safe) throw new Err(400, null, `Blocked URL: ${reason}`);
++}
++
+ async function importBasemapURL(
+     config: Config,
+     rawURL: string,
+@@ -111,7 +135,7 @@ async function importBasemapURL(
+         return await layer.tilejson();
+     }
+ 
+-    const tjres = await fetch(url);
++    const tjres = await safeFetch(url);
+     if (!tjres.ok) {
+         throw new Err(400, new Error(await tjres.text()), 'Unable to fetch TileJSON from source URL');
+     }
+@@ -497,7 +521,7 @@ export default async function router(schema: Schema, config: Config) {
+                 }
+                 const metaURL = new URL(req.body.url);
+                 metaURL.searchParams.set('f', 'json');
+-                const metaRes = await fetch(metaURL);
++                const metaRes = await safeFetch(metaURL);
+                 const meta = await metaRes.json() as { geometryType?: string };
+                 req.body.type = meta.geometryType ? Basemap_Type.VECTOR : Basemap_Type.RASTER;
+             }
+@@ -762,8 +786,11 @@ export default async function router(schema: Schema, config: Config) {
+                 }
+             }
+ 
++            const tileOrigin = configuredTileOrigin(config);
++            const tileAllow = tileOrigin ? [tileOrigin] : [];
++
+             if (basemap.tilejson && (basemap.tilejson.startsWith('http://') || basemap.tilejson.startsWith('https://'))) {
+-                await warmTileJSON(basemap.tilejson);
++                await warmTileJSON(basemap.tilejson, tileAllow);
+             }
+ 
+             let tileURL: string;
+@@ -803,18 +830,19 @@ export default async function router(schema: Schema, config: Config) {
+ 
+             if (basemap.tilejson && (basemap.tilejson.startsWith('http://') || basemap.tilejson.startsWith('https://'))) {
+                 const url = new URL(basemap.tilejson);
++                const configured = tileOrigin !== null && url.origin === tileOrigin;
+ 
+-                if (url.hostname === new URL(config.PMTILES_URL).hostname) {
++                if (configured) {
+                     url.searchParams.set('token', auth.token);
+-                } else {
+-                    // Skip isSafeUrl check when StackName=test (test mode)
+-                    if (process.env.StackName !== 'test') {
+-                        const { safe, reason } = await isSafeUrl(basemap.tilejson);
+-                        if (!safe) throw new Err(400, null, `Blocked URL: ${reason}`);
+-                    }
++                } else if (process.env.StackName !== 'test') {
++                    await assertSafeDestination(basemap.tilejson);
+                 }
+ 
+-                const tj = await fetch(url);
++                const tj = configured
++                    ? await safeFetch(url, { safeUrlAllow: tileAllow })
++                    : process.env.StackName === 'test'
++                        ? await fetch(url)
++                        : await safeFetch(url);
+ 
+                 if (!tj.ok) {
+                     throw new Err(400, null, 'Unable to fetch TileJSON from source URL');
+@@ -823,7 +851,7 @@ export default async function router(schema: Schema, config: Config) {
+                 const json = await tj.json();
+ 
+                 if (Array.isArray(json.tiles) && json.tiles.length) {
+-                    await probeTileTemplate(String(json.tiles[0]));
++                    await probeTileTemplate(String(json.tiles[0]), tileAllow);
+                 }
+ 
+                 res.json({
+@@ -842,7 +870,7 @@ export default async function router(schema: Schema, config: Config) {
+                 tilejsonUrl.pathname = decodeURIComponent(parsedUrl.pathname).replace(/\/tiles\/\{[^}]+\}.*$/, '');
+                 tilejsonUrl.searchParams.set('token', auth.token);
+ 
+-                const tj = await fetch(tilejsonUrl);
++                const tj = await safeFetch(tilejsonUrl, { safeUrlAllow: tileAllow });
+                 if (!tj.ok) {
+                     throw new Err(400, null, 'Unable to fetch TileJSON from hosted basemap');
+                 }

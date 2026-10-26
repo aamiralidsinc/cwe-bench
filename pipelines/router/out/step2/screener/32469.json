@@ -1,0 +1,150 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "32469",
+  "advisory_ids": ["GHSA-67MX-6WF2-92XP", "CVE-2026-71415"],
+  "repo": "getkirby/kirby",
+  "pinned_commit": "58f819988436b31969078bc4655452dd48546451",
+  "fix_commits": ["37e206f3ed40ad3fab2e47e055ccb19e9c207dab"],
+  "trust_decision": {
+    "summary": "Whether the current API user may create/replace the target file (or update the user that owns the avatar) for the declared file template is decided in the upload entry points, before any chunk byte is persisted to the cache dir, by building a File/User from the target parent plus the declared template and calling permissions()->can('create'|'replace'|'update'); at the pinned commit no such pre-persistence decision exists anywhere on the chunk path - the only permission check runs at commit time in FileRules::create(), after the upload has already been buffered.",
+    "evidence": [
+      "config/api/routes/files.php:49-59",
+      "config/api/routes/users.php:89-102",
+      "config/fields/mixins/upload.php:65-82",
+      "src/Api/Upload.php:177-190",
+      "src/Api/Upload.php:238-267",
+      "src/Api/Upload.php:347-392",
+      "src/Cms/FileRules.php:137-141",
+      "src/Cms/UserRules.php:227-244"
+    ]
+  },
+  "landing_point": {
+    "where": "src/Api/Upload.php:221-244",
+    "why": "The advisory summary says permissions are not checked during processing of chunk data; processChunk() is the only code that buffers chunk bytes into site/cache/.uploads and it validates template maxsize, extension and offset but never permissions, so a reader who follows the summary lands here first."
+  },
+  "fix_sites": [
+    {
+      "where": "config/api/routes/files.php:49-59",
+      "entry_point": "POST /api/(account|pages/:id|site|users/:id)/files (multipart create)",
+      "module_kind": "http_api_route"
+    },
+    {
+      "where": "config/api/routes/files.php:110-118",
+      "entry_point": "POST /api/<parent>/files/:filename (multipart replace)",
+      "module_kind": "http_api_route"
+    },
+    {
+      "where": "config/api/routes/users.php:88-102",
+      "entry_point": "POST /api/(account|users/:id)/avatar",
+      "module_kind": "http_api_route"
+    },
+    {
+      "where": "config/fields/mixins/upload.php:55-83",
+      "entry_point": "POST /api/<model>/fields/<field>/upload (files and textarea fields, config/fields/files.php:112-130 and config/fields/textarea.php:100-112)",
+      "module_kind": "panel_field_mixin"
+    },
+    {
+      "where": "src/Api/Api.php:638-652",
+      "entry_point": "public API $kirby->api()->upload(callback, single:, debug:, template:) used by every caller above and by plugins",
+      "module_kind": "public_library_api"
+    },
+    {
+      "where": "src/Api/Upload.php:156-209",
+      "entry_point": "Upload::process() / Upload::processChunk() - reached from all of the above; where the preflight must run and where the chunk buffer lives",
+      "module_kind": "upload_primitive"
+    },
+    {
+      "where": "fix.diff:262-321",
+      "entry_point": "chunk request state (template and Upload-Length) carried across requests via the site/cache/.uploads tmp file; the fix pins it in a Json sidecar written by processChunk() and re-read by validateChunk()",
+      "module_kind": "upload_primitive"
+    }
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "src/Api/Upload.php:177-190 (preflight must be invoked here, inside the uploader, before processChunk buffers bytes) and src/Api/Api.php:638-652 (public Api::upload() had no way to pass an authorization callback at all)"
+  },
+  "O3_reason_to_dismiss": "File creation already calls $file->permissions()->can('create') inside FileRules::create() (and UserRules::createAvatar()/replaceAvatar() for avatars), so a solver can argue the permission is enforced and the report is only an ordering detail inside the uploader - leaving the pre-persistence chunk write and the template/Upload-Length switching between chunk requests untouched.",
+  "O4_distance": {
+    "files": 4,
+    "packages": 3,
+    "repo_mb": null
+  },
+  "O5_coupled_behaviour": {
+    "what": "Authorized chunked uploads must still complete, including the first-chunk-already-completes-the-file shortcut and panel field uploads whose template is declared only as the Api::upload() template argument from the blueprint uploads option and never appears in the request body; a preflight that reads only requestBody('template'), or that refuses chunked requests outright, denies every field upload and every single-request upload. The pinned test testValidateChunkTemplatePriority (tests/Api/UploadTest.php:650-681) fixes the constructor-argument template as the one that must win over the body.",
+    "where": "config/fields/mixins/upload.php:82"
+  },
+  "O6_input_shapes": [
+    "template declared in the JSON request body (file/avatar routes) vs template passed as the Api::upload() argument (field mixin, blueprint uploads.template) - src/Api/Upload.php:243",
+    "template omitted (null, falls back to the default blueprint) vs a named template",
+    "non-chunked upload (no Upload-Length header) vs chunked upload - src/Api/Upload.php:181-183",
+    "first chunk that already carries the full Upload-Length vs a partial first chunk - src/Api/Upload.php:256-259",
+    "a later chunk declaring a different template than the first one",
+    "a later chunk declaring a different Upload-Length than the first one",
+    "single file per request (avatar, single: true) vs multiple files in one request (files create route, single: false) - src/Api/Upload.php:203-205"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "src/Api/Upload.php:226-250 - chunk bytes and their filename are buffered under site/cache/.uploads (tmpDir() at src/Api/Upload.php:334-337); nothing persists the first chunk's template or Upload-Length at the pinned commit (the fix adds a Json sidecar, fix.diff:290-300)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Upload::processChunk() is public and has no authorization of its own; the published fix puts the preflight in process() one frame above, so any caller that invokes processChunk() directly (as the existing unit tests do) still writes chunk bytes into the cache dir for an unauthorized user",
+      "where": "src/Api/Upload.php:221-270",
+      "reason_to_dismiss": "processChunk() is an internal helper whose only production caller is process(), so the check above it is assumed to cover every path",
+      "distance": "same file as the chunk sink, one call frame below the preflight",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "src/Api/Upload.php:347-409",
+      "sibling": "a second chunk-time rule inside validateChunk() (for example locking the first chunk's accept/extension set, or a per-upload maxsize taken from the first chunk's blueprint) that must read the same persisted descriptor",
+      "why_realistic": "validateChunk() already carries exactly this kind of rule (maxsize, extension, offset) and maintainers extended this function for the template lock, so adding one more rule there is the natural move"
+    },
+    {
+      "where": "config/fields/mixins/upload.php:55-83",
+      "sibling": "another field mixin or field type that composes $api->upload() with its own template (an image/avatar field next to files and textarea) and forgets the preflight",
+      "why_realistic": "files.php and textarea.php already share this mixin and pass the template as an argument rather than in the body, so a third field copying the pattern is a plausible sibling with the same trap"
+    },
+    {
+      "where": "src/Api/Api.php:638-652",
+      "sibling": "a fail-closed Api::upload() wrapper (uploadFor(File $parent) that always supplies the preflight, or a required preflight when a File-producing callback is registered)",
+      "why_realistic": "the published fix made preflight an optional constructor parameter, so the natural hardening is a wrapper at the same seam that cannot be forgotten by a caller"
+    }
+  ],
+  "O9_family": "authorization / missing permission check (CWE-862) on file upload, with cross-request state integrity for the declared file template",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "PHP",
+    "toolchain": "composer (vendor/ and composer.lock present at the pinned commit; requires PHP ~8.2-8.5 with ext-json/mbstring/curl), PHPUnit 11 via 'composer test' (cpx phpunit/phpunit:11.5.55)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/Api/UploadTest.php (chunk upload unit tests, incl. testProcessChunkFirstChunkFullLength:325, testValidateChunkWithTemplate:594, testValidateChunkTemplatePriority:650), tests/Api/ApiTest.php:629-670, tests/Form/Field/FilesFieldTest.php"
+  },
+  "O11_fix_minutes": 55,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "config/api/routes/files.php, config/api/routes/users.php, config/fields/mixins/upload.php, src/Api/Api.php, src/Api/Upload.php",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a permission check inside the file-create/replace callback (or rely on the existing FileRules::create() check) instead of authorizing before processChunk() persists bytes, and read the template only from requestBody('template')."
+  },
+  "out_of_scope_notes": [
+    "FileActions::normalizeProps() at src/Cms/FileActions.php:384 re-reads $props['filename'] instead of the already-computed local $filename, so the fallback filename from the source basename is discarded; this is a separate naming bug and was not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB could not be measured (no shell access in this session); no tiny_repo/giant_repo flag was raised.",
+    "Latest upstream state for the O8 route could not be checked (no latest release was supplied for this candidate), so present_in_latest is unknown.",
+    "Whether PHPUnit and the vendored dependencies are actually installed under vendor/ was only inferred from the presence of vendor/autoload.php; no build or test run was performed."
+  ]
+}

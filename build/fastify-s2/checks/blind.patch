@@ -1,0 +1,239 @@
+diff -ruN a/lib/four-oh-four.js b/lib/four-oh-four.js
+--- a/lib/four-oh-four.js	2026-10-25 23:09:09.000000000 +0000
++++ b/lib/four-oh-four.js	2026-10-25 23:21:14.683971052 +0000
+@@ -12,12 +12,17 @@
+   kFourOhFourContext,
+   kHooks,
+   kErrorHandler,
+-  kLogController
++  kLogController,
++  kSchemaController,
++  kOptions
+ } = require('./symbols.js')
+ const { lifecycleHooks } = require('./hooks')
+ const { buildErrorHandler } = require('./error-handler.js')
++const { normalizeSchema } = require('./schemas')
++const { compileSchemasForValidation, hasRequestSchema } = require('./validation')
+ const {
+-  FST_ERR_NOT_FOUND
++  FST_ERR_NOT_FOUND,
++  FST_ERR_SCH_VALIDATION_BUILD
+ } = require('./errors')
+ const { createChildLogger } = require('./logger-factory')
+ const { getGenReqId } = require('./req-id-gen-factory.js')
+@@ -149,6 +154,10 @@
+       schema: opts.schema,
+       handler,
+       config: opts.config || {},
++      // Unlike a route, the not-found handler has no user-facing
++      // `attachValidation` option. A request that fails its schema is answered
++      // here; it must never be handed to the handler with the error attached.
++      attachValidation: false,
+       server: this
+     })
+ 
+@@ -163,6 +172,27 @@
+       context.errorHandler = opts.errorHandler
+         ? buildErrorHandler(this[kErrorHandler], opts.errorHandler)
+         : this[kErrorHandler]
++
++      // A not-found handler can declare request schemas just like any other
++      // request handler, and nothing else normalizes or compiles them. Do it
++      // once every plugin and registered schema is in place, so the same
++      // general rule holds for URLs that match no route.
++      if (context.schema) {
++        context.schema = normalizeSchema(context.schema, this.initialConfig)
++        if (hasRequestSchema(context.schema)) {
++          const schemaController = this[kSchemaController]
++          schemaController.setupValidator(this[kOptions])
++          try {
++            compileSchemasForValidation(
++              context,
++              schemaController.validatorCompiler,
++              schemaController.isCustomValidatorCompiler
++            )
++          } catch (error) {
++            throw new FST_ERR_SCH_VALIDATION_BUILD('NOT_FOUND', prefix, error.message)
++          }
++        }
++      }
+     })
+ 
+     if (this[kFourOhFourContext] !== null && prefix === '/') {
+diff -ruN a/lib/request.js b/lib/request.js
+--- a/lib/request.js	2026-10-25 23:09:12.000000000 +0000
++++ b/lib/request.js	2026-10-25 23:21:06.419978535 +0000
+@@ -343,7 +343,10 @@
+   },
+   validateSchema: {
+     value: function (schema, data, httpPart = null) {
+-      if (!schema) {
++      // An absent schema (undefined) validates everything. A JSON Schema
++      // boolean (`false`, `true`) is a real schema and is compiled like any
++      // other, so only `undefined` short-circuits here.
++      if (schema === undefined) {
+         return true
+       }
+ 
+diff -ruN a/lib/route.js b/lib/route.js
+--- a/lib/route.js	2026-10-25 23:09:12.000000000 +0000
++++ b/lib/route.js	2026-10-25 23:21:04.827979977 +0000
+@@ -10,7 +10,8 @@
+ 
+ const {
+   compileSchemasForValidation,
+-  compileSchemasForSerialization
++  compileSchemasForSerialization,
++  hasRequestSchema
+ } = require('./validation')
+ 
+ const {
+@@ -419,10 +420,9 @@
+             context.schema = normalizeSchema(context.schema, this.initialConfig)
+ 
+             const schemaController = this[kSchemaController]
+-            const hasValidationSchema = opts.schema.body ||
+-              opts.schema.headers ||
+-              opts.schema.querystring ||
+-              opts.schema.params
++            // Presence, not truthiness: a JSON Schema boolean (`false`/`true`)
++            // is a schema and needs the validator compiler set up for it.
++            const hasValidationSchema = hasRequestSchema(opts.schema)
+             if (!opts.validatorCompiler && hasValidationSchema) {
+               schemaController.setupValidator(this[kOptions])
+             }
+diff -ruN a/lib/schema-defaults.js b/lib/schema-defaults.js
+--- a/lib/schema-defaults.js	2026-10-25 23:09:12.000000000 +0000
++++ b/lib/schema-defaults.js	2026-10-25 23:21:05.935978974 +0000
+@@ -25,7 +25,7 @@
+     if (part === 'querystring' && schema.query !== undefined) {
+       continue
+     }
+-    if (schema[part] === undefined && defaultSchema[part]) {
++    if (schema[part] === undefined && defaultSchema[part] !== undefined) {
+       schema[part] = defaultSchema[part]
+       applied = true
+     }
+diff -ruN a/lib/schemas.js b/lib/schemas.js
+--- a/lib/schemas.js	2026-10-25 23:09:09.000000000 +0000
++++ b/lib/schemas.js	2026-10-25 23:21:05.631979249 +0000
+@@ -61,9 +61,11 @@
+   }
+ 
+   // alias query to querystring schema
+-  if (routeSchemas.query) {
++  // `false`/`true` are valid JSON Schemas too, so the alias is copied whenever
++  // the application actually supplied `query`; only `undefined` means absent.
++  if (routeSchemas.query !== undefined) {
+     // check if our schema has both querystring and query
+-    if (routeSchemas.querystring) {
++    if (routeSchemas.querystring !== undefined) {
+       throw new FST_ERR_SCH_DUPLICATE('querystring')
+     }
+     routeSchemas.querystring = routeSchemas.query
+diff -ruN a/lib/validation.js b/lib/validation.js
+--- a/lib/validation.js	2026-10-25 23:09:09.000000000 +0000
++++ b/lib/validation.js	2026-10-25 23:21:02.499982085 +0000
+@@ -217,6 +217,20 @@
+   return undefined
+ }
+ 
++// A request part has a schema whenever the application supplied a value for
++// it. `undefined` means the part was left out; every other value is a schema
++// the compiler must see. In particular JSON Schema's boolean forms (`true` and
++// `false`) are complete schemas, so truthiness says nothing about presence.
++function hasRequestSchema (schema) {
++  if (!schema) {
++    return false
++  }
++  return schema.body !== undefined ||
++    schema.headers !== undefined ||
++    schema.querystring !== undefined ||
++    schema.params !== undefined
++}
++
+ function compileSchemasForValidation (context, compile, isCustom) {
+   const { schema } = context
+   if (!schema) {
+@@ -225,26 +239,38 @@
+ 
+   const { method, url } = context.config || {}
+ 
++  // A declared part is identified with `!== undefined`, never with truthiness
++  // (see `hasRequestSchema`), and the `hasOwnProperty` checks below are only
++  // reached for a part that is explicitly set to `undefined` - the legacy
++  // "empty part" case that only warns.
+   const headers = schema.headers
+   // the or part is used for backward compatibility
+-  if (headers && (isCustom || Object.getPrototypeOf(headers) !== Object.prototype)) {
+-    // do not mess with schema when custom validator applied, e.g. Joi, Typebox
+-    context[headersSchema] = compile({ schema: headers, method, url, httpPart: 'headers' })
+-  } else if (headers) {
+-    // The header keys are case insensitive
+-    //  https://datatracker.ietf.org/doc/html/rfc2616#section-4.2
+-    const headersSchemaLowerCase = lowerCaseHeadersSchema(headers)
+-    const externalRef = findExternalHeaderRef(headers)
+-    if (externalRef !== undefined) {
+-      FSTSEC002(method, url, externalRef)
++  if (headers !== undefined) {
++    if (isCustom || headers === null || typeof headers !== 'object' ||
++      Object.getPrototypeOf(headers) !== Object.prototype) {
++      // do not mess with schema when custom validator applied, e.g. Joi, Typebox
++      // boolean schemas (and values that are not schemas at all) are compiled
++      // unchanged so the compiler decides what they mean
++      context[headersSchema] = compile({ schema: headers, method, url, httpPart: 'headers' })
++    } else {
++      // The header keys are case insensitive
++      //  https://datatracker.ietf.org/doc/html/rfc2616#section-4.2
++      const headersSchemaLowerCase = lowerCaseHeadersSchema(headers)
++      const externalRef = findExternalHeaderRef(headers)
++      if (externalRef !== undefined) {
++        FSTSEC002(method, url, externalRef)
++      }
++      context[headersSchema] = compile({ schema: headersSchemaLowerCase, method, url, httpPart: 'headers' })
+     }
+-    context[headersSchema] = compile({ schema: headersSchemaLowerCase, method, url, httpPart: 'headers' })
+   } else if (Object.hasOwn(schema, 'headers')) {
+     FSTWRN001('headers', method, url)
+   }
+ 
+-  if (schema.body) {
+-    const contentProperty = schema.body.content
++  if (schema.body !== undefined) {
++    const body = schema.body
++    // Only an object can carry the media-type map; booleans (and other
++    // non-schemas) go straight to the compiler.
++    const contentProperty = body !== null && typeof body === 'object' ? body.content : undefined
+     if (contentProperty) {
+       const contentTypeSchemas = {}
+       for (const contentType of Object.keys(contentProperty)) {
+@@ -253,19 +279,19 @@
+       }
+       context[bodySchema] = contentTypeSchemas
+     } else {
+-      context[bodySchema] = compile({ schema: schema.body, method, url, httpPart: 'body' })
++      context[bodySchema] = compile({ schema: body, method, url, httpPart: 'body' })
+     }
+   } else if (Object.hasOwn(schema, 'body')) {
+     FSTWRN001('body', method, url)
+   }
+ 
+-  if (schema.querystring) {
++  if (schema.querystring !== undefined) {
+     context[querystringSchema] = compile({ schema: schema.querystring, method, url, httpPart: 'querystring' })
+   } else if (Object.hasOwn(schema, 'querystring')) {
+     FSTWRN001('querystring', method, url)
+   }
+ 
+-  if (schema.params) {
++  if (schema.params !== undefined) {
+     context[paramsSchema] = compile({ schema: schema.params, method, url, httpPart: 'params' })
+   } else if (Object.hasOwn(schema, 'params')) {
+     FSTWRN001('params', method, url)
+@@ -439,5 +465,6 @@
+   symbols: { bodySchema, querystringSchema, responseSchema, paramsSchema, headersSchema },
+   compileSchemasForValidation,
+   compileSchemasForSerialization,
++  hasRequestSchema,
+   validate
+ }

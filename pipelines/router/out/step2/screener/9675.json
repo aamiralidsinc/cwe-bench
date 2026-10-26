@@ -1,0 +1,49 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "9675", "advisory_ids": ["GHSA-8238-W5PM-2374"], "repo": "cthackers/adm-zip", "pinned_commit": "747060a7b6a20c677a8ef6c66c45f262de1f8e69", "fix_commits": ["5e70d3a26097d68fa981c41f022c053117174e49"],
+  "trust_decision": {
+    "summary": "Decided in the async DEFLATE decompression path: bytes taken from an untrusted archive (central-directory method/size and payload, headers/entryHeader.js:260-268, zipEntry.js:27-28) may feed a zlib InflateRaw stream, and every failure of that stream must be delivered to the caller's callback (empty buffer + err) instead of being emitted as an unhandled 'error' event, while a CRC mismatch must keep returning the decoded buffer alongside BAD_CRC.",
+    "evidence": ["methods/inflater.js:12-32", "zipEntry.js:110-118", "headers/entryHeader.js:260-268", "zipEntry.js:102"]
+  },
+  "landing_point": {"where": "zipEntry.js:110", "why": "The report says 'async DEFLATE decompression'; decompress()'s async branch is the only call site of inflateAsync, and an engineer searching for the async path lands here (or one hop away at methods/inflater.js:13, where the zlib stream without an 'error' listener is created)."},
+  "fix_sites": [
+    {"where": "methods/inflater.js:12-32", "entry_point": "AdmZip#readFileAsync (adm-zip.js:157), AdmZip#readAsTextAsync (adm-zip.js:192), AdmZip#extractAllToAsync (adm-zip.js:813), ZipEntry#getDataAsync (zipEntry.js:309) - all reach inflateAsync through zipEntry.js:110", "module_kind": "low-level zlib wrapper (methods/inflater.js, published as adm-zip/methods)"},
+    {"where": "zipEntry.js:110-118", "entry_point": "AdmZip#readFileAsync / readAsTextAsync / extractAllToAsync / ZipEntry#getDataAsync", "module_kind": "decompression handler in the root package module"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "methods/inflater.js:12-32"},
+  "O3_reason_to_dismiss": "A solver can dismiss everything except the one DEFLATE stream-error event: an unknown compression method or a password-protected entry is an 'unsupported combination' the caller should not pass, the synchronous read API is documented (and tested) to throw, and the write-side deflate stream only ever sees data the application itself supplied.",
+  "O4_distance": {"files": 2, "packages": 0, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A CRC mismatch on the async path must still hand the decoded buffer to the callback together with BAD_CRC (callback(result, err)); only a stream failure returns the empty placeholder. An over-broad fix that funnels every async failure through callback(Buffer.alloc(0), err) (or through one generic error) breaks this contract. Likewise the sync path must keep throwing BAD_CRC for a bad CRC rather than returning an empty buffer (test/crc/index.js:65-81, test/decompress_bomb.test.js:84).", "where": "test/crc/index.js:58-62"},
+  "O6_input_shapes": [
+    "malformed DEFLATE payload: zlib emits 'error' (Z_DATA_ERROR) before 'end', no 'data' chunks or a partial prefix",
+    "well-formed DEFLATE whose output exceeds the declared central-directory size: maxOutputLength cap (inflater.js:5) produces ERR_BUFFER_TOO_LARGE as an 'error' event",
+    "'error' arriving after some 'data' chunks, plus the error-then-end ordering, so the callback must fire exactly once (done flag)",
+    "async call made without a callback function (inflater.js:21-29 guards with callback &&, zipEntry.js:111 guards with if (!callback))"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "Unknown compression method: decompress() calls callback(Buffer.alloc(0), UNKNOWN_METHOD()) and then throws; when reached from the async chain (extractAllToAsync's reduce continuation runs inside a previous zlib 'end' callback) that throw is an uncaught exception that kills the process, with no error listener and no try/catch on the path.", "where": "zipEntry.js:121-123", "reason_to_dismiss": "An unsupported compression method is a different defect from malformed-DEFLATE stream errors; the callback already received UNKNOWN_METHOD, so the failure is 'reported'.", "distance": "same file, 11 lines below the fixed branch", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Encrypted entry with no / non-string password: decompress() throws INVALID_PASS_PARAM, and ZipCrypto.decrypt throws WRONG_PASSWORD (methods/zipcrypto.js:128); both escape synchronously into the async caller and become an uncaught exception for any entry after the first in the extractAllToAsync chain (that continuation runs inside a previous zlib 'end' callback).", "where": "zipEntry.js:71-76", "reason_to_dismiss": "Encryption is a neighbouring feature the caller opts into by supplying a password; a missing password is caller misuse, not archive-driven decompression failure.", "distance": "same function, ~35 lines above the fixed branch", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Synchronous decompression of a malformed DEFLATE payload via getData()/inflateRawSync (readFile, readAsText, extractEntryTo, extractAllTo, test) throws ERR_Z_DATA_ERROR from inflater.js:9 with no handling at zipEntry.js:103-107.", "where": "zipEntry.js:103-108", "reason_to_dismiss": "Sync APIs are documented and tested to throw (test/crc/index.js:65-81, test/decompress_bomb.test.js:84); a caller can try/catch, so the throw is not the uncatchable error event the advisory describes.", "distance": "one file (methods/inflater.js:8-10), same function's sync branch", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Write-side async DEFLATE: deflateAsync creates a zlib DeflateRaw stream with 'data' and 'end' listeners only; the try/catch in zipFile.js:371 cannot catch an error raised later from its async callback (zipFile.js:391-414), so an 'error' event is uncaught - the exact mirror of the fixed defect.", "where": "methods/deflater.js:11-31", "reason_to_dismiss": "The compressor only sees data the application supplied via addFile/updateFile, never archive bytes; the advisory's property covers decompression of untrusted input.", "distance": "one directory sibling, 2 files from the landing point (methods/deflater.js vs zipEntry.js)", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "zipFile.js:370-453", "sibling": "A second async writer (e.g. a streaming zip writer) that reuses compress2Buffer and relies on the surrounding try/catch.", "why_realistic": "toAsyncBuffer already has a try/catch at line 371 that reads as protection but cannot cover errors thrown from the asynchronous getCompressedDataAsync callback; a maintainer copying this shape would reproduce the same blind spot."},
+    {"where": "util/utils.js:98-160", "sibling": "Another async fs helper (read/copy/move) that reports failures through a boolean callback and drops or re-throws the underlying fs error.", "why_realistic": "writeFileToAsync's comments at lines 117-123 and 144-147 show this exact bug class was fixed here twice (issues #470, #402); a new sibling helper written the same way is entirely in character for this codebase."},
+    {"where": "adm-zip.js:354-382", "sibling": "An addLocalFileAsync-style promise/stream variant using fs.createReadStream, where a stream 'error' event has no handler.", "why_realistic": "The public API already mixes callback, Promise and stream-ish helpers (addLocalFileAsync, addLocalFolderPromise, writeZipPromise, toBufferPromise), so a stream-based read helper with the same missing 'error' listener is a natural addition."}
+  ],
+  "O9_family": "CWE-248 uncaught exception / CWE-400 uncontrolled resource consumption in archive decompression", "O9_dos": true,
+  "O10_build": {"language": "JavaScript (Node.js, engines >= 14)", "toolchain": "npm + mocha 12 beta, chai, prettier (devDependencies only; no build step, CommonJS main adm-zip.js)", "services": [], "offline_after_build": true, "project_tests": "mocha suite under test/; for this area test/crc/index.js (async BAD_CRC callback, sync BAD_CRC throw), test/decompress_bomb.test.js (sync inflate of bogus DEFLATE, declared-size bomb), test/methods/methods.test.js:139-202 (extractAllToAsync callback and Promise forms). No test exercises a malformed DEFLATE stream over any async entry point."},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "methods/inflater.js, zipEntry.js", "j_sibling_sites": "yes", "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1, "j_tempting_wrong_fix": "Add the 'error' listener at the zipEntry.js call site only (or wrap that call in try/catch) and map every stream error to Utils.Errors.BAD_CRC, leaving inflateAsync's callback contract, the sync throw path and the deflate mirror untouched."},
+  "out_of_scope_notes": ["The async chain also drops other synchronous throws from decompress() (missing password, unknown method) - noted as O8 routes only because they share the same sink; broader crash-hardening of adm-zip's async API is outside this advisory."],
+  "unverified": [
+    "Repo size not measurable without a shell; all 20-odd source files are small (adm-zip.js 995 lines, zipFile.js 457, zipEntry.js 391, util/ methods/ headers/ each a few hundred), so source is far under 5 MB, but binary test fixtures under test/assets were not sized.",
+    "Latest release for O8 was given as 'none', so present_in_latest is unknown for every route.",
+    "Whether a malformed DEFLATE payload can be delivered to the write-side deflate stream (methods/deflater.js) was reasoned from code, not executed; the route is listed for structure, not triggerability."
+  ]
+}

@@ -1,0 +1,163 @@
+diff --git a/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/HandlebarsViewResolver.java b/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/HandlebarsViewResolver.java
+index 0998225a..8d9c4fae 100644
+--- a/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/HandlebarsViewResolver.java
++++ b/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/HandlebarsViewResolver.java
+@@ -163,16 +163,23 @@ public class HandlebarsViewResolver extends AbstractTemplateViewResolver
+   protected AbstractUrlBasedView configure(final HandlebarsView view) throws IOException {
+     String url = view.getUrl();
+     // Remove prefix & suffix.
+-    url = url.substring(getPrefix().length(), url.length() - getSuffix().length());
++    String strippedUrl = url.substring(getPrefix().length(), url.length() - getSuffix().length());
++
++    // Strict web-layer rejection: View names from controllers should never contain
++    // protocols, fragments, or traversal sequences.
++    if (strippedUrl.contains(":") || strippedUrl.contains("#") || strippedUrl.contains("..")) {
++      throw new IllegalArgumentException("Unsafe Spring MVC view name detected: " + strippedUrl);
++    }
++
+     // Compile the template.
+     try {
+-      view.setTemplate(handlebars.compile(url));
++      view.setTemplate(handlebars.compile(strippedUrl));
+       view.setValueResolver(valueResolvers.toArray(new ValueResolver[0]));
+     } catch (IOException ex) {
+       if (failOnMissingFile) {
+         throw ex;
+       }
+-      logger.debug("File not found: " + url);
++      logger.debug("File not found: " + strippedUrl);
+     }
+     return view;
+   }
+diff --git a/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/SpringTemplateLoader.java b/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/SpringTemplateLoader.java
+index c2d92b94..9970184e 100644
+--- a/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/SpringTemplateLoader.java
++++ b/handlebars-springmvc/src/main/java/com/github/jknack/handlebars/springmvc/SpringTemplateLoader.java
+@@ -13,7 +13,6 @@ import java.net.URL;
+ import org.springframework.context.ApplicationContext;
+ import org.springframework.core.io.Resource;
+ import org.springframework.core.io.ResourceLoader;
+-import org.springframework.util.ResourceUtils;
+ 
+ import com.github.jknack.handlebars.io.URLTemplateLoader;
+ 
+@@ -55,24 +54,62 @@ public class SpringTemplateLoader extends URLTemplateLoader {
+ 
+   @Override
+   protected URL getResource(final String location) throws IOException {
++    // 1. Logical Bounds Check (Parity with d177cdee)
++    // Spring locations often contain protocols (classpath:). We must strip it to normalize the
++    // path.
++    String pathPart = location;
++    int protocolIndex = location.indexOf(":");
++    if (protocolIndex != -1) {
++      pathPart = location.substring(protocolIndex + 1);
++    }
++
++    String resolvedPath =
++        java.nio.file.Paths.get(pathPart)
++            .normalize()
++            .toString()
++            .replace(java.io.File.separatorChar, '/');
++    if (pathPart.startsWith("/") && !resolvedPath.startsWith("/")) {
++      resolvedPath = "/" + resolvedPath;
++    }
++
++    // Extract the raw path from the configured prefix
++    String prefixPath = getPrefix();
++    int prefixProtocolIndex = prefixPath.indexOf(":");
++    if (prefixProtocolIndex != -1) {
++      prefixPath = prefixPath.substring(prefixProtocolIndex + 1);
++    }
++
++    // Enforce the boundary
++    if (!prefixPath.equals("/") && !resolvedPath.startsWith(prefixPath)) {
++      throw new IllegalArgumentException(
++          "Path traversal attempt detected. Resolved path escapes Spring base prefix: " + location);
++    }
++
++    // 2. Delegate to Spring
+     Resource resource = loader.getResource(location);
+     if (!resource.exists()) {
+       return null;
+     }
+-    return resource.getURL();
++
++    // 3. Post-resolution URL Component Validation (Fragment/Query injection)
++    URL url = resource.getURL();
++    validateNoUnsafeUrlComponents(url);
++
++    return url;
+   }
+ 
+-  @Override
+-  public String resolve(final String location) {
+-    String protocol = null;
+-    if (location.startsWith(ResourceUtils.CLASSPATH_URL_PREFIX)) {
+-      protocol = ResourceUtils.CLASSPATH_URL_PREFIX;
+-    } else if (location.startsWith(ResourceUtils.FILE_URL_PREFIX)) {
+-      protocol = ResourceUtils.FILE_URL_PREFIX;
++  /**
++   * Verifies that the resolved URL does not contain components that can bypass suffix validation.
++   *
++   * @param url The resolved URL.
++   */
++  private void validateNoUnsafeUrlComponents(final URL url) {
++    String external = url.toExternalForm();
++    if (external.indexOf('#') >= 0) {
++      throw new IllegalArgumentException("Template URL must not contain a fragment: " + url);
+     }
+-    if (protocol == null) {
+-      return super.resolve(location);
++    if (external.indexOf('?') >= 0) {
++      throw new IllegalArgumentException("Template URL must not contain a query: " + url);
+     }
+-    return protocol + super.resolve(location.substring(protocol.length()));
+   }
+ }
+diff --git a/handlebars/src/main/java/com/github/jknack/handlebars/io/FileTemplateLoader.java b/handlebars/src/main/java/com/github/jknack/handlebars/io/FileTemplateLoader.java
+index 3882f9f4..384e1f2b 100644
+--- a/handlebars/src/main/java/com/github/jknack/handlebars/io/FileTemplateLoader.java
++++ b/handlebars/src/main/java/com/github/jknack/handlebars/io/FileTemplateLoader.java
+@@ -64,25 +64,8 @@ public class FileTemplateLoader extends URLTemplateLoader {
+     this(basedir, DEFAULT_SUFFIX);
+   }
+ 
+-  @Override
+-  public String resolve(final String location) {
+-    // Support fully-qualified "file:" URLs as template names, e.g.
+-    // "file:/opt/shared/page.hbs". These are already absolute locations, so only the
+-    // configured suffix is applied; the base directory prefix does not apply to them.
+-    if (location.startsWith("file:")) {
+-      return location + getSuffix();
+-    }
+-    return super.resolve(location);
+-  }
+-
+   @Override
+   protected URL getResource(final String location) throws IOException {
+-    if (location.startsWith("file:")) {
+-      // Already an absolute file URL: hand it straight to the URL layer.
+-      URL url = new URL(location);
+-      File file = new File(url.getPath());
+-      return file.exists() ? url : null;
+-    }
+     File file = new File(location).getCanonicalFile();
+     File basedir = new File(getPrefix()).getCanonicalFile();
+ 
+diff --git a/handlebars/src/main/java/com/github/jknack/handlebars/io/ServletContextTemplateLoader.java b/handlebars/src/main/java/com/github/jknack/handlebars/io/ServletContextTemplateLoader.java
+index d3b7189c..7e3f9251 100644
+--- a/handlebars/src/main/java/com/github/jknack/handlebars/io/ServletContextTemplateLoader.java
++++ b/handlebars/src/main/java/com/github/jknack/handlebars/io/ServletContextTemplateLoader.java
+@@ -60,11 +60,6 @@ public class ServletContextTemplateLoader extends URLTemplateLoader {
+ 
+   @Override
+   protected URL getResource(final String location) throws IOException {
+-    // Absolute context paths are already rooted at the web application root, so the
+-    // container resolves them directly; pass them straight through.
+-    if (location.startsWith("/")) {
+-      return servletContext.getResource(location);
+-    }
+     return servletContext.getResource(classpathResource(location));
+   }
+ }

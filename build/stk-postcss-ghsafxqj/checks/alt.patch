@@ -1,0 +1,129 @@
+diff --git a/lib/lazy-result.js b/lib/lazy-result.js
+index 2ad67da9..df1e5433 100644
+--- a/lib/lazy-result.js
++++ b/lib/lazy-result.js
+@@ -380,6 +380,13 @@ class LazyResult {
+ 
+     let rootSource = this.result.root.source
+     if (opts.map === undefined && !(rootSource && rootSource.input && rootSource.input.map)) {
++      let root = this.result.root
++      for (let i = root.nodes.length - 1; i >= 0; i--) {
++        let node = root.nodes[i]
++        if (node.type === 'comment' && node.text.startsWith('# sourceMappingURL=')) {
++          root.removeChild(i)
++        }
++      }
+       let result = ''
+       str(this.result.root, i => {
+         result += i
+diff --git a/lib/previous-map.js b/lib/previous-map.js
+index c6827ffc..e0c00d39 100644
+--- a/lib/previous-map.js
++++ b/lib/previous-map.js
+@@ -1,8 +1,24 @@
+ 'use strict'
+ 
+-let { existsSync, readFileSync } = require('fs')
+-let { dirname, join } = require('path')
++let { existsSync, readFileSync, realpathSync } = require('fs')
++let { dirname, isAbsolute, resolve, sep } = require('path')
+ let { SourceMapConsumer, SourceMapGenerator } = require('source-map-js')
++let tokenize = require('./tokenize')
++
++function canonical(path) {
++  try {
++    return realpathSync(path)
++  } catch {
++    return path
++  }
++}
++
++function isInside(root, target) {
++  let base = canonical(root)
++  let full = canonical(target)
++  if (full === base) return true
++  return full.startsWith(base.endsWith(sep) ? base : base + sep)
++}
+ 
+ function fromBase64(str) {
+   if (Buffer) {
+@@ -30,7 +46,7 @@ class PreviousMap {
+ 
+   consumer() {
+     if (!this.consumerCache) {
+-      this.consumerCache = new SourceMapConsumer(this.text)
++      this.consumerCache = new SourceMapConsumer(this.json || this.text)
+     }
+     return this.consumerCache
+   }
+@@ -70,20 +86,31 @@ class PreviousMap {
+   }
+ 
+   loadAnnotation(css) {
+-    let comments = css.match(/\/\*\s*# sourceMappingURL=/g)
+-    if (!comments) return
+-
+-    // sourceMappingURLs from comments, strings, etc.
+-    let start = css.lastIndexOf(comments.pop())
+-    let end = css.indexOf('*/', start)
+-
+-    if (start > -1 && end > -1) {
+-      // Locate the last sourceMappingURL to avoid pickin
+-      this.annotation = this.getAnnotationURL(css.substring(start, end))
++    let annotation
++    try {
++      let tokenizer = tokenize({ css })
++      while (!tokenizer.endOfFile()) {
++        let token = tokenizer.nextToken()
++        if (token[0] !== 'comment') continue
++        let text = token[1].replace(/\*\/\s*$/, '')
++        if (/^\/\*\s*# sourceMappingURL=/.test(text)) {
++          annotation = this.getAnnotationURL(text)
++        }
++      }
++    } catch {
++      return
+     }
++    if (annotation !== undefined) this.annotation = annotation
+   }
+ 
+-  loadFile(path) {
++  loadFile(path, cssFile, trusted) {
++    if (!trusted) {
++      if (!/\.map$/i.test(path)) return undefined
++      let root = cssFile ? dirname(cssFile) : process.cwd()
++      let target = isAbsolute(path) ? path : resolve(root, path)
++      if (!isInside(root, target)) return undefined
++      path = target
++    }
+     this.root = dirname(path)
+     if (existsSync(path)) {
+       this.mapFile = path
+@@ -100,7 +127,7 @@ class PreviousMap {
+       } else if (typeof prev === 'function') {
+         let prevPath = prev(file)
+         if (prevPath) {
+-          let map = this.loadFile(prevPath)
++          let map = this.loadFile(prevPath, file, true)
+           if (!map) {
+             throw new Error(
+               'Unable to load previous source map: ' + prevPath.toString()
+@@ -123,8 +150,16 @@ class PreviousMap {
+       return this.decodeInline(this.annotation)
+     } else if (this.annotation) {
+       let map = this.annotation
+-      if (file) map = join(dirname(file), map)
+-      return this.loadFile(map)
++      if (file) map = resolve(dirname(file), map)
++      let unknown = this.loadFile(map, file, false)
++      if (unknown) {
++        try {
++          this.json = JSON.parse(unknown.replace(/^\)]}'[^\n]*\n/, ''))
++        } catch {
++          return undefined
++        }
++      }
++      return unknown
+     }
+   }
+ 

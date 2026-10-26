@@ -1,0 +1,246 @@
+diff --git a/trestle/common/file_utils.py b/trestle/common/file_utils.py
+index 1e19944..aef1926 100644
+--- a/trestle/common/file_utils.py
++++ b/trestle/common/file_utils.py
+@@ -92,6 +92,22 @@ def is_local_and_visible(file_path: pathlib.Path) -> bool:
+     return not (is_hidden(file_path) or is_symlink(file_path))
+ 
+ 
++def require_within_workspace(path: pathlib.Path, trestle_root: pathlib.Path) -> pathlib.Path:
++    """Return path unchanged, raising if it resolves outside the trestle workspace."""
++    root = os.path.realpath(str(trestle_root))
++    candidate = pathlib.Path(path)
++    if not candidate.is_absolute():
++        candidate = pathlib.Path(trestle_root) / candidate
++    target = os.path.realpath(str(candidate))
++    try:
++        inside = os.path.commonpath([root, target]) == root
++    except ValueError:
++        inside = False
++    if not inside:
++        raise TrestleError(f'Path {path} is outside the trestle workspace {trestle_root}')
++    return pathlib.Path(target)
++
++
+ def is_directory_name_allowed(name: str) -> bool:
+     """Determine whether a directory name, which is a 'non-core-OSCAL activity/directory is allowed.
+ 
+@@ -105,6 +121,17 @@ def is_directory_name_allowed(name: str) -> bool:
+     # Task must not self-interfere with a project
+     pathed_name = pathlib.Path(name)
+ 
++    # Defense-in-depth: reject absolute paths
++    # Check both is_absolute() and if the name starts with '/' to handle Unix-style paths on Windows.
++    if pathed_name.is_absolute() or name.startswith('/'):
++        logger.warning('Task name must not be an absolute path')
++        return False
++
++    # Defense-in-depth: reject any path containing ".." components
++    if '..' in pathed_name.parts:
++        logger.warning('Task name must not contain ".." path traversal sequences')
++        return False
++
+     root_path = pathed_name.parts[0]
+     if root_path in const.MODEL_TYPE_TO_MODEL_DIR.values():
+         logger.warning('Task name is the same as an OSCAL schema name.')
+diff --git a/trestle/common/model_utils.py b/trestle/common/model_utils.py
+index b1a7f2d..4875022 100644
+--- a/trestle/common/model_utils.py
++++ b/trestle/common/model_utils.py
+@@ -32,6 +32,7 @@ import trestle.common.common_types
+ from trestle.common import const, err, list_utils, str_utils, type_utils as utils
+ from trestle.common.common_types import TG, TopLevelOscalModel
+ from trestle.common.err import TrestleError, TrestleNotFoundError
++from trestle.common import file_utils
+ from trestle.common.file_utils import extract_trestle_project_root, iterdir_without_hidden_files
+ from trestle.common.list_utils import as_filtered_list, none_if_empty
+ from trestle.common.str_utils import AliasMode, alias_to_classname
+@@ -645,6 +646,8 @@ class ModelUtils:
+             raise TrestleError(f'Unable to determine model type for model {model_name} with class {model_class}')
+         model_alias = const.MODEL_MODULE_TO_MODEL_TYPE[model_class.__module__]
+         model_dir = trestle_root / f'{const.MODEL_TYPE_TO_MODEL_DIR[model_alias]}/{model_name}'
++        # Validate the model name so it cannot reach outside the workspace.
++        file_utils.require_within_workspace(model_dir, trestle_root)
+         return model_dir / model_alias
+ 
+     @staticmethod
+diff --git a/trestle/core/commands/assemble.py b/trestle/core/commands/assemble.py
+index 23319aa..13b33da 100644
+--- a/trestle/core/commands/assemble.py
++++ b/trestle/core/commands/assemble.py
+@@ -91,9 +91,12 @@ class AssembleCmd(CommandPlusDocs):
+ 
+             assembled_model_dir = trestle_root / const.TRESTLE_DIST_DIR / plural_alias
+ 
+-            output_name = getattr(args, 'output', None) or model_name
++            output_name = args.output if args.output else model_name
+             assembled_model_filepath = assembled_model_dir / f'{output_name}.{args.extension}'
+ 
++            # Validate the assembled output path so it cannot reach outside the workspace.
++            file_utils.require_within_workspace(assembled_model_filepath, trestle_root)
++
+             plan = Plan()
+             plan.add_action(CreatePathAction(assembled_model_filepath, True))
+             plan.add_action(
+diff --git a/trestle/core/commands/author/catalog.py b/trestle/core/commands/author/catalog.py
+index 6839568..9f306d7 100644
+--- a/trestle/core/commands/author/catalog.py
++++ b/trestle/core/commands/author/catalog.py
+@@ -69,10 +69,13 @@ class CatalogGenerate(AuthorCommonCommand):
+             if not file_utils.is_directory_name_allowed(args.output):
+                 raise TrestleError(f'{args.output} is not an allowed directory name')
+ 
++            # Validate the output path so the name cannot reach outside the workspace.
++            file_utils.require_within_workspace(trestle_root / args.output, trestle_root)
++
+             if args.force_overwrite:
+                 try:
+                     logger.info(f'Overwriting the content in {args.output} folder.')
+-                    clear_folder(pathlib.Path(args.output))
++                    clear_folder(trestle_root / args.output)
+                 except TrestleError as e:  # pragma: no cover
+                     raise TrestleError(f'Unable to overwrite contents in {args.output} folder: {e}')
+ 
+diff --git a/trestle/core/commands/author/common.py b/trestle/core/commands/author/common.py
+index 08d180b..7f78e6f 100644
+--- a/trestle/core/commands/author/common.py
++++ b/trestle/core/commands/author/common.py
+@@ -56,6 +56,7 @@ class AuthorCommonCommand(CommandPlusDocs):
+                     f'Task name {self.task_name} is invalid as it interferes with OSCAL and trestle reserved names.'
+                 )
+                 return CmdReturnCodes.COMMAND_ERROR.value
++            file_utils.require_within_workspace(self.task_path, self.trestle_root)
+ 
+         rc = self._setup_template_dir(args)
+ 
+diff --git a/trestle/core/commands/author/component.py b/trestle/core/commands/author/component.py
+index 9b3a39a..c2a3660 100644
+--- a/trestle/core/commands/author/component.py
++++ b/trestle/core/commands/author/component.py
+@@ -66,10 +66,15 @@ class ComponentGenerate(AuthorCommonCommand):
+         try:
+             log.set_log_level_from_args(args)
+ 
++            if not file_utils.is_directory_name_allowed(args.output):
++                raise TrestleError(f'{args.output} is not an allowed directory name')
++            # Validate the output path before it is cleared or written.
++            file_utils.require_within_workspace(args.trestle_root / args.output, args.trestle_root)
++
+             if args.force_overwrite:
+                 try:
+                     logger.info(f'Overwriting the content in {args.output} folder.')
+-                    clear_folder(pathlib.Path(args.output))
++                    clear_folder(args.trestle_root / args.output)
+                 except TrestleError as e:  # pragma: no cover
+                     raise TrestleError(f'Unable to overwrite contents in {args.output} folder: {e}')
+ 
+@@ -85,6 +90,8 @@ class ComponentGenerate(AuthorCommonCommand):
+     def write_component_index(trestle_root: pathlib.Path, markdown_dir_name: str, index_name: str) -> None:
+         """Write a markdown index of the component folders that were generated."""
+         index_path = trestle_root / index_name
++        # Validate the index path so the name cannot reach outside the workspace.
++        file_utils.require_within_workspace(index_path, trestle_root)
+         index_path.parent.mkdir(parents=True, exist_ok=True)
+         lines = ['# Component markdown', '']
+         md_path = trestle_root / markdown_dir_name
+diff --git a/trestle/core/commands/author/headers.py b/trestle/core/commands/author/headers.py
+index f2352bd..f6641ab 100644
+--- a/trestle/core/commands/author/headers.py
++++ b/trestle/core/commands/author/headers.py
+@@ -315,7 +315,7 @@ class Headers(AuthorCommonCommand):
+                 # Files in the root directory must be exclused
+                 if path.is_file():
+                     continue
+-                if not file_utils.is_directory_name_allowed(path):
++                if not file_utils.is_directory_name_allowed(str(relative_path)):
+                     continue
+                 if str(relative_path).rstrip('/') in const.MODEL_DIR_LIST:
+                     continue
+diff --git a/trestle/core/commands/author/prof.py b/trestle/core/commands/author/prof.py
+index 3a545ab..0df483a 100644
+--- a/trestle/core/commands/author/prof.py
++++ b/trestle/core/commands/author/prof.py
+@@ -86,6 +86,9 @@ class ProfileGenerate(AuthorCommonCommand):
+             if not file_utils.is_directory_name_allowed(args.output):
+                 raise TrestleError(f'{args.output} is not an allowed directory name')
+ 
++            # Validate the output path so the name cannot reach outside the workspace.
++            file_utils.require_within_workspace(trestle_root / args.output, trestle_root)
++
+             yaml_header: Dict[str, Any] = {}
+             if args.yaml_header:
+                 try:
+@@ -98,7 +101,7 @@ class ProfileGenerate(AuthorCommonCommand):
+             if args.force_overwrite:
+                 try:
+                     logger.info(f'Overwriting the content in {args.output}.')
+-                    clear_folder(pathlib.Path(args.output))
++                    clear_folder(trestle_root / args.output)
+                 except TrestleError as e:  # pragma: no cover
+                     raise TrestleError(f'Unable to overwrite contents of {args.output}: {e}')
+ 
+diff --git a/trestle/core/commands/author/ssp.py b/trestle/core/commands/author/ssp.py
+index e86e693..02fe9bd 100644
+--- a/trestle/core/commands/author/ssp.py
++++ b/trestle/core/commands/author/ssp.py
+@@ -105,6 +105,9 @@ class SSPGenerate(AuthorCommonCommand):
+             if not file_utils.is_directory_name_allowed(args.output):
+                 raise TrestleError(f'{args.output} is not an allowed directory name')
+ 
++            # Validate the output path so the name cannot reach outside the workspace.
++            file_utils.require_within_workspace(trestle_root / args.output, trestle_root)
++
+             yaml_header: Dict[str, Any] = {}
+             if args.yaml_header:
+                 try:
+@@ -244,6 +247,8 @@ class SSPGenerate(AuthorCommonCommand):
+             ssp_href = const.TRESTLE_HREF_HEADING + local_path
+ 
+         inheritance_view_path: pathlib.Path = md_path.joinpath(inheritance_view)
++        # Validate the inheritance view path so the name cannot reach outside the workspace.
++        file_utils.require_within_workspace(inheritance_view_path, trestle_root)
+         inheritance_view_path.mkdir(exist_ok=True)
+         logger.debug(f'Creating content for inheritance view in {inheritance_view_path}')
+ 
+diff --git a/trestle/core/commands/create.py b/trestle/core/commands/create.py
+index a13afda..98b3222 100644
+--- a/trestle/core/commands/create.py
++++ b/trestle/core/commands/create.py
+@@ -94,6 +94,9 @@ class CreateCmd(CommandPlusDocs):
+ 
+         desired_model_dir = trestle_root / plural_path / args.output
+ 
++        # Validate the output name so it cannot reach outside the workspace.
++        file_utils.require_within_workspace(desired_model_dir, trestle_root)
++
+         desired_model_path = desired_model_dir / (model_alias + '.' + args.extension)
+ 
+         if desired_model_path.exists():
+diff --git a/trestle/core/commands/import_.py b/trestle/core/commands/import_.py
+index c2fc914..3d168bb 100644
+--- a/trestle/core/commands/import_.py
++++ b/trestle/core/commands/import_.py
+@@ -86,6 +86,9 @@ class ImportCmd(CommandPlusDocs):
+                 FileContentType.to_file_extension(content_type)
+             ).resolve()
+ 
++            # Validate the output name so it cannot reach outside the workspace.
++            file_utils.require_within_workspace(desired_model_path, trestle_root)
++
+             if desired_model_path.exists():
+                 logger.warning(f'Cannot import because file to be imported here: {desired_model_path} already exists.')
+                 return CmdReturnCodes.COMMAND_ERROR.value
+diff --git a/trestle/core/commands/replicate.py b/trestle/core/commands/replicate.py
+index a973914..f2155df 100644
+--- a/trestle/core/commands/replicate.py
++++ b/trestle/core/commands/replicate.py
+@@ -90,6 +90,9 @@ class ReplicateCmd(CommandPlusDocs):
+             trestle_root / plural_path / args.output / (model_alias + FileContentType.to_file_extension(content_type))
+         )
+ 
++        # Validate the output name so it cannot reach outside the workspace.
++        file_utils.require_within_workspace(rep_model_path, trestle_root)
++
+         if rep_model_path.exists():
+             raise TrestleError(f'OSCAL file to be replicated here: {rep_model_path} exists.')
+ 

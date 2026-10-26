@@ -1,0 +1,7 @@
+View = "View"
+ModifyPortalContent = "Modify portal content"
+DeleteObjects = "Delete objects"
+AccessContentsInformation = "Access contents information"
+AddPortalContent = "Add portal content"
+ManagePortal = "Manage portal"
+ManageUsers = "Manage users"

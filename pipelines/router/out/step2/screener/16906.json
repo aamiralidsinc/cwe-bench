@@ -1,0 +1,122 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "deepseek-flash",
+  "entry_id": "16906",
+  "advisory_ids": ["GHSA-9H23-53F4-Q947", "CVE-2026-107804"],
+  "repo": "0xjacky/nginx-ui",
+  "pinned_commit": "ece8c62c512378eb8360bf8d6d31bec7468f15bb",
+  "fix_commits": ["e30e331303fc21cf077a2bea724bd79e66892eaf"],
+  "trust_decision": {
+    "summary": "Whether a network request is from an allowed client is decided in internal/middleware/ip_whitelist.go from gin's c.ClientIP(); that value is produced outside the check, by the engine's trusted-proxy set fixed once at router/routers.go:47, and it is also the key of the login-ban bucket in api/user/auth.go:51, so one bundled proxy makes every client look like 127.0.0.1 and both the allowlist and the ban bucket collapse.",
+    "evidence": [
+      "internal/middleware/ip_whitelist.go:13-21",
+      "router/routers.go:47",
+      "settings/auth.go:4",
+      "api/user/auth.go:51-56",
+      "internal/user/login.go:36-47",
+      "internal/middleware/middleware.go:182"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/middleware/ip_whitelist.go:14",
+    "why": "The only line in the whitelist middleware that lets a request through without consulting IPWhiteList: clientIP == \"\" (unparseable peer) and clientIP == \"127.0.0.1\"/\"::1\" both short-circuit, which is exactly what a bundled reverse proxy produces for every user."
+  },
+  "fix_sites": [
+    {"where": "internal/middleware/ip_whitelist.go:14", "entry_point": "every /api/* HTTP route and the embedded static UI via middleware.IPWhiteList()", "module_kind": "internal/middleware"},
+    {"where": "router/routers.go:47-49", "entry_point": "process bootstrap: gin engine trusted-proxy configuration used by c.ClientIP() for all routes", "module_kind": "router bootstrap"},
+    {"where": "fix.diff:1657-1686 (new router/client_ip.go)", "entry_point": "engine trusted-proxy defaults merged from NGINX_UI_OFFICIAL_DOCKER / NGINX_UI_DISABLE_BUNDLED_NGINX at startup", "module_kind": "router bootstrap (defaults merge)"},
+    {"where": "settings/auth.go:3-7 with fix.diff:1843", "entry_point": "app.ini [auth] TrustedProxies / NGINX_UI_AUTH_TRUSTED_PROXIES / POST /api/settings", "module_kind": "settings schema and config loader"},
+    {"where": "app.example.ini:16-19 with fix.diff:1120-1121", "entry_point": "shipped sample app.ini used by new installations", "module_kind": "config template"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "fix.diff:1669-1682 (new trustedProxiesForCurrentTopology in router/client_ip.go)"},
+  "O3_reason_to_dismiss": "Re-adding 127.0.0.1 and ::1 to the trusted proxies reads as re-introducing the very bypass the report describes, and it only fires for the official Docker image, so a solver can argue that default belongs to the deployment and not to the fix.",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Direct loopback access must keep working without being listed in IPWhiteList: it is documented behaviour, it is how an admin on the host or over an SSH tunnel gets in, and the fix keeps it while adding a test that a forwarding header from an untrusted peer is still ignored. Deleting the 127.0.0.1/::1 exception, or trusting every peer's headers instead, breaks one side or the other.",
+    "where": "internal/middleware/ip_whitelist.go:14, docs/guide/config-auth.md:17, fix.diff:1486-1493"
+  },
+  "O6_input_shapes": [
+    "X-Forwarded-For with a single address",
+    "X-Forwarded-For comma chain with a client-supplied spoofed prefix (rightmost untrusted hop wins)",
+    "X-Real-IP only, no X-Forwarded-For",
+    "forwarded headers sent by a peer that is not a configured trusted proxy (must be ignored)",
+    "IPv4 peer, IPv6 loopback peer, and CIDR trust entries such as 10.0.0.0/8 and 2001:db8::/32",
+    "empty or unparseable peer address (must fail closed with 403 instead of passing)",
+    "empty trusted-proxy list (nil, no header is trusted)",
+    "settings payload shape: JSON array of strings carrying the __NGINX_UI_REDACTED__ placeholder"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "settings/settings.go:33 registers AuthSettings for NGINX_UI_AUTH_* / app.ini (struct at settings/auth.go:3-7); the loaded value is turned into the engine's trusted-proxy set at startup in the new router/client_ip.go (fix.diff:1669-1682)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Routes registered on the engine before initEmbedRoute installs the global IPWhiteList chain - /healthz always, and /pages/maintenance in an unembed build - never pass the allowlist gate at all.",
+      "where": "router/routers.go:43, router/routers_unembed.go:7-8, api/pages/router.go:10",
+      "reason_to_dismiss": "A liveness probe and a maintenance page have to stay reachable from an unconfigured load balancer and they expose no application data.",
+      "distance": "same file as the router bootstrap, 0 packages from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "WebSocket upgrade origin check accepts Forwarded / X-Forwarded-Host / X-Forwarded-Proto from any peer and uses them as the request's own origin, with no trusted-proxy gate.",
+      "where": "internal/middleware/websocket_origin.go:45-57",
+      "reason_to_dismiss": "It is the cross-site-WebSocket origin check, a neighbouring feature; the advisory is about client IPs and this setting lists origins, not proxies.",
+      "distance": "same package as the landing point, different file and different sink",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {
+      "where": "api/user/passkey.go:239",
+      "sibling": "passkey login recomputes the client address itself (X-Forwarded-For split) instead of calling c.ClientIP()",
+      "why_realistic": "The passkey path already duplicates the password path's ban bookkeeping (compare api/user/auth.go:51 with api/user/passkey.go:239), so a maintainer adding a third login path would plausibly read the header directly."
+    },
+    {
+      "where": "fix.diff:1669-1682 (client_ip defaults merge)",
+      "sibling": "a second topology default for the demo container (resources/demo/nginx-ui.conf) added next to the bundled-nginx loopback default",
+      "why_realistic": "There are already two shipped front-proxy configs; the next deployment topology that proxies from a fixed address gets the same helper extended."
+    },
+    {
+      "where": "internal/middleware/websocket_origin.go:50-53",
+      "sibling": "the forwarded host/proto used for the origin check is gated on the same TrustedProxies list",
+      "why_realistic": "The fix's own rule ('only trusted proxies may supply forwarded headers') applies verbatim to this code, so a follow-up hardening would copy the ClientIP gate here."
+    }
+  ],
+  "O9_family": "improper authorization from trust in an unvalidated client identity (CWE-346 origin validation error): the bundled reverse proxy makes every client share the 127.0.0.1 identity, so the IP allowlist short-circuits for everyone and all logins feed one ban bucket",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Go 1.27.1 backend, TypeScript/Vue frontend",
+    "toolchain": "go build / go test (cgo needed for mattn/go-sqlite3 via gorm.io/driver/sqlite); bun for app/ tests",
+    "services": ["none for the affected tests (httptest, in-memory SQLite)", "nginx only for the bundled-proxy deployment scenario"],
+    "offline_after_build": true,
+    "project_tests": "internal/middleware/middleware_test.go, mcp/router_test.go:28-46 (sets IPWhiteList and exercises /mcp), api/user/security_test.go, api/user/passkey_security_test.go; the fix adds internal/middleware/ip_whitelist_test.go, router/client_ip_test.go and internal/user/login_ban_test.go, none of which exist at the pinned commit"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/middleware/ip_whitelist.go, router/routers.go, router/client_ip.go, settings/auth.go, app.example.ini",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Delete the 127.0.0.1/::1 and empty-IP short-circuits in IPWhiteList() and stop there: every proxied user is then 403'd, while the ban bucket still keys on 127.0.0.1."
+  },
+  "out_of_scope_notes": [
+    "The fix commit is a bundled release commit: app/src session-expiry, HTTP error normalisation, nginx dashboard, release notes, PRODUCT.md and index-CustomMMDB changes are unrelated to this advisory and were not screened.",
+    "resources/demo/nginx-ui.conf:28-31 serves /var/log/nginx/demo-boot.log from the demo front proxy; outside this advisory, not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB was not measured (no shell in this session); the tree has many hundreds of Go packages, so tiny_repo/giant_repo were judged not to hold rather than measured.",
+    "gin v1.12.0 source is not vendored in the tree; c.ClientIP() trusted-proxy and X-Real-IP fallback semantics were taken from the fix's own tests (fix.diff:1464-1493, 1746-1800), not read directly.",
+    "present_in_latest is unknown for both O8 routes because no latest release tree was supplied.",
+    "Impact of the websocket_origin forwarded-host path was not demonstrated; browsers cannot set X-Forwarded-Host on a WebSocket handshake, so it may be defence-in-depth only."
+  ]
+}

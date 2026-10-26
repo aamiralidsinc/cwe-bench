@@ -1,0 +1,507 @@
+diff -ruN old/charts/fission-all/templates/webhook-server/webhooks.yaml new/charts/fission-all/templates/webhook-server/webhooks.yaml
+--- old/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-18 20:05:51.000000000 +0000
++++ new/charts/fission-all/templates/webhook-server/webhooks.yaml	2026-10-21 23:47:47.908025775 +0000
+@@ -72,6 +72,7 @@
+     - v1
+     operations:
+     - CREATE
++    - UPDATE
+     resources:
+     - environments
+   sideEffects: None
+diff -ruN old/pkg/apis/core/v1/podspec_safety.go new/pkg/apis/core/v1/podspec_safety.go
+--- old/pkg/apis/core/v1/podspec_safety.go	1970-01-01 00:00:00.000000000 +0000
++++ new/pkg/apis/core/v1/podspec_safety.go	2026-10-21 23:47:47.908025775 +0000
+@@ -0,0 +1,129 @@
++/*
++Copyright 2026 The Fission Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++
++	apiv1 "k8s.io/api/core/v1"
++	"sigs.k8s.io/yaml"
++)
++
++// dangerousCapabilities lists Linux capabilities that effectively grant root
++// or break the container sandbox. Tenants that can write Environment or
++// Function objects must not be able to add these via securityContext.
++var dangerousCapabilities = map[string]struct{}{
++	"SYS_ADMIN":       {},
++	"NET_ADMIN":       {},
++	"SYS_PTRACE":      {},
++	"SYS_MODULE":      {},
++	"DAC_READ_SEARCH": {},
++	"DAC_OVERRIDE":    {},
++	"ALL":             {},
++}
++
++// capabilityName normalizes a capability spelling. Container runtimes
++// upper-case capability names and add the CAP_ prefix, so "cap_sys_admin",
++// "CAP_SYS_ADMIN" and "SYS_ADMIN" all take effect on a container.
++func capabilityName(c apiv1.Capability) string {
++	name := strings.ToUpper(strings.TrimSpace(string(c)))
++	return strings.TrimPrefix(name, "CAP_")
++}
++
++// ValidateContainerSafety rejects containers whose securityContext lets the
++// container escape the sandbox it runs in.
++func ValidateContainerSafety(fieldPath string, c *apiv1.Container) error {
++	if c == nil || c.SecurityContext == nil {
++		return nil
++	}
++	var errs error
++	sc := c.SecurityContext
++	if sc.Privileged != nil && *sc.Privileged {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.privileged is not allowed", fieldPath))
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		errs = errors.Join(errs, fmt.Errorf("%s.securityContext.allowPrivilegeEscalation is not allowed", fieldPath))
++	}
++	if sc.Capabilities != nil {
++		for _, capability := range sc.Capabilities.Add {
++			if _, bad := dangerousCapabilities[capabilityName(capability)]; bad {
++				errs = errors.Join(errs, fmt.Errorf("%s.securityContext.capabilities.add contains %q, which is not allowed", fieldPath, capability))
++			}
++		}
++	}
++	return errs
++}
++
++// ValidatePodSpecSafety rejects PodSpec fields that would let a low-privilege
++// tenant escalate to host or cluster level when the executor or buildermgr
++// schedules a pod from a user-supplied podspec.
++//
++// The fieldPath argument is used as a prefix in error messages so the caller
++// can identify which podspec failed.
++func ValidatePodSpecSafety(fieldPath string, ps *apiv1.PodSpec) error {
++	if ps == nil {
++		return nil
++	}
++	var errs error
++
++	if ps.HostNetwork {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostNetwork is not allowed", fieldPath))
++	}
++	if ps.HostPID {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostPID is not allowed", fieldPath))
++	}
++	if ps.HostIPC {
++		errs = errors.Join(errs, fmt.Errorf("%s.hostIPC is not allowed", fieldPath))
++	}
++	if ps.ServiceAccountName != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccountName override is not allowed", fieldPath))
++	}
++	if ps.DeprecatedServiceAccount != "" {
++		errs = errors.Join(errs, fmt.Errorf("%s.serviceAccount override is not allowed", fieldPath))
++	}
++	for _, v := range ps.Volumes {
++		if v.HostPath != nil {
++			errs = errors.Join(errs, fmt.Errorf("%s.volumes[%s].hostPath is not allowed", fieldPath, v.Name))
++		}
++	}
++	for i := range ps.Containers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.containers[%s]", fieldPath, ps.Containers[i].Name), &ps.Containers[i]))
++	}
++	for i := range ps.InitContainers {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("%s.initContainers[%s]", fieldPath, ps.InitContainers[i].Name), &ps.InitContainers[i]))
++	}
++	return errs
++}
++
++// ValidatePodSpecPatchSafety checks a serialized pod spec patch for the same
++// forbidden primitives as a structured pod spec.
++func ValidatePodSpecPatchSafety(fieldPath string, patch string) error {
++	if strings.TrimSpace(patch) == "" {
++		return nil
++	}
++	raw, err := yaml.YAMLToJSON([]byte(patch))
++	if err != nil {
++		return fmt.Errorf("%s is not valid YAML or JSON: %v", fieldPath, err)
++	}
++	ps := &apiv1.PodSpec{}
++	if err := yaml.Unmarshal(raw, ps); err != nil {
++		return fmt.Errorf("%s is not a valid pod spec fragment: %v", fieldPath, err)
++	}
++	return ValidatePodSpecSafety(fieldPath, ps)
++}
+diff -ruN old/pkg/apis/core/v1/validation.go new/pkg/apis/core/v1/validation.go
+--- old/pkg/apis/core/v1/validation.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/apis/core/v1/validation.go	2026-10-21 23:47:47.908025775 +0000
+@@ -297,6 +297,13 @@
+ 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.PodSpec", "", "executor type container requires a pod spec"))
+ 	}
+ 
++	// Reject pod settings that would let a tenant escalate through the
++	// executor service account.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec))
++	for i := range spec.Sidecars {
++		errs = errors.Join(errs, ValidateContainerSafety(fmt.Sprintf("Function.spec.sidecars[%s]", spec.Sidecars[i].Name), &spec.Sidecars[i]))
++	}
++
+ 	// TODO Add below validation warning
+ 	// if spec.FunctionTimeout <= 0 {
+ 	// 	errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionTimeout value", spec.FunctionTimeout, "not a valid value. Should always be more than 0"))
+@@ -666,6 +673,14 @@
+ 			}
+ 		}
+ 	}
++
++	// Reject pod settings that would let a tenant escalate through the
++	// executor / buildermgr service accounts.
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.runtime.podspec", e.Spec.Runtime.PodSpec))
++	errs = errors.Join(errs, ValidatePodSpecSafety("Environment.spec.builder.podspec", e.Spec.Builder.PodSpec))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.runtime.container", e.Spec.Runtime.Container))
++	errs = errors.Join(errs, ValidateContainerSafety("Environment.spec.builder.container", e.Spec.Builder.Container))
++	errs = errors.Join(errs, ValidatePodSpecPatchSafety("Environment.spec.runtime.podSpecPatch", e.Spec.Runtime.PodSpecPatch))
+ 	return errs
+ }
+ 
+diff -ruN old/pkg/executor/executortype/container/deployment.go new/pkg/executor/executortype/container/deployment.go
+--- old/pkg/executor/executortype/container/deployment.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/executor/executortype/container/deployment.go	2026-10-21 23:47:47.908025775 +0000
+@@ -250,9 +250,13 @@
+ 		return nil, err
+ 	}
+ 
+-	// Attach the sidecar containers requested by the function.
++	// Attach the sidecar containers requested by the function. The list is
++	// tenant-supplied, so it is sanitized like the rest of the pod spec.
+ 	if len(fn.Spec.Sidecars) > 0 {
+ 		podSpec.Containers = append(podSpec.Containers, fn.Spec.Sidecars...)
++		for i := range podSpec.Containers {
++			util.SanitizeContainerSecurityContext(&podSpec.Containers[i])
++		}
+ 	}
+ 
+ 	pod := apiv1.PodTemplateSpec{
+diff -ruN old/pkg/executor/util/merge.go new/pkg/executor/util/merge.go
+--- old/pkg/executor/util/merge.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/executor/util/merge.go	2026-10-21 23:47:47.908025775 +0000
+@@ -20,6 +20,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"reflect"
++	"strings"
+ 
+ 	"dario.cat/mergo"
+ 	apiv1 "k8s.io/api/core/v1"
+@@ -51,6 +52,8 @@
+ 		checkSliceConflicts("Name", dstC.VolumeMounts),
+ 		checkSliceConflicts("Name", dstC.VolumeDevices))
+ 
++	SanitizeContainerSecurityContext(&dstC)
++
+ 	return &dstC, errs
+ }
+ 
+@@ -79,8 +82,20 @@
+ 		srcPodSpec.InitContainers = cList
+ 	}
+ 
+-	// For volumes - if duplicate exist, throw error
+-	vols, err := mergeVolumeLists(srcPodSpec.Volumes, targetPodSpec.Volumes)
++	// A container that only exists in the target pod spec is appended
++	// without going through MergeContainer, so sanitize the whole merged
++	// result as well.
++	for i := range srcPodSpec.Containers {
++		SanitizeContainerSecurityContext(&srcPodSpec.Containers[i])
++	}
++	for i := range srcPodSpec.InitContainers {
++		SanitizeContainerSecurityContext(&srcPodSpec.InitContainers[i])
++	}
++
++	// For volumes - if duplicate exist, throw error. hostPath volumes are
++	// removed from the target before merging: a tenant-supplied hostPath
++	// mount reaches the node filesystem.
++	vols, err := mergeVolumeLists(srcPodSpec.Volumes, withoutHostPathVolumes(targetPodSpec.Volumes))
+ 	if err != nil {
+ 		multierr = errors.Join(multierr, err)
+ 	} else {
+@@ -142,29 +157,17 @@
+ 		srcPodSpec.DNSPolicy = targetPodSpec.DNSPolicy
+ 	}
+ 
+-	if targetPodSpec.ServiceAccountName != "" {
+-		srcPodSpec.ServiceAccountName = targetPodSpec.ServiceAccountName
+-	}
+-
+-	if targetPodSpec.DeprecatedServiceAccount != "" {
+-		srcPodSpec.DeprecatedServiceAccount = targetPodSpec.DeprecatedServiceAccount
+-	}
++	// ServiceAccountName / DeprecatedServiceAccount are not propagated: the
++	// controller chooses the service account for the pod (fission-fetcher
++	// for runtime pods, fission-builder for build pods).
+ 
+ 	if targetPodSpec.AutomountServiceAccountToken != nil {
+ 		srcPodSpec.AutomountServiceAccountToken = targetPodSpec.AutomountServiceAccountToken
+ 	}
+ 
+-	if targetPodSpec.HostNetwork {
+-		srcPodSpec.HostNetwork = targetPodSpec.HostNetwork
+-	}
+-
+-	if targetPodSpec.HostPID {
+-		srcPodSpec.HostPID = targetPodSpec.HostPID
+-	}
+-
+-	if targetPodSpec.HostIPC {
+-		srcPodSpec.HostIPC = targetPodSpec.HostIPC
+-	}
++	// HostNetwork / HostPID / HostIPC are not propagated: a pod sharing a
++	// host namespace reaches node-level state that the tenant was never
++	// granted.
+ 
+ 	if targetPodSpec.ShareProcessNamespace != nil {
+ 		srcPodSpec.ShareProcessNamespace = targetPodSpec.ShareProcessNamespace
+@@ -288,3 +291,83 @@
+ 	}
+ 	return errs
+ }
++
++// dangerousMergeCapabilities is the merge-layer mirror of the admission
++// denylist in pkg/apis/core/v1/podspec_safety.go. The webhook is the primary
++// defence; this covers stored objects and webhook-bypassed clusters.
++var dangerousMergeCapabilities = map[string]struct{}{
++	"SYS_ADMIN":       {},
++	"NET_ADMIN":       {},
++	"SYS_PTRACE":      {},
++	"SYS_MODULE":      {},
++	"DAC_READ_SEARCH": {},
++	"DAC_OVERRIDE":    {},
++	"ALL":             {},
++}
++
++func normalizedCapability(c apiv1.Capability) string {
++	name := strings.ToUpper(strings.TrimSpace(string(c)))
++	return strings.TrimPrefix(name, "CAP_")
++}
++
++// SanitizeContainerSecurityContext removes privilege-escalation settings from
++// a container. It deep-copies the security context first so a context shared
++// with an informer cache object is not modified.
++func SanitizeContainerSecurityContext(c *apiv1.Container) {
++	if c == nil || c.SecurityContext == nil {
++		return
++	}
++	sc := c.SecurityContext.DeepCopy()
++	if sc.Privileged != nil && *sc.Privileged {
++		sc.Privileged = new(false)
++	}
++	if sc.AllowPrivilegeEscalation != nil && *sc.AllowPrivilegeEscalation {
++		sc.AllowPrivilegeEscalation = new(false)
++	}
++	if sc.Capabilities != nil && len(sc.Capabilities.Add) > 0 {
++		kept := make([]apiv1.Capability, 0, len(sc.Capabilities.Add))
++		for _, capability := range sc.Capabilities.Add {
++			if _, bad := dangerousMergeCapabilities[normalizedCapability(capability)]; bad {
++				continue
++			}
++			kept = append(kept, capability)
++		}
++		sc.Capabilities.Add = kept
++	}
++	c.SecurityContext = sc
++}
++
++// withoutHostPathVolumes returns the volumes that are not hostPath mounts.
++func withoutHostPathVolumes(vols []apiv1.Volume) []apiv1.Volume {
++	if len(vols) == 0 {
++		return vols
++	}
++	out := make([]apiv1.Volume, 0, len(vols))
++	for _, v := range vols {
++		if v.HostPath != nil {
++			continue
++		}
++		out = append(out, v)
++	}
++	return out
++}
++
++// SanitizePodSpec removes the primitives that cross the container sandbox
++// boundary from a pod spec built out of tenant-supplied settings.
++func SanitizePodSpec(ps *apiv1.PodSpec) {
++	if ps == nil {
++		return
++	}
++	ps.HostNetwork = false
++	ps.HostPID = false
++	ps.HostIPC = false
++	ps.ServiceAccountName = ""
++	ps.DeprecatedServiceAccount = ""
++	ps.Volumes = withoutHostPathVolumes(ps.Volumes)
++	for i := range ps.Containers {
++		SanitizeContainerSecurityContext(&ps.Containers[i])
++	}
++	for i := range ps.InitContainers {
++		SanitizeContainerSecurityContext(&ps.InitContainers[i])
++	}
++}
+diff -ruN old/pkg/executor/util/pod_overrides.go new/pkg/executor/util/pod_overrides.go
+--- old/pkg/executor/util/pod_overrides.go	2026-10-21 23:43:35.696250278 +0000
++++ new/pkg/executor/util/pod_overrides.go	2026-10-21 23:47:47.908025775 +0000
+@@ -14,6 +14,8 @@
+ 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+ 	"k8s.io/client-go/kubernetes"
+ 	"sigs.k8s.io/yaml"
++
++	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+ )
+ 
+ // NamespacePodOverridesConfigMap is the ConfigMap a namespace uses to supply
+@@ -52,6 +54,16 @@
+ 		return nil, fmt.Errorf("error parsing namespace pod overrides: %w", err)
+ 	}
+ 
++	// The overlay is tenant-supplied, so it is held to the same rule as the
++	// typed pod spec before it is merged into the platform's pod.
++	overlaySpec := &apiv1.PodSpec{}
++	if err := json.Unmarshal(overlayJSON, overlaySpec); err != nil {
++		return nil, fmt.Errorf("error parsing namespace pod overrides: %w", err)
++	}
++	if err := fv1.ValidatePodSpecSafety("namespace pod overrides", overlaySpec); err != nil {
++		return nil, err
++	}
++
+ 	baseJSON, err := json.Marshal(ps)
+ 	if err != nil {
+ 		return nil, err
+diff -ruN old/pkg/executor/util/podspec_legacy.go new/pkg/executor/util/podspec_legacy.go
+--- old/pkg/executor/util/podspec_legacy.go	2026-10-21 23:43:36.912249198 +0000
++++ new/pkg/executor/util/podspec_legacy.go	2026-10-21 23:47:47.908025775 +0000
+@@ -15,6 +15,11 @@
+ 		return
+ 	}
+ 
++	// Version-1 values are tenant-supplied too: keep the legacy behaviour for
++	// the settings that stay inside the container sandbox boundary, and drop
++	// the ones that do not.
++	target = legacySafePodSpec(target)
++
+ 	if target.HostNetwork {
+ 		src.HostNetwork = true
+ 	}
+@@ -49,3 +54,11 @@
+ 	restoreSecurityContexts(src.Containers, target.Containers)
+ 	restoreSecurityContexts(src.InitContainers, target.InitContainers)
+ }
++
++// legacySafePodSpec returns a copy of target with the fields that cross the
++// container sandbox boundary removed.
++func legacySafePodSpec(target *apiv1.PodSpec) *apiv1.PodSpec {
++	safe := target.DeepCopy()
++	SanitizePodSpec(safe)
++	return safe
++}
+diff -ruN old/pkg/executor/util/podspec_patch.go new/pkg/executor/util/podspec_patch.go
+--- old/pkg/executor/util/podspec_patch.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/executor/util/podspec_patch.go	2026-10-21 23:47:47.908025775 +0000
+@@ -25,6 +25,11 @@
+ 		return nil, fmt.Errorf("error parsing pod spec patch: %w", err)
+ 	}
+ 
++	// The platform chooses the pod's service account; a patch cannot change
++	// it, so restore the base value after sanitizing.
++	serviceAccount := ps.ServiceAccountName
++	deprecatedServiceAccount := ps.DeprecatedServiceAccount
++
+ 	baseJSON, err := json.Marshal(ps)
+ 	if err != nil {
+ 		return nil, err
+@@ -39,5 +44,10 @@
+ 	if err := json.Unmarshal(mergedJSON, merged); err != nil {
+ 		return nil, err
+ 	}
++	// The patch is tenant-supplied, so the merged pod spec is sanitized the
++	// same way as a tenant-supplied pod spec.
++	SanitizePodSpec(merged)
++	merged.ServiceAccountName = serviceAccount
++	merged.DeprecatedServiceAccount = deprecatedServiceAccount
+ 	return merged, nil
+ }
+diff -ruN old/pkg/webhook/environment.go new/pkg/webhook/environment.go
+--- old/pkg/webhook/environment.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/environment.go	2026-10-21 23:47:47.908025775 +0000
+@@ -42,14 +42,13 @@
+ var _ webhook.CustomDefaulter = &Environment{}
+ 
+ // user: change verbs to "verbs=create;update;delete" if you want to enable deletion validation.
+-//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
++// The validation must also run on UPDATE: otherwise a tenant can create a
++// clean object and then patch in unsafe pod settings.
++//+kubebuilder:webhook:path=/validate-fission-io-v1-environment,mutating=false,failurePolicy=fail,sideEffects=None,groups=fission.io,resources=environments,verbs=create;update,versions=v1,name=venvironment.fission.io,admissionReviewVersions=v1
+ 
+ var _ webhook.CustomValidator = &Environment{}
+ 
+ func (r *Environment) Validate(new *v1.Environment) error {
+-	if skipPodSpecValidation(new.Annotations) {
+-		return nil
+-	}
+ 	if err := new.Validate(); err != nil {
+ 		err = v1.AggregateValidationErrors("Environment", err)
+ 		return err
+diff -ruN old/pkg/webhook/function.go new/pkg/webhook/function.go
+--- old/pkg/webhook/function.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/function.go	2026-10-21 23:47:47.908025775 +0000
+@@ -49,9 +49,6 @@
+ var _ webhook.CustomValidator = &Function{}
+ 
+ func (r *Function) Validate(new *v1.Function) error {
+-	if skipPodSpecValidation(new.Annotations) {
+-		return nil
+-	}
+ 	for _, cnfMap := range new.Spec.ConfigMaps {
+ 		if cnfMap.Namespace != new.Namespace {
+ 			err := fmt.Errorf("configMap's [%s] and function's Namespace [%s] are different. ConfigMap needs to be present in the same namespace as function", cnfMap.Namespace, new.Namespace)
+diff -ruN old/pkg/webhook/generic.go new/pkg/webhook/generic.go
+--- old/pkg/webhook/generic.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/generic.go	2026-10-21 23:47:47.908025775 +0000
+@@ -84,10 +84,10 @@
+ 
+ // ValidateUpdate implements webhook.CustomValidator.
+ func (w *GenericWebhook[T]) ValidateUpdate(_ context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
+-	typedObj, ok := newObj.(T)
++	typedObj, ok := oldObj.(T)
+ 	if !ok {
+ 		var t T
+-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected %T but got %T", t, newObj))
++		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected %T but got %T", t, oldObj))
+ 	}
+ 	w.Logger.V(1).Info("validate update", "name", typedObj.GetName())
+ 	if w.Validator != nil {
+diff -ruN old/pkg/webhook/legacy.go new/pkg/webhook/legacy.go
+--- old/pkg/webhook/legacy.go	2026-10-18 20:05:51.000000000 +0000
++++ new/pkg/webhook/legacy.go	1970-01-01 00:00:00.000000000 +0000
+@@ -1,14 +0,0 @@
+-// SPDX-License-Identifier: Apache-2.0
+-
+-package webhook
+-
+-// legacyPodSpecAnnotation marks objects that were created before the current
+-// environment and function validation rules took effect. Keeping the
+-// annotation lets users keep updating such objects while a release rolls out.
+-const legacyPodSpecAnnotation = "fission.io/legacy-podspec"
+-
+-// skipPodSpecValidation reports whether an object was marked for the
+-// pre-existing validation rules with the legacy annotation.
+-func skipPodSpecValidation(annotations map[string]string) bool {
+-	return annotations[legacyPodSpecAnnotation] == "true"
+-}

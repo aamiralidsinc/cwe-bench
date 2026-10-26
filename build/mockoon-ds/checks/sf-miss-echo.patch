@@ -1,0 +1,922 @@
+diff --git a/packages/cli/src/commands/start.ts b/packages/cli/src/commands/start.ts
+index 9a8987e..c86adef 100644
+--- a/packages/cli/src/commands/start.ts
++++ b/packages/cli/src/commands/start.ts
+@@ -100,6 +100,18 @@ export default class Start extends Command {
+         'Disable the admin API, enabled by default (more info: https://mockoon.com/docs/latest/admin-api/overview/)',
+       default: false
+     }),
++    'admin-api-token': Flags.string({
++      description:
++        'Admin API bearer token(s). Provide once to reuse for all environments, or multiple times (or comma-separated) to set one token per environment.',
++      multiple: true,
++      env: 'MOCKOON_ADMIN_API_TOKEN'
++    }),
++    'admin-api-cors-origin': Flags.string({
++      description:
++        "Allowed CORS origin(s) for the admin API (e.g. 'https://app.example.com'). Provide multiple times or comma-separated for multiple origins. Use '*' to explicitly opt into wildcard CORS. When omitted, no CORS headers are emitted on admin API responses.",
++      multiple: true,
++      env: 'MOCKOON_ADMIN_API_CORS_ORIGIN'
++    }),
+     'disable-tls': Flags.boolean({
+       description:
+         'Disable TLS for all environments. TLS configuration is part of the environment configuration (more info: https://mockoon.com/docs/latest/server-configuration/serving-over-tls/).',
+@@ -146,6 +158,13 @@ export default class Start extends Command {
+ 
+   public async run(): Promise<void> {
+     const { flags: userFlags } = await this.parse(Start);
++    const adminApiTokens = this.resolveTokens(
++      userFlags['admin-api-token'],
++      userFlags.data.length
++    );
++    const adminApiCorsOrigins = this.normalizeCsvFlag(
++      userFlags['admin-api-cors-origin']
++    );
+ 
+     // validate flags
+     if (
+@@ -203,6 +222,9 @@ export default class Start extends Command {
+           },
+           envVarsPrefix: userFlags['env-vars-prefix'],
+           enableAdminApi: !userFlags['disable-admin-api'],
++          adminApiAuthToken: adminApiTokens[index],
++          adminApiCorsOrigins:
++            adminApiCorsOrigins.length > 0 ? adminApiCorsOrigins : undefined,
+           disableTls: userFlags['disable-tls'],
+           maxTransactionLogs: userFlags['max-transaction-logs'],
+           enableRandomLatency: userFlags['enable-random-latency'],
+@@ -269,6 +291,8 @@ export default class Start extends Command {
+       fakerOptions: parameters.fakerOptions,
+       envVarsPrefix: parameters.envVarsPrefix,
+       enableAdminApi: parameters.enableAdminApi,
++      adminApiAuthToken: parameters.adminApiAuthToken,
++      adminApiCorsOrigins: parameters.adminApiCorsOrigins,
+       disableTls: parameters.disableTls,
+       maxTransactionLogs: parameters.maxTransactionLogs,
+       enableRandomLatency: parameters.enableRandomLatency,
+@@ -338,4 +362,44 @@ export default class Start extends Command {
+ 
+     return server;
+   };
++
++  private resolveTokens = (
++    rawTokens: string[] | string | undefined,
++    environmentsCount: number
++  ): (string | undefined)[] => {
++    const parsedTokens = this.normalizeCsvFlag(rawTokens);
++
++    if (parsedTokens.length === 0) {
++      return Array.from({ length: environmentsCount }, () => undefined);
++    }
++
++    if (parsedTokens.length === 1) {
++      return Array.from({ length: environmentsCount }, () => parsedTokens[0]);
++    }
++
++    if (parsedTokens.length !== environmentsCount) {
++      this.error(
++        `The number of provided API tokens (${parsedTokens.length}) must be 1 or match the number of environments (${environmentsCount}).`
++      );
++    }
++
++    return parsedTokens;
++  };
++
++  /**
++   * Normalize an oclif flag value that may arrive as a single CSV string
++   * (when set through an env var) or an array (when set through repeated
++   * CLI flags), into a flat array of trimmed, non-empty values.
++   */
++  private normalizeCsvFlag = (
++    rawValue: string[] | string | undefined
++  ): string[] => {
++    const values =
++      rawValue == null ? [] : Array.isArray(rawValue) ? rawValue : [rawValue];
++
++    return values
++      .flatMap((value) => value.split(','))
++      .map((value) => value.trim())
++      .filter((value) => value.length > 0);
++  };
+ }
+diff --git a/packages/commons-server/src/constants/server-messages.constants.ts b/packages/commons-server/src/constants/server-messages.constants.ts
+index c07e69b..7d82da9 100644
+--- a/packages/commons-server/src/constants/server-messages.constants.ts
++++ b/packages/commons-server/src/constants/server-messages.constants.ts
+@@ -16,6 +16,7 @@ export const ServerMessages = {
+   HEADER_PARSING_ERROR_LIGHT:
+     '-- Header parsing error, see logs for more details --',
+   SERVER_STARTED: 'Server started on port %d',
++  ADMIN_API_AUTH_AUTO_GENERATED_TOKEN: 'Admin API token (auto-generated): %s',
+   SERVER_STOPPED: 'Server stopped',
+   CALLBACK_FILE_ERROR: 'Error while attaching file to callback request: %s',
+   CALLBACK_ERROR: 'Error while executing callback: %s',
+diff --git a/packages/commons-server/src/libs/logger.ts b/packages/commons-server/src/libs/logger.ts
+index 1b4d045..94bd442 100644
+--- a/packages/commons-server/src/libs/logger.ts
++++ b/packages/commons-server/src/libs/logger.ts
+@@ -10,26 +10,53 @@ import {
+   FileTransportOptions
+ } from 'winston/lib/winston/transports';
+ 
++const autoGeneratedTokenMessagePatterns = [
++  /(Admin API token \(auto-generated\):\s*)(.+)$/i
++];
++
++const redactAutoGeneratedTokenMessage = (value: string): string =>
++  autoGeneratedTokenMessagePatterns.reduce(
++    (redactedValue, pattern) => redactedValue.replace(pattern, '$1[REDACTED]'),
++    value
++  );
++
++const fileTransportRedactionFormat = logFormat((info) => {
++  if (typeof info.message === 'string') {
++    info.message = redactAutoGeneratedTokenMessage(info.message);
++  }
++
++  return info;
++});
++
+ export const createLoggerInstance = (
+   fileTransportOptions?: FileTransportOptions | null
+ ): Logger => {
+   const transportsInstances: (
+     | FileTransportInstance
+     | ConsoleTransportInstance
+-  )[] = [new logsTransports.Console({ handleExceptions: true })];
++  )[] = [
++    new logsTransports.Console({
++      handleExceptions: true,
++      format: logFormat.combine(logFormat.timestamp(), logFormat.json())
++    })
++  ];
+ 
+   if (fileTransportOptions) {
+     transportsInstances.push(
+       new logsTransports.File({
+         ...fileTransportOptions,
+-        handleExceptions: true
++        handleExceptions: true,
++        format: logFormat.combine(
++          fileTransportRedactionFormat(),
++          logFormat.timestamp(),
++          logFormat.json()
++        )
+       })
+     );
+   }
+ 
+   return createLogger({
+     level: 'info',
+-    format: logFormat.combine(logFormat.timestamp(), logFormat.json()),
+     transports: transportsInstances,
+     exitOnError: false
+   });
+diff --git a/packages/commons-server/src/libs/server/admin-api.ts b/packages/commons-server/src/libs/server/admin-api.ts
+index a61917b..f081029 100644
+--- a/packages/commons-server/src/libs/server/admin-api.ts
++++ b/packages/commons-server/src/libs/server/admin-api.ts
+@@ -1,5 +1,12 @@
+-import { Environment, EnvironmentSchema, Transaction } from '@mockoon/commons';
++import {
++  Environment,
++  EnvironmentSchema,
++  extractBearerToken,
++  Transaction
++} from '@mockoon/commons';
+ import { Express, Request, Response } from 'express';
++import { timingSafeEqual } from 'node:crypto';
++import { redactTransaction } from '../utils';
+ import { MockoonServer } from './server';
+ import { Sse } from './sse';
+ 
+@@ -21,6 +28,8 @@ export const createAdminEndpoint = (
+     getLogs,
+     purgeLogs,
+     envVarsPrefix,
++    adminApiAuthToken,
++    adminApiCorsOrigins,
+     updateEnvironment
+   }: {
+     statePurgeCallback: () => void;
+@@ -33,6 +42,8 @@ export const createAdminEndpoint = (
+     getLogs: () => Transaction[];
+     purgeLogs: () => void;
+     envVarsPrefix: string;
++    adminApiAuthToken: string;
++    adminApiCorsOrigins?: string[];
+     updateEnvironment: (environment: Environment) => void;
+   }
+ ): void => {
+@@ -54,22 +65,86 @@ export const createAdminEndpoint = (
+         ...replayableEvents,
+         ...limitedLogs.map((transaction) => ({
+           event: 'transaction-complete',
+-          transaction
++          transaction: redactTransaction(transaction)
+         }))
+       ];
+     }
+   });
+ 
+   app.use(`${adminApiPrefix}*`, (req, res, next) => {
+-    res.setHeaders(
+-      new Headers({
+-        'Access-Control-Allow-Origin': '*',
+-        'Access-Control-Allow-Methods':
+-          'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS',
+-        'Access-Control-Allow-Headers':
+-          'Content-Type, Origin, Accept, Authorization, Content-Length, X-Requested-With'
+-      })
+-    );
++    const allowedOrigins = adminApiCorsOrigins ?? [];
++    const allowAll = allowedOrigins.includes('*');
++    const requestOrigin = req.get('origin');
++    const matchedOrigin = allowAll
++      ? '*'
++      : requestOrigin && allowedOrigins.includes(requestOrigin)
++        ? requestOrigin
++        : undefined;
++
++    if (matchedOrigin) {
++      res.setHeader('Access-Control-Allow-Origin', matchedOrigin);
++      if (matchedOrigin !== '*') {
++        res.setHeader('Vary', 'Origin');
++      }
++      res.setHeader(
++        'Access-Control-Allow-Methods',
++        'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS'
++      );
++      res.setHeader(
++        'Access-Control-Allow-Headers',
++        'Content-Type, Origin, Accept, Authorization, Content-Length, X-Requested-With'
++      );
++    }
++
++    if (req.method === 'OPTIONS') {
++      // Always terminate preflight at the admin endpoint to avoid leaking
++      // to user-defined routes. Browsers will reject the response if no
++      // matching Access-Control-Allow-Origin header is present.
++      res.status(matchedOrigin ? 204 : 403).end();
++
++      return;
++    }
++
++    next();
++  });
++
++  const adminApiUnauthorized = (res: Response) => {
++    res.status(401).send({ message: 'Unauthorized' });
++  };
++
++  const hasValidAdminApiToken = (providedToken: string): boolean => {
++    const expectedTokenBuffer = Buffer.from(adminApiAuthToken, 'utf8');
++    const providedTokenBuffer = Buffer.from(providedToken, 'utf8');
++
++    if (expectedTokenBuffer.length !== providedTokenBuffer.length) {
++      return false;
++    }
++
++    return timingSafeEqual(expectedTokenBuffer, providedTokenBuffer);
++  };
++
++  app.use(`${adminApiPrefix}*`, (req: Request, res: Response, next) => {
++    if (req.method === 'OPTIONS') {
++      next();
++
++      return;
++    }
++
++    const isSseEndpoint =
++      req.method === 'GET' && req.baseUrl === `${adminApiPrefix}/events`;
++    const bearerToken = extractBearerToken(req.get('authorization'));
++    const sseQueryToken =
++      isSseEndpoint && typeof req.query['token'] === 'string'
++        ? req.query['token'].trim()
++        : undefined;
++    const providedToken = bearerToken || sseQueryToken;
++
++    if (!providedToken || !hasValidAdminApiToken(providedToken)) {
++      adminApiUnauthorized(res);
++
++      return;
++    }
++
+     next();
+   });
+ 
+@@ -86,7 +161,10 @@ export const createAdminEndpoint = (
+ 
+   // listen to server events and send them through the SSE
+   serverInstance.on('transaction-complete', (transaction) => {
+-    const event = { event: 'transaction-complete', transaction };
++    const event = {
++      event: 'transaction-complete',
++      transaction: redactTransaction(transaction)
++    };
+ 
+     events.send(event);
+   });
+@@ -143,7 +221,15 @@ export const createAdminEndpoint = (
+   };
+ 
+   /**
+-   * Set the value of an environment variable
++   * Set the value of an environment variable.
++   *
++   * The key must start with the configured prefix to prevent arbitrary
++   * environment variable writes (e.g. PATH, NODE_OPTIONS). If the key
++   * does not start with the prefix, it is automatically prepended,
++   * mirroring the read handler behavior.
++   *
++   * When the prefix is empty, writes are rejected to avoid arbitrary
++   * environment variable writes.
+    *
+    * @param req
+    * @param res
+@@ -151,15 +237,28 @@ export const createAdminEndpoint = (
+   const setEnvVarHandler = (req, res) => {
+     try {
+       const { key, value } = req.body;
+-      if (key !== undefined && value !== undefined) {
+-        process.env[key] = value;
++      if (key === undefined || value === undefined) {
++        throw new Error('Key or value missing from request');
++      }
+ 
+-        res.send({
+-          message: `Environment variable '${key}' has been set to '${value}'`
++      if (!envVarsPrefix) {
++        res.status(403).send({
++          message:
++            'Environment variable writes are disabled when the prefix is empty'
+         });
+-      } else {
+-        throw new Error('Key or value missing from request');
++
++        return;
+       }
++
++      const prefixedKey = key.startsWith(envVarsPrefix)
++        ? key
++        : envVarsPrefix + key;
++
++      process.env[prefixedKey] = value;
++
++      res.send({
++        message: `Environment variable '${prefixedKey}' has been set to '${value}'`
++      });
+     } catch (_error) {
+       res.status(400).send({ message: 'Invalid request' });
+     }
+@@ -183,10 +282,23 @@ export const createAdminEndpoint = (
+         throw new Error('Variables missing from request');
+       }
+ 
++      if (!envVarsPrefix) {
++        res.status(403).send({
++          message:
++            'Environment variable writes are disabled when the prefix is empty'
++        });
++
++        return;
++      }
++
+       const keys = Object.keys(variables);
+ 
+       keys.forEach((key) => {
+-        process.env[key] = String(variables[key]);
++        const prefixedKey = key.startsWith(envVarsPrefix)
++          ? key
++          : envVarsPrefix + key;
++
++        process.env[prefixedKey] = String(variables[key]);
+       });
+ 
+       res.send({
+@@ -338,7 +450,7 @@ export const createAdminEndpoint = (
+     const logs = getLogs();
+     const start = (page - 1) * limit;
+ 
+-    res.send(logs.slice(start, start + limit));
++    res.send(logs.slice(start, start + limit).map(redactTransaction));
+   };
+ 
+   /**
+diff --git a/packages/commons-server/src/libs/server/events-listeners.ts b/packages/commons-server/src/libs/server/events-listeners.ts
+index 224a17b..c8a568e 100644
+--- a/packages/commons-server/src/libs/server/events-listeners.ts
++++ b/packages/commons-server/src/libs/server/events-listeners.ts
+@@ -1,7 +1,6 @@
+ import {
+   CloneObject,
+   Environment,
+-  Header,
+   InFlightRequest,
+   InvokedCallback,
+   Methods,
+@@ -10,19 +9,9 @@ import {
+ import { format } from 'util';
+ import { Logger } from 'winston';
+ import { ServerMessages } from '../../constants/server-messages.constants';
++import { redactHeaders, redactInFlightRequestInPlace } from '../utils';
+ import { MockoonServer } from './server';
+ 
+-const authorizationHeaders = ['authorization', 'proxy-authorization'];
+-const filterAuthorizationHeaders = (header: Header) => {
+-  if (authorizationHeaders.includes(header.key.toLowerCase())) {
+-    const headerSplit = header.value.split(' ');
+-
+-    header.value = headerSplit.length === 1 ? '***' : `${headerSplit[0]} ***`;
+-  }
+-
+-  return header;
+-};
+-
+ export const listenServerEvents = function (
+   server: MockoonServer,
+   environment: Environment,
+@@ -40,6 +29,21 @@ export const listenServerEvents = function (
+       ...defaultLogMeta
+     });
+ 
++    if (
++      server.isAdminApiEnabled() &&
++      server.isAdminApiAuthTokenAutoGenerated()
++    ) {
++      logger.warn(
++        format(
++          ServerMessages.ADMIN_API_AUTH_AUTO_GENERATED_TOKEN,
++          server.getAdminApiAuthToken()
++        ),
++        {
++          ...defaultLogMeta
++        }
++      );
++    }
++
+     if (process.send) {
+       process.send('ready');
+     }
+@@ -108,10 +112,12 @@ export const listenServerEvents = function (
+ 
+     if (logTransaction) {
+       logMeta.transaction = CloneObject(transaction) as Transaction;
+-      logMeta.transaction.request.headers =
+-        logMeta.transaction.request.headers.map(filterAuthorizationHeaders);
+-      logMeta.transaction.response.headers =
+-        logMeta.transaction.response.headers.map(filterAuthorizationHeaders);
++      logMeta.transaction.request.headers = redactHeaders(
++        logMeta.transaction.request.headers
++      );
++      logMeta.transaction.response.headers = redactHeaders(
++        logMeta.transaction.response.headers
++      );
+       logMeta.transaction.request.method =
+         logMeta.transaction.request.method.toUpperCase() as Methods;
+     }
+@@ -131,11 +137,11 @@ export const listenServerEvents = function (
+     if (logTransaction) {
+       const clonedCallback = CloneObject(callback) as InvokedCallback;
+       logMeta.callback = clonedCallback;
+-      logMeta.callback.requestHeaders = logMeta.callback.requestHeaders.map(
+-        filterAuthorizationHeaders
++      logMeta.callback.requestHeaders = redactHeaders(
++        logMeta.callback.requestHeaders
+       );
+-      logMeta.callback.responseHeaders = logMeta.callback.responseHeaders.map(
+-        filterAuthorizationHeaders
++      logMeta.callback.responseHeaders = redactHeaders(
++        logMeta.callback.responseHeaders
+       );
+     }
+     logger.info('Callback invoked', logMeta);
+@@ -150,13 +156,9 @@ export const listenServerEvents = function (
+     };
+ 
+     if (logTransaction) {
+-      logMeta.inflightRequest = CloneObject(inflightRequest) as InFlightRequest;
+-      logMeta.inflightRequest.request.headers = logMeta.inflightRequest.request
+-        ?.headers
+-        ? logMeta.inflightRequest.request?.headers.map(
+-            filterAuthorizationHeaders
+-          )
+-        : [];
++      logMeta.inflightRequest = redactInFlightRequestInPlace(
++        CloneObject(inflightRequest) as InFlightRequest
++      );
+     }
+     logger.info('New WebSocket connection', logMeta);
+   });
+@@ -173,16 +175,10 @@ export const listenServerEvents = function (
+         };
+ 
+       if (logTransaction) {
+-        logMeta.inflightRequest = CloneObject(
+-          inflightRequest
+-        ) as InFlightRequest;
++        logMeta.inflightRequest = redactInFlightRequestInPlace(
++          CloneObject(inflightRequest) as InFlightRequest
++        );
+         logMeta.messageData = message;
+-        logMeta.inflightRequest.request.headers = logMeta.inflightRequest
+-          .request?.headers
+-          ? logMeta.inflightRequest.request?.headers.map(
+-              filterAuthorizationHeaders
+-            )
+-          : [];
+       }
+       logger.info('WebSocket message received', logMeta);
+     }
+@@ -199,13 +195,9 @@ export const listenServerEvents = function (
+       };
+ 
+       if (logTransaction) {
+-        logMeta.inflightRequest = CloneObject(request) as InFlightRequest;
+-        logMeta.inflightRequest.request.headers = logMeta.inflightRequest
+-          .request?.headers
+-          ? logMeta.inflightRequest.request?.headers.map(
+-              filterAuthorizationHeaders
+-            )
+-          : [];
++        logMeta.inflightRequest = redactInFlightRequestInPlace(
++          CloneObject(request) as InFlightRequest
++        );
+       }
+ 
+       logger.info('WebSocket closed', logMeta);
+diff --git a/packages/commons-server/src/libs/server/server.ts b/packages/commons-server/src/libs/server/server.ts
+index de4c527..e2bd1f8 100644
+--- a/packages/commons-server/src/libs/server/server.ts
++++ b/packages/commons-server/src/libs/server/server.ts
+@@ -27,6 +27,8 @@ import {
+   defaultMaxCallbackDepth,
+   defaultMaxTransactionLogs,
+   deterministicStringify,
++  extractBearerToken,
++  generateSecureToken,
+   generateUUID,
+   getLatency,
+   pathMatch,
+@@ -39,6 +41,7 @@ import appendField from 'append-field';
+ import busboy from 'busboy';
+ import cookieParser from 'cookie-parser';
+ import { EventEmitter } from 'events';
++import { timingSafeEqual } from 'node:crypto';
+ import express, { Application, NextFunction, Request, Response } from 'express';
+ import { createReadStream, readFile, readFileSync, statSync } from 'fs';
+ import type { RequestListener } from 'http';
+@@ -71,6 +74,7 @@ import {
+   CreateInFlightRequest,
+   CreateTransaction,
+   isBodySupportingMethod,
++  redactTransaction,
+   isValidStatusCode,
+   mimeTypeLookup,
+   resolvePathFromEnvironment
+@@ -112,6 +116,8 @@ import {
+  * ```
+  */
+ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<ServerEvents>) {
++  private adminApiAuthToken: string;
++  private adminApiAuthTokenIsAutoGenerated = false;
+   private serverInstance: httpServer | httpsServer;
+   private adminLogStreamServer: WebSocketServer | null = null;
+   private webSocketServers: WebSocketServerInstance[] = [];
+@@ -151,6 +157,13 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+       maxCallbackDepth: options.maxCallbackDepth ?? defaultMaxCallbackDepth
+     };
+ 
++    if (this.options.adminApiAuthToken) {
++      this.adminApiAuthToken = this.options.adminApiAuthToken;
++    } else {
++      this.adminApiAuthToken = generateSecureToken(32);
++      this.adminApiAuthTokenIsAutoGenerated = true;
++    }
++
+     this.computeEffectiveRestRoutes();
+     this.computeEffectiveWebSocketRoutes();
+   }
+@@ -238,6 +251,18 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+     }
+   }
+ 
++  public getAdminApiAuthToken(): string {
++    return this.adminApiAuthToken;
++  }
++
++  public isAdminApiEnabled(): boolean {
++    return this.options.enableAdminApi;
++  }
++
++  public isAdminApiAuthTokenAutoGenerated(): boolean {
++    return this.adminApiAuthTokenIsAutoGenerated;
++  }
++
+   /**
+    * Create a request listener
+    */
+@@ -294,6 +319,8 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+           this.transactionLogs = [];
+         },
+         envVarsPrefix: this.options.envVarsPrefix,
++        adminApiAuthToken: this.adminApiAuthToken,
++        adminApiCorsOrigins: this.options.adminApiCorsOrigins,
+         updateEnvironment: (environment: Environment) => {
+           this.updateEnvironment(environment);
+         }
+@@ -832,6 +859,26 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+     );
+   }
+ 
++  /**
++   * Check a token against the admin API token in constant time.
++   *
++   * @param providedToken
++   */
++  private isAdminApiTokenValid(providedToken: string | undefined): boolean {
++    if (!providedToken) {
++      return false;
++    }
++
++    const expectedTokenBuffer = Buffer.from(this.adminApiAuthToken, 'utf8');
++    const providedTokenBuffer = Buffer.from(providedToken, 'utf8');
++
++    if (expectedTokenBuffer.length !== providedTokenBuffer.length) {
++      return false;
++    }
++
++    return timingSafeEqual(expectedTokenBuffer, providedTokenBuffer);
++  }
++
+   /**
+    * Creates websocket routes from the given set of routes.
+    *
+@@ -843,7 +890,10 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+       this.adminLogStreamServer.on('connection', (socket: WebSocket) => {
+         const sendTransaction = (transaction: Transaction) => {
+           socket.send(
+-            JSON.stringify({ event: 'transaction-complete', transaction })
++            JSON.stringify({
++              event: 'transaction-complete',
++              transaction: redactTransaction(transaction)
++            })
+           );
+         };
+ 
+@@ -918,6 +968,23 @@ export class MockoonServer extends (EventEmitter as new () => TypedEmitter<Serve
+       this.adminLogStreamServer !== null &&
+       urlParsed.pathname === '/mockoon-admin/logs/stream'
+     ) {
++      const queryToken =
++        typeof urlParsed.query['token'] === 'string'
++          ? urlParsed.query['token'].trim()
++          : undefined;
++      const providedToken =
++        extractBearerToken(req.headers.authorization) || queryToken;
++
++      if (!this.isAdminApiTokenValid(providedToken)) {
++        socket.write(`HTTP/${req.httpVersion} 401 Unauthorized\r\n`);
++        socket.write('Content-Type: text/plain\r\n');
++        socket.write('Content-length: 12\r\n\r\n');
++        socket.write('Unauthorized');
++        socket.destroy();
++
++        return;
++      }
++
+       this.adminLogStreamServer.handleUpgrade(req, socket, head, (client) => {
+         this.adminLogStreamServer?.emit('connection', client, req);
+       });
+diff --git a/packages/commons-server/src/libs/utils.ts b/packages/commons-server/src/libs/utils.ts
+index 13ff2cc..a980970 100644
+--- a/packages/commons-server/src/libs/utils.ts
++++ b/packages/commons-server/src/libs/utils.ts
+@@ -30,6 +30,96 @@ import { ServerRequest } from './requests';
+ export { lookup as mimeTypeLookup } from 'mime-types';
+ export { get as objectGetPath } from 'object-path';
+ 
++/**
++ * Header names whose values are redacted before transactions are exposed
++ * outside of the original process trust boundary.
++ *
++ * Applied to:
++ *  - Admin API output (SSE stream + GET /logs)
++ *  - CLI / serverless transaction logs (--log-transaction)
++ *
++ * NOT applied to:
++ *  - Desktop "Logs" tab (transactions reach the renderer through local IPC
++ *    and are only visible to the user running the app)
++ */
++const SENSITIVE_TRANSACTION_HEADERS = new Set([
++  'authorization',
++  'proxy-authorization',
++  'cookie',
++  'set-cookie',
++  'x-api-key',
++  'api-key',
++  'x-auth-token'
++]);
++
++const REDACTED_VALUE = '[REDACTED]';
++
++/**
++ * Headers whose value starts with an auth scheme (e.g. "Bearer xyz",
++ * "Basic xyz"). For these, the scheme is preserved and only the credential
++ * portion is redacted ("Bearer [REDACTED]"), which is useful for debugging
++ * client configuration without leaking the secret.
++ */
++const SCHEME_PRESERVING_HEADERS = new Set([
++  'authorization',
++  'proxy-authorization'
++]);
++
++const redactHeaderValue = (key: string, value: string): string => {
++  if (SCHEME_PRESERVING_HEADERS.has(key)) {
++    const [scheme, ...rest] = value.split(' ');
++
++    return rest.length === 0 ? REDACTED_VALUE : `${scheme} ${REDACTED_VALUE}`;
++  }
++
++  return REDACTED_VALUE;
++};
++
++/**
++ * Return a copy of the given header list with sensitive values replaced.
++ */
++export const redactHeaders = (headers: Header[]): Header[] =>
++  headers.map((header) => {
++    const lowerKey = header.key.toLowerCase();
++
++    return SENSITIVE_TRANSACTION_HEADERS.has(lowerKey)
++      ? { ...header, value: redactHeaderValue(lowerKey, header.value) }
++      : header;
++  });
++
++/**
++ * Return a shallow copy of a transaction with sensitive request/response
++ * header values redacted.
++ */
++export const redactTransaction = (transaction: Transaction): Transaction => ({
++  ...transaction,
++  request: {
++    ...transaction.request,
++    headers: redactHeaders(transaction.request.headers)
++  },
++  response: {
++    ...transaction.response,
++    headers: redactHeaders(transaction.response.headers)
++  }
++});
++
++/**
++ * Mutate the given in-flight request in place, redacting sensitive header
++ * values. The input is expected to be a clone (e.g. via CloneObject) so the
++ * underlying transaction reference held elsewhere stays unchanged.
++ */
++export const redactInFlightRequestInPlace = (
++  inflightRequest: InFlightRequest
++): InFlightRequest => {
++  if (inflightRequest.request?.headers) {
++    inflightRequest.request.headers = redactHeaders(
++      inflightRequest.request.headers
++    );
++  }
++
++  return inflightRequest;
++};
++
+ /**
+  * Transform http headers objects to Mockoon's Header key value object
+  *
+diff --git a/packages/commons/src/models/server.model.ts b/packages/commons/src/models/server.model.ts
+index 7e900ea..1defe2a 100644
+--- a/packages/commons/src/models/server.model.ts
++++ b/packages/commons/src/models/server.model.ts
+@@ -119,6 +119,20 @@ export type ServerOptions = {
+    */
+   enableAdminApi: boolean;
+ 
++  /**
++   * Bearer token required to access the admin API.
++   * If omitted, the runtime generates one automatically.
++   */
++  adminApiAuthToken?: string;
++
++  /**
++   * Explicit list of allowed CORS origins for the admin API (e.g. ['https://app.example.com']).
++   * - When empty/undefined, no CORS headers are emitted (default-deny browser cross-origin requests).
++   * - When a request's `Origin` header matches one of the entries, the origin is echoed back.
++   * - To explicitly opt into wildcard CORS, include `'*'` in the list.
++   */
++  adminApiCorsOrigins?: string[];
++
+   /**
+    * Disable TLS
+    */
+diff --git a/packages/commons/src/utils/utils.ts b/packages/commons/src/utils/utils.ts
+index d04eca4..5ffd463 100644
+--- a/packages/commons/src/utils/utils.ts
++++ b/packages/commons/src/utils/utils.ts
+@@ -182,6 +182,27 @@ export const generateUUID = (): string =>
+     ? window.crypto.randomUUID()
+     : require('crypto').randomUUID();
+ 
++/**
++ * Generate a cryptographically secure random token encoded in hexadecimal.
++ */
++export const generateSecureToken = (byteLength = 32): string => {
++  const effectiveByteLength = Math.max(1, Math.floor(byteLength));
++
++  const cryptoLib =
++    globalThis.crypto ?? require('crypto').webcrypto ?? undefined;
++
++  if (!cryptoLib) {
++    return require('crypto').randomBytes(effectiveByteLength).toString('hex');
++  }
++
++  const randomBytes = new Uint8Array(effectiveByteLength);
++  cryptoLib.getRandomValues(randomBytes);
++
++  return Array.from(randomBytes, (byte) =>
++    byte.toString(16).padStart(2, '0')
++  ).join('');
++};
++
+ /**
+  * Return a random integer
+  *
+@@ -514,3 +535,16 @@ export const pathMatchErrorBuilder = (error: unknown) => {
+     message: 'Invalid route path'
+   };
+ };
++
++/**
++ * Extract a Bearer token from an Authorization header.
++ * Returns undefined when the header is not a Bearer scheme or token is empty.
++ */
++export const extractBearerToken = (
++  authorizationHeader: string | undefined
++): string | undefined => {
++  const headerValue = authorizationHeader ?? '';
++  const token = headerValue.replace(/^bearer\s+/i, '').trim();
++
++  return token !== headerValue.trim() && token ? token : undefined;
++};
+diff --git a/packages/serverless/src/libs/serverless.ts b/packages/serverless/src/libs/serverless.ts
+index f8ab91f..a16f568 100644
+--- a/packages/serverless/src/libs/serverless.ts
++++ b/packages/serverless/src/libs/serverless.ts
+@@ -12,8 +12,13 @@ import {
+ import { RequestListener } from 'http';
+ import ServerlessHttp from 'serverless-http';
+ 
++type ServerlessOptions = Partial<ServerOptions> & {
++  logTransaction: boolean;
++  adminApiAuthToken?: string;
++};
++
+ export class MockoonServerless {
+-  private options: Partial<ServerOptions> & { logTransaction: boolean } = {
++  private options: ServerlessOptions = {
+     logTransaction: false,
+     disabledRoutes: [],
+     fakerOptions: {},
+@@ -37,6 +42,15 @@ export class MockoonServerless {
+       ...this.options,
+       ...options
+     };
++
++    this.options.adminApiAuthToken =
++      this.options.adminApiAuthToken ?? process.env['MOCKOON_ADMIN_API_TOKEN'];
++
++    if (this.options.enableAdminApi && !this.options.adminApiAuthToken) {
++      throw new Error(
++        'Admin API is enabled but no admin API token was provided. Set adminApiAuthToken or MOCKOON_ADMIN_API_TOKEN, or disable the admin API.'
++      );
++    }
+   }
+ 
+   /**
+@@ -47,16 +61,19 @@ export class MockoonServerless {
+    */
+   public requestListener(): RequestListener {
+     const logger = createLoggerInstance();
+-    const server = new MockoonServer(this.environment, {
++    const serverOptions = {
+       disabledRoutes: this.options.disabledRoutes,
+       fakerOptions: this.options.fakerOptions,
+       envVarsPrefix: this.options.envVarsPrefix,
+       enableAdminApi: this.options.enableAdminApi,
++      adminApiAuthToken: this.options.adminApiAuthToken,
++      adminApiCorsOrigins: this.options.adminApiCorsOrigins,
+       disableTls: this.options.disableTls,
+       maxTransactionLogs: this.options.maxTransactionLogs,
+       enableRandomLatency: this.options.enableRandomLatency,
+       enableRouteMetadataHeaders: this.options.enableRouteMetadataHeaders
+-    });
++    } as Partial<ServerOptions>;
++    const server = new MockoonServer(this.environment, serverOptions);
+     listenServerEvents(
+       server,
+       this.environment,

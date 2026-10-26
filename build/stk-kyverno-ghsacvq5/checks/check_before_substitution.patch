@@ -1,0 +1,386 @@
+diff --git a/pkg/controllers/cleanup/controller.go b/pkg/controllers/cleanup/controller.go
+index 72381470f..b87594d51 100644
+--- a/pkg/controllers/cleanup/controller.go
++++ b/pkg/controllers/cleanup/controller.go
+@@ -169,7 +169,7 @@ func (c *controller) cleanup(ctx context.Context, logger logr.Logger, policy kyv
+ 		PropagationPolicy: spec.DeletionPropagationPolicy,
+ 	}
+ 	enginectx := enginecontext.NewContext(c.jp)
+-	ctxFactory := factories.DefaultContextLoaderFactory(c.cmResolver, factories.WithGlobalContextStore(c.gctxStore))
++	ctxFactory := factories.DefaultContextLoaderFactory(c.cmResolver, factories.WithGlobalContextStore(c.gctxStore), factories.WithPolicyNamespace(policy.GetNamespace()))
+ 	loader := ctxFactory(nil, kyvernov1.Rule{})
+ 	if err := loader.Load(
+ 		ctx,
+diff --git a/pkg/engine/apicall/apiCall.go b/pkg/engine/apicall/apiCall.go
+index dc7503b73..77a105cc0 100644
+--- a/pkg/engine/apicall/apiCall.go
++++ b/pkg/engine/apicall/apiCall.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"path"
++	"regexp"
+ 
+ 	"github.com/go-logr/logr"
+ 	kyvernov1 "github.com/kyverno/kyverno/api/kyverno/v1"
+@@ -12,12 +14,15 @@ import (
+ 	"github.com/kyverno/kyverno/pkg/engine/variables"
+ )
+ 
++var namespacePathRegex = regexp.MustCompile(`^/api(s)?/.*?/namespaces/([^/]+)/?.*$`)
++
+ type apiCall struct {
+-	logger   logr.Logger
+-	jp       jmespath.Interface
+-	entry    kyvernov1.ContextEntry
+-	jsonCtx  enginecontext.Interface
+-	executor Executor
++	logger          logr.Logger
++	jp              jmespath.Interface
++	entry           kyvernov1.ContextEntry
++	jsonCtx         enginecontext.Interface
++	executor        Executor
++	policyNamespace string
+ }
+ 
+ func New(
+@@ -27,19 +32,25 @@ func New(
+ 	jsonCtx enginecontext.Interface,
+ 	client ClientInterface,
+ 	apiCallConfig APICallConfiguration,
++	policyNamespaces ...string,
+ ) (*apiCall, error) {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	if entry.APICall == nil {
+ 		return nil, fmt.Errorf("missing APICall in context entry %v", entry)
+ 	}
+ 
+-	executor := NewExecutor(logger, entry.Name, client, apiCallConfig)
++	executor := NewExecutor(logger, entry.Name, client, apiCallConfig, policyNamespace)
+ 
+ 	return &apiCall{
+-		logger:   logger,
+-		jp:       jp,
+-		entry:    entry,
+-		jsonCtx:  jsonCtx,
+-		executor: executor,
++		logger:          logger,
++		jp:              jp,
++		entry:           entry,
++		jsonCtx:         jsonCtx,
++		executor:        executor,
++		policyNamespace: policyNamespace,
+ 	}, nil
+ }
+ 
+@@ -62,6 +73,17 @@ func (a *apiCall) Fetch(ctx context.Context) ([]byte, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context entry %s %s: %v", a.entry.Name, a.entry.APICall.URLPath, err)
+ 	}
++	if a.policyNamespace != "" && call.APICall.URLPath != "" {
++		cleanPath := path.Clean(a.entry.APICall.URLPath)
++		if matches := namespacePathRegex.FindStringSubmatch(cleanPath); len(matches) > 2 {
++			if ns := matches[2]; ns != a.policyNamespace {
++				return nil, fmt.Errorf("path %s refers to namespace %s, which is different from the policy namespace %s", cleanPath, ns, a.policyNamespace)
++			}
++		} else {
++			return nil, fmt.Errorf("path %s does not contain a namespace segment, which is required for namespaced policies", cleanPath)
++		}
++	}
++
+ 	data, err := a.Execute(ctx, &call.APICall)
+ 	if err != nil {
+ 		if data == nil && a.entry.APICall.Default != nil {
+diff --git a/pkg/engine/apicall/executor.go b/pkg/engine/apicall/executor.go
+index aa3cdadbc..e305cdae9 100644
+--- a/pkg/engine/apicall/executor.go
++++ b/pkg/engine/apicall/executor.go
+@@ -22,10 +22,11 @@ type Executor interface {
+ }
+ 
+ type executor struct {
+-	logger logr.Logger
+-	name   string
+-	client ClientInterface
+-	config APICallConfiguration
++	logger          logr.Logger
++	name            string
++	client          ClientInterface
++	config          APICallConfiguration
++	policyNamespace string
+ }
+ 
+ func NewExecutor(
+@@ -33,12 +34,18 @@ func NewExecutor(
+ 	name string,
+ 	client ClientInterface,
+ 	apiCallConfig APICallConfiguration,
++	policyNamespaces ...string,
+ ) *executor {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	return &executor{
+-		logger: logger,
+-		name:   name,
+-		client: client,
+-		config: apiCallConfig,
++		logger:          logger,
++		name:            name,
++		client:          client,
++		config:          apiCallConfig,
++		policyNamespace: policyNamespace,
+ 	}
+ }
+ 
+@@ -145,7 +152,7 @@ func (a *executor) addHTTPHeaders(req *http.Request, headers []kyvernov1.HTTPHea
+ 		req.Header.Add(header.Key, header.Value)
+ 	}
+ 
+-	if req.Header.Get("Authorization") == "" {
++	if req.Header.Get("Authorization") == "" && a.policyNamespace == "" {
+ 		token := a.getToken()
+ 		if token != "" {
+ 			req.Header.Add("Authorization", "Bearer "+token)
+diff --git a/pkg/engine/context/loaders/apicall.go b/pkg/engine/context/loaders/apicall.go
+index 6f09a22bc..81b59d1c2 100644
+--- a/pkg/engine/context/loaders/apicall.go
++++ b/pkg/engine/context/loaders/apicall.go
+@@ -13,14 +13,15 @@ import (
+ )
+ 
+ type apiLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	enginectx enginecontext.Interface
+-	jp        jmespath.Interface
+-	client    engineapi.RawClient
+-	config    apicall.APICallConfiguration
+-	data      []byte
++	ctx             context.Context //nolint:containedctx
++	logger          logr.Logger
++	entry           kyvernov1.ContextEntry
++	enginectx       enginecontext.Interface
++	jp              jmespath.Interface
++	client          engineapi.RawClient
++	config          apicall.APICallConfiguration
++	data            []byte
++	policyNamespace string
+ }
+ 
+ func NewAPILoader(
+@@ -31,15 +32,21 @@ func NewAPILoader(
+ 	jp jmespath.Interface,
+ 	client engineapi.RawClient,
+ 	apiCallConfig apicall.APICallConfiguration,
++	policyNamespaces ...string,
+ ) enginecontext.Loader {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	return &apiLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		enginectx: enginectx,
+-		jp:        jp,
+-		client:    client,
+-		config:    apiCallConfig,
++		ctx:             ctx,
++		logger:          logger,
++		entry:           entry,
++		enginectx:       enginectx,
++		jp:              jp,
++		client:          client,
++		config:          apiCallConfig,
++		policyNamespace: policyNamespace,
+ 	}
+ }
+ 
+@@ -48,7 +55,7 @@ func (a *apiLoader) HasLoaded() bool {
+ }
+ 
+ func (a *apiLoader) LoadData() error {
+-	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config)
++	executor, err := apicall.New(a.logger, a.jp, a.entry, a.enginectx, a.client, a.config, a.policyNamespace)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to initiaize APICal: %w", err)
+ 	}
+diff --git a/pkg/engine/context/loaders/configmap.go b/pkg/engine/context/loaders/configmap.go
+index 7740903eb..287c0b34a 100644
+--- a/pkg/engine/context/loaders/configmap.go
++++ b/pkg/engine/context/loaders/configmap.go
+@@ -13,12 +13,13 @@ import (
+ )
+ 
+ type configMapLoader struct {
+-	ctx       context.Context //nolint:containedctx
+-	logger    logr.Logger
+-	entry     kyvernov1.ContextEntry
+-	resolver  engineapi.ConfigmapResolver
+-	enginectx enginecontext.Interface
+-	data      []byte
++	ctx             context.Context //nolint:containedctx
++	logger          logr.Logger
++	entry           kyvernov1.ContextEntry
++	resolver        engineapi.ConfigmapResolver
++	enginectx       enginecontext.Interface
++	data            []byte
++	policyNamespace string
+ }
+ 
+ func NewConfigMapLoader(
+@@ -27,13 +28,19 @@ func NewConfigMapLoader(
+ 	entry kyvernov1.ContextEntry,
+ 	resolver engineapi.ConfigmapResolver,
+ 	enginectx enginecontext.Interface,
++	policyNamespaces ...string,
+ ) enginecontext.Loader {
++	policyNamespace := ""
++	if len(policyNamespaces) > 0 {
++		policyNamespace = policyNamespaces[0]
++	}
+ 	return &configMapLoader{
+-		ctx:       ctx,
+-		logger:    logger,
+-		entry:     entry,
+-		resolver:  resolver,
+-		enginectx: enginectx,
++		ctx:             ctx,
++		logger:          logger,
++		entry:           entry,
++		resolver:        resolver,
++		enginectx:       enginectx,
++		policyNamespace: policyNamespace,
+ 	}
+ }
+ 
+@@ -73,23 +80,38 @@ func (cml *configMapLoader) fetchConfigMap() ([]byte, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.name %s: %v", entryName, cmName, err)
+ 	}
++	nameStr, ok := name.(string)
++	if !ok {
++		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.name %s: expected string, got %T", entryName, cmName, name)
++	}
+ 	namespace, err := variables.SubstituteAll(logger, cml.enginectx, cml.entry.ConfigMap.Namespace)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.namespace %s: %v", entryName, cmNamespace, err)
+ 	}
+-	if namespace == "" {
+-		namespace = "default"
++	namespaceStr, ok := namespace.(string)
++	if !ok {
++		return nil, fmt.Errorf("failed to substitute variables in context %s configMap.namespace %s: expected string, got %T", entryName, cmNamespace, namespace)
++	}
++	if namespaceStr == "" {
++		if cml.policyNamespace != "" {
++			namespaceStr = cml.policyNamespace
++		} else {
++			namespaceStr = "default"
++		}
++	}
++	if cml.policyNamespace != "" && namespaceStr != cml.policyNamespace {
++		return nil, fmt.Errorf("context entry %s: configMap namespace %q is different from policy namespace %q", entryName, namespaceStr, cml.policyNamespace)
+ 	}
+-	obj, err := cml.resolver.Get(cml.ctx, namespace.(string), name.(string))
++	obj, err := cml.resolver.Get(cml.ctx, namespaceStr, nameStr)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to get configmap %s/%s : %v", namespace, name, err)
++		return nil, fmt.Errorf("failed to get configmap %s/%s : %v", namespaceStr, nameStr, err)
+ 	}
+ 	// extract configmap data
+ 	contextData["data"] = obj.Data
+ 	contextData["metadata"] = obj.ObjectMeta
+ 	data, err := json.Marshal(contextData)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failed to unmarshal configmap %s/%s: %v", namespace, name, err)
++		return nil, fmt.Errorf("failed to unmarshal configmap %s/%s: %v", namespaceStr, nameStr, err)
+ 	}
+ 	return data, nil
+ }
+diff --git a/pkg/engine/factories/contextloaderfactory.go b/pkg/engine/factories/contextloaderfactory.go
+index 606422303..e60c192db 100644
+--- a/pkg/engine/factories/contextloaderfactory.go
++++ b/pkg/engine/factories/contextloaderfactory.go
+@@ -18,7 +18,7 @@ import (
+ type ContextLoaderFactoryOptions func(*contextLoader)
+ 
+ func DefaultContextLoaderFactory(cmResolver engineapi.ConfigmapResolver, opts ...ContextLoaderFactoryOptions) engineapi.ContextLoaderFactory {
+-	return func(_ kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
++	return func(policy kyvernov1.PolicyInterface, _ kyvernov1.Rule) engineapi.ContextLoader {
+ 		cl := &contextLoader{
+ 			logger:     logging.WithName("DefaultContextLoaderFactory"),
+ 			cmResolver: cmResolver,
+@@ -26,6 +26,13 @@ func DefaultContextLoaderFactory(cmResolver engineapi.ConfigmapResolver, opts ..
+ 		for _, o := range opts {
+ 			o(cl)
+ 		}
++		if policy != nil {
++			if policy.IsNamespaced() {
++				cl.policyNamespace = policy.GetNamespace()
++			} else {
++				cl.policyNamespace = ""
++			}
++		}
+ 		return cl
+ 	}
+ }
+@@ -42,6 +49,14 @@ func WithAPICallConfig(config apicall.APICallConfiguration) ContextLoaderFactory
+ 	}
+ }
+ 
++// WithPolicyNamespace scopes context lookups to a namespace when the loader is created
++// without a namespaced policy object.
++func WithPolicyNamespace(namespace string) ContextLoaderFactoryOptions {
++	return func(cl *contextLoader) {
++		cl.policyNamespace = namespace
++	}
++}
++
+ func WithGlobalContextStore(gctxStore loaders.Store) ContextLoaderFactoryOptions {
+ 	return func(cl *contextLoader) {
+ 		cl.gctxStore = gctxStore
+@@ -49,11 +64,12 @@ func WithGlobalContextStore(gctxStore loaders.Store) ContextLoaderFactoryOptions
+ }
+ 
+ type contextLoader struct {
+-	logger        logr.Logger
+-	cmResolver    engineapi.ConfigmapResolver
+-	initializers  []engineapi.Initializer
+-	apiCallConfig apicall.APICallConfiguration
+-	gctxStore     loaders.Store
++	logger          logr.Logger
++	cmResolver      engineapi.ConfigmapResolver
++	initializers    []engineapi.Initializer
++	apiCallConfig   apicall.APICallConfiguration
++	gctxStore       loaders.Store
++	policyNamespace string
+ }
+ 
+ func (l *contextLoader) Load(
+@@ -100,7 +116,7 @@ func (l *contextLoader) newLoader(
+ ) (enginecontext.DeferredLoader, error) {
+ 	if entry.ConfigMap != nil {
+ 		if l.cmResolver != nil {
+-			ldr := loaders.NewConfigMapLoader(ctx, l.logger, entry, l.cmResolver, jsonContext)
++			ldr := loaders.NewConfigMapLoader(ctx, l.logger, entry, l.cmResolver, jsonContext, l.policyNamespace)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of ConfigMap context entry", "name", entry.Name)
+@@ -108,7 +124,7 @@ func (l *contextLoader) newLoader(
+ 		}
+ 	} else if entry.APICall != nil {
+ 		if client != nil {
+-			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig)
++			ldr := loaders.NewAPILoader(ctx, l.logger, entry, jsonContext, jp, client, l.apiCallConfig, l.policyNamespace)
+ 			return enginecontext.NewDeferredLoader(entry.Name, ldr, l.logger)
+ 		} else {
+ 			l.logger.V(3).Info("disabled loading of APICall context entry", "name", entry.Name)

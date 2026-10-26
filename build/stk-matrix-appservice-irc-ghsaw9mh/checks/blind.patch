@@ -1,0 +1,188 @@
+diff -ruN a/src/bridge/MatrixHandler.ts b/src/bridge/MatrixHandler.ts
+--- a/src/bridge/MatrixHandler.ts	2026-10-26 02:46:59.000000000 +0000
++++ b/src/bridge/MatrixHandler.ts	2026-10-26 05:21:32.264352463 +0000
+@@ -37,6 +37,14 @@
+ const MSG_PMS_DISABLED = "[Bridge] Sorry, PMs are disabled on this bridge.";
+ const MSG_PMS_DISABLED_FEDERATION = "[Bridge] Sorry, PMs are disabled on this bridge over federation.";
+ 
++/*
++ * A homeserver's clock may drift slightly from ours. A timestamp further in the future than
++ * this is not a time the bridge can base an access decision on.
++ */
++const MAX_HOMESERVER_CLOCK_SKEW_MS = 5 * 60 * 1000;
++/* Upper bound on remembered member arrivals, so a busy bridge cannot grow without limit. */
++const MAX_TRACKED_MEMBER_JOINS = 8192;
++
+ export interface MatrixHandlerConfig {
+     /* Number of events to store in memory for use in replies. */
+     eventCacheSize: number;
+@@ -116,6 +124,13 @@
+     body: string;
+     sender: string;
+     timestamp: number;
++    /** The room this event belongs to, as the bridge itself learned it. */
++    roomId?: string;
++    /**
++     * When the bridge itself saw this event. Only set for events the bridge relayed; entries
++     * built from a fetched response carry no observation of their own.
++     */
++    observedAt?: number;
+ }
+ 
+ export class MatrixHandler {
+@@ -134,6 +149,18 @@
+     private memberTracker?: StateLookup;
+     private adminHandler: AdminRoomHandler;
+     private config: MatrixHandlerConfig = DEFAULTS;
++    /*
++     * When the bridge itself observed each member arrive, keyed by `roomId/userId`. Homeserver
++     * timestamps are never recorded here: they are the homeserver's account of an arrival, not
++     * the bridge's observation of one.
++     */
++    private readonly observedMemberJoins: Map<string, number> = new Map();
++    /*
++     * A member whose arrival the bridge never saw is treated as having been present since the
++     * bridge started observing the room. Events the bridge relayed after that point can safely
++     * quote them; older material cannot, because nothing observed supports the entitlement.
++     */
++    private readonly bridgeStartTs = Date.now();
+ 
+     constructor(
+         private readonly ircBridge: IrcBridge,
+@@ -386,10 +413,61 @@
+      * @param {Object} event : The Matrix member event.
+      */
+     private _onMemberEvent(req: BridgeRequest, event: OnMemberEventData) {
++        const memberKey = `${event.room_id}/${event.state_key}`;
++        if (event.content.membership === "join") {
++            // The moment the bridge processed the join is the only arrival evidence it owns.
++            this.observedMemberJoins.delete(memberKey);
++            this.observedMemberJoins.set(memberKey, Date.now());
++            while (this.observedMemberJoins.size > MAX_TRACKED_MEMBER_JOINS) {
++                const oldest = this.observedMemberJoins.keys().next().value;
++                if (oldest === undefined) {
++                    break;
++                }
++                this.observedMemberJoins.delete(oldest);
++            }
++        }
++        else {
++            this.observedMemberJoins.delete(memberKey);
++        }
+         this.memberTracker?.onEvent(event);
+     }
+ 
+     /**
++     * Whether `event`'s sender may be shown text taken from another event.
++     *
++     * The answer comes from what the bridge observed itself. For a target the bridge relayed,
++     * its own relay time is compared with the sender's observed arrival. For a target fetched
++     * from the homeserver, the response must name this room, carry a usable time, and that time
++     * must not be in the future; only then is the sender's observed arrival compared with it.
++     */
++    private senderMaySeeTextFrom(event: MatrixMessageEvent, target: {
++        roomId?: string;
++        timestamp?: number;
++        observedAt?: number;
++    }): boolean {
++        // An answer naming another room, or no room, is not the event that was asked for.
++        if (target.roomId !== event.room_id) {
++            return false;
++        }
++        const observedJoinTs = this.observedMemberJoins.get(
++            `${event.room_id}/${event.sender}`
++        ) ?? this.bridgeStartTs;
++        if (target.observedAt !== undefined) {
++            // The bridge relayed the target itself and knows when that happened.
++            return observedJoinTs <= target.observedAt;
++        }
++        if (typeof target.timestamp !== "number" || !Number.isFinite(target.timestamp)) {
++            // Without a usable time there is nothing on which to base an access decision.
++            return false;
++        }
++        if (target.timestamp - Date.now() > MAX_HOMESERVER_CLOCK_SKEW_MS) {
++            // The target has not happened yet as far as the bridge's clock is concerned.
++            return false;
++        }
++        return observedJoinTs <= target.timestamp;
++    }
++
++    /**
+      * Called when a Matrix user tries to invite another user into a PM
+      * @param {Object} event : The Matrix invite event.
+      * @param {MatrixUser} inviter : The inviter (sender).
+@@ -1049,8 +1127,8 @@
+         // special handling for edits
+         if (event.content["m.relates_to"]?.rel_type === "m.replace") {
+             const originalEventId = event.content["m.relates_to"].event_id;
+-            let originalBody = this.getCachedEvent(event.room_id, originalEventId)?.body;
+-            if (!originalBody) {
++            let original = this.getCachedEvent(event.room_id, originalEventId);
++            if (!original) {
+                 try {
+                     // FIXME: this will return the new event rather than the original one
+                     // to actually see the original content we'd need to use whatever
+@@ -1067,15 +1145,22 @@
+                     const eventContent = await intent.getEvent(
+                         event.room_id, originalEventId
+                     );
+-                    originalBody = eventContent.content.body;
++                    original = {
++                        body: eventContent.content.body,
++                        sender: eventContent.sender,
++                        roomId: eventContent.room_id,
++                        timestamp: eventContent.origin_server_ts,
++                    };
+                 }
+                 catch (_err) {
+                     req.log.warn("Couldn't find an event being edited, using fallback text");
+                 }
+             }
+             const newBody = event.content["m.new_content"]?.body;
+-            if (originalBody && newBody) {
+-                const diff = messageDiff(originalBody, newBody);
++            // Diffing against the original reveals its words, so only do it when the editor
++            // is entitled to see the original.
++            if (original?.body && newBody && this.senderMaySeeTextFrom(event, original)) {
++                const diff = messageDiff(original.body, newBody);
+                 if (diff) {
+                     ircAction.text = diff;
+                 }
+@@ -1094,7 +1179,10 @@
+             {
+                 body: cacheBody,
+                 sender: event.sender,
++                roomId: event.room_id,
+                 timestamp: event.origin_server_ts,
++                // The bridge processed this event itself just now.
++                observedAt: Date.now(),
+             },
+         );
+ 
+@@ -1300,7 +1388,12 @@
+                 else {
+                     rplSource = eventContent.content.body;
+                 }
+-                cachedEvent = {sender: rplName, body: rplSource, timestamp: eventContent.origin_server_ts};
++                cachedEvent = {
++                    sender: rplName,
++                    body: rplSource,
++                    roomId: eventContent.room_id,
++                    timestamp: eventContent.origin_server_ts,
++                };
+                 this.cacheEvent(eventContent.room_id, eventContent.event_id, cachedEvent);
+             }
+             catch (err) {
+@@ -1317,6 +1410,12 @@
+             rplSource = cachedEvent.body;
+         }
+ 
++        if (!this.senderMaySeeTextFrom(event, cachedEvent)) {
++            // The replier's entitlement to the referenced event cannot be established, so relay
++            // their own message without quoting any text from it.
++            rplSource = "";
++        }
++
+         // Get the first non-blank line from the source.
+         const lines = rplSource.split('\n').filter((line) => !/^\s*$/.test(line))
+         if (lines.length > 0) {

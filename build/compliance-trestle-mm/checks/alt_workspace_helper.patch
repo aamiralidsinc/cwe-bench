@@ -1,0 +1,177 @@
+--- a/trestle/common/file_utils.py
++++ b/trestle/common/file_utils.py
+@@ -105,6 +105,11 @@
+     # Task must not self-interfere with a project
+     pathed_name = pathlib.Path(name)
+ 
++    if pathed_name.is_absolute() or name.startswith('/') or '..' in pathed_name.parts:
++        logger.warning('Directory name must stay a plain relative name inside the workspace.')
++        return False
++
++
+     root_path = pathed_name.parts[0]
+     if root_path in const.MODEL_TYPE_TO_MODEL_DIR.values():
+         logger.warning('Task name is the same as an OSCAL schema name.')
+@@ -121,6 +126,15 @@
+         return False
+     return True
+ 
++
++def within_workspace(candidate: pathlib.Path, trestle_root: pathlib.Path) -> bool:
++    """Whether the resolved candidate path lies inside the resolved workspace."""
++    try:
++        candidate.resolve().relative_to(trestle_root.resolve())
++    except ValueError:
++        return False
++    return True
++
+ 
+ def make_hidden_file(file_path: pathlib.Path) -> None:
+     """Make hidden file."""
+--- a/trestle/common/model_utils.py
++++ b/trestle/common/model_utils.py
+@@ -275,6 +275,8 @@
+             This does not validate the model.  If you want to validate the model use the load_validate utilities.
+         """
+         root_model_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model_class)  # type: ignore
++        if not trestle.common.file_utils.within_workspace(root_model_path, trestle_root):
++            raise TrestleError(f'Model name would leave the workspace: {model_name}')
+         if file_content_type is None:
+             file_content_type = FileContentType.path_to_content_type(root_model_path)
+         if not FileContentType.is_readable_file(file_content_type):
+@@ -308,6 +310,8 @@
+         If the model directory does not exist, it is created.
+         """
+         root_model_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model)
++        if not trestle.common.file_utils.within_workspace(root_model_path, trestle_root):
++            raise TrestleError(f'Model name would leave the workspace: {model_name}')
+         full_model_path = root_model_path.with_suffix(FileContentType.to_file_extension(file_content_type))
+         if not full_model_path.parent.exists():
+             full_model_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -513,7 +517,9 @@
+         If file_content_type is given it will not inspect the file system or confirm the needed path and file exists.
+         """
+         if file_content_type is None:
+             root_model_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model_class)
++            if not trestle.common.file_utils.within_workspace(root_model_path, trestle_root):
++                raise TrestleError(f'Model name would leave the workspace: {model_name}')
+             file_content_type = FileContentType.path_to_content_type(root_model_path)
+             if not FileContentType.is_readable_file(file_content_type):
+                 return None
+@@ -521,4 +527,6 @@
+             return root_model_path.with_suffix(FileContentType.to_file_extension(file_content_type))
+
+         root_path = ModelUtils._root_path_for_top_level_model(trestle_root, model_name, model_class)
++        if not trestle.common.file_utils.within_workspace(root_path, trestle_root):
++            raise TrestleError(f'Model name would leave the workspace: {model_name}')
+         return root_path.with_suffix(FileContentType.to_file_extension(file_content_type))
+--- a/trestle/core/commands/author/component.py
++++ b/trestle/core/commands/author/component.py
+@@ -68,10 +68,14 @@
+         try:
+             log.set_log_level_from_args(args)
+ 
++            markdown_path = args.trestle_root / args.output
++            if not file_utils.within_workspace(markdown_path, args.trestle_root):
++                raise TrestleError('output name would leave the workspace')
++
+             if args.force_overwrite:
+                 try:
+                     logger.info(f'Overwriting the content in {args.output} folder.')
+-                    clear_folder(pathlib.Path(args.output))
++                    clear_folder(markdown_path)
+                 except TrestleError as e:  # pragma: no cover
+                     raise TrestleError(f'Unable to overwrite contents in {args.output} folder: {e}')
+ 
+@@ -100,16 +104,22 @@
+ 
+         if component_name:
+             # The named subfolder sits under the output folder the command already chose.
++            comp_path = md_path / component_name
++            if not file_utils.within_workspace(comp_path, trestle_root):
++                raise TrestleError('output name would leave the workspace')
+             rc = CmdReturnCodes.SUCCESS.value
+             for component in as_list(component_def.components):
+-                rc = self.component_generate_by_name(context, component, md_path / component_name)
++                rc = self.component_generate_by_name(context, component, comp_path)
+                 if rc != CmdReturnCodes.SUCCESS.value:
+                     break
+             return rc
+ 
+         rc = CmdReturnCodes.SUCCESS.value
+         for component in as_list(component_def.components):
+-            rc = self.component_generate_by_name(context, component, md_path / component.title)
++            comp_path = md_path / component.title
++            if not file_utils.within_workspace(comp_path, trestle_root):
++                raise TrestleError('component title would leave the workspace')
++            rc = self.component_generate_by_name(context, component, comp_path)
+             if rc != CmdReturnCodes.SUCCESS.value:
+                 break
+         return rc
+--- a/trestle/core/commands/author/docs.py
++++ b/trestle/core/commands/author/docs.py
+@@ -171,6 +171,8 @@
+ 
+         if sample_name:
+             candidate_task = self.task_path / sample_name
++            if not file_utils.within_workspace(candidate_task, self.trestle_root):
++                raise TrestleError("sample name would leave the workspace")
+             candidate_task.parent.mkdir(exist_ok=True, parents=True)
+             shutil.copy(str(template_file), str(candidate_task))
+             logger.info(f'Sample document created for task {self.task_name} at {self.rel_dir(candidate_task)}')
+--- a/trestle/core/commands/author/folders.py
++++ b/trestle/core/commands/author/folders.py
+@@ -417,6 +417,8 @@
+             if not _sample_folder_name_allowed(sample_name):
+                 raise TrestleError(f'{sample_name} is not an allowed sample folder name')
+             sample_path = self.task_path / sample_name
++            if not file_utils.within_workspace(sample_path, self.trestle_root):
++                raise TrestleError("sample name would leave the workspace")
+             shutil.copytree(str(self.template_dir), str(sample_path))
+             logger.info(f'Sample folder created for task {self.task_name} at {self.rel_dir(sample_path)}')
+             return CmdReturnCodes.SUCCESS.value
+--- a/trestle/core/commands/author/headers.py
++++ b/trestle/core/commands/author/headers.py
+@@ -315,7 +315,7 @@
+                 # Files in the root directory must be exclused
+                 if path.is_file():
+                     continue
+-                if not file_utils.is_directory_name_allowed(path):
++                if not file_utils.is_directory_name_allowed(str(relative_path)):
+                     continue
+                 if str(relative_path).rstrip('/') in const.MODEL_DIR_LIST:
+                     continue
+--- a/trestle/core/commands/create.py
++++ b/trestle/core/commands/create.py
+@@ -93,6 +93,8 @@
+         plural_path = ModelUtils.model_type_to_model_dir(model_alias)
+ 
+         desired_model_dir = trestle_root / plural_path / args.output
++        if not file_utils.within_workspace(desired_model_dir, trestle_root):
++            raise err.TrestleError("output name would leave the workspace")
+ 
+         desired_model_path = desired_model_dir / (model_alias + '.' + args.extension)
+ 
+--- a/trestle/core/commands/import_.py
++++ b/trestle/core/commands/import_.py
+@@ -85,6 +85,8 @@
+             desired_model_path = desired_model_path.with_suffix(
+                 FileContentType.to_file_extension(content_type)
+             ).resolve()
++            if not file_utils.within_workspace(desired_model_path, trestle_root):
++                raise TrestleError("output name would leave the workspace")
+ 
+             if desired_model_path.exists():
+                 logger.warning(f'Cannot import because file to be imported here: {desired_model_path} already exists.')
+--- a/trestle/core/commands/replicate.py
++++ b/trestle/core/commands/replicate.py
+@@ -90,6 +90,9 @@
+             trestle_root / plural_path / args.output / (model_alias + FileContentType.to_file_extension(content_type))
+         )
+ 
++        if not file_utils.within_workspace(rep_model_path, trestle_root):
++            raise TrestleError("output name would leave the workspace")
++
+         if rep_model_path.exists():
+             raise TrestleError(f'OSCAL file to be replicated here: {rep_model_path} exists.')
+ 

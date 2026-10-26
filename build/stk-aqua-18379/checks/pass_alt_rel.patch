@@ -1,0 +1,111 @@
+diff --git a/pkg/unarchive/archives.go b/pkg/unarchive/archives.go
+index 2008985..7a95cc4 100644
+--- a/pkg/unarchive/archives.go
++++ b/pkg/unarchive/archives.go
+@@ -2,6 +2,7 @@ package unarchive
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"log/slog"
+@@ -15,6 +16,12 @@ import (
+ 	"github.com/suzuki-shunsuke/slog-error/slogerr"
+ )
+ 
++var (
++	errEscapeDest         = errors.New("the file path escapes the extraction directory")
++	errSymlinkEscapeDest  = errors.New("the symlink target escapes the extraction directory")
++	errHardlinkEscapeDest = errors.New("the hard link target escapes the extraction directory")
++)
++
+ type handler struct {
+ 	fs       afero.Fs
+ 	dest     string
+@@ -24,6 +31,9 @@ type handler struct {
+ 
+ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
+ 	dstPath := filepath.Join(h.dest, h.normalizePath(f.NameInArchive))
++	if !h.withinDest(dstPath) {
++		return fmt.Errorf("%w: %s", errEscapeDest, f.NameInArchive)
++	}
+ 	parentDir := filepath.Dir(dstPath)
+ 	if err := osfile.MkdirAll(h.fs, parentDir); err != nil {
+ 		slogerr.WithError(h.logger, err).Warn("create a directory")
+@@ -40,16 +50,9 @@ func (h *handler) HandleFile(_ context.Context, f archives.FileInfo) error {
+ 
+ 	if f.LinkTarget != "" {
+ 		if f.Mode()&os.ModeSymlink != 0 {
+-			if err := os.Symlink(f.LinkTarget, dstPath); err != nil {
+-				slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", f.LinkTarget, "link_dest", dstPath)
+-				return nil
+-			}
+-			return nil
+-		}
+-		if err := os.Link(filepath.Join(h.dest, h.normalizePath(f.LinkTarget)), dstPath); err != nil {
+-			slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", f.LinkTarget, "link_dest", dstPath)
++			return h.handleSymlink(dstPath, f.LinkTarget)
+ 		}
+-		return nil
++		return h.handleHardlink(dstPath, f.LinkTarget)
+ 	}
+ 
+ 	reader, err := f.Open()
+@@ -84,6 +87,56 @@ func (h *handler) Unarchive(ctx context.Context, _ *slog.Logger, src *File) erro
+ 	return nil
+ }
+ 
++// handleSymlink creates a symlink at dstPath pointing to target. It returns an
++// error if the target resolves outside h.dest, because such a symlink could be
++// followed by a later file entry with the same path to write outside the
++// extraction directory.
++func (h *handler) handleSymlink(dstPath, target string) error {
++	if !h.symlinkTargetWithinDest(dstPath, target) {
++		return fmt.Errorf("%w: %s -> %s", errSymlinkEscapeDest, dstPath, target)
++	}
++	if err := os.Symlink(target, dstPath); err != nil {
++		slogerr.WithError(h.logger, err).Warn("create a symlink", "link_target", target, "link_dest", dstPath)
++	}
++	return nil
++}
++
++// handleHardlink creates a hard link at dstPath to target, which is named
++// relative to the extraction directory. It returns an error if the link target
++// is outside h.dest.
++func (h *handler) handleHardlink(dstPath, target string) error {
++	oldPath := filepath.Join(h.dest, h.normalizePath(target))
++	if !h.withinDest(oldPath) {
++		return fmt.Errorf("%w: %s -> %s", errHardlinkEscapeDest, dstPath, target)
++	}
++	if err := os.Link(oldPath, dstPath); err != nil {
++		slogerr.WithError(h.logger, err).Warn("create a hard link", "link_target", target, "link_dest", dstPath)
++	}
++	return nil
++}
++
++// symlinkTargetWithinDest reports whether a symlink created at linkPath with the
++// given target resolves to a path inside h.dest. A relative target is resolved
++// against the directory containing the symlink, matching how the OS dereferences
++// it.
++func (h *handler) symlinkTargetWithinDest(linkPath, target string) bool {
++	resolved := target
++	if !filepath.IsAbs(resolved) {
++		resolved = filepath.Join(filepath.Dir(linkPath), target)
++	}
++	return h.withinDest(resolved)
++}
++
++// withinDest reports whether the cleaned path is h.dest itself or located inside
++// it.
++func (h *handler) withinDest(p string) bool {
++	rel, err := filepath.Rel(h.dest, filepath.Clean(p))
++	if err != nil {
++		return false
++	}
++	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
++}
++
+ func (h *handler) normalizePath(nameInArchive string) string {
+ 	slashCount := strings.Count(nameInArchive, "/")
+ 	backSlashCount := strings.Count(nameInArchive, "\\")

@@ -1,0 +1,180 @@
+diff --git a/pkg/fuzz/execute.go b/pkg/fuzz/execute.go
+index edb48d09..77c139df 100644
+--- a/pkg/fuzz/execute.go
++++ b/pkg/fuzz/execute.go
+@@ -246,7 +246,12 @@ func (rule *Rule) evaluateVarsWithInteractsh(data map[string]interface{}, intera
+ 					}
+ 				}
+ 			}
+-			// Evaluate the replaced data
++			// Only template text that carried an interactsh marker is rendered
++			// again. A value that the replacement did not touch is runtime data
++			// and is kept as-is.
++			if got == value {
++				continue
++			}
+ 			evaluatedData, err := expressions.Evaluate(got, data)
+ 			if err == nil {
+ 				// Update the data if there is a change after evaluation
+diff --git a/pkg/fuzz/parts.go b/pkg/fuzz/parts.go
+index 1b0835fa..cc608c48 100644
+--- a/pkg/fuzz/parts.go
++++ b/pkg/fuzz/parts.go
+@@ -194,8 +194,12 @@ func (rule *Rule) executeEvaluate(input *ExecuteRuleInput, _, value, payload str
+ 	values := generators.MergeMaps(rule.options.Variables.GetAll(), map[string]interface{}{
+ 		"value": value,
+ 	}, rule.options.Options.Vars.AsMap(), input.Values)
+-	firstpass, _ := expressions.Evaluate(payload, values)
+-	interactData, interactshURLs := rule.options.Interactsh.Replace(firstpass, interactshURLs)
++
++	// Authored interactsh markers are allocated before rendering so helper
++	// expressions around the generated URL still work; the payload itself is
++	// then rendered exactly once. Values coming from input.Values are data and
++	// are not evaluated again as template text.
++	interactData, interactshURLs := rule.options.Interactsh.Replace(payload, interactshURLs)
+ 	evaluated, _ := expressions.Evaluate(interactData, values)
+ 	replaced := rule.executeRuleTypes(input, value, evaluated)
+ 	return replaced, interactshURLs
+diff --git a/pkg/protocols/common/replacer/replacer.go b/pkg/protocols/common/replacer/replacer.go
+index c95086b3..c7ef3d22 100644
+--- a/pkg/protocols/common/replacer/replacer.go
++++ b/pkg/protocols/common/replacer/replacer.go
+@@ -3,21 +3,82 @@ package replacer
+ import (
+ 	"strings"
+ 
+-	"github.com/projectdiscovery/fasttemplate"
+-
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/marker"
+ 	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+ )
+ 
+ // Replace replaces placeholders in template with values on the fly.
++//
++// Substitution happens in a single pass over the input template: an inserted
++// value is emitted as data and is never scanned again for placeholders. Both
++// marker forms are understood during that same pass.
+ func Replace(template string, values map[string]interface{}) string {
+ 	valuesMap := make(map[string]interface{}, len(values))
+ 	for k, v := range values {
+ 		valuesMap[k] = types.ToString(v)
+ 	}
+-	replaced := fasttemplate.ExecuteStringStd(template, marker.ParenthesisOpen, marker.ParenthesisClose, valuesMap)
+-	final := fasttemplate.ExecuteStringStd(replaced, marker.General, marker.General, valuesMap)
+-	return final
++	return replaceSinglePass(template, marker.ParenthesisOpen, marker.ParenthesisClose, marker.General, valuesMap)
++}
++
++// replaceSinglePass scans the template once from left to right and substitutes
++// both marker forms as it goes. When a marker's key is unknown the opening
++// marker is emitted literally and scanning continues after it, so a marker of
++// the other form nested inside an unknown one is still substituted.
++func replaceSinglePass(template, open, close, general string, values map[string]interface{}) string {
++	if template == "" || len(values) == 0 {
++		return template
++	}
++	var builder strings.Builder
++	builder.Grow(len(template))
++
++	for index := 0; index < len(template); {
++		rest := template[index:]
++		openIndex := strings.Index(rest, open)
++		generalIndex := strings.Index(rest, general)
++
++		switch {
++		case openIndex < 0 && generalIndex < 0:
++			builder.WriteString(rest)
++			index = len(template)
++		case openIndex >= 0 && (generalIndex < 0 || openIndex <= generalIndex):
++			builder.WriteString(rest[:openIndex])
++			index += openIndex
++			keyStart := index + len(open)
++			keyEnd := strings.Index(template[keyStart:], close)
++			if keyEnd < 0 {
++				builder.WriteString(open)
++				index += len(open)
++				continue
++			}
++			keyEnd += keyStart
++			if value, ok := values[template[keyStart:keyEnd]]; ok {
++				builder.WriteString(types.ToString(value))
++				index = keyEnd + len(close)
++			} else {
++				builder.WriteString(open)
++				index += len(open)
++			}
++		default:
++			builder.WriteString(rest[:generalIndex])
++			index += generalIndex
++			keyStart := index + len(general)
++			keyEnd := strings.Index(template[keyStart:], general)
++			if keyEnd < 0 {
++				builder.WriteString(general)
++				index += len(general)
++				continue
++			}
++			keyEnd += keyStart
++			if value, ok := values[template[keyStart:keyEnd]]; ok {
++				builder.WriteString(types.ToString(value))
++				index = keyEnd + len(general)
++			} else {
++				builder.WriteString(general)
++				index += len(general)
++			}
++		}
++	}
++	return builder.String()
+ }
+ 
+ // Replace replaces one placeholder in template with one value on the fly.
+diff --git a/pkg/protocols/common/variables/variables.go b/pkg/protocols/common/variables/variables.go
+index 76bcacd9..831b64a3 100644
+--- a/pkg/protocols/common/variables/variables.go
++++ b/pkg/protocols/common/variables/variables.go
+@@ -80,10 +80,18 @@ func (variables *Variable) Evaluate(values map[string]interface{}) map[string]in
+ 			combined[key] = sliceValue
+ 			return
+ 		}
+-		valueString := types.ToString(value)
++		// A value supplied by the caller (runtime, payload or option data) has
++		// precedence over the declared variable. If it is not the declared
++		// template text itself it is data: it is used as-is and is not
++		// evaluated again as template text.
+ 		if existingValue, ok := combined[key]; ok {
+-			valueString = types.ToString(existingValue)
++			if types.ToString(existingValue) != types.ToString(value) {
++				result[key] = existingValue
++				combined[key] = existingValue
++				return
++			}
+ 		}
++		valueString := types.ToString(value)
+ 		evaluated := evaluateVariableValueWithMap(valueString, combined)
+ 		result[key] = evaluated
+ 		combined[key] = evaluated
+@@ -114,10 +122,23 @@ func (variables *Variable) EvaluateWithInteractsh(values map[string]interface{},
+ 			combined[key] = sliceValue
+ 			return
+ 		}
+-		valueString := types.ToString(value)
++		// A value supplied by the caller (runtime, payload or option data) has
++		// precedence over the declared variable. If it is not the declared
++		// template text itself it is data: interactsh markers in it are still
++		// allocated (that is a source-level effect), but the result is not
++		// evaluated again as template text.
+ 		if existingValue, ok := combined[key]; ok {
+-			valueString = types.ToString(existingValue)
++			existingString := types.ToString(existingValue)
++			if existingString != types.ToString(value) {
++				if strings.Contains(existingString, "interactsh-url") {
++					existingString, interactURLs = interact.Replace(existingString, interactURLs)
++				}
++				result[key] = existingString
++				combined[key] = existingString
++				return
++			}
+ 		}
++		valueString := types.ToString(value)
+ 		if strings.Contains(valueString, "interactsh-url") {
+ 			valueString, interactURLs = interact.Replace(valueString, interactURLs)
+ 		}

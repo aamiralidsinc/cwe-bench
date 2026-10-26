@@ -1,0 +1,162 @@
+diff -ruN a/bbot/modules/apkpure.py b/bbot/modules/apkpure.py
+--- a/bbot/modules/apkpure.py	2026-10-26 12:14:27.853868055 +0000
++++ b/bbot/modules/apkpure.py	2026-10-26 12:24:54.069274350 +0000
+@@ -46,6 +46,13 @@
+ 
+     async def download_apk(self, app_id):
+         path = None
++        # app_id becomes a path component; refuse anything that could leave the output folder
++        if not app_id or app_id in (".", "..") or "/" in app_id or "\\" in app_id or ".." in app_id:
++            self.warning(f"Unsafe app_id, skipping: {app_id!r}")
++            return path
++        if Path(app_id).name != app_id:
++            self.warning(f"Unsafe app_id, skipping: {app_id!r}")
++            return path
+         url = f"https://d.apkpure.com/b/XAPK/{app_id}?version=latest"
+         self.helpers.mkdir(self.output_dir / app_id)
+         response = await self.helpers.request(url, allow_redirects=True)
+diff -ruN a/bbot/modules/internal/unarchive.py b/bbot/modules/internal/unarchive.py
+--- a/bbot/modules/internal/unarchive.py	2026-10-26 12:14:27.857868051 +0000
++++ b/bbot/modules/internal/unarchive.py	2026-10-26 12:33:39.984784108 +0000
+@@ -1,4 +1,6 @@
+-from pathlib import Path
++import tarfile
++import zipfile
++from pathlib import Path, PurePosixPath
+ from bbot.modules.internal.base import BaseInternalModule
+ from bbot.core.helpers.libmagic import get_magic_info, get_compression
+ 
+@@ -65,19 +67,103 @@
+         else:
+             output_dir.rmdir()
+ 
+-    async def extract_file(self, path, output_dir):
++    @staticmethod
++    def _inside(path, root):
++        try:
++            return Path(path).resolve().is_relative_to(Path(root).resolve())
++        except (OSError, RuntimeError):
++            return False
++
++    @staticmethod
++    def _name_is_safe(name):
++        pure = PurePosixPath(name)
++        if not name or pure.is_absolute():
++            return False
++        if ".." in pure.parts:
++            return False
++        return True
++
++    @staticmethod
++    def _link_is_safe(member_name, link_target, root, root_relative):
++        if not link_target:
++            return False
++        target = PurePosixPath(link_target)
++        if target.is_absolute():
++            return False
++        if root_relative:
++            base = Path(root)
++        else:
++            base = (Path(root) / PurePosixPath(member_name)).parent
++        resolved = base / target
++        try:
++            return Path(resolved).resolve().is_relative_to(Path(root).resolve())
++        except (OSError, RuntimeError):
++            return False
++
++    async def _check_archive_safe(self, path, compression_format, root):
++        """Refuse an archive whose members could land outside ``root``."""
++        path = Path(path)
++        try:
++            if compression_format in ("tar", "bzip2", "xz", "gzip"):
++                with tarfile.open(path) as archive:
++                    members = archive.getmembers()
++                for member in members:
++                    if not self._name_is_safe(member.name):
++                        self.warning(f"Archive {path} contains an unsafe member: {member.name!r}")
++                        return False
++                    if member.issym() or member.islnk():
++                        self.warning(f"Archive {path} contains a link entry: {member.name!r}")
++                        return False
++            elif compression_format == "zip":
++                with zipfile.ZipFile(path) as archive:
++                    for info in archive.infolist():
++                        if not self._name_is_safe(info.filename):
++                            self.warning(f"Archive {path} contains an unsafe member: {info.filename!r}")
++                            return False
++                        file_type = (info.external_attr >> 16) & 0o170000
++                        if file_type == 0o120000:
++                            self.warning(f"Archive {path} contains a link entry: {info.filename!r}")
++                            return False
++            elif compression_format == "7z":
++                result = await self.run_process(["7z", "l", "-slt", str(path)])
++                current = None
++                for line in result.stdout.splitlines():
++                    if line.startswith("Path = "):
++                        current = line.split("= ", 1)[1]
++                        if current != str(path) and not self._name_is_safe(current):
++                            self.warning(f"Archive {path} contains an unsafe member: {current!r}")
++                            return False
++                    elif line.startswith("Symbolic Link = ") and current:
++                        target = line.split("= ", 1)[1]
++                        if not self._link_is_safe(current, target, root, False):
++                            self.warning(f"Archive {path} contains a link escaping its destination: {current!r}")
++                            return False
++        except Exception as e:
++            self.warning(f"Unable to verify archive {path}: {type(e).__name__}: {e}")
++            return False
++        return True
++
++    async def extract_file(self, path, output_dir, root=None):
++        if root is None:
++            root = output_dir
++        # the destination itself must live inside the extraction root
++        if not self._inside(output_dir, root):
++            self.warning(f"Refusing to extract {path} outside {root}")
++            return False
+         extension, mime_type, description, confidence = get_magic_info(path)
+         compression_format = get_compression(mime_type)
+         cmd_list = self.compression_methods.get(compression_format, [])
+         if cmd_list:
+             if not output_dir.exists():
+                 self.helpers.mkdir(output_dir)
++            if not await self._check_archive_safe(path, compression_format, root):
++                return False
+             command = [s.format(filename=path, extract_dir=output_dir) for s in cmd_list]
+             try:
+                 await self.run_process(command, check=True)
+                 for item in output_dir.iterdir():
+                     if item.is_file():
+-                        await self.extract_file(item, output_dir / item.stem)
++                        await self.extract_file(item, output_dir / item.stem, root=root)
+             except Exception as e:
+                 self.warning(f"Error extracting {path}. Error: {e}")
+                 return False
+diff -ruN a/bbot/modules/postman_download.py b/bbot/modules/postman_download.py
+--- a/bbot/modules/postman_download.py	2026-10-26 12:14:27.865868044 +0000
++++ b/bbot/modules/postman_download.py	2026-10-26 12:24:54.957273519 +0000
+@@ -55,12 +55,24 @@
+                     context=f"{{module}} downloaded postman workspace at {repo_url} to {{event.type}}: {workspace_path}",
+                 )
+ 
++    @staticmethod
++    def _safe_name(name):
++        if not name or name in (".", "..") or "/" in name or "\\" in name:
++            return False
++        return Path(name).name == name
++
+     def save_workspace(self, workspace, environments, collections):
+         zip_path = None
+         # Create a folder for the workspace
+         name = workspace["name"]
+         id = workspace["id"]
++        if not self._safe_name(name):
++            self.warning(f"Unsafe workspace name, skipping: {name!r}")
++            return None
+         folder = self.output_dir / name
++        if not folder.resolve().is_relative_to(self.output_dir.resolve()):
++            self.warning(f"Unsafe workspace name, skipping: {name!r}")
++            return None
+         self.helpers.mkdir(folder)
+         zip_path = folder / f"{id}.zip"
+ 

@@ -1,0 +1,193 @@
+diff --git a/src/assertions/path-confinement.ts b/src/assertions/path-confinement.ts
+new file mode 100644
+index 0000000..d0d3ee5
+--- /dev/null
++++ b/src/assertions/path-confinement.ts
+@@ -0,0 +1,49 @@
++/**
++ * Path confinement helpers for snapshot file I/O.
++ * @module path-confinement
++ */
++
++import * as fs from 'node:fs';
++import * as path from 'node:path';
++
++/** True when `target` is `root` itself or lies below it. */
++export function isWithin(root: string, target: string): boolean {
++  const rel = path.relative(root, target);
++  return (
++    rel === '' ||
++    (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
++  );
++}
++
++/**
++ * Resolve the nearest existing ancestor so that links along the way are
++ * followed even when the final entry does not exist yet.
++ */
++function realPathLoose(target: string): string {
++  let probe = path.resolve(target);
++  const tail: string[] = [];
++  while (!fs.existsSync(probe)) {
++    const parent = path.dirname(probe);
++    if (parent === probe) break;
++    tail.unshift(path.basename(probe));
++    probe = parent;
++  }
++  try {
++    probe = fs.realpathSync(probe);
++  } catch {
++    return path.resolve(target);
++  }
++  return tail.length > 0 ? path.join(probe, ...tail) : probe;
++}
++
++/**
++ * Return `candidate` resolved against `root` when the result, after links are
++ * followed, stays inside `root`; otherwise return null.
++ */
++export function confineToRoot(root: string, candidate: string): string | null {
++  const absRoot = path.resolve(root);
++  const absTarget = path.resolve(absRoot, candidate);
++  if (!isWithin(absRoot, absTarget)) return null;
++  if (!isWithin(realPathLoose(absRoot), realPathLoose(absTarget))) return null;
++  return absTarget;
++}
+diff --git a/src/assertions/snapshot-environment.ts b/src/assertions/snapshot-environment.ts
+index c1ff2e6..b2842ba 100644
+--- a/src/assertions/snapshot-environment.ts
++++ b/src/assertions/snapshot-environment.ts
+@@ -6,6 +6,8 @@
+ import * as fs from 'node:fs';
+ import * as path from 'node:path';
+ 
++import { confineToRoot } from './path-confinement.js';
++
+ /**
+  * Interface for snapshot file I/O operations.
+  * Allows different environments (Node, browser, etc.) to provide
+@@ -56,16 +58,17 @@ export class NodeSnapshotEnvironment implements SnapshotEnvironment {
+ 
+   async readSnapshotFile(filepath: string): Promise<string> {
+     try {
+-      return fs.readFileSync(filepath, 'utf-8');
++      return fs.readFileSync(this.confinedTarget(filepath), 'utf-8');
+     } catch {
+       return '';
+     }
+   }
+ 
+   async saveSnapshotFile(filepath: string, content: string): Promise<void> {
+-    const dir = path.dirname(filepath);
++    const target = this.confinedTarget(filepath);
++    const dir = path.dirname(target);
+     await this.prepareDirectory(dir);
+-    fs.writeFileSync(filepath, content, 'utf-8');
++    fs.writeFileSync(target, content, 'utf-8');
+   }
+ 
+   resolveSnapshotPath(testPath: string): string {
+@@ -78,16 +81,34 @@ export class NodeSnapshotEnvironment implements SnapshotEnvironment {
+   }
+ 
+   async removeSnapshotFile(filepath: string): Promise<void> {
++    const target = this.confinedTarget(filepath);
+     try {
+-      fs.unlinkSync(filepath);
++      fs.unlinkSync(target);
+     } catch {
+       // File may not exist, ignore
+     }
+   }
+ 
+   async prepareDirectory(dirPath: string): Promise<void> {
+-    if (!fs.existsSync(dirPath)) {
+-      fs.mkdirSync(dirPath, { recursive: true });
++    const target = this.confinedTarget(dirPath);
++    if (!fs.existsSync(target)) {
++      fs.mkdirSync(target, { recursive: true });
++    }
++  }
++
++  /**
++   * Resolve a filepath and, when the environment was given an absolute
++   * snapshot directory, refuse anything that resolves outside it.
++   */
++  private confinedTarget(filepath: string): string {
++    const target = path.resolve(filepath);
++    if (!path.isAbsolute(this.snapshotDir)) return target;
++    const confined = confineToRoot(this.snapshotDir, target);
++    if (confined === null) {
++      throw new Error(
++        `Snapshot file path must be within the snapshot directory: ${filepath}`,
++      );
+     }
++    return confined;
+   }
+ }
+diff --git a/src/assertions/snapshots.ts b/src/assertions/snapshots.ts
+index 5f4ddae..5e48f57 100644
+--- a/src/assertions/snapshots.ts
++++ b/src/assertions/snapshots.ts
+@@ -6,6 +6,8 @@
+ import * as fs from 'node:fs';
+ import * as path from 'node:path';
+ 
++import { confineToRoot } from './path-confinement.js';
++
+ /**
+  * Configuration for the serialize function's pretty-formatting behavior.
+  */
+@@ -729,19 +731,31 @@ export function matchInlineSnapshot(
+  * - If the file doesn't exist and update mode is active, create it.
+  * - If mismatch and update mode is 'all', overwrite the file.
+  */
+-export function matchFileSnapshot(actual: unknown, filePath: string): void {
++export function matchFileSnapshot(
++  actual: unknown,
++  filePath: string,
++  projectRoot?: string,
++): void {
++  const root = projectRoot ?? process.cwd();
++  const resolved = confineToRoot(root, filePath);
++  if (resolved === null) {
++    throw new Error(
++      `File snapshot path must be within the project directory: ${filePath}`,
++    );
++  }
++
+   const serialized = serialize(actual);
+   const mode = resolveUpdateMode();
+-  const fileExists = fs.existsSync(filePath);
++  const fileExists = fs.existsSync(resolved);
+ 
+   if (!fileExists) {
+     if (mode === 'all' || mode === 'new') {
+       // Create the file
+-      const dir = path.dirname(filePath);
++      const dir = path.dirname(resolved);
+       if (!fs.existsSync(dir)) {
+         fs.mkdirSync(dir, { recursive: true });
+       }
+-      fs.writeFileSync(filePath, serialized, 'utf-8');
++      fs.writeFileSync(resolved, serialized, 'utf-8');
+       return;
+     }
+     throw new Error(
+@@ -750,14 +764,14 @@ export function matchFileSnapshot(actual: unknown, filePath: string): void {
+     );
+   }
+ 
+-  const stored = fs.readFileSync(filePath, 'utf-8');
++  const stored = fs.readFileSync(resolved, 'utf-8');
+   if (serialized === stored) {
+     return; // match
+   }
+ 
+   // Mismatch
+   if (mode === 'all') {
+-    fs.writeFileSync(filePath, serialized, 'utf-8');
++    fs.writeFileSync(resolved, serialized, 'utf-8');
+     return;
+   }
+ 

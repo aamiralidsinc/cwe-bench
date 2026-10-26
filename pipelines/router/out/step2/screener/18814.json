@@ -1,0 +1,69 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "deepseek-flash[1m]",
+  "entry_id": "18814",
+  "advisory_ids": ["GHSA-Q7HV-XX6H-Q2X8", "CVE-2026-26287"],
+  "repo": "external-secrets/external-secrets",
+  "pinned_commit": "b90e4e7ebc8c189cf71be838121701fedde064ca",
+  "fix_commits": ["25aa09275861e3ed6fc5d2a1a60b9ac3df4a93ba"],
+  "trust_decision": {
+    "summary": "The webhook generator decides which Kubernetes Secrets it may read: a Secret named by spec.secrets[] or spec.auth.ntlm is readable only while the shared webhook.Webhook carries EnforceLabels=true, but Generate arms that flag and then overwrites the whole struct, so getStoreSecret's label gate is off and any Secret in the referencing namespace can be read into the webhook template and sent to the tenant's URL.",
+    "evidence": ["generators/v1/webhook/webhook.go:40-43", "providers/v1/webhook/pkg/webhook/webhook.go:52", "providers/v1/webhook/pkg/webhook/webhook.go:71-79", "providers/v1/webhook/pkg/webhook/webhook.go:182-197", "fix.diff:217-221"]
+  },
+  "landing_point": {
+    "where": "generators/v1/webhook/webhook.go:40",
+    "why": "The summary says 'label enforcement bypass in webhook generator'; line 40 is the only place in the generator that arms label enforcement, and the reset three lines later disarms it."
+  },
+  "fix_sites": [
+    {"where": "generators/v1/webhook/webhook.go:40-43", "entry_point": "ExternalSecret spec.dataFrom[].sourceRef.generatorRef (pkg/controllers/externalsecret/externalsecret_controller_secret.go:90-91) and PushSecret spec.selector.generatorRef (pkg/controllers/pushsecret/pushsecret_controller.go:494) resolving a generators.external-secrets.io/v1alpha1 Webhook; published fix moves the struct reset above the EnforceLabels/ClusterScoped assignments (fix.diff:217-221)", "module_kind": "generator module, separate go.mod (generators/v1/webhook) consuming the webhook provider module"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "providers/v1/webhook/pkg/webhook/webhook.go:52"},
+  "O3_reason_to_dismiss": "The label gate is an opt-in bool on the shared provider-module Webhook (zero value = no check) and the provider path already arms it correctly (providers/v1/webhook/webhook.go:75), so a solver can argue the generator's reset ordering is generator-local state hygiene and the shared low-level API needs no change.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The per-call reset of the process-wide shared generator instance must survive: one Webhook generator object is registered once and reused by every ExternalSecret and PushSecret reconcile, so deleting line 43 to keep EnforceLabels would let a reconcile inherit a previous call's Namespace/Kube/HTTP client (cross-namespace read) and stale generator state.",
+    "where": "generators/v1/webhook/webhook.go:41-43; pkg/register/generators.go:54; runtime/esutils/resolvers/generator.go:77; cmd/controller/root.go:353"
+  },
+  "O6_input_shapes": ["spec.secrets[].secretRef (template data secrets)", "spec.auth.ntlm.usernameSecret and spec.auth.ntlm.passwordSecret (auth secrets, read via the same getStoreSecret)"],
+  "O7_producer": {"kind": "handler", "where": "generators/v1/webhook/webhook.go:39-43", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "providers/v1/webhook/pkg/webhook/webhook.go:340-364", "sibling": "a second auth protocol (or any inline secret read in ReqAddAuth) that reads its credential Secret without going through getStoreSecret", "why_realistic": "the file explicitly invites new auth methods ('add additional auth methods here', providers/v1/webhook/pkg/webhook/webhook.go:401) and the NTLM branch is already a second route to getStoreSecret that a solver fixing only getTemplatedSecrets would miss"},
+    {"where": "providers/v1/webhook/pkg/webhook/webhook.go:409-427", "sibling": "caProvider Secret/ConfigMap read through esutils.FetchCACertFromSource, which never consults EnforceLabels", "why_realistic": "caProvider is documented as a peer of secrets[] in the same spec (apis/generators/v1alpha1/types_webhook.go:97-122) yet uses a different read helper, so a maintainer adding a label-gated read there is a plausible omission"},
+    {"where": "generators/v1/webhook/webhook.go:39-56", "sibling": "a sibling webhook-family generator under generators/v1/ that constructs webhook.Webhook and repeats the reset-after-flags order", "why_realistic": "pkg/register/generators.go:38-55 registers a flat list of near-identical generators copied from each other, so a maintainer cloning the webhook generator is realistic"}
+  ],
+  "O9_family": "authorization/label-enforcement bypass caused by incorrect initialization order (CWE-696); the security flag is set and then zeroed by a struct reset before the guarded read",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.5 in generators/v1/webhook/go.mod:3 (1.25.1 in apis/runtime); multi-module tree with local replace directives to ../../../apis, ../../../providers/v1/webhook and ../../../runtime (generators/v1/webhook/go.mod:101-105); module deps fetched, no vendor dir",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "generators/v1/webhook/webhook_test.go:164 TestWebhookGetSecret is table-driven over httptest servers but calls Generate with a nil kube client and no spec.secrets (:226), so it never exercises the label gate; providers/v1/webhook/webhook_test.go and webhook_auth_test.go:124-178 use a controller-runtime fake client and seed a Secret already labelled external-secrets.io/type=webhook (:130-136), i.e. the provider path only; no test asserts the missing-label error."
+  },
+  "O11_fix_minutes": 5,
+  "O12_red_flags": ["single_site", "protection_documented_without_exceptions"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "generators/v1/webhook/webhook.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Delete the 'w.wh = webhook.Webhook{}' reset at generators/v1/webhook/webhook.go:43 because it looks like the line that erases EnforceLabels, keeping the flag but losing per-call isolation of the shared generator singleton."
+  },
+  "out_of_scope_notes": [
+    "The same shared singleton is mutated without locking (pkg/register/generators.go:54; runtime/esutils/resolvers/generator.go:77), so even after the published reorder concurrently reconciled ExternalSecrets/PushSecrets can interleave and zero EnforceLabels or swap Namespace mid-read; a local per-call webhook.Webhook is the robust fix and the advisory does not address it.",
+    "The caProvider/caBundle Secret/ConfigMap read (providers/v1/webhook/pkg/webhook/webhook.go:409-427) bypasses the label gate, but its content is only used as TLS roots and never sent to the webhook, so it is outside this advisory's exfiltration property.",
+    "The rest of the published fix is go.mod Go-version bumps across ~50 modules (fix.diff:5-716); build metadata, not source."
+  ],
+  "unverified": [
+    "Repo size in MB and file count not measured (no shell access in this session).",
+    "The advisory body text was not available; only the one-line summary was screened.",
+    "No build or test was run; buildability is read from go.mod, local replace directives and existing test files.",
+    "O8 present_in_latest: no uncovered routes were found, so no latest-code check was possible or needed (inputs also report no latest release).",
+    "Recall risk judged low only from the 2026-10-06 publication date and the narrow commit; no external write-up lookup was done."
+  ]
+}

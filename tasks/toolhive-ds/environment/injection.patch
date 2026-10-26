@@ -1,0 +1,126 @@
+diff --git a/pkg/api/v1/workloads.go b/pkg/api/v1/workloads.go
+index 595631890..33c868db0 100644
+--- a/pkg/api/v1/workloads.go
++++ b/pkg/api/v1/workloads.go
+@@ -116,6 +116,8 @@ func WorkloadRouter(
+ 
+ 	r.With(stdTimeout).Get("/", apierrors.ErrorHandler(routes.listWorkloads))
+ 	r.With(longTimeout).Post("/", apierrors.ErrorHandler(routes.createWorkload))
++	// Literal /import is registered before the /{name} wildcard.
++	r.With(longTimeout).Post("/import", apierrors.ErrorHandler(routes.importWorkloads))
+ 	r.With(stdTimeout).Post("/stop", apierrors.ErrorHandler(routes.stopWorkloadsBulk))
+ 	r.With(stdTimeout).Post("/restart", apierrors.ErrorHandler(routes.restartWorkloadsBulk))
+ 	r.With(stdTimeout).Post("/delete", apierrors.ErrorHandler(routes.deleteWorkloadsBulk))
+diff --git a/pkg/api/v1/workloads_import.go b/pkg/api/v1/workloads_import.go
+new file mode 100644
+index 000000000..f6bd5880f
+--- /dev/null
++++ b/pkg/api/v1/workloads_import.go
+@@ -0,0 +1,107 @@
++// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++package v1
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++
++	"github.com/stacklok/toolhive-core/httperr"
++
++	"github.com/stacklok/toolhive/pkg/runner"
++	wt "github.com/stacklok/toolhive/pkg/workloads/types"
++)
++
++// importWorkloadsRequest carries workload definitions that were exported
++// earlier (for example with the export command or the export endpoint).
++type importWorkloadsRequest struct {
++	// Definitions is the list of exported run configurations to start.
++	Definitions []json.RawMessage `json:"definitions"`
++}
++
++// importWorkloadsResponse reports the workloads that were started.
++type importWorkloadsResponse struct {
++	// Started is the list of workload names that were started.
++	Started []string `json:"started"`
++}
++
++// importWorkloads
++//
++//	@Summary		Import and start workloads from exported definitions
++//	@Description	Start one or more workloads from run configurations that were exported earlier.
++//	@Tags			workloads
++//	@Accept			json
++//	@Produce		json
++//	@Param			request	body		importWorkloadsRequest	true	"Exported workload definitions"
++//	@Success		201		{object}	importWorkloadsResponse
++//	@Failure		400		{string}	string	"Bad Request"
++//	@Router			/api/v1beta/workloads/import [post]
++func (s *WorkloadRoutes) importWorkloads(w http.ResponseWriter, r *http.Request) error {
++	ctx := r.Context()
++
++	var req importWorkloadsRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		return httperr.WithCode(
++			fmt.Errorf("failed to decode request: %w", err),
++			http.StatusBadRequest,
++		)
++	}
++	if len(req.Definitions) == 0 {
++		return httperr.WithCode(
++			fmt.Errorf("at least one definition is required"),
++			http.StatusBadRequest,
++		)
++	}
++
++	started := make([]string, 0, len(req.Definitions))
++	for i, raw := range req.Definitions {
++		runConfig, err := runner.ReadJSON(bytes.NewReader(raw))
++		if err != nil {
++			return httperr.WithCode(
++				fmt.Errorf("invalid definition %d: %w", i, err),
++				http.StatusBadRequest,
++			)
++		}
++		if err := wt.ValidateWorkloadName(runConfig.Name); err != nil {
++			return err
++		}
++		if err := s.workloadService.ImportWorkloadFromDefinition(ctx, runConfig); err != nil {
++			return err
++		}
++		started = append(started, runConfig.Name)
++	}
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusCreated)
++	return json.NewEncoder(w).Encode(importWorkloadsResponse{Started: started})
++}
++
++// ImportWorkloadFromDefinition starts a workload from an already materialised
++// run configuration, such as one produced by exporting a workload.
++func (s *WorkloadService) ImportWorkloadFromDefinition(ctx context.Context, runConfig *runner.RunConfig) error {
++	if runConfig == nil {
++		return httperr.WithCode(
++			fmt.Errorf("definition is required"),
++			http.StatusBadRequest,
++		)
++	}
++
++	if runConfig.ContainerName == "" || runConfig.BaseName == "" {
++		runConfig.WithContainerName()
++	}
++	runConfig.WithStandardLabels()
++
++	if err := runner.EagerCheckCreateServer(ctx, runConfig); err != nil {
++		return fmt.Errorf("server creation blocked by policy: %w", err)
++	}
++
++	if err := runConfig.SaveState(ctx); err != nil {
++		return fmt.Errorf("failed to save workload config: %w", err)
++	}
++
++	return s.workloadManager.RunWorkloadDetached(ctx, runConfig)
++}

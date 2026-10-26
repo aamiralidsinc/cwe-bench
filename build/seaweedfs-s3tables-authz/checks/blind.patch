@@ -1,0 +1,1266 @@
+diff -ruN a/weed/s3api/iceberg/commit_helpers.go b/weed/s3api/iceberg/commit_helpers.go
+--- a/weed/s3api/iceberg/commit_helpers.go	2026-10-17 21:32:24.945618262 +0000
++++ b/weed/s3api/iceberg/commit_helpers.go	2026-10-17 21:41:11.797269074 +0000
+@@ -178,7 +178,7 @@
+ 	}
+ 	createErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(ctx, mgrClient, "CreateTable", createReq, nil, input.identityName)
++		return s.tablesManager.ExecuteAs(ctx, mgrClient, "CreateTable", createReq, nil, input.identityName, nil)
+ 	})
+ 	if createErr != nil {
+ 		if cleanupErr := s.deleteMetadataFile(ctx, metadataBucket, metadataPath, metadataFileName); cleanupErr != nil {
+@@ -212,3 +212,8 @@
+ 		Metadata:         newMetadata,
+ 	}, nil
+ }
++
++func isS3TablesAccessDenied(err error) bool {
++	var tableErr *s3tables.S3TablesError
++	return errors.As(err, &tableErr) && tableErr.Type == s3tables.ErrCodeAccessDenied
++}
+diff -ruN a/weed/s3api/iceberg/handlers_commit.go b/weed/s3api/iceberg/handlers_commit.go
+--- a/weed/s3api/iceberg/handlers_commit.go	2026-10-17 21:32:24.945618262 +0000
++++ b/weed/s3api/iceberg/handlers_commit.go	2026-10-17 21:41:11.797269074 +0000
+@@ -79,10 +79,21 @@
+ 
+ 		err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 			mgrClient := s3tables.NewManagerClient(client)
+-			return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName)
++			return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 		})
+ 		if err != nil {
+ 			if isS3TablesNotFound(err) {
++				// Create-on-commit: authorize the create before reading
++				// stage-create state or writing any metadata file.
++				if authErr := s.authorizeTableWrite(r.Context(), "CreateTable", &s3tables.CreateTableRequest{
++					TableBucketARN: bucketARN,
++					Namespace:      namespace,
++					Name:           tableName,
++					Format:         "ICEBERG",
++				}, identityName, s3_constants.GetIdentityFromContext(r)); authErr != nil {
++					writeError(w, authErr.status, authErr.errType, authErr.message)
++					return
++				}
+ 				location := fmt.Sprintf("s3://%s/%s", bucketName, path.Join(flattenNamespacePath(namespace), tableName))
+ 				tableUUID := generatedLegacyUUID
+ 				baseMetadataVersion := 0
+@@ -188,6 +199,10 @@
+ 				writeJSON(w, http.StatusOK, result)
+ 				return
+ 			}
++			if isS3TablesAccessDenied(err) {
++				writeError(w, http.StatusForbidden, "ForbiddenException", "Access denied")
++				return
++			}
+ 			glog.V(1).Infof("Iceberg: CommitTable GetTable error: %v", err)
+ 			writeError(w, http.StatusInternalServerError, "InternalServerError", err.Error())
+ 			return
+@@ -280,6 +295,16 @@
+ 			writeError(w, http.StatusInternalServerError, "InternalServerError", "Invalid table location: "+err.Error())
+ 			return
+ 		}
++		// Authorize the update before writing the new metadata file, so a
++		// refused commit changes nothing.
++		if authErr := s.authorizeTableWrite(r.Context(), "UpdateTable", &s3tables.UpdateTableRequest{
++			TableBucketARN: bucketARN,
++			Namespace:      namespace,
++			Name:           tableName,
++		}, identityName, s3_constants.GetIdentityFromContext(r)); authErr != nil {
++			writeError(w, authErr.status, authErr.errType, authErr.message)
++			return
++		}
+ 		if err := s.saveMetadataFile(r.Context(), metadataBucket, metadataPath, metadataFileName, metadataBytes); err != nil {
+ 			writeError(w, http.StatusInternalServerError, "InternalServerError", "Failed to save metadata file: "+err.Error())
+ 			return
+@@ -302,7 +327,7 @@
+ 
+ 		err = s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 			mgrClient := s3tables.NewManagerClient(client)
+-			return s.tablesManager.Execute(r.Context(), mgrClient, "UpdateTable", updateReq, nil, identityName)
++			return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "UpdateTable", updateReq, nil, identityName, s3_constants.GetIdentityFromContext(r))
+ 		})
+ 		if err == nil {
+ 			result := CommitTableResponse{
+diff -ruN a/weed/s3api/iceberg/handlers_namespace.go b/weed/s3api/iceberg/handlers_namespace.go
+--- a/weed/s3api/iceberg/handlers_namespace.go	2026-10-17 21:32:24.945618262 +0000
++++ b/weed/s3api/iceberg/handlers_namespace.go	2026-10-17 21:40:27.405298356 +0000
+@@ -77,7 +77,7 @@
+ 
+ 	err = s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "ListNamespaces", req, &resp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "ListNamespaces", req, &resp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -129,7 +129,7 @@
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+ 		glog.V(2).Infof("Iceberg: handleCreateNamespace calling Execute with identityName=%s", identityName)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "CreateNamespace", createReq, &createResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "CreateNamespace", createReq, &createResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -173,7 +173,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetNamespace", getReq, &getResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetNamespace", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -216,7 +216,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetNamespace", getReq, &getResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetNamespace", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -253,7 +253,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "DeleteNamespace", deleteReq, nil, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "DeleteNamespace", deleteReq, nil, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+diff -ruN a/weed/s3api/iceberg/handlers_table.go b/weed/s3api/iceberg/handlers_table.go
+--- a/weed/s3api/iceberg/handlers_table.go	2026-10-17 21:32:24.945618262 +0000
++++ b/weed/s3api/iceberg/handlers_table.go	2026-10-17 21:41:11.793269076 +0000
+@@ -60,7 +60,7 @@
+ 
+ 	err = s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "ListTables", listReq, &listResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "ListTables", listReq, &listResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -201,7 +201,7 @@
+ 	var existsResp s3tables.GetTableResponse
+ 	existsErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", existsReq, &existsResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", existsReq, &existsResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 	if existsErr == nil {
+ 		// Table already registered. Return the existing definition so CTAS/IF NOT
+@@ -216,6 +216,18 @@
+ 		return
+ 	}
+ 
++	// Authorize the create before writing any metadata file, so a refused
++	// request changes nothing.
++	if authErr := s.authorizeTableWrite(r.Context(), "CreateTable", &s3tables.CreateTableRequest{
++		TableBucketARN: bucketARN,
++		Namespace:      namespace,
++		Name:           tableName,
++		Format:         "ICEBERG",
++	}, identityName, s3_constants.GetIdentityFromContext(r)); authErr != nil {
++		writeError(w, authErr.status, authErr.errType, authErr.message)
++		return
++	}
++
+ 	// Stage-create persists metadata in the internal staged area and skips S3Tables registration.
+ 	if req.StageCreate {
+ 		stagedTablePath := stageCreateStagedTablePath(namespace, tableName, tableUUID)
+@@ -259,7 +271,7 @@
+ 
+ 	err = s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "CreateTable", createReq, &createResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "CreateTable", createReq, &createResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -272,7 +284,7 @@
+ 			var getResp s3tables.GetTableResponse
+ 			getErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 				mgrClient := s3tables.NewManagerClient(client)
+-				return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName)
++				return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 			})
+ 			if getErr != nil {
+ 				writeError(w, http.StatusConflict, "AlreadyExistsException", err.Error())
+@@ -291,7 +303,7 @@
+ 			var getResp s3tables.GetTableResponse
+ 			getErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 				mgrClient := s3tables.NewManagerClient(client)
+-				return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName)
++				return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 			})
+ 			if getErr != nil {
+ 				writeError(w, http.StatusConflict, "AlreadyExistsException", err.Error())
+@@ -349,7 +361,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -446,7 +458,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", getReq, &getResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+@@ -486,7 +498,7 @@
+ 	var lookupResp s3tables.GetTableResponse
+ 	lookupErr := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "GetTable", lookupReq, &lookupResp, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "GetTable", lookupReq, &lookupResp, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 	if lookupErr == nil {
+ 		storedMetadataLocation = lookupResp.MetadataLocation
+@@ -500,7 +512,7 @@
+ 
+ 	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		mgrClient := s3tables.NewManagerClient(client)
+-		return s.tablesManager.Execute(r.Context(), mgrClient, "DeleteTable", deleteReq, nil, identityName)
++		return s.tablesManager.ExecuteAs(r.Context(), mgrClient, "DeleteTable", deleteReq, nil, identityName, s3_constants.GetIdentityFromContext(r))
+ 	})
+ 
+ 	if err != nil {
+diff -ruN a/weed/s3api/iceberg/utils.go b/weed/s3api/iceberg/utils.go
+--- a/weed/s3api/iceberg/utils.go	2026-10-17 21:32:24.945618262 +0000
++++ b/weed/s3api/iceberg/utils.go	2026-10-17 21:41:17.257265461 +0000
+@@ -1,7 +1,9 @@
+ package iceberg
+ 
+ import (
++	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"os"
+@@ -10,6 +12,7 @@
+ 
+ 	"github.com/gorilla/mux"
+ 	"github.com/seaweedfs/seaweedfs/weed/glog"
++	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+ 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+ 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+ )
+@@ -204,3 +207,32 @@
+ 	}
+ 	return properties
+ }
++
++// authorizeTableWrite asks the S3 Tables layer whether the caller may perform
++// operation on the resources named by req, before any metadata file is
++// written. It returns an error response description when the caller is
++// refused (or the target does not exist), and nil when authorized.
++func (s *Server) authorizeTableWrite(ctx context.Context, operation string, req interface{}, identityName string, identity interface{}) *icebergRequestError {
++	err := s.filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++		mgrClient := s3tables.NewManagerClient(client)
++		return s.tablesManager.AuthorizeAs(ctx, mgrClient, operation, req, identityName, identity)
++	})
++	if err == nil {
++		return nil
++	}
++	var tableErr *s3tables.S3TablesError
++	if errors.As(err, &tableErr) {
++		switch tableErr.Type {
++		case s3tables.ErrCodeAccessDenied:
++			return &icebergRequestError{status: http.StatusForbidden, errType: "ForbiddenException", message: "Access denied"}
++		case s3tables.ErrCodeNoSuchNamespace:
++			return &icebergRequestError{status: http.StatusNotFound, errType: "NoSuchNamespaceException", message: "Namespace does not exist"}
++		case s3tables.ErrCodeNoSuchTable:
++			return &icebergRequestError{status: http.StatusNotFound, errType: "NoSuchTableException", message: "Table does not exist"}
++		case s3tables.ErrCodeNoSuchBucket:
++			return &icebergRequestError{status: http.StatusNotFound, errType: "NoSuchNamespaceException", message: "Catalog does not exist"}
++		}
++	}
++	glog.V(1).Infof("Iceberg: authorization check for %s failed: %v", operation, err)
++	return &icebergRequestError{status: http.StatusForbidden, errType: "ForbiddenException", message: "Access denied"}
++}
+diff -ruN a/weed/s3api/s3api_tables.go b/weed/s3api/s3api_tables.go
+--- a/weed/s3api/s3api_tables.go	2026-10-17 21:32:24.977618239 +0000
++++ b/weed/s3api/s3api_tables.go	2026-10-17 21:41:48.229244922 +0000
+@@ -683,7 +683,9 @@
+ 	return func(w http.ResponseWriter, r *http.Request) {
+ 		glog.V(2).Infof("S3Tables: authenticateS3Tables called, iam.isEnabled()=%t", s3a.iam.isEnabled())
+ 		if !s3a.iam.isEnabled() {
+-			f(w, r)
++			// No identities configured: requests carry no credentials and get
++			// the open-by-default fallback.
++			f(w, r.WithContext(s3tables.WithOpenAccess(r.Context())))
+ 			return
+ 		}
+ 
+diff -ruN a/weed/s3api/s3tables/authz.go b/weed/s3api/s3tables/authz.go
+--- a/weed/s3api/s3tables/authz.go	1970-01-01 00:00:00.000000000 +0000
++++ b/weed/s3api/s3tables/authz.go	2026-10-17 21:40:13.185307701 +0000
+@@ -0,0 +1,251 @@
++package s3tables
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"strings"
++
++	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
++)
++
++// Context keys used to describe how a request reached the handler. They are
++// unexported so only code in this package (and the explicit helpers below)
++// can set them; nothing a remote client sends can influence them.
++type trustedCallerKey struct{}
++type openAccessKey struct{}
++type authorizeOnlyKey struct{}
++
++type trustedCaller struct {
++	accountID string
++}
++
++// withTrustedCaller marks the request as coming from a trusted local tool
++// (weed shell, admin console, weed mini) acting for the named account.
++func withTrustedCaller(ctx context.Context, accountID string) context.Context {
++	return context.WithValue(ctx, trustedCallerKey{}, &trustedCaller{accountID: accountID})
++}
++
++// WithOpenAccess marks a request as served by a gateway that has no
++// identities configured. Such requests carry no credentials and get the
++// open-by-default fallback.
++func WithOpenAccess(ctx context.Context) context.Context {
++	return context.WithValue(ctx, openAccessKey{}, true)
++}
++
++func hasOpenAccess(r *http.Request) bool {
++	v, _ := r.Context().Value(openAccessKey{}).(bool)
++	return v
++}
++
++func withAuthorizeOnly(ctx context.Context) context.Context {
++	return context.WithValue(ctx, authorizeOnlyKey{}, true)
++}
++
++// isAuthorizeOnly reports whether the handler should stop right after a
++// successful authorization check without changing anything.
++func isAuthorizeOnly(r *http.Request) bool {
++	v, _ := r.Context().Value(authorizeOnlyKey{}).(bool)
++	return v
++}
++
++// caller describes who a request acts as, derived only from authentication.
++type caller struct {
++	principal     string
++	authenticated bool
++	trusted       bool
++	admin         bool
++	canOwn        bool
++	actions       []string
++	fallback      bool
++}
++
++// resolveCaller derives the caller from the authenticated identity in the
++// request context. Request headers are never consulted.
++func (h *S3TablesHandler) resolveCaller(r *http.Request) *caller {
++	if tc, ok := r.Context().Value(trustedCallerKey{}).(*trustedCaller); ok && tc != nil {
++		principal := normalizePrincipalID(tc.accountID)
++		if principal == "" {
++			principal = h.accountID
++		}
++		return &caller{
++			principal:     principal,
++			authenticated: true,
++			trusted:       true,
++			admin:         principal == s3_constants.AccountAdminId,
++			canOwn:        true,
++			fallback:      h.defaultAllow,
++		}
++	}
++
++	identity := s3_constants.GetIdentityFromContext(r)
++	identityName := s3_constants.GetIdentityNameFromContext(r)
++	if (identity == nil && identityName == "") ||
++		isAnonymousIdentity(r) ||
++		(identity == nil && identityName == s3_constants.AccountAnonymousId) {
++		// No valid credentials: never an owner or an administrator.
++		return &caller{
++			principal:     h.accountID,
++			authenticated: false,
++			actions:       withoutAdminActions(getIdentityActions(r)),
++			fallback:      h.defaultAllow || hasOpenAccess(r),
++		}
++	}
++
++	principal := h.getAccountID(r)
++	actions := getIdentityActions(r)
++	admin := false
++	for _, a := range actions {
++		if a == string(s3_constants.ACTION_ADMIN) {
++			admin = true
++			break
++		}
++	}
++	// The reserved admin/anonymous accounts can only be owned through
++	// administrative permissions, not by an identity that merely resolves to
++	// that account id (e.g. via its account, name or identity provider claims).
++	canOwn := principal != "" && (admin || !h.isReservedPrincipal(principal))
++	return &caller{
++		principal:     principal,
++		authenticated: true,
++		admin:         admin,
++		canOwn:        canOwn,
++		actions:       actions,
++		fallback:      false,
++	}
++}
++
++// isReservedPrincipal reports whether principal names one of the built-in
++// accounts (administrator, anonymous, or the handler's default account that
++// owns resources created by unauthenticated requests and local tools).
++func (h *S3TablesHandler) isReservedPrincipal(principal string) bool {
++	switch principal {
++	case s3_constants.AccountAdminId, s3_constants.AccountAnonymousId, DefaultAccountID, h.accountID:
++		return true
++	}
++	return false
++}
++
++func withoutAdminActions(actions []string) []string {
++	if len(actions) == 0 {
++		return nil
++	}
++	filtered := make([]string, 0, len(actions))
++	for _, a := range actions {
++		if a == string(s3_constants.ACTION_ADMIN) {
++			continue
++		}
++		filtered = append(filtered, a)
++	}
++	return filtered
++}
++
++// accessCheck is one resource policy evaluation used by checkAccessAny.
++type accessCheck struct {
++	owner     string
++	policy    string
++	arn       string
++	policyCtx *PolicyContext
++}
++
++// checkAccess decides whether the caller may perform operation on a resource
++// owned by owner and governed by resourcePolicy. The principal argument is
++// ignored; the caller is always derived from the authenticated request.
++func (h *S3TablesHandler) checkAccess(r *http.Request, operation, _ string, owner, resourcePolicy, resourceARN string, policyCtx *PolicyContext) bool {
++	return h.checkAccessAny(r, operation, accessCheck{owner: owner, policy: resourcePolicy, arn: resourceARN, policyCtx: policyCtx})
++}
++
++// checkAccessAny allows the operation if any of the checks allows it. For
++// callers without credentials an explicit Deny in any of the policies wins.
++func (h *S3TablesHandler) checkAccessAny(r *http.Request, operation string, checks ...accessCheck) bool {
++	c := h.resolveCaller(r)
++	if c.principal == "" {
++		return false
++	}
++	if !c.authenticated {
++		for _, chk := range checks {
++			if policyExplicitlyDenies(operation, c.principal, chk.policy, chk.arn, chk.policyCtx) {
++				return false
++			}
++		}
++	}
++	for _, chk := range checks {
++		if h.checkOne(r, c, operation, chk) {
++			return true
++		}
++	}
++	return false
++}
++
++func (h *S3TablesHandler) checkOne(r *http.Request, c *caller, operation string, chk accessCheck) bool {
++	if chk.owner == "" {
++		return false
++	}
++	if c.admin {
++		return true
++	}
++	if c.canOwn && c.principal == chk.owner {
++		return true
++	}
++	pctx := PolicyContext{}
++	if chk.policyCtx != nil {
++		pctx = *chk.policyCtx
++	}
++	pctx.IdentityActions = c.actions
++	pctx.DefaultAllow = c.fallback
++	if hasIdentityPermission(operation, &pctx) {
++		return true
++	}
++	if h.iamAllows(r, c, operation, chk.arn) {
++		return true
++	}
++	return evaluateResourcePolicy(operation, c.principal, chk.policy, chk.arn, &pctx)
++}
++
++// iamAllows consults the IAM authorizer for authenticated, non-local callers.
++func (h *S3TablesHandler) iamAllows(r *http.Request, c *caller, operation, resourceARN string) bool {
++	if !c.authenticated || c.trusted || resourceARN == "" {
++		return false
++	}
++	policyNames := getIdentityPolicyNames(r)
++	if !h.shouldUseIAM(r, c.actions, policyNames) {
++		return false
++	}
++	allowed, err := h.authorizeIAMAction(r, policyNames, operation, resourceARN)
++	return err == nil && allowed
++}
++
++// policyExplicitlyDenies reports whether a matching Deny statement exists.
++func policyExplicitlyDenies(operation, principal, resourcePolicy, resourceARN string, ctx *PolicyContext) bool {
++	if resourcePolicy == "" {
++		return false
++	}
++	fullAction := operation
++	if !strings.Contains(operation, ":") {
++		fullAction = "s3tables:" + operation
++	}
++	var policy PolicyDocument
++	if err := json.Unmarshal([]byte(resourcePolicy), &policy); err != nil {
++		// An unreadable policy cannot grant anything; treat it as denying.
++		return true
++	}
++	for _, stmt := range policy.Statement {
++		if stmt.Effect != "Deny" {
++			continue
++		}
++		if !matchesPrincipal(stmt.Principal, principal) {
++			continue
++		}
++		if !matchesAction(stmt.Action, fullAction) {
++			continue
++		}
++		if resourceARN != "" && !matchesResource(stmt.Resource, resourceARN) {
++			continue
++		}
++		if !matchesConditions(stmt.Condition, ctx) {
++			continue
++		}
++		return true
++	}
++	return false
++}
+diff -ruN a/weed/s3api/s3tables/handler.go b/weed/s3api/s3tables/handler.go
+--- a/weed/s3api/s3tables/handler.go	2026-10-17 21:32:24.989618230 +0000
++++ b/weed/s3api/s3tables/handler.go	2026-10-17 21:38:13.265385727 +0000
+@@ -226,11 +226,8 @@
+ 		}
+ 	}
+ 
+-	if accountID := r.Header.Get(s3_constants.AmzAccountId); accountID != "" {
+-		if principal := normalizePrincipalID(accountID); principal != "" {
+-			return principal
+-		}
+-	}
++	// Request headers are never used: only authentication decides who a
++	// request acts as.
+ 	return h.accountID
+ }
+ 
+diff -ruN a/weed/s3api/s3tables/handler_bucket_create.go b/weed/s3api/s3tables/handler_bucket_create.go
+--- a/weed/s3api/s3tables/handler_bucket_create.go	2026-10-17 21:32:24.989618230 +0000
++++ b/weed/s3api/s3tables/handler_bucket_create.go	2026-10-17 21:38:13.269385724 +0000
+@@ -51,7 +51,7 @@
+ 		if owner == "" {
+ 			owner = DefaultAccountID
+ 		}
+-		if !CheckPermissionWithContext("CreateTableBucket", principal, owner, "", "", &PolicyContext{
++		if !h.checkAccess(r, "CreateTableBucket", principal, owner, "", "", &PolicyContext{
+ 			IdentityActions: identityActions,
+ 			DefaultAllow:    h.defaultAllow,
+ 		}) {
+diff -ruN a/weed/s3api/s3tables/handler_bucket_get_list_delete.go b/weed/s3api/s3tables/handler_bucket_get_list_delete.go
+--- a/weed/s3api/s3tables/handler_bucket_get_list_delete.go	2026-10-17 21:32:24.989618230 +0000
++++ b/weed/s3api/s3tables/handler_bucket_get_list_delete.go	2026-10-17 21:42:46.761205916 +0000
+@@ -69,7 +69,7 @@
+ 	bucketARN := h.generateTableBucketARN(metadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("GetTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "GetTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+ 		DefaultAllow:    h.defaultAllow,
+@@ -97,16 +97,9 @@
+ 		return err
+ 	}
+ 
+-	principal := h.getAccountID(r)
++	// The listing below only includes buckets the caller may see, so there is
++	// no separate gate on the operation itself.
+ 	accountID := h.getAccountID(r)
+-	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("ListTableBuckets", principal, accountID, "", "", &PolicyContext{
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	}) {
+-		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to list table buckets")
+-		return NewAuthError("ListTableBuckets", principal, "not authorized to list table buckets")
+-	}
+ 
+ 	maxBuckets := req.MaxBuckets
+ 	if maxBuckets <= 0 {
+@@ -197,7 +190,7 @@
+ 
+ 				bucketARN := h.generateTableBucketARN(metadata.OwnerAccountID, entry.Entry.Name)
+ 				identityActions := getIdentityActions(r)
+-				if !CheckPermissionWithContext("GetTableBucket", accountID, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++				if !h.checkAccess(r, "GetTableBucket", accountID, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 					TableBucketName: entry.Entry.Name,
+ 					IdentityActions: identityActions,
+ 					DefaultAllow:    h.defaultAllow,
+@@ -300,7 +293,7 @@
+ 		bucketARN := h.generateTableBucketARN(metadata.OwnerAccountID, bucketName)
+ 		principal := h.getAccountID(r)
+ 		identityActions := getIdentityActions(r)
+-		if !CheckPermissionWithContext("DeleteTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++		if !h.checkAccess(r, "DeleteTableBucket", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 			TableBucketName: bucketName,
+ 			IdentityActions: identityActions,
+ 			DefaultAllow:    h.defaultAllow,
+diff -ruN a/weed/s3api/s3tables/handler_namespace.go b/weed/s3api/s3tables/handler_namespace.go
+--- a/weed/s3api/s3tables/handler_namespace.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/handler_namespace.go	2026-10-17 21:42:27.993218450 +0000
+@@ -51,6 +51,7 @@
+ 	var bucketPolicy string
+ 	var bucketTags map[string]string
+ 	ownerAccountID := h.getAccountID(r)
++	adoptBucketMetadata := false
+ 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+ 		data, err := h.getExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata)
+ 		if err != nil {
+@@ -66,18 +67,16 @@
+ 				if entryResp.Entry == nil || !IsTableBucketEntry(entryResp.Entry) {
+ 					return filer_pb.ErrNotFound
+ 				}
++				// The bucket has no ownership metadata yet. Do not let the
++				// caller claim it: evaluate access as if it were owned by the
++				// default account, and only persist metadata once the request
++				// has been authorized.
+ 				bucketMetadata = tableBucketMetadata{
+ 					Name:           bucketName,
+ 					CreatedAt:      time.Now(),
+-					OwnerAccountID: ownerAccountID,
+-				}
+-				metadataBytes, err := json.Marshal(&bucketMetadata)
+-				if err != nil {
+-					return fmt.Errorf("failed to marshal bucket metadata: %w", err)
+-				}
+-				if err := h.setExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata, metadataBytes); err != nil {
+-					return err
++					OwnerAccountID: h.accountID,
+ 				}
++				adoptBucketMetadata = true
+ 			} else {
+ 				return err
+ 			}
+@@ -113,7 +112,7 @@
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+ 	glog.Infof("S3Tables: CreateNamespace permission check - principal=%s, owner=%s, actions=%v", principal, bucketMetadata.OwnerAccountID, identityActions)
+-	if !CheckPermissionWithContext("CreateNamespace", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "CreateNamespace", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+@@ -125,6 +124,22 @@
+ 		return ErrAccessDenied
+ 	}
+ 
++	if adoptBucketMetadata {
++		bucketMetadata.OwnerAccountID = ownerAccountID
++		metadataBytes, err := json.Marshal(&bucketMetadata)
++		if err != nil {
++			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to marshal bucket metadata: %v", err))
++			return err
++		}
++		err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
++			return h.setExtendedAttribute(r.Context(), client, bucketPath, ExtendedKeyMetadata, metadataBytes)
++		})
++		if err != nil {
++			h.writeError(w, http.StatusInternalServerError, ErrCodeInternalError, fmt.Sprintf("failed to store bucket metadata: %v", err))
++			return err
++		}
++	}
++
+ 	namespacePath := GetNamespacePath(bucketName, namespaceName)
+ 
+ 	// Check if namespace already exists
+@@ -254,7 +269,7 @@
+ 	bucketARN := h.generateTableBucketARN(metadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("GetNamespace", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "GetNamespace", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+@@ -342,7 +357,7 @@
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("ListNamespaces", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "ListNamespaces", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		TableBucketTags: bucketTags,
+ 		IdentityActions: identityActions,
+@@ -526,7 +541,7 @@
+ 	bucketARN := h.generateTableBucketARN(metadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("DeleteNamespace", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "DeleteNamespace", principal, metadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableBucketTags: bucketTags,
+diff -ruN a/weed/s3api/s3tables/handler_policy.go b/weed/s3api/s3tables/handler_policy.go
+--- a/weed/s3api/s3tables/handler_policy.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/handler_policy.go	2026-10-17 21:45:29.437096382 +0000
+@@ -91,7 +91,7 @@
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("PutTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, "", bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "PutTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, "", bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+ 		DefaultAllow:    h.defaultAllow,
+@@ -169,7 +169,7 @@
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("GetTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, string(policy), bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "GetTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, string(policy), bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+ 		DefaultAllow:    h.defaultAllow,
+@@ -245,7 +245,7 @@
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("DeleteTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++	if !h.checkAccess(r, "DeleteTableBucketPolicy", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		IdentityActions: identityActions,
+ 		DefaultAllow:    h.defaultAllow,
+@@ -344,7 +344,7 @@
+ 	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("PutTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
++	if !h.checkAccess(r, "PutTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+@@ -452,7 +452,7 @@
+ 	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("GetTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
++	if !h.checkAccess(r, "GetTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+@@ -542,7 +542,7 @@
+ 	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespaceName+"/"+tableName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	if !CheckPermissionWithContext("DeleteTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
++	if !h.checkAccess(r, "DeleteTablePolicy", principal, metadata.OwnerAccountID, bucketPolicy, tableARN, &PolicyContext{
+ 		TableBucketName: bucketName,
+ 		Namespace:       namespaceName,
+ 		TableName:       tableName,
+@@ -639,7 +639,7 @@
+ 		resourceARN := req.ResourceARN
+ 		principal := h.getAccountID(r)
+ 		identityActions := getIdentityActions(r)
+-		if !CheckPermissionWithContext("TagResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
++		if !h.checkAccess(r, "TagResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
+ 			TableBucketName: bucketName,
+ 			TableBucketTags: bucketTags,
+ 			RequestTags:     req.Tags,
+@@ -747,19 +747,18 @@
+ 
+ 		data, err = h.getExtendedAttribute(r.Context(), client, resourcePath, extendedKey)
+ 		if err != nil {
+-			if errors.Is(err, ErrAttributeNotFound) {
+-				return nil // No tags is not an error.
++			// No tags is not an error, but the caller must still be authorized.
++			if !errors.Is(err, ErrAttributeNotFound) {
++				return err // Propagate other errors.
+ 			}
+-			return err // Propagate other errors.
+-		}
+-		if err := json.Unmarshal(data, &tags); err != nil {
++		} else if err := json.Unmarshal(data, &tags); err != nil {
+ 			return err
+ 		}
+ 
+ 		resourceARN := req.ResourceARN
+ 		principal := h.getAccountID(r)
+ 		identityActions := getIdentityActions(r)
+-		if !CheckPermissionWithContext("ListTagsForResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
++		if !h.checkAccess(r, "ListTagsForResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
+ 			TableBucketName: bucketName,
+ 			TableBucketTags: bucketTags,
+ 			ResourceTags:    tags,
+@@ -854,19 +853,18 @@
+ 
+ 		data, err = h.getExtendedAttribute(r.Context(), client, resourcePath, extendedKey)
+ 		if err != nil {
+-			if errors.Is(err, ErrAttributeNotFound) {
+-				return nil
++			// No tags is not an error, but the caller must still be authorized.
++			if !errors.Is(err, ErrAttributeNotFound) {
++				return err
+ 			}
+-			return err
+-		}
+-		if err := json.Unmarshal(data, &tags); err != nil {
++		} else if err := json.Unmarshal(data, &tags); err != nil {
+ 			return err
+ 		}
+ 
+ 		resourceARN := req.ResourceARN
+ 		principal := h.getAccountID(r)
+ 		identityActions := getIdentityActions(r)
+-		if !CheckPermissionWithContext("UntagResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
++		if !h.checkAccess(r, "UntagResource", principal, ownerAccountID, bucketPolicy, resourceARN, &PolicyContext{
+ 			TableBucketName: bucketName,
+ 			TableBucketTags: bucketTags,
+ 			TagKeys:         req.TagKeys,
+diff -ruN a/weed/s3api/s3tables/handler_table.go b/weed/s3api/s3tables/handler_table.go
+--- a/weed/s3api/s3tables/handler_table.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/handler_table.go	2026-10-17 21:47:09.137028587 +0000
+@@ -85,7 +85,6 @@
+ 	}
+ 
+ 	// Authorize table creation using policy framework (namespace + bucket policies)
+-	accountID := h.getAccountID(r)
+ 	bucketPath := GetTableBucketPath(bucketName)
+ 	namespacePolicy := ""
+ 	bucketPolicy := ""
+@@ -135,31 +134,37 @@
+ 
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	identityActions := getIdentityActions(r)
+-	nsAllowed := CheckPermissionWithContext("CreateTable", accountID, namespaceMetadata.OwnerAccountID, namespacePolicy, bucketARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		RequestTags:     req.Tags,
+-		TagKeys:         mapKeys(req.Tags),
+-		TableBucketTags: bucketTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
+-	bucketAllowed := CheckPermissionWithContext("CreateTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		RequestTags:     req.Tags,
+-		TagKeys:         mapKeys(req.Tags),
+-		TableBucketTags: bucketTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
++	allowed := h.checkAccessAny(r, "CreateTable",
++		accessCheck{owner: namespaceMetadata.OwnerAccountID, policy: namespacePolicy, arn: bucketARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			RequestTags:     req.Tags,
++			TagKeys:         mapKeys(req.Tags),
++			TableBucketTags: bucketTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++		accessCheck{owner: bucketMetadata.OwnerAccountID, policy: bucketPolicy, arn: bucketARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			RequestTags:     req.Tags,
++			TagKeys:         mapKeys(req.Tags),
++			TableBucketTags: bucketTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++	)
+ 
+-	if !nsAllowed && !bucketAllowed {
++	if !allowed {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to create table in this namespace")
+ 		return ErrAccessDenied
+ 	}
++	if isAuthorizeOnly(r) {
++		h.writeJSON(w, http.StatusOK, nil)
++		return nil
++	}
+ 
+ 	tablePath := GetTablePath(bucketName, namespaceName, tableName)
+ 
+@@ -323,7 +328,6 @@
+ 	}
+ 
+ 	// Authorize access to the table using policy framework
+-	accountID := h.getAccountID(r)
+ 	bucketPath := GetTableBucketPath(bucketName)
+ 	tablePolicy := ""
+ 	bucketPolicy := ""
+@@ -379,26 +383,28 @@
+ 	tableARN := h.generateTableARN(metadata.OwnerAccountID, bucketName, namespace+"/"+tableName)
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	identityActions := getIdentityActions(r)
+-	tableAllowed := CheckPermissionWithContext("GetTable", accountID, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespace,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
+-	bucketAllowed := CheckPermissionWithContext("GetTable", accountID, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespace,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
++	allowed := h.checkAccessAny(r, "GetTable",
++		accessCheck{owner: metadata.OwnerAccountID, policy: tablePolicy, arn: tableARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespace,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++		accessCheck{owner: bucketMetadata.OwnerAccountID, policy: bucketPolicy, arn: bucketARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespace,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++	)
+ 
+-	if !tableAllowed && !bucketAllowed {
++	if !allowed {
+ 		h.writeError(w, http.StatusNotFound, ErrCodeNoSuchTable, fmt.Sprintf("table %s not found", tableName))
+ 		return ErrAccessDenied
+ 	}
+@@ -520,21 +526,23 @@
+ 
+ 			bucketARN := h.generateTableBucketARN(bucketMeta.OwnerAccountID, bucketName)
+ 			identityActions := getIdentityActions(r)
+-			nsAllowed := CheckPermissionWithContext("ListTables", accountID, nsMeta.OwnerAccountID, namespacePolicy, bucketARN, &PolicyContext{
+-				TableBucketName: bucketName,
+-				Namespace:       namespaceName,
+-				TableBucketTags: bucketTags,
+-				IdentityActions: identityActions,
+-				DefaultAllow:    h.defaultAllow,
+-			})
+-			bucketAllowed := CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+-				TableBucketName: bucketName,
+-				Namespace:       namespaceName,
+-				TableBucketTags: bucketTags,
+-				IdentityActions: identityActions,
+-				DefaultAllow:    h.defaultAllow,
+-			})
+-			if !nsAllowed && !bucketAllowed {
++			allowed := h.checkAccessAny(r, "ListTables",
++				accessCheck{owner: nsMeta.OwnerAccountID, policy: namespacePolicy, arn: bucketARN, policyCtx: &PolicyContext{
++					TableBucketName: bucketName,
++					Namespace:       namespaceName,
++					TableBucketTags: bucketTags,
++					IdentityActions: identityActions,
++					DefaultAllow:    h.defaultAllow,
++				}},
++				accessCheck{owner: bucketMeta.OwnerAccountID, policy: bucketPolicy, arn: bucketARN, policyCtx: &PolicyContext{
++					TableBucketName: bucketName,
++					Namespace:       namespaceName,
++					TableBucketTags: bucketTags,
++					IdentityActions: identityActions,
++					DefaultAllow:    h.defaultAllow,
++				}},
++			)
++			if !allowed {
+ 				return ErrAccessDenied
+ 			}
+ 
+@@ -573,7 +581,7 @@
+ 
+ 			bucketARN := h.generateTableBucketARN(bucketMeta.OwnerAccountID, bucketName)
+ 			identityActions := getIdentityActions(r)
+-			if !CheckPermissionWithContext("ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
++			if !h.checkAccess(r, "ListTables", accountID, bucketMeta.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+ 				TableBucketName: bucketName,
+ 				TableBucketTags: bucketTags,
+ 				IdentityActions: identityActions,
+@@ -909,25 +917,27 @@
+ 	bucketARN := h.generateTableBucketARN(bucketMetadata.OwnerAccountID, bucketName)
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+-	tableAllowed := CheckPermissionWithContext("DeleteTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
+-	bucketAllowed := CheckPermissionWithContext("DeleteTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
+-	if !tableAllowed && !bucketAllowed {
++	allowed := h.checkAccessAny(r, "DeleteTable",
++		accessCheck{owner: metadata.OwnerAccountID, policy: tablePolicy, arn: tableARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++		accessCheck{owner: bucketMetadata.OwnerAccountID, policy: bucketPolicy, arn: bucketARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++	)
++	if !allowed {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to delete table")
+ 		return NewAuthError("DeleteTable", principal, "not authorized to delete table")
+ 	}
+@@ -1051,29 +1061,35 @@
+ 	principal := h.getAccountID(r)
+ 	identityActions := getIdentityActions(r)
+ 
+-	tableAllowed := CheckPermissionWithContext("UpdateTable", principal, metadata.OwnerAccountID, tablePolicy, tableARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
+-	bucketAllowed := CheckPermissionWithContext("UpdateTable", principal, bucketMetadata.OwnerAccountID, bucketPolicy, bucketARN, &PolicyContext{
+-		TableBucketName: bucketName,
+-		Namespace:       namespaceName,
+-		TableName:       tableName,
+-		TableBucketTags: bucketTags,
+-		ResourceTags:    tableTags,
+-		IdentityActions: identityActions,
+-		DefaultAllow:    h.defaultAllow,
+-	})
++	allowed := h.checkAccessAny(r, "UpdateTable",
++		accessCheck{owner: metadata.OwnerAccountID, policy: tablePolicy, arn: tableARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++		accessCheck{owner: bucketMetadata.OwnerAccountID, policy: bucketPolicy, arn: bucketARN, policyCtx: &PolicyContext{
++			TableBucketName: bucketName,
++			Namespace:       namespaceName,
++			TableName:       tableName,
++			TableBucketTags: bucketTags,
++			ResourceTags:    tableTags,
++			IdentityActions: identityActions,
++			DefaultAllow:    h.defaultAllow,
++		}},
++	)
+ 
+-	if !tableAllowed && !bucketAllowed {
++	if !allowed {
+ 		h.writeError(w, http.StatusForbidden, ErrCodeAccessDenied, "not authorized to update table")
+ 		return NewAuthError("UpdateTable", principal, "not authorized to update table")
+ 	}
++	if isAuthorizeOnly(r) {
++		h.writeJSON(w, http.StatusOK, nil)
++		return nil
++	}
+ 
+ 	// Check version token if provided
+ 	if req.VersionToken != "" && req.VersionToken != metadata.VersionToken {
+diff -ruN a/weed/s3api/s3tables/iam.go b/weed/s3api/s3tables/iam.go
+--- a/weed/s3api/s3tables/iam.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/iam.go	2026-10-17 21:43:11.381189439 +0000
+@@ -29,9 +29,13 @@
+ 	if s3_constants.GetIdentityFromContext(r) == nil {
+ 		return false
+ 	}
+-	// When default-allow is enabled, keep anonymous requests on the legacy path
+-	// to preserve zero-config behavior (IAM policies are not available for anonymous).
+-	if h.defaultAllow && isAnonymousIdentity(r) {
++	// Requests without credentials (including those served by the anonymous
++	// identity) stay on the legacy path, where they are never owners or
++	// administrators and explicit Deny statements always apply.
++	if isAnonymousIdentity(r) {
++		return false
++	}
++	if _, trusted := r.Context().Value(trustedCallerKey{}).(*trustedCaller); trusted {
+ 		return false
+ 	}
+ 	// An empty inline `identityActions` slice doesn't mean the identity has no
+@@ -211,7 +215,24 @@
+ 	return claims
+ }
+ 
++// reservedIAMContextKeys are request-context keys the IAM authorizer trusts
++// to describe the caller (for example "is_admin" bypasses policy
++// evaluation). They must never be populated from identity-provider claims.
++var reservedIAMContextKeys = map[string]bool{
++	"is_admin":         true,
++	"principal":        true,
++	"aws:PrincipalArn": true,
++}
++
+ func buildIAMRequestContext(r *http.Request, claims map[string]interface{}) map[string]interface{} {
++	filtered := make(map[string]interface{}, len(claims))
++	for k, v := range claims {
++		if reservedIAMContextKeys[k] || reservedIAMContextKeys[strings.TrimPrefix(k, "jwt:")] {
++			continue
++		}
++		filtered[k] = v
++	}
++	claims = filtered
+ 	ctx := make(map[string]interface{})
+ 	if ua := r.Header.Get("User-Agent"); ua != "" {
+ 		ctx["userAgent"] = ua
+diff -ruN a/weed/s3api/s3tables/manager.go b/weed/s3api/s3tables/manager.go
+--- a/weed/s3api/s3tables/manager.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/manager.go	2026-10-17 21:40:38.401291119 +0000
+@@ -5,6 +5,7 @@
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -53,10 +54,55 @@
+ 	}
+ 	httpReq.Header.Set("Content-Type", "application/x-amz-json-1.1")
+ 	httpReq.Header.Set("X-Amz-Target", "S3Tables."+operation)
++	// Execute is used by trusted local tools (weed shell, admin console,
++	// weed mini) that act for the account they name.
++	reqCtx := withTrustedCaller(httpReq.Context(), identity)
+ 	if identity != "" {
+-		httpReq.Header.Set(s3_constants.AmzAccountId, identity)
+-		httpReq = httpReq.WithContext(s3_constants.SetIdentityNameInContext(httpReq.Context(), identity))
++		reqCtx = s3_constants.SetIdentityNameInContext(reqCtx, identity)
+ 	}
++	httpReq = httpReq.WithContext(reqCtx)
++	recorder := httptest.NewRecorder()
++	m.handler.HandleRequest(recorder, httpReq, filerClient)
++	return decodeS3TablesHTTPResponse(recorder, resp)
++}
++
++// ExecuteAs runs an S3 Tables operation on behalf of a remote caller whose
++// identity was established by authentication (identityName and identity as
++// reported by the authenticator; both empty for requests without
++// credentials). Authorization is evaluated for that caller only.
++func (m *Manager) ExecuteAs(ctx context.Context, filerClient FilerClient, operation string, req interface{}, resp interface{}, identityName string, identity interface{}) error {
++	return m.executeAs(ctx, filerClient, operation, req, resp, identityName, identity)
++}
++
++// AuthorizeAs checks whether the remote caller may perform operation on the
++// resources named by req, without changing anything. It returns nil when the
++// operation would be authorized.
++func (m *Manager) AuthorizeAs(ctx context.Context, filerClient FilerClient, operation string, req interface{}, identityName string, identity interface{}) error {
++	switch operation {
++	case "CreateTable", "UpdateTable":
++	default:
++		return fmt.Errorf("authorize-only is not supported for %s", operation)
++	}
++	return m.executeAs(withAuthorizeOnly(ctx), filerClient, operation, req, nil, identityName, identity)
++}
++
++func (m *Manager) executeAs(ctx context.Context, filerClient FilerClient, operation string, req interface{}, resp interface{}, identityName string, identity interface{}) error {
++	body, err := json.Marshal(req)
++	if err != nil {
++		return err
++	}
++	if identityName != "" {
++		ctx = s3_constants.SetIdentityNameInContext(ctx, identityName)
++	}
++	if identity != nil {
++		ctx = s3_constants.SetIdentityInContext(ctx, identity)
++	}
++	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "/", bytes.NewReader(body))
++	if err != nil {
++		return err
++	}
++	httpReq.Header.Set("Content-Type", "application/x-amz-json-1.1")
++	httpReq.Header.Set("X-Amz-Target", "S3Tables."+operation)
+ 	recorder := httptest.NewRecorder()
+ 	m.handler.HandleRequest(recorder, httpReq, filerClient)
+ 	return decodeS3TablesHTTPResponse(recorder, resp)
+diff -ruN a/weed/s3api/s3tables/permissions.go b/weed/s3api/s3tables/permissions.go
+--- a/weed/s3api/s3tables/permissions.go	2026-10-17 21:32:24.993618227 +0000
++++ b/weed/s3api/s3tables/permissions.go	2026-10-17 21:38:06.941389800 +0000
+@@ -97,11 +97,6 @@
+ 		return false
+ 	}
+ 
+-	// Admin always has permission.
+-	if principal == s3_constants.AccountAdminId {
+-		return true
+-	}
+-
+ 	glog.V(2).Infof("S3Tables: CheckPermission operation=%s principal=%s owner=%s", operation, principal, owner)
+ 
+ 	return checkPermission(operation, principal, owner, resourcePolicy, resourceARN, ctx)
+@@ -118,6 +113,13 @@
+ 		return true
+ 	}
+ 
++	return evaluateResourcePolicy(operation, principal, resourcePolicy, resourceARN, ctx)
++}
++
++// evaluateResourcePolicy evaluates a resource policy for principal. When no
++// statement decides, ctx.DefaultAllow is used; callers must only set it for
++// requests without credentials.
++func evaluateResourcePolicy(operation, principal, resourcePolicy, resourceARN string, ctx *PolicyContext) bool {
+ 	// If no policy is provided, use default allow if enabled
+ 	if resourcePolicy == "" {
+ 		if ctx != nil && ctx.DefaultAllow {

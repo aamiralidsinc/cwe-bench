@@ -1,0 +1,175 @@
+diff --git a/core/src/main/java/org/apache/calcite/model/JsonJdbcSchema.java b/core/src/main/java/org/apache/calcite/model/JsonJdbcSchema.java
+index 99edce2..613a65d 100644
+--- a/core/src/main/java/org/apache/calcite/model/JsonJdbcSchema.java
++++ b/core/src/main/java/org/apache/calcite/model/JsonJdbcSchema.java
+@@ -34,6 +34,14 @@
+  * @see JsonRoot Description of JSON schema elements
+  */
+ public class JsonJdbcSchema extends JsonSchema {
++  /** The FQN of a {@link javax.sql.DataSource} implementation used by this
++   * schema.
++   *
++   * <p>Optional. When set, this class is used instead of the URL and driver
++   * properties.
++   */
++  public final @Nullable String dataSource;
++
+   /** The name of the JDBC driver class.
+    *
+    * <p>Optional. If not specified, uses whichever class the JDBC
+@@ -82,6 +90,7 @@ public JsonJdbcSchema(
+       @JsonProperty("path") @Nullable List<Object> path,
+       @JsonProperty("cache") @Nullable Boolean cache,
+       @JsonProperty("autoLattice") @Nullable Boolean autoLattice,
++      @JsonProperty("dataSource") @Nullable String dataSource,
+       @JsonProperty("jdbcDriver") @Nullable String jdbcDriver,
+       @JsonProperty("sqlDialectFactory") @Nullable String sqlDialectFactory,
+       @JsonProperty(value = "jdbcUrl", required = true)  String jdbcUrl,
+@@ -90,6 +99,7 @@ public JsonJdbcSchema(
+       @JsonProperty("jdbcCatalog") @Nullable String jdbcCatalog,
+       @JsonProperty("jdbcSchema") @Nullable String jdbcSchema) {
+     super(name, path, cache, autoLattice);
++    this.dataSource = dataSource;
+     this.jdbcDriver = jdbcDriver;
+     this.sqlDialectFactory = sqlDialectFactory;
+     this.jdbcUrl = requireNonNull(jdbcUrl, "jdbcUrl");
+diff --git a/core/src/main/java/org/apache/calcite/model/JsonMaterialization.java b/core/src/main/java/org/apache/calcite/model/JsonMaterialization.java
+index 55969be..5452f36 100644
+--- a/core/src/main/java/org/apache/calcite/model/JsonMaterialization.java
++++ b/core/src/main/java/org/apache/calcite/model/JsonMaterialization.java
+@@ -45,16 +45,27 @@ public class JsonMaterialization {
+ 
+   public final @Nullable List<String> viewSchemaPath;
+ 
++  /** Name of the factory class that creates the storage table for this
++   * materialization.
++   *
++   * <p>Optional. When set, the class must implement
++   * {@link org.apache.calcite.schema.TableFactory} and have a public default
++   * constructor. When absent, Calcite creates the materialization storage.
++   */
++  public final @Nullable String tableFactory;
++
+   @JsonCreator
+   public JsonMaterialization(
+       @JsonProperty("view") @Nullable String view,
+       @JsonProperty("table") @Nullable String table,
+       @JsonProperty(value = "sql", required = true) Object sql,
+-      @JsonProperty("viewSchemaPath") @Nullable List<String> viewSchemaPath) {
++      @JsonProperty("viewSchemaPath") @Nullable List<String> viewSchemaPath,
++      @JsonProperty("tableFactory") @Nullable String tableFactory) {
+     this.view = view;
+     this.table = table;
+     this.sql = requireNonNull(sql, "sql");
+     this.viewSchemaPath = viewSchemaPath;
++    this.tableFactory = tableFactory;
+   }
+ 
+   public void accept(ModelHandler handler) {
+diff --git a/core/src/main/java/org/apache/calcite/model/JsonType.java b/core/src/main/java/org/apache/calcite/model/JsonType.java
+index bc3f7fd..c2d9ef7 100644
+--- a/core/src/main/java/org/apache/calcite/model/JsonType.java
++++ b/core/src/main/java/org/apache/calcite/model/JsonType.java
+@@ -45,6 +45,15 @@ public class JsonType {
+    */
+   public final @Nullable String type;
+ 
++  /** Name of the class that provides this type.
++   *
++   * <p>Optional. When set, the class must implement
++   * {@link org.apache.calcite.rel.type.RelProtoDataType} and have a public
++   * default constructor; it takes precedence over {@link #type} and
++   * {@link #attributes}.
++   */
++  public final @Nullable String className;
++
+   /** Definition of the attributes of this type.
+    */
+   public final List<JsonTypeAttribute> attributes = new ArrayList<>();
+@@ -52,9 +61,11 @@ public class JsonType {
+   @JsonCreator
+   public JsonType(
+       @JsonProperty(value = "name", required = true) String name,
+-      @JsonProperty("type") @Nullable String type) {
++      @JsonProperty("type") @Nullable String type,
++      @JsonProperty("className") @Nullable String className) {
+     this.name = requireNonNull(name, "name");
+     this.type = type;
++    this.className = className;
+   }
+ 
+   public void accept(ModelHandler handler) {
+diff --git a/core/src/main/java/org/apache/calcite/model/ModelHandler.java b/core/src/main/java/org/apache/calcite/model/ModelHandler.java
+index 5842619..337e568 100644
+--- a/core/src/main/java/org/apache/calcite/model/ModelHandler.java
++++ b/core/src/main/java/org/apache/calcite/model/ModelHandler.java
+@@ -22,6 +22,7 @@
+ import org.apache.calcite.jdbc.CalciteSchema;
+ import org.apache.calcite.materialize.Lattice;
+ import org.apache.calcite.rel.type.RelDataType;
++import org.apache.calcite.rel.type.RelProtoDataType;
+ import org.apache.calcite.rel.type.RelDataTypeFactory;
+ import org.apache.calcite.schema.AggregateFunction;
+ import org.apache.calcite.schema.Function;
+@@ -329,11 +330,18 @@ protected Map<String, Object> operandMap(@Nullable JsonSchema jsonSchema,
+ 
+   public void visit(JsonJdbcSchema jsonSchema) {
+     final SchemaPlus parentSchema = currentMutableSchema("jdbc schema");
+-    final DataSource dataSource =
+-        JdbcSchema.dataSource(jsonSchema.jdbcUrl,
+-            jsonSchema.jdbcDriver,
+-            jsonSchema.jdbcUser,
+-            jsonSchema.jdbcPassword);
++    final DataSource dataSource;
++    if (jsonSchema.dataSource != null) {
++      dataSource =
++          AvaticaUtils.instantiatePlugin(DataSource.class,
++              jsonSchema.dataSource);
++    } else {
++      dataSource =
++          JdbcSchema.dataSource(jsonSchema.jdbcUrl,
++              jsonSchema.jdbcDriver,
++              jsonSchema.jdbcUser,
++              jsonSchema.jdbcPassword);
++    }
+     final JdbcSchema schema;
+     if (jsonSchema.sqlDialectFactory == null || jsonSchema.sqlDialectFactory.isEmpty()) {
+       schema =
+@@ -374,10 +382,19 @@ public void visit(JsonMaterialization jsonMaterialization) {
+         existing = false;
+       }
+       List<String> viewPath = calciteSchema.path(viewName);
+-      schema.add(viewName,
+-          MaterializedViewTable.create(calciteSchema,
+-              jsonMaterialization.getSql(), jsonMaterialization.viewSchemaPath, viewPath,
+-              jsonMaterialization.table, existing));
++      if (jsonMaterialization.tableFactory != null) {
++        final TableFactory tableFactory =
++            AvaticaUtils.instantiatePlugin(TableFactory.class,
++                jsonMaterialization.tableFactory);
++        final Table table =
++            tableFactory.create(schema, viewName, ImmutableMap.of(), null);
++        schema.add(viewName, table);
++      } else {
++        schema.add(viewName,
++            MaterializedViewTable.create(calciteSchema,
++                jsonMaterialization.getSql(), jsonMaterialization.viewSchemaPath, viewPath,
++                jsonMaterialization.table, existing));
++      }
+     } catch (Exception e) {
+       throw new RuntimeException("Error instantiating " + jsonMaterialization,
+           e);
+@@ -485,6 +502,13 @@ private SchemaPlus currentMutableSchema(String elementType) {
+   public void visit(final JsonType jsonType) {
+     try {
+       final SchemaPlus schema = currentMutableSchema("type");
++      if (jsonType.className != null) {
++        final RelProtoDataType proto =
++            AvaticaUtils.instantiatePlugin(RelProtoDataType.class,
++                jsonType.className);
++        schema.add(jsonType.name, proto);
++        return;
++      }
+       schema.add(jsonType.name, typeFactory -> {
+         if (jsonType.type != null) {
+           return typeFactory.createSqlType(

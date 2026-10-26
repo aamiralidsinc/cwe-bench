@@ -1,0 +1,287 @@
+diff --git a/pkg/auth/providerrefresh/daemon.go b/pkg/auth/providerrefresh/daemon.go
+index 0ee561c..ace02fa 100644
+--- a/pkg/auth/providerrefresh/daemon.go
++++ b/pkg/auth/providerrefresh/daemon.go
+@@ -77,6 +77,15 @@ func RefreshAllForCron() {
+ 	ref.refreshAll(false)
+ }
+ 
++// TriggerAllUserRefresh triggers a forced refresh for all users.
++func TriggerAllUserRefresh() {
++	if ref == nil {
++		return
++	}
++
++	ref.TriggerAllUserRefresh()
++}
++
+ func RefreshAttributes(attribs *apiv3.UserAttribute) (*apiv3.UserAttribute, error) {
+ 	if ref == nil {
+ 		return nil, errors.Errorf("refresh daemon not yet initialized")
+diff --git a/pkg/auth/providers/githubapp/github_data.go b/pkg/auth/providers/githubapp/github_data.go
+index 2dbd3cd..755eae2 100644
+--- a/pkg/auth/providers/githubapp/github_data.go
++++ b/pkg/auth/providers/githubapp/github_data.go
+@@ -119,9 +119,13 @@ func (g *gitHubAppData) listOrgs() []common.GitHubAccount {
+ func (g *gitHubAppData) listTeamsForUser(username string) []common.GitHubAccount {
+ 	var accounts []common.GitHubAccount
+ 
+-	for orgName := range g.members[username].orgs {
++	for orgName, teamNames := range g.members[username].orgs {
+ 		org := g.orgs[orgName]
+-		for teamName, team := range org.teams {
++		for _, teamName := range teamNames {
++			team, ok := org.teams[teamName]
++			if !ok {
++				continue
++			}
+ 			accounts = append(accounts, common.GitHubAccount{Name: teamName, Login: team.login, AvatarURL: org.avatarURL, ID: team.id, HTMLURL: team.htmlURL})
+ 		}
+ 	}
+diff --git a/pkg/auth/providers/githubapp/github_data_test.go b/pkg/auth/providers/githubapp/github_data_test.go
+index f93eebd..2f2c1a1 100644
+--- a/pkg/auth/providers/githubapp/github_data_test.go
++++ b/pkg/auth/providers/githubapp/github_data_test.go
+@@ -216,14 +216,9 @@ func TestGitHubAppData(t *testing.T) {
+ 	})
+ 
+ 	t.Run("teams for user", func(t *testing.T) {
++		// test-user is a member of: dev-team (example), dev-team2 (other-org), admin-team2 (other-org).
++		// test-user is NOT a member of admin-team (example) — it must not appear.
+ 		want := []common.GitHubAccount{
+-			{
+-				ID:        45678,
+-				Login:     "admin-team",
+-				Name:      "admin-team",
+-				AvatarURL: "https://example.com/avatar1.jpg",
+-				HTMLURL:   "https://example.com/org/example/team/admin-team",
+-			},
+ 			{
+ 				ID:        34579,
+ 				Login:     "admin-team2",
+@@ -253,6 +248,7 @@ func TestGitHubAppData(t *testing.T) {
+ 
+ 		assert.Equal(t, want, accounts)
+ 
++		// test-user2 is only a member of admin-team2 (other-org); dev-team2 must not appear.
+ 		want = []common.GitHubAccount{
+ 			{
+ 				ID:        34579,
+@@ -261,13 +257,6 @@ func TestGitHubAppData(t *testing.T) {
+ 				AvatarURL: "https://example.com/avatar2.jpg",
+ 				HTMLURL:   "https://example.com/org/other-org/team-dev-team2",
+ 			},
+-			{
+-				ID:        23468,
+-				Login:     "dev-team2",
+-				Name:      "dev-team2",
+-				AvatarURL: "https://example.com/avatar2.jpg",
+-				HTMLURL:   "https://example.com/org/other-org/team/dev-team2",
+-			},
+ 		}
+ 		accounts = data.listTeamsForUser("test-user2")
+ 		slices.SortFunc(accounts, func(a, b common.GitHubAccount) int {
+@@ -276,6 +265,24 @@ func TestGitHubAppData(t *testing.T) {
+ 		assert.Equal(t, want, accounts)
+ 	})
+ 
++	t.Run("non-member team is not returned", func(t *testing.T) {
++		// A user who belongs to one team in an org
++		// must not be reported as a member of other teams in that same org.
++		accounts := data.listTeamsForUser("test-user")
++		for _, a := range accounts {
++			if a.Login == "admin-team" {
++				t.Errorf("listTeamsForUser returned admin-team but test-user is not a member of it")
++			}
++		}
++
++		accounts = data.listTeamsForUser("test-user2")
++		for _, a := range accounts {
++			if a.Login == "dev-team2" {
++				t.Errorf("listTeamsForUser returned dev-team2 but test-user2 is not a member of it")
++			}
++		}
++	})
++
+ 	t.Run("list all teams", func(t *testing.T) {
+ 		want := []common.GitHubAccount{
+ 			{
+diff --git a/pkg/data/management/githubapp_refresh_users.go b/pkg/data/management/githubapp_refresh_users.go
+new file mode 100644
+index 0000000..cbade73
+--- /dev/null
++++ b/pkg/data/management/githubapp_refresh_users.go
+@@ -0,0 +1,65 @@
++package management
++
++import (
++	"context"
++	"encoding/json"
++
++	"github.com/rancher/rancher/pkg/auth/providerrefresh"
++	"github.com/rancher/rancher/pkg/auth/providers/githubapp"
++	apisv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
++	"github.com/sirupsen/logrus"
++	k8serrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++const providerRefreshRequestedAnnotation = "auth.cattle.io/provider-refresh-requested"
++
++// RefreshGitHubAppUsersOnce triggers a forced refresh of all user
++// group principals to update team memberships.
++//
++// The annotation on the "githubapp" AuthConfig acts as a one-time guard
++// so the function is a no-op on subsequent restarts.
++func RefreshGitHubAppUsersOnce(ctx context.Context, authConfigs apisv3.AuthConfigClient) {
++	authConfig, err := authConfigs.Get(githubapp.Name, metav1.GetOptions{})
++	if k8serrors.IsNotFound(err) {
++		logrus.Debugf("refreshGitHubAppUsersOnce: AuthConfig %s not found, skipping", githubapp.Name)
++		return
++	}
++	if err != nil {
++		logrus.Errorf("refreshGitHubAppUsersOnce: getting AuthConfig: %v", err)
++		return
++	}
++
++	if !authConfig.Enabled {
++		logrus.Debugf("refreshGitHubAppUsersOnce: provider %s is not enabled, skipping", githubapp.Name)
++		return
++	}
++
++	if authConfig.Annotations[providerRefreshRequestedAnnotation] == "true" {
++		logrus.Debugf("refreshGitHubAppUsersOnce: provider %s already refreshed, skipping", githubapp.Name)
++		return
++	}
++
++	logrus.Infof("refreshGitHubAppUsersOnce: triggering refresh for all users of provider %s", githubapp.Name)
++	providerrefresh.TriggerAllUserRefresh()
++
++	// Use a JSON Merge Patch instead of a typed Update to set the
++	// annotation. AuthConfig objects store provider-specific fields not
++	// defined in the base v3.AuthConfig struct; a typed Update (PUT)
++	// would strip those fields and corrupt the stored configuration.
++	patch, err := json.Marshal(map[string]any{
++		"metadata": map[string]any{
++			"annotations": map[string]string{
++				providerRefreshRequestedAnnotation: "true",
++			},
++		},
++	})
++	if err != nil {
++		logrus.Errorf("refreshGitHubAppUsersOnce: marshaling patch: %v", err)
++		return
++	}
++	if _, err := authConfigs.Patch(githubapp.Name, types.MergePatchType, patch); err != nil {
++		logrus.Warnf("refreshGitHubAppUsersOnce: patching annotation: %v", err)
++	}
++}
+diff --git a/pkg/data/management/githubapp_refresh_users_test.go b/pkg/data/management/githubapp_refresh_users_test.go
+new file mode 100644
+index 0000000..aacbc3b
+--- /dev/null
++++ b/pkg/data/management/githubapp_refresh_users_test.go
+@@ -0,0 +1,90 @@
++package management
++
++import (
++	"encoding/json"
++	"fmt"
++	"testing"
++
++	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
++	"github.com/rancher/wrangler/v3/pkg/generic/fake"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++	k8serrors "k8s.io/apimachinery/pkg/api/errors"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	"k8s.io/apimachinery/pkg/types"
++)
++
++func TestRefreshGitHubAppUsersOnce(t *testing.T) {
++	t.Parallel()
++
++	notFound := k8serrors.NewNotFound(schema.GroupResource{Resource: "authconfigs"}, "githubapp")
++
++	tests := []struct {
++		name       string
++		authConfig *v3.AuthConfig
++		getErr     error
++		wantPatch  bool
++	}{
++		{
++			name:   "provider not configured",
++			getErr: notFound,
++		},
++		{
++			name:   "get authconfig error",
++			getErr: fmt.Errorf("connection refused"),
++		},
++		{
++			name: "provider not enabled",
++			authConfig: &v3.AuthConfig{
++				ObjectMeta: metav1.ObjectMeta{Name: "githubapp"},
++				Enabled:    false,
++			},
++		},
++		{
++			name: "already ran",
++			authConfig: &v3.AuthConfig{
++				ObjectMeta: metav1.ObjectMeta{
++					Name:        "githubapp",
++					Annotations: map[string]string{providerRefreshRequestedAnnotation: "true"},
++				},
++				Enabled: true,
++			},
++		},
++		{
++			name: "first run",
++			authConfig: &v3.AuthConfig{
++				ObjectMeta: metav1.ObjectMeta{Name: "githubapp"},
++				Enabled:    true,
++			},
++			wantPatch: true,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			t.Parallel()
++
++			ctrl := gomock.NewController(t)
++
++			mock := fake.NewMockNonNamespacedClientInterface[*v3.AuthConfig, *v3.AuthConfigList](ctrl)
++			mock.EXPECT().Get("githubapp", metav1.GetOptions{}).Return(tt.authConfig, tt.getErr)
++
++			if tt.wantPatch {
++				mock.EXPECT().Patch("githubapp", types.MergePatchType, gomock.Any()).DoAndReturn(
++					func(_ string, _ types.PatchType, data []byte, _ ...string) (*v3.AuthConfig, error) {
++						var payload map[string]any
++						require.NoError(t, json.Unmarshal(data, &payload))
++						metadata, _ := payload["metadata"].(map[string]any)
++						annotations, _ := metadata["annotations"].(map[string]any)
++						assert.Equal(t, "true", annotations[providerRefreshRequestedAnnotation])
++						return tt.authConfig, nil
++					},
++				)
++			}
++
++			RefreshGitHubAppUsersOnce(t.Context(), mock)
++		})
++	}
++}
+diff --git a/pkg/multiclustermanager/app.go b/pkg/multiclustermanager/app.go
+index 55cf440..f5432fb 100644
+--- a/pkg/multiclustermanager/app.go
++++ b/pkg/multiclustermanager/app.go
+@@ -210,6 +210,7 @@ func (m *mcm) Start(ctx context.Context) error {
+ 		go adunmigration.UnmigrateAdGUIDUsersOnce(m.ScaledContext)
+ 		tokens.StartPurgeDaemon(ctx, management)
+ 		providerrefresh.StartRefreshDaemon(m.ScaledContext, management)
++		managementdata.RefreshGitHubAppUsersOnce(ctx, m.wranglerContext.Mgmt.AuthConfig())
+ 		managementdata.CleanupOrphanedSystemUsers(ctx, management)
+ 		clusterupstreamrefresher.MigrateEksRefreshCronSetting(m.wranglerContext)
+ 		go managementdata.CleanupDuplicateBindings(m.ScaledContext, m.wranglerContext)

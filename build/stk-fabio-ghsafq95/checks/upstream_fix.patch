@@ -1,0 +1,116 @@
+diff --git a/main.go b/main.go
+index a42f2b82..bd1f5ac9 100644
+--- a/main.go
++++ b/main.go
+@@ -13,6 +13,7 @@ import (
+ 	"log"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"os"
+ 	"runtime"
+ 	"runtime/debug"
+@@ -192,6 +193,12 @@ func newHTTPProxy(cfg *config.Config, statsHandler *proxy.HttpStatsHandler) *pro
+ 	//Init Glob Cache
+ 	globCache := route.NewGlobCache(cfg.GlobCacheSize)
+ 
++	//Init ProtectHeaders
++	protectHeaders := proxy.DefaultProtectHeaders
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.RequestID)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.ClientIPHeader)] = true
++	protectHeaders[textproto.CanonicalMIMEHeaderKey(cfg.Proxy.TLSHeader)] = true
++
+ 	switch cfg.Log.AccessTarget {
+ 	case "":
+ 		log.Printf("[INFO] Access logging disabled")
+@@ -230,6 +237,7 @@ func newHTTPProxy(cfg *config.Config, statsHandler *proxy.HttpStatsHandler) *pro
+ 		Config:            cfg.Proxy,
+ 		Transport:         transport.NewTransport(nil),
+ 		InsecureTransport: transport.NewTransport(&tls.Config{InsecureSkipVerify: true}),
++		ProtectHeaders:    protectHeaders,
+ 		Lookup: func(r *http.Request) *route.Target {
+ 			t := route.GetTable().Lookup(r, r.Header.Get("trace"), pick, match, globCache, cfg.GlobMatchingDisabled)
+ 			if t == nil {
+diff --git a/proxy/http_headers.go b/proxy/http_headers.go
+index 66966efd..d2f017e1 100644
+--- a/proxy/http_headers.go
++++ b/proxy/http_headers.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"net"
+ 	"net/http"
++	"net/textproto"
+ 	"strings"
+ 
+ 	"github.com/fabiolb/fabio/config"
+@@ -26,6 +27,17 @@ func addResponseHeaders(w http.ResponseWriter, r *http.Request, cfg config.Proxy
+ 	return nil
+ }
+ 
++// DefaultProtectHeaders is a map of headers that are protected from Client manipulation.
++var DefaultProtectHeaders = map[string]bool{
++	"Forwarded":          true,
++	"X-Forwarded-For":    true,
++	"X-Forwarded-Host":   true,
++	"X-Forwarded-Port":   true,
++	"X-Forwarded-Proto":  true,
++	"X-Forwarded-Prefix": true,
++	"X-Real-Ip":          true,
++}
++
+ // addHeaders adds/updates headers in request
+ //
+ // * add/update `Forwarded` header
+@@ -33,12 +45,28 @@ func addResponseHeaders(w http.ResponseWriter, r *http.Request, cfg config.Proxy
+ // * add X-Real-Ip, if not present
+ // * ClientIPHeader != "": Set header with that name to <remote ip>
+ // * TLS connection: Set header with name from `cfg.TLSHeader` to `cfg.TLSHeaderValue`
+-func addHeaders(r *http.Request, cfg config.Proxy, stripPath string) error {
++func addHeaders(r *http.Request, hdrs map[string]bool, cfg config.Proxy, stripPath string) error {
+ 	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+ 	if err != nil {
+ 		return errors.New("cannot parse " + r.RemoteAddr)
+ 	}
+ 
++	// exclude headers from Connection rules.
++	var conHeaders []string
++	for _, s := range r.Header.Values("Connection") {
++		for _, p := range strings.Split(s, ",") {
++			p = strings.TrimSpace(p)
++			if !hdrs[textproto.CanonicalMIMEHeaderKey(p)] {
++				conHeaders = append(conHeaders, p)
++			}
++		}
++	}
++
++	r.Header.Del("Connection")
++	if len(conHeaders) > 0 {
++		r.Header.Set("Connection", strings.Join(conHeaders, ", "))
++	}
++
+ 	// set configurable ClientIPHeader
+ 	// X-Real-Ip is set later and X-Forwarded-For is set
+ 	// by the Go HTTP reverse proxy.
+diff --git a/proxy/http_proxy.go b/proxy/http_proxy.go
+index 70883b1b..d79a9474 100644
+--- a/proxy/http_proxy.go
++++ b/proxy/http_proxy.go
+@@ -46,6 +46,9 @@ type HTTPProxy struct {
+ 	// Config is the proxy configuration as provided during startup.
+ 	Config config.Proxy
+ 
++	// ProtectHeaders is a map of headers to protect against client side manipulation
++	ProtectHeaders map[string]bool
++
+ 	// Time returns the current time as the number of seconds since the epoch.
+ 	// If Time is nil, time.Now is used.
+ 	Time func() time.Time
+@@ -179,7 +182,7 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 	}
+ 
+-	if err := addHeaders(r, p.Config, t.StripPath); err != nil {
++	if err := addHeaders(r, p.ProtectHeaders, p.Config, t.StripPath); err != nil {
+ 		http.Error(w, "cannot parse "+r.RemoteAddr, http.StatusInternalServerError)
+ 		return
+ 	}

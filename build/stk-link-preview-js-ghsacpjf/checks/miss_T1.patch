@@ -1,0 +1,402 @@
+diff --git a/constants.ts b/constants.ts
+index f747ab3..0e80017 100644
+--- a/constants.ts
++++ b/constants.ts
+@@ -5,6 +5,9 @@ export const CONSTANTS = {
+       "(?:(?:https?|ftp)://)" +
+       // user:pass authentication
+       "(?:\\S+(?::\\S*)?@)?" +
++      // block internal-only hostnames and wildcard DNS rebinding services
++      "(?![^/?#]+\\.(?:internal|local)(?::\\d{2,5})?(?:[/?#]|$))" +
++      "(?![^/?#]+\\.(?:nip|sslip)\\.io(?::\\d{2,5})?(?:[/?#]|$))" +
+       "(?:" +
+       // IP address exclusion
+       // private & local networks
+diff --git a/index.ts b/index.ts
+index eb3579d..65d7525 100644
+--- a/index.ts
++++ b/index.ts
+@@ -42,9 +42,242 @@ interface IPreFetchedResource {
+   data: string;
+ }
+ 
+-function throwOnLoopback(address: string) {
+-  if (CONSTANTS.REGEX_LOOPBACK.test(address)) {
+-    throw new Error("SSRF request detected, trying to query host");
++const SSRF_ERROR = "SSRF request detected, trying to query host";
++
++function stripIPv6Brackets(address: string) {
++  if (address.startsWith("[") && address.endsWith("]")) {
++    return address.slice(1, -1);
++  }
++
++  return address;
++}
++
++function parseIPv4Address(address: string): number[] | undefined {
++  const parts = address.split(".");
++
++  if (parts.length !== 4) {
++    return undefined;
++  }
++
++  const octets: number[] = [];
++
++  for (const part of parts) {
++    if (!/^\d{1,3}$/.test(part)) {
++      return undefined;
++    }
++
++    const octet = Number(part);
++
++    if (octet > 255) {
++      return undefined;
++    }
++
++    octets.push(octet);
++  }
++
++  return octets;
++}
++
++function parseIPv6Address(address: string): number[] | undefined {
++  const addressWithoutZone = stripIPv6Brackets(address.trim()).split("%")[0].toLowerCase();
++
++  if (addressWithoutZone.indexOf(":") === -1) {
++    return undefined;
++  }
++
++  // An embedded dotted quad is rewritten as two hextets.
++  let normalizedAddress = addressWithoutZone;
++  const ipv4Match = addressWithoutZone.match(/^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/);
++
++  if (ipv4Match) {
++    const octets = parseIPv4Address(ipv4Match[2]);
++
++    if (!octets) {
++      return undefined;
++    }
++
++    normalizedAddress =
++      ipv4Match[1] +
++      [((octets[0] << 8) | octets[1]).toString(16), ((octets[2] << 8) | octets[3]).toString(16)].join(
++        ":",
++      );
++  }
++
++  const compressedParts = normalizedAddress.split("::");
++
++  if (compressedParts.length > 2) {
++    return undefined;
++  }
++
++  const left = compressedParts[0] ? compressedParts[0].split(":") : [];
++  const right = compressedParts.length === 2 && compressedParts[1] ? compressedParts[1].split(":") : [];
++  const missing = 8 - left.length - right.length;
++
++  if (missing < 0 || (compressedParts.length === 1 && missing !== 0)) {
++    return undefined;
++  }
++
++  const hextets: number[] = [];
++
++  for (const part of [...left, ...Array(missing).fill("0"), ...right]) {
++    if (!/^[\da-f]{1,4}$/.test(part)) {
++      return undefined;
++    }
++
++    hextets.push(Number.parseInt(part, 16));
++  }
++
++  return hextets;
++}
++
++function ipv4FromHextets(high: number, low: number): number[] {
++  return [high >> 8, high & 255, low >> 8, low & 255];
++}
++
++function embeddedIPv4Address(hextets: number[]): number[] | undefined {
++  const leadingZeroHextets = hextets.slice(0, 5).every((part) => part === 0);
++  const isIpv4Compatible = leadingZeroHextets && hextets[5] === 0;
++  const isIpv4Mapped = leadingZeroHextets && hextets[5] === 0xffff;
++  const isNat64 = hextets[0] === 0x64 && hextets[1] === 0xff9b && hextets.slice(2, 6).every((part) => part === 0);
++  const isSixToFour = hextets[0] === 0x2002;
++
++  if (isIpv4Compatible || isIpv4Mapped || isNat64) {
++    return ipv4FromHextets(hextets[6], hextets[7]);
++  }
++
++  if (isSixToFour) {
++    return ipv4FromHextets(hextets[1], hextets[2]);
++  }
++
++  return undefined;
++}
++
++function isNonPublicIPv4Address(octets: number[]) {
++  const [first, second, third] = octets;
++
++  return (
++    octets.every((octet) => octet === 0) ||
++    first === 10 ||
++    first === 127 ||
++    (first === 100 && second >= 64 && second <= 127) ||
++    (first === 169 && second === 254) ||
++    (first === 172 && second >= 16 && second <= 31) ||
++    (first === 192 && second === 168) ||
++    (first === 192 && second === 0 && third === 2) ||
++    (first === 192 && second === 0 && third === 0) ||
++    (first === 198 && (second === 18 || second === 19)) ||
++    (first === 198 && second === 51 && third === 100) ||
++    (first === 203 && second === 0 && third === 113) ||
++    first >= 224
++  );
++}
++
++function isNonPublicIPv6Address(hextets: number[]) {
++  const isUnspecified = hextets.every((part) => part === 0);
++  const isLoopback = hextets.slice(0, 7).every((part) => part === 0) && hextets[7] === 1;
++  const isUniqueLocal = (hextets[0] & 0xfe00) === 0xfc00;
++  const isLinkLocal = (hextets[0] & 0xffc0) === 0xfe80;
++  const isMulticast = (hextets[0] & 0xff00) === 0xff00;
++  const embedded = embeddedIPv4Address(hextets);
++
++  return (
++    isUnspecified ||
++    isLoopback ||
++    isUniqueLocal ||
++    isLinkLocal ||
++    isMulticast ||
++    Boolean(embedded && isNonPublicIPv4Address(embedded))
++  );
++}
++
++function normalizeAddress(address: string): string | undefined {
++  const trimmed = stripIPv6Brackets(address.trim()).split("%")[0];
++
++  if (parseIPv4Address(trimmed)) {
++    return trimmed;
++  }
++
++  if (parseIPv6Address(trimmed)) {
++    return trimmed.toLowerCase();
++  }
++
++  return undefined;
++}
++
++function isPublicAddress(address: string) {
++  const octets = parseIPv4Address(address);
++
++  if (octets) {
++    return !isNonPublicIPv4Address(octets);
++  }
++
++  const hextets = parseIPv6Address(address);
++
++  if (hextets) {
++    return !isNonPublicIPv6Address(hextets);
++  }
++
++  return false;
++}
++
++/**
++ * Accepts only an answer that can be read as a public, globally reachable IP address.
++ * Returns the normalised address so the caller can send its request to it.
++ */
++function validateResolvedAddress(answer: string): string {
++  if (typeof answer !== "string") {
++    throw new Error(SSRF_ERROR);
++  }
++
++  const address = normalizeAddress(answer);
++
++  if (!address) {
++    throw new Error(SSRF_ERROR);
++  }
++
++  if (!isPublicAddress(address)) {
++    throw new Error(SSRF_ERROR);
++  }
++
++  return address;
++}
++
++function formatAddressForUrl(address: string) {
++  return parseIPv6Address(address) ? `[${address}]` : address;
++}
++
++/** The request must be sent to the address that was validated, not to the name it came from. */
++function withValidatedAddress(url: string, address: string) {
++  const parsedUrl = new URL(url);
++  parsedUrl.hostname = formatAddressForUrl(address);
++
++  return parsedUrl.href;
++}
++
++const LOCAL_HOSTNAME_SUFFIXES = [".internal", ".local", ".localhost"];
++
++/** A URL is refused when its own host is an address or a name that the local network owns. */
++function assertFetchableUrl(url: string) {
++  const hostname = stripIPv6Brackets(new URL(url).hostname).toLowerCase();
++  const literalAddress = normalizeAddress(hostname);
++
++  if (literalAddress) {
++    if (!isPublicAddress(literalAddress)) {
++      throw new Error(SSRF_ERROR);
++    }
++
++    return;
++  }
++
++  const isLocalName =
++    hostname === "localhost" || LOCAL_HOSTNAME_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
++
++  if (isLocalName) {
++    throw new Error(SSRF_ERROR);
++  }
++
++  if (CONSTANTS.REGEX_LOOPBACK.test(hostname)) {
++    throw new Error(SSRF_ERROR);
+   }
+ }
+ 
+@@ -409,34 +642,83 @@ export async function getLinkPreview(text: string, options?: ILinkPreviewOptions
+     );
+   }
+ 
+-  if (options?.resolveDNSHost) {
+-    const resolvedUrl = await options.resolveDNSHost(detectedUrl);
+-
+-    throwOnLoopback(resolvedUrl);
+-  }
++  assertFetchableUrl(detectedUrl);
+ 
+   const timeout = options?.timeout ?? 3000; // 3 second timeout default
+   const controller = new AbortController();
+   const timeoutCounter = setTimeout(() => controller.abort(), timeout);
+ 
+-  const fetchOptions = {
++  const followRedirects = options?.followRedirects ?? `error`;
++  // With a caller supplied resolver the library walks redirects itself, so every hop can be
++  // resolved and validated before it is requested.
++  const validatesEveryHop = Boolean(options?.resolveDNSHost) && !options?.proxyUrl;
++  const checksRedirects = false;
++  const fetchOptions: RequestInit = {
+     headers: options?.headers ?? {},
+-    redirect: options?.followRedirects ?? `error`,
++    redirect: checksRedirects ? `manual` : followRedirects,
+     signal: controller.signal,
+   };
+ 
+-  const fetchUrl = options?.proxyUrl ? options.proxyUrl.concat(detectedUrl) : detectedUrl;
++  /** Resolves the URL through the caller's resolver and returns the address to connect to. */
++  const validateUrl = async (url: string) => {
++    if (!validatesEveryHop) {
++      return undefined;
++    }
++
++    const answer = await options!.resolveDNSHost!(url);
++
++    return validateResolvedAddress(answer);
++  };
++
++  const requestOnce = (url: string) =>
++    fetch(url, fetchOptions).catch((e: any) => {
++      if (e.name === `AbortError`) {
++        throw new Error(`Request timeout`);
++      }
++
++      clearTimeout(timeoutCounter);
++      throw e;
++    });
++
++  // The URL the caller and the site see; the request itself is sent to the validated address.
++  let reportedUrl = detectedUrl;
++  let validatedAddress = await validateUrl(detectedUrl);
++  let fetchUrl = options?.proxyUrl
++    ? options.proxyUrl.concat(detectedUrl)
++    : validatedAddress
++      ? withValidatedAddress(detectedUrl, validatedAddress)
++      : detectedUrl;
+ 
+-  let response = await fetch(fetchUrl, fetchOptions).catch((e) => {
+-    if (e.name === `AbortError`) {
+-      throw new Error(`Request timeout`);
++  let response = await requestOnce(fetchUrl);
++
++  let redirectHops = 0;
++
++  while (
++    checksRedirects &&
++    response.status > 300 &&
++    response.status < 309 &&
++    response.headers.get(`location`)
++  ) {
++    redirectHops += 1;
++
++    if (redirectHops > 20) {
++      clearTimeout(timeoutCounter);
++      throw new Error(`link-preview-js could not handle redirect`);
+     }
+ 
+-    clearTimeout(timeoutCounter);
+-    throw e;
+-  });
++    const locationHeader = response.headers.get(`location`) || ``;
++    const forwardedUrl = new URL(locationHeader, reportedUrl).href;
++
++    const forwardedAddress = await validateUrl(forwardedUrl);
++
++    reportedUrl = forwardedUrl;
++    fetchUrl = forwardedAddress ? withValidatedAddress(forwardedUrl, forwardedAddress) : forwardedUrl;
++
++    response = await requestOnce(fetchUrl);
++  }
+ 
+   if (
++    !checksRedirects &&
+     response.status > 300 &&
+     response.status < 309 &&
+     fetchOptions.redirect === `manual` &&
+@@ -447,19 +729,19 @@ export async function getLinkPreview(text: string, options?: ILinkPreviewOptions
+       locationHeader.startsWith("http://") || locationHeader.startsWith("https://");
+ 
+     // Resolve the URL, handling both absolute and relative URLs
+-    const forwardedUrl = isAbsoluteURI ? locationHeader : new URL(locationHeader, fetchUrl).href;
++    const redirectedFrom = options?.proxyUrl ? fetchUrl : reportedUrl;
++    const forwardedUrl = isAbsoluteURI ? locationHeader : new URL(locationHeader, redirectedFrom).href;
+ 
+-    if (!options.handleRedirects(fetchUrl, forwardedUrl)) {
++    if (!options.handleRedirects(redirectedFrom, forwardedUrl)) {
+       throw new Error(`link-preview-js could not handle redirect`);
+     }
+ 
+-    if (options?.resolveDNSHost) {
+-      const resolvedUrl = await options.resolveDNSHost(forwardedUrl);
++    const forwardedAddress = await validateUrl(forwardedUrl);
+ 
+-      throwOnLoopback(resolvedUrl);
+-    }
++    reportedUrl = forwardedUrl;
++    fetchUrl = forwardedAddress ? withValidatedAddress(forwardedUrl, forwardedAddress) : forwardedUrl;
+ 
+-    response = await fetch(forwardedUrl, fetchOptions as any);
++    response = await requestOnce(fetchUrl);
+   }
+ 
+   clearTimeout(timeoutCounter);
+@@ -470,7 +752,11 @@ export async function getLinkPreview(text: string, options?: ILinkPreviewOptions
+   });
+ 
+   const normalizedResponse: IPreFetchedResource = {
+-    url: options?.proxyUrl ? response.url.replace(options.proxyUrl, ``) : response.url,
++    url: options?.proxyUrl
++      ? response.url.replace(options.proxyUrl, ``)
++      : validatedAddress
++        ? reportedUrl
++        : response.url,
+     headers,
+     data: await response.text(),
+   };

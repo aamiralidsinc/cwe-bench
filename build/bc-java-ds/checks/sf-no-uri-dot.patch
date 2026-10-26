@@ -1,0 +1,182 @@
+diff --git a/core/src/main/java/org/bouncycastle/asn1/x509/PKIXNameConstraintValidator.java b/core/src/main/java/org/bouncycastle/asn1/x509/PKIXNameConstraintValidator.java
+index f9c28c3c..d30585dd 100644
+--- a/core/src/main/java/org/bouncycastle/asn1/x509/PKIXNameConstraintValidator.java
++++ b/core/src/main/java/org/bouncycastle/asn1/x509/PKIXNameConstraintValidator.java
+@@ -326,17 +326,10 @@ private static boolean withinDNSubtree(ASN1Sequence dns, ASN1Sequence subtree)
+             return withinDNSubtreeSGP22(dns, subtree);
+         }
+ 
++        // RFC 5280 4.2.1.10 / 7.1: the constraint's RDNSequence must be an initial prefix of the
++        // subject's; matching its first RDN at an arbitrary offset would let RDNs be prepended
++        // ahead of the permitted sequence.
+         int start = 0;
+-        RDN subtreeRdnStart = RDN.getInstance(subtree.getObjectAt(0));
+-        for (int j = 0; j < dns.size(); j++)
+-        {
+-            start = j;
+-            RDN dnsRdn = RDN.getInstance(dns.getObjectAt(j));
+-            if (IETFUtils.rDNAreEqual(subtreeRdnStart, dnsRdn))
+-            {
+-                break;
+-            }
+-        }
+ 
+         if (subtree.size() > dns.size() - start)
+         {
+@@ -1089,18 +1082,21 @@ private static boolean isEmailConstrained(String constraint, String email)
+     {
+         int atPos = constraint.indexOf('@');
+ 
+-        // a particular mailbox
++        // a particular mailbox. An RFC 1034 root-label trailing dot is normalised away on both
++        // sides, as the dNSName path already does.
+         if (atPos > 0)
+         {
+-            return email.equalsIgnoreCase(constraint);
++            return stripTrailingDot(email).equalsIgnoreCase(stripTrailingDot(constraint));
+         }
+ 
+-        String sub = email.substring(email.indexOf('@') + 1);
++        // The local part may be a quoted string that itself contains '@', so the host is what
++        // follows the last '@' in the address.
++        String sub = stripTrailingDot(email.substring(email.lastIndexOf('@') + 1));
+ 
+         // "@domain" style
+         if (atPos == 0)
+         {
+-            return sub.equalsIgnoreCase(constraint.substring(1));
++            return sub.equalsIgnoreCase(stripTrailingDot(constraint.substring(1)));
+         }
+ 
+         // address in sub domain
+@@ -1110,7 +1106,7 @@ private static boolean isEmailConstrained(String constraint, String email)
+         }
+ 
+         // on particular host
+-        return sub.equalsIgnoreCase(constraint);
++        return sub.equalsIgnoreCase(stripTrailingDot(constraint));
+     }
+ 
+     private static boolean withinDomain(String testDomain, String domain)
+diff --git a/prov/src/main/java/org/bouncycastle/jce/provider/RFC3280CertPathUtilities.java b/prov/src/main/java/org/bouncycastle/jce/provider/RFC3280CertPathUtilities.java
+index b2d00399..87159f9f 100644
+--- a/prov/src/main/java/org/bouncycastle/jce/provider/RFC3280CertPathUtilities.java
++++ b/prov/src/main/java/org/bouncycastle/jce/provider/RFC3280CertPathUtilities.java
+@@ -1174,26 +1174,18 @@ protected static void processCertBC(
+             throw new CertPathValidatorException("Subject alternative name extension could not be decoded.", e,
+                 certPath, index);
+         }
+-        /*
+-         * Where the subject alternative name extension carries email addresses they are the
+-         * certificate's email identities; the legacy emailAddress attributes of the subject DN
+-         * are checked against the email name constraints only when it does not.
+-         */
+-        if (!containsEmailAlternativeName(altName))
++        String[] subjectEmails = extractEmailAddressesFromSubjectDN(X500Name.getInstance(dns));
++        for (int eI = 0; eI != subjectEmails.length; eI++)
+         {
+-            String[] subjectEmails = extractEmailAddressesFromSubjectDN(X500Name.getInstance(dns));
+-            for (int eI = 0; eI != subjectEmails.length; eI++)
++            try
+             {
+-                try
+-                {
+-                    nameConstraintValidator.checkPermittedEmail(subjectEmails[eI]);
+-                    nameConstraintValidator.checkExcludedEmail(subjectEmails[eI]);
+-                }
+-                catch (PKIXNameConstraintValidatorException ex)
+-                {
+-                    throw new CertPathValidatorException(
+-                        "Subtree check for certificate subject alternative email failed.", ex, certPath, index);
+-                }
++                nameConstraintValidator.checkPermittedEmail(subjectEmails[eI]);
++                nameConstraintValidator.checkExcludedEmail(subjectEmails[eI]);
++            }
++            catch (PKIXNameConstraintValidatorException ex)
++            {
++                throw new CertPathValidatorException(
++                    "Subtree check for certificate subject alternative email failed.", ex, certPath, index);
+             }
+         }
+         if (altName != null)
+@@ -1619,61 +1611,42 @@ protected static void prepareNextCertG(
+             return;
+         }
+ 
+-        GeneralSubtree[] excluded = nc.getExcludedSubtrees();
+-
+-        if (excluded != null && excluded.length != 0)
++        //
++        // (g) (1) permitted subtrees
++        //
++        GeneralSubtree[] permitted = nc.getPermittedSubtrees();
++        if (permitted != null)
+         {
+-            //
+-            // (g) (2) excluded subtrees
+-            //
+             try
+             {
+-                for (int i = 0; i != excluded.length; i++)
+-                {
+-                    nameConstraintValidator.addExcludedSubtree(excluded[i]);
+-                }
++                nameConstraintValidator.intersectPermittedSubtree(permitted);
+             }
+             catch (Exception ex)
+             {
+                 throw new ExtCertPathValidatorException(
+-                    "Excluded subtrees could not be built from name constraints extension.", ex, certPath, index);
++                    "Permitted subtrees could not be built from name constraints extension.", ex, certPath, index);
+             }
+         }
+-        else
++
++        //
++        // (g) (2) excluded subtrees
++        //
++        GeneralSubtree[] excluded = nc.getExcludedSubtrees();
++        if (excluded != null)
+         {
+-            //
+-            // (g) (1) permitted subtrees
+-            //
+-            GeneralSubtree[] permitted = nc.getPermittedSubtrees();
+-            if (permitted != null)
++            try
+             {
+-                try
+-                {
+-                    nameConstraintValidator.intersectPermittedSubtree(permitted);
+-                }
+-                catch (Exception ex)
++                for (int i = 0; i != excluded.length; i++)
+                 {
+-                    throw new ExtCertPathValidatorException(
+-                        "Permitted subtrees could not be built from name constraints extension.", ex, certPath, index);
++                    nameConstraintValidator.addExcludedSubtree(excluded[i]);
+                 }
+             }
+-        }
+-    }
+-
+-    private static boolean containsEmailAlternativeName(GeneralNames names)
+-    {
+-        if (names != null)
+-        {
+-            GeneralName[] generalNames = names.getNames();
+-            for (int i = 0; i != generalNames.length; i++)
++            catch (Exception ex)
+             {
+-                if (generalNames[i].getTagNo() == GeneralName.rfc822Name)
+-                {
+-                    return true;
+-                }
++                throw new ExtCertPathValidatorException(
++                    "Excluded subtrees could not be built from name constraints extension.", ex, certPath, index);
+             }
+         }
+-        return false;
+     }
+ 
+     /**

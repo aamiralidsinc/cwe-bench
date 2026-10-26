@@ -1,0 +1,705 @@
+diff --git a/api/v1/extension.go b/api/v1/extension.go
+index 16b1da9..3156e99 100644
+--- a/api/v1/extension.go
++++ b/api/v1/extension.go
+@@ -1,12 +1,38 @@
+ package v1
+ 
+ import (
++	"crypto/x509"
++	"errors"
+ 	"fmt"
+ 	"time"
+ 
+ 	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ )
+ 
++// CredsFromAPI converts a VcenterCredentials API type to models.Credentials.
++func CredsFromAPI(v VcenterCredentials) (models.Credentials, error) {
++	c := models.Credentials{
++		URL:      v.Url,
++		Username: v.Username,
++		Password: v.Password,
++	}
++	if v.Cacert != nil {
++		if v.SkipTls != nil && *v.SkipTls {
++			return models.Credentials{}, errors.New("skipTls and cacert are mutually exclusive")
++		}
++		pemBytes := []byte(*v.Cacert)
++		pool := x509.NewCertPool()
++		if !pool.AppendCertsFromPEM(pemBytes) {
++			return models.Credentials{}, errors.New("cacert: no valid PEM certificates found")
++		}
++		c.CACert = pemBytes
++	} else {
++		// no cacert: default to skip-verify for backwards compat unless explicitly false
++		c.SkipTLS = v.SkipTls == nil || *v.SkipTls
++	}
++	return c, nil
++}
++
+ func (a *AgentStatus) FromModel(m models.AgentStatus) {
+ 	switch m.Console.Current {
+ 	case models.ConsoleStatusConnected:
+diff --git a/api/v1/types.gen.go b/api/v1/types.gen.go
+index 6582040..a32c8a2 100644
+--- a/api/v1/types.gen.go
++++ b/api/v1/types.gen.go
+@@ -690,7 +690,12 @@ type VMNIC struct {
+ 
+ // VcenterCredentials defines model for VcenterCredentials.
+ type VcenterCredentials struct {
+-	Password string `binding:"required,min=1" json:"password"`
++	// Cacert PEM-encoded CA certificate bundle for verifying the vCenter TLS certificate. Mutually exclusive with skipTls.
++	Cacert   *string `binding:"omitempty" json:"cacert,omitempty"`
++	Password string  `binding:"required,min=1" json:"password"`
++
++	// SkipTls When true, TLS certificate verification is skipped. Must not be set to true alongside cacert — that combination returns 400. When omitted: if cacert is absent the connection skips TLS verification (backwards compatibility); if cacert is provided the connection verifies TLS using that certificate — skipTls need not be sent.
++	SkipTls *bool `json:"skipTls,omitempty"`
+ 
+ 	// Url vCenter URL
+ 	Url      string `binding:"required,url" json:"url"`
+diff --git a/internal/handlers/v1/collector.go b/internal/handlers/v1/collector.go
+index 028b907..33baa4a 100644
+--- a/internal/handlers/v1/collector.go
++++ b/internal/handlers/v1/collector.go
+@@ -6,7 +6,6 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 
+ 	v1 "github.com/kubev2v/assisted-migration-agent/api/v1"
+-	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ 	srvErrors "github.com/kubev2v/assisted-migration-agent/pkg/errors"
+ )
+ 
+@@ -26,10 +25,14 @@ func (h *Handler) StartCollector(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	creds := models.Credentials{
+-		URL:      req.Url,
+-		Username: req.Username,
+-		Password: req.Password,
++	creds, err := v1.CredsFromAPI(req)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	if err := creds.Validate(); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
+ 	}
+ 
+ 	if err := h.collectorSrv.Start(c.Request.Context(), creds); err != nil {
+diff --git a/internal/handlers/v1/forecaster.go b/internal/handlers/v1/forecaster.go
+index 09e3ae2..7f8b53c 100644
+--- a/internal/handlers/v1/forecaster.go
++++ b/internal/handlers/v1/forecaster.go
+@@ -52,11 +52,16 @@ func (h *Handler) StartForecaster(c *gin.Context) {
+ 		Pairs: pairs,
+ 	}
+ 	if req.Credentials != nil {
+-		forecastReq.Credentials = models.Credentials{
+-			URL:      req.Credentials.Url,
+-			Username: req.Credentials.Username,
+-			Password: req.Credentials.Password,
++		creds, err := v1api.CredsFromAPI(*req.Credentials)
++		if err != nil {
++			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++			return
++		}
++		if err := creds.Validate(); err != nil {
++			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
++			return
+ 		}
++		forecastReq.Credentials = creds
+ 	}
+ 	if req.DiskSizeGb != nil {
+ 		forecastReq.DiskSizeGB = *req.DiskSizeGb
+@@ -156,10 +161,14 @@ func (h *Handler) PutForecasterCredentials(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	creds := models.Credentials{
+-		URL:      req.Url,
+-		Username: req.Username,
+-		Password: req.Password,
++	creds, err := v1api.CredsFromAPI(req)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	if err := creds.Validate(); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
+ 	}
+ 
+ 	if err := h.forecasterSrv.VerifyCredentials(c.Request.Context(), creds); err != nil {
+diff --git a/internal/handlers/v1/inspector.go b/internal/handlers/v1/inspector.go
+index 5310b21..49d9314 100644
+--- a/internal/handlers/v1/inspector.go
++++ b/internal/handlers/v1/inspector.go
+@@ -8,7 +8,6 @@ import (
+ 	"github.com/gin-gonic/gin"
+ 
+ 	v1 "github.com/kubev2v/assisted-migration-agent/api/v1"
+-	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ 	srvErrors "github.com/kubev2v/assisted-migration-agent/pkg/errors"
+ )
+ 
+@@ -39,10 +38,14 @@ func (h *Handler) StartInspection(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	creds := models.Credentials{
+-		URL:      req.Credentials.Url,
+-		Username: req.Credentials.Username,
+-		Password: req.Credentials.Password,
++	creds, err := v1.CredsFromAPI(req.Credentials)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	if err := creds.Validate(); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
+ 	}
+ 
+ 	if err := h.inspectorSrv.Start(c.Request.Context(), creds, req.VmIds); err != nil {
+@@ -107,10 +110,14 @@ func (h *Handler) ValidateInspectorCredentials(c *gin.Context) {
+ 		return
+ 	}
+ 
+-	creds := models.Credentials{
+-		URL:      req.Url,
+-		Username: req.Username,
+-		Password: req.Password,
++	creds, err := v1.CredsFromAPI(req)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	if err := creds.Validate(); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
+ 	}
+ 
+ 	if err := h.inspectorSrv.Credentials(c.Request.Context(), creds); err != nil {
+diff --git a/internal/handlers/v1/rightsizing.go b/internal/handlers/v1/rightsizing.go
+index 2453710..92971eb 100644
+--- a/internal/handlers/v1/rightsizing.go
++++ b/internal/handlers/v1/rightsizing.go
+@@ -63,15 +63,21 @@ func (h *Handler) TriggerRightsizingCollection(c *gin.Context) {
+ 		return
+ 	}
+ 
++	creds, err := v1.CredsFromAPI(req.Credentials)
++	if err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++	if err := creds.Validate(); err != nil {
++		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
++		return
++	}
++
+ 	params := models.RightsizingParams{
+-		Credentials: models.Credentials{
+-			URL:      req.Credentials.Url,
+-			Username: req.Credentials.Username,
+-			Password: req.Credentials.Password,
+-		},
+-		LookbackH:  defaultInt(req.LookbackHours, 720),
+-		IntervalID: defaultInt(req.IntervalId, 7200),
+-		BatchSize:  defaultInt(req.BatchSize, 64),
++		Credentials: creds,
++		LookbackH:   defaultInt(req.LookbackHours, 720),
++		IntervalID:  defaultInt(req.IntervalId, 7200),
++		BatchSize:   defaultInt(req.BatchSize, 64),
+ 	}
+ 	if req.NameFilter != nil {
+ 		params.NameFilter = *req.NameFilter
+diff --git a/internal/models/vcenter.go b/internal/models/vcenter.go
+index 9701390..593d027 100644
+--- a/internal/models/vcenter.go
++++ b/internal/models/vcenter.go
+@@ -1,8 +1,25 @@
+ package models
+ 
+-// Credentials holds vCenter connection credentials.
++import "errors"
++
++// Credentials holds vCenter connection credentials and TLS options.
+ type Credentials struct {
+-	URL      string
+-	Username string
+-	Password string
++	URL      string `json:"url"`
++	Username string `json:"username"`
++	Password string `json:"password"`
++	// CACert is a PEM-encoded CA certificate bundle used to verify the vCenter
++	// TLS certificate. Mutually exclusive with SkipTLS.
++	CACert []byte `json:"cacert,omitempty"`
++	// SkipTLS disables TLS certificate verification. Mutually exclusive with CACert.
++	// Default false — verified TLS is the secure default.
++	SkipTLS bool `json:"skipTls"`
++}
++
++// Validate returns an error if the TLS fields are in a conflicting state.
++// Call this at every service entry point before making any vCenter connection.
++func (c Credentials) Validate() error {
++	if c.SkipTLS && len(c.CACert) > 0 {
++		return errors.New("skipTls and cacert are mutually exclusive: set skipTls=true for unverified TLS or provide a cacert for verified TLS, not both")
++	}
++	return nil
+ }
+diff --git a/internal/services/collector_work.go b/internal/services/collector_work.go
+index 5d8f4a8..14e8bc8 100644
+--- a/internal/services/collector_work.go
++++ b/internal/services/collector_work.go
+@@ -132,7 +132,7 @@ func (f *collectorWorkFactory) Build(creds models.Credentials) work.WorkBuilder[
+ func (f *collectorWorkFactory) verifyCredentials(ctx context.Context, cred models.Credentials) error {
+ 	// Fail fast when the endpoint is unreachable instead of letting every
+ 	// pipeline stage time out against it.
+-	if err := vmware.CheckEndpoint(ctx, cred.URL); err != nil {
++	if err := vmware.CheckEndpoint(ctx, &cred); err != nil {
+ 		zap.S().Named("collector_service").Errorw("vCenter endpoint check failed", "error", err)
+ 		return err
+ 	}
+diff --git a/internal/services/forecaster.go b/internal/services/forecaster.go
+index 4dcecc4..e33eb1f 100644
+--- a/internal/services/forecaster.go
++++ b/internal/services/forecaster.go
+@@ -14,7 +14,6 @@ import (
+ 	"github.com/vmware/govmomi/find"
+ 	"github.com/vmware/govmomi/session"
+ 	"github.com/vmware/govmomi/vim25"
+-	"github.com/vmware/govmomi/vim25/soap"
+ 
+ 	"go.uber.org/zap"
+ 
+@@ -111,7 +110,7 @@ func (f *ForecasterService) Start(ctx context.Context, req models.ForecastReques
+ 
+ 	zap.S().Infow("starting forecaster", "pairs", len(req.Pairs), "diskSizeGB", req.DiskSizeGB, "iterations", req.Iterations, "concurrency", req.Concurrency)
+ 
+-	vClient, err := vmware.NewVsphereClient(ctx, cred.URL, cred.Username, cred.Password, true)
++	vClient, err := vmware.NewVsphereClient(ctx, &cred)
+ 	if err != nil {
+ 		zap.S().Named("forecaster_service").Errorw("failed to connect to vSphere", "error", err)
+ 		return srvErrors.NewVCenterError(err)
+@@ -171,6 +170,10 @@ func (f *ForecasterService) VerifyCredentials(ctx context.Context, credentials m
+ 	}
+ 	credentials.URL = u
+ 
++	if err := credentials.Validate(); err != nil {
++		return err
++	}
++
+ 	if err := f.verifyCredentialsAndPrivileges(ctx, &credentials, models.ForecasterRequiredPrivileges); err != nil {
+ 		return err
+ 	}
+@@ -191,7 +194,11 @@ func (f *ForecasterService) verifyCredentialsAndPrivileges(ctx context.Context,
+ 	verifyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+ 
+-	vimClient, err := vim25.NewClient(verifyCtx, soap.NewClient(u, true))
++	soapClient, err := vmware.NewSoapClient(u, creds.SkipTLS, creds.CACert)
++	if err != nil {
++		return err
++	}
++	vimClient, err := vim25.NewClient(verifyCtx, soapClient)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -246,6 +253,9 @@ func (f *ForecasterService) resolveCredentials(ctx context.Context, creds models
+ 	creds.URL = u
+ 
+ 	if creds.URL != "" {
++		if err := creds.Validate(); err != nil {
++			return models.Credentials{}, err
++		}
+ 		if err := f.verifyCredentialsAndPrivileges(ctx, &creds, models.ForecasterRequiredPrivileges); err != nil {
+ 			return models.Credentials{}, err
+ 		}
+diff --git a/internal/services/inspector.go b/internal/services/inspector.go
+index 7a1d3c6..a8fb2c6 100644
+--- a/internal/services/inspector.go
++++ b/internal/services/inspector.go
+@@ -95,11 +95,15 @@ func (i *InspectorService) Start(ctx context.Context, creds models.Credentials,
+ 	creds.URL = url
+ 
+ 	// Record the vCenter appliance version alongside the run.
+-	if version, verr := vCenterVersion(ctx, creds.URL); verr == nil {
++	if version, verr := vCenterVersion(ctx, &creds); verr == nil {
+ 		zap.S().Named("inspector_service").Infow("vCenter version", "version", version)
+ 	}
+ 
+-	vClient, err := vmware.NewVsphereClient(ctx, creds.URL, creds.Username, creds.Password, true)
++	if err := creds.Validate(); err != nil {
++		return err
++	}
++
++	vClient, err := vmware.NewVsphereClient(ctx, &creds)
+ 	if err != nil {
+ 		zap.S().Named("inspector_service").Errorw("failed to connect to vSphere", "error", err)
+ 		return srvErrors.NewVCenterError(err)
+diff --git a/internal/services/inspector_meta.go b/internal/services/inspector_meta.go
+index dc6854b..593176c 100644
+--- a/internal/services/inspector_meta.go
++++ b/internal/services/inspector_meta.go
+@@ -3,28 +3,46 @@ package services
+ import (
+ 	"context"
+ 	"crypto/tls"
++	"crypto/x509"
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"time"
++
++	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ )
+ 
+ // vCenterVersion queries the vCenter REST API for the appliance version. The
+ // inspector records it with the run so results can be correlated with the
+ // vCenter build they were collected from.
+-func vCenterVersion(ctx context.Context, vcenterURL string) (string, error) {
+-	u, err := url.Parse(vcenterURL)
++func vCenterVersion(ctx context.Context, creds *models.Credentials) (string, error) {
++	if creds == nil {
++		return "", fmt.Errorf("credentials must not be nil")
++	}
++	if err := creds.Validate(); err != nil {
++		return "", err
++	}
++	u, err := url.Parse(creds.URL)
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to parse vCenter URL: %w", err)
+ 	}
+ 	if u.Host == "" {
+-		return "", fmt.Errorf("vCenter URL has no host: %q", vcenterURL)
++		return "", fmt.Errorf("vCenter URL has no host: %q", creds.URL)
++	}
++
++	tlsConfig := &tls.Config{InsecureSkipVerify: creds.SkipTLS}
++	if len(creds.CACert) > 0 {
++		pool := x509.NewCertPool()
++		if !pool.AppendCertsFromPEM(creds.CACert) {
++			return "", fmt.Errorf("invalid CA bundle: no valid PEM certificates found")
++		}
++		tlsConfig.RootCAs = pool
+ 	}
+ 
+ 	client := &http.Client{
+ 		Timeout: 5 * time.Second,
+ 		Transport: &http.Transport{
+-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
++			TLSClientConfig: tlsConfig,
+ 		},
+ 	}
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.Scheme+"://"+u.Host+"/rest/appliance/system/version", nil)
+diff --git a/internal/services/rightsizing.go b/internal/services/rightsizing.go
+index 6757b13..0c93c0b 100644
+--- a/internal/services/rightsizing.go
++++ b/internal/services/rightsizing.go
+@@ -249,13 +249,8 @@ func buildVSphereConfig(params models.RightsizingParams, lookback time.Duration)
+ 		VCenterURL: params.URL,
+ 		Username:   params.Username,
+ 		Password:   params.Password,
+-		// TLS verification is skipped because on-prem vCenter deployments almost universally use
+-		// self-signed certificates, and even CA-signed certs frequently fail verification due to
+-		// SAN mismatches (the cert is issued for the FQDN but the agent may connect via IP or alias).
+-		// So, in order to provide a valid cert, the vCenter admins will need to hav a cert for each of the possible IPs/aliases the agent might use.
+-		// The risk is accepted: the agent runs inside the customer's own network, so the MITM
+-		// threat model is low.
+-		Insecure:   true,
++		Insecure:   params.SkipTLS,
++		CACert:     params.CACert,
+ 		NameFilter: params.NameFilter,
+ 		ClusterID:  params.ClusterID,
+ 		Lookback:   lookback,
+@@ -268,6 +263,9 @@ func buildVSphereConfig(params models.RightsizingParams, lookback time.Duration)
+ // The report shell is persisted in DuckDB synchronously before returning (202 Accepted).
+ // Callers poll GET /rightsizing/{id} to observe metrics being populated.
+ func (s *RightsizingService) TriggerCollection(ctx context.Context, params models.RightsizingParams) (*models.RightsizingReportSummary, error) {
++	if err := params.Validate(); err != nil {
++		return nil, err
++	}
+ 	applyCollectionDefaults(&params)
+ 
+ 	s.mu.Lock()
+diff --git a/pkg/collector/vsphere.go b/pkg/collector/vsphere.go
+index 58ef0a4..6d44d17 100644
+--- a/pkg/collector/vsphere.go
++++ b/pkg/collector/vsphere.go
+@@ -107,16 +107,24 @@ func createProvider(creds *models.Credentials) *api.Provider {
+ 
+ // createSecret creates a Kubernetes Secret with vCenter credentials.
+ func createSecret(creds *models.Credentials) *core.Secret {
++	skipVerify := "false"
++	if creds.SkipTLS {
++		skipVerify = "true"
++	}
++	data := map[string][]byte{
++		"user":               []byte(creds.Username),
++		"password":           []byte(creds.Password),
++		"insecureSkipVerify": []byte(skipVerify),
++	}
++	if len(creds.CACert) > 0 {
++		data["ca.crt"] = creds.CACert
++	}
+ 	return &core.Secret{
+ 		ObjectMeta: meta.ObjectMeta{
+ 			Name:      "vsphere-secret",
+ 			Namespace: "default",
+ 		},
+-		Data: map[string][]byte{
+-			"user":               []byte(creds.Username),
+-			"password":           []byte(creds.Password),
+-			"insecureSkipVerify": []byte("true"),
+-		},
++		Data: data,
+ 	}
+ }
+ 
+diff --git a/pkg/rightsizing/vsphere.go b/pkg/rightsizing/vsphere.go
+index c7b349e..3708a16 100644
+--- a/pkg/rightsizing/vsphere.go
++++ b/pkg/rightsizing/vsphere.go
+@@ -2,6 +2,8 @@ package rightsizing
+ 
+ import (
+ 	"context"
++	"crypto/x509"
++	"errors"
+ 	"fmt"
+ 	"maps"
+ 	"net/url"
+@@ -42,6 +44,7 @@ type Config struct {
+ 	Username   string
+ 	Password   string
+ 	Insecure   bool
++	CACert     []byte
+ 	NameFilter string
+ 	ClusterID  string
+ 	Lookback   time.Duration
+@@ -63,6 +66,23 @@ type VMReport struct {
+ 	Warnings []string
+ }
+ 
++// buildSoapClient creates a SOAP client with TLS configured from the given
++// parameters. CACert content is never included in error messages or logs.
++// Mirrors vmware.NewSoapClient; kept separate to avoid cross-package coupling.
++func buildSoapClient(u *url.URL, insecure bool, caCert []byte) (*soap.Client, error) {
++	sc := soap.NewClient(u, insecure)
++	if len(caCert) == 0 {
++		return sc, nil
++	}
++	pool := x509.NewCertPool()
++	if !pool.AppendCertsFromPEM(caCert) {
++		return nil, errors.New("invalid CA bundle: no valid PEM certificates found")
++	}
++	// soap.NewClient always initialises TLSClientConfig.
++	sc.DefaultTransport().TLSClientConfig.RootCAs = pool
++	return sc, nil
++}
++
+ // Connect authenticates a govmomi client. Never logs the password.
+ func Connect(ctx context.Context, cfg Config) (*govmomi.Client, error) {
+ 	u, err := soap.ParseURL(cfg.VCenterURL)
+@@ -71,7 +91,11 @@ func Connect(ctx context.Context, cfg Config) (*govmomi.Client, error) {
+ 	}
+ 	u.User = url.UserPassword(cfg.Username, cfg.Password)
+ 
+-	soapClient := soap.NewClient(u, cfg.Insecure)
++	soapClient, err := buildSoapClient(u, cfg.Insecure, cfg.CACert)
++	if err != nil {
++		return nil, fmt.Errorf("failed to configure TLS: %w", err)
++	}
++
+ 	vimClient, err := vim25.NewClient(ctx, soapClient)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create vim25 client: %w", err)
+diff --git a/pkg/vmware/auth.go b/pkg/vmware/auth.go
+index 9b26fba..5ce37cd 100644
+--- a/pkg/vmware/auth.go
++++ b/pkg/vmware/auth.go
+@@ -9,7 +9,6 @@ import (
+ 
+ 	"github.com/vmware/govmomi"
+ 	"github.com/vmware/govmomi/session"
+-	"github.com/vmware/govmomi/vim25/soap"
+ 	"go.uber.org/zap"
+ 
+ 	"github.com/kubev2v/assisted-migration-agent/internal/models"
+@@ -65,17 +64,25 @@ func (m *VMManager) ValidatePrivileges(ctx context.Context, moid string, require
+ }
+ 
+ func VerifyCredentials(ctx context.Context, creds *models.Credentials, resourceName string) error {
++	if err := creds.Validate(); err != nil {
++		return err
++	}
++
+ 	u, err := url.ParseRequestURI(creds.URL)
+ 	if err != nil {
+ 		return err
+ 	}
+-
+ 	u.User = url.UserPassword(creds.Username, creds.Password)
+ 
+ 	verifyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+ 	defer cancel()
+ 
+-	vimClient, err := vim25.NewClient(verifyCtx, soap.NewClient(u, true))
++	soapClient, err := NewSoapClient(u, creds.SkipTLS, creds.CACert)
++	if err != nil {
++		return err
++	}
++
++	vimClient, err := vim25.NewClient(verifyCtx, soapClient)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/vmware/client.go b/pkg/vmware/client.go
+index 8ec82d8..0f29e45 100644
+--- a/pkg/vmware/client.go
++++ b/pkg/vmware/client.go
+@@ -9,30 +9,27 @@ import (
+ 	"github.com/vmware/govmomi/session"
+ 	"github.com/vmware/govmomi/vim25"
+ 	"github.com/vmware/govmomi/vim25/soap"
++
++	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ )
+ 
+-// NewVsphereClient creates and authenticates a new vSphere client connection to a vCenter server.
+-//
+-// Parameters:
+-//   - ctx: the context for the API request.
+-//   - vcenterUrl: the URL of the vCenter server (e.g., "https://vcenter.example.com/sdk").
+-//   - username: the username for authentication.
+-//   - password: the password for authentication.
+-//   - insecure: if true, skips TLS certificate verification (use only for testing).
+-//
+-// Returns an error if:
+-//   - the vCenter URL cannot be parsed,
+-//   - the vim25 client creation fails,
+-//   - or authentication to vCenter fails.
+-func NewVsphereClient(ctx context.Context, vcenterUrl, username, password string, insecure bool) (*govmomi.Client, error) {
+-	u, err := soap.ParseURL(vcenterUrl)
++// NewVsphereClient creates and authenticates a govmomi client using the provided
++// credentials. TLS behaviour is governed by creds.SkipTLS and creds.CACert.
++// Callers must invoke creds.Validate() before calling this function.
++func NewVsphereClient(ctx context.Context, creds *models.Credentials) (*govmomi.Client, error) {
++	if creds == nil {
++		return nil, fmt.Errorf("credentials must not be nil")
++	}
++	u, err := soap.ParseURL(creds.URL)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse vCenter URL: %w", err)
+ 	}
++	u.User = url.UserPassword(creds.Username, creds.Password)
+ 
+-	u.User = url.UserPassword(username, password)
+-
+-	soapClient := soap.NewClient(u, insecure)
++	soapClient, err := NewSoapClient(u, creds.SkipTLS, creds.CACert)
++	if err != nil {
++		return nil, fmt.Errorf("failed to configure TLS: %w", err)
++	}
+ 
+ 	vimClient, err := vim25.NewClient(ctx, soapClient)
+ 	if err != nil {
+diff --git a/pkg/vmware/endpoint.go b/pkg/vmware/endpoint.go
+index 01b8199..50c402d 100644
+--- a/pkg/vmware/endpoint.go
++++ b/pkg/vmware/endpoint.go
+@@ -7,23 +7,40 @@ import (
+ 	"net"
+ 	"net/url"
+ 	"time"
++
++	"github.com/kubev2v/assisted-migration-agent/internal/models"
+ )
+ 
+ // CheckEndpoint performs a quick TLS reachability check against the vCenter
+ // endpoint before a long-running pipeline starts, so that an unreachable
+ // endpoint fails fast instead of being retried by every stage.
+-func CheckEndpoint(ctx context.Context, vcenterURL string) error {
+-	u, err := url.Parse(vcenterURL)
++func CheckEndpoint(ctx context.Context, creds *models.Credentials) error {
++	if creds == nil {
++		return fmt.Errorf("credentials must not be nil")
++	}
++	if err := creds.Validate(); err != nil {
++		return err
++	}
++	u, err := url.Parse(creds.URL)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to parse vCenter URL: %w", err)
+ 	}
+ 	if u.Host == "" {
+-		return fmt.Errorf("vCenter URL has no host: %q", vcenterURL)
++		return fmt.Errorf("vCenter URL has no host: %q", creds.URL)
++	}
++
++	tlsConfig := &tls.Config{InsecureSkipVerify: creds.SkipTLS}
++	if len(creds.CACert) > 0 {
++		pool, err := certPool(creds.CACert)
++		if err != nil {
++			return err
++		}
++		tlsConfig.RootCAs = pool
+ 	}
+ 
+ 	dialer := &tls.Dialer{
+ 		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+-		Config:    &tls.Config{InsecureSkipVerify: true},
++		Config:    tlsConfig,
+ 	}
+ 	conn, err := dialer.DialContext(ctx, "tcp", u.Host)
+ 	if err != nil {
+diff --git a/pkg/vmware/tls.go b/pkg/vmware/tls.go
+new file mode 100644
+index 0000000..f665cfe
+--- /dev/null
++++ b/pkg/vmware/tls.go
+@@ -0,0 +1,39 @@
++package vmware
++
++import (
++	"crypto/x509"
++	"errors"
++	"net/url"
++
++	"github.com/vmware/govmomi/vim25/soap"
++)
++
++// NewSoapClient creates a govmomi SOAP client with TLS configured from the
++// provided parameters. Pass insecure=true only when the caller has explicitly
++// opted out of certificate verification (SkipTLS=true on Credentials).
++// If caCert is non-empty it must be a PEM-encoded certificate bundle; it is
++// loaded into the client's root CA pool. caCert content is never logged.
++func NewSoapClient(u *url.URL, insecure bool, caCert []byte) (*soap.Client, error) {
++	sc := soap.NewClient(u, insecure)
++	if len(caCert) == 0 {
++		return sc, nil
++	}
++	pool, err := certPool(caCert)
++	if err != nil {
++		return nil, err
++	}
++	// soap.NewClient always initialises TLSClientConfig; SetRootCAs() is not used
++	// because it loads from file paths, not in-memory PEM bytes.
++	transport := sc.DefaultTransport()
++	transport.TLSClientConfig.RootCAs = pool
++	return sc, nil
++}
++
++// certPool builds a root CA pool from an in-memory PEM bundle.
++func certPool(caCert []byte) (*x509.CertPool, error) {
++	pool := x509.NewCertPool()
++	if !pool.AppendCertsFromPEM(caCert) {
++		return nil, errors.New("invalid CA bundle: no valid PEM certificates found")
++	}
++	return pool, nil
++}

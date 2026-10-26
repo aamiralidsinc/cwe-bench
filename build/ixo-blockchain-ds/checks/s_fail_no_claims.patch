@@ -1,0 +1,340 @@
+diff --git a/x/bonds/keeper/auth.go b/x/bonds/keeper/auth.go
+new file mode 100644
+index 0000000..44e7859
+--- /dev/null
++++ b/x/bonds/keeper/auth.go
+@@ -0,0 +1,51 @@
++package keeper
++
++import (
++	errorsmod "cosmossdk.io/errors"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
++
++	iidtypes "github.com/ixofoundation/ixo-blockchain/v7/x/iid/types"
++)
++
++// verifyDidSignerAuthentication checks inside the keeper that signer is an
++// account the DID document authorises to act for did. The IID ante performs
++// this check for top-level transactions only; handlers reached through any
++// other dispatch path must re-establish it themselves.
++func (k Keeper) verifyDidSignerAuthentication(ctx sdk.Context, did, signer string) error {
++	doc, found := k.iidKeeper.GetDidDocument(ctx, []byte(did))
++	if !found {
++		return errorsmod.Wrapf(iidtypes.ErrDidDocumentNotFound, "did document %s not found", did)
++	}
++	if !doc.HasRelationship(iidtypes.NewBlockchainAccountID(signer), iidtypes.Authentication, iidtypes.AssertionMethod) {
++		return errorsmod.Wrapf(iidtypes.ErrUnauthorized,
++			"signer %s is not authorized to act on behalf of did %s", signer, did)
++	}
++	return nil
++}
++
++// resolveDidSignerAccount resolves the account a DID fragment names and
++// requires it to be the signer's own account, so that coins are only ever
++// moved from an account belonging to the party that authorized the request.
++func (k Keeper) resolveDidSignerAccount(ctx sdk.Context, fragment iidtypes.DIDFragment, signer string) (sdk.AccAddress, error) {
++	if err := k.verifyDidSignerAuthentication(ctx, fragment.Did(), signer); err != nil {
++		return nil, err
++	}
++	doc, found := k.iidKeeper.GetDidDocument(ctx, []byte(fragment.Did()))
++	if !found {
++		return nil, errorsmod.Wrapf(iidtypes.ErrDidDocumentNotFound, "did document %s not found", fragment.Did())
++	}
++	resolved, err := doc.GetVerificationMethodBlockchainAddress(fragment.String())
++	if err != nil {
++		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++	}
++	signerAddr, err := sdk.AccAddressFromBech32(signer)
++	if err != nil {
++		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address (%s)", err)
++	}
++	if !resolved.Equals(signerAddr) {
++		return nil, errorsmod.Wrapf(iidtypes.ErrUnauthorized,
++			"signer %s does not control account %s", signer, resolved.String())
++	}
++	return resolved, nil
++}
+diff --git a/x/bonds/keeper/msg_server.go b/x/bonds/keeper/msg_server.go
+index c476f60..ffcfc50 100755
+--- a/x/bonds/keeper/msg_server.go
++++ b/x/bonds/keeper/msg_server.go
+@@ -177,6 +177,11 @@ func (k msgServer) CreateBond(goCtx context.Context, msg *types.MsgCreateBond) (
+ 
+ func (k msgServer) EditBond(goCtx context.Context, msg *types.MsgEditBond) (*types.MsgEditBondResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
++
++	if err := k.verifyDidSignerAuthentication(ctx, msg.EditorDid.Did(), msg.EditorAddress); err != nil {
++		return nil, err
++	}
++
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+ 	if !found {
+ 		return nil, errorsmod.Wrap(types.ErrBondDoesNotExist, msg.BondDid)
+@@ -247,6 +252,11 @@ func (k msgServer) EditBond(goCtx context.Context, msg *types.MsgEditBond) (*typ
+ 
+ func (k msgServer) SetNextAlpha(goCtx context.Context, msg *types.MsgSetNextAlpha) (*types.MsgSetNextAlphaResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
++
++	if err := k.verifyDidSignerAuthentication(ctx, msg.OracleDid.Did(), msg.OracleAddress); err != nil {
++		return nil, err
++	}
++
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+ 	if !found {
+ 		return nil, errorsmod.Wrap(types.ErrBondDoesNotExist, msg.BondDid)
+@@ -388,6 +398,11 @@ func (k msgServer) SetNextAlpha(goCtx context.Context, msg *types.MsgSetNextAlph
+ 
+ func (k msgServer) UpdateBondState(goCtx context.Context, msg *types.MsgUpdateBondState) (*types.MsgUpdateBondStateResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
++
++	if err := k.verifyDidSignerAuthentication(ctx, msg.EditorDid.Did(), msg.EditorAddress); err != nil {
++		return nil, err
++	}
++
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+ 	if !found {
+ 		return nil, errorsmod.Wrap(types.ErrBondDoesNotExist, msg.BondDid)
+@@ -430,13 +445,9 @@ func (k msgServer) UpdateBondState(goCtx context.Context, msg *types.MsgUpdateBo
+ 
+ func (k msgServer) Buy(goCtx context.Context, msg *types.MsgBuy) (*types.MsgBuyResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+-	buyerDid, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.BuyerDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	buyerAddr, err := buyerDid.GetVerificationMethodBlockchainAddress(msg.BuyerDid.String())
++	buyerAddr, err := k.resolveDidSignerAccount(ctx, msg.BuyerDid, msg.BuyerAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+@@ -501,13 +512,9 @@ func (k msgServer) Buy(goCtx context.Context, msg *types.MsgBuy) (*types.MsgBuyR
+ }
+ 
+ func performFirstSwapperFunctionBuy(ctx sdk.Context, keeper Keeper, msg types.MsgBuy) (*types.MsgBuyResponse, error) {
+-	buyerDid, exists := keeper.iidKeeper.GetDidDocument(ctx, []byte(msg.BuyerDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	buyerAddr, err := buyerDid.GetVerificationMethodBlockchainAddress(msg.BuyerDid.String())
++	buyerAddr, err := keeper.resolveDidSignerAccount(ctx, msg.BuyerDid, msg.BuyerAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 	// TODO: investigate effect that a high amount has on future buyers' ability to buy.
+ 
+@@ -555,13 +562,9 @@ func performFirstSwapperFunctionBuy(ctx sdk.Context, keeper Keeper, msg types.Ms
+ func (k msgServer) Sell(goCtx context.Context, msg *types.MsgSell) (*types.MsgSellResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+ 
+-	sellerDid, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.SellerDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	sellerAddr, err := sellerDid.GetVerificationMethodBlockchainAddress(msg.SellerDid.String())
++	sellerAddr, err := k.resolveDidSignerAccount(ctx, msg.SellerDid, msg.SellerAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+@@ -627,13 +630,9 @@ func (k msgServer) Sell(goCtx context.Context, msg *types.MsgSell) (*types.MsgSe
+ 
+ func (k msgServer) Swap(goCtx context.Context, msg *types.MsgSwap) (*types.MsgSwapResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+-	swapperDid, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.SwapperDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	swapperAddr, err := swapperDid.GetVerificationMethodBlockchainAddress(msg.SwapperDid.String())
++	swapperAddr, err := k.resolveDidSignerAccount(ctx, msg.SwapperDid, msg.SwapperAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+@@ -691,13 +690,9 @@ func (k msgServer) Swap(goCtx context.Context, msg *types.MsgSwap) (*types.MsgSw
+ 
+ func (k msgServer) MakeOutcomePayment(goCtx context.Context, msg *types.MsgMakeOutcomePayment) (*types.MsgMakeOutcomePaymentResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+-	senderDid, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.SenderDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	senderAddr, err := senderDid.GetVerificationMethodBlockchainAddress(msg.SenderDid.String())
++	senderAddr, err := k.resolveDidSignerAccount(ctx, msg.SenderDid, msg.SenderAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+@@ -734,13 +729,9 @@ func (k msgServer) MakeOutcomePayment(goCtx context.Context, msg *types.MsgMakeO
+ 
+ func (k msgServer) WithdrawShare(goCtx context.Context, msg *types.MsgWithdrawShare) (*types.MsgWithdrawShareResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+-	recipientDid, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.RecipientDid.Did()))
+-	if !exists {
+-		return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "signer must be payment contract payer")
+-	}
+-	recipientAddr, err := recipientDid.GetVerificationMethodBlockchainAddress(msg.RecipientDid.String())
++	recipientAddr, err := k.resolveDidSignerAccount(ctx, msg.RecipientDid, msg.RecipientAddress)
+ 	if err != nil {
+-		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++		return nil, err
+ 	}
+ 
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+@@ -807,6 +798,10 @@ func (k msgServer) WithdrawShare(goCtx context.Context, msg *types.MsgWithdrawSh
+ func (k msgServer) WithdrawReserve(goCtx context.Context, msg *types.MsgWithdrawReserve) (*types.MsgWithdrawReserveResponse, error) {
+ 	ctx := sdk.UnwrapSDKContext(goCtx)
+ 
++	if err := k.verifyDidSignerAuthentication(ctx, msg.WithdrawerDid.Did(), msg.WithdrawerAddress); err != nil {
++		return nil, err
++	}
++
+ 	bond, found := k.GetBond(ctx, msg.BondDid)
+ 	if !found {
+ 		return nil, errorsmod.Wrapf(types.ErrBondDoesNotExist, msg.BondDid)
+@@ -848,13 +843,9 @@ func (k msgServer) WithdrawReserve(goCtx context.Context, msg *types.MsgWithdraw
+ 	// withdrawer's DID account before the net amount is released.
+ 	exitFee := bond.GetExitFees(sdk.NewDecCoinsFromCoins(msg.Amount...))
+ 	if !exitFee.IsZero() {
+-		withdrawerDidDoc, exists := k.iidKeeper.GetDidDocument(ctx, []byte(msg.WithdrawerDid.Did()))
+-		if !exists {
+-			return nil, errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "withdrawer did not found")
+-		}
+-		withdrawerAddr, err := withdrawerDidDoc.GetVerificationMethodBlockchainAddress(msg.WithdrawerDid.String())
++		withdrawerAddr, err := k.resolveDidSignerAccount(ctx, msg.WithdrawerDid, msg.WithdrawerAddress)
+ 		if err != nil {
+-			return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++			return nil, err
+ 		}
+ 		if err := k.BankKeeper.SendCoinsFromAccountToModule(
+ 			ctx, withdrawerAddr, types.BondsReserveAccount, exitFee); err != nil {
+diff --git a/x/claims/keeper/auth.go b/x/claims/keeper/auth.go
+new file mode 100644
+index 0000000..b9867d0
+--- /dev/null
++++ b/x/claims/keeper/auth.go
+@@ -0,0 +1,36 @@
++package keeper
++
++import (
++	errorsmod "cosmossdk.io/errors"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
++
++	iidtypes "github.com/ixofoundation/ixo-blockchain/v7/x/iid/types"
++)
++
++// ResolveDidSignerAccount resolves the account a DID fragment names and
++// requires it to be the signer's own account, so that funds are only ever
++// taken from an account belonging to the party that authorized the request.
++func (k Keeper) ResolveDidSignerAccount(ctx sdk.Context, fragment iidtypes.DIDFragment, signer string) (sdk.AccAddress, error) {
++	doc, found := k.IidKeeper.GetDidDocument(ctx, []byte(fragment.Did()))
++	if !found {
++		return nil, errorsmod.Wrapf(iidtypes.ErrDidDocumentNotFound, "did document %s not found", fragment.Did())
++	}
++	if !doc.HasRelationship(iidtypes.NewBlockchainAccountID(signer), iidtypes.Authentication, iidtypes.AssertionMethod) {
++		return nil, errorsmod.Wrapf(iidtypes.ErrUnauthorized,
++			"signer %s is not authorized to act on behalf of did %s", signer, fragment.Did())
++	}
++	resolved, err := doc.GetVerificationMethodBlockchainAddress(fragment.String())
++	if err != nil {
++		return nil, errorsmod.Wrap(err, "Address not found in iid doc")
++	}
++	signerAddr, err := sdk.AccAddressFromBech32(signer)
++	if err != nil {
++		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address (%s)", err)
++	}
++	if !resolved.Equals(signerAddr) {
++		return nil, errorsmod.Wrapf(iidtypes.ErrUnauthorized,
++			"signer %s does not control account %s", signer, resolved.String())
++	}
++	return resolved, nil
++}
+diff --git a/x/entity/keeper/auth.go b/x/entity/keeper/auth.go
+new file mode 100644
+index 0000000..7fbc077
+--- /dev/null
++++ b/x/entity/keeper/auth.go
+@@ -0,0 +1,29 @@
++package keeper
++
++import (
++	errorsmod "cosmossdk.io/errors"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++
++	iidtypes "github.com/ixofoundation/ixo-blockchain/v7/x/iid/types"
++)
++
++// VerifyDidSignerAuthentication re-establishes, inside the keeper, the
++// signer→DID binding that the IID ante decorator performs at transaction
++// level: the signer must be an account the DID document authorises to act for
++// the DID.
++//
++// Every entity handler that authorises an action "as" a DID must call it,
++// because the IID ante decorator does not run on messages dispatched through
++// other paths (contract execution, delegated execution, or a direct module
++// call).
++func (k Keeper) VerifyDidSignerAuthentication(ctx sdk.Context, did, signerAddr string) error {
++	doc, found := k.IidKeeper.GetDidDocument(ctx, []byte(did))
++	if !found {
++		return errorsmod.Wrapf(iidtypes.ErrDidDocumentNotFound, "did document %s not found", did)
++	}
++	if !doc.HasRelationship(iidtypes.NewBlockchainAccountID(signerAddr), iidtypes.Authentication, iidtypes.AssertionMethod) {
++		return errorsmod.Wrapf(iidtypes.ErrUnauthorized,
++			"signer %s is not authorized to act on behalf of did %s", signerAddr, did)
++	}
++	return nil
++}
+diff --git a/x/entity/keeper/msg_server.go b/x/entity/keeper/msg_server.go
+index 2897f77..cb9f93c 100755
+--- a/x/entity/keeper/msg_server.go
++++ b/x/entity/keeper/msg_server.go
+@@ -162,6 +162,12 @@ func (s msgServer) UpdateEntity(goCtx context.Context, msg *types.MsgUpdateEntit
+ 		return nil, err
+ 	}
+ 
++	// Bind the signer to the acting DID in the keeper, so authorization holds
++	// on every dispatch path, not only on top-level signed transactions.
++	if err := s.Keeper.VerifyDidSignerAuthentication(ctx, msg.ControllerDid.Did(), msg.ControllerAddress); err != nil {
++		return nil, err
++	}
++
+ 	if err := iidkeeper.ExecuteOnDidWithRelationships(
+ 		ctx,
+ 		s.Keeper.IidKeeper,
+@@ -226,6 +232,12 @@ func (s msgServer) TransferEntity(goCtx context.Context, msg *types.MsgTransferE
+ 		return nil, err
+ 	}
+ 
++	// The IID-document rewrite below runs independently of the NFT transfer,
++	// so it needs its own signer→DID binding.
++	if err := s.Keeper.VerifyDidSignerAuthentication(ctx, msg.OwnerDid.Did(), msg.OwnerAddress); err != nil {
++		return nil, err
++	}
++
+ 	err = iidkeeper.ExecuteOnDidWithRelationships(
+ 		ctx,
+ 		s.Keeper.IidKeeper,
+@@ -311,6 +323,12 @@ func (s msgServer) UpdateEntityVerified(goCtx context.Context, msg *types.MsgUpd
+ 		return nil, errorsmod.Wrapf(types.ErrUpdateVerifiedFailed, "invalid relayer node did (%s)", msg.RelayerNodeDid.String())
+ 	}
+ 
++	// Pinning the relayer DID to entity state does not prove the caller
++	// controls it; re-establish the binding in the keeper.
++	if err := s.Keeper.VerifyDidSignerAuthentication(ctx, msg.RelayerNodeDid.Did(), msg.RelayerNodeAddress); err != nil {
++		return nil, err
++	}
++
+ 	entity.EntityVerified = msg.EntityVerified
+ 
+ 	types.UpdateEntityMetadata(entity.Metadata, ctx.TxBytes(), ctx.BlockTime())

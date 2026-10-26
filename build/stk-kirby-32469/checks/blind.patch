@@ -1,0 +1,285 @@
+diff -ruN a/config/api/routes/files.php b/config/api/routes/files.php
+--- a/config/api/routes/files.php	2026-10-26 03:25:04.000000000 +0000
++++ b/config/api/routes/files.php	2026-10-26 05:33:43.439680251 +0000
+@@ -1,5 +1,7 @@
+ <?php
+ 
++use Kirby\Exception\PermissionException;
++
+ // routing pattern to match all models with files
+ $filePattern   = '(account/|pages/[^/]+/|site/|users/[^/]+/|)files/(:any)';
+ $parentPattern = '(account|pages/[^/]+|site|users/[^/]+)/files';
+@@ -44,11 +46,20 @@
+ 		'pattern' => $parentPattern,
+ 		'method'  => 'POST',
+ 		'action'  => function (string $path) {
++			$parent = $this->parent($path);
++
++			// decide whether the finished file may be created before
++			// the uploader stores the first part of the upload
++			$this->assertFileCreatable(
++				$parent,
++				$this->requestBody('template')
++			);
++
+ 			// move_uploaded_file() not working with unit test
+ 			// @codeCoverageIgnoreStart
+-			return $this->upload(function ($source, $filename) use ($path) {
++			return $this->upload(function ($source, $filename) use ($parent) {
+ 				// move the source file to the content folder
+-				return $this->parent($path)->createFile([
++				return $parent->createFile([
+ 					'content' => [
+ 						'sort' => $this->requestBody('sort')
+ 					],
+@@ -110,9 +121,19 @@
+ 		'pattern' => $filePattern,
+ 		'method'  => 'POST',
+ 		'action'  => function (string $path, string $filename) {
++			$file = $this->file($path, $filename);
++
++			// the finished operation is replacing this very file,
++			// so this decision has to be made before anything is stored
++			if ($file->permissions()->can('replace') !== true) {
++				throw new PermissionException(
++					message: 'The file cannot be replaced'
++				);
++			}
++
+ 			// move the source file from the temp dir
+ 			return $this->upload(
+-				fn ($source) => $this->file($path, $filename)->replace($source, true)
++				fn ($source) => $file->replace($source, true)
+ 			);
+ 		}
+ 	],
+diff -ruN a/config/api/routes/users.php b/config/api/routes/users.php
+--- a/config/api/routes/users.php	2026-10-26 03:25:04.000000000 +0000
++++ b/config/api/routes/users.php	2026-10-26 05:33:46.399677545 +0000
+@@ -1,6 +1,7 @@
+ <?php
+ 
+ use Kirby\Cms\Find;
++use Kirby\Exception\PermissionException;
+ use Kirby\Filesystem\F;
+ 
+ /**
+@@ -86,9 +87,20 @@
+ 		],
+ 		'method'  => 'POST',
+ 		'action'  => function (string $id) {
++			$user = Find::user($id);
++
++			// an avatar is part of the account, so the finished
++			// operation is an account update; decide it before the
++			// uploader stores the first part of the upload
++			if ($user->permissions()->can('update') !== true) {
++				throw new PermissionException(
++					key: 'user.update.permission',
++					data: ['name' => $user->username()]
++				);
++			}
++
+ 			return $this->upload(
+-				function ($source, $filename) use ($id) {
+-					$user   = Find::user($id);
++				function ($source, $filename) use ($user) {
+ 					$method = $user->avatar() === null ? 'createAvatar' : 'replaceAvatar';
+ 
+ 					return $user->$method(
+diff -ruN a/config/fields/mixins/upload.php b/config/fields/mixins/upload.php
+--- a/config/fields/mixins/upload.php	2026-10-26 03:25:04.000000000 +0000
++++ b/config/fields/mixins/upload.php	2026-10-26 05:33:49.235674954 +0000
+@@ -62,6 +62,12 @@
+ 			$parent   = $this->uploadParent($params['parent'] ?? null);
+ 			$template = $params['template'] ?? null;
+ 
++			// the file type declared by the field governs the whole
++			// upload, so it has to be judged here instead of the type
++			// a request body might claim; decide it before the
++			// uploader stores the first part of the upload
++			$api->assertFileCreatable($parent, $template);
++
+ 			return $api->upload(function ($source, $filename, $template) use ($parent, $map) {
+ 				$props = [
+ 					'source'   => $source,
+diff -ruN a/src/Api/Upload.php b/src/Api/Upload.php
+--- a/src/Api/Upload.php	2026-10-26 03:25:04.000000000 +0000
++++ b/src/Api/Upload.php	2026-10-26 05:34:04.547660963 +0000
+@@ -229,20 +229,44 @@
+ 		// prefix with id while file isn't completely uploaded yet
+ 		$id       = $this->api->requestHeaders('Upload-Id', '');
+ 		$id       = static::chunkId($id);
++		$offset   = (int)$this->api->requestHeaders('Upload-Offset');
+ 		$total    = (int)$this->api->requestHeaders('Upload-Length');
+ 		$filename = basename($filename);
++		$template = $this->template ?? $this->api->requestBody('template');
+ 		$tmpRoot  = $dir . '/' . $id . '-' . $filename;
+ 
++		// sidecar holding the declaration of the first chunk; it is
++		// compared against by every following chunk of the upload
++		$metaRoot = $tmpRoot . '.meta';
++
+ 		// validate various aspects of the request
+ 		// to ensure the chunk isn't trying to do malicious actions
+ 		static::validateChunk(
+ 			source:   $source,
+ 			tmp:      $tmpRoot,
++			meta:     $metaRoot,
+ 			total:    $total,
+-			offset:   $this->api->requestHeaders('Upload-Offset'),
+-			template: $this->template ?? $this->api->requestBody('template'),
++			offset:   $offset,
++			template: $template,
++			filename: $filename,
+ 		);
+ 
++		if ($offset === 0) {
++			// a first chunk that already carries the whole file can be
++			// handed to the caller directly, nothing needs to be staged
++			if (F::size($source) >= $total) {
++				return $source;
++			}
++
++			// the first chunk fixes the declared file type and the total
++			// length for the rest of the upload; a later chunk that relies
++			// on different values is refused by `::validateChunk()`
++			F::write($metaRoot, json_encode([
++				'template' => $template,
++				'total'    => $total
++			]));
++		}
++
+ 		// stream chunk content and append it to partial file
+ 		stream_copy_to_stream(
+ 			fopen($source, 'r'),
+@@ -258,9 +282,12 @@
+ 			return null;
+ 		}
+ 
+-		// remove id from partial filename now the file is complete,
+-		// so we can pass the path from the tmp upload directory
+-		// as new source path for the file back to the API upload method
++		// the upload is complete: its declaration sidecar is no longer
++		// needed and the id prefix can be removed from the filename, so
++		// we can pass the path from the tmp upload directory as new
++		// source path for the file back to the API upload method
++		F::remove($metaRoot);
++
+ 		rename(
+ 			$tmpRoot,
+ 			$source = $dir . '/' . $filename
+@@ -342,18 +369,26 @@
+ 	 * @throws \Kirby\Exception\DuplicateException Duplicate first chunk (same filename and id)
+ 	 * @throws \Kirby\Exception\InvalidArgumentException Chunk offset does not match existing tmp file
+ 	 * @throws \Kirby\Exception\InvalidArgumentException The maximum file size for this blueprint was exceeded
++	 * @throws \Kirby\Exception\InvalidArgumentException Declared template or total length changed between chunks
+ 	 * @throws \Kirby\Exception\NotFoundException Subsequent chunk has no  existing tmp file
+ 	 */
+ 	protected static function validateChunk(
+ 		string $source,
+ 		string $tmp,
++		string $meta,
+ 		int $total,
+ 		int $offset,
+-		string|null $template = null
++		string|null $template = null,
++		string|null $filename = null
+ 	): void {
++		// judge the file that will actually be stored by its final name;
++		// the id-prefixed name of the temporary chunk file is not what
++		// the file is going to be called
++		$filename = basename($filename ?? $tmp);
++
+ 		$file = new File([
+ 			'parent'   => new Page(['slug' => 'tmp']),
+-			'filename' => $filename = basename($tmp),
++			'filename' => $filename,
+ 			'template' => $template
+ 		]);
+ 
+@@ -393,6 +428,23 @@
+ 		}
+ 
+ 		// validate subsequent chunks:
++		// the declaration of the first chunk governs the whole upload;
++		// a later chunk that relies on a different template or a
++		// different total length must not be able to substitute them
++		$declaration = F::exists($meta) === true
++			? json_decode(F::read($meta), true)
++			: null;
++
++		if (
++			is_array($declaration) === false ||
++			($declaration['template'] ?? null) !== $template ||
++			($declaration['total'] ?? null) !== $total
++		) {
++			throw new InvalidArgumentException(
++				message: 'The declared file template and upload length must not change between chunks'
++			);
++		}
++
+ 		// no tmp in place
+ 		if (F::exists($tmp) === false) {
+ 			throw new NotFoundException(
+diff -ruN a/src/Cms/Api.php b/src/Cms/Api.php
+--- a/src/Cms/Api.php	2026-10-26 03:25:04.000000000 +0000
++++ b/src/Cms/Api.php	2026-10-26 05:33:37.831685375 +0000
+@@ -3,6 +3,7 @@
+ namespace Kirby\Cms;
+ 
+ use Kirby\Api\Api as BaseApi;
++use Kirby\Api\Upload;
+ use Kirby\Exception\NotFoundException;
+ use Kirby\Exception\PermissionException;
+ use Kirby\Form\Form;
+@@ -85,6 +86,49 @@
+ 	}
+ 
+ 	/**
++	 * Ensures that the current user may create the file that an
++	 * upload to the given parent will produce
++	 *
++	 * This has to be decided before any part of the upload is
++	 * stored, otherwise a refused upload would still leave its
++	 * first part behind in the upload staging area.
++	 *
++	 * @param \Kirby\Cms\ModelWithContent $parent Parent model of the future file
++	 * @param string|null $template Declared file template of the upload
++	 * @throws \Kirby\Exception\PermissionException If the file cannot be created
++	 */
++	public function assertFileCreatable(
++		ModelWithContent $parent,
++		string|null $template = null
++	): void {
++		foreach ($this->requestFiles() as $upload) {
++			// files that fail with an upload error are not checked
++			// here; the uploader reports their own error instead
++			if (
++				is_array($upload) === false ||
++				isset($upload['tmp_name']) === false ||
++				($upload['error'] ?? 0) !== 0
++			) {
++				continue;
++			}
++
++			// judge exactly the file that the upload will create:
++			// same parent, same filename, same declared template
++			$file = new File([
++				'parent'   => $parent,
++				'filename' => Upload::filename($upload),
++				'template' => $template
++			]);
++
++			if ($file->permissions()->can('create') !== true) {
++				throw new PermissionException(
++					message: 'The file cannot be created'
++				);
++			}
++		}
++	}
++
++	/**
+ 	 * Returns the file object for the given
+ 	 * parent path and filename
+ 	 *

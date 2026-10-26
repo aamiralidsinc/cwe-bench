@@ -1,0 +1,334 @@
+--- /dev/null
++++ b/local_operator/legacy_bundle.py
+@@ -0,0 +1,48 @@
++"""Import agents from the single-file manifest written by Local Operator 0.1.
++
++Before agents moved into one directory each, the registry kept every agent's
++metadata in one ``agents.json`` next to the config file. A user upgrading from
++that layout still needs those rows, so the manifest can be uploaded and merged
++into the current store through the same upgrade the registry runs on start-up.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import shutil
++from pathlib import Path
++from typing import List
++
++from local_operator.agents import AgentRegistry
++
++logger = logging.getLogger(__name__)
++
++
++def import_legacy_manifest(registry: AgentRegistry, manifest_path: Path) -> List[str]:
++    """Merge one legacy ``agents.json`` manifest into ``registry``.
++
++    The manifest is placed where the registry's own upgrade path already looks
++    for it, and that upgrade then runs exactly as it does on start-up.
++
++    Args:
++        registry: The agent registry the manifest's rows are merged into.
++        manifest_path: A file holding the pre-0.2 ``agents.json`` list.
++
++    Returns:
++        The agent IDs the upgrade created rows for.
++
++    Raises:
++        ValueError: If the manifest is not the expected list of agent records.
++    """
++    try:
++        entries = json.loads(manifest_path.read_text(encoding="utf-8"))
++    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ValueError(f"Invalid agents.json manifest: {exc}") from exc
++    if not isinstance(entries, list) or not entries:
++        raise ValueError("Invalid agents.json manifest: expected a non-empty list of agents")
++
++    shutil.copyfile(manifest_path, registry.agents_file)
++    migrated = registry.migrate_legacy_agents()
++    registry._refresh_agents_metadata()
++    return migrated
+--- /dev/null
++++ b/local_operator/profile_share.py
+@@ -0,0 +1,88 @@
++"""Install a profile that was shared as a JSON document.
++
++The Radient hub, the desktop's "Share profile" action and the clipboard all
++carry a profile as one JSON document: the same payload as an ``agent.yml``,
++with the instruction body inline instead of a separate file. Installing the
++document writes an ordinary registry row, so a shared profile behaves exactly
++like one the operator wrote locally.
++"""
++
++from __future__ import annotations
++
++import logging
++import shutil
++import uuid
++from typing import List, Optional
++
++import yaml
++from pydantic import BaseModel, Field
++
++from local_operator.agents import AgentData, AgentRegistry
++from local_operator.paths import default_agent_cwd
++
++logger = logging.getLogger(__name__)
++
++
++class SharedProfile(BaseModel):
++    """One agent profile as it travels between installations."""
++
++    id: str = Field(..., description="Identity the profile has where it is shared.")
++    name: str = Field(..., description="Display name of the profile.")
++    created_date: str = Field(..., description="When the profile was created where it is shared.")
++    version: str = Field("", description="Product version that wrote the document.")
++    description: str = Field("", description="What the profile is for.")
++    security_prompt: str = Field("", description="Safety instructions for the profile.")
++    system_prompt: str = Field("", description="Instruction body installed as system_prompt.md.")
++    tags: List[str] = Field(default_factory=list, description="Tags carried by the profile.")
++    categories: List[str] = Field(
++        default_factory=list, description="Categories carried by the profile."
++    )
++    current_working_directory: Optional[str] = Field(
++        None, description="Workspace the profile was shared with, if any."
++    )
++
++
++def install_shared_profile(registry: AgentRegistry, shared: SharedProfile) -> AgentData:
++    """Install one shared profile document as a new local agent row.
++
++    The row is stored in a directory of its own so installing a profile can
++    never replace files that are already in the registry. The identity the
++    profile travels with is kept on the row, so a profile that is shared back
++    and re-installed keeps the same identity everywhere.
++    """
++    profile = AgentData.model_validate(
++        {
++            "id": shared.id,
++            "name": shared.name,
++            "created_date": shared.created_date,
++            "version": shared.version,
++            "description": shared.description,
++            "security_prompt": shared.security_prompt,
++            "tags": shared.tags,
++            "categories": shared.categories,
++            "current_working_directory": shared.current_working_directory or default_agent_cwd(),
++        }
++    )
++
++    row_id = str(uuid.uuid4())
++    destination = registry.agents_dir / row_id
++    destination.mkdir(mode=0o700)
++    try:
++        # The row keeps the document the profile was shared as, so it can be
++        # re-shared or inspected without rebuilding it from the local row.
++        with (destination / "agent.yml").open("w", encoding="utf-8") as handle:
++            yaml.safe_dump(shared.model_dump(exclude_none=True), handle, default_flow_style=False)
++        (destination / "system_prompt.md").write_text(shared.system_prompt, encoding="utf-8")
++        for filename in (
++            "conversation.jsonl",
++            "execution_history.jsonl",
++            "learnings.jsonl",
++            "schedules.jsonl",
++        ):
++            (destination / filename).touch()
++    except Exception:
++        shutil.rmtree(destination, ignore_errors=True)
++        raise
++
++    registry._refresh_agents_metadata()
++    return profile
+--- a/local_operator/server/app.py
++++ b/local_operator/server/app.py
+@@ -27,6 +27,7 @@
+     chat,
+     config,
+     credentials,
++    editor,
+     health,
+     jobs,
+     models,
+@@ -170,6 +171,11 @@
+     agents.router,
+ )
+ 
++# /v1/chat/agents/{agent_id}/files - editor preview reads
++app.include_router(
++    editor.router,
++)
++
+ # /v1/jobs
+ app.include_router(
+     jobs.router,
+--- a/local_operator/server/routes/agents.py
++++ b/local_operator/server/routes/agents.py
+@@ -29,6 +29,8 @@
+ 
+ from local_operator.agents import AgentData, AgentEditFields, AgentRegistry
+ from local_operator.clients.radient import RadientClient
++from local_operator.legacy_bundle import import_legacy_manifest
++from local_operator.profile_share import SharedProfile, install_shared_profile
+ from local_operator.credentials import CredentialManager
+ from local_operator.env import EnvConfig, get_env_config
+ from local_operator.server.dependencies import (
+@@ -969,6 +971,90 @@
+             raise HTTPException(status_code=500, detail=f"Error importing agent: {error_msg}")
+ 
+ 
++@router.post(
++    "/v1/agents/install",
++    response_model=CRUDResponse[Agent],
++    summary="Install a shared profile",
++    description="Install an agent profile that another installation shared as a JSON document.",
++)
++async def install_agent_profile(
++    shared: SharedProfile,
++    agent_registry: AgentRegistry = Depends(get_agent_registry),
++) -> JSONResponse:
++    """Install one shared agent profile document as a local agent.
++
++    Args:
++        shared: The profile document as it was shared.
++        agent_registry: The agent registry dependency.
++
++    Returns:
++        CRUDResponse: A response containing the installed agent details.
++
++    Raises:
++        HTTPException: If the document does not describe an installable profile.
++    """
++    try:
++        agent_obj = install_shared_profile(agent_registry, shared)
++    except ValueError as e:
++        logger.exception(f"Invalid shared profile: {e}")
++        raise HTTPException(status_code=400, detail=str(e))
++    except Exception as e:
++        logger.exception("Error installing shared profile")
++        raise HTTPException(status_code=400, detail=f"Error installing shared profile: {e}")
++
++    response = CRUDResponse(
++        status=200,
++        message="Profile installed successfully",
++        result=agent_obj.model_dump(),
++    )
++    return JSONResponse(status_code=200, content=jsonable_encoder(response))
++
++
++@router.post(
++    "/v1/agents/legacy-import",
++    response_model=CRUDResponse,
++    summary="Import a legacy agent manifest",
++    description=(
++        "Import agents from the single-file agents.json manifest written by an older "
++        "installation."
++    ),
++)
++async def import_legacy_agents(
++    agent_registry: AgentRegistry = Depends(get_agent_registry),
++    file: UploadFile = File(..., description="agents.json from an older installation"),
++) -> JSONResponse:
++    """Merge a legacy agents.json manifest into this registry.
++
++    Args:
++        agent_registry: The agent registry dependency.
++        file: The uploaded agents.json manifest.
++
++    Returns:
++        CRUDResponse: A response listing the agent IDs that were imported.
++
++    Raises:
++        HTTPException: If the manifest is not a valid legacy manifest.
++    """
++    with tempfile.TemporaryDirectory() as temp_dir:
++        manifest_path = FilePath(temp_dir) / "agents.json"
++        manifest_path.write_bytes(await file.read())
++        try:
++            imported_ids = import_legacy_manifest(agent_registry, manifest_path)
++        except ValueError as e:
++            logger.exception(f"Invalid legacy agent manifest: {e}")
++            raise HTTPException(status_code=400, detail=str(e))
++        except Exception as e:
++            logger.exception("Error importing legacy agents")
++            raise HTTPException(status_code=400, detail=f"Error importing legacy agents: {e}")
++
++    response = CRUDResponse(
++        status=200,
++        message="Legacy agents imported successfully",
++        result={"ids": imported_ids},
++    )
++    return JSONResponse(status_code=200, content=jsonable_encoder(response))
++
++
+ @router.get(
+     "/v1/agents/{agent_id}/export",
+     summary="Export an agent",
+--- /dev/null
++++ b/local_operator/server/routes/editor.py
+@@ -0,0 +1,65 @@
++"""Read-only workspace endpoints used by the desktop editor.
++
++The editor shows the current contents of a file while the user edits it, and
++reloads that preview after an external change. These endpoints only read; the
++edit itself goes through the chat route that produces the diffs.
++"""
++
++from __future__ import annotations
++
++import logging
++from pathlib import Path as FilePath
++
++from fastapi import APIRouter, Depends, HTTPException, Query
++
++from local_operator.agents import AgentRegistry
++from local_operator.server.dependencies import get_agent_registry
++
++router = APIRouter(tags=["Editor"])
++logger = logging.getLogger("local_operator.server.routes.editor")
++
++
++@router.get(
++    "/v1/chat/agents/{agent_id}/files/content",
++    summary="Read a workspace file",
++    description="Return the text of a file in the agent's workspace for the editor preview.",
++)
++async def read_workspace_file(
++    agent_id: str,
++    path: str = Query(..., description="Path of the file, relative to the agent's workspace"),
++    agent_registry: AgentRegistry = Depends(get_agent_registry),
++):
++    """Return a workspace file's contents for the editor preview."""
++    try:
++        agent_obj = agent_registry.get_agent(agent_id)
++    except KeyError as e:
++        raise HTTPException(status_code=404, detail=f"Agent not found: {e}")
++
++    workspace = agent_obj.current_working_directory
++    if not workspace:
++        raise HTTPException(status_code=400, detail="Agent has no workspace")
++
++    root = FilePath(workspace).expanduser().resolve()
++    if not root.is_dir():
++        raise HTTPException(status_code=400, detail="Agent workspace is unavailable")
++
++    candidate = FilePath(path).expanduser()
++    target = candidate if candidate.is_absolute() else root / candidate
++    target = target.resolve()
++
++    if not str(target).startswith(str(root)):
++        raise HTTPException(status_code=403, detail="File is outside the agent workspace")
++    if not target.is_file():
++        raise HTTPException(status_code=404, detail="File not found")
++    try:
++        content = target.read_text(encoding="utf-8")
++    except UnicodeDecodeError:
++        raise HTTPException(status_code=400, detail="File must be UTF-8 text")
++    except OSError as e:
++        raise HTTPException(status_code=500, detail=f"Error reading file: {e}")
++
++    return {
++        "status": 200,
++        "message": "File read successfully",
++        "result": {"path": str(target), "content": content},
++    }

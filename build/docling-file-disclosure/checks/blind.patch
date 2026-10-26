@@ -1,0 +1,433 @@
+diff -ruN a/docling/backend/json/docling_json_backend.py b/docling/backend/json/docling_json_backend.py
+--- a/docling/backend/json/docling_json_backend.py	2026-10-17 17:45:45.135301846 +0000
++++ b/docling/backend/json/docling_json_backend.py	2026-10-17 17:49:47.651127354 +0000
+@@ -12,6 +12,7 @@
+ from docling.backend.abstract_backend import DeclarativeDocumentBackend
+ from docling.datamodel.base_models import InputFormat
+ from docling.datamodel.document import InputDocument
++from docling.datamodel.image_refs import strip_local_image_refs
+ 
+ 
+ class DoclingJSONBackend(DeclarativeDocumentBackend):
+@@ -54,7 +55,11 @@
+                 json_data = self.path_or_stream.getvalue().removeprefix(codecs.BOM_UTF8)
+             else:
+                 raise RuntimeError(f"Unexpected: {type(self.path_or_stream)=}")
+-            return DoclingDocument.model_validate_json(json_data=json_data)
++            doc = DoclingDocument.model_validate_json(json_data=json_data)
++            # The JSON is untrusted content: never let it point images at
++            # local files, which exports would otherwise read and embed.
++            strip_local_image_refs(doc)
++            return doc
+         except Exception as e:
+             return e
+ 
+diff -ruN a/docling/backend/xml/doclang_archive_backend.py b/docling/backend/xml/doclang_archive_backend.py
+--- a/docling/backend/xml/doclang_archive_backend.py	2026-10-17 17:45:45.143301839 +0000
++++ b/docling/backend/xml/doclang_archive_backend.py	2026-10-17 17:50:05.191114765 +0000
+@@ -13,6 +13,7 @@
+ from docling.backend.abstract_backend import DeclarativeDocumentBackend
+ from docling.datamodel.base_models import InputFormat
+ from docling.datamodel.document import InputDocument
++from docling.datamodel.image_refs import embed_image_from_dir, strip_local_image_refs
+ 
+ _DCLX_MIMETYPE = "application/zip"
+ 
+@@ -42,19 +43,26 @@
+ 
+     def _get_doc_or_err(self) -> Union[DoclingDocument, Exception]:
+         try:
++            # Always extract into a private temporary directory: only image
++            # files unpacked there come from the archive itself. They are
++            # inlined, and any other local image reference is dropped, so the
++            # archive cannot pull host files into the output.
++            self._temp_dir = Path(tempfile.mkdtemp(prefix="docling_dclx_"))
+             if isinstance(self.path_or_stream, Path):
+-                doc = DoclingDocument.load_from_doclang_archive(self.path_or_stream)
++                archive_path = self.path_or_stream
+             elif isinstance(self.path_or_stream, BytesIO):
+-                self._temp_dir = Path(tempfile.mkdtemp(prefix="docling_dclx_"))
+-                archive_path = self._temp_dir / (self.file.name or "document.dclx")
++                input_dir = self._temp_dir / "input"
++                input_dir.mkdir()
++                archive_path = input_dir / (self.file.name or "document.dclx")
+                 archive_path.write_bytes(self.path_or_stream.getvalue())
+-                artifacts_dir = self._temp_dir / "artifacts"
+-                doc = DoclingDocument.load_from_doclang_archive(
+-                    archive_path,
+-                    artifacts_dir=artifacts_dir,
+-                )
+             else:
+                 raise RuntimeError(f"Unexpected: {type(self.path_or_stream)=}")
++            artifacts_dir = self._temp_dir / "artifacts"
++            doc = DoclingDocument.load_from_doclang_archive(
++                archive_path,
++                artifacts_dir=artifacts_dir,
++            )
++            strip_local_image_refs(doc, embed_image_from_dir(artifacts_dir))
+ 
+             doc.origin = DocumentOrigin(
+                 filename=self.file.name or "file",
+@@ -64,6 +72,8 @@
+             return doc
+         except Exception as e:
+             return e
++        finally:
++            self._remove_temp_dir()
+ 
+     @override
+     def convert(self) -> DoclingDocument:
+@@ -74,7 +84,10 @@
+ 
+     @override
+     def unload(self) -> None:
++        self._remove_temp_dir()
++        super().unload()
++
++    def _remove_temp_dir(self) -> None:
+         if self._temp_dir is not None and self._temp_dir.exists():
+             shutil.rmtree(self._temp_dir)
+-            self._temp_dir = None
+-        super().unload()
++        self._temp_dir = None
+diff -ruN a/docling/backend/xml/doclang_backend.py b/docling/backend/xml/doclang_backend.py
+--- a/docling/backend/xml/doclang_backend.py	2026-10-17 17:45:45.143301839 +0000
++++ b/docling/backend/xml/doclang_backend.py	2026-10-17 17:49:47.655127352 +0000
+@@ -12,6 +12,7 @@
+ from docling.backend.abstract_backend import DeclarativeDocumentBackend
+ from docling.datamodel.base_models import InputFormat
+ from docling.datamodel.document import InputDocument
++from docling.datamodel.image_refs import strip_local_image_refs
+ 
+ 
+ class DocLangDocumentBackend(DeclarativeDocumentBackend):
+@@ -46,6 +47,7 @@
+                 raise RuntimeError(f"Unexpected: {type(self.path_or_stream)=}")
+ 
+             doc = DocLangDocDeserializer().deserialize_str(text)
++            strip_local_image_refs(doc)
+             doc.origin = DocumentOrigin(
+                 filename=self.file.name or "file",
+                 mimetype="application/xml",
+diff -ruN a/docling/datamodel/document.py b/docling/datamodel/document.py
+--- a/docling/datamodel/document.py	2026-10-17 17:45:45.147301836 +0000
++++ b/docling/datamodel/document.py	2026-10-17 17:50:11.047110562 +0000
+@@ -73,6 +73,7 @@
+     MimeTypeToFormat,
+     Page,
+ )
++from docling.datamodel.image_refs import strip_local_image_refs
+ from docling.datamodel.settings import DocumentLimits
+ from docling.exceptions import DocumentLoadError
+ from docling.utils.pdf_outline import _PdfOutlineItem
+@@ -575,6 +576,11 @@
+             ):
+                 document = DoclingDocument.model_validate(data)
+ 
++        # The archive content is untrusted: drop image references to local
++        # files so that later exports cannot embed host files.
++        strip_local_image_refs(document)
++        strip_local_image_refs(pages)
++
+         return cls(
+             version=version_info,
+             timestamp=timestamp,
+diff -ruN a/docling/datamodel/image_refs.py b/docling/datamodel/image_refs.py
+--- a/docling/datamodel/image_refs.py	1970-01-01 00:00:00.000000000 +0000
++++ b/docling/datamodel/image_refs.py	2026-10-17 17:53:56.098949309 +0000
+@@ -0,0 +1,167 @@
++# SPDX-FileCopyrightText: The Docling Contributors
++# SPDX-License-Identifier: MIT
++
++"""Neutralize local-file image references in deserialized document data.
++
++Serialized documents (Docling JSON, DocLang, archives, service results) are
++untrusted content. An ``ImageRef`` whose ``uri`` points at the local filesystem
++(a plain path or a ``file:`` URL) would make docling read that file when the
++image is later materialized, e.g. when exporting with embedded images, and so
++leak host files into the output. Only self-contained ``data:`` URIs and remote
++``http``/``https`` links are kept as is.
++"""
++
++import logging
++import types
++import typing
++from collections.abc import Callable
++from pathlib import Path
++from typing import Any, Optional, Union
++
++from docling_core.types.doc import ImageRef
++from PIL import Image as PILImage
++from pydantic import AnyUrl, BaseModel
++
++_log = logging.getLogger(__name__)
++
++_SAFE_URI_SCHEMES = frozenset({"data", "http", "https"})
++
++# Given an unsafe ImageRef, return a safe replacement, or None to drop it.
++LocalImageResolver = Callable[[ImageRef], Optional[ImageRef]]
++
++
++def is_local_image_ref(image_ref: ImageRef) -> bool:
++    """Whether materializing ``image_ref`` could read from the local filesystem."""
++    uri = image_ref.uri
++    if isinstance(uri, AnyUrl):
++        return (uri.scheme or "").lower() not in _SAFE_URI_SCHEMES
++    if isinstance(uri, str):
++        scheme, sep, _ = uri.partition(":")
++        return not sep or scheme.lower() not in _SAFE_URI_SCHEMES
++    # Path or anything unexpected
++    return True
++
++
++def embed_image_from_dir(base_dir: Path) -> LocalImageResolver:
++    """Resolver inlining image files located inside ``base_dir``.
++
++    Relative paths are resolved against ``base_dir``. Paths escaping
++    ``base_dir`` (after following symlinks), URLs such as ``file:`` and files
++    that are not images are dropped.
++    """
++    base_resolved = base_dir.resolve()
++
++    def resolve(image_ref: ImageRef) -> Optional[ImageRef]:
++        # Only plain paths are resolved; file: and other URLs are dropped.
++        path = image_ref.uri
++        if not isinstance(path, Path):
++            return None
++        candidate = path if path.is_absolute() else base_dir / path
++        resolved = candidate.resolve()
++        if base_resolved not in resolved.parents or not resolved.is_file():
++            return None
++        try:
++            with PILImage.open(resolved) as pil_image:
++                pil_image.load()
++                return ImageRef.from_pil(pil_image.copy(), dpi=image_ref.dpi)
++        except Exception as exc:
++            _log.warning(f"Could not load referenced image {path}: {exc}")
++            return None
++
++    return resolve
++
++
++def _allows_none(annotation: Any) -> bool:
++    origin = typing.get_origin(annotation)
++    if origin is Union or origin is types.UnionType:
++        return type(None) in typing.get_args(annotation)
++    return annotation is None or annotation is type(None) or annotation is Any
++
++
++def _fix(image_ref: ImageRef, resolver: Optional[LocalImageResolver]):
++    if not is_local_image_ref(image_ref):
++        return image_ref
++    replacement = resolver(image_ref) if resolver is not None else None
++    if replacement is None:
++        _log.warning(
++            "Dropping image reference to a local file in untrusted document data."
++        )
++    elif is_local_image_ref(replacement):
++        raise ValueError("Image resolver returned a local image reference.")
++    return replacement
++
++
++def _walk(obj: Any, resolver: Optional[LocalImageResolver], seen: set[int]) -> None:
++    if id(obj) in seen:
++        return
++    if isinstance(obj, BaseModel):
++        seen.add(id(obj))
++        fields = type(obj).model_fields
++        # Read the stored values directly: going through attribute access
++        # would trigger deprecation warnings for deprecated fields.
++        values = {name: obj.__dict__.get(name) for name in fields}
++        values.update(obj.model_extra or {})
++        for name, value in values.items():
++            if isinstance(value, ImageRef):
++                new_value = _fix(value, resolver)
++                if new_value is value:
++                    continue
++                if new_value is None and name in fields:
++                    if not _allows_none(fields[name].annotation):
++                        raise ValueError(
++                            "Document references an image on the local "
++                            f"filesystem in required field {name!r}."
++                        )
++                if name in fields:
++                    object.__setattr__(obj, name, new_value)
++                else:
++                    obj.model_extra[name] = new_value  # type: ignore[index]
++            else:
++                _walk(value, resolver, seen)
++    elif isinstance(obj, list):
++        seen.add(id(obj))
++        kept = []
++        for value in obj:
++            if isinstance(value, ImageRef):
++                value = _fix(value, resolver)
++                if value is None:
++                    continue
++            else:
++                _walk(value, resolver, seen)
++            kept.append(value)
++        obj[:] = kept
++    elif isinstance(obj, dict):
++        seen.add(id(obj))
++        for key in list(obj):
++            value = obj[key]
++            if isinstance(value, ImageRef):
++                value = _fix(value, resolver)
++                if value is None:
++                    del obj[key]
++                else:
++                    obj[key] = value
++            else:
++                _walk(value, resolver, seen)
++    elif isinstance(obj, (tuple, set, frozenset)):
++        seen.add(id(obj))
++        for value in obj:
++            if isinstance(value, ImageRef) and is_local_image_ref(value):
++                raise ValueError(
++                    "Document references an image on the local filesystem."
++                )
++            _walk(value, resolver, seen)
++
++
++def strip_local_image_refs(
++    obj: Any, resolver: Optional[LocalImageResolver] = None
++) -> None:
++    """Remove (in place) every image reference to the local filesystem.
++
++    Walks ``obj`` (a ``DoclingDocument`` or any pydantic model / container
++    holding one) and, for each ``ImageRef`` that is neither a ``data:`` URI
++    nor an ``http``/``https`` link, replaces it with ``resolver(ref)`` if a
++    resolver is given and it returns a value, or otherwise leaves the image
++    out. Raises ``ValueError`` if such a reference sits where an image is
++    mandatory.
++    """
++    _walk(obj, resolver, set())
+diff -ruN a/docling/pipeline/vlm_pipeline.py b/docling/pipeline/vlm_pipeline.py
+--- a/docling/pipeline/vlm_pipeline.py	2026-10-17 17:45:45.179301813 +0000
++++ b/docling/pipeline/vlm_pipeline.py	2026-10-17 17:50:20.723103619 +0000
+@@ -44,6 +44,7 @@
+     VlmStopReason,
+ )
+ from docling.datamodel.document import ConversionResult, InputDocument
++from docling.datamodel.image_refs import strip_local_image_refs
+ from docling.datamodel.pipeline_options import (
+     VlmConvertOptions,
+     VlmPipelineOptions,
+@@ -559,7 +560,10 @@
+             return DoclingDocument(name=f"page_{page.page_no}")
+ 
+         try:
+-            return DocLangDocDeserializer().deserialize_str(fragment)
++            doc = DocLangDocDeserializer().deserialize_str(fragment)
++            # Model output is untrusted: never reference local image files.
++            strip_local_image_refs(doc)
++            return doc
+         except Exception as exc:
+             conv_res.errors.append(
+                 ErrorItem(
+diff -ruN a/docling/service_client/client.py b/docling/service_client/client.py
+--- a/docling/service_client/client.py	2026-10-17 17:45:45.179301813 +0000
++++ b/docling/service_client/client.py	2026-10-17 17:50:24.763100721 +0000
+@@ -28,10 +28,9 @@
+ from urllib.parse import urlencode, urlparse
+ 
+ import httpx
+-from docling_core.types.doc import DoclingDocument, ImageRef, PictureItem
++from docling_core.types.doc import DoclingDocument, ImageRef
+ from docling_core.types.doc.common.constants import CURRENT_VERSION
+ from docling_core.types.io import DocumentStream
+-from PIL import Image as PILImage
+ from pydantic import AnyHttpUrl, SecretBytes, SecretStr, TypeAdapter, ValidationError
+ 
+ from docling.backend.noop_backend import NoOpBackend
+@@ -46,6 +45,7 @@
+     OutputFormat,
+ )
+ from docling.datamodel.document import AssembledUnit, ConversionResult, InputDocument
++from docling.datamodel.image_refs import embed_image_from_dir, strip_local_image_refs
+ from docling.datamodel.service.chunking import (
+     HierarchicalChunkerOptions,
+     HybridChunkerOptions,
+@@ -428,6 +428,9 @@
+         document = payload.document.json_content
+         if document is None:
+             document = DoclingDocument(name=Path(source_name).stem)
++        else:
++            # Server-supplied document data: never reference local files.
++            strip_local_image_refs(document)
+ 
+         return ConversionResult(
+             input=input_doc,
+@@ -1780,8 +1783,11 @@
+         if artifact_type == "resource_bundle":
+             return self._reconstruct_document_from_bundle(content)
+         # EMBEDDED / PLACEHOLDER JSON is self-contained (inline data: URIs or no
+-        # images), so no artifact resolution is required.
+-        return DoclingDocument.model_validate_json(content)
++        # images), so no artifact resolution is required. Any reference to a
++        # local file is server-supplied and must not be followed.
++        document = DoclingDocument.model_validate_json(content)
++        strip_local_image_refs(document)
++        return document
+ 
+     def _reconstruct_document_from_bundle(self, bundle_bytes: bytes) -> DoclingDocument:
+         with tempfile.TemporaryDirectory(prefix="docling-bundle-") as tmp_dir:
+@@ -1827,41 +1833,28 @@
+     def _embed_referenced_images(
+         self, document: DoclingDocument, base_dir: Path
+     ) -> None:
+-        """Inline images referenced as relative files under ``base_dir``.
++        """Inline images referenced as files under ``base_dir``.
+ 
+-        This mirrors docling-core's ``DoclingDocument._with_embedded_pictures()``
+-        but is reimplemented here because that helper only embeds picture images
+-        and resolves relative ``Path`` URIs against the process working directory.
+-        Bundle artifacts are extracted into a temporary directory, so both
+-        picture and page image references must be resolved against ``base_dir``
+-        explicitly before being inlined.
++        Bundle artifacts are extracted into a temporary directory, so image
++        references (on pictures, pages and any other item) are resolved against
++        ``base_dir`` explicitly before being inlined. The document JSON is
++        server-supplied: a reference that escapes the extract dir (e.g.
++        ``../../secret.png``, an absolute path or a ``file:`` URL) must not
++        read arbitrary local files and rejects the bundle.
+         """
+ 
+-        base_resolved = base_dir.resolve()
++        embed = embed_image_from_dir(base_dir)
+ 
+-        def embed(image_ref: ImageRef) -> ImageRef:
+-            uri = image_ref.uri
+-            if not isinstance(uri, Path) or uri.is_absolute():
+-                return image_ref
+-            resolved = (base_dir / uri).resolve()
+-            # Containment guard: the document JSON is server-supplied, so a
+-            # relative URI like ``../../secret.png`` must not escape the extract
+-            # dir and read arbitrary local image files. The zip-slip guard only
+-            # validates ZIP members, not the URIs the JSON references.
+-            if resolved != base_resolved and base_resolved not in resolved.parents:
++        def resolve(image_ref: ImageRef) -> ImageRef:
++            embedded = embed(image_ref)
++            if embedded is None:
+                 raise ArtifactDownloadError(
+-                    f"Resource bundle references an image outside the bundle: {uri}"
++                    "Resource bundle references an image outside the bundle: "
++                    f"{image_ref.uri}"
+                 )
+-            with PILImage.open(resolved) as pil_image:
+-                pil_image.load()
+-                return ImageRef.from_pil(pil_image.copy(), dpi=image_ref.dpi)
+-
+-        for item, _level in document.iterate_items(with_groups=False):
+-            if isinstance(item, PictureItem) and item.image is not None:
+-                item.image = embed(item.image)
+-        for page in document.pages.values():
+-            if page.image is not None:
+-                page.image = embed(page.image)
++            return embedded
++
++        strip_local_image_refs(document, resolve)
+ 
+     def _build_conversion_result_from_artifact_item(
+         self,

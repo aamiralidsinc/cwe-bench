@@ -1,0 +1,196 @@
+diff --git a/builtin/logical/pki/cert_util.go b/builtin/logical/pki/cert_util.go
+index 24bc444..ffdb50c 100644
+--- a/builtin/logical/pki/cert_util.go
++++ b/builtin/logical/pki/cert_util.go
+@@ -265,6 +265,11 @@ func fetchCertBySerial(sc *storageContext, prefix, serial string) (*logical.Stor
+ 	return certEntry, nil
+ }
+ 
++// templateGlobDisallowedChars are the characters which values substituted from
++// identity templates may not contain when the rendered value is used as an
++// allow-list glob pattern.
++const templateGlobDisallowedChars = "*"
++
+ // Given a URI SAN, verify that it is allowed.
+ func validateURISAN(b *backend, data *inputBundle, uri string) bool {
+ 	valid := false
+@@ -272,7 +277,7 @@ func validateURISAN(b *backend, data *inputBundle, uri string) bool {
+ 		if data.role.AllowedURISANsTemplate {
+ 			isTemplate, _ := framework.ValidateIdentityTemplate(allowed)
+ 			if isTemplate && data.req.EntityID != "" {
+-				tmpAllowed, err := framework.PopulateIdentityTemplate(allowed, data.req.EntityID, b.System())
++				tmpAllowed, err := framework.PopulateIdentityTemplateWithDisallowedChars(allowed, data.req.EntityID, b.System(), templateGlobDisallowedChars)
+ 				if err != nil {
+ 					continue
+ 				}
+@@ -564,7 +569,7 @@ func validateNames(b *backend, data *inputBundle, names []string) string {
+ 				if data.role.AllowedDomainsTemplate {
+ 					isTemplate, _ := framework.ValidateIdentityTemplate(currDomain)
+ 					if isTemplate && data.req.EntityID != "" {
+-						tmpCurrDomain, err := framework.PopulateIdentityTemplate(currDomain, data.req.EntityID, b.System())
++						tmpCurrDomain, err := framework.PopulateIdentityTemplateWithDisallowedChars(currDomain, data.req.EntityID, b.System(), templateGlobDisallowedChars)
+ 						if err != nil {
+ 							continue
+ 						}
+@@ -679,7 +684,7 @@ func validateUserId(b *backend, data *inputBundle, userId string) bool {
+ 		for _, rolePattern := range allowedList {
+ 			isTemplate, _ := framework.ValidateIdentityTemplate(rolePattern)
+ 			if isTemplate {
+-				rendered, err := framework.PopulateIdentityTemplate(rolePattern, data.req.EntityID, b.System())
++				rendered, err := framework.PopulateIdentityTemplateWithDisallowedChars(rolePattern, data.req.EntityID, b.System(), templateGlobDisallowedChars)
+ 				if err != nil {
+ 					continue
+ 				}
+diff --git a/builtin/logical/ssh/path_issue_sign.go b/builtin/logical/ssh/path_issue_sign.go
+index 1d84e2a..5b9e816 100644
+--- a/builtin/logical/ssh/path_issue_sign.go
++++ b/builtin/logical/ssh/path_issue_sign.go
+@@ -73,7 +73,7 @@ func (b *backend) pathSignIssueCertificateHelper(sc *storageContext, req *logica
+ 
+ 	var parsedPrincipals []string
+ 	if certificateType == ssh.HostCert {
+-		parsedPrincipals, err = b.calculateValidPrincipals(data, req, role, "", role.AllowedDomains, role.AllowedDomainsTemplate, validateValidPrincipalForHosts(role))
++		parsedPrincipals, err = b.calculateValidPrincipals(data, req, role, "", role.AllowedDomains, role.AllowedDomainsTemplate, allowedDomainsDisallowedChars, validateValidPrincipalForHosts(role))
+ 		if err != nil {
+ 			return logical.ErrorResponse(err.Error()), nil
+ 		}
+@@ -85,7 +85,7 @@ func (b *backend) pathSignIssueCertificateHelper(sc *storageContext, req *logica
+ 				return nil, err
+ 			}
+ 		}
+-		parsedPrincipals, err = b.calculateValidPrincipals(data, req, role, defaultPrincipal, role.AllowedUsers, role.AllowedUsersTemplate, slices.Contains)
++		parsedPrincipals, err = b.calculateValidPrincipals(data, req, role, defaultPrincipal, role.AllowedUsers, role.AllowedUsersTemplate, allowedUsersDisallowedChars, slices.Contains)
+ 		if err != nil {
+ 			return logical.ErrorResponse(err.Error()), nil
+ 		}
+@@ -164,13 +164,25 @@ func (b *backend) pathSignIssueCertificateHelper(sc *storageContext, req *logica
+ 	return response, nil
+ }
+ 
++// Characters which values substituted from identity templates may not contain
++// when rendering principal allow-lists: the list separator and, for host
++// domains, the glob star.
++const (
++	allowedUsersDisallowedChars   = ","
++	allowedDomainsDisallowedChars = ",*"
++)
++
+ func (b *backend) renderPrincipal(principal string, req *logical.Request) (string, error) {
++	return b.renderPrincipalWithDisallowedChars(principal, req, "")
++}
++
++func (b *backend) renderPrincipalWithDisallowedChars(principal string, req *logical.Request, disallowedChars string) (string, error) {
+ 	// Look for templating markers {{ .* }}
+ 	matched := containsTemplateRegex.MatchString(principal)
+ 	if matched {
+ 		if req.EntityID != "" {
+ 			// Retrieve principal based on template + entityID from request.
+-			renderedPrincipal, err := framework.PopulateIdentityTemplate(principal, req.EntityID, b.System())
++			renderedPrincipal, err := framework.PopulateIdentityTemplateWithDisallowedChars(principal, req.EntityID, b.System(), disallowedChars)
+ 			if err != nil {
+ 				return "", fmt.Errorf("template '%s' could not be rendered -> %s", principal, err)
+ 			}
+@@ -181,7 +193,7 @@ func (b *backend) renderPrincipal(principal string, req *logical.Request) (strin
+ 	return principal, nil
+ }
+ 
+-func (b *backend) calculateValidPrincipals(data *framework.FieldData, req *logical.Request, role *sshRole, defaultPrincipal, principalsAllowedByRole string, enableTemplating bool, validatePrincipal func([]string, string) bool) ([]string, error) {
++func (b *backend) calculateValidPrincipals(data *framework.FieldData, req *logical.Request, role *sshRole, defaultPrincipal, principalsAllowedByRole string, enableTemplating bool, disallowedChars string, validatePrincipal func([]string, string) bool) ([]string, error) {
+ 	validPrincipals := ""
+ 	validPrincipalsRaw, ok := data.GetOk("valid_principals")
+ 	if ok {
+@@ -194,7 +206,7 @@ func (b *backend) calculateValidPrincipals(data *framework.FieldData, req *logic
+ 	// Build list of allowed Principals from template and static principalsAllowedByRole
+ 	var allowedPrincipals []string
+ 	if enableTemplating {
+-		rendered, err := b.renderPrincipal(principalsAllowedByRole, req)
++		rendered, err := b.renderPrincipalWithDisallowedChars(principalsAllowedByRole, req, disallowedChars)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/sdk/framework/identity.go b/sdk/framework/identity.go
+index f32f02d..889ba73 100644
+--- a/sdk/framework/identity.go
++++ b/sdk/framework/identity.go
+@@ -16,6 +16,15 @@ import (
+ // entity and use the resulting identity information to populate the template
+ // string.
+ func PopulateIdentityTemplate(tpl string, entityID string, sysView logical.SystemView) (string, error) {
++	return PopulateIdentityTemplateWithDisallowedChars(tpl, entityID, sysView, "")
++}
++
++// PopulateIdentityTemplateWithDisallowedChars behaves like
++// PopulateIdentityTemplate, but fails if any value substituted from identity
++// data contains one of the characters in disallowedChars. Use it when the
++// rendered template is used as a pattern (e.g. a glob or a separated list) so
++// that identity data cannot introduce pattern metacharacters.
++func PopulateIdentityTemplateWithDisallowedChars(tpl string, entityID string, sysView logical.SystemView, disallowedChars string) (string, error) {
+ 	entity, err := sysView.EntityInfo(entityID)
+ 	if err != nil {
+ 		return "", err
+@@ -34,6 +43,8 @@ func PopulateIdentityTemplate(tpl string, entityID string, sysView logical.Syste
+ 		Entity: entity,
+ 		Groups: groups,
+ 		Mode:   identitytpl.ACLTemplating,
++
++		DisallowedChars: disallowedChars,
+ 	}
+ 
+ 	_, out, err := identitytpl.PopulateString(input)
+diff --git a/sdk/helper/identitytpl/templating.go b/sdk/helper/identitytpl/templating.go
+index 214af79..34e21b7 100644
+--- a/sdk/helper/identitytpl/templating.go
++++ b/sdk/helper/identitytpl/templating.go
+@@ -20,8 +20,15 @@ var (
+ 	ErrNoEntityAttachedToToken       = errors.New("string contains entity template directives but no entity was provided")
+ 	ErrNoGroupsAttachedToToken       = errors.New("string contains groups template directives but no groups were provided")
+ 	ErrTemplateValueNotFound         = errors.New("no value could be found for one of the template directives")
++	ErrTemplateValueDisallowedChars  = errors.New("a value substituted for one of the template directives contains a disallowed character")
+ )
+ 
++// ACLPathDisallowedChars are the characters that may not appear in a value
++// substituted into an ACL policy path: the path wildcards and the path
++// separator. Allowing them would let identity data widen the paths a policy
++// grants.
++const ACLPathDisallowedChars = "*+/"
++
+ const (
+ 	ACLTemplating = iota // must be the first value for backwards compatibility
+ 	JSONTemplating
+@@ -36,6 +43,12 @@ type PopulateStringInput struct {
+ 	Mode              int       // processing mode, ACLTemplate or JSONTemplating
+ 	Now               time.Time // optional, defaults to current time
+ 
++	// DisallowedChars, if set, causes PopulateString to fail with
++	// ErrTemplateValueDisallowedChars when any value substituted for a
++	// template directive contains one of these characters. Characters
++	// written literally in String are unaffected.
++	DisallowedChars string
++
+ 	templateHandler templateHandlerFunc
+ 	groupIDs        []string
+ 	groupNames      []string
+@@ -155,6 +168,9 @@ func PopulateString(p PopulateStringInput) (bool, string, error) {
+ 				if err != nil {
+ 					return false, "", err
+ 				}
++				if p.DisallowedChars != "" && strings.ContainsAny(tmplStr, p.DisallowedChars) {
++					return false, "", ErrTemplateValueDisallowedChars
++				}
+ 				b.WriteString(tmplStr)
+ 				b.WriteString(splitPiece[1])
+ 			}
+diff --git a/vault/policy/policy.go b/vault/policy/policy.go
+index 2f22fd4..9ccf47e 100644
+--- a/vault/policy/policy.go
++++ b/vault/policy/policy.go
+@@ -355,6 +355,9 @@ func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, en
+ 				Entity:      identity.ToSDKEntity(entity),
+ 				Groups:      identity.ToSDKGroups(groups),
+ 				NamespaceID: result.Namespace.ID,
++				// Substituted values must not be able to introduce path
++				// wildcards or span path segments.
++				DisallowedChars: identitytpl.ACLPathDisallowedChars,
+ 			})
+ 			if err != nil {
+ 				continue

@@ -1,0 +1,190 @@
+diff --git a/packages/nitro-server/src/index.ts b/packages/nitro-server/src/index.ts
+index f5bca95..fd94d39 100644
+--- a/packages/nitro-server/src/index.ts
++++ b/packages/nitro-server/src/index.ts
+@@ -81,6 +81,12 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
+   nuxt.options.nitro.plugins ||= []
+   nuxt.options.nitro.plugins = nuxt.options.nitro.plugins.map(plugin => plugin ? resolveAlias(plugin, nuxt.options.alias) : plugin)
+ 
++  // Nitro matches route rules case-sensitively; mirror the app-side matcher on the server.
++  nuxt.options.nitro.plugins.push(resolve(distDir, 'runtime/plugins/route-rules-case'))
++  nuxt.options.nitro.virtual = defu(nuxt.options.nitro.virtual, {
++    '#internal/route-rules-case': () => `export const sensitive = ${!!nuxt.options.router.options.sensitive};`,
++  })
++
+   if (nuxt.options.dev && nuxt.options.features.devLogs) {
+     addPlugin(resolve(nuxt.options.appDir, 'plugins/dev-server-logs'))
+     nuxt.options.nitro.plugins.push(resolve(distDir, 'runtime/plugins/dev-server-logs'))
+@@ -348,13 +354,30 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
+ 
+   const validManifestKeys = ['prerender', 'redirect', 'appMiddleware', 'appLayout', 'cache', 'isr', 'swr', 'ssr']
+ 
+-  function getRouteRulesRouter () {
++  // rou3 matches keys case-sensitively, but vue-router matches routes case-insensitively
++  // unless `sensitive`, so an insensitive-routing rule keyed `/Admin` would never match a
++  // folded lookup and silently lose its protections. `sensitive` can also come from
++  // `app/router.options.ts` (runtime-only), so emit both a verbatim and a folded matcher
++  // and pick at runtime.
++  const caseSensitiveRouteRules = !!nuxt.options.router.options.sensitive
++  const foldRouteRuleKey = (route: string) => caseSensitiveRouteRules || typeof route !== 'string' ? route : route.toLowerCase()
++
++  function getRouteRulesRouter (fold: boolean) {
+     const routeRulesRouter = createRou3Router<NitroRouteRules>()
+     if (nuxt._nitro) {
++      const foldedKeys = new Map<string, string>()
+       for (const [route, rules] of Object.entries(nuxt._nitro.options.routeRules)) {
+         if (route === '/__nuxt_error') { continue }
+         if (validManifestKeys.every(key => !(key in rules))) { continue }
+-        addRoute(routeRulesRouter, undefined, route, rules)
++        const key = fold && typeof route === 'string' ? route.toLowerCase() : route
++        if (fold) {
++          const existing = foldedKeys.get(key)
++          if (existing !== undefined && existing !== route && !caseSensitiveRouteRules) {
++            logger.warn(`Route rules for \`${existing}\` and \`${route}\` resolve to the same path when matched case-insensitively; \`${route}\` takes precedence. Disambiguate the keys or set \`router.options.sensitive: true\`.`)
++          }
++          foldedKeys.set(key, route)
++        }
++        addRoute(routeRulesRouter, undefined, key, rules)
+       }
+     }
+     return routeRulesRouter
+@@ -368,7 +391,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
+       if (cachedMatchers[key]) {
+         return cachedMatchers[key]
+       }
+-      const matcher = compileRouterToString(getRouteRulesRouter(), '', {
++      const compile = (fold: boolean) => compileRouterToString(getRouteRulesRouter(fold), '', {
+         matchAll: true,
+         serialize (routeRules) {
+           return `{${Object.entries(routeRules)
+@@ -399,11 +422,17 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
+           }}`
+         },
+       })
+-      return cachedMatchers[key] = `
+-      import { defu } from 'defu'
+-      const matcher = ${matcher}
+-      export default (path) => defu({}, ...matcher('', typeof path === 'string' ? path.toLowerCase() : path).map(r => r.data).reverse())
+-      `
++      const sensitiveMatcher = compile(false)
++      const foldedMatcher = compile(true)
++      return cachedMatchers[key] = [
++        `import { defu } from 'defu'`,
++        `import routerOptions from '#build/router.options.mjs'`,
++        `const sensitiveMatcher = ${sensitiveMatcher}`,
++        foldedMatcher === sensitiveMatcher ? `const foldedMatcher = sensitiveMatcher` : `const foldedMatcher = ${foldedMatcher}`,
++        `export default (path) => routerOptions.sensitive`,
++        `  ? defu({}, ...sensitiveMatcher('', path).map(r => r.data).reverse())`,
++        `  : defu({}, ...foldedMatcher('', typeof path === 'string' ? path.toLowerCase() : path).map(r => r.data).reverse())`,
++      ].join('\n')
+     },
+   })
+ 
+@@ -530,13 +559,13 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
+       nitro.hooks.hook('rollup:before', async (nitro) => {
+         // Add pages prerendered but not covered by route rules
+         const prerenderedRoutes = new Set<string>()
+-        const routeRulesMatcher = getRouteRulesRouter()
++        const routeRulesMatcher = getRouteRulesRouter(!caseSensitiveRouteRules)
+         if (nitro._prerenderedRoutes?.length) {
+           const payloadSuffix = nuxt.options.experimental.renderJsonPayloads ? '/_payload.json' : '/_payload.js'
+           for (const route of nitro._prerenderedRoutes) {
+             if (!route.error && route.route.endsWith(payloadSuffix)) {
+               const url = route.route.slice(0, -payloadSuffix.length) || '/'
+-              const rules = defu({}, ...findAllRoutes(routeRulesMatcher, undefined, url).reverse()) as Record<string, any>
++              const rules = defu({}, ...findAllRoutes(routeRulesMatcher, undefined, foldRouteRuleKey(url)).reverse()) as Record<string, any>
+               if (!rules.prerender) {
+                 prerenderedRoutes.add(url)
+               }
+diff --git a/packages/nitro-server/src/runtime/plugins/route-rules-case.ts b/packages/nitro-server/src/runtime/plugins/route-rules-case.ts
+new file mode 100644
+index 0000000..cd5a7e6
+--- /dev/null
++++ b/packages/nitro-server/src/runtime/plugins/route-rules-case.ts
+@@ -0,0 +1,25 @@
++import { addRoute, createRouter, findAllRoutes } from 'rou3'
++import { defu } from 'defu'
++import { withoutBase } from 'ufo'
++import { defineNitroPlugin, useRuntimeConfig } from 'nitropack/runtime'
++// @ts-expect-error virtual file
++import { sensitive } from '#internal/route-rules-case'
++
++export default defineNitroPlugin((nitroApp) => {
++  if (sensitive) { return }
++
++  const runtimeConfig = useRuntimeConfig()
++  const routeRules = (runtimeConfig.nitro?.routeRules || {}) as Record<string, any>
++  const router = createRouter()
++  for (const [route, rules] of Object.entries(routeRules)) {
++    if (typeof route === 'string') {
++      addRoute(router, undefined, route.toLowerCase(), rules)
++    }
++  }
++
++  nitroApp.hooks.hook('request', (event) => {
++    const path = withoutBase(event.path.split('?')[0] || '/', runtimeConfig.app.baseURL)
++    event.context._nitro ||= {}
++    event.context._nitro.routeRules = defu({}, ...findAllRoutes(router, undefined, path.toLowerCase()).map(r => r.data).reverse())
++  })
++})
+diff --git a/packages/nuxt/src/app/composables/manifest.ts b/packages/nuxt/src/app/composables/manifest.ts
+index a7695f6..ba23d62 100644
+--- a/packages/nuxt/src/app/composables/manifest.ts
++++ b/packages/nuxt/src/app/composables/manifest.ts
+@@ -71,7 +71,10 @@ export function getRouteRules (url: string): Record<string, any>
+ export function getRouteRules (arg: string | H3Event | { path: string }) {
+   const path = typeof arg === 'string' ? arg : arg.path
+   try {
+-    return routeRulesMatcher(path.toLowerCase())
++    // The compiled matcher case-folds the lookup path itself (unless routing is
++    // `sensitive`), so callers pass the path verbatim; folding here as well would
++    // force case-insensitive matching even when `sensitive: true` is configured.
++    return routeRulesMatcher(path)
+   } catch (e) {
+     console.error('[nuxt] Error matching route rules.', e)
+     return {}
+diff --git a/packages/nuxt/src/app/composables/payload.ts b/packages/nuxt/src/app/composables/payload.ts
+index 480c589..a33e98d 100644
+--- a/packages/nuxt/src/app/composables/payload.ts
++++ b/packages/nuxt/src/app/composables/payload.ts
+@@ -161,7 +161,7 @@ async function _isPrerenderedInManifest (url: string) {
+  * @internal
+  */
+ export async function shouldLoadPayload (url = useRoute().path) {
+-  const rules = getRouteRules({ path: _getRoutePath(url).toLowerCase() })
++  const rules = getRouteRules({ path: _getRoutePath(url) })
+   if (rules.ssr === false) {
+     return false
+   }
+@@ -180,7 +180,7 @@ export async function shouldLoadPayload (url = useRoute().path) {
+ 
+ /** @since 3.0.0 */
+ export async function isPrerendered (url = useRoute().path) {
+-  const res = _shouldLoadPrerenderedPayload(getRouteRules({ path: _getRoutePath(url).toLowerCase() }))
++  const res = _shouldLoadPrerenderedPayload(getRouteRules({ path: _getRoutePath(url) }))
+   if (res !== undefined) {
+     return res
+   }
+diff --git a/packages/nuxt/src/pages/module.ts b/packages/nuxt/src/pages/module.ts
+index a3d46cc..444b416 100644
+--- a/packages/nuxt/src/pages/module.ts
++++ b/packages/nuxt/src/pages/module.ts
+@@ -440,12 +440,16 @@ export default defineNuxtModule({
+ 
+       // Inject page patterns that explicitly match `prerender: true` route rule
+       if (!nitro.options.static) {
++        // Fold keys (unless `sensitive`) to mirror the compiled `#build/route-rules.mjs`
++        // matcher, so a `prerender: true` rule keyed `/Admin` is honoured at `/Admin`.
++        const caseSensitiveRouteRules = !!nuxt.options.router.options.sensitive
++        const foldRouteRuleKey = (route: string) => caseSensitiveRouteRules ? route : route.toLowerCase()
+         const routeRulesRouter = createRou3Router<NitroRouteRules>()
+         for (const [route, rules] of Object.entries(nitro.options.routeRules)) {
+-          addRoute(routeRulesRouter, undefined, route, rules)
++          addRoute(routeRulesRouter, undefined, foldRouteRuleKey(route), rules)
+         }
+         for (const route of prerenderRoutes) {
+-          const rules = defu({} as Record<string, any>, ...findAllRoutes(routeRulesRouter, undefined, route).reverse())
++          const rules = defu({} as Record<string, any>, ...findAllRoutes(routeRulesRouter, undefined, foldRouteRuleKey(route)).reverse())
+           if (rules.prerender) {
+             nitro.options.prerender.routes.push(route)
+           }
