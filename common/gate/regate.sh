@@ -28,8 +28,14 @@ python3 -I common/gate/fingerprint.py write "$S" >> "$L" 2>&1
 if [ "$LISTING" = 1 ]; then
   python3 -I pipelines/stacking/4-listing/listing_verdict.py "$S" > /dev/null 2>&1; LRC=$?
   if [ "$LRC" != 0 ] && [ -f pipelines/stacking/4-listing/LISTING_ENFORCE ]; then
-    rm -f "$B/.sound" "$B/.gate_passed" "$B/.listing_warn"; touch "$B/.listing_fail"
-    log "RESULT: gated, but the listing review FAILs (exit $LRC): .listing_fail, not sound"; exit 3
+    # Same as run_stack_pipeline.sh: an instruction-only rewrite (5-upgrade), sound only if the listing then passes.
+    log "listing review FAILs (exit $LRC): instruction-only rewrite (5-upgrade)"
+    UPGRADE_FORCE=1 "$CWE_DRIVE" deepseek bash pipelines/stacking/5-upgrade/run_upgrade_stack.sh "$S" >> "$L" 2>&1; URC=$?
+    if [ "$URC" != 0 ] || ! python3 -I common/gate/fingerprint.py check "$S" >/dev/null 2>&1; then
+      rm -f "$B/.sound" "$B/.gate_passed" "$B/.listing_warn"; touch "$B/.listing_fail"
+      log "RESULT: gated, but the listing review still FAILs after the rewrite (exit $URC): .listing_fail, not sound"; exit 3
+    fi
+    log "listing PASS after the rewrite"
   fi
 fi
 rm -f "$B/.gate_passed"; touch "$B/.sound"
