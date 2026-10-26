@@ -119,9 +119,10 @@ for s, st in now.items():
     p = prev.get(s)
     if p and p != st and any(w in st for w in ("unsound", "gate error", "declined", "incomplete", "BREAKER", "breaker", "held")):
         alerts.append(f"{s}: {p} -> {st}")
-guard = sh("grep -c stopped build/audit/orphan_builder_guard.log")
-if guard and guard != "0":
-    alerts.append(f"orphan guard has stopped {guard} builder(s) in total")
+guard = sh("grep -c stopped build/audit/orphan_builder_guard.log") or "0"
+if guard != str(prev.get("__guard__", "0")):
+    alerts.append(f"orphan guard stopped a builder (total {guard}; see build/audit/orphan_builder_guard.log)")
+now["__guard__"] = guard
 if float(load) > 300:
     alerts.append(f"LOAD HIGH: {load}")
 if disk and int(disk.rstrip("G")) < 150:
