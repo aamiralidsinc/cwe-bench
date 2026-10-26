@@ -63,6 +63,9 @@ def track_of(task):
     # GitHub Actions; its runs are imported as ext-actions-* jobs (see build/audit/EXTERNAL-RUNS.md).
     if task.startswith("pv-"):
         return "precision-validation"
+    # stk- tasks are stacking by name: some scale-run builders wrote source = "injected" (2026-10-26).
+    if task.startswith("stk-"):
+        return "stacking"
     toml = ROOT / "tasks" / task / "task.toml"
     m = re.search(r'^\s*source\s*=\s*"([^"]+)"', toml.read_text(), re.M) if toml.is_file() else None
     src = m.group(1) if m else "?"
