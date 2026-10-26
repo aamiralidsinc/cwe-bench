@@ -27,7 +27,7 @@
 | `{{UNCOVERED_ROUTES}}` | pattern B only: the screener's O8 leads, to be confirmed; `none` otherwise |
 | `{{DESIGN_PLAN}}` | the lead's plan: the main lever; sites, routes and input shapes to test; coupled behaviours; injected siblings, if any, with place and why they are realistic |
 | `{{HOST_NOTES}}` | build gotchas, things to avoid, credit lines (e.g. "producer-off-path shape: credit Hadi"); `none` if empty |
-| `{{PROJECT_ROOT}}` | `/Users/dev/terminal-bench/cwe-bench` |
+| `{{PROJECT_ROOT}}` | the repo root (the folder holding `.cwe-bench-root`); the prepare step fills it |
 
 ### Launch
 - **Claude Code sub-agent**, with the slots filled. A fresh chat also works: paste the filled prompt.

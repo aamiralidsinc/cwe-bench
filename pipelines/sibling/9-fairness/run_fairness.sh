@@ -14,7 +14,7 @@ B=build/$SLUG
 BRIEF=$(cat "$CWE_FAIRNESS_BRIEF")
 P="$BRIEF
 
-Review SLUG=$SLUG. The project root here is /home/mara/cwe-bench (NOT the path in the brief): read tasks/$SLUG/instruction.md, tasks/$SLUG/tests/, tasks/$SLUG/solution/fix.patch, build/$SLUG/manifest.json, build/$SLUG/notes.md, build/$SLUG/checks/*.patch; write build/$SLUG/FAIRNESS.md. Do not run anything."
+Review SLUG=$SLUG. The project root here is $CWE_ROOT (NOT the path in the brief): read tasks/$SLUG/instruction.md, tasks/$SLUG/tests/, tasks/$SLUG/solution/fix.patch, build/$SLUG/manifest.json, build/$SLUG/notes.md, build/$SLUG/checks/*.patch; write build/$SLUG/FAIRNESS.md. Do not run anything."
 # A stale review must never pass for this run's result.
 [ -f "$B/FAIRNESS.md" ] && mv "$B/FAIRNESS.md" "$B/FAIRNESS.md.prev-$(date -u +%Y%m%dT%H%M%SZ)"
 echo "running" > "$B/fairness_status.txt"

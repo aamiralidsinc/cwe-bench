@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ledger of the three-step scale run (owner request 2026-10-26). Run on the VM from ~/cwe-bench; the heartbeat runs it.
+"""Ledger of the three-step scale run (owner request 2026-10-26). Run on the VM from the repo root; the heartbeat runs it.
 
     python3 pipelines/router/scale_ledger.py
 
@@ -11,7 +11,9 @@ each graded run. Batches: pipelines/router/out/batches/*.txt.
 import csv, glob, json, os, re, subprocess, sys, time
 from pathlib import Path
 
-ROOT = Path(os.path.expanduser("~/cwe-bench")); os.chdir(ROOT)
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+ROOT = paths.ROOT; os.chdir(ROOT)
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 OUT = ROOT / "reports" / "scale-run"; OUT.mkdir(parents=True, exist_ok=True)
 

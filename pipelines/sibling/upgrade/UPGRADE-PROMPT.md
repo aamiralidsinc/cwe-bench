@@ -1,6 +1,6 @@
 You are UPGRADING one already-built CWE-bench security-fix task to comply with the sibling-injection
 rules (BETTER-PATTERNS §2–§8), reusing its existing build wherever possible, before a fresh trial.
-Project root: /home/mara/cwe-bench. Task slug: {{SLUG}}.
+Project root: {{ROOT}}. Task slug: {{SLUG}}.
 
 Read, in order: tasks/{{SLUG}}/instruction.md, every file in tasks/{{SLUG}}/tests/,
 tasks/{{SLUG}}/solution/fix.patch, build/{{SLUG}}/manifest.json, build/{{SLUG}}/notes.md,

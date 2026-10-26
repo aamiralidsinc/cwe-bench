@@ -2,7 +2,10 @@
 """Keep the KEEP earliest post-build gates of scale-b1; stop the gate processes (gate_one_ds/gate.py/harbor + their
 containers) of the other tasks. Blind fix, listing, builders and pipelines are not touched. --apply to act."""
 import os, re, subprocess, sys, time
-os.chdir(os.path.expanduser("~/cwe-bench"))
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+os.chdir(paths.ROOT)
 KEEP = int(os.environ.get("KEEP", "10")); apply = "--apply" in sys.argv
 slugs = [l.split("#")[0].strip() for l in open("pipelines/stacking/out/scale-b1.txt") if l.split("#")[0].strip()]
 act = []

@@ -65,7 +65,7 @@ the scripts refuse to run without `MODEL`.
 ### Phase 2: build and gate (VM)
 
 6. Prepare a prompt per job:
-   `python3 -I pipelines/stacking/2-prepare/build_prepare_stack.py <job_id> --project-root ~/cwe-bench`.
+   `python3 -I pipelines/stacking/2-prepare/build_prepare_stack.py <job_id> --project-root "$PWD"` (from the repo root).
    This writes `build/<slug>/BUILD-PROMPT.md`.
 7. Build and gate the batch:
    `python3 -I pipelines/stacking/6-trial/stk_queue.py build --slugs-file pipelines/stacking/out/batch1.txt --slots 16`.

@@ -8,7 +8,7 @@ record's hyperlink, Defiant's copyright designation and its licence text (plus M
 records that came from MITRE). A free wordfence.com account supplies the API key.
 WPScan and Patchstack are NOT used: their terms forbid storing the data and third-party use.
 
-The key is read from WORDFENCE_API_KEY in an env file (default /Users/dev/terminal-bench/.env),
+The key is read from WORDFENCE_API_KEY in an env file (default ~/terminal-bench/.env),
 or from --key-file (one line); never from the command line, and never printed. The raw feed is untrusted data, saved outside the code tree.
 
   python3 -I sources2/wordfence_fetch.py [--env-file F | --key-file F] [--data ~/.tb-graders/cwe/sources2-data]
@@ -20,7 +20,7 @@ URL = "https://www.wordfence.com/api/intelligence/v3/vulnerabilities/production"
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--env-file", default="/Users/dev/terminal-bench/.env")
+    ap.add_argument("--env-file", default=os.path.expanduser("~/terminal-bench/.env"))
     ap.add_argument("--key-file", default="")
     ap.add_argument("--data", default=os.path.expanduser("~/.tb-graders/cwe/sources2-data"))
     a = ap.parse_args()

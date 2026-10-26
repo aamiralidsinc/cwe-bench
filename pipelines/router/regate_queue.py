@@ -2,7 +2,10 @@
 """pipelines/router/regate_queue.py <slugs-file> <P>: throttled re-gate of a list of slugs: up to P at a time, each only after its post-build step has ended
 (postbuild.log has a RESULT line: the blind fix and listing review are finished)."""
 import os, subprocess, sys, time
-os.chdir(os.path.expanduser("~/cwe-bench"))
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+os.chdir(paths.ROOT)
 lst, P = sys.argv[1], int(sys.argv[2])
 # Morning of 2026-10-26 (overload): GATE_PARALLEL=4 and stages one at a time. From the afternoon the VM-wide caps
 # (60 Harbor runs, 10 gating tasks) protect the machine, so stages run in parallel unless REGATE_* says otherwise.

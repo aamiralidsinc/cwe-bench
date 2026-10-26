@@ -21,7 +21,7 @@ bash "$CWE_SNAPSHOT" "$SLUG"
 REL="tasks/$SLUG/tests tasks/$SLUG/solution tasks/$SLUG/environment $B/checks $B/manifest.json"
 fp() { find $@ -type f 2>/dev/null | sort | xargs cat 2>/dev/null | sha256sum | cut -d' ' -f1; }
 PRE=$(fp $REL); PRE_ALL=$(fp tasks/$SLUG $B/checks $B/manifest.json)
-P=$(sed "s/{{SLUG}}/$SLUG/g" pipelines/sibling/upgrade/UPGRADE-PROMPT.md)
+P=$(sed "s/{{SLUG}}/$SLUG/g; s#{{ROOT}}#$CWE_ROOT#g" pipelines/sibling/upgrade/UPGRADE-PROMPT.md)
 date -u +%FT%TZ > "$B/upgrade_start.txt"
 timeout "${UPGRADE_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --permission-mode bypassPermissions --add-dir "$CWE_ROOT" --add-dir "$HOME/.tb-graders/cwe/work" \

@@ -20,13 +20,15 @@ and confirms each vuln is reproducible and reachable offline.
 """
 import glob
 import json
+import os
 import re
 import zipfile
 import collections
 
-DUMPS = glob.glob("/Users/dev/.tb-graders/cwe/sourcer-data/dumps/*.zip")
-OUT_TSV = "/Users/dev/terminal-bench/cwe-bench/sourcer/stacking-shortlist.tsv"
-OUT_MD = "/Users/dev/terminal-bench/cwe-bench/sourcer/stacking-shortlist.md"
+HERE = os.path.dirname(os.path.abspath(__file__))   # sourcer/
+DUMPS = glob.glob(os.path.expanduser("~/.tb-graders/cwe/sourcer-data/dumps/*.zip"))
+OUT_TSV = os.path.join(HERE, "stacking-shortlist.tsv")
+OUT_MD = os.path.join(HERE, "stacking-shortlist.md")
 
 CO_MIN, CO_MAX = 4, 10          # stack 4-10 real bugs: hard but buildable, not a monster
 MAX_TOTAL_ADV = 60              # smallness proxy: skip projects with huge advisory histories

@@ -6,7 +6,7 @@ For each chosen entry_id, build a build_prepare spec with:
   - the SAME constant self-design plan (pipelines/sibling/5-prepare/SELFDESIGN-PLAN.md) for every candidate,
     so the DRIVER model designs the injection itself (no per-candidate human plan);
   - track=injected, pattern from the record (A/B/A+B, else A+B);
-  - the VM project root.
+  - the project root (the repo root, from common/paths.py).
 Then runs common/builder/build_prepare.py to write build/<slug>/BUILD-PROMPT.md, and lists the slugs in
 build/pipeline/slugs_<driver>.txt.
 
@@ -22,7 +22,7 @@ ROOT = str(paths.ROOT)
 RECS = str(paths.SCREENER_RECORDS)
 PREPARE = str(paths.BUILD_PREPARE)
 PLAN = open(os.path.join(HERE, "SELFDESIGN-PLAN.md")).read().strip()
-VM_ROOT = "/home/mara/cwe-bench"
+VM_ROOT = ROOT  # the project root written into BUILD-PROMPTs (name kept: lane.py reads pl.VM_ROOT)
 
 
 def main(driver):

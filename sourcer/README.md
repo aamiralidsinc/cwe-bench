@@ -33,7 +33,7 @@ as JSON or text; nothing from them is executed.
 Always run with `-I` (isolated mode: ignores environment variables and the current directory):
 
 ```sh
-cd /Users/dev/terminal-bench/cwe-bench/sourcer
+cd sourcer                                          # from the repo root
 python3 -I osv_sourcer.py fetch-dumps                 # 7 ecosystem zips, about 300 MB
 python3 -I osv_sourcer.py parse --since 2026-06-01    # stages 1-2
 python3 -I osv_sourcer.py diffs --delay 0.6           # stage 3, long; stop (Ctrl-C) and resume freely

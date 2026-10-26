@@ -14,7 +14,7 @@
 # Trials, post-run audits (common/audit/postmortem.py) and fairness (pipelines/stacking/7-fairness/run_fairness_stack.sh, only
 # after a model fails 3/3, per the 2026-10-19 rule) are separate steps, run after this one.
 #
-# Usage (on the stacking VM, from $HOME/cwe-bench, with build/SLUG/BUILD-PROMPT.md in place):
+# Usage (on the stacking VM, from the repo root, with build/SLUG/BUILD-PROMPT.md in place):
 #   bash pipelines/stacking/3-build-gate/run_stack_pipeline.sh SLUG
 # Progress: build/SLUG/stack_pipeline.log (one line per step). Exit 0 = SLUG marked sound (the control may or may not be).
 set -uo pipefail

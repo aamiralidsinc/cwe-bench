@@ -6,8 +6,9 @@
 # Without this a quota-cut agent left a half-edited task still marked .sound, and the trial
 # folders of the real current version were hidden from audit_results.py in the experiment dir.
 set -uo pipefail
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 SLUG=${1:?usage: restore_snapshot.sh SLUG "<why>"}; WHY=${2:-unspecified}
-cd "$HOME/cwe-bench" || exit 1
+cd "$CWE_ROOT" || exit 1
 B=build/$SLUG; JOBS="$HOME/.tb-graders/cwe/jobs"
 [ -f "$B/.last_snapshot" ] || { echo "restore: $SLUG has no .last_snapshot; nothing restored" >&2; exit 1; }
 dest=$(sed -n 1p "$B/.last_snapshot"); ver=$(sed -n 2p "$B/.last_snapshot")

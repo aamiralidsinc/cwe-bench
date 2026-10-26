@@ -1,10 +1,11 @@
 #!/bin/bash
-# Full-pool stacking selection on DeepSeek screens (2026-10-25). Run on the VM from ~/cwe-bench.
+# Full-pool stacking selection on DeepSeek screens (2026-10-25). Run on the VM from the repo root.
 # Rebuilds out/screener-ds/ (derived, not committed), ranks H4 and writes out/reader_jobs_ds.jsonl. Then:
 #   common/launch/drive.sh deepseek bash -c "CLAUDE_BIN=$HOME/.local/bin/claude python3 -I pipelines/stacking/1-select/run_reader.py --parallel 70 --model \"$MODEL\" --outdir pipelines/stacking/out/reader-ds --jobs-file pipelines/stacking/out/reader_jobs_ds.jsonl"
 #   python3 -I pipelines/stacking/1-select/score_stack.py --reader-dir pipelines/stacking/out/reader-ds
 set -uo pipefail
-cd ~/cwe-bench; O=pipelines/stacking/out
+. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+cd "$CWE_ROOT" || exit 1; O=pipelines/stacking/out
 # 1. keep batch 1's selection files
 B=$O/batch1-selection-20261025; mkdir -p $B
 for f in h4_candidates.tsv h4_shortlist.md reader_jobs.jsonl stack_scores.md stack_scores.tsv; do [ -f $O/$f ] && [ ! -f $B/$f ] && cp -p $O/$f $B/; done

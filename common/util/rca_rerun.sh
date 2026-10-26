@@ -48,10 +48,10 @@ timeout 3600 docker run --rm --network none --name "rca-$SLUG-$$" \
     bash /tests/test.sh' > "$OUT/stdout.txt" 2>&1
 rc=$?
 echo "[rca] test.sh exit $rc (90 = no /app, 91 = patch did not apply, 124 = timeout)"
-python3 - "$OUT" "$SLUG" "$PATCH" "$rc" <<'PY'
+python3 - "$OUT" "$SLUG" "$PATCH" "$rc" "$CWE_COMMON/util" <<'PY'
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.home() / "cwe-bench" / "common" / "util"))
+sys.path.insert(0, sys.argv[5])
 import evidence as ev
 out, slug, patch, rc = sys.argv[1:5]
 d = {"failing_tests": ev.junit_failures(out), "verifier_stdout_tail": ev.read(Path(out, "stdout.txt"), 400_000),

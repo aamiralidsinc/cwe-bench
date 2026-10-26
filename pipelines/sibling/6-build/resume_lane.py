@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start every resume job (pipelines/sibling/out/pipeline/resume_jobs.tsv: slug, stage, session) with a random
 5-20 s stagger and no concurrency cap — the real-workload check of the Docker deadlock fix.
-Writes /home/mara/spike/target_c (= number of jobs) so the monitor records the level.
+Writes $CWE_SPIKE_DIR/target_c (default ~/spike/target_c) (= number of jobs) so the monitor records the level.
   python3 -I pipelines/sibling/6-build/resume_lane.py
 """
 import os, random, subprocess, time
@@ -11,6 +11,7 @@ sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 
 import paths  # noqa: E402  (repo locations: common/paths.py)
 
 ROOT = str(paths.ROOT)
+SPIKE = os.environ.get("CWE_SPIKE_DIR", str(Path.home() / "spike"))  # monitor scratch folder
 LOG = os.path.join(str(paths.SIBLING_OUT / "pipeline"), "resume_lane.log")
 
 
@@ -23,7 +24,7 @@ def log(m):
 
 jobs = [l.rstrip("\n").split("\t") for l in open(os.path.join(str(paths.SIBLING_OUT / "pipeline"), "resume_jobs.tsv"))
         if l.strip() and not l.startswith("slug\t")]
-open("/home/mara/spike/target_c", "w").write(str(len(jobs)))
+open(os.path.join(SPIKE, "target_c"), "w").write(str(len(jobs)))
 log(f"resume lane: {len(jobs)} jobs, stagger 5-20 s")
 procs = {}
 for slug, stage, sess in jobs:

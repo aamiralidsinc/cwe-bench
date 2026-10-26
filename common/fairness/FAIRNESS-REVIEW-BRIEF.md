@@ -1,7 +1,7 @@
 # Pre-trial fairness and leniency review brief (gate requirement, BUILDER.md 3h)
 
 You review ONE task before any model trial. You did not write its tests. Project root:
-/Users/dev/terminal-bench/cwe-bench. Read tasks/SLUG/instruction.md, every file in tasks/SLUG/tests/,
+the repo root (the folder holding .cwe-bench-root). Read tasks/SLUG/instruction.md, every file in tasks/SLUG/tests/,
 tasks/SLUG/solution/fix.patch, build/SLUG/manifest.json (patch_checks, traps, wrong_fix_catalogue),
 build/SLUG/notes.md and build/SLUG/checks/*.patch. Do not run Docker, trials or gates. Do not look
 up the upstream fix online.

@@ -94,7 +94,7 @@ PY
 BRIEF=$(cat "$CWE_BLIND_BRIEF") || die 2 "no common/blindfix/BLIND-FIX-BRIEF.md"
 P="$BRIEF
 
-WORK=$WORK . Everything you may use is under \$WORK: instruction.md, app/ (the vulnerable tree; edit it), tests/ (the hidden tests), reference.patch (the reference fix), injected-sites.md (the trap list), build-notes.md, libs/ if present. Do NOT open anything under /home/mara/cwe-bench or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
+WORK=$WORK . Everything you may use is under \$WORK: instruction.md, app/ (the vulnerable tree; edit it), tests/ (the hidden tests), reference.patch (the reference fix), injected-sites.md (the trap list), build-notes.md, libs/ if present. Do NOT open anything under $R or elsewhere. Write \$WORK/blind.patch and \$WORK/mechanisms.md as the brief says."
 date -u +%FT%TZ > "$B/blind_start.txt"
 log "agent start"
 timeout 5400 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \

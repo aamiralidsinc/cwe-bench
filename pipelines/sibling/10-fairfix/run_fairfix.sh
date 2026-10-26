@@ -13,7 +13,7 @@ echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
 bash "$CWE_SNAPSHOT" "$SLUG"  # preserve prior version before in-place edit (provenance)
 P="You are revising ONE already-built security-fix benchmark task to address its pre-trial FAIRNESS
-review before model trials. Project root: /home/mara/cwe-bench. Task slug: ${SLUG}.
+review before model trials. Project root: ${CWE_ROOT}. Task slug: ${SLUG}.
 
 Read, in order: build/${SLUG}/FAIRNESS.md (the review, with a numbered 'Required changes' list),
 common/fairness/FAIRNESS-REVIEW-BRIEF.md (what fairness means here), tasks/${SLUG}/instruction.md,

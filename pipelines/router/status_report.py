@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full status of the scale run, for the heartbeat (2026-10-26). Run on the VM from ~/cwe-bench:
+"""Full status of the scale run, for the heartbeat (2026-10-26). Run on the VM from the repo root:
 
     python3 -I pipelines/router/status_report.py            # report; remembers what it printed
     python3 -I pipelines/router/status_report.py --no-save   # report without updating the "since last" memory
@@ -9,8 +9,11 @@ ledger (build/audit/ledger.md, regenerated here). Then audits owed, queues, the 
 wrong since the previous report (state: pipelines/router/out/queue/status_last.json).
 """
 import collections, glob, json, os, re, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
 
-ROOT = os.path.expanduser("~/cwe-bench")
+ROOT = str(paths.ROOT)
 os.chdir(ROOT)
 LAST = "pipelines/router/out/queue/status_last.json"
 

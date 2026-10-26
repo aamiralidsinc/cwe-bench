@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Emit one line per built task: slug, entry_id, repo, track, deepseek rewards, mimo rewards,
-parked flag, policy-b flag. Run on the VM in ~/cwe-bench. Reads BUILD-PROMPT.md (embedded screener
+parked flag, policy-b flag. Run on the VM from the repo root. Reads BUILD-PROMPT.md (embedded screener
 record has entry_id/repo), runs_<model>.log, PARKED.txt, POLICY-B-ACCEPT.txt."""
 import json, os, re, glob
 

@@ -3,10 +3,10 @@
 raising the target on a schedule (default 16 for 45 min, 24 for 45, 30 for 45, then 40 to the end),
 starting one build at a time with jitter. Each build is pipelines/sibling/6-build/run_pipeline.sh (build -> gate).
 
-Safety: if the monitor (/home/mara/spike/monitor.csv) shows docker ps or sshd stuck (> 10 s) for three
+Safety: if the monitor ($CWE_SPIKE_DIR/monitor.csv, default ~/spike) shows docker ps or sshd stuck (> 10 s) for three
 checks in a row, the ramp HOLDS: no new builds start, none are killed, and the level is logged as the
-knee. A manual hold: touch /home/mara/spike/HOLD. The current target is written to
-/home/mara/spike/target_c so the monitor records it.
+knee. A manual hold: touch $CWE_SPIKE_DIR/HOLD. The current target is written to
+$CWE_SPIKE_DIR/target_c so the monitor records it.
 
   python3 -I pipelines/sibling/6-build/ramp_lane.py [--schedule 16:45,24:45,30:45,40:0]
 """
@@ -17,7 +17,7 @@ sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 
 import paths  # noqa: E402  (repo locations: common/paths.py)
 
 ROOT = str(paths.ROOT)
-SPIKE = "/home/mara/spike"
+SPIKE = os.environ.get("CWE_SPIKE_DIR", str(Path.home() / "spike"))  # monitor scratch folder
 LOG = os.path.join(str(paths.SIBLING_OUT / "pipeline"), "ramp_lane.log")
 STUCK_MS = 10000
 

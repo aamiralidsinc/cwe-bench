@@ -142,7 +142,7 @@ and only get a warning; electron-builder-ds, hubuum-client-rust-ds and mockoon-d
 
 | Setting | Effect |
 |---|---|
-| `common/launch/drive.sh` | Reads `$CWE_MODELS_ENV`, `~/.tb-graders/cwe/models.env`, `~/cwe-bench/.env`, then `~/.env`. Sets DeepSeek's output and thinking token caps and `API_TIMEOUT_MS=1200000` |
+| `common/launch/drive.sh` | Reads `$CWE_MODELS_ENV`, `~/.tb-graders/cwe/models.env`, `.env` at the repo root, then `~/.env`. Sets DeepSeek's output and thinking token caps and `API_TIMEOUT_MS=1200000` |
 | `common/gate/docker-tuning.env` | Sourced by every Docker-touching script: client/compose timeouts 300 s, BuildKit off. **Dockerfile heredocs are not allowed**; the classic builder drops them |
 | Timeouts | `BUILD_TIMEOUT`, `FAIRFIX_TIMEOUT` and `UPGRADE_TIMEOUT` default to 10800 s; fairness 2400 s; blind fix 5400 s |
 | Trials | `CWE_AGENT_TIMEOUT_MULT=1.5` gives a 3 h agent limit; **a 3 h timeout counts as a fail** |

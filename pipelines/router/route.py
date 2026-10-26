@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Router for the three-step scale run (docs/PIPELINE-3STEP-DESIGN.md). Run on the VM from ~/cwe-bench.
+"""Router for the three-step scale run (docs/PIPELINE-3STEP-DESIGN.md). Run on the VM from the repo root.
 
   step 1  stacking-batch  stacking's batch: the best usable stacked design per unbuilt repo VERSION (pinned commit), from the DeepSeek reader
                           (pipelines/stacking/out/stack_scores_ds.tsv + reader_jobs_ds.jsonl + reader-ds/), then its

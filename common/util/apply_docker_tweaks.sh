@@ -32,7 +32,7 @@ cat > common/gate/docker-tuning.env <<'ENV'
 export COMPOSE_HTTP_TIMEOUT=300
 export DOCKER_CLIENT_TIMEOUT=300
 ENV
-SRC='. "$HOME/cwe-bench/common/gate/docker-tuning.env" 2>/dev/null || true'
+SRC=". \"$CWE_DOCKER_TUNING\" 2>/dev/null || true"  # the absolute path of this checkout, written into each script
 for f in pipelines/sibling/archive/batch1-lane-pilot/run_pipeline.sh common/trial/run_trial.sh common/gate/gate_one_ds.sh; do
   if [ -f "$f" ] && ! grep -q docker-tuning.env "$f"; then
     awk -v s="$SRC" 'NR==1{print; print s; next} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f" && chmod +x "$f"
