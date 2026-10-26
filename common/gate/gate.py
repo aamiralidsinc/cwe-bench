@@ -47,6 +47,7 @@ exception_traceback included), every failing test's complete output, the verifie
 stdout/stderr and the raw artifact paths. The stage record names it in "evidence_file".
 """
 import argparse
+import random
 import json
 import os
 import re
@@ -244,7 +245,44 @@ def wait_for_disk():
     raise InfraError(f"Docker disk below {MIN_DOCKER_FREE_GB} GB free for 30 min")
 
 
+GATE_SLOTS_DIR = Path.home() / ".tb-graders" / "cwe" / "slots" / "gate"
+
+
+class global_slot:
+    """VM-wide cap on concurrent gate Harbor runs (2026-10-26). Scale batch 1 ran 56 parallel gates at ~15
+    Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (default
+    40) lock files under ~/.tb-graders/cwe/slots/gate/; locks are released when the process ends, so a killed
+    gate never leaks a slot. GATE_GLOBAL_SLOTS=0 disables the cap."""
+
+    def __enter__(self):
+        import fcntl
+        n = int(os.environ.get("GATE_GLOBAL_SLOTS", "40") or 0)
+        self.f = None
+        if n <= 0:
+            return self
+        GATE_SLOTS_DIR.mkdir(parents=True, exist_ok=True)
+        while True:
+            for i in range(n):
+                f = open(GATE_SLOTS_DIR / f"slot-{i:03d}.lock", "w")
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.f = f
+                    return self
+                except OSError:
+                    f.close()
+            time.sleep(5 + random.random() * 5)
+
+    def __exit__(self, *exc):
+        if self.f:
+            self.f.close()          # closing releases the lock
+
+
 def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
+    with global_slot():
+        return _run_harbor(task_dir, agent, label)
+
+
+def _run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     """Run one Harbor trial and return {'reward', 'security', 'functional', 'trial_dir'}.
     Raises InfraError when the trial produced no result about the task, GateFailure when the
     task's own files make the result meaningless."""
