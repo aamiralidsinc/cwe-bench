@@ -27,10 +27,15 @@ case "$SLUG" in stk-*-control) echo "refused: $SLUG is a control; upgrade its st
 [ -f "$B/.sound" ] || [ "${UPGRADE_FORCE:-0}" = 1 ] || { echo "refused: $SLUG is not gated sound (its container gate is what makes an instruction-only upgrade safe); re-gate it first, or UPGRADE_FORCE=1"; exit 2; }
 CTL=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('stacking') or {}).get('control_slug',''))" "$B/manifest.json")
 [ -n "$CTL" ] && [ -f "tasks/$CTL/instruction.md" ] || { echo "refused: no control task"; exit 2; }
+# Our own ancestors never count as busy: run_stack_pipeline.sh calls this script for its own slug, and before
+# 2026-10-26 that parent made every post-build rewrite refuse itself (exit 2, five false listing holds in scale-b2).
+ancestors() { local p=$$; while [ "$p" -gt 1 ] 2>/dev/null; do echo "$p"; p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || break; [ -n "$p" ] || break; done; }
+MINE=" $(ancestors | tr '\n' ' ') "
 busy_pids() {
   local p a
   for p in /proc/[0-9]*; do
-    a=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
+    case "$MINE" in *" ${p#/proc/} "*) continue ;; esac
+    a=$( { tr '\0' ' ' < "$p/cmdline"; } 2>/dev/null) || continue
     case "$a" in
       *"common/trial/trial.py $SLUG "*|*"common/trial/trial.py $CTL "*|*"run_stack_pipeline.sh $SLUG"*|*"run_fairfix_stack.sh $SLUG"*) echo "${p#/proc/}" ;;
     esac

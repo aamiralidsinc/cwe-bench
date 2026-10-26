@@ -54,7 +54,7 @@ NOW = datetime.now(timezone.utc)
 STAMP = NOW.strftime("%Y%m%dT%H%MZ")
 LIVE_WINDOW_S = 3 * 3600          # a trial with no result.json touched this recently may be live
 # Regenerable build output agents wrote into their log folder (russh: 10+ GB of cargo targets).
-EXCLUDE_DIR = re.compile(r"(^|[-_])target$|^node_modules$|^\.gradle$|^\.m2$")
+EXCLUDE_DIR = re.compile(r"(^|[-_])target$|^node_modules$|^\.gradle$|^\.m2$|^priv-docker$|^dind-data$|^\.mypy_cache$|^__pycache__$")
 # Known edits to task folders, newest first: (current text, older text, what changed).
 # Used to recover the exact older version a run used, verified by Harbor's fingerprint.
 KNOWN_EDITS = [("timeout_sec = 7200.0", "timeout_sec = 3600.0",
@@ -83,7 +83,12 @@ def lock(path):
 
 def copytree_filtered(src, dst, excluded, rel=""):
     dst.mkdir(parents=True, exist_ok=True)
-    for p in sorted(src.iterdir()):
+    try:
+        entries = sorted(src.iterdir())
+    except PermissionError:
+        excluded.append(f"{rel or src.name}\tunreadable")
+        return
+    for p in entries:
         r = f"{rel}/{p.name}" if rel else p.name
         if p.is_symlink():
             continue
@@ -94,7 +99,10 @@ def copytree_filtered(src, dst, excluded, rel=""):
                 continue
             copytree_filtered(p, dst / p.name, excluded, r)
         else:
-            shutil.copy2(p, dst / p.name)
+            try:
+                shutil.copy2(p, dst / p.name)
+            except PermissionError:          # e.g. root-owned files a builder's private dockerd left behind
+                excluded.append(f"{r}\tunreadable")
 
 
 def fingerprint(path):
@@ -150,10 +158,24 @@ def archive_task_metadata(task):
         if prev and _same_tree(src, prev[-1]):
             return
     dst.mkdir(parents=True)
+    skipped = []
     for p in src.iterdir():
         if p.name in DERIVED_UNTRUSTED:
             continue                     # written by the buggy reader; see docs/history/RESULTS-AUDIT.md
-        (shutil.copytree if p.is_dir() else shutil.copy2)(p, dst / p.name)
+        if p.is_symlink():
+            continue
+        if p.is_dir():
+            if EXCLUDE_DIR.search(p.name):   # runtime data (a builder's private dockerd, caches), not metadata
+                skipped.append(f"{p.name}\truntime data, not archived")
+                continue
+            copytree_filtered(p, dst / p.name, skipped, p.name)
+        else:
+            try:
+                shutil.copy2(p, dst / p.name)
+            except PermissionError:
+                skipped.append(f"{p.name}\tunreadable")
+    if skipped:
+        (dst / "EXCLUDED.txt").write_text("\n".join(skipped) + "\n")
     lock(dst)
 
 

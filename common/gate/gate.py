@@ -246,22 +246,39 @@ def wait_for_disk():
 
 
 GATE_SLOTS_DIR = Path.home() / ".tb-graders" / "cwe" / "slots" / "gate"
+GATE_LIMITS_FILE = Path.home() / ".tb-graders" / "cwe" / "slots" / "limits.env"
+
+
+def gate_limit(name: str, default: int) -> int:
+    """A gate concurrency limit (2026-10-26): the environment variable if set, else the VM-wide limits file
+    (~/.tb-graders/cwe/slots/limits.env, lines NAME=VALUE, read on every call so changes apply at once), else default."""
+    if os.environ.get(name, "").strip():
+        return int(os.environ[name])
+    try:
+        for line in GATE_LIMITS_FILE.read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == name and v.strip():
+                return int(v.strip())
+    except (OSError, ValueError):
+        pass
+    return default
 
 
 class global_slot:
     """VM-wide cap on concurrent gate Harbor runs (2026-10-26). Scale batch 1 ran 56 parallel gates at ~15
-    Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (default
+    Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (limits file or env, see gate_limit; default
     60 since 2026-10-26 afternoon; 40 before) lock files under ~/.tb-graders/cwe/slots/gate/; locks are released when the process ends, so a killed
     gate never leaks a slot. GATE_GLOBAL_SLOTS=0 disables the cap."""
 
     def __enter__(self):
         import fcntl
-        n = int(os.environ.get("GATE_GLOBAL_SLOTS", "60") or 0)
         self.f = None
-        if n <= 0:
-            return self
         GATE_SLOTS_DIR.mkdir(parents=True, exist_ok=True)
         while True:
+            # Re-read on every attempt, so a change in the limits file reaches gates that are already waiting.
+            n = gate_limit("GATE_GLOBAL_SLOTS", 60)
+            if n <= 0:
+                return self
             for i in range(n):
                 f = open(GATE_SLOTS_DIR / f"slot-{i:03d}.lock", "w")
                 try:

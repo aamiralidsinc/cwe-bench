@@ -27,11 +27,22 @@ flock -n 9 || { echo "$s: another gate already holds $B/.gate.lock; not starting
 # VM. Scale batch 1 put 56 tasks into their gates together (~15 Harbor runs each, ~650 runs, load ~1000 on 64 CPUs).
 # A slot is one of N lock files; the lock lives on fd 8 for this script's lifetime (its stage subshells inherit it),
 # so a killed gate never leaks its slot. gate.py also caps Harbor runs VM-wide (GATE_GLOBAL_SLOTS). 0 disables.
-TS=${GATE_TASK_SLOTS:-10}
+# The limit is the env var if set, else GATE_TASK_SLOTS in ~/.tb-graders/cwe/slots/limits.env (re-read on every attempt,
+# so a change reaches gates that are already waiting), else 10.
+task_slots() { local v="${GATE_TASK_SLOTS:-}"; [ -n "$v" ] || v=$(sed -n 's/^GATE_TASK_SLOTS=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1); echo "${v:-10}"; }
+TS=$(task_slots)
 if [ "$TS" -gt 0 ]; then
   SD="$HOME/.tb-graders/cwe/slots/task-gate"; mkdir -p "$SD"; got=""
   while [ -z "$got" ]; do
-    for i in $(seq 1 "$TS"); do
+    TS=$(task_slots)
+    # Re-gates first (2026-10-26): slots 1..GATE_REGATE_RESERVED (limits file, default 0) are left to re-gates
+    # (GATE_POOL=regate, set by common/gate/regate.sh); every other gate uses the slots above them.
+    lo=1
+    if [ "${GATE_POOL:-}" != regate ]; then
+      R=$(sed -n 's/^GATE_REGATE_RESERVED=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1)
+      [ -n "$R" ] && [ "$R" -lt "$TS" ] && lo=$((R + 1))
+    fi
+    for i in $(seq "$lo" "$TS"); do
       exec 8>"$SD/slot-$i.lock"
       if flock -n 8; then got=$i; break; fi
       exec 8>&-

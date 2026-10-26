@@ -11,6 +11,7 @@ cd "$CWE_ROOT" || exit 2
 B="build/$S"; L="$B/postbuild.log"
 log() { echo "$(date -u +%FT%TZ) $S $*" | tee -a "$L"; }
 log "regate: start (GATE_PARALLEL=${GATE_PARALLEL:-all}; blind fix and listing reused)"
+export GATE_POOL=regate   # re-gates may use the reserved low task-gate slots (gate_one_ds.sh)
 bash "$CWE_GATE_ONE" "$S" > "$B/regate.gate.out" 2>&1; GRC=$?
 log "regate gate: $(tail -1 "$B/regate.gate.out") (exit $GRC)"
 [ "$GRC" = 0 ] || { log "RESULT: not sound (regate gate exit $GRC)"; exit "$GRC"; }
