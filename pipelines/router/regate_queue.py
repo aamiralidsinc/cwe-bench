@@ -4,11 +4,14 @@
 import os, subprocess, sys, time
 os.chdir(os.path.expanduser("~/cwe-bench"))
 lst, P = sys.argv[1], int(sys.argv[2])
-env = dict(os.environ, GATE_PARALLEL="4", GATE_STAGES_PARALLEL="0")
+# Morning of 2026-10-26 (overload): GATE_PARALLEL=4 and stages one at a time. From the afternoon the VM-wide caps
+# (60 Harbor runs, 10 gating tasks) protect the machine, so stages run in parallel unless REGATE_* says otherwise.
+env = dict(os.environ, GATE_PARALLEL=os.environ.get("REGATE_GATE_PARALLEL", "0"),
+           GATE_STAGES_PARALLEL=os.environ.get("REGATE_STAGES_PARALLEL", "1"))
 todo = [l.strip() for l in open(lst) if l.strip()]; running = {}
-log = open("pipelines/router/out/queue/regate-b1.log", "a")
+log = open(os.environ.get("REGATE_LOG", "pipelines/router/out/queue/regate-b1.log"), "a")
 def say(m): log.write(time.strftime("%FT%TZ ", time.gmtime()) + m + "\n"); log.flush()
-say(f"regate queue: {len(todo)} slugs, {P} at a time, GATE_PARALLEL=4, stages one at a time")
+say(f"regate queue: {len(todo)} slugs, {P} at a time, GATE_PARALLEL={env['GATE_PARALLEL']}, stages parallel={env['GATE_STAGES_PARALLEL']}")
 while todo or running:
     for s, p in list(running.items()):
         if p.poll() is not None:

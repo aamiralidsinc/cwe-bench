@@ -23,11 +23,11 @@ B="build/$s"; LOG="$B/recover.log"
 exec 9>"$B/.gate.lock"
 flock -n 9 || { echo "$s: another gate already holds $B/.gate.lock; not starting a second" | tee -a "$LOG"; exit 2; }
 
-# Task-level gate mutex (owner decision 2026-10-26): at most GATE_TASK_SLOTS (default 6) tasks gate at once on this
+# Task-level gate mutex (owner decision 2026-10-26): at most GATE_TASK_SLOTS (default 10; 6 until the afternoon) tasks gate at once on this
 # VM. Scale batch 1 put 56 tasks into their gates together (~15 Harbor runs each, ~650 runs, load ~1000 on 64 CPUs).
 # A slot is one of N lock files; the lock lives on fd 8 for this script's lifetime (its stage subshells inherit it),
 # so a killed gate never leaks its slot. gate.py also caps Harbor runs VM-wide (GATE_GLOBAL_SLOTS). 0 disables.
-TS=${GATE_TASK_SLOTS:-6}
+TS=${GATE_TASK_SLOTS:-10}
 if [ "$TS" -gt 0 ]; then
   SD="$HOME/.tb-graders/cwe/slots/task-gate"; mkdir -p "$SD"; got=""
   while [ -z "$got" ]; do

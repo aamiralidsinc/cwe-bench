@@ -251,12 +251,12 @@ GATE_SLOTS_DIR = Path.home() / ".tb-graders" / "cwe" / "slots" / "gate"
 class global_slot:
     """VM-wide cap on concurrent gate Harbor runs (2026-10-26). Scale batch 1 ran 56 parallel gates at ~15
     Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (default
-    40) lock files under ~/.tb-graders/cwe/slots/gate/; locks are released when the process ends, so a killed
+    60 since 2026-10-26 afternoon; 40 before) lock files under ~/.tb-graders/cwe/slots/gate/; locks are released when the process ends, so a killed
     gate never leaks a slot. GATE_GLOBAL_SLOTS=0 disables the cap."""
 
     def __enter__(self):
         import fcntl
-        n = int(os.environ.get("GATE_GLOBAL_SLOTS", "40") or 0)
+        n = int(os.environ.get("GATE_GLOBAL_SLOTS", "60") or 0)
         self.f = None
         if n <= 0:
             return self
