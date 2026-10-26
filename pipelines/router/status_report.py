@@ -130,6 +130,17 @@ if disk and int(disk.rstrip("G")) < 150:
 for s, st in now.items():
     if st == "waiting for re-gate" and not proc_has(s, "regate"):
         pass
+# Disk janitor (owner rule 2026-10-26): it only reports; every cleanup waits for the owner's approval.
+jr = "build/audit/janitor/LATEST_REPORT.txt"
+if os.path.exists(jr):
+    rep = open(jr).read().splitlines()
+    cand = os.path.basename(rep[0].split("apply ")[-1]) if rep else ""
+    applied = open("build/audit/janitor/applied.log").read() if os.path.exists("build/audit/janitor/applied.log") else ""
+    if cand and cand not in applied:
+        out.append("== janitor report waiting for owner approval: " + " | ".join(x.strip() for x in rep[1:5]))
+jl = sh("ps -eo args | grep -c '[d]isk_janitor.sh loop'")
+if jl == "0":
+    alerts.append("janitor report loop is not running")
 if LEDGER_ERR:
     alerts.append(f"LEDGER NOT REBUILT (trial results may be stale): {LEDGER_ERR}")
 out.append("== new or odd since last report: " + ("; ".join(alerts) if alerts else "nothing"))
