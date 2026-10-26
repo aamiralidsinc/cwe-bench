@@ -43,7 +43,17 @@ log "postbuild: listing + gate + blind fix in parallel"
 bash common/gate/postbuild.sh "$SLUG" --listing >> "$L" 2>&1; PRC=$?
 case $PRC in
   0) log "SOUND: $SLUG ready for trials" ;;
-  3) log "LISTING: $SLUG is gated but its instruction lists hidden traps (or the check errored); not marked sound. Rewrite the instruction (build rule 7) and copy it to the control $CTL, re-run pipelines/stacking/4-listing/run_listing_check.sh, then mark it."; exit 3 ;;
+  3) # The gate passed but the instruction lists hidden traps (build rule 7). Rewrite ONLY the instruction
+     # (pipelines/stacking/5-upgrade, no rebuild: tests, fix and image are unchanged, so the gate still holds;
+     # UPGRADE_FORCE because the task has no .sound yet). It re-runs the listing check itself (two rounds).
+     log "LISTING: instruction lists hidden traps; instruction-only rewrite (5-upgrade)"
+     UPGRADE_FORCE=1 "$CWE_DRIVE" deepseek bash pipelines/stacking/5-upgrade/run_upgrade_stack.sh "$SLUG" >> "$L" 2>&1; URC=$?
+     if [ "$URC" = 0 ] && python3 -I common/gate/fingerprint.py check "$SLUG" >> "$L" 2>&1; then
+       rm -f "build/$SLUG/.listing_fail"; touch "build/$SLUG/.sound"
+       log "SOUND: $SLUG ready for trials (instruction rewritten, listing PASS)"
+     else
+       log "LISTING: rewrite exit $URC; $SLUG stays .listing_fail for a person (see build/$SLUG/upgrade_stack.log)"; exit 3
+     fi ;;
   *) log "STOP: postbuild exit $PRC for $SLUG (see build/$SLUG/postbuild.log)"; exit 1 ;;
 esac
 # Scale run (owner decision 2026-10-25): controls are not gated or trialled unless STACK_CONTROLS=1.

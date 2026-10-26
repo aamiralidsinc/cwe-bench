@@ -113,6 +113,29 @@ account's rate limit, not the VM: the agents mostly wait on the model API. **Par
 realistic plan**; try 20 if the account allows it. Step 2 needs no extra screening, because it reuses these
 records. The whole pool screened also gives step 2 a ranked pool for the rest of the scale run.
 
-## 9. Dry run
+## 9. Dry run (2026-10-25 22:54 → 2026-10-26 00:33 UTC)
 
-(to be filled with the dry-run result)
+Five real tasks, one per path: two stacked (stk-nltk-ghsap3m8, stk-social-core-5847, the top two of the scale
+batch), two step-2 sibling (fastify-s2, nuxt-s2, from DeepSeek's step-2 selection), one step-3 sibling (nuclei-s3,
+from batch 1's solved stk-nuclei).
+
+| Task | Build | Post-build (gate + blind fix in parallel) | Result |
+|---|---|---|---|
+| stk-social-core-5847 | 30 min | 5 min; blind patch pass | SOUND |
+| stk-nltk-ghsap3m8 | 36 min | 7 min; blind patch pass | gated, but `.listing_fail`: 3 of 7 traps described; the automatic instruction rewrite (2 rounds) did not clear it |
+| fastify-s2 | 24 min | 6 min; blind patch pass | SOUND |
+| nuxt-s2 | 60 min | 21 min; blind patch pass | SOUND |
+| nuclei-s3 | 83 min | 14 min; blind patch pass | SOUND |
+
+Found and fixed during the dry run:
+- builders ran `score_stack.py` for `score_at_build`, which rewrote the shared `stack_scores.tsv` with batch 1's Opus
+  scores: the router now reads the frozen `stack_scores_ds.tsv`, and the build addendum says to copy the score;
+- step 3: batch 1's H3 tasks had no screen record (8 repos), the same repo was routed twice, and a lane re-run
+  emptied its slug list: fixed in the router and the lane;
+- `gate_one_ds.sh` wrote `.sound` before `postbuild.sh` finished the blind and listing checks: `postbuild.sh` now holds
+  the marker until the end;
+- a stacking task that fails the listing check now gets the instruction-only rewrite automatically
+  (`run_stack_pipeline.sh` → `5-upgrade`), and is marked SOUND only if the listing then passes.
+
+Open question for the owner: the listing reviewer still flags general-rule sentences in stk-nltk ("Any location
+designated for an operation is a boundary"), which the fairness rule requires the instruction to state.
