@@ -37,10 +37,18 @@ if [ "$TS" -gt 0 ]; then
     TS=$(task_slots)
     # Re-gates first (2026-10-26): slots 1..GATE_REGATE_RESERVED (limits file, default 0) are left to re-gates
     # (GATE_POOL=regate, set by common/gate/regate.sh); every other gate uses the slots above them.
+    # Priority lane (2026-10-26): slots 1..GATE_PRIORITY_TASK_SLOTS are left to tasks listed in
+    # ~/.tb-graders/cwe/slots/priority.txt (breaker candidates); re-gates use the slots above those.
     lo=1
-    if [ "${GATE_POOL:-}" != regate ]; then
-      R=$(sed -n 's/^GATE_REGATE_RESERVED=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1)
-      [ -n "$R" ] && [ "$R" -lt "$TS" ] && lo=$((R + 1))
+    PT=$(sed -n 's/^GATE_PRIORITY_TASK_SLOTS=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1); PT=${PT:-0}
+    if ! grep -qx -- "$s" "$HOME/.tb-graders/cwe/slots/priority.txt" 2>/dev/null; then
+      if [ "${GATE_POOL:-}" = regate ]; then
+        R=$PT
+      else
+        R=$(sed -n 's/^GATE_REGATE_RESERVED=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1); R=${R:-0}
+        [ "$PT" -gt "$R" ] && R=$PT
+      fi
+      [ "$R" -lt "$TS" ] && lo=$((R + 1))
     fi
     for i in $(seq "$lo" "$TS"); do
       exec 8>"$SD/slot-$i.lock"

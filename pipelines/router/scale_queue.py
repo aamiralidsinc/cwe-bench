@@ -50,6 +50,14 @@ def build_done(s):
     b = bdir(s)
     if is_sound(s) or os.path.isfile(os.path.join(b, ".listing_fail")):
         return True
+    # A build that already ran and ended is done, whatever its post-build state (waiting for a re-gate, re-gating,
+    # held for a test repair). Before 2026-10-26 a restarted scheduler rebuilt such tasks from scratch.
+    for marker in (".hold-repair", ".gate_passed"):
+        if os.path.isfile(os.path.join(b, marker)):
+            return True
+    end, start = os.path.join(b, "end_utc.txt"), os.path.join(b, "start_utc.txt")
+    if os.path.isfile(end) and (not os.path.isfile(start) or open(end).read().strip() >= open(start).read().strip()):
+        return True
     for marker in (".unsound", ".gate_error"):
         if os.path.isfile(os.path.join(b, marker)):
             return True

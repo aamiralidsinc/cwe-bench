@@ -264,6 +264,18 @@ def gate_limit(name: str, default: int) -> int:
     return default
 
 
+GATE_PRIORITY_FILE = Path.home() / ".tb-graders" / "cwe" / "slots" / "priority.txt"
+
+
+def is_priority_task() -> bool:
+    """True when this gate's task (gate.py's first argument) is listed in the priority file (one slug per line)."""
+    slug = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        return bool(slug) and slug in {l.strip() for l in GATE_PRIORITY_FILE.read_text().splitlines()}
+    except OSError:
+        return False
+
+
 class global_slot:
     """VM-wide cap on concurrent gate Harbor runs (2026-10-26). Scale batch 1 ran 56 parallel gates at ~15
     Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (limits file or env, see gate_limit; default
@@ -279,7 +291,11 @@ class global_slot:
             n = gate_limit("GATE_GLOBAL_SLOTS", 60)
             if n <= 0:
                 return self
-            for i in range(n):
+            # Priority lane (2026-10-26): the first GATE_PRIORITY_RUN_SLOTS slots are left to tasks listed in
+            # ~/.tb-graders/cwe/slots/priority.txt (breaker candidates); every other gate uses the slots above them.
+            pr = gate_limit("GATE_PRIORITY_RUN_SLOTS", 0)
+            start = 0 if is_priority_task() else min(max(pr, 0), max(n - 1, 0))
+            for i in range(start, n):
                 f = open(GATE_SLOTS_DIR / f"slot-{i:03d}.lock", "w")
                 try:
                     fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
