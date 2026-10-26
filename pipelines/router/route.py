@@ -90,8 +90,6 @@ def stacking_batch(a):
     # stack_scores_ds.tsv: the frozen DeepSeek scores of the full-pool selection (stack_scores.tsv is rewritten
     # whenever score_stack.py runs, e.g. by a builder; 2026-10-25 a builder overwrote it with batch 1's scores).
     scores = [r for r in csv.DictReader(open(SO / "stack_scores_ds.tsv"), delimiter="\t") if r["usable"] == "True"]
-    built = built_repos()
-    taken = {norm(r["repo"]) for b in batches() for r in batch_rows(b)}
     # One stacked task per repo VERSION (owner decision 2026-10-25): designs pinned to different commits are
     # different code with different bugs (e.g. a year apart), so each can be its own task. Two designs on the
     # same pinned commit overlap (same checkout, shared routes): only the best-scored one is taken.
@@ -101,6 +99,16 @@ def stacking_batch(a):
             return str(rec.get("pinned_commit") or rec.get("pin") or "")[:12]
         except Exception:
             return ""
+    # Scale-run batches (every registered batch except the old batch1) are excluded by repo VERSION, not by repo:
+    # a second version of a repo whose first version is in an earlier scale batch is still its own task (fix
+    # 2026-10-26: batch 2 had lost 4 such designs). Repos built outside the scale run (sibling tasks, the old
+    # batch 1) stay excluded as a whole.
+    scale_rows = [r for b in batches() if b != "batch1" for r in batch_rows(b)]
+    scale_slugs = {r["slug"] for r in scale_rows}
+    taken = {(norm(r["repo"]), pin_of(r["job_id"]) or r["job_id"]) for r in scale_rows if r.get("job_id")}
+    built = {repo for repo, slugs in built_repos().items()
+             if any(s not in scale_slugs and s.removesuffix("-control") not in scale_slugs for s in slugs)}
+    built |= {norm(r["repo"]) for r in batch_rows("batch1")}
     best = {}
     for r in sorted(scores, key=lambda r: -float(r["score"])):
         j = jobs.get(r["candidate"])
@@ -108,7 +116,7 @@ def stacking_batch(a):
             continue
         repo = norm(j["repo"])
         key = (repo, pin_of(j["id"]) or j["id"])
-        if repo in built or repo in taken or key in best or float(r["score"]) < a.min_score:
+        if repo in built or key in taken or key in best or float(r["score"]) < a.min_score:
             continue
         best[key] = (r, j)
     chosen = list(best.values())[: a.top] if a.top else list(best.values())
