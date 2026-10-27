@@ -61,6 +61,6 @@ come in. Trials, audits (failing runs only) and fairness follow each pipeline's 
 |---|---|
 | `route.py` | the router (this folder's only code) |
 | `out/stacking_batches.txt` | registered stacking batches (names of `pipelines/stacking/out/<name>.tsv`) |
-| `out/step2/screener/`, `out/step2/pipeline/` | the general sibling pool (screen records) and the lane's files for it (`pool.jsonl`, `pool_excluded.tsv`, selections) |
+| `out/step2/screener/`, `out/step2/pipeline/` | the general sibling pool (screen records) and the lane's files for it (`pool.jsonl`, `pool_excluded.tsv`, `pool_sources.tsv`, selections) |
 | `out/step3/routed.tsv`, `out/step3/screener/` | routing record of solved stacked tasks (each is also in the general pool) |
 | `out/step3/pipeline/` | the former step-3 lane (selection and BUILD-PROMPTs of 2026-10-25 to 27); history only |

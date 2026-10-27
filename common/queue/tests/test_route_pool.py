@@ -83,7 +83,8 @@ def test_pool_excludes_built_and_batched_and_marks_the_source(world, monkeypatch
     pipe = world / "pipelines" / "router" / "out" / "step2" / "pipeline"
     rows = {x["entry_id"]: x for x in map(json.loads, (pipe / "pool.jsonl").read_text().splitlines())}
     assert set(rows) == {"100", "101"}                                   # 103 is in a batch, 102 is built
-    assert rows["100"]["source"] == "solved stacked task"
-    assert rows["101"]["source"] == "step-2 screen"
+    assert all("source" not in x for x in rows.values())                 # the ranking does not see the origin
+    src = dict(l.split("\t")[0::2] for l in (pipe / "pool_sources.tsv").read_text().splitlines()[1:])
+    assert src == {"100": "solved stacked task", "101": "step-2 screen"}
     assert "in a batch" in (pipe / "pool_excluded.tsv").read_text()
     assert "1 from solved stacked tasks" in capsys.readouterr().out
