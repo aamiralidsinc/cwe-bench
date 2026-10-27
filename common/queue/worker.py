@@ -14,6 +14,7 @@ Commands:
   regrade  python3 -I common/audit/regrade_from_code.py <trial_dir> "<why>"
   rescore  python3 -I common/audit/rescore_from_results.py <trial_dir> --drop <name> ... --why "<why>"
   audit_prep, audit_record, fairness, cleanup, step3: phase4.py command() (the commands auto_advance.sh ran)
+  delivery_prep: python3 -I common/queue/delivery.py prep <slug>
 A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}). [env.<kind>] adds
 environment variables (trial_run: CWE_AGENT_TIMEOUT_MULT, as the scheduler set it). [ok_exit_codes.<kind>] lists the
 exits that count as done (trial.py exits 2 when some runs were ungraded: the reconciler plans the next run).
@@ -53,8 +54,9 @@ def command(row, cfg):
     if k == "rescore":
         drops = [x for d in a["drop"] for x in ("--drop", d)]
         return [sys.executable, "-I", "common/audit/rescore_from_results.py", trial, *drops, "--why", a["why"]]
+    import delivery
     import phase4                                       # audit_prep, audit_record, fairness, cleanup, step3
-    argv = phase4.command(row, cfg)
+    argv = phase4.command(row, cfg) or delivery.command(row, cfg)
     if argv:
         return argv
     raise ValueError(f"no worker for kind {k}")

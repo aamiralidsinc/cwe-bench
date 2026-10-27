@@ -10,9 +10,12 @@ One queue starts every stage of the pipeline:
 - audit preparation and recording;
 - fairness reviews;
 - the hourly cleanup;
-- the router's periodic step.
+- the router's periodic step;
+- delivery preparation after the owner's keep decision.
 
-It is the implementation of section 1 of `docs/ARCHITECTURE-ROADMAP.md`.
+It also keeps an event queue for the orchestrator and a decisions inbox for the owner. Together these implement
+section 1 of `docs/ARCHITECTURE-ROADMAP.md`, plus the event queue and decisions inbox of section 4 and the delivery
+job of section 8.
 
 ## Design
 
@@ -145,13 +148,68 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 - **Pseudo tasks.** `audit_record`, `cleanup` and `step3` run as the pseudo tasks `_ledger`, `_machine` and
   `_router`.
 
+### Delivery preparation (`common/queue/delivery.py`)
+
+A task gets one `delivery_prep` job per keep decision when all of these hold:
+- its `HUMAN-DECISION.md` records a current KEEP;
+- the audited ledger shows both models failed;
+- it is not in the delivery register (`build/audit/delivered.tsv`).
+
+A kept task that is not a both-model breaker is reported and never prepared.
+
+The job runs `delivery.py prep <slug>`:
+1. `common/util/export_delivery.py` writes the task package and its counted rollouts into
+   `~/.tb-graders/cwe/deliveries/<UTC>-<slug>/` (`[delivery] out_dir`). The export redacts every model key value.
+2. `task.toml` gets `name = "cwe-bench/<name>"`; nothing else in the package changes.
+3. A pattern scan of the whole export must find no key-like strings outside upstream test fixtures.
+4. `ready.json` records the result:
+   - the proposed name (the repository name plus the CWE's short name, in kebab case);
+   - the README row;
+   - rollouts per model, and runs skipped for lack of a trajectory;
+   - both scan results.
+
+The job never touches the delivery repository; the commit and push are done by a person. After the push,
+`cweq delivered <slug> <name> <commit>` appends the register row (and the `-control` row of a stacked task) and the
+`DELIVERED` line in `HUMAN-DECISION.md`.
+
+## Events
+
+Each reconcile pass turns what changed into rows of the `events` table (`common/queue/events.py`):
+
+| Event | When |
+|---|---|
+| `job.done`, `job.failed`, `job.blocked` | A job ended. `done` is emitted only for the kinds in `[events] job_done_kinds` |
+| `stage.<stage>` | A task reached a new stage, for the stages in `[events] stages` |
+| `breaker.candidate` | The audited ledger now calls the task a BREAKER candidate |
+| `audit.ready` | An evidence folder waits for its auditor |
+| `adoption.conflict` | The latest adoption has a conflict |
+| `disk.critical` | Free disk fell below `[events] disk_critical_gb` |
+
+- **No duplicates.** Every event has a dedup key, and the values an event compares against (a task's stage, its
+  ledger verdict, the disk state) are kept in the `marks` table. The same change therefore never emits twice.
+- **Quiet first pass.** The first pass records the marks without emitting, so history does not flood the table.
+- **Handling order.** `cweq events next` returns the oldest open event, urgent kinds first (`[events] urgent`).
+  `cweq events handle ID --action TEXT` closes an event with the action taken. Events are handled one at a time,
+  in that order.
+
+## Decisions inbox
+
+`cweq inbox` prints, and `cweq inbox --html PATH` writes as one self-contained page, every decision waiting on the
+owner. Everything comes from `taskstate`, `fairness_verdict`, `HUMAN-DECISION.md`, the job table and the prepared
+delivery packages. The sections are:
+- breakers ready for KEEP, REPAIR or DROP, with the reviewer's human-review question quoted from `FAIRNESS.md`;
+- fairness reviews that are NOT READY, with the required change quoted;
+- kept tasks that are not delivered yet, with their prepared package;
+- blocked jobs;
+- tasks that need a person (listing check failed, trials stuck).
+
 ## Admission
 
 No job starts while any limit is exceeded:
 
 | Limit | Value |
 |---|---|
-| Running per kind (`[limits.max_running]`) | build 32, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1 |
+| Running per kind (`[limits.max_running]`) | build 32, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1, delivery_prep 1 |
 | Running in total (`max_running_total`) | 69 |
 | Free disk | a floor per kind (`[limits.disk_floor]`), read live from `limits.env` through `common/util/diskguard.py` |
 | Machine | maximum load, minimum available memory, ceiling on `/tmp` inodes |
@@ -172,7 +230,7 @@ Further rules:
 | Column | Meaning |
 |---|---|
 | `id` | integer key |
-| `kind` | `build` `gate` `regate` `trial_run` `regrade` `rescore` `audit_prep` `audit_record` `fairness` `cleanup` `step3` |
+| `kind` | `build` `gate` `regate` `trial_run` `regrade` `rescore` `audit_prep` `audit_record` `fairness` `cleanup` `step3` `delivery_prep` |
 | `task` | the slug, or a pseudo task |
 | `args` | canonical JSON (sorted keys). `(kind, task, args)` is UNIQUE |
 | `priority` | higher starts first. Effective priority = `priority + aging_per_hour × hours since queued_at` |
@@ -187,6 +245,9 @@ Further rules:
 Adoption adds two more tables:
 - `adoptions`: one row per import, with its counts, conflicts and differences.
 - `tasks`: each task's stage, next step and facts at the last adoption.
+
+The event queue adds `events` (kind, task, payload, dedup key, urgent, state open or handled, action) and `marks` (the
+last value seen per key).
 
 Exit codes:
 - `0` → `done`.
@@ -208,6 +269,9 @@ python3 common/queue/cweq.py block ID [--why TEXT]
 python3 common/queue/cweq.py explain TASK      # what the rules see for the task, and all its jobs
 python3 common/queue/cweq.py verify [--kind K] [--state S]   # post-condition checks of finished jobs (read-only)
 python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   # reproduce a known grading
+python3 common/queue/cweq.py events [--open] | events next | events handle ID --action TEXT
+python3 common/queue/cweq.py inbox [--html PATH] [--json]
+python3 common/queue/cweq.py delivered TASK NAME COMMIT [--date D] [--note TEXT]
 ```
 
 A job that exits with an ok code is `done` only when its post-condition check passes; every automatic rule, its

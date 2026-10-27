@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 
 KINDS = ("build", "gate", "regate", "trial_run", "regrade", "rescore", "audit_prep", "audit_record", "fairness",
-         "cleanup", "step3")
+         "cleanup", "step3", "delivery_prep")
 STATES = ("queued", "leased", "running", "done", "failed", "blocked")
 ACTIVE = ("leased", "running")
 
