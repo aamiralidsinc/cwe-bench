@@ -10,6 +10,8 @@
     python3 common/queue/cweq.py status                        counts, running jobs, blocked jobs, headroom
     python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--after ID ...]
     python3 common/queue/cweq.py retry ID | block ID [--why TEXT]
+    python3 common/queue/cweq.py stop ID [--grace N] [--why TEXT]   stop one job (identity-checked) and its containers
+    python3 common/queue/cweq.py orphans [--json]              containers and processes with no live job (read-only)
     python3 common/queue/cweq.py explain TASK                  what the rules see for a task, and all its jobs
 
 Options before the command: --db PATH (default from the config), --config PATH (default common/queue/queue.toml
@@ -25,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adopt  # noqa: E402
 import config  # noqa: E402
 import dispatch  # noqa: E402
+import identity  # noqa: E402
 import procs  # noqa: E402
 import qdb  # noqa: E402
 import reconcile  # noqa: E402
@@ -227,6 +230,29 @@ def cmd_block(conn, cfg, a):
     return 0
 
 
+def cmd_stop(conn, cfg, a):
+    for line in identity.stop(conn, a.id, grace=a.grace, why=a.why or "stopped by cweq stop"):
+        print(line)
+    return 0
+
+
+def cmd_orphans(conn, cfg, a):
+    res = identity.orphans(conn)
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    print(f"containers whose job is no longer running ({len(res['containers_job_ended'])}):")
+    for c in res["containers_job_ended"]:
+        print(f"  {c['id']} {c['name']:<60} {c['state']:<8} job #{c['labels'].get('cwe.job_id')} {c['job_state']}")
+    print(f"pipeline containers with no cwe labels ({len(res['containers_unlabelled'])}):")
+    for c in res["containers_unlabelled"]:
+        print(f"  {c['id']} {c['name']:<60} {c['state']:<8} {c['status']}")
+    print(f"processes whose job is no longer running ({len(res['processes_job_ended'])}):")
+    for p in res["processes_job_ended"]:
+        print(f"  pid {p['pid']} job #{p['job_id']} {p['job_state']} {p['cmd']}")
+    return 0
+
+
 def cmd_explain(conn, cfg, a):
     t = reconcile.analyse(a.task, cfg, procs.busy_tasks([a.task], cfg["busy"]["patterns"],
                                                         skip_dirs=(paths.COMMON,)))
@@ -280,6 +306,12 @@ def main(argv=None):
     p = sub.add_parser("block")
     p.add_argument("id", type=int)
     p.add_argument("--why")
+    p = sub.add_parser("stop", help="stop one job: its process group (identity verified) and its containers")
+    p.add_argument("id", type=int)
+    p.add_argument("--grace", type=int, default=30)
+    p.add_argument("--why")
+    p = sub.add_parser("orphans", help="containers and processes with no live job (read-only)")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("explain")
     p.add_argument("task")
     p = sub.add_parser("_work")                          # internal: the worker wrapper
@@ -288,7 +320,7 @@ def main(argv=None):
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks")
+    looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
@@ -296,7 +328,7 @@ def main(argv=None):
     if a.cmd == "_work":
         return worker.run(conn, cfg, a.id)
     return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
-            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain}[a.cmd](conn, cfg, a)
+            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "stop": cmd_stop, "orphans": cmd_orphans}[a.cmd](conn, cfg, a)
 
 
 if __name__ == "__main__":

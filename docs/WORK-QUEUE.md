@@ -165,6 +165,37 @@ Further rules:
 - **Staggered starts.** Starts are spaced 15-40 s apart during the first fill, then 2-8 s, so simultaneous container
   start-up never starves the machine.
 
+## Process identity and labels
+
+- **Identity.** When a worker starts a job's command, it records the following in the table `job_procs`
+  (`common/queue/identity.py`):
+  - its own pid;
+  - its process group (the worker leads its own session, so the group holds the whole job);
+  - the start time of each process, from `/proc/<pid>/stat`;
+  - the command's pid;
+  - the code version (`common/queue/DEPLOYED_FROM`, else the git commit).
+- **`cweq stop <id> [--grace N] [--why TEXT]`** stops one job. It works in this order:
+  1. It checks that the recorded worker pid still has the recorded start time, so a reused pid is never signalled.
+  2. It sends SIGTERM to the job's process group, then SIGKILL after the grace period.
+  3. It removes every container of the job's compose projects, sidecars included.
+  4. It marks the job `blocked`.
+
+  Nothing is stopped by matching command lines.
+- **Labels on processes.** Every process a worker starts carries `CWE_JOB_ID`, `CWE_KIND`, `CWE_TASK`, `CWE_BATCH`,
+  `CWE_MODEL`, `CWE_RUN` and `CWE_CODE_VERSION`, and its children inherit them. `trial.py` also sets `CWE_TASK`,
+  `CWE_MODEL` and `CWE_RUN` for each run it starts.
+- **Labels on containers.** Every `main` container Harbor starts through `common/harbor_ext/cwe_reuse_env.py` (gate
+  runs, trials, regrades) carries matching Docker labels: `cwe.job_id`, `cwe.kind`, `cwe.task`, `cwe.batch`,
+  `cwe.model`, `cwe.run`, `cwe.code_version`, `cwe.started_by` (`cweq`, or `script` for other launchers) and
+  `cwe.session`.
+  - They come from one extra compose override (`common/harbor_ext/cwe_labels.py`) added to Harbor's compose file
+    list. Harbor itself is unchanged.
+  - `CWE_LABELS=0` turns them off.
+- **`cweq orphans [--json]`** is read-only. It lists:
+  - containers labelled with a job that is no longer running;
+  - pipeline containers with no `cwe.*` labels;
+  - processes carrying a queue job id whose job is no longer running.
+
 ## Schema
 
 `jobs` (`common/queue/qdb.py`):
@@ -206,6 +237,8 @@ python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--a
 python3 common/queue/cweq.py retry ID          # also re-opens jobs blocked because this one failed
 python3 common/queue/cweq.py block ID [--why TEXT]
 python3 common/queue/cweq.py explain TASK      # what the rules see for the task, and all its jobs
+python3 common/queue/cweq.py stop ID [--grace N] [--why TEXT]
+python3 common/queue/cweq.py orphans [--json]
 ```
 
 Options before the command: `--db PATH`, and `--config PATH` (or `$CWEQ_CONFIG`).

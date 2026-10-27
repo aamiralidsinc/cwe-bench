@@ -143,7 +143,8 @@ def one_run(model, task_dir, idx):
         # pruned mid-up; fixes the concurrent network-not-found race under parallelism.
         subprocess.run(["docker", "network", "prune", "-f", "--filter", "until=10m"], capture_output=True)
     proc = subprocess.run(["bash", str(RUN), model, str(task_dir), "1",
-                           "--job-name", name, "-n", "1", "-y"], capture_output=True, text=True)
+                           "--job-name", name, "-n", "1", "-y"], capture_output=True, text=True,
+                          env=dict(os.environ, CWE_TASK=task_dir.name, CWE_MODEL=model, CWE_RUN=str(idx)))
     wall = round(time.time() - t0)
     rec = {"job": name, "wall_s": wall, "harbor_rc": proc.returncode, "reward": None, "cause": None}
     if proc.returncode == 3 and (ROOT / "build" / task_dir.name / f"hold_{model}").exists():

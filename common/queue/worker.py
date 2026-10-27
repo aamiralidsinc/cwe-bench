@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402
 
+import identity  # noqa: E402
 import qdb  # noqa: E402
 
 
@@ -95,8 +96,13 @@ def run(conn, cfg, job_id):
                   f"{' '.join(argv)}\n")
         log.flush()
         env = dict(os.environ, **{k2: str(v) for k2, v in (cfg.get("env", {}).get(row["kind"]) or {}).items()})
+        env.update(identity.job_env(row, paths.PIPELINES / "router" / "out" / "batches"))   # labels (identity.py)
         child = subprocess.Popen(argv, cwd=str(paths.ROOT), stdin=subprocess.DEVNULL, stdout=log,
                                  stderr=subprocess.STDOUT, env=env)
+        try:
+            identity.record(conn, job_id, row["attempts"], me, child.pid)
+        except Exception as e:                           # identity is bookkeeping: never fail the job over it
+            log.write(f"{qdb.utc()} cweq: process identity not recorded ({type(e).__name__}: {e})\n")
         step = max(1.0, lease / 10)
         lost = False
         while True:
