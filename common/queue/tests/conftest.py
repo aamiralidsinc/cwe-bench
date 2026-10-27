@@ -27,6 +27,10 @@ def root(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "BUILD", r / "build")
     monkeypatch.setattr(paths, "TASKS", r / "tasks")
     import reconcile
+    import taskstate
+    monkeypatch.setattr(taskstate.trial_state, "ROOT", r)
+    monkeypatch.setattr(taskstate.fairness_verdict, "ROOT", r)
+    monkeypatch.setattr(paths, "PIPELINES", r / "pipelines")
     reconcile._digest_cache.clear()
     return r
 
@@ -34,6 +38,7 @@ def root(tmp_path, monkeypatch):
 def write_config(tmp_path, root, extra=""):
     f = tmp_path / "queue.toml"
     f.write_text(f'db = "{tmp_path / "queue.db"}"\nlog_dir = "{tmp_path / "logs"}"\njobs_dir = "{root / "jobs"}"\n'
+                 'require_adoption = false\n'
                  + extra)
     return config.load(f)
 

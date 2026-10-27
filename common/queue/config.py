@@ -12,6 +12,7 @@ DEFAULTS = {
     "log_dir": "~/.tb-graders/cwe/queue-logs",
     "jobs_dir": "~/.tb-graders/cwe/jobs",
     "enabled": True,
+    "require_adoption": True,
     "dispatch": {"tick_sec": 30, "start_spacing_sec": 20, "max_starts_per_tick": 2, "lease_sec": 600,
                  "aging_per_hour": 10, "max_running_total": 8, "max_running_per_task": 1},
     "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True},

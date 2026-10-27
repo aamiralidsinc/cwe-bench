@@ -1,4 +1,4 @@
-# Work queue (phase 1)
+# Work queue (phase 1 and adoption)
 
 Code: `common/queue/`. CLI: `python3 common/queue/cweq.py`. Settings: `common/queue/queue.toml`.
 Tests: `python3 -m pytest common/queue/tests` (Python 3.11 or newer, for `tomllib`).
@@ -116,6 +116,45 @@ Options before the command: `--db PATH` and `--config PATH` (or `$CWEQ_CONFIG`).
 - `dispatch --dry-run --with-reconcile` copies the queue into memory, reconciles into the copy, and then plans. It
   answers "what would the queue do right now?" and writes nothing.
 - `status`, `explain` and the dry runs never create the database.
+
+## Adoption: continuing from where the pipeline stands
+
+The queue never starts from zero. Before the dispatcher starts anything, `cweq adopt` reads the state of every task
+the pipeline knows into the database. The dispatcher stays closed (`require_adoption = true`) until an adoption has
+been recorded with no conflicts.
+
+- **What it reads** (`common/queue/taskstate.py`). It reuses the readers the current pipeline relies on: the
+  scheduler's build-done rules, the gate markers and fingerprint, `trial_state.py`, the audited ledger,
+  `fairness_verdict.py`, `HUMAN-DECISION.md`, and the delivery register `build/audit/delivered.tsv`. It also reads
+  the processes running right now for builds, gates, re-gates, trials, fairness reviews and repairs.
+- **Which tasks.** Every slug in a batch file, every ledger row, and every task package with a build record.
+- **What it records.** Each task gets one stage and the one next step that moves it on. The stages are listed in
+  `taskstate.STAGES`: from `waiting_build` through `trialing` and `awaiting_audit` to `kept` and `delivered`.
+- **Running work.** Work that is running under the current scripts is recorded as running, never started a second
+  time.
+- **Older tasks.** A task from before the scale batches (not in a batch file, no `.sound` marker) is
+  `outside_batches`. It is never built or gated. When the ledger has its verdicts, they decide its stage.
+- **Delivery.** The delivery register is the record of what is in the client repository, so nothing is delivered
+  twice. A delivery job appends a row to it.
+- **Never redo.** Before a `build`, `gate` or `trial_run` job starts, and when one is enqueued by hand,
+  `taskstate.redo_reason()` checks the files again. A job whose work the files show as done or running is closed as
+  `done` ("not needed, it would redo finished work: ..."); it never runs. Holds are checked first, so a held task
+  waits instead.
+- **Conflicts.** A conflict is a reading that would make the queue repeat finished work or lose track of running
+  work. Examples: a task package with no build record, a ledger verdict that the files do not explain, a running
+  process for an unknown task. Conflicts keep the dispatcher closed.
+- **Differences.** A difference is a place where the audited ledger and a model's runs log disagree, for example
+  when runs of an older task version count in the ledger. Differences are shown for a person; the queue follows the
+  ledger.
+
+```
+python3 common/queue/cweq.py adopt --dry-run [--detail]   # the report; writes nothing
+python3 common/queue/cweq.py adopt                        # record it (tables adoptions, tasks)
+python3 common/queue/cweq.py tasks [--stage S] [--next TEXT]
+```
+
+The per-batch schedulers are retired only after an adoption is OK and its counts match the schedulers' own state
+files (builds running and waiting, trials running).
 
 ## Running it alongside the current scripts
 

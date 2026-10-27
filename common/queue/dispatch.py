@@ -25,8 +25,10 @@ import paths  # noqa: E402
 
 import procs  # noqa: E402
 import qdb  # noqa: E402
+import taskstate  # noqa: E402
 
 CWEQ = Path(__file__).resolve().parent / "cweq.py"
+REDO = "not needed, it would redo finished work: "
 
 
 def effective_priority(row, now, aging_per_hour):
@@ -114,17 +116,31 @@ class Dispatcher:
         busy = procs.busy_tasks({r["task"] for r in queued}, cfg["busy"]["patterns"], self.proc_list,
                                 skip_dirs=(paths.COMMON,))
         maxk = cfg["limits"]["max_running"]
+        adoption = qdb.latest_adoption(self.conn)
+        not_adopted = None
+        if cfg.get("require_adoption", True):
+            if adoption is None:
+                not_adopted = "no adoption yet: run `cweq adopt` so the queue starts from the pipeline's current state"
+            elif not adoption["ok"]:
+                not_adopted = f"adoption #{adoption['id']} has conflicts: resolve them and run `cweq adopt` again"
+        ctx = None
         starts, waits = [], []
         for r in queued:
             k, t = r["kind"], r["task"]
             if not cfg.get("enabled", True):
                 why = "queue switched off (enabled = false)"
+            elif not_adopted:
+                why = not_adopted
             elif k not in maxk and k not in cfg.get("commands", {}):
                 why = f"no worker for {k} in phase 1"
             elif not self.deps_done(r):
                 why = "waiting for " + ", ".join(f"#{x}" for x in qdb.deps_of(r))
             elif held(t, k, qdb.args_of(r)):
                 why = held(t, k, qdb.args_of(r))
+            elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(
+                    k, t, qdb.args_of(r), ctx := ctx or taskstate.context(
+                        procs.list_processes() if self.proc_list is None else self.proc_list))):
+                why = REDO + redo
             elif t in busy:
                 why = f"task busy (old script pid {busy[t][0][0]}: {busy[t][0][1][:80]})"
             elif per_task.get(t, 0) >= d["max_running_per_task"]:
@@ -165,6 +181,11 @@ class Dispatcher:
             rep["reaped"] = self.reap()
             rep["blocked"] = self.block_broken_deps()
         starts, waits = self.plan()
+        if not dry_run:                                  # the files show the work done: close the job, never run it
+            for r, why in waits:
+                if why and why.startswith(REDO):
+                    qdb.set_state(self.conn, r["id"], "done", why)
+            waits = [(r, w) for r, w in waits if not (w and w.startswith(REDO))]
         rep["waiting"] = waits
         if dry_run:
             rep["started"] = [(r, "would start") for r, _ in starts]

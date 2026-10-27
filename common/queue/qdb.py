@@ -40,6 +40,29 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
 CREATE INDEX IF NOT EXISTS jobs_task ON jobs (task);
+
+-- Adoption (adopt.py): the queue's picture of the running pipeline, imported from disk before it dispatches.
+CREATE TABLE IF NOT EXISTS adoptions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    started       TEXT NOT NULL,
+    finished      TEXT,
+    code_version  TEXT,                          -- git commit of the queue code that read the state
+    tasks         INTEGER,
+    counts        TEXT,                          -- JSON {{stage: n}}
+    conflicts     TEXT,                          -- JSON list: readings that would make the queue redo work
+    differences   TEXT,                          -- JSON list: ledger vs launch-state differences (information)
+    ok            INTEGER NOT NULL DEFAULT 0     -- 1 = no conflicts: the dispatcher may start work
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    task          TEXT PRIMARY KEY,
+    adoption_id   INTEGER NOT NULL,
+    batch         TEXT,
+    pipeline      TEXT,
+    stage         TEXT NOT NULL,
+    next          TEXT NOT NULL,
+    facts         TEXT NOT NULL,                 -- JSON: markers, per-model states, verdicts, running processes
+    read_at       TEXT NOT NULL
+);
 """
 
 
@@ -204,3 +227,7 @@ def retry(conn, job_id):
                          " finished=NULL, exit_code=NULL, result='retry by hand', queued_at=? WHERE id=?", (utc(), i))
             out.append(i)
     return out
+
+
+def latest_adoption(conn):
+    return conn.execute("SELECT * FROM adoptions WHERE finished IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()

@@ -2,6 +2,9 @@
 """cweq: the CWE-bench work queue (phase 1: re-gate, regrade, rescore). Design: docs/WORK-QUEUE.md.
 
     python3 common/queue/cweq.py init                          create the database (WAL)
+    python3 common/queue/cweq.py adopt [--dry-run] [--detail]  read the running pipeline's state into the queue;
+                                                               the dispatcher starts nothing until this is OK
+    python3 common/queue/cweq.py tasks [--stage S] [--next TEXT]   the adopted state per task
     python3 common/queue/cweq.py reconcile [--once] [--dry-run] [--task SLUG]   derive jobs from the files on disk
     python3 common/queue/cweq.py dispatch [--once] [--dry-run] start queued jobs within the limits
     python3 common/queue/cweq.py status                        counts, running jobs, blocked jobs, headroom
@@ -19,11 +22,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import adopt  # noqa: E402
 import config  # noqa: E402
 import dispatch  # noqa: E402
 import procs  # noqa: E402
 import qdb  # noqa: E402
 import reconcile  # noqa: E402
+import taskstate  # noqa: E402
 import worker  # noqa: E402
 from dispatch import paths  # noqa: E402
 
@@ -132,8 +137,34 @@ def cmd_status(conn, cfg, a):
     return 0
 
 
+def cmd_adopt(conn, cfg, a):
+    rep = adopt.adopt(conn, cfg, dry_run=a.dry_run)
+    adopt.report(rep, detail=a.detail)
+    return 0 if rep["ok"] else 1
+
+
+def cmd_tasks(conn, cfg, a):
+    ad = qdb.latest_adoption(conn)
+    if ad is None:
+        print("no adoption recorded yet: run `cweq adopt --dry-run`, then `cweq adopt`")
+        return 1
+    print(f"adoption #{ad['id']} at {ad['finished']} ({'OK' if ad['ok'] else 'NOT OK'}; code {ad['code_version']})")
+    where, params = "1", []
+    if a.stage:
+        where, params = "stage=?", [a.stage]
+    for r in conn.execute(f"SELECT * FROM tasks WHERE {where} ORDER BY stage, task", params):
+        if a.next and a.next not in r["next"]:
+            continue
+        print(f"  {r['task']:<44} {r['stage']:<20} {r['next']}")
+    return 0
+
+
 def cmd_enqueue(conn, cfg, a):
     args = json.loads(a.args) if a.args else {}
+    why = taskstate.redo_reason(a.kind, a.task, args, taskstate.context(procs.list_processes()))
+    if why:
+        print(f"refused: {a.kind} {a.task} would redo finished work ({why})")
+        return 1
     pri = a.priority if a.priority is not None else cfg["priority"].get(a.kind, 0)
     jid, created = qdb.enqueue(conn, a.kind, a.task, args, priority=pri,
                                max_attempts=cfg["max_attempts"].get(a.kind, 2), depends_on=a.after or ())
@@ -183,6 +214,12 @@ def main(argv=None):
     ap.add_argument("--config")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
+    p = sub.add_parser("adopt")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--detail", action="store_true", help="every task's stage and next step, every difference")
+    p = sub.add_parser("tasks")
+    p.add_argument("--stage", choices=taskstate.STAGES)
+    p.add_argument("--next", help="only tasks whose next step contains this text")
     p = sub.add_parser("reconcile")
     p.add_argument("--once", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -213,14 +250,14 @@ def main(argv=None):
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain")
+    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
         return 0
     if a.cmd == "_work":
         return worker.run(conn, cfg, a.id)
-    return {"reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
+    return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
             "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain}[a.cmd](conn, cfg, a)
 
 
