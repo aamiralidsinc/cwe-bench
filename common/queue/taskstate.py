@@ -82,6 +82,32 @@ def batches():
     return out
 
 
+def batch_meta():
+    """{batch name: {"priority": int, "hold": bool}} from header lines of the batch files:
+    `# priority: <int>`  added to the default priority of the batch's builds and trial runs (a later batch gets a
+                         lower number so its builds start only after the earlier batch's builds have started);
+    `# hold: yes`        no new builds start for the batch (queued ones wait in the queue); built tasks still go through
+                         their gate and trials, and running builds finish."""
+    out = {}
+    for f in sorted((paths.PIPELINES / "router" / "out" / "batches").glob("*.txt")):
+        m = {"priority": 0, "hold": False}
+        for line in _read(f).splitlines():
+            t = line.strip()
+            if not t.startswith("#"):
+                continue
+            k, _, v = t.lstrip("#").strip().partition(":")
+            k, v = k.strip().lower(), v.strip().lower()
+            if k == "priority":
+                try:
+                    m["priority"] = int(v.split()[0])
+                except (ValueError, IndexError):
+                    pass
+            elif k == "hold":
+                m["hold"] = v.split()[:1] in (["yes"], ["true"], ["1"])
+        out[f.stem] = m
+    return out
+
+
 def ledger():
     """{slug: {"track", "deepseek", "mimo", "verdict"}} from the 'All tasks' table of build/audit/ledger.md."""
     out, on = {}, False
@@ -167,8 +193,8 @@ def deliveries():
 
 
 def context(proc_list, ignore_own=False):
-    return {"batches": batches(), "ledger": ledger(), "running": running(proc_list, ignore_own),
-            "delivered": deliveries()}
+    return {"batches": batches(), "batch_meta": batch_meta(), "ledger": ledger(),
+            "running": running(proc_list, ignore_own), "delivered": deliveries()}
 
 
 def gate_sha16(slug):

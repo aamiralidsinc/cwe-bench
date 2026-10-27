@@ -65,6 +65,9 @@ These rules apply to tasks listed in a batch file.
 |---|---|---|---|---|
 | D1 | A queued job | Start in order of priority + `aging_per_hour` × hours waited | No job waits forever | `test_queue.py` aging test |
 | D2 | A kind at `[limits.max_running]`, or all kinds at `max_running_total`; work started outside the queue counts | The job waits | Running jobs never exceed the caps | `dispatch.plan()`, `test_phase3.py` |
+| D7 | CPU idle stayed >= `[autolimit] raise_idle_pct` for `raise_window_min` with work queued, or <= `lower_idle_pct` for `lower_window_min` | `max_running_total` moves one `step`, between the base and `ceiling`, at most once per `cooldown_min` | The limit follows sustained load, never one reading; lowering stops nothing | `autolimit.step()`, `test_batch_order_autolimit.py` |
+| D8 | A batch file says `# hold: yes`, or a reconciler-queued build's task left every batch file | The build waits | A held or re-ranked batch starts no new builds; lifting the hold resumes them | `dispatch.batch_hold()`, `test_batch_order_autolimit.py` |
+| P3-order | Batch tasks are planned | In batch-file order; `# priority: <int>` adds to the batch's build and trial priorities | Earlier batches and higher-ranked lines start first | `phase3.reconcile()`, `test_batch_order_autolimit.py` |
 | D3 | Free disk under the kind's diskguard floor; load, memory or `/tmp` inodes over their limits | The job waits (bookkeeping kinds are exempt) | Nothing heavy starts on a short machine | `dispatch.plan()` |
 | D4 | A build, gate, regate, regrade or rescore of the task is running | Other jobs of the task wait | One exclusive job per task | `dispatch.plan()` |
 | D5 | The newest real `cweq selfcheck --run` of `regrade` or `rescore` failed (`[checks] refuse_on_failed_selfcheck`) | Jobs of that tool wait | No grading runs with a tool that does not reproduce a known result | `checks.tool_refused()`, `test_checks.py` |

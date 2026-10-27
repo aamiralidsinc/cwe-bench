@@ -51,15 +51,17 @@ def launches(conn, slug, m, version):
     return len(groups)
 
 
-def wants(t, cfg, conn, ctx_ledger=None):
-    """(jobs wanted [{kind, args}], notes) for one task reading."""
+def wants(t, cfg, conn, ctx_ledger=None, meta=None):
+    """(jobs wanted [{kind, args}], notes) for one task reading. meta: its batch's header ({priority, hold})."""
     p3, slug, stage = cfg["phase3"], t["task"], t["stage"]
     out, notes = [], []
     allowed = p3.get("batches") or []
     if not t["batch"] or (allowed and t["batch"] not in allowed):
         return out, notes
     if stage in ("waiting_build", "build_interrupted"):
-        if t.get("paused_build"):
+        if (meta or {}).get("hold"):
+            notes.append(f"batch {t['batch']} on hold (# hold: yes): no new build")
+        elif t.get("paused_build"):
             notes.append("builder was paused and cut by its timer: resumed by kind build_resume, never rebuilt")
         elif (paths.BUILD / slug / "BUILD-PROMPT.md").is_file():
             out.append({"kind": "build", "args": {}})
@@ -92,13 +94,16 @@ def reconcile(conn, cfg, ctx, dry_run=False):
     rep = []
     if not cfg["phase3"].get("enabled", True):
         return rep
-    for slug in sorted(ctx["batches"]):
+    metas = ctx.get("batch_meta") or {}
+    # Batch-file order (files by name, lines as written): equal priorities start in rank order (ids ascend).
+    for slug in ctx["batches"]:
         try:
             t = taskstate.read(slug, ctx)
         except Exception as e:                             # one unreadable task must not stop the pass
             rep.append({"task": slug, "stage": "?", "want": [], "notes": [f"unreadable: {type(e).__name__}: {e}"]})
             continue
-        w, notes = wants(t, cfg, conn, ctx["ledger"])
+        meta = metas.get(t["batch"]) or {}
+        w, notes = wants(t, cfg, conn, ctx["ledger"], meta)
         for x in w:
             why = taskstate.redo_reason(x["kind"], slug, x["args"], ctx, t)
             if why:                                        # never plan finished or running work
@@ -107,7 +112,9 @@ def reconcile(conn, cfg, ctx, dry_run=False):
         w = [x for x in w if not x.get("skip")]
         if not dry_run:
             for x in w:
-                x["id"], _ = qdb.enqueue(conn, x["kind"], slug, x["args"], priority=cfg["priority"].get(x["kind"], 0),
+                bump = meta.get("priority", 0) if x["kind"] in ("build", "trial_run") else 0
+                x["id"], _ = qdb.enqueue(conn, x["kind"], slug, x["args"],
+                                         priority=cfg["priority"].get(x["kind"], 0) + bump,
                                          max_attempts=cfg["max_attempts"].get(x["kind"], 2), origin="reconciler")
             if t["stage"] in ("waiting_trials", "trialing", "awaiting_audit", "not_breaker"):
                 version = taskstate.gate_sha16(slug)

@@ -336,7 +336,8 @@ def step3(a):
 
 def pool(a):
     """Regenerate the general pool file (pipelines/router/out/step2/pipeline/pool.jsonl) from step2/screener/,
-    without repos already built as sibling tasks or already in a batch. No selection is run."""
+    without repos already built as sibling tasks, repos stacking took (unless a stacked task of the repo was solved)
+    or candidates already in a batch. No selection is run."""
     pipe = OUT / "step2" / "pipeline"
     pipe.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, LANE_RECS=str(GENERAL), LANE_PIPE=str(pipe), LANE_SUFFIX="s2")
@@ -365,11 +366,18 @@ def pool(a):
             solved_repos.add(norm(json.loads(f.read_text()).get("repo")))
         except Exception:
             pass
+    # Step 2's rule: a repo stacking took (any registered stacking batch, any stk- task) stays out, unless one of
+    # its stacked tasks was solved (step 3: then it is a sibling candidate like any other, owner rule 2026-10-27).
+    built = built_repos()
+    stacked = {norm(r["repo"]) for b in batches() for r in batch_rows(b)}
+    stacked |= {repo for repo, slugs in built.items() if any(s.startswith("stk-") for s in slugs)}
     keep, excluded = [], []
     for x in rows:
         repo, eid = norm(x.get("repo")), str(x.get("entry_id"))
         if repo in sib:
             excluded.append((eid, repo, "built: the repo already has a sibling task"))
+        elif repo in stacked and repo not in solved_repos:
+            excluded.append((eid, repo, "taken by stacking: no stacked task of the repo was solved"))
         elif eid in batched_ids or repo in batched_repos:
             excluded.append((eid, repo, "in a batch: prepared and queued already"))
         else:

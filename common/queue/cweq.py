@@ -107,6 +107,14 @@ def cmd_monitor(conn, cfg, a):
                 print(f"{qdb.utc()} settings changed: now {cfg['_settings_hash']}", flush=True)
         rep = mon.tick(dry_run=a.dry_run)
         print(monitor.line(rep["sample"]), flush=True)
+        try:                                             # the total limit follows sustained CPU idle (autolimit.py)
+            import autolimit
+            new, why = autolimit.step(conn, cfg, dry_run=a.dry_run)
+            if new is not None:
+                print(f"{rep['sample']['ts']} {'would set' if a.dry_run else 'set'} total job limit {new}: {why}",
+                      flush=True)
+        except Exception as e:
+            print(f"{qdb.utc()} autolimit error: {type(e).__name__}: {e}", flush=True)
         for name, state, value, thr, msg in rep["alerts"]:
             print(f"{rep['sample']['ts']} ALERT {state} {name}: {msg}", flush=True)
         for jid, r in rep["queued"]:
@@ -233,8 +241,14 @@ def cmd_status(conn, cfg, a):
     for r in run:
         per_kind[r["kind"]] = per_kind.get(r["kind"], 0) + 1
     print("  slots " + ", ".join(f"{k} {per_kind.get(k, 0)}/{n}" for k, n in lim["max_running"].items())
-          + f"; total {len(run)}/{cfg['dispatch']['max_running_total']}")
+          + f"; total {len(run)}/{_total_limit(conn, cfg)}")
     return 0
+
+
+def _total_limit(conn, cfg):
+    import autolimit
+    eff, base = autolimit.effective(conn, cfg), cfg["dispatch"]["max_running_total"]
+    return f"{eff} (base {base}, raised on sustained idle CPU)" if eff != base else f"{eff}"
 
 
 def cmd_adopt(conn, cfg, a):
