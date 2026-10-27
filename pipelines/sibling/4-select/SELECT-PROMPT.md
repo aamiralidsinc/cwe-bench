@@ -1,7 +1,7 @@
 You are selecting candidates for a security-fix benchmark whose goal is that BOTH target models
 (DeepSeek V4.1 Flash and MiMo-V2.6-Pro) fail all three attempts on each task. You will be given a
 pool of candidate open-source advisories, one JSON object per line. Score every candidate for
-**breaker potential** and return the best 50.
+**breaker potential** and return the best {{N}}.
 
 ## What makes a strong breaker candidate (score each 0–10)
 Models find the code the report points to and diagnose it correctly. They fail on **scope** and on
@@ -22,12 +22,12 @@ Models find the code the report points to and diagnose it correctly. They fail o
 - a candidate that looks already-covered or trivial.
 
 ## Output — STRICT
-Return ONLY a JSON array (no prose before or after) of the **50 highest-scoring** candidates,
+Return ONLY a JSON array (no prose before or after) of the **{{N}} highest-scoring** candidates,
 sorted by score descending:
 ```
 [{"entry_id": "1234", "score": 8, "reason": "two sibling gaps at the authz check + coupled list-read; multi-site"}, ...]
 ```
-Each `reason` is one line. Use entry_id values exactly as given. Pick exactly 50 (or all of them if
-fewer than 50 are provided). Do not include any candidate you scored ≤ 2.
+Each `reason` is one line. Use entry_id values exactly as given. Pick exactly {{N}} (or all of them if
+fewer than {{N}} are provided). Do not include any candidate you scored ≤ 2.
 
 The candidate pool follows.
