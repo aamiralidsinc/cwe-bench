@@ -32,6 +32,7 @@ sys.path.insert(0, str(paths.COMMON / "util"))
 import diskguard  # noqa: E402  (disk floors per kind, common/util/diskguard.py; live values in limits.env)
 
 import procs  # noqa: E402
+import monitor  # noqa: E402
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
 import checks  # noqa: E402
@@ -73,7 +74,8 @@ class Dispatcher:
     def __init__(self, conn, cfg, db_path, metrics=None, proc_list=None, spawn=None, sleep=time.sleep,
                  disk_ok=None):
         self.conn, self.cfg, self.db_path = conn, cfg, db_path
-        self.metrics = metrics or (lambda: procs.headroom(str(paths.ROOT)))
+        # Admission values: the monitor's latest sample when it is fresh (monitor.py), else measured here.
+        self.metrics = metrics or (lambda: monitor.fresh_headroom(conn, cfg) or procs.headroom(str(paths.ROOT)))
         self.proc_list = proc_list                       # None = read the real process table
         self.spawn = spawn or self._spawn
         self.sleep = sleep

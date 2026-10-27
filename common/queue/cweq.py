@@ -12,6 +12,8 @@
     python3 common/queue/cweq.py retry ID | block ID [--why TEXT]
     python3 common/queue/cweq.py stop ID [--grace N] [--why TEXT]   stop one job (identity-checked) and its containers
     python3 common/queue/cweq.py orphans [--json]              containers and processes with no live job (read-only)
+    python3 common/queue/cweq.py monitor [--once] [--dry-run]   sample the machine every minute (monitor.py)
+    python3 common/queue/cweq.py preflight                     read-only setup checks (preflight.py); exit 2 = critical
     python3 common/queue/cweq.py explain TASK                  what the rules see for a task, and all its jobs
     python3 common/queue/cweq.py verify [--kind K] [--state S]  post-condition checks of finished jobs (read-only)
     python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   reproduce a known grading per tool
@@ -32,6 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adopt  # noqa: E402
 import checks  # noqa: E402
 import config  # noqa: E402
+import monitor  # noqa: E402
+import preflight  # noqa: E402
 import dispatch  # noqa: E402
 import identity  # noqa: E402
 import procs  # noqa: E402
@@ -81,7 +85,33 @@ def cmd_reconcile(conn, cfg, a):
         time.sleep(cfg["reconcile"]["tick_sec"])
 
 
+def cmd_monitor(conn, cfg, a):
+    from dispatch import paths as _paths
+    mon = monitor.Monitor(conn, cfg, _paths.ROOT, wait_df=a.once or a.dry_run)
+    while True:
+        rep = mon.tick(dry_run=a.dry_run)
+        print(monitor.line(rep["sample"]), flush=True)
+        for name, state, value, thr, msg in rep["alerts"]:
+            print(f"{rep['sample']['ts']} ALERT {state} {name}: {msg}", flush=True)
+        for jid, r in rep["queued"]:
+            what = "would queue" if a.dry_run else (f"queued #{jid}" if jid else "already queued")
+            print(f"{rep['sample']['ts']} {what} {r['kind']} {json.dumps(r['args'])}", flush=True)
+        if a.once or a.dry_run:
+            return 0
+        time.sleep(monitor.settings(cfg)["tick_sec"])
+
+
+def cmd_preflight(conn, cfg, a):
+    return preflight.report(preflight.run_all(cfg))
+
+
 def cmd_dispatch(conn, cfg, a):
+    if not a.dry_run and not a.skip_preflight:
+        res = preflight.run_all(cfg)
+        if preflight.exit_code(res) == 2:
+            preflight.report(res)
+            print("dispatch refused: preflight is critical (fix it, or pass --skip-preflight)")
+            return 2
     if a.dry_run and a.with_reconcile:
         # Plan on a private in-memory copy: reconcile into it, then show what would start. Nothing is written.
         mem = qdb.connect(":memory:")
@@ -366,9 +396,14 @@ def main(argv=None):
     p.add_argument("--once", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true", help="also list waiting jobs and why")
+    p.add_argument("--skip-preflight", action="store_true", help="start even when a preflight check is critical")
     p.add_argument("--with-reconcile", action="store_true",
                    help="with --dry-run: first reconcile into an in-memory copy of the queue (what would happen now)")
     sub.add_parser("status")
+    p = sub.add_parser("monitor")
+    p.add_argument("--once", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="one sample, printed; nothing written or queued")
+    sub.add_parser("preflight")
     p = sub.add_parser("enqueue")
     p.add_argument("kind", choices=qdb.KINDS)
     p.add_argument("task")
@@ -415,7 +450,8 @@ def main(argv=None):
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks", "verify", "inbox")
+    looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks", "verify", "inbox",
+                                                         "preflight")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
@@ -425,7 +461,8 @@ def main(argv=None):
     return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
             "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "verify": cmd_verify,
             "selfcheck": cmd_selfcheck, "events": cmd_events, "inbox": cmd_inbox,
-            "delivered": cmd_delivered, "stop": cmd_stop, "orphans": cmd_orphans}[a.cmd](conn, cfg, a)
+            "delivered": cmd_delivered, "stop": cmd_stop, "orphans": cmd_orphans, "monitor": cmd_monitor,
+            "preflight": cmd_preflight}[a.cmd](conn, cfg, a)
 
 
 if __name__ == "__main__":
