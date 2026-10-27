@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
+import markers  # noqa: E402  (task-folder markers: common/markers.py; on sys.path via taskstate)
 from taskstate import paths  # noqa: E402
 
 KIND = "delivery_prep"
@@ -251,13 +252,12 @@ def record_delivered(slug, name, commit, date=None, note="", repo_label=None):
             if s not in have:
                 f.write(f"{s}\t{name}\t{commit}\t{date}\n")
                 added.append(s)
-    dec = paths.BUILD / slug / "HUMAN-DECISION.md"
+    dec = markers.path(paths.BUILD / slug, "HUMAN-DECISION.md")
     line = f"DELIVERED: {date} to {label}, commit {commit}, as tasks/{name}" + (f" ({note})" if note else "")
-    text = dec.read_text() if dec.exists() else ""
+    text = markers.read_text(dec)
     wrote_line = False
     if f"commit {commit}" not in text:
-        with open(dec, "a") as f:
-            f.write(("" if text.endswith("\n") or not text else "\n") + line + "\n")
+        markers.write_atomic(dec, text + ("" if text.endswith("\n") or not text else "\n") + line + "\n")
         wrote_line = True
     return added, wrote_line
 

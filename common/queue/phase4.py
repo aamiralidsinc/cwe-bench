@@ -40,6 +40,7 @@ import procs  # noqa: E402
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
 from taskstate import paths  # noqa: E402
+import markers  # noqa: E402  (task-folder markers: common/markers.py; on sys.path via taskstate)
 
 KINDS = ("audit_prep", "audit_record", "fairness", "cleanup", "step3")
 LEDGER, MACHINE, ROUTER = "_ledger", "_machine", "_router"
@@ -107,7 +108,7 @@ def held_or_busy(slugs, cfg, proc_list, ctx):
     """{slug: why} for tasks whose grading is about to change."""
     out = {}
     for s in slugs:
-        if (paths.BUILD / s / ".hold-repair").exists():
+        if markers.has(paths.BUILD / s, ".hold-repair"):
             out[s] = "held for a repair (.hold-repair)"
     for s, runs in ctx["running"].items():
         kinds = {k for k, _m, _p in runs}

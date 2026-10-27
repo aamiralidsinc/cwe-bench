@@ -22,6 +22,7 @@ import argparse, json, os, random, subprocess, sys, threading, time
 from pathlib import Path
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (task-folder markers: common/markers.py)
 
 ROOT = str(paths.ROOT)
 QDIR = os.path.join(str(paths.STACKING_OUT), "queue")
@@ -47,7 +48,7 @@ def build_jobs(slugs, retry):
     jobs = []
     for s in slugs:
         b = os.path.join(ROOT, "build", s)
-        if os.path.isfile(os.path.join(b, ".sound")) or os.path.isfile(os.path.join(b, ".listing_fail")):
+        if markers.has(b, ".sound") or markers.has(b, ".listing_fail"):
             continue                     # .listing_fail: built and gated; waits for an instruction rewrite
         plog = os.path.join(b, "stack_pipeline.log")
         if not retry and os.path.isfile(plog) and "STOP:" in open(plog, errors="replace").read():
@@ -61,7 +62,7 @@ def build_jobs(slugs, retry):
 
 def trial_jobs():
     sound = sorted(d for d in os.listdir(os.path.join(ROOT, "build"))
-                   if d.startswith("stk-") and os.path.isfile(os.path.join(ROOT, "build", d, ".sound")))
+                   if d.startswith("stk-") and markers.has(os.path.join(ROOT, "build", d), ".sound"))
     order = [s for s in sound if not s.endswith("-control")]
     # Scale run (owner decision 2026-10-25): no control trials unless STACK_CONTROLS=1.
     if os.environ.get("STACK_CONTROLS", "0") == "1":

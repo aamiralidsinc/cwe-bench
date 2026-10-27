@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 . "$CWE_DOCKER_TUNING" 2>/dev/null || true
 # Run a Harbor task with Claude Code driving DeepSeek V4.1 Flash or MiMo-V2.6-Pro.
 #
@@ -25,7 +26,7 @@ done
 # starting (checked on every run, so it also stops a trial.py loop that is already
 # going, e.g. after the same runs were started in parallel by hand).
 hold="$CWE_BUILD/$(basename "$task")/hold_$model"
-if [ -f "$hold" ]; then echo "held: $hold exists; not starting a run" >&2; exit 3; fi
+if cwe_has "$CWE_BUILD/$(basename "$task")" "hold_$model"; then echo "held: $hold exists; not starting a run" >&2; exit 3; fi
 # A task whose tests/solution/environment/checks changed after its gate pass must be re-gated first
 # (common/gate/fingerprint.py; rule in pipelines/*/GUIDE.md). Tasks gated before 2026-10-25: warning only.
 python3 -I "$CWE_ROOT/common/gate/fingerprint.py" check "$(basename "$task")" >&2; fp=$?

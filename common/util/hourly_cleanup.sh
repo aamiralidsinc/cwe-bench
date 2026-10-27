@@ -16,6 +16,7 @@
 #   bash common/util/hourly_cleanup.sh loop     # one pass every CLEANUP_EVERY_MIN minutes (default 60), forever
 # Log: build/audit/hourly_cleanup.log. Loop PID: build/audit/hourly_cleanup.pid
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 cd "$CWE_ROOT" || exit 1
 L=build/audit/hourly_cleanup.log
 log() { echo "$(date -u +%FT%TZ) $*" >> "$L"; }
@@ -23,7 +24,7 @@ freegb() { df -BG / | tail -1 | awk '{print $4}' | tr -d G; }
 
 pass() {
   local keep n
-  keep=$(ls -d build/*/.hold-repair 2>/dev/null | awk -F/ '{print $2}' | paste -sd'|' -)
+  keep=$(cwe_tasks_with .hold-repair | paste -sd'|' -)
   [ -z "$keep" ] && keep='^$'
   log "pass start: free $(freegb) GB; repair tasks kept: $keep"
   # 1. stopped containers exited > 1 h

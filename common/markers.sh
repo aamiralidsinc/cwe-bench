@@ -26,3 +26,15 @@ cwe_mark_listing_fail() { rm -f "$1/.sound" "$1/.gate_passed" "$1/.listing_warn"
 
 # Write a record file atomically (readers see the old or the new content, never half of it).
 cwe_write_atomic() { local t; t=$(mktemp "$(dirname "$1")/.$(basename "$1").XXXXXX") && cat > "$t" && mv -f "$t" "$1"; }
+
+# Is a marker or record file present (a regular file, like the scripts' `[ -f ... ]` tests)?
+cwe_has() { [ -f "$1/$2" ]; }
+
+# Print a record file; non-zero (and nothing printed) when it is missing, like `cat ... 2>/dev/null`.
+cwe_read() { cat "$1/$2" 2>/dev/null; }
+
+# Write the current UTC time (YYYY-MM-DDTHH:MM:SSZ) into a record file atomically (start_utc.txt, end_utc.txt, ...).
+cwe_stamp() { date -u +%FT%TZ | cwe_write_atomic "$1/$2"; }
+
+# Slugs whose build folder holds marker $1 (under $CWE_BUILD), one per line.
+cwe_tasks_with() { local f; for f in "$CWE_BUILD"/*/"$1"; do [ -e "$f" ] && basename "$(dirname "$f")"; done; return 0; }

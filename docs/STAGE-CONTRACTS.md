@@ -80,21 +80,34 @@ added without breaking the next one.
 
 ## Where the library is used
 
-- **Python readers:** `common/queue/taskstate.py` (build state, flags, fingerprint version, delivered line),
-  `common/trial/trial_state.py` (runs log), `common/fairness/fairness_verdict.py` (owner decision),
-  `pipelines/router/scale_queue.py` (build done, sound), `common/queue/reconcile.py` (last gate result).
-- **Shell writers:** `common/gate/gate_one_ds.sh` (the gate verdict), `common/gate/postbuild.sh` and
-  `common/gate/regate.sh` (hold after the gate, blind and listing flags, final sound).
+Every reader and writer of a task-folder marker goes through the library: `common/markers.py` in Python,
+`common/markers.sh` in shell.
 
-## Follow-ups
-
-These still name markers directly. They behave correctly today; moving them to the library is mechanical but
-touches scripts that run all day, so each moves with its next change:
-
-- `common/launch/run_build.sh` (`start_utc.txt`, `end_utc.txt`, `build-exit.txt`),
-  `pipelines/sibling/6-build/resume_pipeline.sh`, `run_pipeline.sh`,
-  `pipelines/stacking/3-build-gate/run_stack_pipeline.sh`, `pipelines/stacking/5-upgrade/run_upgrade_stack.sh`.
-- `common/trial/run_trial.sh` and `common/trial/trial.py` (`hold_<model>`).
-- `common/queue/checks.py`, `phase4.py`, `delivery.py`, `inbox.py`, `lintstep.py`, `cweq.py` (post-condition and
-  inbox readers), `pipelines/router/status_report.py`, `scale_ledger.py`, `pipelines/stacking/6-trial/stk_queue.py`.
-- `common/util/orphan_builder_guard.sh`, `hourly_cleanup.sh`, `common/versioning/restore_snapshot.sh`.
+- **Python readers**
+  - `common/queue/taskstate.py`: build state, flags, fingerprint version, delivered line. The decisions inbox
+    (`inbox.py`), the lint step (`lintstep.py`) and `cweq.py` read task state through it.
+  - `common/queue/checks.py`: post-condition checks (last gate result, gate markers, fingerprint, build start and
+    end, holds, runs log).
+  - `common/queue/phase4.py` (repair holds), `common/queue/delivery.py` (the DELIVERED line, written atomically),
+    `common/queue/reconcile.py` (last gate result).
+  - `common/trial/trial.py` (holds, runs log), `common/trial/trial_state.py` (runs log),
+    `common/fairness/fairness_verdict.py` (owner decision).
+  - `pipelines/router/scale_queue.py` (build done, sound), `pipelines/router/status_report.py` and
+    `scale_ledger.py` (gate state, build start and end), `pipelines/stacking/6-trial/stk_queue.py` (sound,
+    listing hold).
+- **Shell helpers** (`common/markers.sh`)
+  - `cwe_mark`, `cwe_unmark`, `cwe_gate_verdict`, `cwe_hold_after_gate`, `cwe_mark_sound`, `cwe_mark_listing_fail`:
+    flag writes.
+  - `cwe_write_atomic`, `cwe_stamp`: record files written atomically (`start_utc.txt`, `end_utc.txt`,
+    `build-exit.txt`, `.upgraded`).
+  - `cwe_has`, `cwe_read`, `cwe_tasks_with`: readers.
+- **Shell scripts**
+  - `common/gate/gate_one_ds.sh`, `postbuild.sh`, `regate.sh`: the gate verdict, the hold after the gate, blind and
+    listing flags, final sound.
+  - `common/launch/run_build.sh`, `pipelines/sibling/6-build/run_pipeline.sh`, `resume_pipeline.sh`: build start,
+    end and exit records.
+  - `pipelines/stacking/3-build-gate/run_stack_pipeline.sh`, `pipelines/stacking/5-upgrade/run_upgrade_stack.sh`:
+    listing hold and sound.
+  - `common/trial/run_trial.sh`: model holds.
+  - `common/util/orphan_builder_guard.sh` (build end), `hourly_cleanup.sh` (repair holds),
+    `common/versioning/restore_snapshot.sh` (gate flags restored with a snapshot).
