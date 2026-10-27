@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (common/markers.py)
 
 ROOT = paths.ROOT
 TOKEN = r"(NOT[ _-]?READY|READY)\b"
@@ -68,20 +69,8 @@ NEEDS_HUMAN = re.compile(r"(?mi)^[\s>*`_|-]*NEEDS_HUMAN_REVIEW[*`_]*\s*[:=]\s*[*
 
 
 def human_decision(slug):
-    """(decision, date, stale) from build/<slug>/HUMAN-DECISION.md, or None."""
-    f = ROOT / "build" / slug / "HUMAN-DECISION.md"
-    if not f.is_file():
-        return None
-    t = f.read_text(errors="replace")
-    d, dt = DECISION.search(t), DATE.search(t)
-    if not d:
-        return None
-    fair = ROOT / "build" / slug / "FAIRNESS.md"
-    stale = False
-    if dt and fair.is_file():
-        import datetime as _dt
-        stale = dt.group(1) < _dt.datetime.fromtimestamp(fair.stat().st_mtime, _dt.timezone.utc).strftime("%Y-%m-%d")
-    return d.group(1).upper(), (dt.group(1) if dt else "undated"), stale
+    """(decision, date, stale) from build/<slug>/HUMAN-DECISION.md, or None (common/markers.py human_decision)."""
+    return markers.human_decision(ROOT / "build" / slug)
 
 
 def verdict(slug):
