@@ -36,6 +36,7 @@ DEFAULTS = {
     "ok_exit_codes": {"trial_run": [0, 2]},
     "env": {"trial_run": {"CWE_AGENT_TIMEOUT_MULT": "1.5"}},
     "commands": {},
+    "checks": {"enabled": True, "refuse_on_failed_selfcheck": True, "selfcheck_dir": "~/.tb-graders/cwe/selfcheck"},
 }
 
 

@@ -206,7 +206,12 @@ python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--a
 python3 common/queue/cweq.py retry ID          # also re-opens jobs blocked because this one failed
 python3 common/queue/cweq.py block ID [--why TEXT]
 python3 common/queue/cweq.py explain TASK      # what the rules see for the task, and all its jobs
+python3 common/queue/cweq.py verify [--kind K] [--state S]   # post-condition checks of finished jobs (read-only)
+python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   # reproduce a known grading
 ```
+
+A job that exits with an ok code is `done` only when its post-condition check passes; every automatic rule, its
+expected outcome and its check are listed in `docs/RULES.md`.
 
 Options before the command: `--db PATH`, and `--config PATH` (or `$CWEQ_CONFIG`).
 - `dispatch --dry-run --with-reconcile` answers "what would the queue do right now?". It copies the queue into memory,

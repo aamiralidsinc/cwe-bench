@@ -34,6 +34,7 @@ import diskguard  # noqa: E402  (disk floors per kind, common/util/diskguard.py;
 import procs  # noqa: E402
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
+import checks  # noqa: E402
 
 CWEQ = Path(__file__).resolve().parent / "cweq.py"
 REDO = "not needed, it would redo finished work: "
@@ -177,6 +178,8 @@ class Dispatcher:
                 why = "waiting for " + ", ".join(f"#{x}" for x in qdb.deps_of(r))
             elif held(t, k, qdb.args_of(r)):
                 why = held(t, k, qdb.args_of(r))
+            elif k in checks.TOOLS and (refused := checks.tool_refused(self.conn, k, cfg)):
+                why = refused
             elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(k, t, qdb.args_of(r), ctx)):
                 # Finished work closes the job; work the old scripts are running only makes it wait.
                 why = ("task busy (old script): " + redo) if redo.endswith("running") else REDO + redo

@@ -11,6 +11,8 @@
     python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--after ID ...]
     python3 common/queue/cweq.py retry ID | block ID [--why TEXT]
     python3 common/queue/cweq.py explain TASK                  what the rules see for a task, and all its jobs
+    python3 common/queue/cweq.py verify [--kind K] [--state S]  post-condition checks of finished jobs (read-only)
+    python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   reproduce a known grading per tool
 
 Options before the command: --db PATH (default from the config), --config PATH (default common/queue/queue.toml
 or $CWEQ_CONFIG). --dry-run prints what would start (or be queued) and why, and changes nothing.
@@ -23,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import adopt  # noqa: E402
+import checks  # noqa: E402
 import config  # noqa: E402
 import dispatch  # noqa: E402
 import procs  # noqa: E402
@@ -246,6 +249,27 @@ def cmd_explain(conn, cfg, a):
     return 0
 
 
+def cmd_verify(conn, cfg, a):
+    where, params = "state=?", [a.state]
+    if a.kind:
+        where, params = where + " AND kind=?", params + [a.kind]
+    print(f"post-condition checks of {a.state} jobs (nothing is changed):")
+    _counts, bad = checks.verify_past(conn, cfg, where, tuple(params))
+    return 1 if bad else 0
+
+
+def cmd_selfcheck(conn, cfg, a):
+    tools = list(checks.TOOLS) if a.tool == "all" else [a.tool]
+    rc = 0
+    for t in tools:
+        sid = checks.selfcheck(conn, cfg, t, run=a.run)
+        row = conn.execute("SELECT ok FROM selfchecks WHERE id=?", (sid,)).fetchone()
+        rc = rc or (1 if a.run and row and row["ok"] == 0 else 0)
+    if not a.run:
+        print("dry run: nothing was graded (add --run to reproduce; it costs one grading per tool)")
+    return rc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cweq", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db")
@@ -282,13 +306,19 @@ def main(argv=None):
     p.add_argument("--why")
     p = sub.add_parser("explain")
     p.add_argument("task")
+    p = sub.add_parser("verify")
+    p.add_argument("--kind", choices=qdb.KINDS)
+    p.add_argument("--state", default="done", choices=qdb.STATES)
+    p = sub.add_parser("selfcheck")
+    p.add_argument("--tool", default="all", choices=["all", *checks.TOOLS])
+    p.add_argument("--run", action="store_true", help="really reproduce (one grading per tool); default is a dry run")
     p = sub.add_parser("_work")                          # internal: the worker wrapper
     p.add_argument("id", type=int)
     a = ap.parse_args(argv)
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks")
+    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks", "verify")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
@@ -296,7 +326,8 @@ def main(argv=None):
     if a.cmd == "_work":
         return worker.run(conn, cfg, a.id)
     return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
-            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain}[a.cmd](conn, cfg, a)
+            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "verify": cmd_verify,
+            "selfcheck": cmd_selfcheck}[a.cmd](conn, cfg, a)
 
 
 if __name__ == "__main__":

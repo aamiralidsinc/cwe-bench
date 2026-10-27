@@ -17,6 +17,7 @@ Commands:
 A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}). [env.<kind>] adds
 environment variables (trial_run: CWE_AGENT_TIMEOUT_MULT, as the scheduler set it). [ok_exit_codes.<kind>] lists the
 exits that count as done (trial.py exits 2 when some runs were ungraded: the reconciler plans the next run).
+A job that exits with an ok code is `done` only after its post-condition checks pass (checks.py, docs/RULES.md).
 """
 import os
 import re
@@ -123,4 +124,7 @@ def run(conn, cfg, job_id):
     state = qdb.finish(conn, job_id, me, rc, last_line(log_path),
                        retry_codes=tuple(cfg["retry_exit_codes"].get(row["kind"], ())),
                        ok_codes=tuple(cfg.get("ok_exit_codes", {}).get(row["kind"], (0,))))
+    if state == "done":                                  # done only when the files show the outcome (checks.py)
+        import checks
+        state = checks.after_done(conn, cfg, job_id, log_path)
     return 0 if state else 3
