@@ -53,6 +53,8 @@ case "$model" in
     model_id=mimo-v2.6-pro
     extra+=(--allow-agent-host=api.xiaomimimo.com)   # new tasks are no-network; allow the model host at run time (B4)
     effort=${EFFORT-}
+    # Same output cap as DeepSeek: Claude Code's default (32000) ended long MiMo turns with an api_error.
+    extra+=(--ae CLAUDE_CODE_MAX_OUTPUT_TOKENS=131072)
     ;;
   *) echo "unknown model: $model (expected deepseek or mimo)" >&2; exit 2 ;;
 esac
