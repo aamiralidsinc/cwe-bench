@@ -113,6 +113,7 @@ def awaiting_audit(cell):
     return int(m.group(1)) if m else 0
 
 
+SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 PROC_RULES = (   # (kind, regex over the joined command line; group 1 = slug, optional group 2 = model)
     ("build", re.compile(r"run_stack_pipeline\.sh (\S+)$")),
     ("build", re.compile(r"run_pipeline\.sh \S+ (\S+)$")),
@@ -137,6 +138,8 @@ def running(proc_list, ignore_own=False):
         for kind, rx in PROC_RULES:
             m = rx.search(cmd)
             if m:
+                if not SLUG_RE.fullmatch(m.group(1)):
+                    break                                # e.g. the text of a wrapper script: "regate.sh $S"
                 out.setdefault(m.group(1), []).append((kind, m.group(2) if rx.groups > 1 else "", pid))
                 break
         else:

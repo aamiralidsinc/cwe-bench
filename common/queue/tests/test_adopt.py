@@ -181,3 +181,9 @@ def test_delivery_register_marks_delivered(root):
         "# slug\tdelivered_as\tclient_commit\tdate\nearly-ds\tearly-task-name\tabc1234\t2026-10-20\n")
     t = read("early-ds")
     assert t["stage"] == "delivered" and "early-task-name" in t["delivered"]
+
+
+def test_wrapper_script_text_is_not_a_task(root):
+    """A shell wrapper whose argv holds a script text such as 'regate.sh $S' names no task."""
+    ps = [proc(31, "bash -c S=x-s2; bash common/gate/regate.sh $S --listing")]
+    assert "$S" not in taskstate.running(ps)
