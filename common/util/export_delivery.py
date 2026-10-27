@@ -14,11 +14,13 @@ Which runs: every run the ledger (common/audit/audit_results.py) counts for the 
 audit. Rollouts are numbered per model in start order. A run without agent/trajectory.json (for example the
 precision_validation runs imported from GitHub Actions) cannot meet the "required" rule: it is skipped and
 listed in <out>/EXPORT-REPORT.md. Each trajectory is checked with Harbor's own validator when available.
+Every key value in the model env files is redacted from the export ([REDACTED]); the report lists the files.
 Read-only on the sources; writes only under <out_dir>.
 """
 import argparse
 import csv
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +55,41 @@ def counted_runs(slug, trials):
             continue
         out.append(t)
     return sorted(out, key=lambda t: t["start_utc"])
+
+
+KEY_FILES = [Path.home() / ".config/cwe/models.env", Path.home() / ".tb-graders/cwe/models.env"]
+
+
+def secret_values():
+    """Values of every *KEY*/*TOKEN*/*SECRET* setting in the model env files (never printed)."""
+    vals = set()
+    for f in KEY_FILES:
+        if f.is_file():
+            for line in f.read_text().splitlines():
+                m = re.match(r"(?:export )?[A-Z_]*(?:KEY|TOKEN|SECRET)[A-Z_]*=(.*)", line.strip())
+                if m and len(m.group(1).strip().strip("\"'")) > 12:
+                    vals.add(m.group(1).strip().strip("\"'"))
+    return vals
+
+
+def redact_tree(root, vals):
+    """Replace every secret value under root with [REDACTED] (an agent that prints its environment puts the
+    provider key in its trajectory). Returns the files changed."""
+    changed = []
+    for p in Path(root).rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            t = p.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        t2 = t
+        for v in vals:
+            t2 = t2.replace(v, "[REDACTED]")
+        if t2 != t:
+            p.write_text(t2)
+            changed.append(str(p.relative_to(root)))
+    return changed
 
 
 def validate(traj):
@@ -108,6 +145,11 @@ def main():
         print(f"{name}: " + ", ".join(f"{MODEL_NAMES[k]} {v}" for k, v in n.items()))
     if skipped:
         report += ["", "## Skipped (no trajectory)", ""] + [f"- {s}" for s in skipped]
+    vals = secret_values()
+    if not vals:
+        sys.exit("secret scan impossible: no key values found in " + ", ".join(map(str, KEY_FILES)))
+    red = redact_tree(out, vals)
+    report += ["", f"## Secret scan: {len(vals)} key values checked, {len(red)} files redacted", ""] + [f"- {r}" for r in red]
     (out / "EXPORT-REPORT.md").write_text("\n".join(report) + "\n")
     print(f"wrote {out} ({len(skipped)} runs skipped, see EXPORT-REPORT.md)")
 
