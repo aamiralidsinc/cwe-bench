@@ -6,18 +6,11 @@ It marks the job running, runs the command with cwd = the repo root and its outp
 lease every lease_sec/10 while the command runs, and records the exit code. If the job stops being ours (the
 dispatcher declared it stale, or `cweq block`), it stops the command and exits.
 
-Commands:
-  build     bash pipelines/stacking/3-build-gate/run_stack_pipeline.sh <slug>          (stk-* slugs)
-            bash pipelines/sibling/6-build/run_pipeline.sh deepseek <slug>             (the others)
-  trial_run python3 -I common/trial/trial.py <slug> --models <m> --no-verdict --first-run N --max-runs K
-  regate   bash common/gate/regate.sh <slug> [--listing]
-  regrade  python3 -I common/audit/regrade_from_code.py <trial_dir> "<why>"
-  rescore  python3 -I common/audit/rescore_from_results.py <trial_dir> --drop <name> ... --why "<why>"
-  audit_prep, audit_record, fairness, cleanup, step3: phase4.py command() (the commands auto_advance.sh ran)
-  delivery_prep: python3 -I common/queue/delivery.py prep <slug>
-A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}). [env.<kind>] adds
+Commands: each kind's declaration in kinds/ builds its argv (command(row, cfg)); a kind without a command has no
+worker. A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}). [env.<kind>] adds
 environment variables (trial_run: CWE_AGENT_TIMEOUT_MULT, as the scheduler set it). [ok_exit_codes.<kind>] lists the
 exits that count as done (trial.py exits 2 when some runs were ungraded: the reconciler plans the next run).
+The job records the settings version the worker loaded (jobs.settings_hash; settings.py).
 A job that exits with an ok code is `done` only after its post-condition checks pass (checks.py, docs/RULES.md).
 """
 import os
@@ -32,33 +25,17 @@ sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 
 import paths  # noqa: E402
 
 import identity  # noqa: E402
+import kinds  # noqa: E402
 import qdb  # noqa: E402
 
 
 def command(row, cfg):
     """argv for a job, or raise ValueError."""
     k, task, a = row["kind"], row["task"], qdb.args_of(row)
-    trial = str(Path(cfg["jobs_dir"]) / a["trial"]) if a.get("trial") else ""
     if k in cfg.get("commands", {}):
-        return [x.format(task=task, trial=trial, job_id=row["id"]) for x in cfg["commands"][k]]
-    if k == "build":                                    # pipelines/router/scale_queue.py build_cmd()
-        if task.startswith("stk-"):
-            return ["bash", "pipelines/stacking/3-build-gate/run_stack_pipeline.sh", task]
-        return ["bash", "pipelines/sibling/6-build/run_pipeline.sh", "deepseek", task]
-    if k == "trial_run":                                # scale_queue.py trial_candidates()
-        return [sys.executable, "-I", str(paths.TRIAL), task, "--models", a["model"], "--no-verdict",
-                "--first-run", str(a["first_run"]), "--max-runs", str(a["max_runs"])]
-    if k == "regate":
-        return ["bash", "common/gate/regate.sh", task] + (["--listing"] if a.get("listing") else [])
-    if k == "regrade":
-        return [sys.executable, "-I", "common/audit/regrade_from_code.py", trial, a["why"]]
-    if k == "rescore":
-        drops = [x for d in a["drop"] for x in ("--drop", d)]
-        return [sys.executable, "-I", "common/audit/rescore_from_results.py", trial, *drops, "--why", a["why"]]
-    import delivery
-    import lintstep
-    import phase4                                       # audit_prep, audit_record, fairness, cleanup, step3
-    argv = phase4.command(row, cfg) or delivery.command(row, cfg) or lintstep.command(row, cfg)
+        return [x.format(task=task, trial=kinds.trial_dir(cfg, a), job_id=row["id"]) for x in cfg["commands"][k]]
+    kd = kinds.get(k)
+    argv = kd.command(row, cfg) if kd and kd.command else None
     if argv:
         return argv
     raise ValueError(f"no worker for kind {k}")
@@ -86,8 +63,13 @@ def run(conn, cfg, job_id):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{job_id}-{row['kind']}-{row['task']}.log"
     me = os.getpid()
-    if not qdb.start(conn, job_id, me, lease, str(log_path)):
+    if not qdb.start(conn, job_id, me, lease, str(log_path), cfg.get("_settings_hash")):
         return 3                                         # requeued or blocked before we got here
+    try:
+        import settings
+        settings.record(conn, cfg, "worker")             # the version this job runs under is in the history
+    except Exception:
+        pass                                             # bookkeeping: never fail a job over it
     try:
         argv = command(row, cfg)
     except (ValueError, KeyError) as e:

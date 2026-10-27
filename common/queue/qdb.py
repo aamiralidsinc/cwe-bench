@@ -11,15 +11,16 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-KINDS = ("build", "gate", "regate", "trial_run", "regrade", "rescore", "audit_prep", "audit_record", "fairness",
-         "cleanup", "step3", "delivery_prep", "lint")
+import kinds as kind_registry
+
+KINDS = kind_registry.names()                            # the built-in kinds (kinds/); plug-in folders add more
 STATES = ("queued", "leased", "running", "done", "failed", "blocked")
 ACTIVE = ("leased", "running")
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind          TEXT NOT NULL CHECK (kind IN {KINDS}),
+    kind          TEXT NOT NULL,                 -- a registered kind (kinds/); checked by enqueue(), not by SQL
     task          TEXT NOT NULL,                 -- the slug (build/<slug>, tasks/<slug>)
     args          TEXT NOT NULL DEFAULT '{{}}',   -- canonical JSON; part of the unique key
     priority      INTEGER NOT NULL DEFAULT 0,    -- higher starts first; waiting time adds to it (aging)
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     result        TEXT,                          -- short text: last log line, or why blocked/skipped
     log_path      TEXT,
     origin        TEXT NOT NULL DEFAULT 'manual', -- reconciler | manual
+    settings_hash TEXT,                          -- the settings version the worker started with (settings.py)
     UNIQUE (kind, task, args)
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
@@ -53,6 +55,17 @@ CREATE TABLE IF NOT EXISTS adoptions (
     conflicts     TEXT,                          -- JSON list: readings that would make the queue redo work
     differences   TEXT,                          -- JSON list: ledger vs launch-state differences (information)
     ok            INTEGER NOT NULL DEFAULT 0     -- 1 = no conflicts: the dispatcher may start work
+);
+-- Settings history (settings.py): every version of the settings file the queue loaded.
+CREATE TABLE IF NOT EXISTS settings (
+    hash          TEXT PRIMARY KEY,              -- sha256 of the file's bytes, 16 hex digits
+    file          TEXT,
+    git_commit    TEXT,                          -- short commit of the file's repository (+local: differs from it)
+    text          TEXT,
+    first_loaded  TEXT NOT NULL,
+    last_loaded   TEXT NOT NULL,
+    loads         INTEGER NOT NULL DEFAULT 0,
+    loaded_by     TEXT                           -- the last loop or worker that loaded it
 );
 CREATE TABLE IF NOT EXISTS tasks (
     task          TEXT PRIMARY KEY,
@@ -99,22 +112,36 @@ def connect(path):
     return conn
 
 
+JOB_COLUMNS = ("id", "kind", "task", "args", "priority", "state", "attempts", "max_attempts", "owner_pid",
+               "lease_expires", "depends_on", "created", "queued_at", "started", "finished", "exit_code", "result",
+               "log_path", "origin", "settings_hash")
+
+
 def migrate(conn):
-    """Bring an older jobs table up to the current kind list. SQLite cannot change a CHECK constraint, so the table
-    is rebuilt in one transaction (ids, the AUTOINCREMENT sequence and every row are kept). Run with the queue loops
-    stopped (deploy step); a no-op when the table already accepts every kind."""
+    """Bring an older jobs table up to the current layout: add settings_hash, and drop the old CHECK on the kind
+    (kinds are plug-ins now, validated by enqueue()). SQLite cannot drop a CHECK constraint, so the table is rebuilt
+    in one transaction (ids, the AUTOINCREMENT sequence and every row are kept). Run with the queue loops stopped
+    (deploy step); a no-op when the table is current. Returns True when it changed the table."""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
-    if row is None or all(f"'{k}'" in row[0] for k in KINDS):
+    if row is None:
         return False
-    ddl = SCHEMA.split("CREATE TABLE IF NOT EXISTS jobs", 1)[1].split(");", 1)[0] + ");"
-    with tx(conn):
-        conn.execute("CREATE TABLE jobs_new" + ddl)
-        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
-        conn.execute("DROP TABLE jobs")
-        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
-        conn.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state)")
-        conn.execute("CREATE INDEX IF NOT EXISTS jobs_task ON jobs (task)")
-    return True
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)")]
+    changed = False
+    if "settings_hash" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN settings_hash TEXT")
+        changed = True
+    if "CHECK (kind IN" in row[0]:
+        ddl = SCHEMA.split("CREATE TABLE IF NOT EXISTS jobs", 1)[1].split("\n);", 1)[0] + "\n);"
+        names = ", ".join(JOB_COLUMNS)
+        with tx(conn):
+            conn.execute("CREATE TABLE jobs_new" + ddl)
+            conn.execute(f"INSERT INTO jobs_new ({names}) SELECT {names} FROM jobs")
+            conn.execute("DROP TABLE jobs")
+            conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+            conn.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state)")
+            conn.execute("CREATE INDEX IF NOT EXISTS jobs_task ON jobs (task)")
+        changed = True
+    return changed
 
 
 class tx:
@@ -133,8 +160,8 @@ class tx:
 
 def enqueue(conn, kind, task, args=None, priority=0, max_attempts=2, depends_on=(), origin="manual"):
     """Add a job unless the same (kind, task, args) exists. Returns (id, created)."""
-    if kind not in KINDS:
-        raise ValueError(f"unknown kind {kind!r}; one of {', '.join(KINDS)}")
+    if kind not in kind_registry.names():
+        raise ValueError(f"unknown kind {kind!r}; one of {', '.join(kind_registry.names())}")
     a, now = canon(args), utc()
     with tx(conn):
         row = conn.execute("SELECT id FROM jobs WHERE kind=? AND task=? AND args=?", (kind, task, a)).fetchone()
@@ -176,11 +203,13 @@ def set_owner(conn, job_id, pid):
     conn.execute("UPDATE jobs SET owner_pid=? WHERE id=? AND state='leased'", (pid, job_id))
 
 
-def start(conn, job_id, pid, lease_sec, log_path):
-    """leased -> running, by the worker itself. False if the job is no longer leased (requeued meanwhile)."""
+def start(conn, job_id, pid, lease_sec, log_path, settings_hash=None):
+    """leased -> running, by the worker itself. False if the job is no longer leased (requeued meanwhile).
+    settings_hash: the settings version the worker loaded (settings.py)."""
     with tx(conn):
-        cur = conn.execute("UPDATE jobs SET state='running', owner_pid=?, started=?, lease_expires=?, log_path=?"
-                           " WHERE id=? AND state='leased'", (pid, utc(), utc(time.time() + lease_sec), log_path, job_id))
+        cur = conn.execute("UPDATE jobs SET state='running', owner_pid=?, started=?, lease_expires=?, log_path=?,"
+                           " settings_hash=? WHERE id=? AND state='leased'",
+                           (pid, utc(), utc(time.time() + lease_sec), log_path, settings_hash, job_id))
         return cur.rowcount == 1
 
 

@@ -3,8 +3,8 @@
 Every automatic rule of the work queue (`common/queue/`). Each rule is written as **trigger** (what on disk makes
 it fire), **action** (the job or decision), **outcome** (what the files show when the action succeeded) and
 **check** (the code that verifies that outcome). Post-condition checks are in `common/queue/checks.py`; a job counts
-as `done` only when its check passes (`checks.after_done`, called by `worker.py`). `cweq verify` runs the checks over
-finished jobs without changing them.
+as `done` only when its check passes (`checks.after_done`, called by `worker.py`); each kind's check is named in its
+declaration (`common/queue/kinds/<kind>.py`). `cweq verify` runs the checks over finished jobs without changing them.
 
 Check verdicts:
 - **pass**: the outcome is on disk.
@@ -67,6 +67,15 @@ These rules apply to tasks listed in a batch file.
 | D4 | A build, gate, regate, regrade or rescore of the task is running | Other jobs of the task wait | One exclusive job per task | `dispatch.plan()` |
 | D5 | The newest real `cweq selfcheck --run` of `regrade` or `rescore` failed (`[checks] refuse_on_failed_selfcheck`) | Jobs of that tool wait | No grading runs with a tool that does not reproduce a known result | `checks.tool_refused()`, `test_checks.py` |
 | D6 | A worker dies or its lease expires | Requeue with one more attempt, or block when attempts are used up | No job is lost or left running twice | `dispatch.reap()` |
+
+## Kinds and settings (`kinds/`, `settings.py`)
+
+| # | Trigger | Action | Outcome | Check |
+|---|---|---|---|---|
+| K1 | A job of a kind is queued or started | `enqueue()` refuses a kind no declaration registers; the worker runs the declaration's command | Only declared kinds run | `qdb.enqueue()`, `test_kinds.py` |
+| K2 | A declaration has `plan` | Its plan runs at the end of each reconcile pass and queues its jobs (idempotent keys) | A plug-in stage is planned like the built-in ones | `reconcile.reconcile()`, `test_kinds.py` |
+| K3 | A loop starts, or the settings file's hash differs from the version in force | Record the version in `settings`; continue with the new values | Every version in force is in the history | `settings.refresh()`, `test_kinds.py` |
+| K4 | A worker starts a job | The job records the settings version the worker loaded | `cweq explain` shows the version a job ran under | `qdb.start()`, `test_kinds.py` |
 
 ## Self-checking tools (`checks.py`, `cweq selfcheck`)
 

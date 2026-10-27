@@ -51,8 +51,15 @@ job of section 8.
    - the delivery register `build/audit/delivered.tsv`.
 
    It also reads the processes running for each task.
-5. **A CLI, `cweq`.** Every command that only looks, and every `--dry-run`, leaves the files unchanged.
-6. **Tests.** They use a temporary database, a fake `build/` + `tasks/` + `jobs/` tree and fake worker commands
+5. **Job kinds as plug-ins** (`common/queue/kinds/`, one file per kind). Each declaration states the kind's command,
+   the files it reads and writes, its post-condition check, whether it is light (bookkeeping) or runs alone on its
+   task, the work started outside the queue that counts as the same kind, and its defaults (priority, cap, attempts,
+   retry and ok exit codes, environment, disk floor). The worker, the dispatcher and the checks read these
+   declarations; the settings file overrides every default. A new stage is a new file (see Job kinds).
+6. **Settings history.** The settings file in git stays the source; every version the queue loads is recorded in the
+   database, and every job records the version it started under (see Settings history).
+7. **A CLI, `cweq`.** Every command that only looks, and every `--dry-run`, leaves the files unchanged.
+8. **Tests.** They use a temporary database, a fake `build/` + `tasks/` + `jobs/` tree and fake worker commands
    (`true`, `false`, `sleep`). They cover:
    - idempotent enqueue, priority and aging;
    - admission limits;
@@ -60,7 +67,9 @@ job of section 8.
    - dependencies, and rebuilding a deleted database without duplicates;
    - holds and busy tasks;
    - adoption and the never-redo rule;
-   - every build, trial, audit, fairness and cleanup rule.
+   - every build, trial, audit, fairness and cleanup rule;
+   - a plug-in kind declared in its own file, planned, started and checked end to end;
+   - the settings history and the table migration.
 
 ## Adoption: continuing from where the pipeline stands
 
@@ -210,6 +219,41 @@ delivery packages. The sections are:
 - blocked jobs;
 - tasks that need a person (listing check failed, trials stuck).
 
+## Job kinds
+
+Every kind is declared in `common/queue/kinds/<kind>.py`; folders listed in `[kinds] extra_dirs` (or
+`CWEQ_KINDS_DIRS`, `:`-separated) are loaded the same way. A declaration is a `Kind(...)` passed to `register()`:
+
+| Field | Meaning |
+|---|---|
+| `command(row, cfg)` | the argv of the stage's existing script (cwd = the repository root). None: no worker (`gate`) |
+| `check(task, args, t0, cfg)` | post-condition checks, `[(name, ok, detail, needs_person)]`; None: the exit code decides |
+| `plan(conn, cfg, ctx, states, dry_run)` | optional: queues the kind's jobs at the end of each reconcile pass (built-in kinds are planned by `reconcile.py`, `phase3.py`, `phase4.py`, `delivery.py` and `lintstep.py`) |
+| `reads`, `writes` | the files the kind reads and writes |
+| `light` | bookkeeping: outside the total cap and the machine limits, holds no task slot, not spaced |
+| `exclusive` | runs alone on its task |
+| `foreign`, `count_foreign` | the process kind of the same work started outside the queue, and whether it counts against the caps |
+| `priority`, `max_running`, `max_attempts`, `retry_exit_codes`, `ok_exit_codes`, `env`, `disk_floor` | defaults; the settings file overrides each |
+
+`cweq config --kinds` lists the registered kinds with the values in force and the file that declares each.
+
+## Settings history
+
+The settings file (`common/queue/queue.toml`, or `--config` / `CWEQ_CONFIG`) is the source of the values in force. A
+version is the sha256 of its bytes (16 hex digits). The reconcile, dispatch and monitor loops record the version they
+start with; at every tick they compare the file with the version in force and, when it changed, record the new
+version and continue with it (new starts follow the new values; running jobs keep the version they started with). A
+file that does not parse keeps the version in force. Every worker records its version on the job
+(`jobs.settings_hash`).
+
+```
+python3 common/queue/cweq.py config                 # the version in force and the history (newest first)
+python3 common/queue/cweq.py config --show HASH     # the full text of a recorded version
+python3 common/queue/cweq.py config --kinds         # also the registered job kinds
+```
+
+`cweq explain TASK` shows the settings version each of the task's jobs ran under.
+
 ## Admission
 
 No job starts while any limit is exceeded:
@@ -271,7 +315,7 @@ Further rules:
 | Column | Meaning |
 |---|---|
 | `id` | integer key |
-| `kind` | `build` `gate` `regate` `trial_run` `regrade` `rescore` `audit_prep` `audit_record` `fairness` `cleanup` `step3` `delivery_prep` |
+| `kind` | a registered kind (`cweq config --kinds`): `build` `gate` `regate` `trial_run` `regrade` `rescore` `audit_prep` `audit_record` `fairness` `cleanup` `step3` `delivery_prep` `lint`, plus plug-ins. `enqueue()` refuses an unregistered kind |
 | `task` | the slug, or a pseudo task |
 | `args` | canonical JSON (sorted keys). `(kind, task, args)` is UNIQUE |
 | `priority` | higher starts first. Effective priority = `priority + aging_per_hour × hours since queued_at` |
@@ -282,6 +326,15 @@ Further rules:
 | `created`, `queued_at`, `started`, `finished` | UTC |
 | `exit_code`, `result`, `log_path` | the script's exit code, its last output line (or why the job was blocked), and its log |
 | `origin` | `reconciler` or `manual` |
+| `settings_hash` | the settings version the worker started with (`settings`) |
+
+`settings` (`common/queue/settings.py`): one row per settings version the queue loaded: `hash` (sha256 of the file,
+16 hex digits), `file`, `git_commit` (short commit of the file's repository; `+local` when the file differs from it),
+the full `text`, `first_loaded`, `last_loaded`, `loads` and `loaded_by` (the loop or worker that loaded it last).
+
+An older `jobs` table is brought up to this layout on the first connect (`qdb.migrate()`): `settings_hash` is added
+and the former fixed kind list is dropped, with every row and id kept. Run that first connect with the queue loops
+stopped.
 
 Adoption adds two more tables:
 - `adoptions`: one row per import, with its counts, conflicts and differences.
@@ -314,6 +367,7 @@ python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   # 
 python3 common/queue/cweq.py events [--open] | events next | events handle ID --action TEXT
 python3 common/queue/cweq.py inbox [--html PATH] [--json]
 python3 common/queue/cweq.py delivered TASK NAME COMMIT [--date D] [--note TEXT]
+python3 common/queue/cweq.py config [--show HASH] [--kinds]
 python3 common/queue/cweq.py stop ID [--grace N] [--why TEXT]
 python3 common/queue/cweq.py orphans [--json]
 python3 common/queue/cweq.py monitor [--once] [--dry-run]   # machine samples, forecasts and alerts

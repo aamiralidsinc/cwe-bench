@@ -32,6 +32,7 @@ sys.path.insert(0, str(paths.COMMON / "util"))
 import diskguard  # noqa: E402  (disk floors per kind, common/util/diskguard.py; live values in limits.env)
 
 import procs  # noqa: E402
+import kinds  # noqa: E402
 import monitor  # noqa: E402
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
@@ -59,8 +60,9 @@ def held(task, kind, args):
     return None
 
 
-EXCLUSIVE = ("build", "gate", "regate", "regrade", "rescore", "fairness")   # one at a time per task, alone on the task
-FOREIGN_KIND = {"build": "build", "trial": "trial_run", "regate": "regate", "fairness": "fairness"}   # old-script processes -> job kind
+# Both come from the kind declarations (kinds/: exclusive, foreign); plan() reads them again so plug-in kinds count.
+EXCLUSIVE = tuple(sorted(kinds.exclusive()))      # one at a time per task, alone on the task
+FOREIGN_KIND = kinds.foreign_map()                 # old-script processes -> job kind
 
 
 def spacing(v):
@@ -134,13 +136,14 @@ class Dispatcher:
                         key=lambda r: (-effective_priority(r, now, d["aging_per_hour"]), r["id"]))
         active = qdb.jobs(self.conn, "state IN ('leased','running')")
         per_kind, per_task, excl_task = {}, {}, set()
+        exclusive, foreign_kind = kinds.exclusive(), kinds.foreign_map()
         light = set(d.get("light_kinds", ()))             # bookkeeping kinds: outside the total and the machine limits
         for r in active:
             per_kind[r["kind"]] = per_kind.get(r["kind"], 0) + 1
             if r["kind"] in light:                       # bookkeeping never holds a task's other work
                 continue
             per_task[r["task"]] = per_task.get(r["task"], 0) + 1
-            if r["kind"] in EXCLUSIVE:
+            if r["kind"] in exclusive:
                 excl_task.add(r["task"])
         total = sum(1 for r in active if r["kind"] not in light)
         # The old scripts' builds and trials hold slots too (cutover: the queue and the schedulers never exceed the
@@ -150,7 +153,7 @@ class Dispatcher:
         foreign = {}
         for runs in ctx["running"].values():
             for kind, _m, _p in runs:
-                k = FOREIGN_KIND.get(kind)
+                k = foreign_kind.get(kind)
                 if k and k in d.get("count_foreign", ()):
                     foreign[k] = foreign.get(k, 0) + 1
         for k, n in foreign.items():
@@ -189,7 +192,7 @@ class Dispatcher:
                 why = ("task busy (old script): " + redo) if redo.endswith("running") else REDO + redo
             elif t in busy:
                 why = f"task busy (old script pid {busy[t][0][0]}: {busy[t][0][1][:80]})"
-            elif t in excl_task or (k in EXCLUSIVE and per_task.get(t, 0)):
+            elif t in excl_task or (k in exclusive and per_task.get(t, 0)):
                 why = "another job of this task is running"
             elif per_task.get(t, 0) >= d["max_running_per_task"]:
                 why = f"{d['max_running_per_task']} jobs of this task are running"

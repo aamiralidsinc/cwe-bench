@@ -264,15 +264,17 @@ def c_lint(task, a, t0, cfg):
     return [("lint.result", bool(mt and mt >= t0 - SLACK), f"{f.name} {qdb.utc(mt) if mt else 'missing'}", False)]
 
 
-CHECKS = {"regrade": c_regrade, "rescore": lambda t, a, t0, c: c_regrade(t, a, t0, c, rescore=True),
-          "regate": c_regate, "build": c_build, "trial_run": c_trial, "audit_prep": c_audit_prep,
-          "audit_record": c_audit_record, "fairness": c_fairness, "cleanup": c_cleanup, "lint": c_lint}
+def check_of(kind):
+    """The kind's post-condition check from its declaration (kinds/), or None."""
+    import kinds
+    kd = kinds.get(kind)
+    return kd.check if kd else None
 
 
 def evaluate(row, cfg):
     """(verdict, failed check or None, [(name, ok, detail)]) for a job, from its start time and the files.
     verdict: pass | fail | person (a failing check that needs a person) | none (no file outcome for this kind)."""
-    fn = CHECKS.get(row["kind"])
+    fn = check_of(row["kind"])
     if fn is None or cfg.get("commands", {}).get(row["kind"]):
         return "none", None, []                        # step3, gate, or a replaced command: the exit code decides
     t0 = qdb.parse_utc(row["started"]) or 0
