@@ -7,23 +7,31 @@
 # After that, use the CWE_* variables (absolute paths) and `cd "$CWE_ROOT"` instead of a hard-coded ~/cwe-bench.
 # Agent prompts may use repo-relative paths (common/gate/gate.py ...) because every agent runs with cwd = $CWE_ROOT.
 
-CWE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# `pwd -P`: the physical path, so a script started through a release's `current` link keeps the release it started
+# with even when `current` is repointed while it runs (versioned releases, docs/RELEASES.md).
+CWE_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 [ -f "$CWE_ROOT/.cwe-bench-root" ] || { echo "common/paths.sh: no .cwe-bench-root at $CWE_ROOT" >&2; return 1 2>/dev/null || exit 1; }
+CWE_CODE_ROOT=$CWE_ROOT
+# Run data: $CWE_DATA_ROOT, else the release's .cwe-data-root file, else the code root (a plain checkout).
+if [ -z "${CWE_DATA_ROOT:-}" ]; then
+  if [ -s "$CWE_ROOT/.cwe-data-root" ]; then CWE_DATA_ROOT=$(head -n 1 "$CWE_ROOT/.cwe-data-root"); else CWE_DATA_ROOT=$CWE_ROOT; fi
+fi
 
-# run data (stays at the root)
-CWE_BUILD=$CWE_ROOT/build
-CWE_TASKS=$CWE_ROOT/tasks
+# run data (stays at the data root; a release links these folders to it)
+CWE_BUILD=$CWE_DATA_ROOT/build
+CWE_TASKS=$CWE_DATA_ROOT/tasks
 CWE_BUILD_PIPELINE=$CWE_BUILD/pipeline
 CWE_AUDIT_DIR=$CWE_BUILD/audit
-CWE_REPORTS=$CWE_ROOT/reports
+CWE_REPORTS=$CWE_DATA_ROOT/reports
 
 # areas
 CWE_COMMON=$CWE_ROOT/common
 CWE_SOURCER=$CWE_ROOT/sourcer
 CWE_SIBLING=$CWE_ROOT/pipelines/sibling
 CWE_STACKING=$CWE_ROOT/pipelines/stacking
-CWE_SIBLING_OUT=$CWE_SIBLING/out
-CWE_STACKING_OUT=$CWE_STACKING/out
+CWE_SIBLING_OUT=$CWE_DATA_ROOT/pipelines/sibling/out
+CWE_STACKING_OUT=$CWE_DATA_ROOT/pipelines/stacking/out
+CWE_ROUTER_OUT=$CWE_DATA_ROOT/pipelines/router/out
 
 # common/launch
 CWE_DRIVE=$CWE_COMMON/launch/drive.sh
@@ -34,7 +42,7 @@ CWE_BUILD_TEMPLATE=$CWE_COMMON/builder/TASK-BUILD-PROMPT-v1.md
 CWE_BUILD_PREPARE=$CWE_COMMON/builder/build_prepare.py
 CWE_SCREENER_PROMPT=$CWE_COMMON/screener/SCREENER-PROMPT-v2.md
 CWE_SCREENER_RUNNER=$CWE_COMMON/screener/run_screener.py
-CWE_SCREENER_RECORDS=$CWE_COMMON/screener/records
+CWE_SCREENER_RECORDS=$CWE_DATA_ROOT/common/screener/records
 
 # common/gate
 CWE_GATE=$CWE_COMMON/gate/gate.py
