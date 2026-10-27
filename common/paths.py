@@ -93,6 +93,10 @@ HARVEST_CODE = AUDIT_TOOLS / "harvest_code.py"
 INTERNET_USE = AUDIT_TOOLS / "internet_use.py"
 ARCHIVE_RUNS = AUDIT_TOOLS / "archive_runs.py"
 
+# ---- common/queue (work queue: docs/WORK-QUEUE.md)
+QUEUE_DIR = COMMON / "queue"
+CWEQ = QUEUE_DIR / "cweq.py"
+
 # ---- common/fairness, common/versioning, common/util
 FAIRNESS_BRIEF = COMMON / "fairness" / "FAIRNESS-REVIEW-BRIEF.md"
 FAIRNESS_VERDICT = COMMON / "fairness" / "fairness_verdict.py"

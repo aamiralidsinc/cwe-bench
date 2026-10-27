@@ -56,6 +56,9 @@ CWE_RUN_TRIAL=$CWE_COMMON/trial/run_trial.sh
 CWE_POSTMORTEM=$CWE_COMMON/audit/postmortem.py
 CWE_AUDIT_RESULTS=$CWE_COMMON/audit/audit_results.py
 
+# common/queue (work queue: docs/WORK-QUEUE.md)
+CWE_CWEQ=$CWE_COMMON/queue/cweq.py
+
 # common/fairness, common/versioning, common/util
 CWE_FAIRNESS_BRIEF=$CWE_COMMON/fairness/FAIRNESS-REVIEW-BRIEF.md
 CWE_FAIRNESS_VERDICT=$CWE_COMMON/fairness/fairness_verdict.py
