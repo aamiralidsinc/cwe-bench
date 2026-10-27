@@ -56,7 +56,7 @@ These rules apply to tasks listed in a batch file.
 | F3 | An auditor's `verdict.json` not recorded yet, or a trial result or regrade newer than the ledger | `audit_record` (`postmortem.py record-ready`, then `audit_results.py`) | `build/audit/ledger.md` and `trials.tsv` rewritten at or after the start | `checks.c_audit_record` |
 | F4 | A batch task the ledger marks BREAKER candidate, no `FAIRNESS.md` newer than its newest trial job folder, no review running, not held or busy | `fairness` (stacking or sibling review) | `FAIRNESS.md` written at or after the start, `fairness_status.txt` says ok, and a verdict READY or NOT_READY | `checks.c_fairness`: `fairness.review`, `fairness.finished`, `fairness.verdict` (person when the review states no verdict) |
 | F5 | Every UTC hour, no other cleanup loop running | `cleanup` (`hourly_cleanup.sh once`) | A `pass done` line in `build/audit/hourly_cleanup.log` at or after the start | `checks.c_cleanup` |
-| F6 | Every UTC half hour | `step3` (the router's periodic step) | Exit code 0 | none (the exit code decides) |
+| F6 | Every UTC half hour | `step3`: `route.py step3` routes newly solved stacked tasks into the general sibling pool, then `route.py pool` when something new was routed | Solved stacked tasks are ranked with every other sibling candidate; nothing is prepared or selected | none (the exit code decides) |
 | L1 | A batch task SOUND on its gate (stage waiting_trials or later) with no `build/<slug>/lint/<fp>.json` for its current gate fingerprint (`lintstep.py`) | `lint` (`lintstep.py run`: `common/lint/task_lint.py`, warning-only) | `build/<slug>/lint/<fp>.json` with warning and note counts, written at or after the start | `checks.c_lint`: `lint.result` |
 
 ## Admission (`dispatch.py`)
