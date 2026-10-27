@@ -313,4 +313,9 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
         import phase4
         plist = procs.list_processes() if proc_list is None else proc_list
         out += phase4.reconcile(conn, cfg, ctx, plist, dry_run=dry_run)
+        import delivery
+        import events                                    # delivery_prep jobs, then the events of this pass
+        states = events.read_all(ctx)
+        out += delivery.reconcile(conn, cfg, states, dry_run=dry_run)
+        events.sync(conn, cfg, ctx, states, dry_run=dry_run)
     return out

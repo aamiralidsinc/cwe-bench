@@ -11,6 +11,9 @@
     python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--after ID ...]
     python3 common/queue/cweq.py retry ID | block ID [--why TEXT]
     python3 common/queue/cweq.py explain TASK                  what the rules see for a task, and all its jobs
+    python3 common/queue/cweq.py events [--open] | events next | events handle ID --action TEXT   the event queue
+    python3 common/queue/cweq.py inbox [--html PATH] [--json]  every decision waiting on the owner
+    python3 common/queue/cweq.py delivered TASK NAME COMMIT    record a delivery after the push
 
 Options before the command: --db PATH (default from the config), --config PATH (default common/queue/queue.toml
 or $CWEQ_CONFIG). --dry-run prints what would start (or be queued) and why, and changes nothing.
@@ -129,7 +132,7 @@ def queue_line(conn, proc_list=None):
                 old[k] = old.get(k, 0) + 1
     parts = []
     for k in ("build", "trial_run", "regate", "regrade", "rescore", "fairness", "audit_prep", "audit_record",
-              "cleanup"):
+              "cleanup", "delivery_prep"):
         c = counts.get(k, {})
         run = c.get("running", 0) + c.get("leased", 0)
         q, o = c.get("queued", 0), old.get(k, 0)
@@ -227,6 +230,56 @@ def cmd_block(conn, cfg, a):
     return 0
 
 
+def cmd_events(conn, cfg, a):
+    import events
+    if a.op == "next":
+        r = events.next_open(conn)
+        if r is None:
+            print("no open events")
+            return 1
+        print(events.line(r))
+        print(json.dumps(json.loads(r["payload"]), indent=2))
+        return 0
+    if a.op == "handle":
+        if a.id is None or not a.action:
+            print("usage: cweq events handle ID --action TEXT")
+            return 2
+        ok = events.handle(conn, a.id, a.action)
+        print(f"#{a.id} handled" if ok else f"#{a.id}: not an open event")
+        return 0 if ok else 1
+    rows = events.listing(conn, open_only=a.open, limit=a.limit)
+    n_open = sum(1 for r in rows if r["state"] == "open")
+    print(f"events ({len(rows)} shown, {n_open} open; oldest first, urgent ones are handled first):")
+    for r in rows:
+        print(events.line(r))
+    return 0
+
+
+def cmd_inbox(conn, cfg, a):
+    import delivery
+    import events
+    import inbox
+    states = events.read_all(taskstate.context(procs.list_processes()))
+    items = inbox.collect(conn, states, delivery.prepared())
+    if a.html:
+        Path(a.html).write_text(inbox.page(items))
+        print(f"wrote {a.html} ({sum(len(v) for v in items.values())} items)")
+    if a.json:
+        print(inbox.as_json(items))
+    elif not a.html:
+        print(inbox.text(items), end="")
+    return 0
+
+
+def cmd_delivered(conn, cfg, a):
+    import delivery
+    added, wrote = delivery.record_delivered(a.task, a.name, a.commit, a.date, a.note,
+                                             delivery.settings(cfg)["repo_label"])
+    print(f"register: {', '.join(added) if added else 'already listed'}; "
+          f"HUMAN-DECISION.md: {'DELIVERED line added' if wrote else 'already has this commit'}")
+    return 0
+
+
 def cmd_explain(conn, cfg, a):
     t = reconcile.analyse(a.task, cfg, procs.busy_tasks([a.task], cfg["busy"]["patterns"],
                                                         skip_dirs=(paths.COMMON,)))
@@ -282,13 +335,28 @@ def main(argv=None):
     p.add_argument("--why")
     p = sub.add_parser("explain")
     p.add_argument("task")
+    p = sub.add_parser("events", help="the event queue: list, next, handle")
+    p.add_argument("op", nargs="?", choices=("list", "next", "handle"), default="list")
+    p.add_argument("id", nargs="?", type=int)
+    p.add_argument("--open", action="store_true", help="only open events")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--action", help="with handle: what was done")
+    p = sub.add_parser("inbox", help="every decision waiting on the owner")
+    p.add_argument("--html", help="write one self-contained HTML page here")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("delivered", help="record a delivery after the push (register + DELIVERED line)")
+    p.add_argument("task")
+    p.add_argument("name")
+    p.add_argument("commit")
+    p.add_argument("--date")
+    p.add_argument("--note", default="")
     p = sub.add_parser("_work")                          # internal: the worker wrapper
     p.add_argument("id", type=int)
     a = ap.parse_args(argv)
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks")
+    looking = getattr(a, "dry_run", False) or a.cmd in ("status", "explain", "tasks", "inbox")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
@@ -296,7 +364,8 @@ def main(argv=None):
     if a.cmd == "_work":
         return worker.run(conn, cfg, a.id)
     return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
-            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain}[a.cmd](conn, cfg, a)
+            "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "events": cmd_events, "inbox": cmd_inbox,
+            "delivered": cmd_delivered}[a.cmd](conn, cfg, a)
 
 
 if __name__ == "__main__":
