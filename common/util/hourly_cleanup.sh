@@ -8,6 +8,8 @@
 #   5. dangling images (untagged leftovers of rebuilt tags)
 #   6. shared task images (cwe-reuse/<task>:<env|verifier>-<hash>, common/harbor_ext/cwe_reuse_env.py) that no
 #      run, gate or regrade has used for CWE_REUSE_KEEP_H hours (default 24); Docker refuses any image in use
+#   7. our own top-level /tmp entries older than 12 h that no process has open (common/util/tmp_cleanup.py);
+#      /tmp is a tmpfs with an inode limit, and other users' entries are never touched
 # Tasks under repair (build/<slug>/.hold-repair) keep their containers and images. Nothing in use is touched.
 #
 #   bash common/util/hourly_cleanup.sh once     # one pass now (also what the permission rule allows on demand)
@@ -68,6 +70,8 @@ pass() {
   xargs -a /tmp/hc-reuse.$$ -r -P 4 -n 10 sh -c 'timeout 300 docker rmi "$@" > /dev/null 2>&1; true' _
   log "  shared task images unused > ${keep_h} h removed (attempted): $(wc -l < /tmp/hc-reuse.$$)"
   rm -f /tmp/hc-containers.$$ /tmp/hc-images.$$ /tmp/hc-running.$$ /tmp/hc-reuse.$$
+  # 7. our own /tmp leftovers older than 12 h, not open by any process
+  log "  /tmp: $(timeout 1200 python3 "$(dirname "$0")/tmp_cleanup.py" 2>&1 | tail -1); inodes $(df --output=ipcent /tmp | tail -1 | tr -d ' ')"
   log "pass done: free $(freegb) GB"
 }
 
