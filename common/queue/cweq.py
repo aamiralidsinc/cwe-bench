@@ -20,6 +20,7 @@
     python3 common/queue/cweq.py events [--open] | events next | events handle ID --action TEXT   the event queue
     python3 common/queue/cweq.py inbox [--html PATH] [--json]  every decision waiting on the owner
     python3 common/queue/cweq.py delivered TASK NAME COMMIT    record a delivery after the push
+    python3 common/queue/cweq.py config [--show HASH] [--kinds]  the settings in force, their history, the job kinds
 
 Options before the command: --db PATH (default from the config), --config PATH (default common/queue/queue.toml
 or $CWEQ_CONFIG). --dry-run prints what would start (or be queued) and why, and changes nothing.
@@ -38,9 +39,11 @@ import monitor  # noqa: E402
 import preflight  # noqa: E402
 import dispatch  # noqa: E402
 import identity  # noqa: E402
+import kinds  # noqa: E402
 import procs  # noqa: E402
 import qdb  # noqa: E402
 import reconcile  # noqa: E402
+import settings  # noqa: E402
 import taskstate  # noqa: E402
 import worker  # noqa: E402
 from dispatch import paths  # noqa: E402
@@ -68,7 +71,13 @@ def line(row, extra=""):
 
 
 def cmd_reconcile(conn, cfg, a):
+    if not a.dry_run:
+        settings.record(conn, cfg, "reconcile")
     while True:
+        if not a.dry_run:
+            cfg, changed = settings.refresh(conn, cfg, "reconcile")
+            if changed:
+                print(f"{qdb.utc()} settings changed: now {cfg['_settings_hash']}", flush=True)
         slugs = [a.task] if a.task else None
         rep = reconcile.reconcile(conn, cfg, slugs=slugs, dry_run=a.dry_run)
         stamp = qdb.utc()
@@ -88,7 +97,14 @@ def cmd_reconcile(conn, cfg, a):
 def cmd_monitor(conn, cfg, a):
     from dispatch import paths as _paths
     mon = monitor.Monitor(conn, cfg, _paths.ROOT, wait_df=a.once or a.dry_run)
+    if not a.dry_run:
+        settings.record(conn, cfg, "monitor")
     while True:
+        if not a.dry_run:
+            cfg, changed = settings.refresh(conn, cfg, "monitor")
+            if changed:
+                mon.cfg, mon.s = cfg, monitor.settings(cfg)
+                print(f"{qdb.utc()} settings changed: now {cfg['_settings_hash']}", flush=True)
         rep = mon.tick(dry_run=a.dry_run)
         print(monitor.line(rep["sample"]), flush=True)
         for name, state, value, thr, msg in rep["alerts"]:
@@ -125,7 +141,14 @@ def cmd_dispatch(conn, cfg, a):
             for n in t["notes"]:
                 print(f"{qdb.utc()} reconcile {t['task']}: {n}")
     d = dispatch.Dispatcher(conn, cfg, a.db)
+    if not a.dry_run:
+        settings.record(conn, cfg, "dispatch")
     while True:
+        if not a.dry_run:
+            cfg, changed = settings.refresh(conn, cfg, "dispatch")
+            if changed:
+                d.cfg = cfg                              # new starts follow the new settings; running jobs keep theirs
+                print(f"{qdb.utc()} settings changed: now {cfg['_settings_hash']}", flush=True)
         rep = d.tick(dry_run=a.dry_run)
         stamp = qdb.utc()
         for jid, state, why in rep["reaped"]:
@@ -163,7 +186,7 @@ def queue_line(conn, proc_list=None):
     old = {}
     for runs in ctx["running"].values():
         for kind, _m, _p in runs:
-            k = dispatch.FOREIGN_KIND.get(kind)
+            k = kinds.foreign_map().get(kind)
             if k:
                 old[k] = old.get(k, 0) + 1
     parts = []
@@ -237,6 +260,9 @@ def cmd_tasks(conn, cfg, a):
 
 
 def cmd_enqueue(conn, cfg, a):
+    if a.kind not in kinds.names():
+        print(f"unknown kind {a.kind!r}; one of {', '.join(kinds.names())}")
+        return 2
     args = json.loads(a.args) if a.args else {}
     why = taskstate.redo_reason(a.kind, a.task, args, taskstate.context(procs.list_processes()))
     if why:
@@ -354,7 +380,33 @@ def cmd_explain(conn, cfg, a):
     rows = qdb.jobs(conn, "task=?", (a.task,))
     print(f"  jobs ({len(rows)}):")
     for r in rows:
-        print(line(r, f"{r['origin']} created {r['created']} exit {r['exit_code']} - {r['result'] or ''}"))
+        print(line(r, f"{r['origin']} created {r['created']} settings {r['settings_hash'] or '-'} "
+                      f"exit {r['exit_code']} - {r['result'] or ''}"))
+    return 0
+
+
+def cmd_config(conn, cfg, a):
+    if a.show:
+        row = settings.text_of(conn, a.show)
+        if row is None:
+            print(f"no recorded settings version starting with {a.show}")
+            return 1
+        print(f"# settings {row['hash']}\n{row['text']}", end="")
+        return 0
+    print(f"settings in force: {cfg['_settings_hash']}  (file {cfg['_file']}; "
+          f"{'recorded' if conn.execute('SELECT 1 FROM settings WHERE hash=?', (cfg['_settings_hash'],)).fetchone() else 'not recorded yet: a loop records it at start'})")
+    print("history (newest first):")
+    for r in settings.history(conn):
+        print(f"  {r['hash']}  first {r['first_loaded']}  last {r['last_loaded']}  loads {r['loads']:<5} "
+              f"commit {r['git_commit'] or '-':<20} by {r['loaded_by'] or '-'}")
+    if a.kinds:
+        print("job kinds (kinds/; queue.toml overrides the defaults shown in the settings):")
+        for k in sorted(kinds.REGISTRY.values(), key=lambda k: k.name):
+            flags = ",".join(f for f, on in (("light", k.light), ("exclusive", k.exclusive),
+                                             ("no-worker", k.command is None), ("plans", bool(k.plan))) if on)
+            print(f"  {k.name:<14} priority {cfg['priority'].get(k.name, '-'):<4} max_running "
+                  f"{cfg['limits']['max_running'].get(k.name, '-'):<4} attempts {cfg['max_attempts'].get(k.name, '-'):<3}"
+                  f" {flags:<28} {Path(k.source).name if k.source else ''}")
     return 0
 
 
@@ -408,7 +460,7 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true", help="one sample, printed; nothing written or queued")
     sub.add_parser("preflight")
     p = sub.add_parser("enqueue")
-    p.add_argument("kind", choices=qdb.KINDS)
+    p.add_argument("kind", help="a registered job kind (cweq config --kinds)")
     p.add_argument("task")
     p.add_argument("--args", help="JSON object, e.g. '{\"trial\": \"<job>/<trial>\", \"why\": \"...\"}'")
     p.add_argument("--priority", type=int)
@@ -427,7 +479,7 @@ def main(argv=None):
     p = sub.add_parser("explain")
     p.add_argument("task")
     p = sub.add_parser("verify")
-    p.add_argument("--kind", choices=qdb.KINDS)
+    p.add_argument("--kind", help="a registered job kind")
     p.add_argument("--state", default="done", choices=qdb.STATES)
     p = sub.add_parser("selfcheck")
     p.add_argument("--tool", default="all", choices=["all", *checks.TOOLS])
@@ -447,6 +499,9 @@ def main(argv=None):
     p.add_argument("commit")
     p.add_argument("--date")
     p.add_argument("--note", default="")
+    p = sub.add_parser("config", help="the settings in force, their history and the job kinds")
+    p.add_argument("--show", metavar="HASH", help="print a recorded settings version")
+    p.add_argument("--kinds", action="store_true", help="also list the registered job kinds")
     p = sub.add_parser("_work")                          # internal: the worker wrapper
     p.add_argument("id", type=int)
     a = ap.parse_args(argv)
@@ -454,7 +509,7 @@ def main(argv=None):
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
     looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks", "verify", "inbox",
-                                                         "preflight")
+                                                         "preflight", "config")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
         print(f"queue database ready: {a.db}")
@@ -465,7 +520,7 @@ def main(argv=None):
             "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "verify": cmd_verify,
             "selfcheck": cmd_selfcheck, "events": cmd_events, "inbox": cmd_inbox,
             "delivered": cmd_delivered, "stop": cmd_stop, "orphans": cmd_orphans, "monitor": cmd_monitor,
-            "preflight": cmd_preflight}[a.cmd](conn, cfg, a)
+            "preflight": cmd_preflight, "config": cmd_config}[a.cmd](conn, cfg, a)
 
 
 if __name__ == "__main__":

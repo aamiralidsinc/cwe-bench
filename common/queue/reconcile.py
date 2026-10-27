@@ -319,5 +319,8 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
         out += delivery.reconcile(conn, cfg, states, dry_run=dry_run)
         import lintstep                                  # warning-only lint per task version
         out += lintstep.reconcile(conn, cfg, states, dry_run=dry_run)
+        import kinds                                     # plug-in kinds that plan their own jobs (kinds/)
+        for kd in kinds.planners():
+            out += kd.plan(conn, cfg, ctx, states, dry_run=dry_run) or []
         events.sync(conn, cfg, ctx, states, dry_run=dry_run)
     return out
