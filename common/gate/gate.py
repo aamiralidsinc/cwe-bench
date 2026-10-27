@@ -99,6 +99,17 @@ import paths  # noqa: E402  (repo locations: common/paths.py)
 
 ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "gate-jobs"
+# Image reuse (2026-10-27): every gate run starts the task's images built once per task version
+# (common/harbor_ext/cwe_reuse_env.py; tag = content hash of environment/ and tests/) instead of
+# building new per-run images. CWE_IMAGE_REUSE=0 restores Harbor's per-run build.
+HARBOR_EXT = ROOT / "common" / "harbor_ext"
+REUSE_ARGS = ["-e", "cwe_reuse_env:ReuseDockerEnvironment"] if os.environ.get("CWE_IMAGE_REUSE", "1") != "0" else []
+
+
+def harbor_env() -> dict:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(HARBOR_EXT), env.get("PYTHONPATH")]))
+    return env
 sys.path.insert(0, str(paths.UTIL))
 sys.path.insert(0, str(paths.BUILDER_DIR))  # so sibling imports resolve under `python3 -I`
 import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
@@ -334,8 +345,8 @@ def _run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     for attempt in (1, 2):
         name = f"{task_dir.name}-{label}-{int(time.time())}"
         cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
-               "--job-name", name, "-y", "-q", "--allow-agent-host", "api.deepseek.com"]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+               "--job-name", name, "-y", "-q", "--allow-agent-host", "api.deepseek.com", *REUSE_ARGS]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=harbor_env())
         trials = [p for p in (JOBS / name).glob("*/") if (p / "result.json").exists()]
         if not trials:
             out = f"{proc.stdout}\n{proc.stderr}"

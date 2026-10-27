@@ -6,6 +6,8 @@
 #   3. gate-run folders under ~/.tb-graders/cwe/gate-jobs older than 1 h that no running gate names
 #   4. unused Docker build cache (docker builder prune --all; Docker keeps cache an active build uses)
 #   5. dangling images (untagged leftovers of rebuilt tags)
+#   6. shared task images (cwe-reuse/<task>:<env|verifier>-<hash>, common/harbor_ext/cwe_reuse_env.py) that no
+#      run, gate or regrade has used for CWE_REUSE_KEEP_H hours (default 24); Docker refuses any image in use
 # Tasks under repair (build/<slug>/.hold-repair) keep their containers and images. Nothing in use is touched.
 #
 #   bash common/util/hourly_cleanup.sh once     # one pass now (also what the permission rule allows on demand)
@@ -46,8 +48,26 @@ pass() {
   log "  gate-run folders removed: $n"
   # 4-5. unused build cache and dangling images
   log "  build cache: $(timeout 1800 docker builder prune --all -f 2>&1 | tail -1)"
-  log "  dangling images: $(timeout 600 docker image prune -f 2>&1 | tail -1)"
-  rm -f /tmp/hc-containers.$$ /tmp/hc-images.$$ /tmp/hc-running.$$
+  # Dangling images are removed one by one, largest first: `docker image prune` on this containerd image store
+  # (~27k images) computed for >7 min without deleting anything (2026-10-27); direct rmi frees space at once.
+  # rmi without -f refuses any image a container still uses. Capped at 50 min per pass.
+  timeout 300 docker images -f dangling=true --format '{{.ID}} {{.Size}}' 2>/dev/null |
+    awk '{v=$2; u=v; gsub(/[0-9.]/,"",u); gsub(/[^0-9.]/,"",v); m=(u=="GB")?1000:(u=="MB")?1:(u=="kB")?0.001:0; print v*m, $1}' |
+    sort -rn | awk '!s[$2]++ {print $2}' > /tmp/hc-dangling.$$
+  timeout 3000 xargs -a /tmp/hc-dangling.$$ -r -P 6 -n 5 sh -c 'timeout 600 docker rmi "$@" > /dev/null 2>&1; true' _
+  log "  dangling images removed (attempted, largest first): $(wc -l < /tmp/hc-dangling.$$)"
+  rm -f /tmp/hc-dangling.$$
+  # 6. shared task images unused for CWE_REUSE_KEEP_H hours (last use = mtime of the stamp each run touches)
+  local used="${CWE_REUSE_STATE:-$HOME/.tb-graders/cwe/image-reuse}/used" keep_h=${CWE_REUSE_KEEP_H:-24}
+  timeout 300 docker images --format '{{.Repository}}:{{.Tag}}' 'cwe-reuse/*' 2>/dev/null | grep -viE "$keep" |
+    while read -r img; do
+      st="$used/$(echo "$img" | tr '/:' '__')"
+      [ -n "$(find "$st" -mmin -$((keep_h * 60)) 2>/dev/null)" ] && continue   # used recently (or right now)
+      echo "$img"
+    done > /tmp/hc-reuse.$$
+  xargs -a /tmp/hc-reuse.$$ -r -P 4 -n 10 sh -c 'timeout 300 docker rmi "$@" > /dev/null 2>&1; true' _
+  log "  shared task images unused > ${keep_h} h removed (attempted): $(wc -l < /tmp/hc-reuse.$$)"
+  rm -f /tmp/hc-containers.$$ /tmp/hc-images.$$ /tmp/hc-running.$$ /tmp/hc-reuse.$$
   log "pass done: free $(freegb) GB"
 }
 

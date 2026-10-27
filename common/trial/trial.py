@@ -80,7 +80,7 @@ def remove_container(container):
                            capture_output=True, text=True).stdout.strip()
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
     subprocess.run(["docker", "rm", "-f", container.replace("-main-1", "-netguard-1")], capture_output=True)
-    if image:
+    if image and not image.startswith("cwe-reuse/"):   # shared per-task image: aged out by hourly_cleanup.sh
         subprocess.run(["docker", "rmi", image], capture_output=True)   # fails harmlessly if shared
 
 

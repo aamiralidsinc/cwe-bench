@@ -61,6 +61,8 @@ import paths  # noqa: E402  (repo locations: common/paths.py)
 
 ROOT = paths.ROOT
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "common" / "harbor_ext"))
+from cwe_reuse_tag import ensure_image_sync, reuse_tag  # noqa: E402  (images shared with gate/trial runs)
 from harvest_code import save_tmp_logs  # noqa: E402
 
 CONVENTION_ARTIFACTS = "/logs/artifacts"   # Harbor's implicit artifact entry (agent publish dir)
@@ -86,10 +88,15 @@ def image_exists(image):
     return sh("docker", "image", "inspect", image).returncode == 0
 
 
-def build(image, context):
-    b = sh("docker", "build", "-q", "-t", image, str(context))
-    if b.returncode != 0:
-        sys.exit(f"image build failed ({context}):\n" + b.stderr[-2000:])
+def reuse_image(context):
+    """The task image the gate and trial runs use (cwe-reuse/<task>:<kind>-<content hash>), built only if
+    no run built it yet. Shared: never removed here (common/util/hourly_cleanup.sh ages it out)."""
+    tag = reuse_tag(Path(context))
+    try:
+        ensure_image_sync(Path(context), tag)
+    except RuntimeError as e:
+        sys.exit(f"image build failed ({context}):\n{e}")
+    return tag
 
 
 def start_env_container(name, image, mem, extra=()):
@@ -192,8 +199,7 @@ def env_mode(trial, task, tdir, cfg, out, why):
         sys.exit(f"no saved final code in {code}")
     mem = int((cfg.get("environment") or {}).get("memory_mb") or 4096)
     vtimeout = int((cfg.get("verifier") or {}).get("timeout_sec") or 1800)
-    image = f"cwe-regrade-{task}:latest"
-    build(image, tdir / "environment")
+    image = reuse_image(tdir / "environment")
     (out / "verifier").mkdir(parents=True)
     name = f"regrade-{trial.name.lower()}"
     start_env_container(name, image, mem, ("-v", f"{out / 'verifier'}:{VERIFIER_LOGS}"))
@@ -265,8 +271,7 @@ def rebuild_inputs(trial, task, tdir, cfg, arts, tmp):
     if not (code / "changes.patch").is_file():
         sys.exit(f"no saved workspace usable and no saved final code in {code}")
     mem = int((cfg.get("environment") or {}).get("memory_mb") or 4096)
-    image = f"cwe-regrade-{task}:latest"
-    build(image, tdir / "environment")
+    image = reuse_image(tdir / "environment")
     name = f"regrade-ws-{trial.name.lower()}"
     start_env_container(name, image, mem)
     applied, skipped = replay_patch(name, code)
@@ -379,16 +384,13 @@ def verifier_mode(trial, task, tdir, cfg, out, why, from_patch, keep_image):
             mode = "verifier image + saved workspace"
         else:
             why_rebuild = "requested (--from-patch)" if from_patch else input_note
-            env_image_existed = image_exists(f"cwe-regrade-{task}:latest")
             found, env_image, applied, skipped = rebuild_inputs(trial, task, tdir, cfg, arts, tmp)
             input_note = f"rebuilt from {env_image} + final-code/changes.patch ({why_rebuild})"
-            if env_image_existed:
-                env_image = None                               # not ours to remove
+            env_image = None                                   # shared reuse image: never removed here
             mode = "verifier image + rebuilt workspace (environment image + changes.patch)"
 
-        image = f"cwe-regrade-verifier-{task}:latest"
-        image_existed = image_exists(image)
-        build(image, tdir / "tests")
+        image = reuse_image(tdir / "tests")
+        image_existed = True                                   # shared reuse image: never removed here
         (out / "verifier").mkdir(parents=True)
         name = f"regrade-v-{trial.name.lower()}"
         sh("docker", "rm", "-f", name)

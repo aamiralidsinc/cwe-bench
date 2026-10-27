@@ -81,6 +81,14 @@ fi
 # code, then removes containers of clean solves and lists the rest for review.
 extra+=(--ek keep_containers=true)
 
+# Image reuse (2026-10-27): start the task's images built once per task version (same tags as the
+# gate and regrades: common/harbor_ext/cwe_reuse_env.py) instead of a fresh build per run.
+# CWE_IMAGE_REUSE=0 restores Harbor's per-run build.
+if [ "${CWE_IMAGE_REUSE:-1}" != 0 ]; then
+  export PYTHONPATH="$CWE_ROOT/common/harbor_ext${PYTHONPATH:+:$PYTHONPATH}"
+  extra+=(-e cwe_reuse_env:ReuseDockerEnvironment)
+fi
+
 # No web tools (2026-10-16). CWE-bench agents reach only the model API. Claude Code's WebSearch
 # runs on the provider's side, inside the allowed API call, so the network allowlist cannot stop
 # it: it returned live results in the "offline" filament r11 run. Remove the tools themselves.
