@@ -5,7 +5,7 @@
     python3 common/lint/task_lint.py --all TASKS_ROOT [--repo-root DIR] [--out DIR]
 
 It never fails a task and never changes a file. Exit code 0 always (2 only for a usage error). Per task it reports:
-  - static findings (common/lint/checks.py): stand-ins against the real code, network stand-ins above the layer a
+  - static findings (common/lint/lint_checks.py): stand-ins against the real code, network stand-ins above the layer a
     fix may use, flaky timing, security tests that drive internal code without accepting a refusal, project tests
     read from the agent's workspace, custom report writers;
   - the scorer check (common/lint/score_check.py): the task's own score.py run against synthetic results.
@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import checks  # noqa: E402
+import lint_checks as checks  # noqa: E402
 import score_check  # noqa: E402
 
 _score_cache = {}

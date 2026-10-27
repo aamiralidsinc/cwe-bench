@@ -9,7 +9,7 @@ import pytest
 LINT = Path(__file__).resolve().parents[1]
 ROOT = LINT.parents[1]
 sys.path.insert(0, str(LINT))
-import checks  # noqa: E402
+import lint_checks as checks  # noqa: E402
 import score_check  # noqa: E402
 import task_lint  # noqa: E402
 
