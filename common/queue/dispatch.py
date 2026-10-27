@@ -37,9 +37,21 @@ import monitor  # noqa: E402
 import qdb  # noqa: E402
 import taskstate  # noqa: E402
 import checks  # noqa: E402
+import autolimit  # noqa: E402
 
 CWEQ = Path(__file__).resolve().parent / "cweq.py"
 REDO = "not needed, it would redo finished work: "
+
+
+def batch_hold(row, ctx):
+    """Why a batch build must wait: its batch is on hold (`# hold: yes`), or the reconciler queued it for a batch
+    the task has since left (a re-ranked batch file). None when it may start."""
+    b = ctx.get("batches", {}).get(row["task"])
+    if b and (ctx.get("batch_meta") or {}).get(b, {}).get("hold"):
+        return f"batch {b} on hold (# hold: yes in its batch file)"
+    if not b and row["origin"] == "reconciler":
+        return "no longer in a batch file (the reconciler queued it for a batch)"
+    return None
 
 
 def effective_priority(row, now, aging_per_hour):
@@ -146,6 +158,7 @@ class Dispatcher:
             if r["kind"] in exclusive:
                 excl_task.add(r["task"])
         total = sum(1 for r in active if r["kind"] not in light)
+        cap = self.cap = autolimit.effective(self.conn, cfg)   # base from the settings file, moved by sustained idle
         # The old scripts' builds and trials hold slots too (cutover: the queue and the schedulers never exceed the
         # caps together). Their processes, without the queue's own workers.
         plist = procs.list_processes() if self.proc_list is None else self.proc_list
@@ -185,6 +198,8 @@ class Dispatcher:
                 why = "waiting for " + ", ".join(f"#{x}" for x in qdb.deps_of(r))
             elif held(t, k, qdb.args_of(r)):
                 why = held(t, k, qdb.args_of(r))
+            elif k == "build" and (bh := batch_hold(r, ctx)):
+                why = bh
             elif k in checks.TOOLS and (refused := checks.tool_refused(self.conn, k, cfg)):
                 why = refused
             elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(k, t, qdb.args_of(r), ctx)):
@@ -198,8 +213,8 @@ class Dispatcher:
                 why = f"{d['max_running_per_task']} jobs of this task are running"
             elif per_kind.get(k, 0) >= maxk.get(k, 0):
                 why = f"{k} at its limit ({maxk.get(k, 0)} running{', old scripts included' if foreign.get(k) else ''})"
-            elif total >= d["max_running_total"] and k not in light:
-                why = f"total at its limit ({d['max_running_total']} running)"
+            elif total >= cap and k not in light:
+                why = f"total at its limit ({cap} running)"
             elif k == "trial_run" and per_kind.get("build", 0) + queued_builds >= d["trials_wait_builds"]:
                 why = (f"builds first: {per_kind.get('build', 0)} running + {queued_builds} queued >= "
                        f"{d['trials_wait_builds']}")
@@ -267,6 +282,6 @@ class Dispatcher:
             rep["started"].append((r, f"pid {pid}"))
         # The first fill ends once the total cap is reached, or a tick started everything that was startable.
         budget_left = any(w == "start budget of this tick used" for _, w in waits)
-        if self.filling and (self.total_seen + len(rep["started"]) >= d["max_running_total"] or not budget_left):
+        if self.filling and (self.total_seen + len(rep["started"]) >= getattr(self, "cap", d["max_running_total"]) or not budget_left):
             self.filling = False
         return rep
