@@ -11,7 +11,14 @@ Import it from any script, at any depth:
     import paths  # noqa: E402
 
 The repo root is the folder holding the `.cwe-bench-root` marker file. On the VM that is ~/cwe-bench.
+
+Code and data (versioned releases, docs/RELEASES.md): ROOT is the folder this code runs from (CODE_ROOT). Run data
+(build/, tasks/, reports/, the pipelines' out/ folders, ...) lives under DATA_ROOT. DATA_ROOT comes from
+$CWE_DATA_ROOT, else from the `.cwe-data-root` file a release writes next to its `.cwe-bench-root`, else it is ROOT
+itself (a plain checkout, as before). A release also links each data folder back to DATA_ROOT, so repo-relative paths
+such as `build/<slug>` work from either root.
 """
+import os
 from pathlib import Path
 
 
@@ -23,14 +30,37 @@ def _find_root() -> Path:
     raise RuntimeError("cwe-bench root not found: no .cwe-bench-root marker above " + str(here))
 
 
-ROOT = _find_root()
+def _find_data_root(code_root: Path) -> Path:
+    env = os.environ.get("CWE_DATA_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser()
+    marker = code_root / ".cwe-data-root"
+    if marker.is_file():
+        text = marker.read_text().strip()
+        if text:
+            return Path(text).expanduser()
+    return code_root
 
-# ---- run data (stays at the root; never moved)
-BUILD = ROOT / "build"                    # build/<slug>/: build records, markers, manifests
-TASKS = ROOT / "tasks"                    # tasks/<slug>/: the Harbor task packages
+
+ROOT = _find_root()
+CODE_ROOT = ROOT                          # the code this process runs (a release, or a plain checkout)
+DATA_ROOT = _find_data_root(ROOT)         # the shared run data (== ROOT outside releases)
+
+# Data folders: never part of a release; a release links each one to DATA_ROOT (common/util/release.py).
+DATA_PATHS = (
+    "build", "tasks", "reports", "experiments",
+    "sourcer/index", "sourcer/reserve/index", "sourcer/reserve/out",
+    "pipelines/router/out", "pipelines/sibling/out", "pipelines/stacking/out",
+    "pipelines/stacking/1-select/calibration",
+    "common/screener/records", "common/archive/logs", "docs/peers",
+)
+
+# ---- run data (stays at the data root; never moved)
+BUILD = DATA_ROOT / "build"               # build/<slug>/: build records, markers, manifests
+TASKS = DATA_ROOT / "tasks"               # tasks/<slug>/: the Harbor task packages
 BUILD_PIPELINE = BUILD / "pipeline"       # batch-1 lane state, night logs
 AUDIT_DIR = BUILD / "audit"               # ledger.md, reviews.tsv, awaiting_audit.tsv
-REPORTS = ROOT / "reports"
+REPORTS = DATA_ROOT / "reports"
 
 # ---- top-level areas
 COMMON = ROOT / "common"
@@ -38,13 +68,14 @@ SOURCER = ROOT / "sourcer"
 PIPELINES = ROOT / "pipelines"
 SIBLING = PIPELINES / "sibling"
 STACKING = PIPELINES / "stacking"
-SIBLING_OUT = SIBLING / "out"
-STACKING_OUT = STACKING / "out"
-EXPERIMENTS = ROOT / "experiments"
+SIBLING_OUT = DATA_ROOT / "pipelines" / "sibling" / "out"
+STACKING_OUT = DATA_ROOT / "pipelines" / "stacking" / "out"
+ROUTER_OUT = DATA_ROOT / "pipelines" / "router" / "out"
+EXPERIMENTS = DATA_ROOT / "experiments"
 PRECISION_VALIDATION = EXPERIMENTS / "precision_validation"   # failed experiment; read only for exclusions
 
 # ---- sourcer
-CANDIDATES_DB = SOURCER / "index" / "candidates.sqlite"
+CANDIDATES_DB = DATA_ROOT / "sourcer" / "index" / "candidates.sqlite"
 
 # ---- common/launch
 DRIVE = COMMON / "launch" / "drive.sh"
@@ -62,7 +93,7 @@ CONFORMANCE_CHECK = BUILDER_DIR / "conformance_check.py"
 # ---- common/screener
 SCREENER_PROMPT = COMMON / "screener" / "SCREENER-PROMPT-v2.md"
 SCREENER_RUNNER = COMMON / "screener" / "run_screener.py"
-SCREENER_RECORDS = COMMON / "screener" / "records"    # the screened pool (screener-v2 records, 10-17)
+SCREENER_RECORDS = DATA_ROOT / "common" / "screener" / "records"    # the screened pool (screener-v2 records, 10-17)
 
 # ---- common/gate
 GATE_DIR = COMMON / "gate"

@@ -149,7 +149,7 @@ def stacking_batch(a):
                                 "--reader-dir", str(SO / "reader-ds")], cwd=ROOT, capture_output=True, text=True)
             print("  " + (p.stdout.strip() or p.stderr.strip())[-200:]); ok += p.returncode == 0
         print(f"prepared {ok}/{len(chosen)} BUILD-PROMPTs")
-    print(f"next: nohup python3 -I pipelines/stacking/6-trial/stk_queue.py build --slugs-file {txt.relative_to(ROOT)} "
+    print(f"next: nohup python3 -I pipelines/stacking/6-trial/stk_queue.py build --slugs-file {txt.relative_to(paths.DATA_ROOT)} "
           f"> pipelines/stacking/out/queue/{a.name}.nohup 2>&1 &")
 
 

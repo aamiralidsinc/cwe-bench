@@ -34,7 +34,7 @@ def digest(slug):
         if root.is_dir():
             files += [p for p in root.rglob("*") if p.is_file() and not (SKIP & set(p.parts))]
     for p in sorted(files):
-        h.update(str(p.relative_to(paths.ROOT)).encode() + b"\0")
+        h.update(str(p.relative_to(paths.DATA_ROOT)).encode() + b"\0")   # data-root relative: same digest from any release
         h.update(hashlib.sha256(p.read_bytes()).digest())
     try:
         pc = json.loads((b / "manifest.json").read_text()).get("patch_checks")

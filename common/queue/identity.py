@@ -67,10 +67,19 @@ _version = []
 
 
 def code_version():
+    """The release this code runs from (RELEASE.json at the code root, common/util/release.py), else the
+    DEPLOYED_FROM file of a copied deploy, else the checkout's git commit."""
     if not _version:
         v = ""
+        rel = HERE.parents[1] / "RELEASE.json"
+        if rel.is_file():
+            try:
+                import json
+                v = json.loads(rel.read_text()).get("sha", "")
+            except (OSError, ValueError):
+                v = ""
         f = HERE / "DEPLOYED_FROM"
-        if f.is_file():
+        if not v and f.is_file():
             v = f.read_text().strip()
         if not v:
             try:

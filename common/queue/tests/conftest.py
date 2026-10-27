@@ -24,6 +24,7 @@ def root(tmp_path, monkeypatch):
         (r / d).mkdir(parents=True)
     (r / ".cwe-bench-root").write_text("test root\n")
     monkeypatch.setattr(paths, "ROOT", r)
+    monkeypatch.setattr(paths, "DATA_ROOT", r, raising=False)   # versioned releases: data root == root here
     monkeypatch.setattr(paths, "BUILD", r / "build")
     monkeypatch.setattr(paths, "TASKS", r / "tasks")
     import reconcile

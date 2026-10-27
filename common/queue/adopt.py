@@ -38,6 +38,12 @@ REWORK_STAGES = ("regating", "held_repair", "stale_gate", "trialing", "waiting_t
 
 
 def code_version():
+    rel = paths.ROOT / "RELEASE.json"                   # a versioned release (common/util/release.py)
+    if rel.is_file():
+        try:
+            return json.loads(rel.read_text()).get("sha") or None
+        except (OSError, ValueError):
+            pass
     try:
         r = subprocess.run(["git", "-C", str(paths.ROOT), "rev-parse", "--short=12", "HEAD"], capture_output=True,
                            text=True, timeout=10)
