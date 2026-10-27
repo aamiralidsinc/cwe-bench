@@ -8,8 +8,7 @@ These rules replace pipelines/router/scale_queue.py. They look only at tasks lis
   P2  stage waiting_trials -> per model without a verdict (not stuck, not held by hold_<model>):
         no graded run yet, or one run left      -> one trial_run with --max-runs <left>      (early abort at a solve)
         a graded run and two or more runs left  -> one trial_run per remaining run, --max-runs 1, started together
-                                                   (owner decision 2026-10-26: a failing model reaches its third
-                                                   verdict in one run's time)
+                                                   (a failing model reaches its third verdict in one run's time)
       args {"model", "first_run", "max_runs", "group", "version"}: version = the SOUND gate's fingerprint, group = runs
       tried when planned. A new task version starts a new set of keys, and the same plan is never queued twice.
       After [phase3] max_launches launch groups of one (task, model, version) without a verdict: no more jobs; the
