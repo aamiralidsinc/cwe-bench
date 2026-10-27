@@ -16,6 +16,7 @@
 # Progress: build/<slug>/postbuild.log.
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 S=${1:?usage: common/gate/postbuild.sh <slug> [--listing]}; LISTING=0; [ "${2:-}" = --listing ] && LISTING=1
 cd "$CWE_ROOT" || exit 2
 B="build/$S"; L="$B/postbuild.log"; mkdir -p "$B"
@@ -48,7 +49,7 @@ fi
 [ "$GRC" = 0 ] || { log "RESULT: not sound (gate exit $GRC)"; exit "$GRC"; }
 # gate_one_ds.sh writes .sound as soon as the gate passes; hold it until every check below is done, so no
 # trial launcher picks the task up in between (seen in the 2026-10-25 dry run).
-mv -f "$B/.sound" "$B/.gate_passed" 2>/dev/null
+cwe_hold_after_gate "$B"
 
 # The blind patch, if the blind fix produced one: one more patch check, then the fingerprint covers it.
 if [ "$BRC" = 0 ] && [ -f "$B/checks/blind.patch" ]; then
@@ -62,7 +63,7 @@ if [ "$BRC" = 0 ] && [ -f "$B/checks/blind.patch" ]; then
     # The manifest keeps its declared blind entry (the static stage requires the declaration); without the
     # file the gate skips that check.
     mv -f "$B/checks/blind.patch" "$B/checks/blind.failed.patch"
-    touch "$B/.blind_fail"
+    cwe_mark "$B" .blind_fail
     log "blind patch check: FAILED (kept as checks/blind.failed.patch, unwired; .blind_fail). Not blocking."
   fi
 fi
@@ -70,12 +71,12 @@ python3 -I common/gate/fingerprint.py write "$S" >> "$L" 2>&1
 
 if [ "$LISTING" = 1 ] && [ "$LRC" != 0 ]; then
   if [ -f pipelines/stacking/4-listing/LISTING_ENFORCE ]; then
-    rm -f "$B/.sound" "$B/.gate_passed" "$B/.listing_warn"; touch "$B/.listing_fail"
+    cwe_mark_listing_fail "$B"
     log "RESULT: gated, but the instruction lists hidden traps (or the check errored): .listing_fail, not sound"
     exit 3
   fi
-  touch "$B/.listing_warn"; log "listing (advisory, reviewer not calibrated): exit $LRC recorded in .listing_warn"
+  cwe_mark "$B" .listing_warn; log "listing (advisory, reviewer not calibrated): exit $LRC recorded in .listing_warn"
 fi
-rm -f "$B/.gate_passed"; touch "$B/.sound"
+cwe_mark_sound "$B"
 log "RESULT: SOUND, ready for trials"
 exit 0

@@ -1,5 +1,6 @@
 #!/bin/bash
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 . "$CWE_DOCKER_TUNING" 2>/dev/null || true
 # gate_one_ds.sh <slug> : gate one built task through static, then nop/oracle/patches IN PARALLEL, and leave exactly ONE
 # marker in build/<slug>/:
@@ -179,7 +180,7 @@ json.dump({"slug": slug, "verdict": verdict, "stage": stage or None, "summary": 
            "evidence_file": rec.get("evidence_file"),
            "finished": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, open(p, "w"), indent=1)
 PY
-rm -f "$B/.sound" "$B/.unsound" "$B/.gate_error"; touch "$B/$mark"
+cwe_gate_verdict "$B" "$mark"
 # A SOUND is valid only for the files it gated (common/gate/fingerprint.py): record them, so a later
 # change to tests/solution/environment/checks makes run_trial.sh and regrade.py refuse until re-gated.
 if [ "$mark" = .sound ]; then python3 -I "$CWE_ROOT/common/gate/fingerprint.py" write "$s" >> "$LOG" 2>&1; else rm -f "$B/gate_fingerprint.json"; fi

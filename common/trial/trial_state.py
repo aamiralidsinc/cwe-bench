@@ -23,13 +23,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (common/markers.py)
 
 ROOT = paths.ROOT
 STUCK_AFTER = 6   # ungraded runs: trial.py makes at most 2 per run slot, so 3 slots' worth
 
 
 def state(slug, model, runs=3):
-    log = ROOT / "build" / slug / f"runs_{model}.log"
+    log = markers.runs_log(ROOT / "build" / slug, model)
     rewards = []
     if log.is_file():
         for line in log.read_text(errors="replace").splitlines():

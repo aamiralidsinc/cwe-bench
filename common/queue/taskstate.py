@@ -25,6 +25,7 @@ import paths  # noqa: E402
 for sub in ("gate", "trial", "fairness"):
     sys.path.insert(0, str(paths.COMMON / sub))
 import fairness_verdict  # noqa: E402
+import markers  # noqa: E402  (common/markers.py: marker names and readers)
 import fingerprint  # noqa: E402
 import trial_state  # noqa: E402
 
@@ -170,32 +171,18 @@ def context(proc_list, ignore_own=False):
 
 def gate_sha16(slug):
     """First 16 hex of the sha256 the last SOUND gate recorded (the task version trials belong to), or 'legacy'."""
-    try:
-        return json.loads((paths.BUILD / slug / "gate_fingerprint.json").read_text()).get("sha256", "")[:16] or "legacy"
-    except (OSError, ValueError):
-        return "legacy"
+    return (markers.fingerprint_sha(paths.BUILD / slug) or "")[:16] or "legacy"
 
 
 # ---------- one task
 
 def build_done(b):
-    """scale_queue.py build_done(): True when the slug needs no (more) build work."""
-    if any((b / m).is_file() for m in (".sound", ".listing_fail", ".hold-repair", ".gate_passed")):
-        return True
-    end, start = b / "end_utc.txt", b / "start_utc.txt"
-    if end.is_file() and (not start.is_file() or _read(end).strip() >= _read(start).strip()):
-        return True
-    if any((b / m).is_file() for m in (".unsound", ".gate_error")):
-        return True
-    for logf in ("stack_pipeline.log", "pipeline.log"):
-        t = _read(b / logf)
-        if "STOP:" in t or "BUILD-INCOMPLETE" in t or "stopped/failed" in t:
-            return True
-    return False
+    """True when the slug needs no (more) build work (common/markers.py build_done)."""
+    return markers.build_done(b)
 
 
 def build_started(b):
-    return any((b / f).exists() for f in ("start_utc.txt", "stack_pipeline.log", "pipeline.log", "manifest.json"))
+    return markers.build_started(b)
 
 
 def fp_state(slug):
@@ -216,18 +203,16 @@ def read(slug, ctx):
     kinds = {k for k, _m, _p in run}
     led = ctx["ledger"].get(slug, {})
     t = {"task": slug, "batch": ctx["batches"].get(slug, ""), "pipeline": "stacking" if slug.startswith("stk-")
-         else "sibling", "markers": sorted(m for m in (".sound", ".unsound", ".gate_error", ".listing_fail",
-                                                         ".gate_passed", ".hold-repair") if (b / m).exists()),
+         else "sibling", "markers": markers.flags(b),
          "running": [f"{k}{':' + m if m else ''} pid {p}" for k, m, p in run], "models": {},
          "ledger_verdict": led.get("verdict", ""), "fairness": "", "decision": "", "delivered": "", "notes": []}
 
     hd = fairness_verdict.human_decision(slug)
-    dec_text = _read(b / "HUMAN-DECISION.md")
     if hd:
         t["decision"] = f"{hd[0]} {hd[1]}" + (" (stale)" if hd[2] else "")
-    d = DELIVERED.search(dec_text)
+    d = markers.delivered_line(b)
     if d:
-        t["delivered"] = d.group(1).strip()
+        t["delivered"] = d
     elif slug in ctx.get("delivered", {}):
         t["delivered"] = "register: " + ctx["delivered"][slug]
     if (b / "FAIRNESS.md").exists() or (b / "fairness_status.txt").exists():

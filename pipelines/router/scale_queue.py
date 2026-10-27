@@ -29,6 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402
+import markers  # noqa: E402  (common/markers.py)
 sys.path.insert(0, str(paths.ROOT / "common" / "util"))
 import diskguard  # noqa: E402  (disk-aware admission: common/util/diskguard.py)
 
@@ -47,32 +48,13 @@ def bdir(s):
 
 
 def is_sound(s):
-    return os.path.isfile(os.path.join(bdir(s), ".sound"))
+    return markers.has(bdir(s), ".sound")
 
 
 def build_done(s):
-    """True when this slug needs no (more) build work: sound, held at the listing check, or stopped."""
-    b = bdir(s)
-    if is_sound(s) or os.path.isfile(os.path.join(b, ".listing_fail")):
-        return True
-    # A build that already ran and ended is done, whatever its post-build state (waiting for a re-gate, re-gating,
-    # held for a test repair). Before 2026-10-26 a restarted scheduler rebuilt such tasks from scratch.
-    for marker in (".hold-repair", ".gate_passed"):
-        if os.path.isfile(os.path.join(b, marker)):
-            return True
-    end, start = os.path.join(b, "end_utc.txt"), os.path.join(b, "start_utc.txt")
-    if os.path.isfile(end) and (not os.path.isfile(start) or open(end).read().strip() >= open(start).read().strip()):
-        return True
-    for marker in (".unsound", ".gate_error"):
-        if os.path.isfile(os.path.join(b, marker)):
-            return True
-    for logf in ("stack_pipeline.log", "pipeline.log"):
-        p = os.path.join(b, logf)
-        if os.path.isfile(p):
-            t = open(p, errors="replace").read()
-            if "STOP:" in t or "BUILD-INCOMPLETE" in t or "stopped/failed" in t:
-                return True
-    return False
+    """True when this slug needs no (more) build work: sound, held, waiting for a re-gate, ended or stopped
+    (common/markers.py build_done; before 2026-10-26 a restarted scheduler rebuilt ended builds from scratch)."""
+    return markers.build_done(Path(bdir(s)))
 
 
 def build_cmd(s):

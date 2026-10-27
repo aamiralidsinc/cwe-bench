@@ -36,6 +36,7 @@ import fingerprint  # noqa: E402  (the gate fingerprint: what a SOUND gate cover
 
 import procs  # noqa: E402
 import qdb  # noqa: E402
+import markers  # noqa: E402  (common/markers.py)
 
 PHASE1_KINDS = ("regate", "regrade", "rescore")
 SKIP = fingerprint.SKIP
@@ -89,16 +90,8 @@ def gate_digest(slug):
 
 
 def last_result(build_dir):
-    """(epoch, text) of the last RESULT line in postbuild.log, or (None, None)."""
-    ts = text = None
-    try:
-        for line in (build_dir / "postbuild.log").read_text(errors="replace").splitlines():
-            m = RESULT_RE.match(line)
-            if m:
-                ts, text = qdb.parse_utc(m.group(1)), m.group(2)
-    except OSError:
-        pass
-    return ts, text
+    """(epoch, text) of the last RESULT line in postbuild.log, or (None, None) (common/markers.py last_result)."""
+    return markers.last_result(build_dir)
 
 
 def strip_backup(name):
