@@ -159,23 +159,41 @@ DF_OUT = ('{"Type":"Images","TotalCount":"382","Size":"3.539TB"}\\n'
           '{"Type":"Build Cache","TotalCount":"71","Size":"18.41GB"}')
 
 
-def test_docker_df_runs_in_the_background(conn, cfg, root, monkeypatch):
+def probes(monkeypatch, delay):
+    monkeypatch.setattr(monitor, "DF_CMD", ["sh", "-c", f"sleep {delay}; printf '{DF_OUT}\\n'"])
+    monkeypatch.setattr(monitor, "IMAGES_CMD", ["sh", "-c", f"sleep {delay}; echo 382"])
+
+
+def test_docker_probes_run_in_the_background(conn, cfg, root, monkeypatch):
     import time as _t
-    monkeypatch.setattr(monitor, "DF_CMD", ["sh", "-c", f"sleep 0.3; printf '{DF_OUT}\\n'"])
+    probes(monkeypatch, 0.3)
     monkeypatch.setattr(monitor, "docker_counts", lambda timeout=20: (10, 4))
     clock = [1_800_000_000.0]
     m = monitor.Monitor(conn, cfg, root, proc_list=[], now=lambda: clock[0])
     m.prev_cpu = (0, 0)
-    first = m.sample()                                    # starts `docker system df`, does not wait for it
+    first = m.sample()                                    # starts both probes, waits for neither
     assert first.get("images") is None and first["containers_running"] == 4
     _t.sleep(0.6)
     clock[0] += 60
-    second = m.sample()                                   # the background result lands here
+    second = m.sample()                                   # their results land here
     assert second["images"] == 382 and second["build_cache_gb"] == 18.4
 
 
-def test_docker_df_waits_in_one_shot_mode(conn, cfg, root, monkeypatch):
-    monkeypatch.setattr(monitor, "DF_CMD", ["sh", "-c", f"sleep 0.2; printf '{DF_OUT}\\n'"])
+def test_slow_probe_is_stopped_after_its_timeout(conn, cfg, root, monkeypatch):
+    probes(monkeypatch, 30)
+    monkeypatch.setattr(monitor, "docker_counts", lambda timeout=20: (None, None))
+    cfg["monitor"] = {"images_timeout_sec": 10, "docker_timeout_sec": 10}
+    clock = [1_800_000_000.0]
+    m = monitor.Monitor(conn, cfg, root, proc_list=[], now=lambda: clock[0])
+    m.prev_cpu = (0, 0)
+    m.sample()
+    clock[0] += 60                                        # past the timeouts: both are stopped
+    s = m.sample()
+    assert s.get("images") is None and all(st[0] is None for st in m.probes.values())
+
+
+def test_docker_probes_wait_briefly_in_one_shot_mode(conn, cfg, root, monkeypatch):
+    probes(monkeypatch, 0.2)
     monkeypatch.setattr(monitor, "docker_counts", lambda timeout=20: (None, None))
     m = monitor.Monitor(conn, cfg, root, proc_list=[], now=lambda: 1_800_000_000.0, wait_df=True)
     m.prev_cpu = (0, 0)

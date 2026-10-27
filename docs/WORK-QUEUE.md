@@ -227,8 +227,9 @@ Options before the command: `--db PATH`, and `--config PATH` (or `$CWEQ_CONFIG`)
 - Docker containers (all and running), images and build-cache size;
 - running jobs per kind, with work started outside the queue shown as `+kind`.
 
-`docker system df` is slow on a large image store, so it runs in the background every 10 minutes, and each sample
-carries its last result.
+The slow Docker reads run in the background, and each sample carries their last result:
+- the image count (`docker images -q`), every 10 minutes;
+- the build-cache size (`docker system df`, which can take many minutes on a large image store), every hour.
 
 Each sample also carries a forecast:
 - the disk burn rate in GB per hour, a least-squares fit over the last hour of samples;

@@ -9,9 +9,10 @@ Each sample (table `metrics`):
   mem_available_gb, swap_used_gb
   free_disk_gb, root_inode_pct   the repository's file system
   tmp_inode_pct      /tmp inodes in use
-  containers, containers_running, images, build_cache_gb   Docker. `docker system df` (images, build cache) runs in
-                     the background every [monitor] docker_df_every_sec (it takes minutes on a large image store) and
-                     is stopped after docker_timeout_sec; samples carry its last result
+  containers, containers_running, images, build_cache_gb   Docker. The image count (`docker images -q`, every
+                     images_every_sec) and the build cache (`docker system df`, every docker_df_every_sec; it can take
+                     many minutes on a large image store) run in the background and are stopped after their timeouts;
+                     samples carry their last results
   jobs               JSON {kind: running} for queue jobs plus work started by other launchers ("+kind")
   disk_burn_gb_h     free-disk loss per hour over the last [monitor] window_min (least squares; negative = growing)
   disk_floor_h       hours until free disk reaches limits.min_free_disk_gb at that rate (NULL when not shrinking)
@@ -55,7 +56,8 @@ CREATE TABLE IF NOT EXISTS monitor_alerts (
 );
 """
 
-DEFAULTS = {"tick_sec": 60, "window_min": 60, "fresh_sec": 120, "docker_df_every_sec": 600, "docker_timeout_sec": 600,
+DEFAULTS = {"tick_sec": 60, "window_min": 60, "fresh_sec": 120, "images_every_sec": 600, "images_timeout_sec": 300,
+            "docker_df_every_sec": 3600, "docker_timeout_sec": 1800, "once_wait_sec": 120,
             "retention_days": 7, "disk_free_gb_warn": 300, "load_warn": 200, "mem_available_gb_warn": 40,
             "tmp_inode_pct_warn": 85, "root_inode_pct_warn": 85, "disk_floor_within_h": 6, "inode_full_within_h": 12,
             "cleanup_on_forecast": True}
@@ -135,6 +137,14 @@ def docker_counts(timeout=20):
 
 
 DF_CMD = ["docker", "system", "df", "--format", "{{json .}}"]
+IMAGES_CMD = ["sh", "-c", "docker images -q | wc -l"]
+
+
+def parse_count(out):
+    try:
+        return int((out or "").strip().split()[-1])
+    except (ValueError, IndexError):
+        return None
 
 
 def parse_df(out):
@@ -187,41 +197,55 @@ class Monitor:
         self.conn, self.cfg, self.root = conn, cfg, str(root)
         self.s = settings(cfg)
         self.proc_list, self.now, self.docker = proc_list, now, docker
-        self.wait_df = wait_df                            # one-shot runs wait for `docker system df`; the loop never does
+        self.wait_df = wait_df                            # one-shot runs wait briefly for the Docker probes; the loop never
         self.prev_cpu = None
-        self.last_df = 0.0
-        self.df_proc = None                               # `docker system df` runs in the background (minutes on a
-        self.df_started = 0.0                             # large image store); its result lands in a later sample
-        self.last = {}                                    # last known Docker values between `system df` runs
+        self.probes = {}                                  # name -> [proc, started, last_start]
+        self.last = {}                                    # last known Docker values between probe runs
 
-    def poll_df(self, t):
-        """Start `docker system df` when due; collect its result when done; stop it after docker_timeout_sec."""
-        if self.df_proc is not None:
+    def probe_specs(self):
+        """name -> (command, every_sec, timeout_sec, apply(out)). Slow Docker reads run in the background."""
+        def images(out):
+            n = parse_count(out)
+            if n is not None:
+                self.last["images"] = n
+
+        def df(out):
+            _imgs, cache = parse_df(out)
+            if cache is not None:
+                self.last["build_cache_gb"] = cache
+        return {"images": (IMAGES_CMD, self.s["images_every_sec"], self.s["images_timeout_sec"], images),
+                "df": (DF_CMD, self.s["docker_df_every_sec"], self.s["docker_timeout_sec"], df)}
+
+    def poll_probes(self, t):
+        """Start each probe when due; collect results when done; stop a probe after its timeout. One-shot runs
+        (wait_df) wait up to once_wait_sec for each probe."""
+        for name, (cmd, every, timeout, apply) in self.probe_specs().items():
+            st = self.probes.setdefault(name, [None, 0.0, None])
+            if st[0] is None and (st[2] is None or t - st[2] >= every):
+                try:
+                    st[0] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                    st[1] = st[2] = t
+                except OSError:
+                    st[2] = t
+                    continue
+            proc = st[0]
+            if proc is None:
+                continue
             if self.wait_df:
                 try:
-                    self.df_proc.wait(timeout=max(1.0, self.s["docker_timeout_sec"] - (t - self.df_started)))
+                    proc.wait(timeout=min(self.s["once_wait_sec"], timeout))
                 except subprocess.TimeoutExpired:
                     pass
-            if self.df_proc.poll() is not None:
-                out = self.df_proc.stdout.read() if self.df_proc.returncode == 0 else ""
-                self.df_proc.stdout.close()
-                imgs, cache = parse_df(out)
-                if imgs is not None or cache is not None:
-                    self.last["images"], self.last["build_cache_gb"] = imgs, cache
-                self.df_proc = None
-            elif t - self.df_started > self.s["docker_timeout_sec"]:
-                self.df_proc.kill()
-                self.df_proc.wait()
-                self.df_proc.stdout.close()
-                self.df_proc = None
-        if self.df_proc is None and t - self.last_df >= self.s["docker_df_every_sec"]:
-            try:
-                self.df_proc = subprocess.Popen(DF_CMD, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-                self.df_started = self.last_df = t
-                if self.wait_df:
-                    self.poll_df(t)
-            except OSError:
-                self.last_df = t
+            if proc.poll() is not None:
+                out = proc.stdout.read() if proc.returncode == 0 else ""
+                proc.stdout.close()
+                apply(out)
+                st[0] = None
+            elif self.wait_df or t - st[1] > timeout:
+                proc.kill()
+                proc.wait()
+                proc.stdout.close()
+                st[0] = None
 
     def sample(self):
         """One sample dict (not written)."""
@@ -247,7 +271,7 @@ class Monitor:
         m["tmp_inode_pct"] = inode_pct("/tmp")
         if self.docker:
             m["containers"], m["containers_running"] = docker_counts()
-            self.poll_df(t)
+            self.poll_probes(t)
             m.update(self.last)
         m["jobs"] = json.dumps(jobs_running(self.conn, self.proc_list), sort_keys=True)
         self.forecast(m)
