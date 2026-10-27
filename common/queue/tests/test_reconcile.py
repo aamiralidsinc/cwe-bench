@@ -150,7 +150,7 @@ def test_no_fingerprint_no_job(conn, cfg, root):
 def test_busy_task_gets_no_jobs(conn, cfg, root, tmp_path):
     repaired_task(root)
     repaired_task(root, "stk-c")
-    script = tmp_path / "fastify-rescore.sh"             # a one-off script that names the slug only inside
+    script = tmp_path / "repair-rescore.sh"             # a one-off script that names the slug only inside
     script.write_text("S=stk-c\nbash common/gate/regate.sh $S\n")
     procs = [(5, ["bash", str(script)], None, {})]
     reconcile.reconcile(conn, cfg, proc_list=[(4, ["bash", "common/gate/regate.sh", "stk-a", "--listing"], None, {})]
@@ -183,8 +183,8 @@ def test_dry_run_writes_nothing(conn, cfg, root):
 
 
 def test_r4_removed_tests_cannot_change_a_both_solved_verdict(root, conn, cfg):
-    """Removing tests from a task both models solved: no regate, regrade or rescore (live case: stk-social-core-5847,
-    stk-cms-ghsa7jx7). A task with one failing model is still re-gated and rescored."""
+    """Removing tests from a task both models solved: no regate, regrade or rescore.
+    A task with one failing model is still re-gated and rescored."""
     import phase3
     import taskstate
     from test_adopt import batch, ledger
@@ -210,7 +210,7 @@ def test_r4_removed_tests_cannot_change_a_both_solved_verdict(root, conn, cfg):
 
 
 def test_r4_covers_a_single_removed_test_function(root, conn, cfg):
-    """stk-social-core-5847: one test function removed from a file that stays (removed-tests-*/<file>.before).
+    """One test function removed from a file that stays (removed-tests-*/<file>.before).
     A repaired-tests-* folder (changed assertions) is not covered: a re-run could change the verdict."""
     from test_adopt import ledger
     for slug in ("fn-s2", "edited-s2"):

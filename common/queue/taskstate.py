@@ -247,7 +247,7 @@ def read(slug, ctx):
     if hd and not hd[2]:
         if hd[0] == "KEEP":
             return done("kept", "deliver (after the owner's KEEP)")
-        return done("dropped", "nothing" if hd[0] == "DROP" else "repair by a person (owner said REPAIR)")
+        return done("dropped", "nothing" if hd[0] == "DROP" else "repair by a person (decision REPAIR)")
 
     if "build" in kinds:
         return done("building", "wait: build running")

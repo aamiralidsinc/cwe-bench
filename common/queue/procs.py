@@ -1,7 +1,7 @@
 """Processes and machine headroom, read without side effects.
 
-busy_tasks(): which tasks the OLD scripts are working on right now (regate.sh <slug>, regate_queue.py <list>,
-regate-regrade.sh <slug>, a one-off repair script that names the slug inside, ...). The queue leaves those tasks alone.
+busy_tasks(): which tasks other launchers are working on right now (regate.sh <slug>, regate_queue.py <list>,
+a repair script that names the slug inside, ...). The queue leaves those tasks alone.
 Our own workers carry CWEQ_JOB in their environment (inherited by every child) and are not counted.
 """
 import os
