@@ -7,20 +7,28 @@
   step 2  step2           sibling pool: every DeepSeek screen record (pipelines/stacking/out/screener-ds/) whose repo
                           stacking did NOT take (any registered batch, any stk- build) and that is not built already.
                           Writes pipelines/router/out/step2/screener/.
-  step 3  step3           sibling on solved stacked tasks: every task of a registered stacking batch that ANY model
-                          solved (ledger: a SOLVED cell; this includes single-model breakers, owner decision
-                          2026-10-25) is routed once: its repo's DeepSeek screen record goes to
-                          pipelines/router/out/step3/screener/ and its entry to step3/pipeline/selection_deepseek.json.
+  step 3  step3           solved stacked tasks join the GENERAL sibling pool: every task of a registered stacking batch
+                          that ANY model solved (ledger: a SOLVED cell; this includes single-model breakers) is routed
+                          once (step3/routed.tsv): its repo's DeepSeek screen record is copied into the general pool
+                          pipelines/router/out/step2/screener/ (and kept in step3/screener/ as the routing record).
+                          It is ranked with every other sibling candidate; it gets no lane or build of its own.
                           Re-run it whenever new stacked verdicts arrive (regenerate the ledger first).
+          pool            the general pool file for ranking: pipelines/router/out/step2/pipeline/pool.jsonl from
+                          step2/screener/, without repos already built as sibling tasks or already in a batch.
           status          what is where.
 
   python3 -I pipelines/router/route.py stacking-batch --name batch2 [--top N] [--min-score S] [--prepare]
   python3 -I pipelines/router/route.py step2
   python3 -I common/audit/audit_results.py >/dev/null && python3 -I pipelines/router/route.py step3
+  python3 -I pipelines/router/route.py pool
   python3 -I pipelines/router/route.py status
 
 What each step then runs is printed at the end (the stacking queue, or the sibling lane with LANE_RECS / LANE_PIPE /
-LANE_SUFFIX pointing at the router's folders). Task names: stacking stk-<repo>-<id>; step 2 <repo>-s2; step 3 <repo>-s3.
+LANE_SUFFIX pointing at the router's folders). Task names: stacking stk-<repo>-<id>; sibling <repo>-s2 (the general
+pool); <repo>-s3 for tasks prepared from the former step-3 lane.
+
+Standing rule (owner, 2026-10-27): solved stacked tasks go into the general sibling pool yet to be ranked, never into
+a separate prioritized lane, so a step-3 candidate is picked only where its score ranks it.
 """
 import argparse, csv, glob, importlib.util, json, os, re, shutil, subprocess, sys
 from pathlib import Path
@@ -33,6 +41,9 @@ SO = paths.STACKING_OUT
 OUT = ROOT / "pipelines" / "router" / "out"
 REG = OUT / "stacking_batches.txt"
 SCREENS = SO / "screener-ds"
+GENERAL = OUT / "step2" / "screener"          # the general sibling-injection pool, yet to be ranked
+ROUTED = OUT / "step3" / "screener"           # routing record of solved stacked tasks (also copied into GENERAL)
+BATCHES = OUT / "batches"
 
 
 def norm(repo):
@@ -51,6 +62,35 @@ def built_repos():
 
 def batches():
     return [l.strip() for l in REG.read_text().splitlines() if l.strip()] if REG.is_file() else []
+
+
+def batch_slugs():
+    """Every slug in a scale-run batch file (pipelines/router/out/batches/*.txt)."""
+    out = set()
+    for f in sorted(BATCHES.glob("*.txt")) if BATCHES.is_dir() else []:
+        for line in f.read_text().splitlines():
+            x = line.split("#")[0].strip()
+            if x:
+                out.add(x)
+    return out
+
+
+def lane_specs():
+    """{slug: entry_id} for the sibling slugs the router lanes prepared (step2/step3 pipeline/specs_deepseek)."""
+    out = {}
+    for st in ("step2", "step3"):
+        for f in sorted((OUT / st / "pipeline" / "specs_deepseek").glob("*.json")):
+            try:
+                out[f.stem] = str(json.loads(f.read_text()).get("entry_id") or "")
+            except Exception:
+                pass
+    return out
+
+
+def sibling_built(built=None):
+    """{repo} that already has a non-stacked task package (a sibling task was built for it)."""
+    built = built_repos() if built is None else built
+    return {repo for repo, slugs in built.items() if any(not x.startswith("stk-") for x in slugs)}
 
 
 def task_repo(slug):
@@ -168,11 +208,22 @@ def step2(a):
         if repo in built:
             skip_b += 1; continue
         shutil.copy2(f, d / f.name); n += 1
+    # Solved stacked tasks already routed (step 3) stay in the general pool: their repos are "taken by stacking"
+    # above, but a solved stacked task is a sibling candidate like any other (owner rule 2026-10-27).
+    sib = sibling_built(built); m = 0
+    for f in sorted(ROUTED.glob("*.json")) if ROUTED.is_dir() else []:
+        try:
+            repo = norm(json.loads(f.read_text()).get("repo"))
+        except Exception:
+            continue
+        if repo not in sib and not (d / f.name).exists():
+            shutil.copy2(f, d / f.name); m += 1
     (OUT / "step2" / "pipeline").mkdir(parents=True, exist_ok=True)
-    print(f"step 2 pool: {n} screened repos (excluded: {skip_s} taken by stacking, {skip_b} already built) -> {d.relative_to(ROOT)}")
+    print(f"step 2 pool: {n} screened repos + {m} solved stacked tasks (excluded: {skip_s} taken by stacking, "
+          f"{skip_b} already built) -> {d.relative_to(ROOT)}")
     env = f"LANE_RECS={d.relative_to(ROOT)} LANE_PIPE=pipelines/router/out/step2/pipeline LANE_SUFFIX=s2"
     print("next:\n"
-          f"  {env} python3 -I pipelines/sibling/4-select/lane.py pool\n"
+          f"  python3 -I pipelines/router/route.py pool\n"
           f"  {env} bash pipelines/sibling/4-select/select.sh deepseek\n"
           f"  {env} python3 -I pipelines/sibling/4-select/lane.py prepare deepseek\n"
           f"  then build the slugs in pipelines/router/out/step2/pipeline/slugs_deepseek.txt (pipelines/sibling/6-build/run_lane.sh)")
@@ -213,9 +264,11 @@ def screen_job_for(slug, job):
 
 
 def step3(a):
+    """Route every newly solved stacked task's repo screen record into the general sibling pool (once per task,
+    one per repo). No lane, no selection, no BUILD-PROMPT: the general ranking decides if and when it is built."""
     led = solved_cells()
     by_repo = screens_by_repo()
-    own = OUT / "step3" / "screens"            # DeepSeek screens made for step 3 (see --screen-missing)
+    own = OUT / "step3" / "screens"            # DeepSeek screens made for solved stacked repos that had none
     if own.is_dir():
         for f in sorted(own.glob("*.json")):
             if f.name.startswith(("_", ".")) or f.name.endswith(".run.json"):
@@ -226,20 +279,23 @@ def step3(a):
                 pass
     built = built_repos()
     missing = []
-    d = OUT / "step3"; (d / "screener").mkdir(parents=True, exist_ok=True); (d / "pipeline").mkdir(parents=True, exist_ok=True)
+    d = OUT / "step3"; ROUTED.mkdir(parents=True, exist_ok=True); GENERAL.mkdir(parents=True, exist_ok=True)
     state = d / "routed.tsv"
     done = {l.split("\t")[0] for l in state.read_text().splitlines()[1:]} if state.is_file() else set()
-    sel_p = d / "pipeline" / "selection_deepseek.json"
-    sel = json.loads(sel_p.read_text()) if sel_p.is_file() else []
+    routed_repos = set()
+    for f in ROUTED.glob("*.json"):
+        try:
+            routed_repos.add(norm(json.loads(f.read_text()).get("repo")))
+        except Exception:
+            pass
     new = []
-    routed_repos = {norm(x.get("repo", "")) for x in sel if x.get("repo")}
     for b in batches():
         for r in batch_rows(b):
             slug = r["slug"]
             if slug in done or slug not in led:
                 continue
             if norm(r["repo"]) in routed_repos:
-                continue                                  # one sibling task per repo
+                continue                                  # one sibling candidate per repo
             ds, mm, verdict = led[slug]
             if not (ds or mm):
                 continue
@@ -253,22 +309,20 @@ def step3(a):
                 if j:
                     missing.append(screen_job_for(slug, j))
                 print(f"  {slug}: solved, but {r['repo']} has no DeepSeek screen yet; "
-                      + ("screen job written (--screen-missing)" if j else "no reader job found; not routed"))
+                      + ("screen job written" if j else "no reader job found; not routed"))
                 continue
             rec = json.loads(f.read_text())
             eid = str(rec.get("entry_id") or f.stem)
-            shutil.copy2(f, d / "screener" / f"{eid}.json")
-            sel.append({"entry_id": eid, "repo": norm(r["repo"]), "source": "step3", "from_stacked": slug,
-                        "why": verdict})
+            shutil.copy2(f, ROUTED / f"{eid}.json")
+            shutil.copy2(f, GENERAL / f"{eid}.json")
             routed_repos.add(norm(r["repo"]))
             new.append((slug, eid, verdict))
-    sel_p.write_text(json.dumps(sel, indent=1))
     if not state.is_file():
         state.write_text("slug\tentry_id\tverdict\n")
     with open(state, "a") as f:
-        for s, e, v in new:
-            f.write(f"{s}\t{e}\t{v}\n")
-    print(f"step 3: {len(new)} newly routed ({len(done)} earlier); selection has {len(sel)} entries -> {sel_p.relative_to(ROOT)}")
+        for s_, e, v in new:
+            f.write(f"{s_}\t{e}\t{v}\n")
+    print(f"step 3: {len(new)} newly routed into the general pool ({len(done)} earlier) -> {GENERAL.relative_to(ROOT)}")
     if missing:
         jf = d / "screen_jobs.jsonl"
         jf.write_text("".join(json.dumps(j) + "\n" for j in {j["repo"]: j for j in missing}.values()))
@@ -276,10 +330,62 @@ def step3(a):
               f"  common/launch/drive.sh deepseek bash -c 'CLAUDE_BIN=$HOME/.local/bin/claude python3 -I "
               f"common/screener/run_screener.py --run --parallel 70 --model \"$MODEL\" --outdir "
               f"{(d / 'screens').relative_to(ROOT)} --jobs-file {jf.relative_to(ROOT)}'\n  then run step3 again")
-    env = "LANE_RECS=pipelines/router/out/step3/screener LANE_PIPE=pipelines/router/out/step3/pipeline LANE_SUFFIX=s3"
     if new:
-        print(f"next:\n  {env} python3 -I pipelines/sibling/4-select/lane.py prepare deepseek\n"
-              "  then build the slugs in pipelines/router/out/step3/pipeline/slugs_deepseek.txt")
+        print("next: python3 -I pipelines/router/route.py pool   (then rank the general pool)")
+
+
+def pool(a):
+    """Regenerate the general pool file (pipelines/router/out/step2/pipeline/pool.jsonl) from step2/screener/,
+    without repos already built as sibling tasks or already in a batch. No selection is run."""
+    pipe = OUT / "step2" / "pipeline"
+    pipe.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, LANE_RECS=str(GENERAL), LANE_PIPE=str(pipe), LANE_SUFFIX="s2")
+    r = subprocess.run([sys.executable, "-I", str(ROOT / "pipelines/sibling/4-select/lane.py"), "pool"],
+                       cwd=ROOT, env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("lane.py pool failed: " + (r.stderr or r.stdout)[-400:])
+    out = pipe / "pool.jsonl"
+    rows = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
+    sib = sibling_built()
+    specs = lane_specs()
+    in_batch = batch_slugs()
+    batched_ids = {eid for slug, eid in specs.items() if slug in in_batch and eid}
+    batched_repos = set()
+    for st in ("step2", "step3"):
+        for f in (OUT / st / "screener").glob("*.json"):
+            try:
+                rec = json.loads(f.read_text())
+            except Exception:
+                continue
+            if str(rec.get("entry_id") or f.stem) in batched_ids:
+                batched_repos.add(norm(rec.get("repo")))
+    solved_repos = set()
+    for f in ROUTED.glob("*.json") if ROUTED.is_dir() else []:
+        try:
+            solved_repos.add(norm(json.loads(f.read_text()).get("repo")))
+        except Exception:
+            pass
+    keep, excluded = [], []
+    for x in rows:
+        repo, eid = norm(x.get("repo")), str(x.get("entry_id"))
+        if repo in sib:
+            excluded.append((eid, repo, "built: the repo already has a sibling task"))
+        elif eid in batched_ids or repo in batched_repos:
+            excluded.append((eid, repo, "in a batch: prepared and queued already"))
+        else:
+            x["source"] = "solved stacked task" if repo in solved_repos else "step-2 screen"
+            keep.append(x)
+    out.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in keep))
+    with open(pipe / "pool_excluded.tsv", "w") as f:
+        f.write("entry_id\trepo\twhy\n")
+        for e in excluded:
+            f.write("\t".join(e) + "\n")
+    from collections import Counter
+    src = Counter(x["source"] for x in keep)
+    why = Counter(w for _e, _r, w in excluded)
+    print(f"general pool: {len(keep)} candidates ({src.get('solved stacked task', 0)} from solved stacked tasks, "
+          f"{src.get('step-2 screen', 0)} from step-2 screens); excluded {len(excluded)}: "
+          + "; ".join(f"{n} {w}" for w, n in why.most_common()) + f" -> {out.relative_to(ROOT)}")
 
 
 def status(a):
@@ -288,9 +394,9 @@ def status(a):
         rows = batch_rows(b)
         snd = sum((ROOT / "build" / r["slug"] / ".sound").exists() for r in rows)
         print(f"  {b}: {len(rows)} tasks, {snd} sound")
-    for st in ("step2", "step3"):
+    for st, what in (("step2", "general sibling pool"), ("step3", "routed solved stacked tasks (history)")):
         d = OUT / st / "screener"
-        print(f"{st}: {len(list(d.glob('*.json'))) if d.is_dir() else 0} screen records in the pool")
+        print(f"{st}: {len(list(d.glob('*.json'))) if d.is_dir() else 0} screen records ({what})")
 
 
 def main():
@@ -300,9 +406,9 @@ def main():
     s.add_argument("--top", type=int, default=0); s.add_argument("--min-score", type=float, default=0.0)
     s.add_argument("--prepare", action="store_true")
     s.add_argument("--count", action="store_true", help="only print how many tasks the batch would hold")
-    sub.add_parser("step2"); sub.add_parser("step3"); sub.add_parser("status")
+    sub.add_parser("step2"); sub.add_parser("step3"); sub.add_parser("pool"); sub.add_parser("status")
     a = ap.parse_args()
-    {"stacking-batch": stacking_batch, "step2": step2, "step3": step3, "status": status}[a.cmd](a)
+    {"stacking-batch": stacking_batch, "step2": step2, "step3": step3, "pool": pool, "status": status}[a.cmd](a)
 
 
 if __name__ == "__main__":

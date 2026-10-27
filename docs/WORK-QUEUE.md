@@ -155,7 +155,7 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 | `audit_record` | An auditor's `verdict.json` is not recorded yet, or a trial result is newer than the ledger | `postmortem.py record-ready`, then `audit_results.py` |
 | `fairness` | The ledger marks a batch task a BREAKER candidate, and no review is current or running. Never while held or busy | the stacking or sibling fairness review |
 | `cleanup` | Every UTC hour | `common/util/hourly_cleanup.sh once` |
-| `step3` | Every UTC half hour | the router's periodic step |
+| `step3` | Every UTC half hour | the router's step 3: routes stacked tasks any model solved into the general sibling pool and refreshes the pool file; never prepares or selects |
 
 - **Audit list.** Every pass rewrites `pipelines/router/out/queue/audit_ready.txt` with the prepared folders waiting
   for an auditor. The audit itself is an independent reviewer's job; the queue prepares and records.

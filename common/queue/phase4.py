@@ -24,8 +24,9 @@ They replace pipelines/router/auto_advance.sh (run on every heartbeat) and the s
   C1 cleanup       one job per UTC hour: `common/util/hourly_cleanup.sh once` (never two at once; it runs in its own
                    worker, so its long dangling-image removal holds no other kind's slot). Not while the old
                    `hourly_cleanup.sh loop` still runs. A queued job of an earlier hour is superseded.
-  S3 step3         one job per UTC half hour: router step 3 (route stacked tasks any model solved, prepare their
-                   sibling builds), the same commands as auto_advance step 3.
+  S3 step3         one job per UTC half hour: router step 3 routes stacked tasks any model solved into the general
+                   sibling pool (pipelines/router/out/step2/screener) and refreshes the pool file when something
+                   new was routed. It never prepares or selects: the general ranking decides what is built.
 
 Job kinds without a task use pseudo tasks: _ledger (audit_record), _machine (cleanup), _router (step3).
 """
@@ -48,12 +49,14 @@ JOB_RE = re.compile(r"^(?P<task>.+?)-(?P<model>deepseek|mimo)-r[0-9]+-")
 READY_FILE = Path("pipelines/router/out/queue/audit_ready.txt")
 FAIRNESS_SCRIPT = {"stk": "pipelines/stacking/7-fairness/run_fairness_stack.sh",
                    "sibling": "pipelines/sibling/9-fairness/run_fairness.sh"}
+# Step 3 routes solved stacked tasks into the general sibling pool and refreshes the pool file; it never prepares
+# or selects (owner rule 2026-10-27: they are ranked with every other sibling candidate).
 STEP3_SH = (
     'L=pipelines/router/out/queue/auto_advance.log; '
-    'python3 -I pipelines/router/route.py step3 2>&1 | grep -E "^step 3|wait for a screen" >> $L; '
-    'if grep -q "newly routed" $L 2>/dev/null && [ -s pipelines/router/out/step3/pipeline/selection_deepseek.json ]; '
-    'then LANE_RECS=pipelines/router/out/step3/screener LANE_PIPE=pipelines/router/out/step3/pipeline '
-    'LANE_SUFFIX=s3 python3 -I pipelines/sibling/4-select/lane.py prepare deepseek > /dev/null 2>&1; fi; true')
+    'O=$(python3 -I pipelines/router/route.py step3 2>&1); '
+    'echo "$O" | grep -E "^step 3|wait for a screen" >> $L; '
+    'if echo "$O" | grep -qE "^step 3: [1-9][0-9]* newly routed"; '
+    'then python3 -I pipelines/router/route.py pool 2>&1 | grep -E "^general pool" >> $L; fi; true')
 
 
 def _json(p):
