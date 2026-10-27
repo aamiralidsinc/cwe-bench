@@ -50,6 +50,8 @@ def prepare(driver):
         r = json.load(open(rp))
         repo = r.get("repo", "")
         slug = f"{repo.split('/')[-1].lower().replace('_', '-')}-{suffix}"
+        if slug in slugs:                       # two picks from one repo map to one slug: keep the higher-ranked
+            print(f"skip (same repo as an earlier pick, {slug}):", eid); continue
         if os.path.exists(os.path.join(ROOT, "build", slug)):
             # With a router suffix (s2/s3) the slug is unique to this lane, so an existing BUILD-PROMPT is this
             # lane's own earlier prepare: keep it in the list (a re-run must not drop it from slugs_<driver>.txt).
