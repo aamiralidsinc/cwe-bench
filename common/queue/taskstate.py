@@ -38,7 +38,8 @@ STAGES = (
     "outside_batches",    # built before the scale batches (older markers), no verdict in the ledger: never scheduled
     "waiting_build",      # listed in a batch, no build started
     "building",           # a build process is running
-    "build_interrupted",  # a build started, did not end, and nothing is running it
+    "build_interrupted",  # a build started, did not end, and nothing is running it; or its builder was paused
+                          # (SIGSTOP) and cut by its overdue timer on resume (markers.build_paused): resumable
     "build_stopped",      # the build ended without a gate verdict (STOP, BUILD-INCOMPLETE, a builder decline)
     "gate_failed",        # .unsound / .gate_error: no trials
     "listing_fail",       # held at the listing check (stacking): a person decides
@@ -118,6 +119,7 @@ SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 PROC_RULES = (   # (kind, regex over the joined command line; group 1 = slug, optional group 2 = model)
     ("build", re.compile(r"run_stack_pipeline\.sh (\S+)$")),
     ("build", re.compile(r"run_pipeline\.sh \S+ (\S+)$")),
+    ("build", re.compile(r"resume_pipeline\.sh (\S+) build\b")),
     ("regate", re.compile(r"regate\.sh (\S+)(?: |$)")),
     ("trial", re.compile(r"trial\.py (\S+) --models (\w+)")),
     ("fairness", re.compile(r"run_fairness(?:_stack)?\.sh (\S+)(?: |$)")),
@@ -265,6 +267,10 @@ def read(slug, ctx):
             return done("gate_failed", "nothing")
         if ".gate_passed" in t["markers"]:
             return done("stale_gate", "regate (the last re-gate stopped before its result)")
+        if markers.build_paused(b):                       # exit 124 long after the limit: paused, not timed out
+            t["paused_build"] = True
+            return done("build_interrupted", "build_resume (the builder was paused and cut by its overdue timer; "
+                                             "resume its session)")
         return done("build_stopped", "nothing")
     t["fp"] = fp_state(slug)
     if t["fp"] == "stale":

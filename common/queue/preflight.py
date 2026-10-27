@@ -21,6 +21,8 @@ Checks:
   versions          harbor, uv and Docker versions (information)
   headroom          free disk, memory and /tmp inodes against the queue's admission limits        CRITICAL when over
   queue_loops       the reconcile and monitor loops are running (information for an operator)
+  frozen_processes  no builder, gate or trial is stopped by SIGSTOP (frozen.py); its timers keep running and fire
+                    on resume                                                                  CRITICAL if any
 """
 import glob
 import json
@@ -36,6 +38,11 @@ import procs  # noqa: E402
 from taskstate import paths  # noqa: E402
 
 OK, NEEDS, CRITICAL = "OK", "NEEDS APPLYING", "CRITICAL"
+
+
+def _frozen_scan():
+    import frozen
+    return frozen.scan()
 GATE_KEYS = ("GATE_TASK_SLOTS", "GATE_GLOBAL_SLOTS", "DISK_MIN_FREE_GB_GATE", "DISK_MIN_FREE_GB_TRIAL",
              "DISK_MIN_FREE_GB_BUILD")
 DEFAULTS = {
@@ -234,7 +241,16 @@ def check_queue_loops(s, proc_list):
     return OK, "reconcile, dispatch and monitor running", None
 
 
-def run_all(cfg, runner=run, proc_list=None):
+def check_frozen(scanner):
+    fz = scanner()
+    if fz:
+        names = ", ".join(sorted({f"{p.get('task') or '?'} (pid {p['pid']})" for p in fz}))[:300]
+        return CRITICAL, f"{len(fz)} pipeline process(es) stopped by SIGSTOP: {names}", \
+            "resume them (kill -CONT) or stop them; to pause, stop new starts (queue enabled = false), never freeze"
+    return OK, "no builder, gate or trial is stopped", None
+
+
+def run_all(cfg, runner=run, proc_list=None, frozen_scan=None):
     """[(name, status, detail, fix)]."""
     s = settings(cfg)
     plist = procs.list_processes() if proc_list is None else proc_list
@@ -247,7 +263,8 @@ def run_all(cfg, runner=run, proc_list=None):
               ("model_keys", lambda: check_model_keys(s)),
               ("versions", lambda: check_versions(s, runner)),
               ("headroom", lambda: check_headroom(s, cfg)),
-              ("queue_loops", lambda: check_queue_loops(s, plist))]
+              ("queue_loops", lambda: check_queue_loops(s, plist)),
+              ("frozen_processes", lambda: check_frozen(frozen_scan or _frozen_scan))]
     out = []
     for name, fn in checks:
         try:

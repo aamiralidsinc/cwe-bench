@@ -10,14 +10,52 @@ such output anyway: backstage-ds wired a quota-cut agent's half patch in as a mu
 complete result text, its error list, terminal reason, turns, duration, cost, permission
 denials, and the tail of its stderr (<same name>.err). The printed line is a summary that names
 that file; until 2026-10-21 it kept only the first 160 characters and nothing else.
+
+Exit 124 from a run that lasted far longer than its limit is not a timeout: the process was paused (SIGSTOP) and its
+overdue timer fired when it resumed (2026-10-27: sixteen builders frozen for hours during a disk emergency were all cut
+at the same second on resume). When the wall time between the run's start (start_utc.txt, or resume_start_utc.txt for
+a resumed build, next to the output file) and end_utc.txt exceeds BUILD_TIMEOUT (default 18000 s) by more than 25 %, the
+status is `error: interrupted (timer fired late: process was paused ...)` and details carry `paused_interrupt: true`,
+`wall_sec` and `limit_sec`. Such a build is resumable (taskstate stage build_interrupted; queue kind build_resume).
 """
 import json
+import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 CUT = re.compile(r"^\s*(You've hit your|API Error: ?\d{3}|Credit balance is too low)|overloaded_error", re.I)
 STDERR_TAIL = 100_000
+
+
+LATE_FACTOR = 1.25
+
+
+def _utc(path):
+    try:
+        return datetime.fromisoformat(Path(path).read_text().strip().replace("Z", "+00:00")).timestamp()
+    except (OSError, ValueError):
+        return None
+
+
+def wall_time(run_dir):
+    """Seconds between the run's start (the later of start_utc.txt and resume_start_utc.txt) and end_utc.txt."""
+    d = Path(run_dir)
+    starts = [t for t in (_utc(d / "start_utc.txt"), _utc(d / "resume_start_utc.txt")) if t is not None]
+    end = _utc(d / "end_utc.txt")
+    if not starts or end is None:
+        return None
+    start = max(starts)
+    return end - start if end >= start else None
+
+
+def paused_interrupt(run_dir, rc, limit=None):
+    """(True, wall, limit) when exit 124 came long after the limit: the timer fired late because the process was
+    paused. (False, wall, limit) otherwise."""
+    limit = float(limit if limit is not None else os.environ.get("BUILD_TIMEOUT") or 18000)
+    wall = wall_time(run_dir)
+    return (rc == 124 and wall is not None and wall > LATE_FACTOR * limit), wall, limit
 
 
 def one_line(text, n=300):
@@ -36,6 +74,11 @@ def inspect(path, rc):
     except OSError as e:
         details["stderr_tail"] = f"(unreadable: {type(e).__name__}: {e})"
     if rc == 124:
+        late, wall, limit = paused_interrupt(p.parent, rc)
+        details.update({"wall_sec": wall, "limit_sec": limit, "paused_interrupt": late})
+        if late:
+            return (f"error: interrupted (timer fired late: process was paused; ran {round(wall / 60)} min against a "
+                    f"{round(limit / 60)} min limit)"), details
         return "error: agent timed out (exit 124)", details
     try:
         raw = p.read_text(errors="replace")
