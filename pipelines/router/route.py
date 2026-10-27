@@ -373,15 +373,20 @@ def pool(a):
         elif eid in batched_ids or repo in batched_repos:
             excluded.append((eid, repo, "in a batch: prepared and queued already"))
         else:
-            x["source"] = "solved stacked task" if repo in solved_repos else "step-2 screen"
-            keep.append(x)
-    out.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in keep))
+            keep.append((x, "solved stacked task" if repo in solved_repos else "step-2 screen"))
+    # The pool file stays neutral (the ranking must not see where a candidate came from); the origin goes to a
+    # side file for reporting.
+    out.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x, _src in keep))
+    with open(pipe / "pool_sources.tsv", "w") as f:
+        f.write("entry_id\trepo\tsource\n")
+        for x, src in keep:
+            f.write(f"{x.get('entry_id')}\t{norm(x.get('repo'))}\t{src}\n")
     with open(pipe / "pool_excluded.tsv", "w") as f:
         f.write("entry_id\trepo\twhy\n")
         for e in excluded:
             f.write("\t".join(e) + "\n")
     from collections import Counter
-    src = Counter(x["source"] for x in keep)
+    src = Counter(src for _x, src in keep)
     why = Counter(w for _e, _r, w in excluded)
     print(f"general pool: {len(keep)} candidates ({src.get('solved stacked task', 0)} from solved stacked tasks, "
           f"{src.get('step-2 screen', 0)} from step-2 screens); excluded {len(excluded)}: "
