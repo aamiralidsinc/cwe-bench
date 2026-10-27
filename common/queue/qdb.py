@@ -11,7 +11,8 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-KINDS = ("build", "gate", "regate", "trial_run", "regrade", "rescore", "audit_prep", "fairness", "cleanup")
+KINDS = ("build", "gate", "regate", "trial_run", "regrade", "rescore", "audit_prep", "audit_record", "fairness",
+         "cleanup", "step3")
 STATES = ("queued", "leased", "running", "done", "failed", "blocked")
 ACTIVE = ("leased", "running")
 
@@ -94,7 +95,26 @@ def connect(path):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
+
+
+def migrate(conn):
+    """Bring an older jobs table up to the current kind list. SQLite cannot change a CHECK constraint, so the table
+    is rebuilt in one transaction (ids, the AUTOINCREMENT sequence and every row are kept). Run with the queue loops
+    stopped (deploy step); a no-op when the table already accepts every kind."""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
+    if row is None or all(f"'{k}'" in row[0] for k in KINDS):
+        return False
+    ddl = SCHEMA.split("CREATE TABLE IF NOT EXISTS jobs", 1)[1].split(");", 1)[0] + ");"
+    with tx(conn):
+        conn.execute("CREATE TABLE jobs_new" + ddl)
+        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state)")
+        conn.execute("CREATE INDEX IF NOT EXISTS jobs_task ON jobs (task)")
+    return True
 
 
 class tx:

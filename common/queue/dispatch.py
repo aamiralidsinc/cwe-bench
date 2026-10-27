@@ -57,8 +57,8 @@ def held(task, kind, args):
     return None
 
 
-EXCLUSIVE = ("build", "gate", "regate", "regrade", "rescore")   # one at a time per task, alone on the task
-FOREIGN_KIND = {"build": "build", "trial": "trial_run", "regate": "regate"}   # old-script processes -> job kind
+EXCLUSIVE = ("build", "gate", "regate", "regrade", "rescore", "fairness")   # one at a time per task, alone on the task
+FOREIGN_KIND = {"build": "build", "trial": "trial_run", "regate": "regate", "fairness": "fairness"}   # old-script processes -> job kind
 
 
 def spacing(v):
@@ -131,12 +131,13 @@ class Dispatcher:
                         key=lambda r: (-effective_priority(r, now, d["aging_per_hour"]), r["id"]))
         active = qdb.jobs(self.conn, "state IN ('leased','running')")
         per_kind, per_task, excl_task = {}, {}, set()
+        light = set(d.get("light_kinds", ()))             # bookkeeping kinds: outside the total and the machine limits
         for r in active:
             per_kind[r["kind"]] = per_kind.get(r["kind"], 0) + 1
             per_task[r["task"]] = per_task.get(r["task"], 0) + 1
             if r["kind"] in EXCLUSIVE:
                 excl_task.add(r["task"])
-        total = len(active)
+        total = sum(1 for r in active if r["kind"] not in light)
         # The old scripts' builds and trials hold slots too (cutover: the queue and the schedulers never exceed the
         # caps together). Their processes, without the queue's own workers.
         plist = procs.list_processes() if self.proc_list is None else self.proc_list
@@ -187,12 +188,12 @@ class Dispatcher:
                 why = f"{d['max_running_per_task']} jobs of this task are running"
             elif per_kind.get(k, 0) >= maxk.get(k, 0):
                 why = f"{k} at its limit ({maxk.get(k, 0)} running{', old scripts included' if foreign.get(k) else ''})"
-            elif total >= d["max_running_total"]:
+            elif total >= d["max_running_total"] and k not in light:
                 why = f"total at its limit ({d['max_running_total']} running)"
             elif k == "trial_run" and per_kind.get("build", 0) + queued_builds >= d["trials_wait_builds"]:
                 why = (f"builds first: {per_kind.get('build', 0)} running + {queued_builds} queued >= "
                        f"{d['trials_wait_builds']}")
-            elif limits:
+            elif limits and k not in light:              # cleanup must run exactly when the disk is short
                 why = "admission closed: " + "; ".join(limits)
             elif cfg["limits"].get("disk_floor", {}).get(k) and not self.disk_ok(cfg["limits"]["disk_floor"][k]):
                 why = f"disk below its {k} floor ({cfg['limits']['disk_floor'][k]}, common/util/diskguard.py)"
@@ -202,7 +203,7 @@ class Dispatcher:
                 why = None
                 per_kind[k] = per_kind.get(k, 0) + 1
                 per_task[t] = per_task.get(t, 0) + 1
-                total += 1
+                total += 0 if k in light else 1
             (starts if why is None else waits).append((r, why))
         return starts, waits
 

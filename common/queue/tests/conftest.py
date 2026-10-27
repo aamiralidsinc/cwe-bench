@@ -47,8 +47,10 @@ def write_config(tmp_path, root, extra=""):
 
 @pytest.fixture
 def cfg(tmp_path, root):
-    return write_config(tmp_path, root, "[dispatch]\nstart_spacing_sec = 0\nfill_spacing_sec = 0\n"
-                                        "max_starts_per_tick = 50\n")
+    c = write_config(tmp_path, root, "[dispatch]\nstart_spacing_sec = 0\nfill_spacing_sec = 0\n"
+                                     "max_starts_per_tick = 50\n")
+    c["phase4"]["enabled"] = False                     # phase-4 rules are tested on their own (test_phase4.py)
+    return c
 
 
 @pytest.fixture

@@ -99,14 +99,26 @@ for bf in sorted(glob.glob("pipelines/router/out/batches/*.txt")):
 
 pend = sh("python3 common/audit/postmortem.py pending 2>/dev/null | wc -l")
 qs = []
+# The work queue (common/queue/, docs/WORK-QUEUE.md) launches every step since the drain handover (2026-10-27).
+try:
+    sys.path.insert(0, os.path.join(ROOT, "common", "queue"))
+    import config as _qconfig, qdb as _qdb, cweq as _cweq  # noqa: E402
+    _qcfg = _qconfig.load()
+    if os.path.exists(_qcfg["db"]):
+        qs.append(_cweq.queue_line(_qdb.connect(_qcfg["db"])))
+except Exception as e:  # reported, never hidden
+    qs.append(f"work queue: unreadable ({type(e).__name__}: {str(e)[:120]})")
+# Old batch schedulers still starting work (no <batch>.drain file, process alive).
 for f in sorted(glob.glob("pipelines/router/out/queue/*.state.json")):
     try:
         st = json.load(open(f))
-        qs.append(f"{st['batch']}: builds {st['builds_running']} running + {st['builds_waiting']} waiting, trials {st['trials_running']}")
+        if os.path.exists(f"pipelines/router/out/queue/{st['batch']}.drain") or \
+                f"scale_queue.py run --batch pipelines/router/out/batches/{st['batch']}.txt" not in running:
+            continue
+        qs.append(f"{st['batch']} (old scheduler): builds {st['builds_running']} running + {st['builds_waiting']} waiting, trials {st['trials_running']}")
     except Exception:
         pass
-rg = sh("grep -c '\\[start\\]' pipelines/router/out/queue/regate-b1.log"), sh("grep -c '\\[finish\\]' pipelines/router/out/queue/regate-b1.log")
-out.append(f"== queues: {' | '.join(qs)} | re-gate queue started {rg[0]}, finished {rg[1]} | failing runs awaiting audit: {pend}")
+out.append(f"== queues: {' | '.join(qs)} | failing runs awaiting audit: {pend}")
 load = open("/proc/loadavg").read().split()[0]
 disk = sh("df -BG / | tail -1 | awk '{print $4}'")
 n_harbor = sh("pgrep -fc 'harbor run'")

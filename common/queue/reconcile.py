@@ -310,4 +310,7 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
         import taskstate
         ctx = taskstate.context(procs.list_processes() if proc_list is None else proc_list)
         out += phase3.reconcile(conn, cfg, ctx, dry_run=dry_run)
+        import phase4
+        plist = procs.list_processes() if proc_list is None else proc_list
+        out += phase4.reconcile(conn, cfg, ctx, plist, dry_run=dry_run)
     return out

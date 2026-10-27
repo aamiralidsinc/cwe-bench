@@ -1,4 +1,4 @@
-# Work queue (phases 1 and 3, adoption)
+# Work queue (phases 1, 3 and 4, adoption)
 
 Code: `common/queue/`. CLI: `python3 common/queue/cweq.py`. Settings: `common/queue/queue.toml`.
 Tests: `python3 -m pytest common/queue/tests` (Python 3.11 or newer, for `tomllib`).
@@ -267,11 +267,53 @@ setsid nohup python3 common/queue/cweq.py dispatch  >> ~/.tb-graders/cwe/queue-l
 - **One job:** `cweq block <id>`. The worker stops the script at its next lease refresh.
 - **Remove it:** delete `queue.db`. Nothing else depends on it, and the old scripts keep working as before.
 
+## Phase 4: audits, fairness, cleanup and router step 3 (replaces auto_advance.sh and the cleanup loop)
+
+Rules in `common/queue/phase4.py`, run in the same reconcile pass after phase 3. Same commands and selections as
+`pipelines/router/auto_advance.sh` (run on every heartbeat) and `common/util/hourly_cleanup.sh loop`, with the
+skips marked "new".
+
+| Kind | When | Command | Key |
+|---|---|---|---|
+| `audit_prep` | a run in `build/audit/awaiting_audit.tsv`. Skip: task "rejected (both solved)". New skips: task held (`.hold-repair`) or busy with a re-gate/repair; the run's model already SOLVED the task in the ledger. Not again while a folder prepared for the current grading waits for its auditor; again when a regrade came after the folder | `python3 common/audit/postmortem.py prepare <trial>` | trial + grading |
+| `audit_record` | an auditor's `verdict.json` not recorded yet, or a trial result / regrade newer than the ledger | `postmortem.py record-ready && audit_results.py` | newest input mtime |
+| `fairness` | a batch task the ledger marks BREAKER candidate, no `FAIRNESS.md` newer than its newest trial job folder, no review running. New: not while held or busy | `common/launch/drive.sh deepseek bash <run_fairness.sh or run_fairness_stack.sh> <slug> > build/<slug>/fairness.nohup` | newest trial job folder |
+| `cleanup` | every UTC hour, unless the old `hourly_cleanup.sh loop` still runs | `bash common/util/hourly_cleanup.sh once` | hour |
+| `step3` | every UTC half hour | router step 3 and the s3 lane prepare, as auto_advance step 3 | half hour |
+
+- **audit_ready.txt.** Every reconcile pass rewrites `pipelines/router/out/queue/audit_ready.txt` with the prepared
+  folders waiting for an auditor. The audits themselves stay with the orchestrator's Opus sub-agents (no CLI audits).
+- **Light kinds.** `audit_prep`, `audit_record`, `cleanup` and `step3` are bookkeeping: they are outside
+  `max_running_total` and the machine limits, so the cleanup runs exactly when the disk is short. Each still has its
+  own cap (cleanup 1, so never two at once). The cleanup's long dangling-image removal holds only the cleanup slot.
+- **Fairness slots.** At most 3 reviews at once; reviews the old scripts started count too.
+- **Pseudo tasks.** `audit_record` runs as task `_ledger`, `cleanup` as `_machine`, `step3` as `_router`.
+- **Switches.** `[phase4]` in `queue.toml`: `audits`, `fairness`, `cleanup`, `step3`, or `enabled = false` for all.
+- **Schema.** The two new kinds need a wider `kind` CHECK; `qdb.connect()` rebuilds an older `jobs` table once
+  (ids and rows kept). Run that first connect with the queue loops stopped (deploy step 2).
+- **Status line.** `pipelines/router/status_report.py` reads the queue (`cweq.queue_line`): per kind, the queue's
+  running jobs, old-script work still running, and queued jobs. Old schedulers appear only while they still start
+  work (no `.drain` file).
+
+### Deploying phase 4
+
+1. Stop the heartbeat's call to `pipelines/router/auto_advance.sh` (the orchestrator's monitor command).
+2. Stop the queue loops (`cweq.py reconcile`, `cweq.py dispatch`).
+3. Stop the old cleanup loop: `kill $(cat build/audit/hourly_cleanup.pid)` (a pass in progress finishes its current
+   docker command; the queue's first cleanup job waits until no loop runs).
+4. Install `common/queue/`, `pipelines/router/status_report.py` and this document.
+5. `python3 -I common/queue/cweq.py adopt` (also migrates the table), then
+   `python3 -I common/queue/cweq.py dispatch --dry-run --with-reconcile` and check the phase-4 lines.
+6. Start the loops again (`setsid nohup python3 -I -u common/queue/cweq.py reconcile|dispatch ...`).
+7. Check within a minute: `cweq status` shows `audit_record`/`step3` done or running and no failures.
+
+Rollback: set `[phase4] enabled = false` (or one switch), restart the loops, put the `auto_advance.sh` call back in
+the heartbeat and start `setsid nohup bash common/util/hourly_cleanup.sh loop &`.
+
 ## Later phases
 
 - **Phase 2: regrades chained into the rest.** After the last regrade of a task, queue the audit work. That means
   `audit_prep` for failing runs whose reward changed (the orchestrator's rule 5.4 step 4) and a ledger rebuild.
   Optionally release `.hold-repair` once every regrade is in, if the owner approves releasing automatically.
-- **Phase 4: audits and fairness.** For each failing run without a current postmortem: `audit_prep`, then the audit.
-  After 3 of 3 failures: `fairness` (the decision of 2026-10-19). `cleanup` jobs come from the janitor's approved
-  reports.
+- **Next:** the audit itself as a queue event for the orchestrator (an event table, FIFO), the resource monitor,
+  labels on every process and container, and versioned releases (docs/ARCHITECTURE-ROADMAP.md).

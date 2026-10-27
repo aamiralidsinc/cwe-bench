@@ -114,6 +114,31 @@ def cmd_dispatch(conn, cfg, a):
         time.sleep(cfg["dispatch"]["tick_sec"])
 
 
+def queue_line(conn, proc_list=None):
+    """One line for the heartbeat (pipelines/router/status_report.py): per kind, the queue's running jobs (+ old-script
+    work still running, drain) and queued jobs; blocked jobs need a person."""
+    counts = {}
+    for r in conn.execute("SELECT kind, state, COUNT(*) n FROM jobs GROUP BY kind, state"):
+        counts.setdefault(r["kind"], {})[r["state"]] = r["n"]
+    ctx = taskstate.context(procs.list_processes() if proc_list is None else proc_list, ignore_own=True)
+    old = {}
+    for runs in ctx["running"].values():
+        for kind, _m, _p in runs:
+            k = dispatch.FOREIGN_KIND.get(kind)
+            if k:
+                old[k] = old.get(k, 0) + 1
+    parts = []
+    for k in ("build", "trial_run", "regate", "regrade", "rescore", "fairness", "audit_prep", "audit_record",
+              "cleanup"):
+        c = counts.get(k, {})
+        run = c.get("running", 0) + c.get("leased", 0)
+        q, o = c.get("queued", 0), old.get(k, 0)
+        if run or q or o:
+            parts.append(f"{k} {run}{f' (+{o} old)' if o else ''} running, {q} queued")
+    blocked = sum(c.get("blocked", 0) for c in counts.values())
+    return "work queue: " + ("; ".join(parts) or "idle") + (f" | {blocked} blocked (a person looks)" if blocked else "")
+
+
 def cmd_status(conn, cfg, a):
     rows = qdb.jobs(conn)
     counts = {}

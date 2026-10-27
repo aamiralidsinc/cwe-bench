@@ -71,9 +71,9 @@ def test_per_task_and_total_limits(tmp_path, root):
 
 
 def test_kind_without_worker_never_starts(conn, cfg):
-    qdb.enqueue(conn, "fairness", "a")                 # audits and fairness move into the queue in phase 4
+    qdb.enqueue(conn, "gate", "a")                     # `gate` has no worker (builds gate themselves)
     starts, waits = disp(conn, cfg).plan()
-    assert not starts and waits[0][1] == "no worker for fairness in phase 1"
+    assert not starts and waits[0][1] == "no worker for gate in phase 1"
 
 
 def test_switched_off_starts_nothing(tmp_path, root):

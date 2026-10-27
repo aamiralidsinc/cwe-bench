@@ -118,7 +118,7 @@ PROC_RULES = (   # (kind, regex over the joined command line; group 1 = slug, op
     ("build", re.compile(r"run_pipeline\.sh \S+ (\S+)$")),
     ("regate", re.compile(r"regate\.sh (\S+)(?: |$)")),
     ("trial", re.compile(r"trial\.py (\S+) --models (\w+)")),
-    ("fairness", re.compile(r"run_fairness\.sh (\S+)(?: |$)")),
+    ("fairness", re.compile(r"run_fairness(?:_stack)?\.sh (\S+)(?: |$)")),
 )
 
 
