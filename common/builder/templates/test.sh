@@ -80,6 +80,7 @@ run_group() {  # <group> <command; the token @OUT@ is replaced with the JUnit XM
   SECONDS=0
   timeout -k 10 "$TEST_TIMEOUT" "${AS_AGENT[@]}" "${CLEAN_ENV[@]}" HOME=/home/agent \
     bash -c "cd /workspace && env $cmd" > "$LOGS/$g.log" 2>&1 < /dev/null
+  echo "$?" > "$LOGS/$g.rc"   # score.py counts a crashed or timed-out runner with a clean report as a setup error
   reap
   cp "$ao" "$LOGS/$g/results.xml" 2>/dev/null || true
 }

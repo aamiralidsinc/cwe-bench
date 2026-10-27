@@ -260,6 +260,16 @@ have it):
   Whether a solver or the blind control (3f) finds the trap unaided is not a fairness test: a trap
   nobody finds is the goal, not a defect.
 
+### 3k. Task quality before trials (common/lint, docs/TASK-QUALITY.md)
+A warning-only lint checks a task's tests before trials: `python3 -I common/lint/task_lint.py tasks/<slug>`
+(`--repo <checkout>` compares stand-ins with the real classes). It looks for the shapes behind the test repairs
+made after trials: a security test that drives a function directly and does not accept a refusal, stand-ins that
+lack members of the real class or library, a fake network above the layer a fix may use, a loopback mapping of a
+host the functional tests treat as public, Hypothesis without `deadline=None`, project tests run from the agent's
+workspace, and a `score.py` that misses setup errors. Shared refusal helpers for pytest, JS/TS, Go, JUnit and
+PHPUnit are in `common/builder/templates/support/refusal/`. The lint complements, and never replaces, the
+fairness review after trials.
+
 ## Manifest (`build/SLUG/manifest.json`)
 
 ```json

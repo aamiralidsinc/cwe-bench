@@ -285,9 +285,27 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 - **Stubs** of permission or authority answer per resource and verb, like the real thing.
 - **Scope.** A test may vary only what the instruction names, and drive only the entry point it
   names.
+- **Refusals.** Where a security test drives a hardened function or handler directly (not through an HTTP
+  or CLI entry point), a refusal is a secure outcome: use the shared helper from
+  `common/builder/templates/support/refusal/` (copy it into `tests/support/`) and pass the product's own
+  refusal exceptions. A client error or a declared refusal passes; a 5xx or any other exception still fails.
+  Check side effects after every outcome.
+- **Stand-ins mirror the real code.** A stub class compiled ahead of the real one declares every public
+  member of the real class. A mocked library exports everything the real library offers that a fix may use
+  (transactions, constants, error types). A fake network sits below every client: name resolution
+  (`dns.lookup` and the resolver bindings) and connections, never `fetch` alone. Never map a host that a
+  functional test treats as public to a loopback address.
+- **No timing flakiness.** Upstream Hypothesis suites run with `deadline=None` (a conftest profile).
+  Wall-clock limits stay far above the reference fix's time under full load.
+- **Project tests.** The project's own tests run from copies in `tests/pristine/` at the pinned commit,
+  never from the agent's `/workspace`.
 - **No network**, and nothing that depends on the fix commit being present.
-- **Templates.** JUnit XML into the two directories the template names. Copy `score.py` unchanged.
-  Edit only the marked command lines of `test.sh`, and keep its agent-kill block.
+- **Templates.** JUnit XML into the two directories the template names. Copy `score.py` unchanged (it counts
+  setup errors and a crashed runner as failures). Edit only the marked command lines of `test.sh`, keep its
+  agent-kill block and the line that records each group's exit code.
+- **Lint before the gate.** Run `python3 -I common/lint/task_lint.py tasks/{{SLUG}}` and fix every
+  warning, or say in `notes.md` why it does not apply. The lint never blocks; the fairness review after
+  trials still decides.
 
 ## Proof
 - **The oracle.** `solution/fix.patch` is the published fix reduced to source changes, plus fixes
