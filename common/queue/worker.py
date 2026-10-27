@@ -6,11 +6,16 @@ It marks the job running, runs the command with cwd = the repo root and its outp
 lease every lease_sec/10 while the command runs, and records the exit code. If the job stops being ours (the
 dispatcher declared it stale, or `cweq block`), it stops the command and exits.
 
-Commands (phase 1):
+Commands:
+  build     bash pipelines/stacking/3-build-gate/run_stack_pipeline.sh <slug>          (stk-* slugs)
+            bash pipelines/sibling/6-build/run_pipeline.sh deepseek <slug>             (the others)
+  trial_run python3 -I common/trial/trial.py <slug> --models <m> --no-verdict --first-run N --max-runs K
   regate   bash common/gate/regate.sh <slug> [--listing]
   regrade  python3 -I common/audit/regrade_from_code.py <trial_dir> "<why>"
   rescore  python3 -I common/audit/rescore_from_results.py <trial_dir> --drop <name> ... --why "<why>"
-A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}).
+A [commands] entry in the config replaces a kind's command (fields {task} {trial} {job_id}). [env.<kind>] adds
+environment variables (trial_run: CWE_AGENT_TIMEOUT_MULT, as the scheduler set it). [ok_exit_codes.<kind>] lists the
+exits that count as done (trial.py exits 2 when some runs were ungraded: the reconciler plans the next run).
 """
 import os
 import re
@@ -32,6 +37,13 @@ def command(row, cfg):
     trial = str(Path(cfg["jobs_dir"]) / a["trial"]) if a.get("trial") else ""
     if k in cfg.get("commands", {}):
         return [x.format(task=task, trial=trial, job_id=row["id"]) for x in cfg["commands"][k]]
+    if k == "build":                                    # pipelines/router/scale_queue.py build_cmd()
+        if task.startswith("stk-"):
+            return ["bash", "pipelines/stacking/3-build-gate/run_stack_pipeline.sh", task]
+        return ["bash", "pipelines/sibling/6-build/run_pipeline.sh", "deepseek", task]
+    if k == "trial_run":                                # scale_queue.py trial_candidates()
+        return [sys.executable, "-I", str(paths.TRIAL), task, "--models", a["model"], "--no-verdict",
+                "--first-run", str(a["first_run"]), "--max-runs", str(a["max_runs"])]
     if k == "regate":
         return ["bash", "common/gate/regate.sh", task] + (["--listing"] if a.get("listing") else [])
     if k == "regrade":
@@ -77,8 +89,9 @@ def run(conn, cfg, job_id):
         log.write(f"{qdb.utc()} cweq job {job_id} ({row['kind']} {row['task']}) attempt {row['attempts']}: "
                   f"{' '.join(argv)}\n")
         log.flush()
+        env = dict(os.environ, **{k2: str(v) for k2, v in (cfg.get("env", {}).get(row["kind"]) or {}).items()})
         child = subprocess.Popen(argv, cwd=str(paths.ROOT), stdin=subprocess.DEVNULL, stdout=log,
-                                 stderr=subprocess.STDOUT)
+                                 stderr=subprocess.STDOUT, env=env)
         step = max(1.0, lease / 10)
         lost = False
         while True:
@@ -103,5 +116,6 @@ def run(conn, cfg, job_id):
     if lost:
         return rc
     state = qdb.finish(conn, job_id, me, rc, last_line(log_path),
-                       retry_codes=tuple(cfg["retry_exit_codes"].get(row["kind"], ())))
+                       retry_codes=tuple(cfg["retry_exit_codes"].get(row["kind"], ())),
+                       ok_codes=tuple(cfg.get("ok_exit_codes", {}).get(row["kind"], (0,))))
     return 0 if state else 3

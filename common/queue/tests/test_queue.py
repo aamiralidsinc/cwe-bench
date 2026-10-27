@@ -56,7 +56,7 @@ def test_admission_limits_block_starts(conn, cfg):
 
 
 def test_per_task_and_total_limits(tmp_path, root):
-    cfg = write_config(tmp_path, root, "[dispatch]\nmax_running_total = 2\nstart_spacing_sec = 0\n"
+    cfg = write_config(tmp_path, root, "[dispatch]\nmax_running_total = 2\nstart_spacing_sec = 0\nfill_spacing_sec = 0\n"
                                        "max_starts_per_tick = 50\n")
     conn = qdb.connect(cfg["db"])
     qdb.enqueue(conn, "regate", "a")
@@ -71,9 +71,9 @@ def test_per_task_and_total_limits(tmp_path, root):
 
 
 def test_kind_without_worker_never_starts(conn, cfg):
-    qdb.enqueue(conn, "build", "a")
+    qdb.enqueue(conn, "fairness", "a")                 # audits and fairness move into the queue in phase 4
     starts, waits = disp(conn, cfg).plan()
-    assert not starts and waits[0][1] == "no worker for build in phase 1"
+    assert not starts and waits[0][1] == "no worker for fairness in phase 1"
 
 
 def test_switched_off_starts_nothing(tmp_path, root):
@@ -174,7 +174,7 @@ def run_until_settled(d, conn, ids, timeout=30):
 def test_workers_run_fake_commands(tmp_path, root):
     cfg = write_config(tmp_path, root, '[commands]\nregate = ["true"]\nregrade = ["false"]\n'
                                        'rescore = ["sh", "-c", "echo rescored {task} {trial}"]\n'
-                                       "[dispatch]\nstart_spacing_sec = 0\nmax_starts_per_tick = 10\nlease_sec = 20\n")
+                                       "[dispatch]\nstart_spacing_sec = 0\nfill_spacing_sec = 0\nmax_starts_per_tick = 10\nlease_sec = 20\n")
     conn = qdb.connect(cfg["db"])
     ok, _ = qdb.enqueue(conn, "regate", "a")
     bad, _ = qdb.enqueue(conn, "regrade", "b", {"trial": "j/t"})
@@ -190,7 +190,7 @@ def test_workers_run_fake_commands(tmp_path, root):
 
 def test_retryable_exit_requeues_then_blocks(tmp_path, root):
     cfg = write_config(tmp_path, root, '[commands]\nregate = ["sh", "-c", "exit 2"]\n'
-                                       "[dispatch]\nstart_spacing_sec = 0\nlease_sec = 20\n")
+                                       "[dispatch]\nstart_spacing_sec = 0\nfill_spacing_sec = 0\nlease_sec = 20\n")
     conn = qdb.connect(cfg["db"])
     jid, _ = qdb.enqueue(conn, "regate", "a", max_attempts=2)
     d = dispatch.Dispatcher(conn, cfg, cfg["db"], metrics=lambda: dict(OPEN), proc_list=[])
@@ -214,7 +214,7 @@ def test_worker_reholds_a_held_task_after_regate(tmp_path, root):
 
 def test_worker_stops_when_job_is_taken_away(tmp_path, root):
     cfg = write_config(tmp_path, root, '[commands]\nregrade = ["sleep", "30"]\n[dispatch]\nlease_sec = 10\n'
-                                       "start_spacing_sec = 0\n")
+                                       "start_spacing_sec = 0\nfill_spacing_sec = 0\n")
     conn = qdb.connect(cfg["db"])
     jid, _ = qdb.enqueue(conn, "regrade", "a", {"trial": "x"})
     d = dispatch.Dispatcher(conn, cfg, cfg["db"], metrics=lambda: dict(OPEN), proc_list=[])

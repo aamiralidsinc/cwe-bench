@@ -19,6 +19,9 @@ Scheduling (every 10 s):
     a model fail). New .sound tasks join as they appear; a task with a stale gate fingerprint is skipped.
   * First fill is staggered (15-40 s between starts, so container starts do not starve sshd); later starts 2-8 s.
 State: pipelines/router/out/queue/<batch>.state.json (every 30 s); log: <batch>.log; job output: jobs/.
+Drain (handover to the work queue, docs/WORK-QUEUE.md): while pipelines/router/out/queue/<batch>.drain exists the
+scheduler starts nothing, keeps polling and reporting the jobs it started, and exits when the last one ends. Its jobs
+run in their own sessions and never need the scheduler. Removing the file (before it exits) resumes normal starts.
 Post-run audits (failing runs only) and fairness are separate steps (pipelines/*/GUIDE.md).
 """
 import argparse, json, os, random, re, subprocess, sys, threading, time
@@ -131,6 +134,9 @@ def run(a):
 
     ext = {"builds": 0, "trials": 0}
 
+    def draining():
+        return os.path.isfile(os.path.join(QDIR, f"{name}.drain"))
+
     def refresh_external():
         """Builds and trials of this batch that run outside this scheduler (an earlier instance): they hold slots."""
         procs = live_procs()
@@ -153,7 +159,7 @@ def run(a):
                   trial_threshold=a.trial_threshold, timeout_mult=a.timeout_mult,
                   builds_running=nb, builds_waiting=len(build_wait), trials_running=nt,
                   running=[dict(job=n, kind=j["kind"], minutes=round((now - j["t0"]) / 60, 1)) for n, j in running.items()],
-                  waiting_builds=build_wait, done=done[-200:])
+                  waiting_builds=build_wait, done=done[-200:], draining=draining())
         tmp = os.path.join(QDIR, f"{name}.state.json.tmp")
         json.dump(st, open(tmp, "w"), indent=1)
         os.replace(tmp, os.path.join(QDIR, f"{name}.state.json"))
@@ -201,6 +207,7 @@ def run(a):
               f"{a.trial_threshold}, trial limit x{a.timeout_mult}")
     filling, last_scan, cands = True, 0, []
     disk_blocked = [""]
+    drain_seen = [False]
     while True:
         refresh_external()
         for n, j in list(running.items()):
@@ -211,6 +218,20 @@ def run(a):
                 log(name, f"[finish] {j['kind']} {n} rc={rc} {(time.time() - j['t0']) / 60:.0f} min")
         nb, nt = kinds()
         started = False
+        if draining():
+            # Handover: start nothing; report until the jobs this scheduler started have ended, then exit.
+            if not drain_seen[0]:
+                log(name, f"[drain] {name}.drain present: starting nothing; {len(running)} own jobs left to finish")
+                drain_seen[0] = True
+            if not running:
+                break
+            with LOCK:
+                write_state()
+            time.sleep(10)
+            continue
+        if drain_seen[0]:
+            log(name, "[drain] drain file removed: starting again")
+            drain_seen[0] = False
         # Disk-aware admission (2026-10-27): no new build or trial job starts below its disk floor
         # (common/util/diskguard.py; floors in limits.env). Running jobs are not touched.
         build_ok, trial_ok = diskguard.ok("DISK_MIN_FREE_GB_BUILD"), diskguard.ok("DISK_MIN_FREE_GB_TRIAL")
@@ -247,7 +268,8 @@ def run(a):
     stop.set()
     with LOCK:
         write_state()
-    log(name, f"batch {name}: all builds and trials finished")
+    log(name, f"batch {name}: " + ("drained: every job this scheduler started has ended; the work queue continues"
+                                   if draining() else "all builds and trials finished"))
 
 
 def status(a):

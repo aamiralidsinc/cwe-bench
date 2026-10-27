@@ -1,6 +1,6 @@
 """The reconciler: derives jobs from the artifacts on disk, never from its own memory.
 
-Phase 1 rules (docs/WORK-QUEUE.md). Only tasks with a test repair (build/<slug>/repaired-tests-* or removed-tests-*)
+Phase 1 rules (docs/WORK-QUEUE.md); the phase-3 rules (builds, trials) are in phase3.py and run in the same pass. Only tasks with a test repair (build/<slug>/repaired-tests-* or removed-tests-*)
 or a hold (.hold-repair) are looked at.
 
   R1  repair + gate fingerprint STALE + no gate RESULT since the files last changed      -> regate
@@ -249,7 +249,9 @@ def candidate_slugs():
 
 def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
     """One pass. Enqueues what the rules want (idempotent), supersedes queued jobs the files no longer want.
-    Returns the per-task analyses."""
+    Phase-1 rules (repairs) first, then the phase-3 rules (phase3.py: builds, trials, stale gates of batch tasks)
+    unless slugs narrows the pass. Returns the per-task analyses."""
+    phase3_too = slugs is None
     slugs = candidate_slugs() if slugs is None else slugs
     busy = procs.busy_tasks(slugs, cfg["busy"]["patterns"], proc_list, skip_dirs=(paths.COMMON,))
     out = []
@@ -279,4 +281,9 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
                 qdb.set_state(conn, row["id"], "failed", "superseded: the task's files changed since it was queued")
             elif a.get("evaluated"):
                 qdb.set_state(conn, row["id"], "done", "not needed any more: the files on disk show it done")
+    if phase3_too:
+        import phase3
+        import taskstate
+        ctx = taskstate.context(procs.list_processes() if proc_list is None else proc_list)
+        out += phase3.reconcile(conn, cfg, ctx, dry_run=dry_run)
     return out

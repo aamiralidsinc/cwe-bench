@@ -122,11 +122,15 @@ PROC_RULES = (   # (kind, regex over the joined command line; group 1 = slug, op
 )
 
 
-def running(proc_list):
+def running(proc_list, ignore_own=False):
     """{slug: [(kind, model or '', pid), ...]} for the pipeline processes running now (one entry per process).
-    A repair script (pipelines/router/out/queue/*-repair.sh) is matched by the slug it sets (S=<slug>)."""
+    A repair script (pipelines/router/out/queue/*-repair.sh) is matched by the slug it sets (S=<slug>).
+    ignore_own: leave out the queue's own workers and their children (CWEQ_JOB in the environment), so only the old
+    scripts' work is counted."""
     out = {}
-    for pid, argv, cwd, _env in proc_list:
+    for pid, argv, cwd, env in proc_list:
+        if ignore_own and (env or {}).get("CWEQ_JOB"):
+            continue
         cmd = " ".join(argv)
         if "taskstate" in cmd or "cweq" in cmd:
             continue
@@ -156,8 +160,17 @@ def deliveries():
     return out
 
 
-def context(proc_list):
-    return {"batches": batches(), "ledger": ledger(), "running": running(proc_list), "delivered": deliveries()}
+def context(proc_list, ignore_own=False):
+    return {"batches": batches(), "ledger": ledger(), "running": running(proc_list, ignore_own),
+            "delivered": deliveries()}
+
+
+def gate_sha16(slug):
+    """First 16 hex of the sha256 the last SOUND gate recorded (the task version trials belong to), or 'legacy'."""
+    try:
+        return json.loads((paths.BUILD / slug / "gate_fingerprint.json").read_text()).get("sha256", "")[:16] or "legacy"
+    except (OSError, ValueError):
+        return "legacy"
 
 
 # ---------- one task

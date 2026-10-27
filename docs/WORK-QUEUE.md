@@ -1,4 +1,4 @@
-# Work queue (phase 1 and adoption)
+# Work queue (phases 1 and 3, adoption)
 
 Code: `common/queue/`. CLI: `python3 common/queue/cweq.py`. Settings: `common/queue/queue.toml`.
 Tests: `python3 -m pytest common/queue/tests` (Python 3.11 or newer, for `tomllib`).
@@ -156,6 +156,84 @@ python3 common/queue/cweq.py tasks [--stage S] [--next TEXT]
 The per-batch schedulers are retired only after an adoption is OK and its counts match the schedulers' own state
 files (builds running and waiting, trials running).
 
+## Phase 3: builds and trials (replaces scale_queue.py)
+
+Rules (`common/queue/phase3.py`, run in the same reconcile pass after the phase-1 rules). They cover only tasks
+listed in a batch file, `pipelines/router/out/batches/*.txt`, or the batches named in `[phase3] batches`.
+
+- **P1 build.** A task in stage `waiting_build` or `build_interrupted` that has `build/<slug>/BUILD-PROMPT.md` gets
+  one `build` job, ever. A failed or declined build is final; `cweq retry` is a person's decision.
+- **P2 trial_run.** A task in stage `waiting_trials` gets jobs for each model with no verdict. A model is skipped
+  when it is stuck, or held by `hold_<model>`.
+  - With no graded run yet, or one run left, the model gets one job with `--max-runs <left>`, which stops early at a
+    solve.
+  - After one failed run, each remaining run becomes its own one-run job, and they start together.
+  - Job args carry `version`, the SOUND gate's fingerprint, so a new task version starts fresh keys, and queued jobs
+    of the old version are superseded.
+  - After `max_launches` launch groups end without a verdict, the model gets no more jobs and is reported for a
+    person.
+- **P3 regate.** A task in stage `stale_gate` gets `regate`, with the same key rule R1 uses.
+- **Busy tasks.** A task that is building, re-gating, trialing or under repair gets nothing.
+- **Never redo.** Nothing is planned or started that `taskstate.redo_reason()` refuses.
+
+Workers run the scheduler's own commands:
+- `build`: `run_stack_pipeline.sh <slug>` for `stk-` tasks, otherwise `run_pipeline.sh deepseek <slug>`.
+- `trial_run`: `trial.py <slug> --models <m> --no-verdict --first-run N --max-runs K`, with
+  `CWE_AGENT_TIMEOUT_MULT=1.5` from `[env.trial_run]`.
+- Exit codes: `trial.py` exit 2 (some runs ungraded) counts as done, and the reconciler plans the next run. A build
+  exits 0 on every recorded outcome. Exit 1 (STOP) and exit 3 (listing fail) show as failed, for a person.
+
+Admission (`dispatch.py`), on top of the phase-1 limits:
+- **Per-kind caps.** `[limits.max_running]`: build 20, trial_run 40.
+- **Total cap.** `max_running_total` (69).
+- **Old scripts count too.** Builds, trials and re-gates the old scripts are still running count against the per-kind
+  and total caps (`count_foreign`), so old and new work together never exceed them.
+- **Builds come first.** Trials wait while builds running plus builds queued reach `trials_wait_builds` (20), as
+  `scale_queue.py --trial-threshold` did.
+- **Disk floors per kind.** `[limits.disk_floor]` names a diskguard floor for build, trial_run and regate. The values
+  live in `limits.env` and are read live.
+- **Load and memory.** The same limits as phase 1.
+- **Sharing a task.** A build, gate, regate, regrade or rescore runs alone on its task. The trial_runs of one task
+  may run together, up to `max_running_per_task`.
+- **Staggered starts.** `fill_spacing_sec` (15-40 s) during the first fill, then `start_spacing_sec` (2-8 s). This
+  keeps simultaneous container start-up from starving sshd.
+
+## Handover: draining the old schedulers (no cutover moment)
+
+The old pipeline is drained, not switched off. Work it has already started finishes under it. Every next step is
+started only by the queue: when a build the old scheduler started ends, the queue starts that task's gate and
+trials. The queue counts the old work still in flight against its limits, so old and new together stay inside the
+caps.
+
+1. **Deploy** the queue code at `~/cwe-bench/common/queue`, and the `scale_queue.py` that knows the drain switch.
+2. **Adopt.** `cweq adopt --dry-run`, then `cweq adopt`. The adoption must be OK, with zero conflicts.
+3. **Check the plan.** `cweq dispatch --dry-run --with-reconcile` shows what would start and why the rest waits. Old
+   running builds and trials appear as slots in use.
+4. **Drain the schedulers.** `touch pipelines/router/out/queue/scale-b1.drain`, and the same for each running batch.
+   - A scheduler that sees its drain file starts nothing more. It keeps polling and writing its state file, and
+     exits when the last job it started has ended (its log says `drained`).
+   - Its jobs run in their own sessions and never need the scheduler, so stopping a scheduler process outright is
+     also safe. It only loses the state reporting.
+   - A scheduler started before the drain switch existed must be restarted once with its same arguments to see the
+     file. It never starts a second build of a running task (`build_alive`), and with the file present it starts
+     nothing.
+5. **Start the queue**, one of each:
+   - `setsid nohup python3 common/queue/cweq.py reconcile ...`
+   - `setsid nohup python3 common/queue/cweq.py dispatch ...`
+
+   Use the same log locations as below.
+6. **Verify.**
+   - `cweq status`: the slots shown include the old work.
+   - `cweq tasks --stage building` and `cweq tasks --stage trialing` should match the processes.
+   - As old jobs end, their tasks' next steps appear as queue jobs.
+
+**Rollback.**
+1. Stop `cweq dispatch` and `cweq reconcile`. Queue workers that are running finish their current script.
+2. Remove the `.drain` files. A scheduler that has not exited yet starts again.
+3. Restart any scheduler that has exited, with its same arguments, for example
+   `scale_queue.py run --batch pipelines/router/out/batches/scale-b3.txt --slots 20`. It adopts running work the same
+   way, with `build_alive`, `trials_alive` and the trial state, so nothing runs twice.
+
 ## Running it alongside the current scripts
 
 Phase 1 takes only jobs that the old scripts are not already doing.
@@ -194,11 +272,6 @@ setsid nohup python3 common/queue/cweq.py dispatch  >> ~/.tb-graders/cwe/queue-l
 - **Phase 2: regrades chained into the rest.** After the last regrade of a task, queue the audit work. That means
   `audit_prep` for failing runs whose reward changed (the orchestrator's rule 5.4 step 4) and a ledger rebuild.
   Optionally release `.hold-repair` once every regrade is in, if the owner approves releasing automatically.
-- **Phase 3: trials and builds as reconciler rules.** Batch files (`pipelines/*/out/<batch>.txt`) are the input.
-  A slug in a batch without a build record gets `build`. An ended build with no `RESULT` gets `gate`, using the
-  same stopped-step test as ORCHESTRATOR 5.3. A `.sound` task with fewer than 3 graded runs per model and no hold
-  gets `trial_run` per model and run number. These rules replace `scale_queue.py` and `regate_queue.py`, so their
-  slot logic becomes the `[limits]` table.
 - **Phase 4: audits and fairness.** For each failing run without a current postmortem: `audit_prep`, then the audit.
   After 3 of 3 failures: `fairness` (the decision of 2026-10-19). `cleanup` jobs come from the janitor's approved
   reports.

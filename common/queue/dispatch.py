@@ -6,14 +6,20 @@ Each tick:
               claim) or, with its attempts used up, blocked;
   2. deps   - a queued job whose dependency failed or was blocked becomes blocked ("dependency #N ...");
   3. start  - candidates in order of priority + aging_per_hour x hours waited (nothing starves), skipping a job when
-              its dependencies are not done, its task is busy (an old script, or one of our jobs: max_running_per_task),
-              its kind is at max_running (a kind with no limit has no worker yet and never starts), a trial_run task
-              is held, or the machine is over a limit. At most max_starts_per_tick starts, start_spacing_sec apart.
+              no adoption is recorded (require_adoption), its dependencies are not done, a trial_run task is held,
+              the files show its work done (closed as done: never redo) or an old script is running it, its task is
+              busy (build/gate/regate/regrade/rescore run alone on a task; trial_runs of one task may run together,
+              up to max_running_per_task), its kind is at max_running or the total at max_running_total (old-script
+              builds and trials count too: count_foreign), a trial_run while builds running + queued >=
+              trials_wait_builds (builds first, as scale_queue.py did), the machine is over a limit, or the kind's
+              disk floor (limits.disk_floor -> common/util/diskguard.py) is not met. At most max_starts_per_tick
+              starts per tick, start_spacing_sec apart (fill_spacing_sec during the first fill; [low, high] = random).
 
 The worker is `cweq.py _work <id>` in its own session (setsid): it runs the existing script, refreshes the lease and
 records the exit code (worker.py). The dispatcher never waits for it, so restarting the dispatcher stops no job.
 """
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -22,6 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402
+sys.path.insert(0, str(paths.COMMON / "util"))
+import diskguard  # noqa: E402  (disk floors per kind, common/util/diskguard.py; live values in limits.env)
 
 import procs  # noqa: E402
 import qdb  # noqa: E402
@@ -49,13 +57,28 @@ def held(task, kind, args):
     return None
 
 
+EXCLUSIVE = ("build", "gate", "regate", "regrade", "rescore")   # one at a time per task, alone on the task
+FOREIGN_KIND = {"build": "build", "trial": "trial_run", "regate": "regate"}   # old-script processes -> job kind
+
+
+def spacing(v):
+    """A start spacing setting: a number of seconds, or [low, high] for a random pause in that range."""
+    if isinstance(v, (list, tuple)):
+        return random.uniform(float(v[0]), float(v[1]))
+    return float(v or 0)
+
+
 class Dispatcher:
-    def __init__(self, conn, cfg, db_path, metrics=None, proc_list=None, spawn=None, sleep=time.sleep):
+    def __init__(self, conn, cfg, db_path, metrics=None, proc_list=None, spawn=None, sleep=time.sleep,
+                 disk_ok=None):
         self.conn, self.cfg, self.db_path = conn, cfg, db_path
         self.metrics = metrics or (lambda: procs.headroom(str(paths.ROOT)))
         self.proc_list = proc_list                       # None = read the real process table
         self.spawn = spawn or self._spawn
         self.sleep = sleep
+        self.disk_ok = disk_ok or diskguard.ok           # floor name -> True when free disk is above it
+        self.filling = True                              # first fill: longer pauses between starts
+        self.total_seen = 0
         self.children = []                               # our Popen objects, polled so they never linger as zombies
 
     # ---- 1. stale workers
@@ -107,11 +130,28 @@ class Dispatcher:
         queued = sorted(qdb.jobs(self.conn, "state='queued'"),
                         key=lambda r: (-effective_priority(r, now, d["aging_per_hour"]), r["id"]))
         active = qdb.jobs(self.conn, "state IN ('leased','running')")
-        per_kind, per_task = {}, {}
+        per_kind, per_task, excl_task = {}, {}, set()
         for r in active:
             per_kind[r["kind"]] = per_kind.get(r["kind"], 0) + 1
             per_task[r["task"]] = per_task.get(r["task"], 0) + 1
+            if r["kind"] in EXCLUSIVE:
+                excl_task.add(r["task"])
         total = len(active)
+        # The old scripts' builds and trials hold slots too (cutover: the queue and the schedulers never exceed the
+        # caps together). Their processes, without the queue's own workers.
+        plist = procs.list_processes() if self.proc_list is None else self.proc_list
+        ctx = taskstate.context(plist, ignore_own=True)
+        foreign = {}
+        for runs in ctx["running"].values():
+            for kind, _m, _p in runs:
+                k = FOREIGN_KIND.get(kind)
+                if k and k in d.get("count_foreign", ()):
+                    foreign[k] = foreign.get(k, 0) + 1
+        for k, n in foreign.items():
+            per_kind[k] = per_kind.get(k, 0) + n
+            total += n
+        queued_builds = sum(1 for r in queued if r["kind"] == "build")
+        self.total_seen = total
         limits = procs.over_limits(self.metrics(), cfg["limits"])
         busy = procs.busy_tasks({r["task"] for r in queued}, cfg["busy"]["patterns"], self.proc_list,
                                 skip_dirs=(paths.COMMON,))
@@ -123,7 +163,6 @@ class Dispatcher:
                 not_adopted = "no adoption yet: run `cweq adopt` so the queue starts from the pipeline's current state"
             elif not adoption["ok"]:
                 not_adopted = f"adoption #{adoption['id']} has conflicts: resolve them and run `cweq adopt` again"
-        ctx = None
         starts, waits = [], []
         for r in queued:
             k, t = r["kind"], r["task"]
@@ -132,25 +171,31 @@ class Dispatcher:
             elif not_adopted:
                 why = not_adopted
             elif k not in maxk and k not in cfg.get("commands", {}):
-                why = f"no worker for {k} in phase 1"
+                why = f"no worker for {k} in phase 1"  # (kinds without a [limits.max_running] entry)
             elif not self.deps_done(r):
                 why = "waiting for " + ", ".join(f"#{x}" for x in qdb.deps_of(r))
             elif held(t, k, qdb.args_of(r)):
                 why = held(t, k, qdb.args_of(r))
-            elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(
-                    k, t, qdb.args_of(r), ctx := ctx or taskstate.context(
-                        procs.list_processes() if self.proc_list is None else self.proc_list))):
-                why = REDO + redo
+            elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(k, t, qdb.args_of(r), ctx)):
+                # Finished work closes the job; work the old scripts are running only makes it wait.
+                why = ("task busy (old script): " + redo) if redo.endswith("running") else REDO + redo
             elif t in busy:
                 why = f"task busy (old script pid {busy[t][0][0]}: {busy[t][0][1][:80]})"
-            elif per_task.get(t, 0) >= d["max_running_per_task"]:
+            elif t in excl_task or (k in EXCLUSIVE and per_task.get(t, 0)):
                 why = "another job of this task is running"
+            elif per_task.get(t, 0) >= d["max_running_per_task"]:
+                why = f"{d['max_running_per_task']} jobs of this task are running"
             elif per_kind.get(k, 0) >= maxk.get(k, 0):
-                why = f"{k} at its limit ({maxk.get(k, 0)} running)"
+                why = f"{k} at its limit ({maxk.get(k, 0)} running{', old scripts included' if foreign.get(k) else ''})"
             elif total >= d["max_running_total"]:
                 why = f"total at its limit ({d['max_running_total']} running)"
+            elif k == "trial_run" and per_kind.get("build", 0) + queued_builds >= d["trials_wait_builds"]:
+                why = (f"builds first: {per_kind.get('build', 0)} running + {queued_builds} queued >= "
+                       f"{d['trials_wait_builds']}")
             elif limits:
                 why = "admission closed: " + "; ".join(limits)
+            elif cfg["limits"].get("disk_floor", {}).get(k) and not self.disk_ok(cfg["limits"]["disk_floor"][k]):
+                why = f"disk below its {k} floor ({cfg['limits']['disk_floor'][k]}, common/util/diskguard.py)"
             elif len(starts) >= d["max_starts_per_tick"]:
                 why = "start budget of this tick used"
             else:
@@ -190,12 +235,21 @@ class Dispatcher:
         if dry_run:
             rep["started"] = [(r, "would start") for r, _ in starts]
             return rep
+        d = self.cfg["dispatch"]
         for i, (r, _) in enumerate(starts):
-            if i and self.cfg["dispatch"]["start_spacing_sec"]:
-                self.sleep(self.cfg["dispatch"]["start_spacing_sec"])
+            if i:
+                # Staggered starts: simultaneous container spin-up starves sshd. Longer pauses during the first fill.
+                pause = spacing(d.get("fill_spacing_sec", d["start_spacing_sec"]) if self.filling
+                                else d["start_spacing_sec"])
+                if pause:
+                    self.sleep(pause)
             if not qdb.claim(self.conn, r["id"], self.cfg["dispatch"]["lease_sec"]):
                 continue
             pid = self.spawn(r["id"])
             qdb.set_owner(self.conn, r["id"], pid)
             rep["started"].append((r, f"pid {pid}"))
+        # The first fill ends once the total cap is reached, or a tick started everything that was startable.
+        budget_left = any(w == "start budget of this tick used" for _, w in waits)
+        if self.filling and (self.total_seen + len(rep["started"]) >= d["max_running_total"] or not budget_left):
+            self.filling = False
         return rep

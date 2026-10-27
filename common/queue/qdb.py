@@ -171,14 +171,14 @@ def refresh(conn, job_id, pid, lease_sec):
     return cur.rowcount == 1
 
 
-def finish(conn, job_id, pid, exit_code, result, retry_codes=()):
+def finish(conn, job_id, pid, exit_code, result, retry_codes=(), ok_codes=(0,)):
     """Record a worker's end. Exit 0 -> done; a retryable exit -> queued again (or blocked at max_attempts);
     anything else -> failed. Returns the new state, or None when the job was no longer ours."""
     with tx(conn):
         row = conn.execute("SELECT * FROM jobs WHERE id=? AND owner_pid=? AND state='running'", (job_id, pid)).fetchone()
         if row is None:
             return None
-        if exit_code == 0:
+        if exit_code in ok_codes:
             state = "done"
         elif exit_code in retry_codes:
             state = "queued" if row["attempts"] < row["max_attempts"] else "blocked"

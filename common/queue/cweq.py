@@ -78,6 +78,10 @@ def cmd_dispatch(conn, cfg, a):
         mem = qdb.connect(":memory:")
         conn.backup(mem)
         conn = mem
+        if qdb.latest_adoption(conn) is None:            # the plan as it would be after `cweq adopt`
+            rep = adopt.adopt(conn, cfg)
+            print(f"{qdb.utc()} adoption (in memory): {'OK' if rep['ok'] else 'NOT OK'}, {len(rep['tasks'])} tasks, "
+                  f"{len(rep['conflicts'])} conflicts")
         for t in reconcile.reconcile(conn, cfg):
             for n in t["notes"]:
                 print(f"{qdb.utc()} reconcile {t['task']}: {n}")
@@ -95,6 +99,15 @@ def cmd_dispatch(conn, cfg, a):
             for r, why in rep["waiting"]:
                 print(f"{stamp} waits      {line(r, '- ' + why)}")
         if a.dry_run:
+            by_kind, wait_kind = {}, {}
+            for r, _how in rep["started"]:
+                by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+            for r, why in rep["waiting"]:
+                key = (r["kind"], (why or "").split(":")[0].split(" (")[0][:60])
+                wait_kind[key] = wait_kind.get(key, 0) + 1
+            print(f"{stamp} would start now: " + (", ".join(f"{k} {n}" for k, n in sorted(by_kind.items())) or "nothing"))
+            for (k, why), n in sorted(wait_kind.items(), key=lambda kv: -kv[1]):
+                print(f"{stamp} waiting: {n:>4} {k:<9} {why}")
             print(f"{stamp} headroom: {procs.headroom(str(paths.ROOT))}")
         if a.once or a.dry_run:
             return 0
