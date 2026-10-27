@@ -1,7 +1,7 @@
 #!/bin/bash
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 . "$CWE_DOCKER_TUNING" 2>/dev/null || true
-# resume_pipeline.sh <slug> <build|gate> [session-id]
+# resume_pipeline.sh <slug> <build|gate> [session-id]   (RESUME_MSG overrides the operator note)
 # Resumes one sibling2 task frozen during the 2026-10-24 Docker deadlock, without a rebuild:
 #   build -> `claude --resume <session>` (same conversation, fresh time budget), then the normal gate;
 #   gate  -> re-run the gate only (no model tokens).
@@ -17,7 +17,7 @@ echo "=== $(date -u +%FT%TZ) RESUME $S stage=$STAGE session=${SESS:-none} ===" >
 if [ "$STAGE" = build ]; then
   [ -n "$SESS" ] || { log build "RESUME-ERROR (no session id)"; exit 0; }
   for f in build-run.json build-run.err build-exit.txt; do [ -f "build/$S/$f" ] && mv "build/$S/$f" "build/$S/$f.pre-resume"; done
-  MSG="Note from the operator: this build was paused for about an hour while we fixed a host Docker bug (the system Docker daemon was deadlocking under load; it is fixed and restarted now). Containers that were running before the pause were stopped, and any private dockerd started during this session was shut down. Use the system Docker only; do not start your own dockerd. Continue the task from where you left off and finish it as the original brief says."
+  MSG="${RESUME_MSG:-Note from the operator: this build was paused for about an hour while we fixed a host Docker bug (the system Docker daemon was deadlocking under load; it is fixed and restarted now). Containers that were running before the pause were stopped, and any private dockerd started during this session was shut down. Use the system Docker only; do not start your own dockerd. Continue the task from where you left off and finish it as the original brief says.}"
   "$CWE_DRIVE" deepseek bash -c '
     date -u +%FT%TZ > "build/'"$S"'/resume_start_utc.txt"
     timeout "${BUILD_TIMEOUT:-18000}" "$HOME/.local/bin/claude" -p "$0" --resume "'"$SESS"'" \
