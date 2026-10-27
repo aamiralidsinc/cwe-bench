@@ -159,7 +159,7 @@ def graded_runs(slug, jobs_dir):
             regrades.append((when, jload(r) or {}))
         out.append({"job": t.parent.name, "trial": t.name, "path": t, "reward": reward, "graded": graded,
                     "regrades": regrades,
-                    "has_code": (t / "final-code" / "changes.patch").is_file() or (t / "artifacts").is_dir()})
+                    "has_code": (t / "final-code" / "changes.patch").is_file() or (t / "artifacts" / "workspace").is_dir()})
     return out
 
 

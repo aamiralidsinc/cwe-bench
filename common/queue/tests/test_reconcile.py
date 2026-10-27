@@ -226,3 +226,16 @@ def test_r4_covers_a_single_removed_test_function(root, conn, cfg):
     rep = {a["task"]: a for a in reconcile.reconcile(conn, cfg, slugs=["fn-s2", "edited-s2"], proc_list=[])}
     assert rep["fn-s2"]["want"] == [] and reconcile.BOTH_SOLVED_NOTE in rep["fn-s2"]["notes"]
     assert [w["kind"] for w in rep["edited-s2"]["want"]] == ["regate"]
+
+
+def test_imported_run_without_workspace_has_no_code(root, cfg):
+    """A run imported from elsewhere keeps only artifacts/manifest.json: nothing to regrade."""
+    import time
+    import reconcile
+    t = make_trial(root, "imp-s2", 1, time.time(), code=False)
+    (t / "artifacts").mkdir()
+    (t / "artifacts" / "manifest.json").write_text("{}")
+    runs = reconcile.graded_runs("imp-s2", cfg["jobs_dir"])
+    assert runs and runs[0]["has_code"] is False
+    (t / "artifacts" / "workspace").mkdir()
+    assert reconcile.graded_runs("imp-s2", cfg["jobs_dir"])[0]["has_code"] is True
