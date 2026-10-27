@@ -26,6 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402
+sys.path.insert(0, str(paths.ROOT / "common" / "util"))
+import diskguard  # noqa: E402  (disk-aware admission: common/util/diskguard.py)
 
 ROOT = str(paths.ROOT)
 QDIR = os.path.join(ROOT, "pipelines", "router", "out", "queue")
@@ -198,6 +200,7 @@ def run(a):
     log(name, f"batch {name}: {len(slugs)} slugs, {len(build_wait)} to build; slots {a.slots}, trials when builds < "
               f"{a.trial_threshold}, trial limit x{a.timeout_mult}")
     filling, last_scan, cands = True, 0, []
+    disk_blocked = [""]
     while True:
         refresh_external()
         for n, j in list(running.items()):
@@ -208,10 +211,17 @@ def run(a):
                 log(name, f"[finish] {j['kind']} {n} rc={rc} {(time.time() - j['t0']) / 60:.0f} min")
         nb, nt = kinds()
         started = False
-        if build_wait and nb + nt < a.slots:
+        # Disk-aware admission (2026-10-27): no new build or trial job starts below its disk floor
+        # (common/util/diskguard.py; floors in limits.env). Running jobs are not touched.
+        build_ok, trial_ok = diskguard.ok("DISK_MIN_FREE_GB_BUILD"), diskguard.ok("DISK_MIN_FREE_GB_TRIAL")
+        blocked = ("builds " if build_wait and not build_ok else "") + ("trials" if not trial_ok else "")
+        if blocked != disk_blocked[0]:
+            log(name, f"[disk] free {diskguard.free_gb()} GB: " + (f"holding {blocked}" if blocked else "admission open again"))
+            disk_blocked[0] = blocked
+        if build_wait and build_ok and nb + nt < a.slots:
             s = build_wait.pop(0)
             start(s, "build", build_cmd(s)); started = True
-        elif nb + len(build_wait) < a.trial_threshold and nb + nt < a.slots:
+        elif trial_ok and nb + len(build_wait) < a.trial_threshold and nb + nt < a.slots:
             if time.time() - last_scan > 60 or not cands:
                 cands, last_scan = trial_candidates(), time.time()
             if cands:

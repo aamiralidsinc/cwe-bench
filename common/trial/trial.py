@@ -32,6 +32,7 @@ RUN = paths.RUN_TRIAL
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 sys.path.insert(0, str(paths.UTIL))
 import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
+import diskguard  # noqa: E402  (disk-aware admission: common/util/diskguard.py)
 # harvest_code, review_flags and postmortem (imported lazily below) live in common/audit/. Before the
 # 2026-10-25 reorganisation they sat next to this file in build/, where the script directory made them importable.
 sys.path.insert(0, str(paths.AUDIT_TOOLS))
@@ -262,6 +263,8 @@ def main():
 
     for model in models:
         for i in range(args.first_run, args.first_run + args.max_runs):
+            # Disk-aware admission (2026-10-27): each run builds its own images; wait below the disk floor.
+            diskguard.wait("DISK_MIN_FREE_GB_TRIAL", f"{args.slug} {model} run {i}")
             rec = one_run(model, task_dir, i)
             rec["model"], rec["run"] = model, i
             detail["runs"].append(rec)

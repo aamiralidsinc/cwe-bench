@@ -60,6 +60,9 @@ import traceback
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "util"))
+import diskguard  # noqa: E402  (disk-aware admission: common/util/diskguard.py)
+
 try:
     import tomllib  # Python 3.11+
     def load_toml(text: str) -> dict:
@@ -286,6 +289,8 @@ class global_slot:
         import fcntl
         self.f = None
         GATE_SLOTS_DIR.mkdir(parents=True, exist_ok=True)
+        # Disk-aware admission (2026-10-27): every gate run builds images, so none starts below the disk floor.
+        diskguard.wait("DISK_MIN_FREE_GB_GATE", f"gate run of {sys.argv[1] if len(sys.argv) > 1 else '?'}")
         while True:
             # Re-read on every attempt, so a change in the limits file reaches gates that are already waiting.
             n = gate_limit("GATE_GLOBAL_SLOTS", 60)
