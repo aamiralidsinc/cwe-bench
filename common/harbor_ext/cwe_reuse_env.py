@@ -13,6 +13,7 @@ image (environment/) and the verifier image (tests/) go through this class. For 
   * starts the run through Harbor's own prebuilt-image path (docker-compose-prebuilt.yaml), exactly as if
     task.toml had `docker_image` set; the delivered task files are not touched.
 Harbor's `down --rmi local` never removes an image with a custom tag, so the shared image survives runs.
+Every run's `main` container also gets the cwe.* labels (cwe_labels.py) through one more compose override.
 Stock behaviour (per-run build) for --force-build, a task that names docker_image, a task with its own
 environment/docker-compose.yaml, Windows containers, or CWE_IMAGE_REUSE=0.
 """
@@ -21,10 +22,13 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import os
+import tempfile
 import time
+from pathlib import Path
 
 from harbor.environments.docker.docker import DockerEnvironment
 
+from cwe_labels import labels as cwe_labels, write_compose as write_labels_compose
 from cwe_reuse_tag import build_cmd, lock_path, reuse_tag, touch_used
 
 
@@ -73,6 +77,22 @@ async def ensure_image(ctx, tag: str, logger=None) -> None:
 
 
 class ReuseDockerEnvironment(DockerEnvironment):
+    @property
+    def _docker_compose_paths(self) -> list[Path]:
+        """Harbor's compose files plus one labels override for `main` (cwe_labels.py). Last in the list, so it only
+        adds labels. CWE_LABELS=0 leaves Harbor's list as it is."""
+        paths = list(super()._docker_compose_paths)
+        if os.environ.get("CWE_LABELS", "1") == "0" or getattr(self, "_is_windows_container", False):
+            return paths
+        f = getattr(self, "_cwe_labels_path", None)
+        if f is None:
+            d = tempfile.mkdtemp(prefix="cwe-labels-")
+            lab = cwe_labels(os.environ, getattr(self, "session_id", "") or "",
+                             getattr(self, "environment_name", "") or "")
+            f = write_labels_compose(Path(d) / "docker-compose-cwe-labels.json", lab)
+            self._cwe_labels_path = f
+        return paths + [f]
+
     def _reuse_applies(self, force_build: bool) -> bool:
         return (os.environ.get("CWE_IMAGE_REUSE", "1") != "0"
                 and not force_build
@@ -92,3 +112,16 @@ class ReuseDockerEnvironment(DockerEnvironment):
             self.task_env_config = self.task_env_config.model_copy(update={"docker_image": tag})
             self._env_vars.prebuilt_image_name = tag
         return await super().start(force_build)
+
+    async def stop(self, delete: bool):
+        try:
+            return await super().stop(delete)
+        finally:
+            f = getattr(self, "_cwe_labels_path", None)
+            if f is not None:                 # the override is only needed while compose runs
+                try:
+                    f.unlink()
+                    f.parent.rmdir()
+                except OSError:
+                    pass
+                self._cwe_labels_path = None
