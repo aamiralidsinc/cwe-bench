@@ -88,3 +88,17 @@ def test_pool_excludes_built_and_batched_and_marks_the_source(world, monkeypatch
     assert src == {"100": "solved stacked task", "101": "step-2 screen"}
     assert "in a batch" in (pipe / "pool_excluded.tsv").read_text()
     assert "1 from solved stacked tasks" in capsys.readouterr().out
+
+
+def test_pool_drops_a_stale_screen_of_a_repo_stacking_took(world, monkeypatch):
+    """A screen copied into the pool before stacking took the repo stays out while no stacked task of it was solved."""
+    r = load_route(world, monkeypatch)
+    r.step3(None)
+    r.step2(None)
+    write(world / "pipelines" / "router" / "out" / "step2" / "screener" / "104.json",
+          json.dumps({"entry_id": "104", "repo": "org/open", "pattern_fit": "A"}))   # stk-open-2: both failed
+    r.pool(None)
+    pipe = world / "pipelines" / "router" / "out" / "step2" / "pipeline"
+    ids = {json.loads(l)["entry_id"] for l in (pipe / "pool.jsonl").read_text().splitlines()}
+    assert "104" not in ids and "100" in ids                             # the solved stacked repo stays
+    assert "taken by stacking" in (pipe / "pool_excluded.tsv").read_text()
