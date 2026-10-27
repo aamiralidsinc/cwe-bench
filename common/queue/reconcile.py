@@ -12,6 +12,9 @@ or a hold (.hold-repair) are looked at.
   R1+R2  when R1 fires, the R2 jobs are queued at once with depends_on = the regate (they wait for it, and are
       blocked if it fails).
   R3  .hold-repair -> trial_run jobs of the task are not started (dispatch.py); shown by `cweq explain`.
+  R4  the repairs only removed tests (removed-tests-*, no repaired-tests-*) and the audited ledger says both models
+      SOLVED -> no job: fewer
+      tests cannot turn a solve into a failure (note "both models solved; removing tests cannot change the verdict").
   --  fingerprint missing (gated before 2026-10-25): no job, reported. A gate that failed on the current files: no
       job, reported (needs a person). A task busy with an old script: no job this pass.
 
@@ -167,8 +170,24 @@ def graded_runs(slug, jobs_dir):
     return out
 
 
-def analyse(slug, cfg, busy=None):
-    """Everything the rules look at for one task, and the jobs they want: {facts..., 'want': [...], 'notes': [...]}."""
+BOTH_SOLVED_NOTE = "both models solved; removing tests cannot change the verdict"
+
+
+def removal_cannot_change_verdict(slug, ledger=None):
+    """True when the task's repairs only removed tests (removed-tests-* folders, whole files or single test functions;
+    no repaired-tests-* folder) and the audited ledger says both models already SOLVED: fewer tests keep a solve a
+    solve, so no re-gate, regrade or rescore is worth running."""
+    import taskstate
+    led = (taskstate.ledger() if ledger is None else ledger).get(slug, {})
+    if not all(taskstate.ledger_model(led.get(m, "")) == "solved" for m in taskstate.MODELS):
+        return False
+    b = paths.BUILD / slug
+    return any(b.glob("removed-tests-*")) and not any(b.glob("repaired-tests-*"))
+
+
+def analyse(slug, cfg, busy=None, ledger=None):
+    """Everything the rules look at for one task, and the jobs they want: {facts..., 'want': [...], 'notes': [...]}.
+    ledger: taskstate.ledger() of this pass (read here when not given)."""
     b = paths.BUILD / slug
     a = {"task": slug, "want": [], "notes": []}
     a["repairs"] = sorted(p.name for p in b.glob("repaired-tests-*")) + sorted(p.name for p in b.glob("removed-tests-*"))
@@ -185,6 +204,9 @@ def analyse(slug, cfg, busy=None):
                           "; ".join(f"pid {p} {c}" for p, c in a["busy"][:3]))
         return a
 
+    if removal_cannot_change_verdict(slug, ledger):
+        a["notes"].append(BOTH_SOLVED_NOTE)
+        return a
     rec = jload(b / "gate_fingerprint.json")
     digest = gate_digest(slug)
     fp16 = digest[:16]
@@ -254,9 +276,11 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
     phase3_too = slugs is None
     slugs = candidate_slugs() if slugs is None else slugs
     busy = procs.busy_tasks(slugs, cfg["busy"]["patterns"], proc_list, skip_dirs=(paths.COMMON,))
+    import taskstate
+    ledger = taskstate.ledger()
     out = []
     for slug in slugs:
-        a = analyse(slug, cfg, busy)
+        a = analyse(slug, cfg, busy, ledger)
         out.append(a)
         if dry_run or a["busy"]:
             continue

@@ -180,3 +180,49 @@ def test_dry_run_writes_nothing(conn, cfg, root):
     repaired_task(root)
     rep, = reconcile.reconcile(conn, cfg, proc_list=[], dry_run=True)
     assert len(rep["want"]) == 3 and not qdb.jobs(conn)
+
+
+def test_r4_removed_tests_cannot_change_a_both_solved_verdict(root, conn, cfg):
+    """Removing tests from a task both models solved: no regate, regrade or rescore (live case: stk-social-core-5847,
+    stk-cms-ghsa7jx7). A task with one failing model is still re-gated and rescored."""
+    import phase3
+    import taskstate
+    from test_adopt import batch, ledger
+    for slug in ("solved-s2", "split-s2"):
+        make_task(root, slug, {"security/a.test.js": "a", "security/gone.test.js": "g"})
+        write_fingerprint(root, slug)
+        gate_log(root, slug, time.time() - 3600, "SOUND (gate)")
+        (root / "build" / slug / ".sound").write_text("")
+        make_trial(root, slug, 1, time.time() - 3000, results={"security": {"gone.test.js > x": "failed"},
+                                                              "functional": {}})
+        rem = root / "build" / slug / "removed-tests-20261027"
+        rem.mkdir()
+        (rem / "gone.test.js").write_text("g")
+        (root / "tasks" / slug / "tests" / "security" / "gone.test.js").unlink()
+    batch(root, "scale-b9", ["solved-s2", "split-s2"])
+    ledger(root, [("solved-s2", "SOLVED 1/1", "SOLVED 2/2", "rejected (both solved)"),
+                  ("split-s2", "SOLVED 1/1", "**failed 0/3** [0.5]", "rejected (DeepSeek solved)")])
+    rep = {a["task"]: a for a in reconcile.reconcile(conn, cfg, slugs=["solved-s2", "split-s2"], proc_list=[])}
+    assert rep["solved-s2"]["want"] == [] and reconcile.BOTH_SOLVED_NOTE in rep["solved-s2"]["notes"]
+    assert [w["kind"] for w in rep["split-s2"]["want"]] == ["regate", "rescore"]
+    p3 = {t["task"]: t for t in phase3.reconcile(conn, cfg, taskstate.context([]))}
+    assert reconcile.BOTH_SOLVED_NOTE in p3["solved-s2"]["notes"] and not qdb.jobs(conn, "task='solved-s2'")
+
+
+def test_r4_covers_a_single_removed_test_function(root, conn, cfg):
+    """stk-social-core-5847: one test function removed from a file that stays (removed-tests-*/<file>.before).
+    A repaired-tests-* folder (changed assertions) is not covered: a re-run could change the verdict."""
+    from test_adopt import ledger
+    for slug in ("fn-s2", "edited-s2"):
+        make_task(root, slug, {"security/t.py": "def test_a(): pass\n"})
+        write_fingerprint(root, slug, sha="0" * 64)
+        (root / "build" / slug / ".sound").write_text("")
+    (root / "build" / "fn-s2" / "removed-tests-20261026").mkdir()
+    (root / "build" / "fn-s2" / "removed-tests-20261026" / "t.py.before").write_text("old")
+    (root / "build" / "edited-s2" / "repaired-tests-20261027").mkdir()
+    (root / "build" / "edited-s2" / "repaired-tests-20261027" / "t.py.orig").write_text("old")
+    ledger(root, [("fn-s2", "SOLVED 1/3", "SOLVED 1/3", "rejected (both solved)"),
+                  ("edited-s2", "SOLVED 1/3", "SOLVED 1/3", "rejected (both solved)")])
+    rep = {a["task"]: a for a in reconcile.reconcile(conn, cfg, slugs=["fn-s2", "edited-s2"], proc_list=[])}
+    assert rep["fn-s2"]["want"] == [] and reconcile.BOTH_SOLVED_NOTE in rep["fn-s2"]["notes"]
+    assert [w["kind"] for w in rep["edited-s2"]["want"]] == ["regate"]

@@ -14,7 +14,8 @@ These rules replace pipelines/router/scale_queue.py. They look only at tasks lis
       tried when planned. A new task version starts a new set of keys, and the same plan is never queued twice.
       After [phase3] max_launches launch groups of one (task, model, version) without a verdict: no more jobs; the
       task is reported for a person (the scheduler's --max-launches).
-  P3  stage stale_gate -> regate {"fp", "listing"} (the same key phase-1 rule R1 uses, so the two never double up)
+  P3  stage stale_gate -> regate {"fp", "listing"} (the same key phase-1 rule R1 uses, so the two never double up),
+      except when reconcile rule R4 applies (tests only removed, both models already solved)
 
 Tasks with a running build, gate, re-gate, trial, fairness review or repair are in stages building / regating /
 trialing and get nothing. Queued phase-3 jobs of an older task version are marked superseded.
@@ -50,7 +51,7 @@ def launches(conn, slug, m, version):
     return len(groups)
 
 
-def wants(t, cfg, conn):
+def wants(t, cfg, conn, ctx_ledger=None):
     """(jobs wanted [{kind, args}], notes) for one task reading."""
     p3, slug, stage = cfg["phase3"], t["task"], t["stage"]
     out, notes = [], []
@@ -76,6 +77,9 @@ def wants(t, cfg, conn):
             out += [{"kind": "trial_run", "args": a} for a in trial_plan(slug, m, mm, version)]
     elif stage == "stale_gate":
         import reconcile
+        if reconcile.removal_cannot_change_verdict(slug, ctx_ledger):
+            notes.append(reconcile.BOTH_SOLVED_NOTE)
+            return out, notes
         listing = any(slug.startswith(x) for x in cfg["reconcile"]["listing_prefixes"])
         out.append({"kind": "regate", "args": {"fp": reconcile.gate_digest(slug)[:16], "listing": listing}})
     return out, notes
@@ -92,7 +96,7 @@ def reconcile(conn, cfg, ctx, dry_run=False):
         except Exception as e:                             # one unreadable task must not stop the pass
             rep.append({"task": slug, "stage": "?", "want": [], "notes": [f"unreadable: {type(e).__name__}: {e}"]})
             continue
-        w, notes = wants(t, cfg, conn)
+        w, notes = wants(t, cfg, conn, ctx["ledger"])
         for x in w:
             why = taskstate.redo_reason(x["kind"], slug, x["args"], ctx, t)
             if why:                                        # never plan finished or running work
