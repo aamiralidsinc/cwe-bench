@@ -154,7 +154,7 @@ No job starts while any limit is exceeded:
 | Running per kind (`[limits.max_running]`) | build 32, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1 |
 | Running in total (`max_running_total`) | 69 |
 | Free disk | a floor per kind (`[limits.disk_floor]`), read live from `limits.env` through `common/util/diskguard.py` |
-| Machine | maximum load, minimum available memory, ceiling on `/tmp` inodes |
+| Machine | maximum load, minimum available memory, ceiling on `/tmp` inodes (from the monitor's latest sample while it is under 2 minutes old, otherwise measured) |
 | Per task | one build, gate, re-gate, regrade or rescore at a time; a task's trial runs may run together |
 
 Further rules:
@@ -188,6 +188,8 @@ Adoption adds two more tables:
 - `adoptions`: one row per import, with its counts, conflicts and differences.
 - `tasks`: each task's stage, next step and facts at the last adoption.
 
+The monitor adds `metrics` (one row per sample) and `monitor_alerts` (raised and cleared threshold crossings).
+
 Exit codes:
 - `0` → `done`.
 - An exit code listed in `[retry_exit_codes]` → requeued, or blocked once the attempts are used up.
@@ -200,12 +202,14 @@ python3 common/queue/cweq.py init
 python3 common/queue/cweq.py adopt [--dry-run] [--detail]
 python3 common/queue/cweq.py tasks [--stage S] [--next TEXT]
 python3 common/queue/cweq.py reconcile [--once] [--dry-run] [--task SLUG]
-python3 common/queue/cweq.py dispatch  [--once] [--dry-run [--with-reconcile]] [-v]
+python3 common/queue/cweq.py dispatch  [--once] [--dry-run [--with-reconcile]] [-v] [--skip-preflight]
 python3 common/queue/cweq.py status
 python3 common/queue/cweq.py enqueue KIND TASK [--args JSON] [--priority N] [--after ID]...
 python3 common/queue/cweq.py retry ID          # also re-opens jobs blocked because this one failed
 python3 common/queue/cweq.py block ID [--why TEXT]
 python3 common/queue/cweq.py explain TASK      # what the rules see for the task, and all its jobs
+python3 common/queue/cweq.py monitor [--once] [--dry-run]   # machine samples, forecasts and alerts
+python3 common/queue/cweq.py preflight       # read-only setup checks; exit 2 = critical
 ```
 
 Options before the command: `--db PATH`, and `--config PATH` (or `$CWEQ_CONFIG`).
@@ -214,6 +218,49 @@ Options before the command: `--db PATH`, and `--config PATH` (or `$CWEQ_CONFIG`)
 - `pipelines/router/status_report.py` reads the queue for its status line: per kind, the running jobs, the work
   started outside the queue, and the queued jobs.
 
+## Monitoring and preflight
+
+**Resource monitor** (`common/queue/monitor.py`, `cweq monitor`). It samples the machine every minute into the
+`metrics` table:
+- CPU busy share, load, available memory and swap;
+- free disk and inodes on the repository's file system, and `/tmp` inodes;
+- Docker containers (all and running), images and build-cache size;
+- running jobs per kind, with work started outside the queue shown as `+kind`.
+
+`docker system df` is slow on a large image store, so it runs in the background every 10 minutes, and each sample
+carries its last result.
+
+Each sample also carries a forecast:
+- the disk burn rate in GB per hour, a least-squares fit over the last hour of samples;
+- the hours until free disk reaches the admission floor at that rate;
+- the same for inodes.
+
+Thresholds in `[monitor]` turn crossings into rows of `monitor_alerts`: a `raised` row when a value crosses its
+threshold, and a `cleared` row when it comes back. Nothing more is written while a value stays on the same side.
+
+Two automatic effects:
+- **Disk forecast.** When free disk is forecast to reach its floor within `disk_floor_within_h`, the monitor queues
+  one extra `cleanup` job per UTC hour.
+- **Admission.** The dispatcher's admission reads the latest sample while it is fresh.
+
+Samples are kept for `retention_days`.
+
+**Preflight** (`common/queue/preflight.py`, `cweq preflight`). Read-only checks of the machine's setup:
+- the Docker daemon answers;
+- `daemon.json`: shutdown timeout, open-file limit, container log rotation;
+- the Docker client and compose timeouts, and BuildKit, in `common/gate/docker-tuning.env`;
+- the local Harbor patches (`common/trial/harbor/README.md`);
+- image reuse is wired in;
+- gate limits and disk floors are set;
+- model credentials are present (values are never read into the report);
+- tool versions;
+- disk, memory and inode headroom;
+- the queue loops are running.
+
+Each check reports OK, NEEDS APPLYING with the exact change, or CRITICAL. Changes that need root or a Docker restart
+are reported, never applied. `cweq dispatch` refuses to start while a check is critical, unless it is given
+`--skip-preflight`.
+
 ## Operations
 
 Start (from the repository root, one of each):
@@ -221,7 +268,10 @@ Start (from the repository root, one of each):
 ```
 setsid nohup python3 -I -u common/queue/cweq.py reconcile >> ~/.tb-graders/cwe/queue-logs/reconcile.log 2>&1 < /dev/null &
 setsid nohup python3 -I -u common/queue/cweq.py dispatch  >> ~/.tb-graders/cwe/queue-logs/dispatch.log  2>&1 < /dev/null &
+setsid nohup python3 -I -u common/queue/cweq.py monitor   >> ~/.tb-graders/cwe/queue-logs/monitor.log   2>&1 < /dev/null &
 ```
+
+Run `cweq preflight` first; `dispatch` runs it itself and refuses to start on a critical result.
 
 Taking over from per-batch schedulers:
 1. Adopt (`cweq adopt --dry-run`, then `cweq adopt`) with zero conflicts.
