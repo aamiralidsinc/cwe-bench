@@ -4,6 +4,7 @@ These rules replace pipelines/router/scale_queue.py. They look only at tasks lis
 (pipelines/router/out/batches/*.txt, or the batches named in [phase3] batches), the same input the scheduler had.
 
   P1  stage waiting_build or build_interrupted, and build/<slug>/BUILD-PROMPT.md exists     -> build {}
+      (a build whose builder was paused and cut by its overdue timer is resumed by kind build_resume instead)
       (one build job per task, ever: a failed or declined build is final; `cweq retry` is a person's decision)
   P2  stage waiting_trials -> per model without a verdict (not stuck, not held by hold_<model>):
         no graded run yet, or one run left      -> one trial_run with --max-runs <left>      (early abort at a solve)
@@ -58,7 +59,9 @@ def wants(t, cfg, conn, ctx_ledger=None):
     if not t["batch"] or (allowed and t["batch"] not in allowed):
         return out, notes
     if stage in ("waiting_build", "build_interrupted"):
-        if (paths.BUILD / slug / "BUILD-PROMPT.md").is_file():
+        if t.get("paused_build"):
+            notes.append("builder was paused and cut by its timer: resumed by kind build_resume, never rebuilt")
+        elif (paths.BUILD / slug / "BUILD-PROMPT.md").is_file():
             out.append({"kind": "build", "args": {}})
         else:
             notes.append("no BUILD-PROMPT.md: not built")

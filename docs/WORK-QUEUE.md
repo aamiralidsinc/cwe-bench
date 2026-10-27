@@ -137,6 +137,11 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
   - Job arguments carry the task version (the SOUND gate's fingerprint), so a new version starts fresh.
   - After `max_launches` launch groups end without a verdict, the model is reported for a person.
 - **Stale gate.** A sound task whose files changed since its gate gets a `regate`.
+- **Paused build.** A builder that ended with exit 124 long after its time limit (more than 25 % over) was paused and
+  cut by its overdue timer when it resumed; it is not a timeout. Its stage is `build_interrupted` and it gets one
+  `build_resume` job (`common/queue/kinds/build_resume.py`): the builder continues in its own session through
+  `resume_pipeline.sh`, then the post-build gate runs as usual. Such a build never gets a fresh `build` job, which
+  would wipe `tasks/<slug>/`. Stacking builds have no resume script and are reported for a person.
 - Workers run the pipeline's own commands:
   - build: `run_stack_pipeline.sh` or `run_pipeline.sh`;
   - trial: `trial.py --no-verdict --first-run N --max-runs K`, with the agent time-limit multiplier from
@@ -445,6 +450,16 @@ Taking over from per-batch schedulers:
    exits once the jobs it started have ended. Those jobs run in their own sessions and finish undisturbed.
 3. Start the queue. From then on the queue starts every next step, including the gate and trials after a build the
    scheduler started. It counts the scheduler's remaining work against its limits.
+
+Pausing safely:
+- **Pause by stopping new starts, never by freezing running work.** Use `enabled = false` in `queue.toml`, stop the
+  `cweq.py dispatch` loop, or raise the diskguard floors in `limits.env`. Running builds, gates and trials then finish
+  on their own while nothing new starts.
+- **Never send SIGSTOP to a builder, gate or trial.** A stopped process keeps its timers running against the wall
+  clock: a builder frozen for longer than its 5 h limit is killed by `timeout` the moment it is resumed.
+- **Detection.** The monitor raises `process_frozen` and an urgent `process.frozen` event when a pipeline process stays
+  stopped for `frozen_after_sec` (default 120 s); `cweq preflight` reports any stopped one as CRITICAL. A build cut
+  this way is classified as interrupted and resumed in its own session (Paused build, above).
 
 Switching it off:
 - **Stop new starts:** set `enabled = false` in `queue.toml`. The dispatcher still reaps stale workers but starts

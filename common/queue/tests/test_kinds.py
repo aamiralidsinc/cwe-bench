@@ -66,7 +66,7 @@ def test_builtin_declarations_give_the_defaults(tmp_path, root):
     assert set(cfg["dispatch"]["light_kinds"]) == {"audit_prep", "audit_record", "cleanup", "step3", "lint"}
     assert set(cfg["dispatch"]["count_foreign"]) == {"build", "trial_run", "regate", "fairness"}
     assert "gate" not in cfg["limits"]["max_running"]           # declared without a worker
-    assert kinds.exclusive() == {"build", "gate", "regate", "regrade", "rescore", "fairness"}
+    assert kinds.exclusive() == {"build", "build_resume", "gate", "regate", "regrade", "rescore", "fairness"}
     assert kinds.foreign_map() == {"build": "build", "trial": "trial_run", "regate": "regate", "fairness": "fairness"}
 
 

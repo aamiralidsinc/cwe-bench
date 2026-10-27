@@ -17,6 +17,8 @@ Each sample (table `metrics`):
   disk_burn_gb_h     free-disk loss per hour over the last [monitor] window_min (least squares; negative = growing)
   disk_floor_h       hours until free disk reaches limits.min_free_disk_gb at that rate (NULL when not shrinking)
   inode_burn_pct_h, inode_full_h   the same for root inodes, towards 100 %
+  stopped_procs      pipeline processes (builders, gates, trials) stopped by SIGSTOP for [monitor] frozen_after_sec
+                     (frozen.py); raises `process_frozen` and an urgent `process.frozen` event naming the tasks
 
 Alerts (table `monitor_alerts`): a row when a value crosses its [monitor] threshold (state 'raised') and when it comes
 back (state 'cleared'); nothing is written while it stays on the same side. A disk forecast below
@@ -42,7 +44,8 @@ CREATE TABLE IF NOT EXISTS metrics (
     free_disk_gb       REAL, root_inode_pct REAL, tmp_inode_pct REAL,
     containers         INTEGER, containers_running INTEGER, images INTEGER, build_cache_gb REAL,
     jobs               TEXT,                     -- JSON {kind: running}
-    disk_burn_gb_h     REAL, disk_floor_h REAL, inode_burn_pct_h REAL, inode_full_h REAL
+    disk_burn_gb_h     REAL, disk_floor_h REAL, inode_burn_pct_h REAL, inode_full_h REAL,
+    stopped_procs      INTEGER                   -- pipeline processes frozen (SIGSTOP) for frozen_after_sec
 );
 CREATE INDEX IF NOT EXISTS metrics_epoch ON metrics (epoch);
 CREATE TABLE IF NOT EXISTS monitor_alerts (
@@ -60,10 +63,10 @@ DEFAULTS = {"tick_sec": 60, "window_min": 60, "fresh_sec": 120, "images_every_se
             "docker_df_every_sec": 3600, "docker_timeout_sec": 1800, "once_wait_sec": 120,
             "retention_days": 7, "disk_free_gb_warn": 300, "load_warn": 200, "mem_available_gb_warn": 40,
             "tmp_inode_pct_warn": 85, "root_inode_pct_warn": 85, "disk_floor_within_h": 6, "inode_full_within_h": 12,
-            "cleanup_on_forecast": True}
+            "cleanup_on_forecast": True, "frozen_after_sec": 120}
 METRIC_COLS = ("cpu_busy_pct", "load1", "mem_available_gb", "swap_used_gb", "free_disk_gb", "root_inode_pct",
                "tmp_inode_pct", "containers", "containers_running", "images", "build_cache_gb", "jobs",
-               "disk_burn_gb_h", "disk_floor_h", "inode_burn_pct_h", "inode_full_h")
+               "disk_burn_gb_h", "disk_floor_h", "inode_burn_pct_h", "inode_full_h", "stopped_procs")
 
 
 def settings(cfg):
@@ -72,6 +75,9 @@ def settings(cfg):
 
 def ensure_schema(conn):
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(metrics)")}
+    if "stopped_procs" not in cols:                        # tables made before the frozen-process check
+        conn.execute("ALTER TABLE metrics ADD COLUMN stopped_procs INTEGER")
 
 
 def has_table(conn, name):
@@ -193,8 +199,10 @@ def burn(points):
 
 
 class Monitor:
-    def __init__(self, conn, cfg, root, proc_list=None, now=time.time, docker=True, wait_df=False):
+    def __init__(self, conn, cfg, root, proc_list=None, now=time.time, docker=True, wait_df=False, frozen_scan=None):
+        import frozen
         self.conn, self.cfg, self.root = conn, cfg, str(root)
+        self.tracker = frozen.Tracker(frozen_scan or frozen.scan)
         self.s = settings(cfg)
         self.proc_list, self.now, self.docker = proc_list, now, docker
         self.wait_df = wait_df                            # one-shot runs wait briefly for the Docker probes; the loop never
@@ -274,8 +282,14 @@ class Monitor:
             self.poll_probes(t)
             m.update(self.last)
         m["jobs"] = json.dumps(jobs_running(self.conn, self.proc_list), sort_keys=True)
+        self.add_frozen(m, t)
         self.forecast(m)
         return m
+
+    def add_frozen(self, m, t):
+        """stopped_procs (count) and _frozen (details, not stored) for processes stopped >= frozen_after_sec."""
+        fz = self.tracker.frozen(t, self.s["frozen_after_sec"])
+        m["stopped_procs"], m["_frozen"] = len(fz), fz
 
     def history(self, since):
         if not has_table(self.conn, "metrics"):
@@ -323,6 +337,11 @@ class Monitor:
         add("root_inodes_high", m.get("root_inode_pct"), s["root_inode_pct_warn"],
             m.get("root_inode_pct") is not None and m["root_inode_pct"] > s["root_inode_pct_warn"],
             f"root inodes {m.get('root_inode_pct')}% above {s['root_inode_pct_warn']}%")
+        fz = m.get("_frozen") or []
+        add("process_frozen", m.get("stopped_procs"), 0, bool(m.get("stopped_procs")),
+            f"{m.get('stopped_procs')} pipeline process(es) frozen (SIGSTOP) for >= {s['frozen_after_sec']} s: "
+            + ", ".join(sorted({f"{p.get('task') or '?'} (pid {p['pid']})" for p in fz}))[:300]
+            + "; their timers keep running: resume them or stop them, and pause by stopping new starts instead")
         add("inodes_full_soon", m.get("inode_full_h"), s["inode_full_within_h"],
             m.get("inode_full_h") is not None and m["inode_full_h"] < s["inode_full_within_h"],
             f"root inodes full in {m.get('inode_full_h')} h")
@@ -370,6 +389,14 @@ class Monitor:
                 self.conn.execute("INSERT INTO monitor_alerts (ts, name, state, value, threshold, message) "
                                   "VALUES (?,?,?,?,?,?)", (m["ts"], name, state, value, thr, msg))
             self.conn.execute("DELETE FROM metrics WHERE epoch < ?", (m["epoch"] - 86400 * self.s["retention_days"],))
+        if any(n == "process_frozen" and st == "raised" for n, st, *_ in al):
+            import events
+            events.ensure(self.conn)
+            fz = m.get("_frozen") or []
+            events.emit(self.conn, "process.frozen", f"process.frozen:{m['ts']}",
+                        task=",".join(sorted({p.get("task") or "?" for p in fz}))[:200],
+                        payload={"processes": [{k: p[k] for k in ("pid", "task", "stopped_sec")} for p in fz][:50]},
+                        urgent=True)
         queued = []
         for r in resp:
             jid, created = qdb.enqueue(self.conn, r["kind"], r["task"], r["args"],

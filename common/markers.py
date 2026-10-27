@@ -75,6 +75,11 @@ MARKERS = {m.name: m for m in (
            "common/launch/run_build.sh, resume_pipeline.sh", "taskstate.py, scale_queue.py, orphan_builder_guard.sh"),
     Marker("build-exit.txt", "record", "Exit code of the last builder run.", "common/launch/run_build.sh",
            "run_pipeline.sh, run_stack_pipeline.sh, checks.py"),
+    Marker("resume_start_utc.txt", "record", "UTC start of the last resumed builder session (resume_pipeline.sh).",
+           "pipelines/sibling/6-build/resume_pipeline.sh", "common/util/agent_status.py, markers.build_paused"),
+    Marker("build_status.json", "record", "agent_status.py details of the last builder run (exit code, result, "
+           "wall_sec / limit_sec / paused_interrupt for an exit 124).", "common/util/agent_status.py (via the build "
+           "pipelines)", "markers.build_paused, people"),
     Marker("pipeline.log", "log", "Sibling build log; STOP / BUILD-INCOMPLETE / stopped/failed lines end a build.",
            "pipelines/sibling/6-build/run_pipeline.sh", "taskstate.py, scale_queue.py"),
     Marker("stack_pipeline.log", "log", "Stacking build log; same end lines as pipeline.log.",
@@ -195,6 +200,38 @@ def build_done(b):
         if any(x in t for x in END_LINES):
             return True
     return False
+
+
+PAUSED_FACTOR = 1.25          # common/util/agent_status.py LATE_FACTOR
+
+
+def _utc_epoch(p):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(read_text(p).strip().replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def build_paused(b, limit=None):
+    """True when the last builder run ended with exit 124 long after its limit (> 25 %): it was paused (SIGSTOP) and
+    its overdue timer fired on resume, so the build is resumable, not finished. Read from build_status.json
+    (paused_interrupt) when agent_status recorded it, else from the start / resume_start / end records."""
+    b = Path(b)
+    if read_text(b / "build-exit.txt").strip() != "124":
+        return False
+    try:
+        st = json.loads(read_text(b / "build_status.json") or "{}")
+    except ValueError:
+        st = {}
+    if st.get("paused_interrupt") is True:
+        return True
+    starts = [t for t in (_utc_epoch(b / "start_utc.txt"), _utc_epoch(b / "resume_start_utc.txt")) if t is not None]
+    end = _utc_epoch(b / "end_utc.txt")
+    if not starts or end is None or end < max(starts):
+        return False
+    lim = float(limit if limit is not None else st.get("limit_sec") or os.environ.get("BUILD_TIMEOUT") or 18000)
+    return end - max(starts) > PAUSED_FACTOR * lim
 
 
 def last_result(b):
