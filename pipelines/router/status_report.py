@@ -12,6 +12,7 @@ import collections, glob, json, os, re, subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (task-folder markers: common/markers.py)
 
 ROOT = str(paths.ROOT)
 os.chdir(ROOT)
@@ -40,7 +41,7 @@ def proc_has(s, pat):
 def gate_state(s):
     b = f"build/{s}"
     for m, k in ((".sound", "sound"), (".unsound", "unsound"), (".gate_error", "gate error"), (".listing_fail", "held at listing")):
-        if os.path.exists(f"{b}/{m}"):
+        if markers.has(markers.folder(s), m):
             return k
     logs = "".join(open(f"{b}/{f}", errors="replace").read() for f in ("stack_pipeline.log", "pipeline.log") if os.path.exists(f"{b}/{f}"))
     if proc_has(s, "regate.sh"):
@@ -49,8 +50,8 @@ def gate_state(s):
         return "builder declined (not buildable)"
     if "BUILD-INCOMPLETE" in logs:
         return "build incomplete"
-    if not os.path.exists(f"{b}/end_utc.txt"):
-        return "building" if os.path.exists(f"{b}/start_utc.txt") else "waiting to build"
+    if not markers.has(markers.folder(s), "end_utc.txt"):
+        return "building" if markers.has(markers.folder(s), "start_utc.txt") else "waiting to build"
     if proc_has(s, "postbuild.sh") or proc_has(s, "gate_one_ds.sh"):
         return "in post-build checks"
     return "waiting for re-gate"

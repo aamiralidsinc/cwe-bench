@@ -11,6 +11,7 @@
 # build/<slug>/end_utc.txt exists (the pipeline has recorded the build as ended). Blind-fix, listing,
 # fairness and trial agents have other prompts and are never touched. Log: build/audit/orphan_builder_guard.log
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 cd "$CWE_ROOT" || exit 1
 IV=${1:-60}; LOG=build/audit/orphan_builder_guard.log
 echo "$(date -u +%FT%TZ) guard start (every ${IV}s)" >> "$LOG"
@@ -19,14 +20,14 @@ while true; do
     a=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null) || continue
     case "$a" in *"Build one security-fix benchmark task"*) ;; *) continue ;; esac
     slug=$(printf '%s' "$a" | grep -o 'Task: `[^`]*`' | head -1 | sed 's/Task: `//; s/`//')
-    [ -n "$slug" ] && [ -f "build/$slug/end_utc.txt" ] || continue
+    [ -n "$slug" ] && cwe_has "build/$slug" end_utc.txt || continue
     # Only a builder that started BEFORE the recorded end is an orphan (a rebuild leaves an older end_utc.txt).
     pstart=$(date -d "$(ps -o lstart= -p "$p" 2>/dev/null)" +%s 2>/dev/null) || continue
-    bend=$(date -d "$(cat "build/$slug/end_utc.txt")" +%s 2>/dev/null) || continue
+    bend=$(date -d "$(cwe_read "build/$slug" end_utc.txt)" +%s 2>/dev/null) || continue
     [ "$pstart" -lt "$bend" ] || continue
     kids=$(pgrep -P "$p" | tr '\n' ' ')
     kill -TERM "$p" $kids 2>/dev/null; sleep 3; kill -9 "$p" $kids 2>/dev/null
-    echo "$(date -u +%FT%TZ) stopped orphaned builder of $slug (pid $p, build ended $(cat build/$slug/end_utc.txt))" >> "$LOG"
+    echo "$(date -u +%FT%TZ) stopped orphaned builder of $slug (pid $p, build ended $(cwe_read "build/$slug" end_utc.txt))" >> "$LOG"
   done
   sleep "$IV"
 done

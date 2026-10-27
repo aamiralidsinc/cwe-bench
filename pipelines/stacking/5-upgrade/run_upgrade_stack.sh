@@ -17,6 +17,7 @@
 #      5 upgraded but the listing check still FAILs after 2 rounds (kept, no .sound, .listing_fail).
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 SLUG=${1:?usage: pipelines/stacking/5-upgrade/run_upgrade_stack.sh SLUG}
 R="$CWE_ROOT"; cd "$R" || exit 2
 B=build/$SLUG; UL="$B/upgrade_stack.log"
@@ -24,7 +25,7 @@ log() { echo "$(date -u +%FT%TZ) $SLUG upgrade: $*" | tee -a "$UL"; }
 [ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via common/launch/drive.sh deepseek bash pipelines/stacking/5-upgrade/run_upgrade_stack.sh $SLUG"; exit 2; }
 case "$SLUG" in stk-*-control) echo "refused: $SLUG is a control; upgrade its stacked task"; exit 2;; stk-*) ;; *) echo "refused: not an stk- task"; exit 2;; esac
 [ -f "$B/manifest.json" ] && [ -f "tasks/$SLUG/instruction.md" ] || { echo "refused: no manifest or instruction"; exit 2; }
-[ -f "$B/.sound" ] || [ "${UPGRADE_FORCE:-0}" = 1 ] || { echo "refused: $SLUG is not gated sound (its container gate is what makes an instruction-only upgrade safe); re-gate it first, or UPGRADE_FORCE=1"; exit 2; }
+cwe_has "$B" .sound || [ "${UPGRADE_FORCE:-0}" = 1 ] || { echo "refused: $SLUG is not gated sound (its container gate is what makes an instruction-only upgrade safe); re-gate it first, or UPGRADE_FORCE=1"; exit 2; }
 CTL=$(python3 -c "import json,sys; print((json.load(open(sys.argv[1])).get('stacking') or {}).get('control_slug',''))" "$B/manifest.json")
 [ -n "$CTL" ] && [ -f "tasks/$CTL/instruction.md" ] || { echo "refused: no control task"; exit 2; }
 # Our own ancestors never count as busy: run_stack_pipeline.sh calls this script for its own slug, and before
@@ -102,11 +103,11 @@ done
 
 V=$(cat "$B/VERSION")
 if [ "$LST" -ne 0 ]; then
-  for s in "$SLUG" "$CTL"; do rm -f "build/$s/.sound"; touch "build/$s/.listing_fail"; done
+  for s in "$SLUG" "$CTL"; do cwe_unmark "build/$s" .sound; touch "build/$s/.listing_fail"; done
   echo "upgraded to $V but the listing check still FAILs after 2 rounds; not sound (v1 is in the snapshot)" > "$B/upgrade_stack_status.txt"
   log "$(cat "$B/upgrade_stack_status.txt")"; exit 5
 fi
-for s in "$SLUG" "$CTL"; do rm -f "build/$s/.listing_fail" "build/$s/.listing_warn"; echo "$V $(date -u +%FT%TZ)" > "build/$s/.upgraded"; done
+for s in "$SLUG" "$CTL"; do cwe_unmark "build/$s" .listing_fail .listing_warn; echo "$V $(date -u +%FT%TZ)" | cwe_write_atomic "build/$s/.upgraded"; done
 echo "upgraded to $V; listing PASS; static ok on both; ready for re-trial" > "$B/upgrade_stack_status.txt"
 log "$(cat "$B/upgrade_stack_status.txt")"
 exit 0

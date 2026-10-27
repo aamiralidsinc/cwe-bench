@@ -43,14 +43,15 @@ import paths  # noqa: E402
 sys.path.insert(0, str(paths.COMMON / "fairness"))
 sys.path.insert(0, str(paths.COMMON / "gate"))
 
+import markers  # noqa: E402  (task-folder markers: common/markers.py)
 import qdb  # noqa: E402
 
 SLACK = 2.0
-RESULT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) \S+ RESULT: (.*)$")
+RESULT_RE = markers.RESULT_RE
 STAMP_RE = re.compile(r"^(regrade|postmortem)-(\d{8}T\d{6}Z)$")
 RUN_ROW = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\t\S+\treward=(\S+)\t.*\t(\S+)$")
-BUILD_STOP = ("STOP:", "BUILD-INCOMPLETE", "stopped/failed")
-GATE_MARKERS = (".sound", ".unsound", ".gate_error", ".listing_fail", ".gate_passed", ".hold-repair")
+BUILD_STOP = markers.END_LINES
+GATE_MARKERS = markers.STATE_FLAGS
 TOOLS = {"regrade": "common/audit/regrade_from_code.py", "rescore": "common/audit/rescore_from_results.py"}
 
 SCHEMA = """
@@ -150,12 +151,7 @@ def c_regrade(task, a, t0, cfg, rescore=False):
 
 
 def last_result(b):
-    ts = text = None
-    for line in read(b / "postbuild.log").splitlines():
-        m = RESULT_RE.match(line)
-        if m:
-            ts, text = qdb.parse_utc(m.group(1)), m.group(2)
-    return ts, text
+    return markers.last_result(b)
 
 
 def c_regate(task, a, t0, cfg):
@@ -163,9 +159,9 @@ def c_regate(task, a, t0, cfg):
     ts, text = last_result(b)
     out = [("regate.result", bool(ts and ts >= t0 - SLACK and text and text.startswith("SOUND")),
             f"last RESULT {qdb.utc(ts) if ts else '-'}: {text or '-'}", False)]
-    marker = (b / ".sound").exists() or (b / ".hold-repair").exists()
+    marker = markers.has(b, ".sound") or markers.has(b, ".hold-repair")
     out.append(("regate.marker", marker, "present" if marker else "neither .sound nor .hold-repair", False))
-    fp = jload(b / "gate_fingerprint.json") or {}
+    fp = jload(markers.path(b, "gate_fingerprint.json")) or {}
     w = qdb.parse_utc(fp.get("written_utc"))
     fresh = bool(w and w >= t0 - SLACK)
     current = False
@@ -182,7 +178,7 @@ def c_regate(task, a, t0, cfg):
 
 def c_build(task, a, t0, cfg):
     b = paths.BUILD / task
-    end, start = read(b / "end_utc.txt").strip(), read(b / "start_utc.txt").strip()
+    end, start = markers.read_text(markers.path(b, "end_utc.txt")).strip(), markers.read_text(markers.path(b, "start_utc.txt")).strip()
     e = qdb.parse_utc(end)
     ended = bool(e and e >= t0 - SLACK and (not start or end >= start))
     out = [("build.ended", ended, f"start {start or '-'} end {end or '-'}", False)]
@@ -199,12 +195,12 @@ def c_build(task, a, t0, cfg):
 
 def c_trial(task, a, t0, cfg):
     m = a.get("model", "")
-    if (paths.BUILD / task / f"hold_{m}").exists():
+    if markers.model_held(paths.BUILD / task, m):
         return [("trial_run.rows", True, f"hold_{m}: no run expected", False)]
     first, k = int(a.get("first_run", 1)), int(a.get("max_runs", 1))
     want = set(range(first, first + k))
     runs = []
-    for line in read(paths.BUILD / task / f"runs_{m}.log").splitlines():
+    for line in markers.read_text(markers.runs_log(paths.BUILD / task, m)).splitlines():
         r = RUN_ROW.match(line)
         if not r:
             continue

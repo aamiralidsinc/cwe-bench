@@ -7,6 +7,7 @@
 # folders of the real current version were hidden from audit_results.py in the experiment dir.
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 SLUG=${1:?usage: restore_snapshot.sh SLUG "<why>"}; WHY=${2:-unspecified}
 cd "$CWE_ROOT" || exit 1
 B=build/$SLUG; JOBS="$HOME/.tb-graders/cwe/jobs"
@@ -23,7 +24,7 @@ rm -rf "$B/checks"; [ -d "$dest/build/checks" ] && cp -a "$dest/build/checks" "$
 for f in manifest.json notes.md FAIRNESS.md VERSION .sound .unsound .gate_error .auto_trialed \
          runs_deepseek.log runs_mimo.log trial_detail.json trial_detail_deepseek.json \
          trial_detail_mimo.json auto_trial.out trial_deepseek.out trial_mimo.out; do
-  rm -f "$B/$f"; [ -e "$dest/build/$f" ] && cp -a "$dest/build/$f" "$B/$f"
+  cwe_unmark "$B" "$f"; [ -e "$dest/build/$f" ] && cp -a "$dest/build/$f" "$B/$f"
 done
 echo "$ver" > "$B/VERSION"
 n=0

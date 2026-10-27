@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (task-folder markers: common/markers.py)
 
 ROOT = paths.ROOT
 RUN = paths.RUN_TRIAL
@@ -147,7 +148,7 @@ def one_run(model, task_dir, idx):
                           env=dict(os.environ, CWE_TASK=task_dir.name, CWE_MODEL=model, CWE_RUN=str(idx)))
     wall = round(time.time() - t0)
     rec = {"job": name, "wall_s": wall, "harbor_rc": proc.returncode, "reward": None, "cause": None}
-    if proc.returncode == 3 and (ROOT / "build" / task_dir.name / f"hold_{model}").exists():
+    if proc.returncode == 3 and markers.model_held(markers.folder(task_dir.name), model):
         # run_trial.sh refused: a hold file appeared mid-loop. Not a run, not an infra error.
         rec["cause"], rec["held"] = "held (build/<task>/hold_<model> exists)", True
         return rec
@@ -217,7 +218,7 @@ def one_run(model, task_dir, idx):
     rec.update(keep_or_release(trial, task_dir.name, model, name, rec.get("reward")))
     # Append an ordered pointer so the LATEST run for this task/model is
     # unambiguous — read THIS, never a glob of all historical job dirs.
-    ptr = ROOT / "build" / task_dir.name / f"runs_{model}.log"
+    ptr = markers.runs_log(markers.folder(task_dir.name), model)
     ptr.parent.mkdir(parents=True, exist_ok=True)
     with open(ptr, "a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tn{RUN_SEQ[0]:03d}\treward={rec['reward']}\t"
@@ -250,7 +251,7 @@ def main():
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     # A hold file blocks new launches for that task/model (e.g. it was already started
     # by hand while an orchestrator still had it queued). Delete the file to release.
-    held = [m for m in models if (ROOT / "build" / args.slug / f"hold_{m}").exists()]
+    held = [m for m in models if markers.model_held(markers.folder(args.slug), m)]
     if held:
         print(f"[trial] {args.slug}: held for {','.join(held)} "
               f"(build/{args.slug}/hold_<model> exists); not starting.")

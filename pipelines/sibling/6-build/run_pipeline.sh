@@ -1,5 +1,6 @@
 #!/bin/bash
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 . "$CWE_DOCKER_TUNING" 2>/dev/null || true
 # run_pipeline.sh <deepseek|mimo> <slug>
 # One candidate, end to end, model-driven generation + both-target trial:
@@ -24,7 +25,7 @@ log(){ printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$S" "$1" "$2" "${
 echo "=== $(date -u +%FT%TZ) build $S (driver=$D) ===" >> "$LOG"
 "$CWE_DRIVE" "$D" bash "$CWE_RUN_BUILD" "$S" >> "$LOG" 2>&1
 tf=$(find "tasks/$S" -type f 2>/dev/null | wc -l | tr -d ' ')
-bx=$(cat "build/$S/build-exit.txt" 2>/dev/null || echo '-')
+bx=$(cwe_read "build/$S" build-exit.txt || echo '-')
 # A builder cut off by a quota/API error/timeout produced no verdict on the candidate, and a
 # half-built task must not be gated (it would read as "unsound"). Until 2026-10-20 a quota stop
 # was logged exactly like a real build failure.

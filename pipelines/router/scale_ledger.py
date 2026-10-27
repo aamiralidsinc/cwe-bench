@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (task-folder markers: common/markers.py)
 ROOT = paths.ROOT; os.chdir(ROOT)
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 OUT = ROOT / "reports" / "scale-run"; OUT.mkdir(parents=True, exist_ok=True)
@@ -42,13 +43,13 @@ def step_of(slug, batch_line):
 def gate(slug):
     b = ROOT / "build" / slug
     for m, k in ((".sound", "sound"), (".unsound", "unsound"), (".gate_error", "gate error"), (".listing_fail", "listing hold")):
-        if (b / m).exists():
+        if markers.has(b, m):
             return k
     logs = "".join((b / f).read_text(errors="replace") for f in ("stack_pipeline.log", "pipeline.log") if (b / f).exists())
     if "STOP: no manifest" in logs:
         return "declined by builder"
-    if not (b / "end_utc.txt").exists():
-        return "building" if (b / "start_utc.txt").exists() else "queued"
+    if not markers.has(b, "end_utc.txt"):
+        return "building" if markers.has(b, "start_utc.txt") else "queued"
     return "checks or re-gate pending"
 
 

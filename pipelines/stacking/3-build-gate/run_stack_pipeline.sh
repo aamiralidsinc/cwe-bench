@@ -19,6 +19,7 @@
 # Progress: build/SLUG/stack_pipeline.log (one line per step). Exit 0 = SLUG marked sound (the control may or may not be).
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
+. "$CWE_COMMON/markers.sh"     # marker helpers (common/markers.py, docs/STAGE-CONTRACTS.md)
 SLUG=${1:?usage: run_stack_pipeline.sh SLUG}
 R="$CWE_ROOT"; cd "$R" || exit 1
 L="build/$SLUG/stack_pipeline.log"; mkdir -p "build/$SLUG"
@@ -27,7 +28,7 @@ gate_ok() { python3 -c "import json,sys; sys.exit(0 if json.load(open('build/$1/
 
 log "build: start (DeepSeek via common/launch/drive.sh)"
 "$CWE_DRIVE" deepseek bash common/launch/run_build.sh "$SLUG" >> "$L" 2>&1
-log "build: exit $(cat "build/$SLUG/build-exit.txt" 2>/dev/null || echo none)"
+log "build: exit $(cwe_read "build/$SLUG" build-exit.txt || echo none)"
 [ -f "build/$SLUG/manifest.json" ] || { log "STOP: no manifest after build"; exit 1; }
 
 python3 -I pipelines/stacking/3-build-gate/normalize_expect.py "$SLUG" >> "$L" 2>&1 || true
@@ -49,7 +50,7 @@ case $PRC in
      log "LISTING: instruction lists hidden traps; instruction-only rewrite (5-upgrade)"
      UPGRADE_FORCE=1 "$CWE_DRIVE" deepseek bash pipelines/stacking/5-upgrade/run_upgrade_stack.sh "$SLUG" >> "$L" 2>&1; URC=$?
      if [ "$URC" = 0 ] && python3 -I common/gate/fingerprint.py check "$SLUG" >> "$L" 2>&1; then
-       rm -f "build/$SLUG/.listing_fail"; touch "build/$SLUG/.sound"
+       cwe_unmark "build/$SLUG" .listing_fail; touch "build/$SLUG/.sound"   # touch: also refreshes an existing .sound
        log "SOUND: $SLUG ready for trials (instruction rewritten, listing PASS)"
      else
        log "LISTING: rewrite exit $URC; $SLUG stays .listing_fail for a person (see build/$SLUG/upgrade_stack.log)"; exit 3
