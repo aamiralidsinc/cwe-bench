@@ -53,7 +53,7 @@ def test_docker_labels_from_the_environment(tmp_path):
                    "cwe.run": "1", "cwe.code_version": "abc12345", "cwe.started_by": "cweq",
                    "cwe.session": "t-s2__AbC__env"}
     f = cwe_labels.write_compose(tmp_path / "x" / "labels.json", lab)
-    assert json.loads(f.read_text()) == {"services": {"main": {"labels": lab}}}
+    assert json.loads(f.read_text()) == {"services": {"main": {"labels": lab, "logging": cwe_labels.LOGGING}}}
 
 
 def test_runs_outside_the_queue_still_carry_their_task():
@@ -152,3 +152,13 @@ def test_orphans_lists_what_no_live_job_owns(conn):
     assert [c["id"] for c in res["containers_job_ended"]] == ["b1"]
     assert [c["id"] for c in res["containers_unlabelled"]] == ["c1"]
     assert [p["pid"] for p in res["processes_job_ended"]] == [101]
+
+
+def test_compose_override_rotates_container_logs(tmp_path):
+    lab = cwe_labels.labels({}, "s1", "t-s2")
+    d = json.loads(cwe_labels.write_compose(tmp_path / "a.json", lab, extra_services=[cwe_labels.EGRESS_SIDECAR])
+                   .read_text())["services"]
+    assert d["main"]["logging"] == cwe_labels.LOGGING and d["main"]["labels"] == lab
+    assert d[cwe_labels.EGRESS_SIDECAR] == {"logging": cwe_labels.LOGGING}   # only logging: never a new service body
+    off = json.loads(cwe_labels.write_compose(tmp_path / "b.json", lab, logging=None).read_text())["services"]
+    assert "logging" not in off["main"] and list(off) == ["main"]

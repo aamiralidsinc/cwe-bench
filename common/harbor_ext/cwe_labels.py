@@ -9,6 +9,8 @@ not patched. Containers then map back to their job:
 
 cwe.started_by is `cweq` for a queue job and `script` for a run started by any other launcher (no CWE_JOB_ID);
 cwe.task falls back to Harbor's environment name, so every pipeline container carries at least its task.
+The same override sets json-file log rotation (50 MB x 3) on `main` and on Harbor's egress-control sidecar when that
+compose file is in the list (CWE_LOG_ROTATE=0 leaves logging to the daemon default).
 """
 from __future__ import annotations
 
@@ -43,8 +45,21 @@ def labels(environ, session_id: str = "", environment_name: str = "") -> dict[st
     return out
 
 
-def write_compose(path: Path, lab: dict[str, str], service: str = "main") -> Path:
-    """A compose override (JSON is valid compose YAML) that adds `lab` to one service."""
+# Container log rotation for every pipeline container, set per container so it applies without restarting Docker
+# (the daemon-wide default in /etc/docker/daemon.json needs a restart that stops all running work).
+LOGGING = {"driver": "json-file", "options": {"max-size": "50m", "max-file": "3"}}
+EGRESS_SIDECAR = "harbor-docker-egress-control-sidecar"   # Harbor's sidecar in docker-compose-egress-control.yaml
+
+
+def write_compose(path: Path, lab: dict[str, str], service: str = "main", extra_services=(),
+                  logging: dict | None = LOGGING) -> Path:
+    """A compose override (JSON is valid compose YAML): `lab` on `service`, and log rotation on `service` and on
+    every service in extra_services (only services the other compose files define: an override cannot add one)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"services": {service: {"labels": lab}}}, sort_keys=True))
+    services = {service: {"labels": lab}}
+    if logging:
+        services[service]["logging"] = logging
+        for s in extra_services:
+            services[s] = {"logging": logging}
+    path.write_text(json.dumps({"services": services}, sort_keys=True))
     return path

@@ -257,9 +257,16 @@ def c_cleanup(task, a, t0, cfg):
     return [("cleanup.pass_done", ok, "pass done logged" if ok else "no 'pass done' line since the job started", False)]
 
 
+def c_lint(task, a, t0, cfg):
+    import lintstep
+    f = lintstep.out_path(task, a.get("fp", ""))
+    mt = mtime(f)
+    return [("lint.result", bool(mt and mt >= t0 - SLACK), f"{f.name} {qdb.utc(mt) if mt else 'missing'}", False)]
+
+
 CHECKS = {"regrade": c_regrade, "rescore": lambda t, a, t0, c: c_regrade(t, a, t0, c, rescore=True),
           "regate": c_regate, "build": c_build, "trial_run": c_trial, "audit_prep": c_audit_prep,
-          "audit_record": c_audit_record, "fairness": c_fairness, "cleanup": c_cleanup}
+          "audit_record": c_audit_record, "fairness": c_fairness, "cleanup": c_cleanup, "lint": c_lint}
 
 
 def evaluate(row, cfg):

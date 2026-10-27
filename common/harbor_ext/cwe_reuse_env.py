@@ -28,7 +28,7 @@ from pathlib import Path
 
 from harbor.environments.docker.docker import DockerEnvironment
 
-from cwe_labels import labels as cwe_labels, write_compose as write_labels_compose
+from cwe_labels import EGRESS_SIDECAR, LOGGING, labels as cwe_labels, write_compose as write_labels_compose
 from cwe_reuse_tag import build_cmd, lock_path, reuse_tag, touch_used
 
 
@@ -79,8 +79,8 @@ async def ensure_image(ctx, tag: str, logger=None) -> None:
 class ReuseDockerEnvironment(DockerEnvironment):
     @property
     def _docker_compose_paths(self) -> list[Path]:
-        """Harbor's compose files plus one labels override for `main` (cwe_labels.py). Last in the list, so it only
-        adds labels. CWE_LABELS=0 leaves Harbor's list as it is."""
+        """Harbor's compose files plus one override (cwe_labels.py): labels on `main`, and log rotation on `main` and
+        the egress sidecar. Last in the list, so it only adds. CWE_LABELS=0 leaves Harbor's list as it is."""
         paths = list(super()._docker_compose_paths)
         if os.environ.get("CWE_LABELS", "1") == "0" or getattr(self, "_is_windows_container", False):
             return paths
@@ -89,7 +89,9 @@ class ReuseDockerEnvironment(DockerEnvironment):
             d = tempfile.mkdtemp(prefix="cwe-labels-")
             lab = cwe_labels(os.environ, getattr(self, "session_id", "") or "",
                              getattr(self, "environment_name", "") or "")
-            f = write_labels_compose(Path(d) / "docker-compose-cwe-labels.json", lab)
+            extra = [EGRESS_SIDECAR] if any("egress-control" in Path(p).name for p in paths) else []
+            f = write_labels_compose(Path(d) / "docker-compose-cwe-labels.json", lab, extra_services=extra,
+                                     logging=None if os.environ.get("CWE_LOG_ROTATE", "1") == "0" else LOGGING)
             self._cwe_labels_path = f
         return paths + [f]
 

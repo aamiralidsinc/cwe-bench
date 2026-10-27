@@ -148,6 +148,13 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 - **Pseudo tasks.** `audit_record`, `cleanup` and `step3` run as the pseudo tasks `_ledger`, `_machine` and
   `_router`.
 
+### Task-quality lint (`common/queue/lintstep.py`)
+
+Every batch task that is SOUND on its gate gets one `lint` job per gate fingerprint: `common/lint/task_lint.py`
+over the task (`docs/TASK-QUALITY.md`), written to `build/<slug>/lint/<fp>.json` with its warning and note counts.
+It is warning-only and a light kind: it never holds a task slot, the start budget or the total, so it never delays
+a build, gate or trial. `cweq explain <task>` and the decisions inbox show the newest result.
+
 ### Delivery preparation (`common/queue/delivery.py`)
 
 A task gets one `delivery_prep` job per keep decision when all of these hold:
@@ -237,6 +244,9 @@ Further rules:
   2. It sends SIGTERM to the job's process group, then SIGKILL after the grace period.
   3. It removes every container of the job's compose projects, sidecars included.
   4. It marks the job `blocked`.
+- **Log rotation.** The same compose override sets json-file log rotation (50 MB x 3) on `main` and on Harbor's
+  egress-control sidecar, so every new pipeline container rotates its logs without a Docker daemon restart
+  (`CWE_LOG_ROTATE=0` leaves logging to the daemon default).
 
   Nothing is stopped by matching command lines.
 - **Labels on processes.** Every process a worker starts carries `CWE_JOB_ID`, `CWE_KIND`, `CWE_TASK`, `CWE_BATCH`,

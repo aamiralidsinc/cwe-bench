@@ -9,7 +9,8 @@ checked for the presence of non-empty *KEY* settings only.
 
 Checks:
   docker_daemon     the daemon answers (`docker version`)                                         CRITICAL if not
-  daemon_json       shutdown-timeout >= 60, default nofile >= 65536, json-file log rotation (log-opts max-size)
+  daemon_json       shutdown-timeout >= 60, default nofile >= 65536, json-file log rotation (log-opts max-size,
+                    or per container through the compose override in common/harbor_ext/cwe_labels.py)
   docker_tuning     common/gate/docker-tuning.env: COMPOSE_HTTP_TIMEOUT and DOCKER_CLIENT_TIMEOUT >= 300,
                     DOCKER_BUILDKIT=0, COMPOSE_DOCKER_CLI_BUILD=0; sourced by run_trial.sh and gate_one_ds.sh
   harbor_patches    the installed Harbor carries the teardown patch and the 300 s kernel-probe timeout
@@ -101,12 +102,27 @@ def check_daemon_json(s):
         missing.append(("nofile limit",
                         '"default-ulimits": {"nofile": {"Name": "nofile", "Soft": 1048576, "Hard": 1048576}}'))
     driver = d.get("log-driver", "json-file")
+    per_container = per_container_rotation()
+    rotation = d.get("log-opts")
     if driver in ("json-file", "local") and not (d.get("log-opts") or {}).get("max-size"):
-        missing.append(("container log rotation",
-                        '"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}'))
+        if per_container:
+            rotation = "per container (common/harbor_ext/cwe_labels.py; the daemon default is optional)"
+        else:
+            missing.append(("container log rotation",
+                            '"log-driver": "json-file", "log-opts": {"max-size": "50m", "max-file": "3"}'))
     if not missing:
-        return OK, f"shutdown-timeout {st}, nofile {nofile.get('Soft')}, log rotation {d.get('log-opts')}", None
+        return OK, f"shutdown-timeout {st}, nofile {nofile.get('Soft')}, log rotation {rotation}", None
     return NEEDS, "daemon.json lacks " + ", ".join(w for w, _ in missing), daemon_fix([j for _, j in missing])
+
+
+def per_container_rotation():
+    """True when every pipeline container gets json-file rotation from the compose override (cwe_labels.py), which
+    applies without restarting Docker."""
+    if os.environ.get("CWE_LOG_ROTATE", "1") == "0":
+        return False
+    lab = read(paths.COMMON / "harbor_ext" / "cwe_labels.py") or ""
+    env = read(paths.COMMON / "harbor_ext" / "cwe_reuse_env.py") or ""
+    return "max-size" in lab and "LOGGING" in env
 
 
 def daemon_fix(items):

@@ -64,8 +64,11 @@ def collect(conn, states, packages=None):
         st = t["stage"]
         if st == "awaiting_decision":
             q = quote(slug, "Human review")
+            import lintstep
+            lint = lintstep.line(slug)
             items["keep"].append({"task": slug, "summary": f"fairness {t['fairness'].split(':')[0]}; {scores(t)}",
-                                  "detail": f"Reviewer asks: {q}" if q else "No question from the reviewer."})
+                                  "detail": (f"Reviewer asks: {q}" if q else "No question from the reviewer.")
+                                  + (f" Task-quality {lint}." if lint else "")})
         elif st == "fairness_not_ready":
             q = quote(slug, "Required change", "Human review")
             items["not_ready"].append({"task": slug, "summary": f"{t['fairness'][:160]}; {scores(t)}",

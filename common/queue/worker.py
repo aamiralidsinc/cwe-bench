@@ -56,8 +56,9 @@ def command(row, cfg):
         drops = [x for d in a["drop"] for x in ("--drop", d)]
         return [sys.executable, "-I", "common/audit/rescore_from_results.py", trial, *drops, "--why", a["why"]]
     import delivery
+    import lintstep
     import phase4                                       # audit_prep, audit_record, fairness, cleanup, step3
-    argv = phase4.command(row, cfg) or delivery.command(row, cfg)
+    argv = phase4.command(row, cfg) or delivery.command(row, cfg) or lintstep.command(row, cfg)
     if argv:
         return argv
     raise ValueError(f"no worker for kind {k}")

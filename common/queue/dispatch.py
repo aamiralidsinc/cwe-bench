@@ -137,6 +137,8 @@ class Dispatcher:
         light = set(d.get("light_kinds", ()))             # bookkeeping kinds: outside the total and the machine limits
         for r in active:
             per_kind[r["kind"]] = per_kind.get(r["kind"], 0) + 1
+            if r["kind"] in light:                       # bookkeeping never holds a task's other work
+                continue
             per_task[r["task"]] = per_task.get(r["task"], 0) + 1
             if r["kind"] in EXCLUSIVE:
                 excl_task.add(r["task"])
@@ -202,12 +204,13 @@ class Dispatcher:
                 why = "admission closed: " + "; ".join(limits)
             elif cfg["limits"].get("disk_floor", {}).get(k) and not self.disk_ok(cfg["limits"]["disk_floor"][k]):
                 why = f"disk below its {k} floor ({cfg['limits']['disk_floor'][k]}, common/util/diskguard.py)"
-            elif len(starts) >= d["max_starts_per_tick"]:
+            elif k not in light and sum(1 for x, _ in starts if x["kind"] not in light) >= d["max_starts_per_tick"]:
                 why = "start budget of this tick used"
             else:
                 why = None
                 per_kind[k] = per_kind.get(k, 0) + 1
-                per_task[t] = per_task.get(t, 0) + 1
+                if k not in light:                       # bookkeeping holds no task slot and no start budget
+                    per_task[t] = per_task.get(t, 0) + 1
                 total += 0 if k in light else 1
             (starts if why is None else waits).append((r, why))
         return starts, waits
@@ -242,13 +245,18 @@ class Dispatcher:
             rep["started"] = [(r, "would start") for r, _ in starts]
             return rep
         d = self.cfg["dispatch"]
-        for i, (r, _) in enumerate(starts):
-            if i:
-                # Staggered starts: simultaneous container spin-up starves sshd. Longer pauses during the first fill.
-                pause = spacing(d.get("fill_spacing_sec", d["start_spacing_sec"]) if self.filling
-                                else d["start_spacing_sec"])
-                if pause:
-                    self.sleep(pause)
+        light = set(d.get("light_kinds", ()))
+        heavy_started = 0
+        for r, _ in starts:
+            if r["kind"] not in light:
+                if heavy_started:
+                    # Staggered starts: simultaneous container spin-up starves sshd. Longer pauses during the first
+                    # fill. Bookkeeping kinds start no containers and are not spaced.
+                    pause = spacing(d.get("fill_spacing_sec", d["start_spacing_sec"]) if self.filling
+                                    else d["start_spacing_sec"])
+                    if pause:
+                        self.sleep(pause)
+                heavy_started += 1
             if not qdb.claim(self.conn, r["id"], self.cfg["dispatch"]["lease_sec"]):
                 continue
             pid = self.spawn(r["id"])

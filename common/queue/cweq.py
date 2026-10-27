@@ -343,6 +343,9 @@ def cmd_explain(conn, cfg, a):
     for k in ("repairs", "markers", "fp", "fp16", "last_result", "held"):
         if k in t:
             print(f"  {k:<12} {t[k]}")
+    import lintstep
+    if lintstep.line(a.task):
+        print(f"  lint         {lintstep.line(a.task)}")
     for n in t["notes"]:
         print(f"  note         {n}")
     for w in t["want"]:

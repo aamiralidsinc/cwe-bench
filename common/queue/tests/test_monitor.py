@@ -117,7 +117,8 @@ def by_name(results):
     return {n: (st, d, f) for n, st, d, f in results}
 
 
-def test_preflight_all_ok_but_log_rotation(cfg, tmp_path, root):
+def test_preflight_all_ok_but_log_rotation(cfg, tmp_path, root, monkeypatch):
+    monkeypatch.setenv("CWE_LOG_ROTATE", "0")                  # per-container rotation switched off
     no_rotation = json.dumps({"shutdown-timeout": 120, "default-ulimits": {"nofile": {"Soft": 1048576,
                                                                                        "Hard": 1048576}}})
     pf_cfg(cfg, tmp_path, no_rotation, GOOD_TUNING, GOOD_LIMITS, "DEEPSEEK_API_KEY=abc123\n", GOOD_HARBOR)
@@ -127,6 +128,15 @@ def test_preflight_all_ok_but_log_rotation(cfg, tmp_path, root):
     for name in ("docker_daemon", "docker_tuning", "harbor_patches", "gate_limits", "model_keys"):
         assert r[name][0] == preflight.OK, (name, r[name])
     assert "abc123" not in json.dumps(r)                       # secret values never reach the report
+
+
+def test_preflight_accepts_per_container_log_rotation(cfg, tmp_path, root, monkeypatch):
+    monkeypatch.delenv("CWE_LOG_ROTATE", raising=False)
+    no_rotation = json.dumps({"shutdown-timeout": 120, "default-ulimits": {"nofile": {"Soft": 1048576,
+                                                                                       "Hard": 1048576}}})
+    pf_cfg(cfg, tmp_path, no_rotation, GOOD_TUNING, GOOD_LIMITS, "K_API_KEY=x\n", GOOD_HARBOR)
+    st, msg, fix = by_name(preflight.run_all(cfg, runner=ANSWERING, proc_list=[]))["daemon_json"]
+    assert st == preflight.OK and "per container" in msg and fix is None
 
 
 def test_preflight_good_daemon_json(cfg, tmp_path, root):
