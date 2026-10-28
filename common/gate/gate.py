@@ -20,7 +20,9 @@ Checks, in order (it stops at the first failing group):
            a wrong-fix catalogue entry for every class in WRONG_FIX_CLASSES,
            and 3 oracle runs. (FAIRNESS.md is written after the trial, not gated.)
   nop      untouched vulnerable code: every security test FAILS, every
-           functional test PASSES
+           functional test PASSES. Then the file-time leak check on the agent
+           image (env_leak_check.py): "leak_check" in the stage report, a
+           WARNING only (static's "leak_warnings" likewise); neither ever fails.
   oracle   reference fix, run twice (3x under strict_gate): reward 1.0 and identical results
   patches  every patch listed in manifest["patch_checks"] behaves as declared:
              security_fail    at least one security test fails, functional all pass
@@ -114,6 +116,9 @@ sys.path.insert(0, str(paths.UTIL))
 sys.path.insert(0, str(paths.BUILDER_DIR))  # so sibling imports resolve under `python3 -I`
 import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
 import conformance_check  # noqa: E402  (Frontier-SWE delivery-format enforcement; common/builder/ on path for -I)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import static_leak  # noqa: E402  (file-time leak rule, static half: common/gate/static_leak.py)
+import env_leak_check  # noqa: E402  (file-time leak check, dynamic half: common/gate/env_leak_check.py)
 REQUIRED = [
     "instruction.md",
     "task.toml",
@@ -659,8 +664,30 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
         problems.extend(catalogue_problems(build, manifest))
     if problems:
         raise GateFailure("; ".join(problems))
-    return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings,
+    # File-time leak rule (2026-10-28, reports/reward-hacking.md): a WARNING only, permanently (owner decision);
+    # kept apart from `warnings`, which strict_gate turns into failures.
+    leak_warnings = static_leak.warnings(task)
+    for w in leak_warnings:
+        print(f"[gate] WARNING (static, not blocking): {w}", flush=True)
+    return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings, "leak_warnings": leak_warnings,
             "security_test_product_imports": product_imports(task)}
+
+
+def leak_check(task: Path) -> dict:
+    """The dynamic file-time leak check on the agent image the nop run just used (common/gate/env_leak_check.py).
+    A WARNING only, permanently (owner decision 2026-10-28): it never raises and never fails the stage.
+    GATE_LEAK_CHECK=0 skips it."""
+    if os.environ.get("GATE_LEAK_CHECK", "1") == "0":
+        return {"status": "skipped", "summary": "GATE_LEAK_CHECK=0"}
+    try:
+        r = env_leak_check.check(task)
+    except Exception as e:  # never let a warning check break the gate
+        r = {"status": "error", "summary": f"leak check crashed: {type(e).__name__}: {e}", "leaks": [], "warns": []}
+    word = {"clean": "clean", "leak": "LEAK"}.get(r.get("status"), "could not check")
+    print(f"[gate] leak check (warning only): {word}: {r.get('summary')}", flush=True)
+    for line in r.get("leaks", []) + r.get("warns", []):
+        print(f"[gate] WARNING (leak check, not blocking): {line}", flush=True)
+    return {k: r.get(k) for k in ("status", "summary", "leaks", "warns", "image")}
 
 
 def check_nop(task: Path) -> dict:
@@ -679,7 +706,8 @@ def check_nop(task: Path) -> dict:
     if problems:
         raise GateFailure("nop: " + "; ".join(problems), failure_evidence(r["trial_dir"]),
                               details=ev.collect(r["trial_dir"]))
-    return {"ok": True, "security": len(sec), "functional": len(fun), "trial": r["trial_dir"]}
+    return {"ok": True, "security": len(sec), "functional": len(fun), "trial": r["trial_dir"],
+            "leak_check": leak_check(task)}
 
 
 def run_parallel(jobs: list, raise_errors: bool = True) -> list:

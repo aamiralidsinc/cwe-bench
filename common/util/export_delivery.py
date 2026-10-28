@@ -16,6 +16,11 @@ precision_validation runs imported from GitHub Actions) cannot meet the "require
 listed in <out>/EXPORT-REPORT.md. Each trajectory is checked with Harbor's own validator when available.
 Every key value in the model env files is redacted from the export ([REDACTED]); the report lists the files.
 Read-only on the sources; writes only under <out_dir>.
+
+File-time leak refusal (owner decision 5 of 2026-10-28, reports/reward-hacking.md): before anything is written, every
+task's agent image (its reuse tag; built if missing) goes through common/gate/env_leak_check.py. A task that LEAKS,
+or that could not be checked, is refused: the export stops with exit 4 and writes nothing. There is no override;
+fix the task first (common/builder/tree_time_reset.py, then a re-gate).
 """
 import argparse
 import csv
@@ -31,6 +36,9 @@ import paths  # noqa: E402
 
 sys.path.insert(0, str(paths.AUDIT_TOOLS))
 import audit_results as ar  # noqa: E402  (same exclusion rules as the ledger)
+sys.path.insert(0, str(paths.COMMON / "gate"))
+import env_leak_check  # noqa: E402  (file-time leak check; also puts common/harbor_ext on sys.path)
+import cwe_reuse_tag  # noqa: E402
 
 MODEL_NAMES = {"deepseek": "deepseek-v4.1-flash", "mimo": "mimo-v2.6-pro"}
 HARBOR_PY = Path.home() / ".local/share/uv/tools/harbor/bin/python"
@@ -104,6 +112,24 @@ def validate(traj):
     return "INVALID: " + ((r.stderr.strip().splitlines() or ["?"])[-1])[:200]
 
 
+def leak_refusals(slugs):
+    """[(slug, reason)] for every task whose agent image is not clean (leak, or could not be checked)."""
+    out = []
+    for slug in slugs:
+        task = paths.TASKS / slug
+        try:
+            tag = cwe_reuse_tag.reuse_tag(task / "environment")
+            cwe_reuse_tag.ensure_image_sync(task / "environment", tag)
+            r = env_leak_check.check(task, tag)
+        except Exception as e:
+            r = {"status": "error", "summary": f"could not check: {type(e).__name__}: {e}", "leaks": []}
+        line = f"{slug}: leak check {r['status']}: {r['summary']}" + "".join(f"\n    {l}" for l in r.get("leaks", []))
+        print(line, flush=True)
+        if r["status"] != "clean":
+            out.append((slug, line))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
@@ -112,6 +138,16 @@ def main():
     a = ap.parse_args()
     names = dict(n.split("=", 1) for n in a.name)
     out = Path(a.out)
+    for slug in a.slugs:
+        if not (paths.TASKS / slug / "task.toml").is_file():
+            sys.exit(f"no task package at {paths.TASKS / slug}")
+    refused = leak_refusals(a.slugs)
+    if refused:
+        print("REFUSED: the agent image shows where the builder changed files (file-time leak), or could not be "
+              "checked; nothing exported. Fix: common/builder/tree_time_reset.py, then re-gate.", file=sys.stderr)
+        for _slug, line in refused:
+            print("  " + line, file=sys.stderr)
+        sys.exit(4)
     trials = list(csv.DictReader(open(paths.AUDIT_DIR / "trials.tsv"), delimiter="\t"))
     report = ["# Export report", "", "| task | model | rollout | job/trial | reward | trajectory |", "|---|---|---|---|---|---|"]
     skipped = []

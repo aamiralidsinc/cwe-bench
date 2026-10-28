@@ -22,7 +22,9 @@ WORKDIR /workspace
 #  checkout FETCH_HEAD), apply injection.patch if source is injected, then install/build dependencies
 #  offline-ready. Do NOT leave upstream git history (it is replaced by the fresh baseline below).>
 # COPY injection.patch /tmp/injection.patch
-# RUN patch -p1 -d /workspace < /tmp/injection.patch && rm -f /tmp/injection.patch
+# RUN patch -p1 --no-backup-if-mismatch -d /workspace < /tmp/injection.patch && rm -f /tmp/injection.patch
+# Never write /workspace after the B2 step below: B2 gives every file of the tree one fixed time (B2b), so the
+# files changed by injection.patch, sed edits or COPY look exactly like the rest. Anything written later stands out.
 
 # --- fixed boilerplate: node for the agent probe --------------------------------------
 # Harbor's claude-code agent installs nothing when curl+bash+node+npm+pgrep all resolve.
@@ -35,13 +37,18 @@ RUN set -eux; command -v node >/dev/null 2>&1 && exit 0; \
     curl -fsSLo "/tmp/$tb" "https://nodejs.org/dist/v${NODE_VERSION}/$tb"; \
     tar -xJf "/tmp/$tb" -C /usr/local --strip-components=1 --no-same-owner; rm -f "/tmp/$tb"; node --version
 
-# --- fixed boilerplate: uid-1000 agent user (B2) --------------------------------------
+# --- fixed boilerplate: uid-1000 agent user (B2) + one file time for the whole tree (B2b) ----
 # Reuse uid 1000 if the base already has a 1000 user (e.g. ubuntu/node images).
+# B2b: every file and folder under /workspace gets the same fixed time, so file dates (mtime/atime, and ctime,
+# because the chown rewrites every file into this one layer) cannot show which files a later step changed.
+# Must stay the last step that writes /workspace before the git baseline (A6).
+ARG TREE_EPOCH=1704067200
 RUN if getent passwd 1000 >/dev/null; then \
         u=$(getent passwd 1000 | cut -d: -f1); [ "$u" = agent ] || usermod -l agent -d /home/agent -m "$u" 2>/dev/null || true; \
         g=$(getent group 1000 | cut -d: -f1 || true); [ -n "$g" ] && [ "$g" != agent ] && groupmod -n agent "$g" 2>/dev/null || true; \
     else useradd -m -d /home/agent -u 1000 -U -s /bin/bash agent; fi; \
-    mkdir -p /home/agent && chown -R agent:agent /home/agent /workspace
+    mkdir -p /home/agent && chown -R agent:agent /home/agent /workspace \
+    && find /workspace -xdev -exec touch -h -d "@${TREE_EPOCH}" {} +
 
 # --- agent layer: install Claude Code for the `agent` user (see harness/claude-code.Dockerfile.snippet) ---
 USER agent

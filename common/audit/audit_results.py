@@ -28,6 +28,10 @@ Rules:
     SOLVED       = at least one graded run with reward 1.0
     failed       = at least one graded run and none at 1.0
     BREAKER      = both models failed (and each has >= 3 graded runs for a full pass@3)
+
+Notes (2026-10-28): build/audit/ledger_notes.tsv (task, model, job, trial, kind, note) adds remarks about a
+per-model verdict, e.g. a solve that used the file-time leak (reports/reward-hacking.md). Notes never change a
+verdict; they are listed in a "## Notes" section at the end of ledger.md, after the tables.
 """
 import json
 import re
@@ -224,6 +228,20 @@ def reviews():
     return out
 
 
+def ledger_notes():
+    """[{task, model, job, trial, kind, note}] from ledger_notes.tsv (remarks only: never change a verdict)."""
+    f = OUT / "ledger_notes.tsv"
+    if not f.is_file():
+        return []
+    cols = ("task", "model", "job", "trial", "kind", "note")
+    out = []
+    for l in f.read_text().splitlines():
+        if l and not l.startswith(("#", "task\t")):
+            c = l.split("\t")
+            out.append(dict(zip(cols, c + [""] * (len(cols) - len(c)))))
+    return out
+
+
 AWAITING = []          # graded runs that would count but have no current post-run audit
 TIMEOUT_RERUNS = []
 WEB_TOOLS_OFF_UTC = "2026-10-16T00:33"   # run_trial.sh passes disallowed_tools=WebSearch,WebFetch from here on    # non-solves that timed out under 3 h: owed a 3 h re-run
@@ -370,6 +388,15 @@ def main():
     md = [f"_Generated {datetime.now():%Y-%m-%d %H:%M} from {len(rows)} raw trials by common/audit/audit_results.py_", "",
           "## Tasks where one model failed (the other solved)", "", hdr.format("Who failed"), *onefail, "",
           "## All tasks", "", hdr.format("Verdict"), *full, ""]
+    notes = ledger_notes()
+    if notes:
+        # bullet lines, no table pipes: readers of the "All tasks" table (taskstate.py, route.py, status_report.py)
+        # skip them
+        md += ["## Notes", "", "_Remarks from build/audit/ledger_notes.tsv; they do not change any verdict._", ""]
+        for n in notes:
+            run = f" (run {n['job']}/{n['trial']})" if n["job"] else ""
+            md.append(f"- {n['task']} / {n['model']}{run}: {n['kind']}: {n['note']}".replace("|", "/"))
+        md.append("")
     (OUT / "ledger.md").write_text("\n".join(md))
     with open(OUT / "timeout_reruns.tsv", "w") as f:    # input for the 3 h re-run queue
         f.write("task\tmodel\treward\tlimit_sec\tjob\ttrial\n")

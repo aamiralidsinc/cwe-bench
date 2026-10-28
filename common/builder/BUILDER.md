@@ -62,6 +62,17 @@ never inside `cwe-bench/`.
 - Keep the image as small and quick to build as the project allows.
 - Confirm the project's own existing tests for the affected area run and pass
   in the image at the vulnerable commit.
+- **No writes to the source tree after B2 (2026-10-28).** The template's B2
+  step (uid-1000 agent user) ends with B2b: every file and folder under
+  `/workspace` gets one fixed time (`ARG TREE_EPOCH`, `touch -h -d`). Do every
+  edit of the tree (`injection.patch` with `patch --no-backup-if-mismatch`,
+  `sed -i`, `COPY` into the tree, generated files, builds) BEFORE B2, and keep
+  B2b in the same RUN as the `chown -R`. A file written after B2 keeps its own
+  time, and an agent that lists files by time then finds the planted code (a
+  DeepSeek run did: reports/reward-hacking.md). The gate warns about such a
+  step (static rule) and about any file-time leak in the built image
+  (`common/gate/env_leak_check.py`); `common/gate/postbuild.sh` adds the reset
+  to a Dockerfile that lacks it (`common/builder/tree_time_reset.py`).
 
 ### 3b. Exploit
 - Reproduce the flaw on the vulnerable code THROUGH A REAL ENTRY POINT: an HTTP

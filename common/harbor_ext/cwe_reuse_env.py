@@ -14,6 +14,8 @@ image (environment/) and the verifier image (tests/) go through this class. For 
     task.toml had `docker_image` set; the delivered task files are not touched.
 Harbor's `down --rmi local` never removes an image with a custom tag, so the shared image survives runs.
 Every run's `main` container also gets the cwe.* labels (cwe_labels.py) through one more compose override.
+The agent container (not the separate verifier) gets the harness file-time reset right after it starts, before the
+agent runs (cwe_tree_reset.py, 2026-10-28; CWE_TREE_RESET=0 turns it off). It runs for every image, reused or not.
 Stock behaviour (per-run build) for --force-build, a task that names docker_image, a task with its own
 environment/docker-compose.yaml, Windows containers, or CWE_IMAGE_REUSE=0.
 """
@@ -28,6 +30,7 @@ from pathlib import Path
 
 from harbor.environments.docker.docker import DockerEnvironment
 
+import cwe_tree_reset as tree_reset
 from cwe_labels import EGRESS_SIDECAR, LOGGING, labels as cwe_labels, write_compose as write_labels_compose
 from cwe_reuse_tag import build_cmd, lock_path, reuse_tag, touch_used
 
@@ -113,7 +116,35 @@ class ReuseDockerEnvironment(DockerEnvironment):
             # model_copy: the Task's own config object (shared by other runs in this process) stays as is.
             self.task_env_config = self.task_env_config.model_copy(update={"docker_image": tag})
             self._env_vars.prebuilt_image_name = tag
-        return await super().start(force_build)
+        result = await super().start(force_build)
+        await self._cwe_tree_reset()
+        return result
+
+    async def _cwe_tree_reset(self) -> None:
+        """Harness reset of the starting tree's file times, agent container only (cwe_tree_reset.py). Best effort:
+        a failure is logged as a warning in the trial log and never fails the run."""
+        if not tree_reset.enabled() or getattr(self, "_is_windows_container", False) \
+                or not tree_reset.is_agent_context(self.environment_dir):
+            return
+        t0 = time.time()
+        try:
+            r = await self.exec(tree_reset.root_script(), user="root", timeout_sec=900)
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            info = tree_reset.parse_summary(out)
+            if r.return_code != 0 or not info:
+                lvl = self.logger.warning if r.return_code != 0 else self.logger.info
+                lvl(f"cwe-tree-reset: exit {r.return_code}: {out[-600:]}")
+                if r.return_code != 0:
+                    return
+            if info:
+                r2 = await self.exec(tree_reset.refresh_script(info["root"]), user=info.get("owner", "0:0"),
+                                     timeout_sec=900)
+                out2 = ((r2.stdout or "") + (r2.stderr or "")).strip()
+                lvl = self.logger.info if r2.return_code == 0 else self.logger.warning
+                lvl(f"cwe-tree-reset: {' '.join(f'{k}={v}' for k, v in info.items())}; {out2[-300:]} "
+                    f"({time.time() - t0:.0f}s)")
+        except Exception as e:                 # never fail a run over the reset
+            self.logger.warning(f"cwe-tree-reset: failed ({type(e).__name__}: {e})")
 
     async def stop(self, delete: bool):
         try:

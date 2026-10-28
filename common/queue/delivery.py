@@ -7,6 +7,8 @@
                      breakers are delivered.
 
 The job runs `delivery.py prep <slug>`:
+  0. export_delivery.py first runs the file-time leak check (common/gate/env_leak_check.py) on the task's agent image
+     and refuses a task that is not clean (exit 4, nothing exported; owner decision 2026-10-28).
   1. common/util/export_delivery.py exports the task package and its counted rollouts into
      <out_dir>/<UTC>-<slug>/ ([delivery] out_dir, default ~/.tb-graders/cwe/deliveries). The export redacts every model
      key value and refuses to run without them.
@@ -207,7 +209,12 @@ def prep(slug, cfg, name=None, out_dir=None, export=None):
     ready["pattern_hits"] = [h for h, in_tests in hits if not in_tests]
     ready["pattern_hits_in_tests"] = [h for h, in_tests in hits if in_tests]
     problems = []
-    if r.returncode != 0:
+    if r.returncode == 4:
+        # export_delivery.py refuses a task whose agent image leaks file times, or that could not be checked
+        # (owner decision 2026-10-28: a hard refusal at delivery)
+        ready["leak_refusal"] = [l.strip() for l in (r.stdout + r.stderr).splitlines() if "leak check" in l]
+        problems.append("refused: file-time leak check not clean (" + "; ".join(ready["leak_refusal"])[:300] + ")")
+    elif r.returncode != 0:
         problems.append(f"export exit {r.returncode}")
     if not ready["secret_scan"] or ready["secret_scan"]["key_values"] == 0:
         problems.append("secret scan did not run")

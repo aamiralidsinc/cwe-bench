@@ -34,6 +34,8 @@ if [ "$STAGE" = build ]; then
   if [ "$tf" -lt 5 ]; then log build "stopped/failed: resumed agent finished but left tf=$tf task files (exit=$bx)"; exit 0; fi
 fi
 
+# B2b file-time reset before the first gate, as in common/gate/postbuild.sh (2026-10-28); refuses once fingerprinted.
+python3 -I common/builder/tree_time_reset.py --postbuild "$S" >> "$LOG" 2>&1
 res=$(bash "$CWE_GATE_ONE" "$S" 2>>"$LOG"); rc=$?
 echo "gate (resumed): $res" >> "$LOG"
 case $rc in

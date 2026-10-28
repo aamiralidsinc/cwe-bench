@@ -23,6 +23,11 @@ B="build/$S"; L="$B/postbuild.log"; mkdir -p "$B"
 log() { echo "$(date -u +%FT%TZ) $S $*" | tee -a "$L"; }
 log "postbuild: start (gate + blind fix${LISTING:+$([ $LISTING = 1 ] && echo ' + listing')} in parallel)"
 
+# B2b file-time reset (owner decision 2 of 2026-10-28, reports/reward-hacking.md): before the first gate, insert the
+# whole-tree time reset into environment/Dockerfile if the builder's Dockerfile lacks it. No gate fingerprint exists
+# yet, so nothing goes stale (the script refuses when one does). Never blocks: it logs a "b2b:" line here.
+python3 -I common/builder/tree_time_reset.py --postbuild "$S" >/dev/null 2>&1 || log "b2b: transformer exit $? (not blocking)"
+
 ( bash "$CWE_GATE_ONE" "$S" > "$B/postbuild.gate.out" 2>&1; echo $? > "$B/postbuild.gate.rc" ) &
 pg=$!
 ( "$CWE_DRIVE" deepseek bash "$CWE_RUN_BLINDFIX" "$S" > "$B/postbuild.blind.out" 2>&1; echo $? > "$B/postbuild.blind.rc" ) &

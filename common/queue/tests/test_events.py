@@ -205,3 +205,17 @@ def test_worker_command_for_delivery_prep(conn, cfg):
     jid, _ = qdb.enqueue(conn, "delivery_prep", "k-s2", {"decision": "KEEP 2026-10-27"})
     argv = worker.command(qdb.get(conn, jid), cfg)
     assert argv[-2:] == ["prep", "k-s2"] and argv[-3].endswith("delivery.py")
+
+
+def test_prep_refuses_a_file_time_leak(root, cfg, tmp_path):
+    """export_delivery.py exits 4 when the leak check is not clean (owner decision 2026-10-28): never ready."""
+    built(root, "k-s2")
+    script = tmp_path / "refusing_export.py"
+    script.write_text('import sys\nprint("k-s2: leak check leak: LEAK (injection files: 4, tracked 10)")\n'
+                      'print("REFUSED: file-time leak", file=sys.stderr)\nsys.exit(4)\n')
+    out = tmp_path / "pkg"
+    rc, ready = delivery.prep("k-s2", cfg, name="k-task", out_dir=out,
+                              export=[sys.executable, str(script), str(out), "k-s2", "--name", "k-s2=k-task"])
+    assert rc == 3 and not ready["ready"]
+    assert any(p.startswith("refused: file-time leak") for p in ready["problems"])
+    assert ready["leak_refusal"] == ["k-s2: leak check leak: LEAK (injection files: 4, tracked 10)"]
