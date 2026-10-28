@@ -156,6 +156,18 @@ def test_old_script_work_counts_against_the_caps(root, conn, cfg):
     assert not starts and "total at its limit" in waits[0][1]
 
 
+def test_an_old_build_holds_one_slot_however_many_processes_it_has(root, conn, cfg):
+    """A resumed build runs its gate in a subshell with the same command line: still one build slot."""
+    cfg["limits"]["max_running"]["build"] = 2
+    prompt(root, "q1-s2")
+    qdb.enqueue(conn, "build", "q1-s2")
+    sess = "6fd2190f-cd82-4eb5-a875-7336d6787b86"
+    old = [proc(11, f"bash pipelines/sibling/6-build/resume_pipeline.sh ember-s2 build {sess}"),
+           proc(12, f"bash pipelines/sibling/6-build/resume_pipeline.sh ember-s2 build {sess}")]
+    starts, _ = disp(conn, cfg, old).plan()
+    assert [r["task"] for r, _ in starts] == ["q1-s2"]
+
+
 def test_own_workers_do_not_count_as_old_scripts(root, conn, cfg):
     cfg["limits"]["max_running"]["build"] = 1
     prompt(root, "q1-s2")

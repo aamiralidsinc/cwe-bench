@@ -164,11 +164,19 @@ class Dispatcher:
         plist = procs.list_processes() if self.proc_list is None else self.proc_list
         ctx = taskstate.context(plist, ignore_own=True)
         foreign = {}
-        for runs in ctx["running"].values():
+        for slug, runs in ctx["running"].items():
+            seen = set()
             for kind, _m, _p in runs:
                 k = foreign_kind.get(kind)
-                if k and k in d.get("count_foreign", ()):
-                    foreign[k] = foreign.get(k, 0) + 1
+                if not k or k not in d.get("count_foreign", ()):
+                    continue
+                # A task holds one slot of an exclusive kind however many processes its script has (a resumed build
+                # runs its gate in a subshell with the same command line); trial runs count one per process.
+                if k in exclusive or k == "fairness":
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                foreign[k] = foreign.get(k, 0) + 1
         for k, n in foreign.items():
             per_kind[k] = per_kind.get(k, 0) + n
             total += n
