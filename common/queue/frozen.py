@@ -1,8 +1,7 @@
 """Frozen pipeline processes: builders, gates and trials stopped by SIGSTOP (state T in /proc/<pid>/stat).
 
 A stopped process keeps its timers running against the wall clock. `timeout 18000` around a builder (run_build.sh)
-fires the moment the builder is resumed if five hours have passed meanwhile: on 2026-10-27 a disk-emergency pause
-froze sixteen builders at 07:06Z and all sixteen were cut at the same second when they were resumed at 14:18Z. Pausing
+fires the moment the builder is resumed if five hours have passed meanwhile, so a frozen builder is cut on resume. Pausing
 the pipeline means stopping new starts (queue `enabled = false`, the dispatcher, the diskguard floors), never freezing
 running work (docs/WORK-QUEUE.md, "Pausing safely").
 

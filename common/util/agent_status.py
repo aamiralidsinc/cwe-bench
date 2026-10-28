@@ -12,8 +12,7 @@ denials, and the tail of its stderr (<same name>.err). The printed line is a sum
 that file; until 2026-10-21 it kept only the first 160 characters and nothing else.
 
 Exit 124 from a run that lasted far longer than its limit is not a timeout: the process was paused (SIGSTOP) and its
-overdue timer fired when it resumed (2026-10-27: sixteen builders frozen for hours during a disk emergency were all cut
-at the same second on resume). When the wall time between the run's start (start_utc.txt, or resume_start_utc.txt for
+overdue timer fired when it resumed (a paused builder's `timeout` keeps counting wall-clock time). When the wall time between the run's start (start_utc.txt, or resume_start_utc.txt for
 a resumed build, next to the output file) and end_utc.txt exceeds BUILD_TIMEOUT (default 18000 s) by more than 25 %, the
 status is `error: interrupted (timer fired late: process was paused ...)` and details carry `paused_interrupt: true`,
 `wall_sec` and `limit_sec`. Such a build is resumable (taskstate stage build_interrupted; queue kind build_resume).
