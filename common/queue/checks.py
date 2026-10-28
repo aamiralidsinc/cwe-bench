@@ -125,6 +125,22 @@ def new_dirs(trial, prefix, t0):
 
 # ---------------------------------------------------------------- per-kind checks: list of (name, ok, detail, person)
 
+def _statuses(group):
+    """{test name: passed?} from one results.json group (a dict of name -> status or {status})."""
+    out = {}
+    for k, v in (group or {}).items():
+        st = v if isinstance(v, str) else (v or {}).get("status", "") if isinstance(v, dict) else v
+        out[k] = st in ("passed", "pass", True)
+    return out
+
+
+def functional_drops(orig_results, new_results):
+    """Functional tests that passed in orig_results and do not pass in new_results (names in both)."""
+    a, b = jload(orig_results) or {}, jload(new_results) or {}
+    before, after = _statuses(a.get("functional")), _statuses(b.get("functional"))
+    return sorted(k for k, ok in before.items() if ok and k in after and not after[k])
+
+
 def c_regrade(task, a, t0, cfg, rescore=False):
     trial = Path(cfg["jobs_dir"]) / a["trial"]
     kind = "rescore" if rescore else "regrade"
@@ -138,6 +154,13 @@ def c_regrade(task, a, t0, cfg, rescore=False):
     out.append((f"{kind}.scored", is_num(reward), f"REGRADE.json reward = {reward!r}", not is_num(reward)))
     rj = (jload(d / "verifier" / "reward.json") or {}).get("reward")
     out.append((f"{kind}.reward_file", is_num(rj), f"verifier/reward.json reward = {rj!r}", False))
+    if not rescore:
+        # Same code, same or repaired tests: a functional test that passed in the original grading and fails
+        # in the regrade points at the grading environment (stk-bifrost-19592 2026-10-28: --network none left no
+        # local address). Not fatal (a repaired functional test can legitimately change); it becomes an event.
+        drops = functional_drops(trial / "verifier" / "results.json", d / "verifier" / "results.json")
+        out.append((f"{kind}.functional_kept", not drops,
+                    f"passed originally, fail now: {drops[:4]}" if drops else "no functional test lost", False))
     if rescore:
         method = str(info.get("method", ""))
         out.append(("rescore.method", method.startswith("rescore"), method[:60], False))
