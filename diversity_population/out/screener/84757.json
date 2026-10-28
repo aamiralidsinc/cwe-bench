@@ -1,0 +1,67 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "84757",
+  "advisory_ids": ["GHSA-4HFF-3256-7FPC", "CVE-2026-16028"],
+  "repo": "vlet/p5-protocol-http2",
+  "pinned_commit": "264b130a0fd590e8983dcca3349dac0a0dd94b21",
+  "fix_commits": ["ec193c64cca6ace0100344f16d3a5e928ef64bed", "27a488a34d74fd16f123e5e6186d4f677faa246f"],
+  "trust_decision": {
+    "summary": "Peer-controlled stream IDs decide how many entries stay in the per-connection streams hash. On CLOSED, stream_state only strips most keys and keeps the entry, so nothing bounds the table's growth.",
+    "evidence": ["lib/Protocol/HTTP2/Stream.pm:112-126", "lib/Protocol/HTTP2/Stream.pm:65", "lib/Protocol/HTTP2/Frame.pm:122-128"]
+  },
+  "landing_point": {
+    "where": "lib/Protocol/HTTP2/Stream.pm:113",
+    "why": "The summary names stream_state and the closed-stream cleanup. The CLOSED branch there deletes keys but never the streams entry."
+  },
+  "fix_sites": [
+    {"where": "lib/Protocol/HTTP2/Stream.pm:113-126", "entry_point": "Protocol::HTTP2::Server/Client->feed -> Frame::frame_decode -> Connection::state_machine -> stream_state(CLOSED); also the send path via enqueue", "module_kind": "core stream state (mixin of Connection)"},
+    {"where": "lib/Protocol/HTTP2/Connection.pm:32", "entry_point": "Protocol::HTTP2::Connection->new (via Server->new / Client->new), new closed_streams/max_closed_streams fields", "module_kind": "connection constructor (plumbing)"},
+    {"where": "lib/Protocol/HTTP2/Connection.pm:96", "entry_point": "Connection->new option list, max_closed_streams becomes a constructor option", "module_kind": "constructor option merge (plumbing)"},
+    {"where": "lib/Protocol/HTTP2/Constants.pm:84-86", "entry_point": "PH2_MAX_CLOSED_STREAMS constant, exported in :limits", "module_kind": "constants"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "The fix is one logical change in stream_state (fix.diff:100-110). The Connection.pm and Constants.pm hunks are only the constant and constructor plumbing (fix.diff:55-70, fix.diff:77-92)."},
+  "O3_reason_to_dismiss": "Refused streams never reach CLOSED or enter stream_state, so a solver can argue that 'closed streams never removed' does not cover them and that the RST_STREAM send path is a 'REFUSED_STREAM special case' already handled by Connection.pm:207.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Closed-stream entries are kept on purpose, so late PRIORITY/WINDOW_UPDATE/RST frames on a closed stream are tolerated by the CLOSED branch, and PRIORITY can depend on a closed stream. Deleting the entry at close makes those frames reach new_peer_stream with id < last_peer_stream (connection PROTOCOL_ERROR), or makes stream_reprio fail with 'Malformed priority frame'.",
+    "where": "lib/Protocol/HTTP2/Connection.pm:331-337; lib/Protocol/HTTP2/Stream.pm:47-53; lib/Protocol/HTTP2/Stream.pm:374-377; lib/Protocol/HTTP2/Frame/Priority.pm:29-35"
+  },
+  "O6_input_shapes": ["stream closed by END_STREAM from HALF_CLOSED (Connection.pm:315-319)", "stream closed by RST_STREAM in OPEN/RESERVED/HALF_CLOSED (Connection.pm:287-288, 301-302, 316-319)", "RST_STREAM sent on an IDLE stream (Connection.pm:266-268)", "pushed stream closed by HEADERS+END_STREAM from RESERVED (Connection.pm:304-306)", "pending CLOSED applied after CONTINUATION END_HEADERS (Connection.pm:239-242)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "A refused peer stream (MAX_CONCURRENT_STREAMS exceeded) queues RST_STREAM. state_machine then reads $self->{streams}->{$id}->{state} for a nonexistent id, which autovivifies an empty entry that never reaches CLOSED, so the new closed_streams cap never evicts it.",
+     "where": "lib/Protocol/HTTP2/Stream.pm:56-61",
+     "reason_to_dismiss": "The leak is an autovivification at Connection.pm:204 in another file, on a path the code labels as a 'REFUSED_STREAM error' early return (Connection.pm:206-207). It is not a 'closed stream', so it reads as outside the advisory's wording.",
+     "distance": "Stream.pm:56-61 -> Connection.pm:135-140 enqueue -> Connection.pm:202-207 state_machine; 2 files from the landing point, same package",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Any local enqueue (send_headers/send_data/RST via stream_error) for a stream id missing from the table hits the same autovivifying read in state_machine and adds a permanent empty entry outside the closed_streams accounting.",
+     "where": "lib/Protocol/HTTP2/Connection.pm:204",
+     "reason_to_dismiss": "Mostly application-driven (Server->response with a bad stream_id). It is peer-driven only through the refused-stream route above.",
+     "distance": "Connection.pm, 1 file from the landing point",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/Protocol/HTTP2/Frame/Push_promise.pm:41", "sibling": "A client-side promised stream that is reset or refused before RESERVED and leaves an entry outside the closed_streams accounting.", "why_realistic": "PUSH_PROMISE creates peer streams through a separate decoder, and a maintainer could add a refusal/cleanup branch there that drops the entry without going through stream_state."},
+    {"where": "lib/Protocol/HTTP2/Stream.pm:65-71", "sibling": "IDLE peer streams created by a PRIORITY frame alone stay IDLE forever and never enter closed_streams. Today they are capped only by active_peer_streams.", "why_realistic": "RFC 7540 says lower IDLE ids are implicitly closed when a higher id opens, and a maintainer implementing that could mark them closed without pushing them to closed_streams."}
+  ],
+  "O9_family": "CWE-401 / unbounded per-connection state growth (resource exhaustion)", "O9_dos": true,
+  "O10_build": {"language": "Perl 5.8.5+", "toolchain": "perl, Minilla/Module::Build, Test::More, Test::LeakTrace (t/12_leaks.t)", "services": [], "offline_after_build": true,
+                "project_tests": "t/03_connection.t, t/08_priority.t, t/12_leaks.t, t/14_keepalive.t (no closed-stream growth test; the fix diff adds no tests)"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "lib/Protocol/HTTP2/Stream.pm, lib/Protocol/HTTP2/Connection.pm, lib/Protocol/HTTP2/Constants.pm", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "delete $self->{streams}->{$stream_id} right at CLOSED in stream_state, which breaks late frames on closed streams and PRIORITY dependencies on closed streams"},
+  "out_of_scope_notes": [
+    "lib/Protocol/HTTP2/Stream.pm:47-49: operator precedence (|| vs ?:) makes the goaway clause of the stream-id validity check ineffective.",
+    "This is resource exhaustion, a family that never produced a hard task (0 of 7), and the uncovered route shares one concept with the fix."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); tiny_repo is inferred from 25 .pm modules of pure-Perl source.",
+    "The refused-stream autovivification (Connection.pm:204) is inferred from Perl rvalue nested-deref semantics and was not run.",
+    "present_in_latest is unknown for every O8 route because no latest release was provided."
+  ]
+}

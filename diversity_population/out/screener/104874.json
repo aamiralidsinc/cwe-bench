@@ -1,0 +1,73 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104874", "advisory_ids": ["GHSA-R7WH-X6RF-8G63", "CVE-2026-97731"], "repo": "pgsty/silo",
+  "pinned_commit": "8a2fe9b7a01a9dabffc8b5dd06c7dca58d9eb1fe",
+  "fix_commits": ["1233254309b15571f101b2b26d531951ceaeef1e"],
+  "trust_decision": {
+    "summary": "SigV4 verification decides whether the request's x-amz-* headers (which select and parameterise the S3 operation, e.g. x-amz-copy-source) are covered by the signature; at the pinned commit only x-amz-meta-* is compared (presigned only) and the Authorization-header path checks nothing, so an unsigned x-amz-copy-source turns a signed/presigned PUT into a server-side copy.",
+    "evidence": ["cmd/signature-v4-utils.go:268-280", "cmd/signature-v4.go:232-236", "cmd/signature-v4.go:360-369", "cmd/api-router.go:377-379", "cmd/api-router.go:313-316"]
+  },
+  "landing_point": {"where": "cmd/signature-v4-utils.go:201", "why": "Advisory summary names extractSignedHeaders() in cmd/signature-v4-utils.go; checkMetaHeaders sits right below at cmd/signature-v4-utils.go:268."},
+  "fix_sites": [
+    {"where": "cmd/signature-v4-utils.go:268", "entry_point": "every SigV4-authenticated S3/STS/admin request via reqSignatureV4Verify (cmd/auth-handler.go:612-621); exploited via PUT /{bucket}/{object} with x-amz-copy-source (CopyObject, CopyObjectPart)", "module_kind": "auth verifier helper (checkMetaHeaders -> checkUnsignedHeaders: all x-amz-*, membership test, two exemptions)"},
+    {"where": "cmd/signature-v4.go:233", "entry_point": "presigned SigV4 URL on any S3 route (doesPresignedSignatureMatch, cmd/auth-handler.go:617-618)", "module_kind": "auth verifier, presigned implementation"},
+    {"where": "cmd/signature-v4.go:361", "entry_point": "Authorization-header SigV4 on any S3 route, plus admin (cmd/auth-handler.go:172) and STS (cmd/sts-handlers.go:221) via isReqAuthenticated", "module_kind": "auth verifier, header implementation (check newly added; never existed here)"},
+    {"where": "cmd/signature-v4.go:338", "entry_point": "presigned SigV4 (writes x-amz-signature-age scratch header after verification)", "module_kind": "auth verifier side effect consumed by policy conditions"},
+    {"where": "cmd/object-handlers.go:3662", "entry_point": "PUT /{bucket}/{object}?tagging (PutObjectTaggingHandler, cmd/api-router.go:350-352)", "module_kind": "handler that synthesises x-amz-tagging from the body; moved after authenticateRequest so the new check does not reject it"},
+    {"where": "cmd/bucket-policy.go:258", "entry_point": "policy condition evaluation (s3:signatureAge) for all authorised requests", "module_kind": "policy condition builder (constant rename only)"},
+    {"where": "fix.diff:452-455", "entry_point": "n/a (constant xhttp.AmzSignatureAge in internal/http/headers.go)", "module_kind": "shared constants package"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "cmd/streaming-signature-v4.go:126-131 (calculateSeedSignature: separate SigV4 seed verifier for STREAMING-AWS4-HMAC-SHA256-PAYLOAD; NOT touched by the published fix, recorded also as O8)"},
+  "O3_reason_to_dismiss": "The advisory's exploit is x-amz-copy-source, and CopyObject/CopyObjectPart reject streaming auth outright (cmd/auth-handler.go:375-376), so the chunked-upload seed verifier looks like a payload-only path that cannot be confused into a copy.",
+  "O4_distance": {"files": 6, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate x-amz-* headers the server or clients send unsigned must keep working: PutObjectTagging synthesises x-amz-tagging before auth (must move after auth), the presigned verifier writes x-amz-signature-age into r.Header and re-verification must still pass, and clients send x-amz-content-sha256 unsigned. A blanket 'all x-amz-* must be signed' breaks tagging, s3:signatureAge policies and idempotent re-verify.",
+    "where": "cmd/object-handlers.go:3661-3666; cmd/signature-v4.go:338; cmd/bucket-policy.go:257-265; cmd/auth-handler.go:645-650"
+  },
+  "O6_input_shapes": [
+    "any x-amz-* header name, not only x-amz-meta-* (case-insensitive prefix)",
+    "multi-value header whose first value is empty (membership test instead of value equality; old code compared val[0] at cmd/signature-v4-utils.go:272)",
+    "presigned (query) and Authorization-header SigV4 variants",
+    "exempt shapes: x-amz-content-sha256 unsigned, x-amz-signature-age scratch header"
+  ],
+  "O7_producer": {"kind": "handler", "where": "cmd/object-handlers.go:3662 (x-amz-tagging synthesised from XML body before authenticateRequest at cmd/object-handlers.go:3666); cmd/signature-v4.go:338 (x-amz-signature-age written by verifier, read at cmd/bucket-policy.go:258)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Streaming-signed SigV4 (STREAMING-AWS4-HMAC-SHA256-PAYLOAD and -TRAILER) PutObject: seed verifier extracts signed headers but never checks unsigned x-amz-* (no meta check either), so unsigned x-amz-tagging/object-lock/SSE/meta headers ride on a signed upload and feed policy conditions",
+     "where": "cmd/streaming-signature-v4.go:126-131", "reason_to_dismiss": "Copy-source confused deputy is unreachable with streaming auth (cmd/auth-handler.go:375-376); looks like a body-chunk signature path, separate file from the advisory's landing point",
+     "distance": "different file (cmd/streaming-signature-v4.go) from cmd/signature-v4-utils.go; reached from cmd/object-handlers.go:2192-2198", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Streaming-signed PutObjectPart reaches the same unchecked seed verifier",
+     "where": "cmd/object-multipart-handlers.go:827-833", "reason_to_dismiss": "Multipart part upload; same as above, and UploadPartCopy is the only multipart route the advisory's mechanism touches",
+     "distance": "cmd/object-multipart-handlers.go -> cmd/streaming-signature-v4.go", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Streaming-signed PutObjectExtract (snowball auto-extract) reaches the same unchecked seed verifier",
+     "where": "cmd/object-handlers.go:2645-2650", "reason_to_dismiss": "MinIO-specific extract extension, a neighbouring feature",
+     "distance": "same seed verifier, third handler", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "cmd/signature-v4-utils.go:213-216", "sibling": "signed-header value satisfied from the query string when the header is absent, so the signed list and the header the handler reads can diverge (identity differential)", "why_realistic": "Existing fallback for presigned clients; a maintainer could extend it to x-amz-* names without noticing the handler reads r.Header"},
+    {"where": "cmd/object-handlers.go:3661-3662", "sibling": "another handler that synthesises an x-amz-* header (e.g. retention or legal-hold from body) before authenticateRequest", "why_realistic": "Exact existing idiom for feeding policy conditions; PutObjectRetention/LegalHold handlers parse bodies into the same condition values"},
+    {"where": "cmd/bucket-policy.go:257-270", "sibling": "policy condition builder reading another internal scratch header from the cloned request headers that a client could also send", "why_realistic": "x-amz-signature-age already follows this pattern with a hand-written authType guard"}
+  ],
+  "O9_family": "signature verification coverage gap (unsigned request elements accepted as authenticated; CWE-347)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.27.1 (go.mod:3)", "services": [], "offline_after_build": true,
+                "project_tests": "cmd/signature-v4-utils_test.go (TestCheckMetaHeaders), cmd/signature-v4_test.go (TestDoesPresignedSignatureMatch), cmd/object-handlers_test.go copy-object tests; in-process httptest + prepareFS, no external services"},
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "cmd/signature-v4-utils.go, cmd/signature-v4.go, cmd/object-handlers.go, cmd/bucket-policy.go, internal/http/headers.go",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add x-amz-copy-source to checkMetaHeaders' prefix list in the presigned path only, keeping value equality on val[0]; misses header-auth and streaming verifiers and the empty-first-value shape."},
+  "out_of_scope_notes": [
+    "x-minio-* request headers (e.g. replication headers, cmd/object-handlers.go:2228) also alter semantics but are outside the advisory's x-amz-* property.",
+    "At the pinned commit PutObjectTagging sets x-amz-tagging before SigV2 verification, which canonicalises all x-amz-* (cmd/signature-v2.go:326-343); possible V2 tagging interop issue, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell used); giant_repo/tiny_repo flags not assessed, MinIO-sized tree expected to be well within limits.",
+    "POST policy uploads (cmd/bucket-handlers.go:1155) sign the form policy, not request headers; whether unsigned x-amz-* request headers influence PostPolicyBucketHandler was not checked.",
+    "O2 site is not part of the published fix; it is listed as second_implementation per lessons guidance and duplicated in O8.",
+    "present_in_latest unknown for all O8 routes (no latest release provided).",
+    "Whether a streaming route's unsigned x-amz-tagging actually changes the authorisation outcome end-to-end (via isPutActionAllowedWithRequestTags at cmd/object-handlers.go:2181-2189) was read but not executed."
+  ]
+}

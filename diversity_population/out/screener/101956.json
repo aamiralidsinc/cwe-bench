@@ -1,0 +1,112 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "101956",
+  "advisory_ids": ["GHSA-CMCQ-V328-82VJ", "CVE-2026-88351"],
+  "repo": "ludocode/mpack",
+  "pinned_commit": "16a94eee78a2ceea5a0bb64c064c696248db8dd7",
+  "fix_commits": ["3d54d1215bdb5478d3ddecaf85884c58b382cd9b"],
+  "trust_decision": {
+    "summary": "Element counts and lengths read from untrusted MessagePack headers (array32/map32/str/bin) are trusted when sizing node pages, buffers and allocations; size_t arithmetic on them is unchecked on 32-bit, so allocations can be smaller than the data later written into them.",
+    "evidence": [
+      "src/mpack/mpack-node.c:274-287",
+      "src/mpack/mpack-node.c:324-327",
+      "src/mpack/mpack-node.c:95",
+      "src/mpack/mpack-node.c:110-117",
+      "src/mpack/mpack-reader.c:520",
+      "src/mpack/mpack-writer.c:213-216"
+    ]
+  },
+  "landing_point": {
+    "where": "src/mpack/mpack-node.c:324-327",
+    "why": "The summary names the Node API and array32/map32 element counts. mpack_tree_parse_children computes total from node->len and sizes the separate page malloc from it, with a literal 'TODO: this should check for overflow' comment."
+  },
+  "fix_sites": [
+    {"where": "src/mpack/mpack-node.c:285-287", "entry_point": "mpack_tree_parse / mpack_tree_try_parse after mpack_tree_init_data|init_stream|init_filename (node count accumulation)", "module_kind": "core parser (node/tree API)"},
+    {"where": "src/mpack/mpack-node.c:325-327", "entry_point": "mpack_tree_parse / mpack_tree_try_parse (separate node page allocation for large array/map)", "module_kind": "core parser (node/tree API)"},
+    {"where": "src/mpack/mpack-node.c:192-197", "entry_point": "mpack_tree_parse / mpack_tree_try_parse (mpack_tree_reserve_bytes, every node); refactor only, pinned check already uses uint64_t", "module_kind": "core parser (node/tree API)"},
+    {"where": "src/mpack/mpack-node.c:94-95", "entry_point": "mpack_tree_init_stream + mpack_tree_try_parse (mpack_tree_reserve_fill max-size check)", "module_kind": "core parser, streaming fill path"},
+    {"where": "src/mpack/mpack-node.c:110-117", "entry_point": "mpack_tree_init_stream + mpack_tree_try_parse (buffer capacity doubling)", "module_kind": "core parser, streaming fill path"},
+    {"where": "src/mpack/mpack-node.c:1673-1683", "entry_point": "mpack_node_cstr_alloc", "module_kind": "node accessor API"},
+    {"where": "src/mpack/mpack-node.c:1710-1720", "entry_point": "mpack_node_utf8_cstr_alloc", "module_kind": "node accessor API"},
+    {"where": "src/mpack/mpack-reader.c:520", "entry_point": "mpack_read_bytes_alloc / mpack_expect_cstr_alloc / mpack_expect_utf8_cstr_alloc (src/mpack/mpack-expect.c:653)", "module_kind": "lower-level reader API (separate streaming reader implementation)"},
+    {"where": "src/mpack/mpack-writer.c:213-216", "entry_point": "mpack_writer_init_growable (src/mpack/mpack-writer.c:276) then any write that overflows the buffer", "module_kind": "encoder (writer, opposite direction)"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "src/mpack/mpack-reader.c:520 (mpack_read_bytes_alloc_impl, reached from the Expect API at src/mpack/mpack-expect.c:653); also the writer at src/mpack/mpack-writer.c:213-216"
+  },
+  "O3_reason_to_dismiss": "The advisory names the Node API and array32/map32 only. The reader/expect API and the growable writer are separate modules, the writer is an encoder (output, not untrusted input), and expect callers bound counts with their own max_count/maxsize.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Large but legitimate arrays/maps (more than MPACK_NODES_PER_PAGE children) must still get their own separate page, and the parser must still pause and resume (return false without an error) when stream data is not yet available. An over-broad cap on len or total, or treating 'not enough data' as an error, breaks the existing large-container and incremental-parse tests. Also, the pinned code deliberately flags mpack_error_invalid (not too_big) for 32-bit count overflow, as test_read_node_possible relies on.",
+    "where": "src/mpack/mpack-node.c:324-349; src/mpack/mpack-node.c:153-158; src/mpack/mpack-node.c:186-194"
+  },
+  "O6_input_shapes": [
+    "array32 count (node page size and node_count)",
+    "map32 count (doubled to key+value total before the same sinks)",
+    "str length to null-terminated alloc (node cstr/utf8 cstr, reader cstr)",
+    "streamed message size vs max_size and buffer doubling (init_stream)",
+    "writer output growth (growable writer)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "Expect API array allocation sizes MPACK_MALLOC(element_size * count) from the input array count with no multiplication overflow check, the same alloc-sized-from-count weakness that the node page fix closes",
+      "where": "src/mpack/mpack-expect.c:454-477",
+      "reason_to_dismiss": "Count is bounded by the caller-supplied max_count (src/mpack/mpack-expect.c:461-463); it is the Expect API, not the Node API; and the fix commit did not touch mpack-expect.c",
+      "distance": "different file (mpack-expect.c vs mpack-node.c), same package; reached via the mpack_expect_array_alloc / mpack_expect_array_or_nil_alloc macros (src/mpack/mpack-expect.h:876-877, 904-905)",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "After parsing a map, node_size -= node->len * 2 is computed in 32-bit unsigned arithmetic (len is uint32_t), so it wraps for len >= 2^31, while the reserve added total as a size_t, which desyncs tree->size on 64-bit",
+      "where": "src/mpack/mpack-node.c:773-777",
+      "reason_to_dismiss": "Needs a map of more than 2^31 entries, so over 4 GiB of message data; the parse_children check at src/mpack/mpack-node.c:278 looks like it already guards map doubling",
+      "distance": "same file, separate function (mpack_tree_parse_node) from the landing point",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Parse stack growth doubles stack_capacity and multiplies by sizeof(mpack_level_t) with no overflow check; nesting depth is input-controlled",
+      "where": "src/mpack/mpack-node.c:229-255",
+      "reason_to_dismiss": "Depth is bounded by message bytes (one byte per level), so overflow needs a message of around 2^28+ bytes on 32-bit; it reads as a stack, not an element allocation",
+      "distance": "same file, adjacent function (mpack_tree_push_stack)",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "src/mpack/mpack-expect.c:477", "sibling": "Already a natural sibling: the typed array alloc multiplies element_size by the input count unchecked", "why_realistic": "Written by the same author with the same 'max_count is the limit' assumption; it sits in a different API family from the advisory"},
+    {"where": "src/mpack/mpack-common.c:380-383", "sibling": "The read-tracking element stack doubles capacity and multiplies by sizeof(mpack_track_element_t) unchecked", "why_realistic": "Debug/tracking code seen as internal, with the same doubling idiom as the fixed writer and tree buffer"},
+    {"where": "src/mpack/mpack-node.c:1647", "sibling": "mpack_node_data_alloc could plausibly gain a padding/terminator (+1) or element-size multiply like its cstr neighbours", "why_realistic": "The neighbouring cstr allocs at src/mpack/mpack-node.c:1683 and 1720 use len + 1; an ext or bin variant with a header prefix is an easy, believable addition"}
+  ],
+  "O9_family": "integer overflow in allocation sizing (CWE-190 leading to undersized heap allocation)", "O9_dos": false,
+  "O10_build": {
+    "language": "C",
+    "toolchain": "C99/C11 compiler (gcc/clang) driven by test/unit/configure.py (python3) plus ninja; triggering needs a 32-bit size_t build (e.g. -m32) or a mocked allocator",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/unit/src/test-node.c (tree parsing, cstr_alloc), test/unit/src/test-expect.c (expect alloc), test/unit/src/test-write.c (growable writer, SIZE_MAX mocks), test/unit/src/test-system.c (malloc/strlen mocks)"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/mpack/mpack-node.c, src/mpack/mpack-reader.c, src/mpack/mpack-writer.c, src/mpack/mpack-platform.h",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a checked multiply only around the separate-page MPACK_MALLOC in mpack_tree_parse_children (or cap node->len for array32/map32), leaving node_count, reserve_fill/buffer doubling, the reader cstr alloc, the writer growth and the expect array alloc unchecked."
+  },
+  "out_of_scope_notes": [
+    "src/mpack/mpack-node.c:1133-1139: file tree size conversion from long to size_t is already guarded when max_bytes != 0; with max_bytes == 0 the long-to-size_t narrowing on 32-bit is unguarded (file-size input, not message content)."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); the tree has 38 .c/.h files in one src/mpack package, so it is almost certainly under 5 MB, which is why tiny_repo is flagged.",
+    "Exploitability of the src/mpack/mpack-node.c:324-327 page-size overflow on 32-bit requires total bytes of message actually present (reserve_bytes before alloc); the reasoning is not run-verified.",
+    "Behavioural testing of these overflows needs a 32-bit size_t build or allocator/size mocks; whether the hidden-test harness can build -m32 offline is unknown.",
+    "The node cstr_alloc len == SIZE_MAX check (fix.diff:111, 129) looks unreachable on 32/64-bit because len is uint32_t (src/mpack/mpack-node.h:156); it is defensive only.",
+    "present_in_latest is unknown for all O8 routes (no latest release given)."
+  ]
+}

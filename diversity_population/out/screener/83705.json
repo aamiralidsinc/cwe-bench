@@ -1,0 +1,114 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "83705",
+  "advisory_ids": ["GHSA-5MCC-8C36-QXP4", "CVE-2026-113707"],
+  "repo": "a2aproject/a2a-rs",
+  "pinned_commit": "a35a053a1e68abc5960b8170b10966ab33bea348",
+  "fix_commits": ["7050c7d329238539424ee46440e23b91c4825bee"],
+  "trust_decision": {
+    "summary": "Whether a task may change state (terminal states are final; cancel is allowed only from a non-terminal state). At the pinned commit cancel_task checks this on a snapshot read and only later writes, and the store's update() never checks it.",
+    "evidence": [
+      "a2a-server/src/handler.rs:818-828",
+      "a2a-server/src/task_store/inmemory.rs:48-56",
+      "a2a/src/types.rs:99-105",
+      "a2a-server/src/handler.rs:215-224"
+    ]
+  },
+  "landing_point": {
+    "where": "a2a-server/src/task_store/inmemory.rs:48",
+    "why": "The summary names 'inmemory.rs update race condition', so an engineer opens InMemoryTaskStore::update first. The cancel check-then-act it pairs with is in a different file, handler.rs."
+  },
+  "fix_sites": [
+    {"where": "a2a-server/src/task_store/inmemory.rs:48 (fix.diff:86-95)", "entry_point": "public TaskStore::update; reached via DefaultRequestHandler send_message / send_streaming_message (drive_execution -> apply_event_to_task -> save_task) and cancel_task", "module_kind": "storage backend (in-memory TaskStore impl)"},
+    {"where": "a2a-server/src/task_store/inmemory.rs:57 (fix.diff:101-116, new InMemoryTaskStore::begin_cancel)", "entry_point": "TaskStore::begin_cancel, called from DefaultRequestHandler::cancel_task", "module_kind": "storage backend (in-memory TaskStore impl)"},
+    {"where": "a2a-server/src/task_store/store.rs:38 (fix.diff:214-237, trait default begin_cancel)", "entry_point": "public TaskStore trait, used by any third-party store that does not override it", "module_kind": "public trait / lower-level API"},
+    {"where": "a2a-server/src/handler.rs:826-830 (fix.diff:13-29)", "entry_point": "DefaultRequestHandler::cancel_task <- JSON-RPC tasks/cancel (a2a-server/src/jsonrpc.rs:106-109), REST POST /tasks/{id}:cancel and legacy /tasks/{id}/cancel (a2a-server/src/rest.rs:87, 244-282), gRPC CancelTask (a2a-grpc/src/server.rs:129-141), SlimRPC CancelTask (a2a-slimrpc/src/server.rs:73-80)", "module_kind": "request handler (transport-agnostic core)"}
+  ],
+  "O1_entry_points": 7,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "a2a-server/src/task_store/store.rs:17-39 (the fix adds trait default begin_cancel at fix.diff:224-237, and the in-memory update terminal guard at fix.diff:90-95 sits in the store impl, not the trait contract at a2a-server/src/task_store/store.rs:22-23)"
+  },
+  "O3_reason_to_dismiss": "The report points at a cancel race in the handler, so a solver can argue that the store's update() is generic persistence with no state machine of its own, and that the public TaskStore trait with its non-atomic default is the store implementer's job. The fix itself documents its default begin_cancel as non-atomic (fix.diff:221-223).",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Re-cancelling an already-CANCELED task must stay idempotent, and once begin_cancel has set CANCELED, the executor's own cancel stream re-emits a CANCELED status/task that save_task must still store (same terminal state, new message). A fix that rejects every update on a terminal task, or treats a raced cancel as an error, breaks both.",
+    "where": "a2a-server/src/handler.rs:820-825; a2a-server/src/handler.rs:843-852; a2a-server/src/handler.rs:232-238; fix.diff:86-90; fix.diff:150-163"
+  },
+  "O6_input_shapes": [
+    "update to a different terminal state (Completed -> Canceled/Failed)",
+    "update from terminal back to non-terminal (Completed -> Submitted/Working)",
+    "update re-applying the same terminal state (allowed)",
+    "two concurrent cancels on one non-terminal task (both return CANCELED)",
+    "cancel racing with completion (raced task terminal but not CANCELED -> TASK_NOT_CANCELABLE)",
+    "cancel of a missing task (TASK_NOT_FOUND)"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "a2a-server/src/handler.rs:226-250 (apply_event_to_task builds the full Task written by save_task from executor events, using a possibly stale current_task copy)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "send_message / send_streaming_message with message.task_id naming a terminal task: prepare_task_for_execution reuses the stored task without checking terminal state, saves a push config for it, and starts an executor on it. The fix's update guard only rejects the executor's later write.",
+      "where": "a2a-server/src/handler.rs:617-627",
+      "reason_to_dismiss": "This is the send-message feature, not cancel, and the store now rejects the state write anyway, so a solver can call it 'already covered'.",
+      "distance": "same file as the cancel fix site (handler.rs), different function, about 200 lines away; a different file from the landing point",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "An ArtifactUpdate event (or a Task event with the same terminal state) still changes a terminal task's artifacts/history, because the fix's guard compares only status.state.",
+      "where": "a2a-server/src/handler.rs:240-246",
+      "reason_to_dismiss": "The fix deliberately allows re-applying the same terminal state for idempotent re-emission, so a solver reads content changes as legitimate.",
+      "distance": "handler.rs mapper vs inmemory.rs guard: 2 files, same crate",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "drive_execution checks the in-memory execution snapshot for terminal state and then writes. begin_cancel updates only the store, never the ActiveExecution snapshot, so the snapshot check is a stale check-then-act on the same task.",
+      "where": "a2a-server/src/handler.rs:316-323",
+      "reason_to_dismiss": "The store guard now rejects the write and the loop breaks on error, so a solver sees only a subscriber-visible error, not a state change.",
+      "distance": "handler.rs, about 500 lines from cancel_task",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "a2a-server/src/task_store/store.rs:22-23", "sibling": "a second in-tree TaskStore (e.g. a file- or sqlite-backed store) whose update() lacks the terminal guard and which inherits the non-atomic default begin_cancel", "why_realistic": "TaskStore is a public trait with the comment 'Contents do not survive restarts' on the in-memory one (a2a-server/src/task_store/inmemory.rs:17), so a persistent store is the natural next addition and would be a real second implementation at distance."},
+    {"where": "a2a-server/src/handler.rs:1225-1236", "sibling": "a delegating wrapper store (like the test PagingTaskStore) that forwards update but not begin_cancel, so it silently falls back to the non-atomic default", "why_realistic": "Wrappers that forward only the methods that existed when they were written are common, and the test double already forwards create/update/get/list only."},
+    {"where": "a2a-server/src/handler.rs:617-627", "sibling": "a resume/continue path (InputRequired -> Working) that does get-then-update without an atomic transition, like begin_cancel", "why_realistic": "Multi-turn resume is part of A2A, and the existing code already reuses the stored task without a state check."}
+  ],
+  "O9_family": "Race / TOCTOU on a task state machine (CWE-362): non-atomic check-then-act on cancel, plus a missing terminal-state immutability check in the store",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo (workspace; a2a-pb has build.rs protobuf codegen at a2a-pb/build.rs, with generated code checked in at a2a-pb/src/gen/)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Unit tests in a2a-server/src/task_store/inmemory.rs (mod tests, update tests about lines 170-195) and a2a-server/src/handler.rs (cancel tests at lines 1745-1850), run with tokio::test"
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "a2a-server/src/handler.rs, a2a-server/src/task_store/inmemory.rs, a2a-server/src/task_store/store.rs",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Take a handler-level mutex around cancel_task, or re-check state right before the write in the handler, and leave store update() and the public trait without any terminal-state guard."
+  },
+  "out_of_scope_notes": [
+    "cancel_task calls execution_manager.finish (a2a-server/src/handler.rs:879-881) while drive_execution may still be running; this concerns lifecycle cleanup, not the terminal-state check.",
+    "subscribe_to_task does not return UnsupportedOperation for terminal tasks as a2a-pb/proto/a2a.proto:75 requires (a2a-server/src/handler.rs:886-899); spec conformance, not this race."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell used); the source tree is about 65 .rs files plus checked-in protobuf codegen, so tiny_repo (<5 MB) may apply and was not confirmed.",
+    "Whether the concurrent-cancel race can be shown deterministically by a hidden test: tokio::test defaults to a current-thread runtime, so the fix's own concurrency test (fix.diff:38-73) may pass even without the fix; this hurts how well the race half can be tested.",
+    "present_in_latest for all O8 routes: no latest release given.",
+    "The a2a/src/types.rs:99 doc ('no further changes are permitted') might be read as protection_documented_without_exceptions; it was not flagged, because the fix itself makes a same-state exception."
+  ]
+}

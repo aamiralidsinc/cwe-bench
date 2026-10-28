@@ -1,0 +1,129 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82845",
+  "advisory_ids": ["GHSA-2M98-3P37-F6H9", "CVE-2026-110392"],
+  "repo": "samsung/qaboard",
+  "pinned_commit": "9592b589a16922a89dde1c9c08fa197e4a1c0492",
+  "fix_commits": ["05789e67c5d022f2403b9340fc8d82dc99dc3707"],
+  "trust_decision": {
+    "summary": "Values stored in the DB by unauthenticated ingestion routes (POST /api/v1/output, POST /api/v1/batch: batch label, configuration, input path, job_options, output/commit dirs, user, hexsha, batch commands) and request fields of the tuning/group routes are trusted when the backend builds bash scripts, bash -c strings and shell=True LSF-bridge commands; the fix quotes every value at the sink (shlex.quote), refuses non-shell-safe values in the bridge template, takes the user from the login session and requires login on the action routes.",
+    "evidence": [
+      "backend/backend/api/outputs.py:175-192",
+      "backend/backend/api/batch.py:59-61",
+      "backend/backend/models/Output.py:233-249",
+      "backend/backend/models/Output.py:288-295",
+      "backend/backend/api/tuning.py:168-179",
+      "backend/backend/api/tuning.py:309-318",
+      "backend/backend/api/tuning.py:331",
+      "fix.diff:880-933"
+    ]
+  },
+  "landing_point": {
+    "where": "backend/backend/models/Output.py:209",
+    "why": "Summary says 'output redo/tuning'; the redo route calls Output.redo, which builds redo.sh with single/double-quote interpolation and runs it through the LSF bridge with shell=True."
+  },
+  "fix_sites": [
+    {"where": "backend/backend/models/Output.py:233-247", "entry_point": "POST /api/v1/output/redo/<id> (and POST /api/v1/batch/redo via Batch.redo)", "module_kind": "model (command builder)"},
+    {"where": "backend/backend/models/Output.py:249-295", "entry_point": "POST /api/v1/output/redo/<id>, POST /api/v1/batch/redo", "module_kind": "model (script writer + shell=True bridge)"},
+    {"where": "backend/backend/models/Batch.py:109-124", "entry_point": "POST /api/v1/batch/redo", "module_kind": "model (wrapper over Output.redo)"},
+    {"where": "backend/backend/models/Batch.py:133-146", "entry_point": "POST /api/v1/batch/stop, DELETE /api/v1/batch/<id>, DELETE /api/v1/commit/<id>/batches", "module_kind": "model -> qaboard CLI runner library (JobGroup.stop -> bkill via bridge)"},
+    {"where": "backend/backend/models/CiCommit.py:173", "entry_point": "POST /api/v1/commit/save-artifacts (also reached from both redo paths)", "module_kind": "model (git argv, option injection via hexsha)"},
+    {"where": "backend/backend/api/tuning.py:167-174", "entry_point": "POST /api/v1/tests/group", "module_kind": "API handler (bash -c)"},
+    {"where": "backend/backend/api/tuning.py:228-251", "entry_point": "POST /api/v1/commit/<hexsha>/batch", "module_kind": "API helper (script generator)"},
+    {"where": "backend/backend/api/tuning.py:254-283", "entry_point": "POST /api/v1/commit/<hexsha>/batch (local/celery runner)", "module_kind": "API helper (bash -c dispatch)"},
+    {"where": "backend/backend/api/tuning.py:286-318", "entry_point": "POST /api/v1/commit/<hexsha>/batch (lsf runner)", "module_kind": "API helper (bsub script + shell=True bridge)"},
+    {"where": "backend/backend/api/tuning.py:331", "entry_point": "POST /api/v1/commit/<hexsha>/batch", "module_kind": "API handler (user from request body)"},
+    {"where": "backend/backend/api/tuning.py:422-439", "entry_point": "POST /api/v1/commit/<hexsha>/batch", "module_kind": "API handler (qa command string)"},
+    {"where": "fix.diff:874-933", "entry_point": "new backend/backend/shell_utils.py helper used by all of the above", "module_kind": "new shared helper"},
+    {"where": "fix.diff:89-105", "entry_point": "login_required decorator applied to ~17 action routes", "module_kind": "auth layer"}
+  ],
+  "O1_entry_points": 8,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "backend/backend/models/Batch.py:133-146 (stop: unauthenticated batch.data['commands'] spread into JobGroup job_options, formatted into the LSF bridge by qaboard/runners/lsf.py:316-319 with shell=True at qaboard/runners/lsf.py:321-326); also backend/backend/models/CiCommit.py:173 (git worktree add <hexsha>, argv option injection, not a shell)"
+  },
+  "O3_reason_to_dismiss": "Batch.stop is a 'stop/kill' feature, not redo/tuning, and its sink lives in the qaboard CLI runner package; CiCommit.save_artifacts uses an argv list (no shell), so it looks safe to a solver searching for shell=True.",
+  "O4_distance": {"files": 7, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Redo/tuning must still run commands whose legitimate values contain spaces, quotes, JSON (--tuning '{...}'), '=' and paths; the bridge template must still substitute {user}/{bsub_command}; the env exports and .envrc sourcing must keep working. Blanket rejection of non-alphanumeric labels/configurations or of JSON tuning parameters breaks redo; quoting {bsub_command} once breaks the documented ssh 'bsub_su {user} -I {bsub_command}' template.",
+    "where": "backend/backend/models/Output.py:233-274; deployments/sirc/sirc.yml:42; website/docs/lsf-cluster-integration.mdx:106-107"
+  },
+  "O6_input_shapes": [
+    "value breaking out of single quotes (configuration, database, type, tuning JSON, job_options queue/resources/max_memory/max_threads, platform, batch_label, selected_group)",
+    "value breaking out of double quotes ($(), backticks) (batch label, input path, artifacts dir, script path)",
+    "unquoted positional value (tests/group name, merged batches path, command_id)",
+    "value starting with '-' parsed as an option (input path after '--', group name after '--', hexsha to git worktree)",
+    "value in a template re-parsed by a second shell (LSF bridge {user}/{bsub_command}; bsub job command parsed again on the exec host)",
+    "non-string JSON types (str() before quote for platform, batch_label, job_id, max_memory)",
+    "path traversal in group file name / project id (get_groups_path)"
+  ],
+  "O7_producer": {
+    "kind": "handler",
+    "where": "backend/backend/api/outputs.py:175-192 (output.data incl. job_options, user, output_dir_override, commit_dir_override) and backend/backend/api/batch.py:29,55-61 (batch_dir_override, batch.data, batch.data['commands']); both remain unauthenticated after the fix",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Output.redo quotes job_options queue/resources into `qa batch --lsf-queue/--lsf-resources`, but the qa CLI's LSF runner re-interpolates them into `-q '{queue}'` / `-R \"{resources}\"` and runs bsub with shell=True (second shell parse in the CLI layer); options['options'] is also passed raw.",
+      "where": "qaboard/runners/lsf.py:133-140",
+      "reason_to_dismiss": "The CLI runner treats its flags as local, trusted user input; the backend already quoted them so 'it's fixed at the source'.",
+      "distance": "different top-level package (qaboard/ CLI vs backend/), reached via qaboard/qa.py:535-640 and qaboard/runners/lsf.py:179-188",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "PUT /api/v1/output/<id> lets an unauthenticated caller rewrite output.data (job_options, user) that Output.redo later consumes; the fix quotes at the sink but leaves this producer unauthenticated.",
+      "where": "backend/backend/api/outputs.py:28-40",
+      "reason_to_dismiss": "Metadata update route used by the CLI; the sink-side quoting is the advertised protection.",
+      "distance": "same file as the redo handler",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Redo and tests/group `source` .envrc files from the artifacts dir and its parents, where the artifacts dir comes from commit_dir_override set by unauthenticated POST /api/v1/output; quoting the path does not stop executing an attacker-chosen .envrc.",
+      "where": "backend/backend/models/Output.py:265-271",
+      "reason_to_dismiss": "Sourcing .envrc is a documented feature and needs a file on the shared filesystem.",
+      "distance": "producer in backend/backend/api/outputs.py:189-191 via backend/backend/models/CiCommit.py:101-107",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "backend/backend/models/Output.py:223-232", "sibling": "another runner branch (e.g. dask/celery job_options -> --dask-* flags) built with f\"'{...}'\" interpolation", "why_realistic": "The code has a TODO to 'support other runners'; a maintainer would copy the LSF branch."},
+    {"where": "backend/backend/api/commit.py:141-162", "sibling": "save-artifacts with a user-supplied branch/ref passed to git or a qa subcommand via a shell string", "why_realistic": "Neighbouring route already passes request.json['hexsha'] into git; a ref option is a natural feature."},
+    {"where": "qaboard/runners/lsf.py:316-319", "sibling": "stop_jobs formats the bridge with **job_options, so any added key (user, queue) flows into a shell string", "why_realistic": "The format(**job_options) idiom already exists; the fix filters only at the backend caller."}
+  ],
+  "O9_family": "OS command injection (CWE-78) via shell-string construction from stored, unauthenticated data, plus missing authentication on action routes",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python",
+    "toolchain": "Python 3 + Flask/SQLAlchemy backend (backend/pyproject.toml, backend/Dockerfile); qaboard CLI package; backend unit tests mock app/db via backend/conftest.py",
+    "services": ["PostgreSQL (real app; unit tests mock it)", "LSF bridge / celery / rabbitmq only for real dispatch (not needed when subprocess is stubbed)"],
+    "offline_after_build": true,
+    "project_tests": "backend/tests/test_commit.py, test_milestones.py, test_image.py (no tests for redo/tuning/shell at pinned); fix adds backend/tests/test_security.py and a conftest pass-through for login_required"
+  },
+  "O11_fix_minutes": 90,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "backend/backend/__init__.py, backend/backend/api/auth.py, backend/backend/api/batch.py, backend/backend/api/commit.py, backend/backend/api/export_to_folder.py, backend/backend/api/integrations.py, backend/backend/api/outputs.py, backend/backend/api/tuning.py, backend/backend/api/webhooks.py, backend/backend/models/Batch.py, backend/backend/models/CiCommit.py, backend/backend/models/Output.py, backend/backend/shell_utils.py (new)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap the Output.redo f-string values in shlex.quote (or add login to the redo route) and stop, leaving the tuning dispatchers, tests/group bash -c, the LSF bridge template (needs shell-safe values, not quoting), Batch.stop job_options and the hexsha option injection open."
+  },
+  "out_of_scope_notes": [
+    "Fix also hardens a hardcoded Flask SECRET_KEY default (fix.diff:13-37): session forgery, separate weakness.",
+    "Fix adds a GitLab host allowlist for GITLAB_ACCESS_TOKEN (fix.diff:236-243) and URL-quotes job/commit ids: token leak / SSRF, separate weakness.",
+    "Fix adds path-traversal checks in get_groups_path (fix.diff:380-387): separate CWE-22.",
+    "At the pinned commit Output.redo references ssh_command unbound when QA_RUNNERS_LSF_BRIDGE is unset (backend/backend/models/Output.py:288-295), so redo only reaches the shell with a bridge configured; a task needs the env var set or the fixed behaviour.",
+    "qaboard/runners/local.py:21-22 and celery_app.py:30 run run_context.command with shell=True by design (user-defined commands)."
+  ],
+  "unverified": [
+    "repo size in MB not measured (no shell); tiny_repo/giant_repo not assessed",
+    "advisory text beyond the summary not available; entry-point list derived from code",
+    "whether the qa CLI re-quotes --lsf-queue/--lsf-resources anywhere between qaboard/qa.py:621-640 and qaboard/runners/lsf.py:133-140 was not traced in full",
+    "dask/celery stop_jobs paths (qaboard/runners/dask_runner.py:381-400, qaboard/runners/celery.py:61) not read in detail",
+    "present_in_latest is unknown for all O8 routes (no latest release given)"
+  ]
+}

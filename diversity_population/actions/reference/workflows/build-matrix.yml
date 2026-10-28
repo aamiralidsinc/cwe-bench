@@ -1,0 +1,131 @@
+name: matrix
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "comma-separated job ids (t01..t21) or all"
+        default: "t01"
+      mode:
+        description: "probe (environment check only) or build"
+        default: "probe"
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ids: ${{ steps.p.outputs.ids }}
+    steps:
+      - id: p
+        env:
+          IDS: ${{ inputs.ids }}
+        run: |
+          if [ "$IDS" = all ]; then seq -f 't%02g' 1 21; else echo "$IDS" | tr ',' '\n'; fi | jq -R . | jq -sc . > ids.json
+          echo "ids=$(cat ids.json)" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        id: ${{ fromJSON(needs.plan.outputs.ids) }}
+    env:
+      CLAUDE_VERSION: "2.1.302"                         # = klavis-vm, 2026-10-22
+      HARBOR_VERSION: "0.23.1.dev202609170426"          # = klavis-vm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /opt/microsoft 2>/dev/null || true
+          docker image prune -af >/dev/null 2>&1 || true
+          df -h / /mnt 2>/dev/null | sed 1d
+
+      - name: Docker on the larger disk
+        run: |
+          rf=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+          mf=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9); mf=${mf:-0}
+          dr=/var/lib/docker; [ "$mf" -gt "$rf" ] && dr=/mnt/docker
+          sudo mkdir -p "$dr"
+          printf '{"data-root":"%s","default-address-pools":[{"base":"172.16.0.0/12","size":24}],"shutdown-timeout":60}\n' "$dr" | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+          echo "docker root: $(docker info --format '{{.DockerRootDir}}'); free: / ${rf}G, /mnt ${mf}G; cpus $(nproc); mem $(free -g | awk '/Mem/{print $2}')G"
+
+      - name: Tools
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          "$HOME/.local/bin/uv" tool install -q "harbor==$HARBOR_VERSION"
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version; "$HOME/.local/bin/harbor" --version
+
+      - name: Payload
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          mkdir -p /tmp/pl
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d payload.tar.gz.gpg | tar -xz -C /tmp/pl
+          pv=$(cat /tmp/pl/pv_path)                 # the project root the build prompts name (kept out of this file)
+          echo "::add-mask::$pv"
+          sudo mkdir -p "$pv" && sudo chown -R "$(id -u):$(id -g)" "$(dirname "$(dirname "$pv")")"
+          mv /tmp/pl/root /tmp/pl/ids.json "$pv"/
+          slug=$(jq -r --arg id "$ID" '.[$id]' "$pv/ids.json")
+          echo "::add-mask::$slug"
+          { echo "PV=$pv"; echo "PV_ROOT=$pv/root"; echo "SLUG=$slug"; } >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.tb-graders/cwe/work"
+
+      - name: Model key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          umask 077
+          printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > "$HOME/.tb-graders/cwe/models.env"
+
+      - name: Probe
+        if: inputs.mode == 'probe'
+        run: |
+          cd "$PV_ROOT"
+          docker run --rm hello-world >/dev/null && echo "docker ok"
+          ./drive.sh deepseek bash -c 'claude -p "Reply with the single word OK." --model "$MODEL" --output-format json > /tmp/probe.json 2>/tmp/probe.err'; echo "deepseek rc=$?"
+          jq -r '"deepseek is_error=\(.is_error) result=\(.result|tostring|.[0:20])"' /tmp/probe.json || tail -c 300 /tmp/probe.err
+          . pipeline/docker-tuning.env
+          harbor run -p harness/smoke-task -a oracle -o /tmp/hj --job-name smoke -y -q > /tmp/smoke.out 2>&1; echo "harbor smoke rc=$?"
+          find /tmp/hj -name reward.txt -exec cat {} \; | head -1 | sed 's/^/smoke reward: /'
+
+      - name: Build and gate
+        if: inputs.mode == 'build'
+        run: |
+          cd "$PV_ROOT"
+          ( while sleep 300; do echo "alive $(date -u +%H:%M) load $(cut -d' ' -f1 /proc/loadavg) free $(df -BG --output=avail / | tail -1 | tr -d ' ')"; done ) &
+          bash pv_pipeline.sh deepseek "$SLUG" > /tmp/pipe.out 2>&1 || true
+          m=none; for x in .sound .unsound .gate_error; do [ -f "build/$SLUG/$x" ] && m=$x; done
+          echo "result ${{ matrix.id }}: gate marker=$m; builder exit=$(cat build/$SLUG/build-exit.txt 2>/dev/null || echo -)"
+
+      - name: Pack (encrypted)
+        if: always()
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          [ -n "${SLUG:-}" ] || exit 0
+          mkdir -p /tmp/pack/gate-jobs
+          cp /tmp/pipe.out /tmp/probe.json /tmp/probe.err /tmp/smoke.out /tmp/pack/ 2>/dev/null || true
+          find "$HOME/.tb-graders/cwe/gate-jobs" -maxdepth 1 -name "$SLUG-*" -exec cp -r {} /tmp/pack/gate-jobs/ \; 2>/dev/null || true
+          tar -czf /tmp/out.tgz -C "$PV" "root/build/$SLUG" "root/build/pipeline" "root/build/audit" $( [ -d "$PV_ROOT/tasks/$SLUG" ] && echo "root/tasks/$SLUG" ) -C /tmp pack
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" --symmetric --cipher-algo AES256 -o "/tmp/$ID.tgz.gpg" /tmp/out.tgz
+          ls -la "/tmp/$ID.tgz.gpg" | awk '{print "packed", $5, "bytes"}'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.id }}
+          path: /tmp/${{ matrix.id }}.tgz.gpg
+          retention-days: 7
+          if-no-files-found: warn

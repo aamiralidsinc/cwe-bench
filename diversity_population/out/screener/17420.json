@@ -1,0 +1,86 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "17420",
+  "advisory_ids": ["GHSA-FM3M-JRGM-5PPG", "CVE-2025-53534", "GO-2025-3844"],
+  "repo": "tnborg/panel",
+  "pinned_commit": "5a9ccddabda45a96ad3ef87e2c1819f0aee37b12",
+  "fix_commits": ["4985eb2e1f388ecd6faf331941c13cb97368ec1d", "91ecd04c270061429f9df5ec19cd6b96a9f595f2", "ed5c74c7534230ba685273504af4c1e1e3598ff1"],
+  "trust_decision": {
+    "summary": "The global chi middlewares (Entrance, MustLogin, MustInstall) make their entrance/login/whitelist/ws-ban/app-installed decisions on the raw r.URL.Path. chi.CleanPath and StripSlashes rewrite only rctx.RoutePath, and the router dispatches on that, so a non-canonical path (e.g. a leading double slash) fails the '/api' prefix test and skips login while still routing to an /api handler.",
+    "evidence": [
+      "internal/http/middleware/middleware.go:44-55",
+      "internal/http/middleware/must_login.go:39-42",
+      "internal/http/middleware/must_login.go:47",
+      "internal/http/middleware/entrance.go:81",
+      "internal/http/middleware/entrance.go:91-96",
+      "internal/http/middleware/entrance.go:106",
+      "internal/http/middleware/must_install.go:17-22",
+      "internal/bootstrap/http.go:21"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/http/middleware/must_login.go:39",
+    "why": "The advisory reports unauthenticated RCE. The login gate's whitelist and '/api' prefix test is where an engineer would look first."
+  },
+  "fix_sites": [
+    {"where": "internal/http/middleware/must_login.go:39", "entry_point": "every HTTP route under /api (internal/route/http.go:117, internal/route/ws.go:20) via global middleware chain internal/bootstrap/http.go:21", "module_kind": "auth middleware (login gate + whitelist)"},
+    {"where": "internal/http/middleware/must_login.go:47", "entry_point": "GET /api/ws/ssh, /api/ws/exec with an API-key Authorization header (internal/route/ws.go:20-23)", "module_kind": "auth middleware (API-key ws ban)"},
+    {"where": "internal/http/middleware/entrance.go:81", "entry_point": "any HTTP request (security entrance redirect / API-key entrance rewrite / robots.txt exemption)", "module_kind": "access-entrance middleware"},
+    {"where": "internal/http/middleware/must_install.go:17", "entry_point": "/api/website*, /api/container*, /api/apps/{slug}/* (internal/route/http.go:410-412)", "module_kind": "feature-gate middleware"},
+    {"where": "internal/http/middleware/middleware.go:42", "entry_point": "global middleware ordering for every request (fix moves StartSession/Compress after CleanPath/StripSlashes)", "module_kind": "middleware composition"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All published fix sites are in one package, internal/http/middleware, and every site applies one concept: read the path from chi's RoutePath. The fix's only edit to the composition is the middleware reorder at internal/http/middleware/middleware.go:41-56, in the same package."},
+  "O3_reason_to_dismiss": "A solver who fixes only MustLogin could argue that MustInstall (must_install.go:17-22) is a feature gate rather than an auth check, and that the Entrance robots.txt/redirect comparisons (entrance.go:81,106) are only a cosmetic obscurity layer.",
+  "O4_distance": {"files": 4, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Several behaviours sit next to the sink and must keep working. Non-/api SPA/static paths load without login. The whitelisted login/key/is_login/is_2fa/panel endpoints stay unauthenticated. /robots.txt is exempt from the entrance check. API-key requests under the entrance prefix have their path rewritten to strip the entrance. A blanket fix that rejects every non-canonical path or forces login on all paths breaks these.",
+    "where": "internal/http/middleware/must_login.go:22-29, internal/http/middleware/must_login.go:39-42, internal/http/middleware/entrance.go:91-101, internal/http/middleware/entrance.go:104-106, internal/route/http.go:415-454"
+  },
+  "O6_input_shapes": [
+    "raw path that chi.CleanPath normalises differently (duplicate slashes, dot segments) — fix.diff:469-473",
+    "trailing slash removed by StripSlashes on RoutePath only — fix.diff:408-409",
+    "entrance-prefixed path with Authorization header, rewritten from the cleaned path — fix.diff:376-384",
+    "/api/apps/{slug} split for the installed-app gate — fix.diff:446-449"
+  ],
+  "O7_producer": {"kind": "none", "where": "The canonical path is produced by chi middleware.CleanPath/StripSlashes, an external dependency (go.mod:11, github.com/go-chi/chi/v5 v5.2.2), registered at internal/http/middleware/middleware.go:44-45. The checks never call it; they read r.URL.Path, which CleanPath does not rewrite (external dependency source not read; see unverified).", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/data/user_token.go:122", "sibling": "The API-key HMAC canonical request signs req.URL.Path (raw) while chi dispatches on the cleaned RoutePath. A per-path token scope, or a path-based deny list checked against the signed path, would reopen the same differential in another package.", "why_realistic": "The signer sits in internal/data, far from the middleware, and a maintainer would naturally sign the path the client sent. Fixing it needs an understanding of the raw-vs-routed path split (how-type), not just a search."},
+    {"where": "internal/http/middleware/must_login.go:47", "sibling": "An additional API-key deny prefix (e.g. a file-download or terminal route) compared against r.URL.Path rather than the routed path.", "why_realistic": "The existing ws ban is an ad-hoc prefix check, so adding a second one is a one-line change a maintainer could plausibly make."},
+    {"where": "internal/route/http.go:410-412", "sibling": "A per-app plugin middleware registered in apploader that gates admin-only app routes by r.URL.Path.", "why_realistic": "Apps register their own sub-routers under /api/apps, and a plugin author would not know that the global chain switched to RoutePath."}
+  ],
+  "O9_family": "authentication bypass via path-normalisation parser differential between the auth middleware (raw r.URL.Path) and the router (cleaned rctx.RoutePath); CWE-305/CWE-436, with CWE-22-style dot/slash segments",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.24.0 (go.mod:3), chi v5.2.2, wire DI",
+    "services": ["SQLite/GORM data layer for user tokens and sessions (unverified)", "app install state via biz.AppRepo"],
+    "offline_after_build": true,
+    "project_tests": "No *_test.go files under internal/. The middlewares take interfaces (biz.UserTokenRepo, biz.AppRepo; mocks exist at mocks/biz/UserTokenRepo.go), so they can be tested with httptest and a chi.Mux."
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/http/middleware/entrance.go, internal/http/middleware/must_login.go, internal/http/middleware/must_install.go, internal/http/middleware/middleware.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Normalise the path, or switch to RoutePath, inside MustLogin only, leaving Entrance and MustInstall on the raw path; or delete CleanPath, which changes routing behaviour."
+  },
+  "out_of_scope_notes": [
+    "internal/http/middleware/entrance.go:81: with entrance == '/', every request without an Authorization header is redirected to /login. This looks odd, but it is not part of this advisory.",
+    "internal/route/http.go:426-427: the SPA handler opens r.URL.Path on an embedded FS. This is read-only embed and was not pursued."
+  ],
+  "unverified": [
+    "Only commit ed5c74c applies to the pinned tree (fix.diff:346-485). Commit 4985eb2 (fix.diff:1-116) is the exact inverse at the blob level (entrance.go 34bb6238->bb934da8 vs bb934da8->34bb6238). Commit 91ecd04 (fix.diff:118-344) targets a much older layout (app.Session, MustLogin via r.With) that does not exist at the pinned commit. So effectively this is one fix commit.",
+    "The chi v5.2.2 CleanPath/StripSlashes semantics (they rewrite rctx.RoutePath only and use RawPath when set) are from knowledge of the library. The module cache was not inspected.",
+    "O1 = 3 counts the distinct gates reachable over HTTP (login gate, API-key ws ban, installed-app gate). Counted per route, every /api route is an entry point.",
+    "repo_mb is unknown: the size was not measured.",
+    "The services list is not verified against internal/data."
+  ]
+}

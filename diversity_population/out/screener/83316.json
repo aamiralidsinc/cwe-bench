@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "83316",
+  "advisory_ids": ["CVE-2026-111879", "GHSA-8CX8-9VJ9-9X7J"],
+  "repo": "perl5-dbi/dbi",
+  "pinned_commit": "c9c310556451f0d0a90f45e4d80a39d00567928f",
+  "fix_commits": ["1c71a976433b46da98b4844d2ae01326b5a242d7", "99bbf2ab9d137e6f042a770bd3bbba3bc0b3a901"],
+  "trust_decision": {
+    "summary": "Not an authorization decision but a resource-ownership invariant: once DBD::File::DataSource::File::open_data has flock()ed the table's .lck handle into $meta->{lockfh}, every later failure inside the table constructor must release it, because DBI::DBD::SqlEngine::Table::new calls open_data before the object is blessed (so DESTROY never runs) and $meta persists in $dbh->{sql_meta}; DBD::DBM::Table::open_data croaked after the lock with no release.",
+    "evidence": [
+      "lib/DBD/File.pm:739-768",
+      "lib/DBI/DBD/SqlEngine.pm:1629-1653",
+      "lib/DBI/DBD/SqlEngine.pm:1556-1561",
+      "lib/DBD/DBM.pm:375",
+      "lib/DBD/DBM.pm:411-423",
+      "lib/DBD/File.pm:954-964"
+    ]
+  },
+  "landing_point": {
+    "where": "lib/DBD/DBM.pm:411-417",
+    "why": "The summary names DBD::DBM open_data and the ChangeLog wording ('bad serializer class') points straight at the dbm_mldbm _CLASS croak that sits after SUPER::open_data."
+  },
+  "fix_sites": [
+    {"where": "fix.diff:137-141 (lib/DBD/DBM.pm:372-375 at pin)", "entry_point": "$dbh->do / execute of CREATE, SELECT, INSERT, UPDATE, DELETE on a DBD::DBM table with dbm_mldbm set (DBI::SQL::Nano open_tables -> SqlEngine open_table -> Table::new -> open_data)", "module_kind": "driver table class (DBD::DBM::Table), the reported module"},
+    {"where": "fix.diff:150-151 (lib/DBD/DBM.pm:415-416 at pin)", "entry_point": "same SQL statements; old post-lock serializer check removed", "module_kind": "driver table class (DBD::DBM::Table)"},
+    {"where": "fix.diff:159-167 (lib/DBD/DBM.pm:421-423 at pin)", "entry_point": "same SQL statements when tie() fails or the data file is missing after tie", "module_kind": "driver table class (DBD::DBM::Table)"},
+    {"where": "fix.diff:184-209 (lib/DBD/File.pm:916-930 at pin)", "entry_point": "SQL DROP via DBI::SQL::Nano DROP -> $table->drop; helper _release_lock extracted from drop", "module_kind": "base class (DBD::File::Table), refactor only"},
+    {"where": "fix.diff:214-222 (lib/DBD/File.pm:954-964 at pin)", "entry_point": "table object destruction after any statement", "module_kind": "base class (DBD::File::Table), refactor only"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "none", "where": "The File.pm hunks (fix.diff:184-222) only extract the existing drop/DESTROY close+unlock code into _release_lock; no behaviour changes there, so the substantive fix is confined to DBD::DBM::Table::open_data."},
+  "O3_reason_to_dismiss": "The advisory and ChangeLog talk only about the 'bad serializer class' and tie failures, so a solver can argue that later croaks (metadata read/write, BerkeleyDB flag handling, the Nano col_names check in a different package) are unrelated input-validation errors, not the reported lock leak.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "DROP TABLE of a table whose dbm_mldbm is invalid must still work (fix skips the new validation in dropMode); validating in init_table_meta or unconditionally in open_data would make the bad table undroppable. Also the .lck file must survive a failed open: unlinking it (tempting given the ChangeLog's 'lock file not removed') makes every later open croak 'Cannot open ... .lck'. Shared SELECT locks must stay held for the life of a successfully opened table.",
+    "where": "fix.diff:137; lib/DBI/SQL/Nano.pm:305-326; lib/DBD/File.pm:747-753; lib/DBD/DBM.pm:342-347"
+  },
+  "O6_input_shapes": [
+    "dbm_mldbm that fails the module-name grammar (path-shaped or traversal)",
+    "tie() failure for the configured dbm_type/MLDBM combination",
+    "tie succeeds but data file absent (-f fails)",
+    "createMode, lockMode (exclusive) and read (shared) lock modes all reach the same failure points"
+  ],
+  "O7_producer": {"kind": "none", "where": "Lock state is produced by lib/DBD/File.pm:739-768 (data-source layer, called via lib/DBI/DBD/SqlEngine.pm:1622) and persisted through $dbh->{sql_meta} at lib/DBI/DBD/SqlEngine.pm:1556-1561; this is a handler-style producer, not a schema/serializer, and the DBM code calls it directly.", "check_calls_producer": true},
+  "O8_uncovered_routes": [
+    {"route": "Post-tie metadata block reads _metadata through the tied (possibly MLDBM-thawing) hash and writes it back even on a read-only (SELECT) tie; any die there leaves the lock held.", "where": "lib/DBD/DBM.pm:426-455", "reason_to_dismiss": "It is past the code the advisory names and looks like data-format handling, not open/lock handling; writing metadata in SELECT is documented legitimate behaviour (lib/DBD/DBM.pm:1202-1206).", "distance": "same function, ~20 lines below the fixed hunk", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "BerkeleyDB branch dereferences dbm_berkeley_flags as a hash after the lock is taken; a non-hash value dies with the lock held.", "where": "lib/DBD/DBM.pm:384-400", "reason_to_dismiss": "Needs the optional BerkeleyDB backend; a solver can call it an unsupported combination / user error.", "distance": "same function, above the fixed hunk", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "After open_data returns, SqlEngine Table::new passes $meta->{col_names} to DBI::SQL::Nano::Table_::new, which croaks unless it is an ARRAY; in createMode DBM does not normalize a string dbm_cols ('foo,bar', documented) before this, so the croak happens unblessed with the lock held.", "where": "lib/DBI/DBD/SqlEngine.pm:1645-1652; lib/DBI/SQL/Nano.pm:772-773; lib/DBD/DBM.pm:361; lib/DBD/DBM.pm:426; lib/DBD/DBM.pm:1194", "reason_to_dismiss": "It is in the generic SqlEngine/Nano layer, two packages from DBD::DBM, and only with Nano (no SQL::Statement); looks like an unrelated column-spec validation.", "distance": "2 files / 2 packages from the landing point", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/DBI/DBD/SqlEngine.pm:1645", "sibling": "A generic post-open_data hook (e.g. column-map or encoding setup) in Table::new that can croak before bless.", "why_realistic": "The comment at lib/DBI/DBD/SqlEngine.pm:1643-1644 already says setup is done before inherited new; adding more pre-bless work there is the natural place a maintainer would extend."},
+    {"where": "lib/DBD/File.pm:732-737", "sibling": "Reorder so the data/lock flock happens before apply_encoding, making an encoding croak leak the lock in the base DBD::File data source (second implementation used by DBD::CSV-style drivers).", "why_realistic": "Both Stream and File data sources do open/encode/lock in slightly different orders (lib/DBD/File.pm:539-555 vs 732-768); a refactor unifying them could plausibly move the lock earlier."},
+    {"where": "lib/DBD/DBM.pm:426-455", "sibling": "Schema/col_names validation from stored _metadata (e.g. croak on column-count mismatch) after the lock.", "why_realistic": "push_names already enforces column rules (lib/DBD/DBM.pm:536-539); mirroring them on reopen is an obvious maintainer addition."}
+  ],
+  "O9_family": "Improper locking / resource release on error path (CWE-667): lock leaked when constructor fails before the owning object exists", "O9_dos": true,
+  "O10_build": {"language": "Perl (with XS core in DBI.xs)", "toolchain": "perl, ExtUtils::MakeMaker, C compiler for DBI.xs; DBD::DBM/DBD::File are pure Perl using core SDBM_File and Fcntl", "services": [], "offline_after_build": true,
+                "project_tests": "t/49dbd_file.t, t/50dbm_simple.t, t/51dbm_file.t, t/52dbm_complex.t, t/53dbm_module_name.t (MLDBM case skipped unless MLDBM installed)"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "lib/DBD/DBM.pm, lib/DBD/File.pm", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Move the dbm_mldbm _CLASS check above SUPER::open_data (or into init_table_meta) and stop, or unlink the .lck file on failure, instead of releasing the lock on every post-lock failure (ideally with an eval around open_data in SqlEngine Table::new)."},
+  "out_of_scope_notes": [
+    "lib/DBD/File.pm:730 and 748: if the lock-file open fails, the already opened data handle stays in $meta->{fh} (open handle leak, not a lock).",
+    "lib/DBD/DBM.pm:391-392 deletes DB_CREATE/DB_RDONLY from the shared dbm_berkeley_flags hash on each open (attribute mutation)."
+  ],
+  "unverified": [
+    "Whether SDBM_File/other DBM stores actually die (vs return false) when writing _metadata on an O_RDONLY tie (O8 route 1).",
+    "Whether a string dbm_cols survives unnormalized to SqlEngine Table::new in createMode, and whether SQL::Statement's Table new (external) has the same ARRAY croak (O8 route 3).",
+    "repo_mb not measured (no shell); tiny_repo flag not assessed, DBI source is likely only a few MB.",
+    "Recall risk judged low from the 2026-10-20 publication date and the advisory's niche scope; not checked externally.",
+    "Hidden-test viability: the published regression test needs MLDBM installed (t/53dbm_module_name.t:83-84)."
+  ]
+}

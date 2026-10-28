@@ -1,0 +1,96 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "95306",
+  "advisory_ids": ["CVE-2026-62862", "GHSA-4G76-CWMG-GQGW"],
+  "repo": "baptistearno/typebot.io",
+  "pinned_commit": "06575dfcd461ba76071012869d4b1f4046f9a6b8",
+  "fix_commits": ["c3185cfe1a0c32bf8b280f14b0ed67805069d7c1", "03c8dd967f21e48e128340e369901d595d89bfd9"],
+  "trust_decision": {
+    "summary": "Whether a submitted 6-digit email sign-in code proves control of the mailbox is decided by the next-auth Prisma adapter's useVerificationToken (delete-by-identifier+token, no failed-attempt limit), with codes made by Math.random in the Nodemailer provider config.",
+    "evidence": [
+      "packages/auth/src/helpers/createAuthPrismaAdapter.ts:184-202",
+      "packages/auth/src/lib/providers.ts:43-44",
+      "packages/auth/src/lib/nextAuth.ts:90-100"
+    ]
+  },
+  "landing_point": {
+    "where": "packages/auth/src/lib/providers.ts:43-44",
+    "why": "The summary says '6-digit magic-link code' / weak randomness; generateVerificationToken with Math.random is the only visible code generator for sign-in."
+  },
+  "fix_sites": [
+    {"where": "packages/auth/src/lib/providers.ts:43-44", "entry_point": "POST /api/auth/signin/nodemailer (next-auth email sign-in request, via authHandlers in packages/auth/src/lib/nextAuth.ts:190)", "module_kind": "provider configuration"},
+    {"where": "packages/auth/src/helpers/createAuthPrismaAdapter.ts:175-183", "entry_point": "POST /api/auth/signin/nodemailer (next-auth calls adapter.createVerificationToken)", "module_kind": "storage adapter (lower-level API called by next-auth internals)"},
+    {"where": "packages/auth/src/helpers/createAuthPrismaAdapter.ts:193-199", "entry_point": "GET /api/auth/callback/nodemailer?token=&email= (next-auth calls adapter.useVerificationToken)", "module_kind": "storage adapter (lower-level API called by next-auth internals)"},
+    {"where": "fix.diff:377-452", "entry_point": "new helper recordFailedEmailSignInAttempt, reached from the callback route via the adapter", "module_kind": "new helper module"},
+    {"where": "packages/prisma/postgresql/schema.prisma:183-190", "entry_point": "data model for VerificationToken (adds failedAttempts), plus new migration fix.diff:516-523", "module_kind": "schema"},
+    {"where": "packages/prisma/mysql/schema.prisma:199-206", "entry_point": "MySQL data model for VerificationToken (adds failedAttempts)", "module_kind": "schema (second database backend)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "packages/auth/src/helpers/createAuthPrismaAdapter.ts:184-202 (useVerificationToken), plus the per-backend schemas packages/prisma/postgresql/schema.prisma:183-190 and packages/prisma/mysql/schema.prisma:199-206"
+  },
+  "O3_reason_to_dismiss": "The report is about weak randomness; swapping Math.random for crypto.randomInt makes the code 'unpredictable', and attempt limiting looks like next-auth's / the infra rate limiter's job (the app already rate-limits sign-in at nextAuth.ts:97-100), so the adapter and schema look out of scope.",
+  "O4_distance": {"files": 5, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The VerificationToken table is shared: WhatsApp webhook tokens (identifier 'whatsapp webhook', value null) and change-email tokens (identifier '<userId>-changeEmail', value = new email) must not be counted or deleted by the failed-attempt logic; a legitimate user who mistypes the code once must still be able to sign in with the right code; legacy rows with value null must still work.",
+    "where": "packages/whatsapp/src/api/handleGenerateVerificationToken.ts:6-12; packages/auth/src/api/sendUpdateEmailVerifCodeEmail.ts:41-48; packages/auth/src/api/updateUserEmail.ts:14-25"
+  },
+  "O6_input_shapes": [
+    "token rows created after the fix (value='email-sign-in')",
+    "legacy unmarked rows (value null)",
+    "rows marked with the 'email-sign-in-failed-attempts:' prefix",
+    "non-email identifiers skipped (isEmailIdentifier split on '@')",
+    "parallel failed attempts (atomic updateMany increment then deleteMany)"
+  ],
+  "O7_producer": {
+    "kind": "schema",
+    "where": "packages/prisma/postgresql/schema.prisma:183-190 and packages/prisma/mysql/schema.prisma:199-206 (no failedAttempts column at pinned commit); createVerificationToken at packages/auth/src/helpers/createAuthPrismaAdapter.ts:175-183 produces the row the check later counts",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {
+      "where": "packages/auth/src/api/sendUpdateEmailVerifCodeEmail.ts:40-43",
+      "sibling": "Change-email verification code generated as a short numeric code (same as sign-in), verified at packages/auth/src/api/updateUserEmail.ts:14-28 with no attempt counter.",
+      "why_realistic": "The email is sent through the same VerificationCodeEmail template as a 'code'; a maintainer aligning UX with the 6-digit sign-in code would plausibly reuse the same generator, and the verify handler already has no failed-attempt handling. Lives in a different file (api/) from the adapter."
+    },
+    {
+      "where": "packages/lib/src/utils.ts:94-104",
+      "sibling": "Math.random-based generateId (currently unused) could be wired into a token generator (e.g. WhatsApp webhook token at packages/whatsapp/src/api/handleGenerateVerificationToken.ts:8).",
+      "why_realistic": "A shared util in another package that a maintainer would reach for; it is a second weak-randomness primitive at distance from the landing point."
+    }
+  ],
+  "O9_family": "authentication: brute-forceable short OTP (missing failed-attempt limit, CWE-307) plus non-CSPRNG token generation (CWE-330)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "bun workspaces + nx; vitest added to packages/auth by the fix; Prisma client generation",
+    "services": ["PostgreSQL or MySQL for end-to-end adapter behaviour", "Redis optional (rate limiter)", "SMTP for real sign-in flow"],
+    "offline_after_build": true,
+    "project_tests": "None for packages/auth at the pinned commit (no *.test.ts under packages/auth); the fix adds a unit test with an in-memory store (fix.diff:198-376). Hidden tests can follow that injectable-store pattern without a DB."
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "packages/auth/src/lib/providers.ts, packages/auth/src/helpers/createAuthPrismaAdapter.ts, packages/auth/src/helpers/recordFailedEmailSignInAttempt.ts (new), packages/prisma/postgresql/schema.prisma (+migration), packages/prisma/mysql/schema.prisma",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Replace Math.random with crypto.randomInt in providers.ts and stop, or add an IP rate limit in the signIn callback (which only runs on send, not on the callback check)."
+  },
+  "out_of_scope_notes": [
+    "createEmailMagicLink.ts:17-22 normalizes the email by splitting the domain on ','; identifier normalization differences vs next-auth were not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check performed).",
+    "next-auth internals (node_modules) not read: whether the callback hashes token with secret before useVerificationToken and how it normalizes the identifier passed to the adapter; this determines how-type room around the counter key.",
+    "MySQL backend has no migrations directory at the pinned commit (only postgresql/migrations found); assumed MySQL uses db push.",
+    "present_in_latest not applicable: no latest release provided and O8 is empty.",
+    "Whether the signIn-callback rate limiter (packages/auth/src/lib/nextAuth.ts:90-100) runs on the callback route was inferred from the email.verificationRequest guard, not from next-auth source."
+  ]
+}

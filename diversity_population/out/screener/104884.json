@@ -1,0 +1,65 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104884",
+  "advisory_ids": ["GHSA-J84G-3JRC-VGCR", "CVE-2026-97865"],
+  "repo": "open-web-analytics/open-web-analytics",
+  "pinned_commit": "1a42241b8db8195e3781b940ed182db604fbe062",
+  "fix_commits": ["78c1222ec0e2119d84684032da1541120a2cdd23", "b6e030b9b123ac7d73f5fa0fe03962eb86cf1309"],
+  "trust_decision": {
+    "summary": "Two decisions: (1) which Event fields an unauthenticated remote queue sender may set, decided in Event::loadFromArray (it currently copies every object var); (2) which classes a stored blob (queue row, file-queue line, settings row, site settings column) may reconstruct on unserialize(), decided at each unserialize() call, which currently allows any class.",
+    "evidence": ["queue.php:49-56", "modules/Base/Classes/Event.php:269-280", "Core/EventQueue.php:103-106", "modules/Base/Classes/FileEventQueue.php:357", "modules/Base/Classes/Settings.php:290", "modules/Base/Classes/Settings.php:380", "modules/Base/Entity/Site.php:67-70"]
+  },
+  "landing_point": {"where": "modules/Base/Classes/Event.php:269", "why": "The summary names queue.php and loadFromArray; queue.php:56 passes the raw request param 'event' straight into Event::loadFromArray, so an engineer starts there, then follows the queue to Core/EventQueue.php:105 decodeMessage."},
+  "fix_sites": [
+    {"where": "modules/Base/Classes/Event.php:269-280", "entry_point": "HTTP POST queue.php (unauthenticated remote event queue endpoint, param 'event')", "module_kind": "domain model / ingress mapper"},
+    {"where": "Core/EventQueue.php:103-106", "entry_point": "CLI `cli.php cmd=processEventQueue` (modules/Base/Module.php:542) -> DbEventQueue::receiveMessage (modules/Base/Classes/DbEventQueue.php:91)", "module_kind": "core abstract queue base class (serializer pair prepareMessage/decodeMessage)"},
+    {"where": "modules/Base/Classes/FileEventQueue.php:357", "entry_point": "CLI processEventQueue with file queue type (default event_queue_type 'file', modules/Base/Classes/Settings.php:923) -> receiveMessage -> parse_log_row (FileEventQueue.php:237)", "module_kind": "second queue implementation that bypasses decodeMessage"},
+    {"where": "modules/Base/Classes/Settings.php:290", "entry_point": "every request boot: Settings::load reads the base.configuration row", "module_kind": "config loader"},
+    {"where": "modules/Base/Classes/Settings.php:380", "entry_point": "Settings::save (admin options save; also from Settings::__destruct, Settings.php:1225)", "module_kind": "config save/merge path"},
+    {"where": "modules/Base/Entity/Site.php:67-70", "entry_point": "any read of a site entity's 'settings' column via Entity::get filter (Core/Entity.php:250), e.g. getSiteSetting (Site.php:87)", "module_kind": "entity column get-filter (save/reload)"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "modules/Base/Classes/FileEventQueue.php:357 (own unserialize, bypasses Core/EventQueue.php:103 decodeMessage; producer at FileEventQueue.php:206 also bypasses prepareMessage). Further save/reload sites in the same fix: modules/Base/Classes/Settings.php:290, modules/Base/Classes/Settings.php:380, modules/Base/Entity/Site.php:69"},
+  "O3_reason_to_dismiss": "Settings and site-settings blobs are written only by the application into its own DB, nothing reaches them from the queue endpoint, and the FileEventQueue log is a local file the app itself writes, so a solver focused on queue.php can argue none of them is attacker-reachable.",
+  "O4_distance": {"files": 7, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Legitimate events must still round-trip: a module-substituted event class from supportClassFactory('base','event') must still decode (pinning Base\\Classes\\Event decodes it as __PHP_Incomplete_Class), and the HttpEventQueue forwarder relays guid and timestamp from export(), so those must stay settable (idempotent retry, upstream event time). For the unfixed caches, cached Entity objects and Browscap parser results must still unserialize as objects, so allowed_classes=false breaks cache hits.", "where": "modules/Base/Classes/HttpEventQueue.php:55"},
+  "O6_input_shapes": [
+    "non-array loadFromArray input (string, null)",
+    "guid/timestamp as non-numeric string, SQL-ish string, serialized-object string, nested array, negative, float, empty, leading spaces",
+    "queue bookkeeping fields (receive_count, do_not_receive_before_timestamp, status, last/first_receive_timestamp, last_error_msg, old_queue_id)",
+    "serialized foreign-class blob in db queue row",
+    "urlencoded serialized blob in file-queue log line",
+    "serialized object inside configuration settings row and site settings column",
+    "serialized-looking string inside event properties (must stay a string)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "modules/Base/Classes/Settings.php:290 (Settings::load); writer at modules/Base/Classes/Settings.php:393-397", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "File object cache cold read unserializes a cache file with no class allowlist", "where": "modules/FileCache/Classes/FileCache.php:90", "reason_to_dismiss": "Cache files are written by the app into OWA_CACHE_DIR, cache_objects defaults to false (modules/Base/Classes/Settings.php:934), it lives in a separate FileCache module, and it must keep returning Entity objects (Core/Entity.php:322, Core/Entity.php:468), so an allowlist is non-trivial", "distance": "separate package modules/FileCache, not referenced by the queue or settings code", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Memcached object cache get relies on the PECL extension's implicit unserialize with no allowed_classes", "where": "modules/MemcachedCache/Classes/MemcachedCache.php:107", "reason_to_dismiss": "Deserialization happens inside the extension, not in OWA code; the extension is optional (MemcachedCache.php:56) and the memcached server is treated as trusted infrastructure", "distance": "separate package modules/MemcachedCache", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "modules/Base/Classes/PaginatedResultSet.php:446-448", "sibling": "a resultSetFromSerializedPhp() counterpart, or a report cache that unserializes result sets", "why_realistic": "resultSetToSerializedPhp() already exists as an output format, and a maintainer adding a reverse path for cached reports would naturally use bare unserialize"},
+    {"where": "modules/Base/Classes/DbEventQueue.php:91", "sibling": "a legacy/old-format queue-row decoder (e.g. for old_queue_id rows) calling unserialize directly instead of decodeMessage", "why_realistic": "the class already carries 'backwards compat. remove soon.' paths (DbEventQueue.php:92, modules/Base/Classes/Event.php:111-112)"},
+    {"where": "modules/Base/Classes/State.php:223-230", "sibling": "a legacy cookie-state format branch that unserializes the value", "why_realistic": "the function already sniffs several historical encodings (|||-assoc, json) by delimiter, so a third legacy format branch fits"}
+  ],
+  "O9_family": "deserialization (CWE-502) plus mass assignment of internal fields at ingress (CWE-20)",
+  "O9_dos": false,
+  "O10_build": {"language": "PHP", "toolchain": "PHP 8.2-8.4, composer v2, PHPUnit (composer run-script test), PHPStan", "services": ["MySQL for DB-backed tests (bootstrap skips them without a connection, tests/bootstrap_owa.php:46-50)"], "offline_after_build": true, "project_tests": "tests/EventQueueProcessingTest.php, tests/SettingsPersistenceTest.php; fix adds tests/EventQueueHardeningTest.php (not present at pinned commit)"},
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "Core/EventQueue.php, modules/Base/Classes/Event.php, modules/Base/Classes/FileEventQueue.php, modules/Base/Classes/Settings.php, modules/Base/Entity/Site.php", "j_sibling_sites": "yes", "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add allowed_classes to Core/EventQueue.php decodeMessage (pinned to Base\\Classes\\Event) and maybe sanitize loadFromArray, missing FileEventQueue's own unserialize, the settings and site blobs, and the object caches."},
+  "out_of_scope_notes": [
+    "Fix commit b6e030b9 (sort-column whitelist, report links) touches modules/base/classes/resultSetManager.php, modules/base/templates/report_traffic.tpl and owa_reportController.php, and none of those paths exist at the pinned tree (the tree has modules/Base/Classes/ResultSetManager.php). It is unrelated to this advisory's protection and was not screened.",
+    "FileEventQueue::isRunning passes a PID read from lock.txt to exec (modules/Base/Classes/FileEventQueue.php:188); not pursued."
+  ],
+  "unverified": [
+    "Repository size in MB was not measured.",
+    "The advisory text itself was not available. The fix's own comments and test (fix.diff:438-442) say HTTP input cannot reach unserialize as an object, so the summary's remote-deserialization framing may overstate the issue. The task report must state the stored-blob property explicitly to stay fair.",
+    "Whether the Browscap cached value class (ua-parser result) and the Entity/DbColumn graph are the full class set a FileCache allowlist would need was not enumerated.",
+    "present_in_latest is unknown: no latest release was provided.",
+    "Recall risk is rated low on the recent publication date only; no write-ups were searched."
+  ]
+}

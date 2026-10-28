@@ -1,0 +1,103 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "83596",
+  "advisory_ids": ["CVE-2026-112935", "GHSA-FQ56-3CX3-FJXP"],
+  "repo": "tox-dev/filelock",
+  "pinned_commit": "86c6d5fb9c23bbcc9f20ab7eda0d625305549b64",
+  "fix_commits": ["60331bb89f325020b48bc51bde904c6446384e4a", "740ff666b62a88496c8d7394e4e6230605e4d62b"],
+  "trust_decision": {
+    "summary": "A soft-lock contender decides that the file now at the lock path is the same marker it judged stale (dead owner, aged malformed record, expired lifetime/lease), identified only by (mtime, inode), and then renames/unlinks it; a reused inode number or a recreate in the rename window lets it remove a live holder's marker.",
+    "evidence": ["src/filelock/_util.py:115-124", "src/filelock/_soft.py:116-132", "src/filelock/_soft.py:134-141", "src/filelock/_api.py:1676-1679"]
+  },
+  "landing_point": {
+    "where": "src/filelock/_soft.py:116",
+    "why": "Summary names the SoftFileLock stale-lock break; SoftFileLock._try_break_stale_lock reads (mtime, ino) and calls break_lock_file (src/filelock/_util.py:86)."
+  },
+  "fix_sites": [
+    {"where": "src/filelock/_util.py:86-124", "entry_point": "break_lock_file, reached from every soft acquire poll (SoftFileLock/MarkerSoftFileLock/SoftFileLease .acquire)", "module_kind": "shared low-level utility (rename/unlink primitive)"},
+    {"where": "src/filelock/_soft.py:116-132", "entry_point": "SoftFileLock.acquire() / AsyncSoftFileLock.acquire() on EEXIST (src/filelock/_soft.py:88)", "module_kind": "core soft-lock implementation"},
+    {"where": "src/filelock/_soft.py:134-141", "entry_point": "SoftFileLock.acquire() malformed-marker self-heal and SoftFileLease lease-expiry timer (src/filelock/_lease.py:267)", "module_kind": "per-instance observation cache (marker identity key)"},
+    {"where": "src/filelock/_soft.py:101-107", "entry_point": "SoftFileLock.acquire() rollback when writing the record fails or is interrupted", "module_kind": "core soft-lock acquire rollback"},
+    {"where": "src/filelock/_soft.py:257-268", "entry_point": "SoftFileLock.release() when the path names another file (peer's break holds our marker aside)", "module_kind": "core soft-lock release"},
+    {"where": "src/filelock/_api.py:1667-1679", "entry_point": "SoftFileLock(lifetime=...).acquire() via BaseFileLock.acquire loop (src/filelock/_api.py:1472) and async (src/filelock/asyncio.py:608-614)", "module_kind": "base class shared by all lock kinds (moved into SoftFileLock by the fix)"},
+    {"where": "src/filelock/_marker.py:76-83", "entry_point": "MarkerSoftFileLock.acquire()", "module_kind": "subclass with protocol-2 marker parser"},
+    {"where": "src/filelock/_lease.py:241-275", "entry_point": "SoftFileLease.acquire() / AsyncSoftFileLease.acquire()", "module_kind": "lease subclass, separate module"},
+    {"where": "src/filelock/_lease.py:350-353", "entry_point": "SoftFileLease heartbeat thread (_RefreshLoop.run) while held", "module_kind": "background refresh loop"},
+    {"where": "src/filelock/_unix.py:126-145", "entry_point": "FileLock/UnixFileLock.acquire() on a filesystem where flock raises ENOSYS (fallback to SoftFileLock)", "module_kind": "OS-lock backend fallback path (looks out of scope for a soft-lock advisory)"}
+  ],
+  "O1_entry_points": 7,
+  "O2_out_of_scope_site": {
+    "kind": "wrapper_or_composition",
+    "where": "src/filelock/_unix.py:126-145 (UnixFileLock ENOSYS fallback removes its placeholder by identity after closing the fd); also src/filelock/_api.py:1667-1679 (lifetime break in BaseFileLock, not in the soft module)"
+  },
+  "O3_reason_to_dismiss": "UnixFileLock is the flock-based FileLock, not a soft lock, and the ENOSYS fallback is a rare-filesystem corner; the lifetime break lives in the base class and is a separate 'lifetime' feature, so a solver fixing SoftFileLock's stale check can argue both are outside the report.",
+  "O4_distance": {"files": 5, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A genuinely dead holder's marker, an aged malformed/empty marker, and a lifetime- or lease-expired marker must still be reclaimed automatically, and break_lock()/force_break() must still remove any marker; a fix that never breaks (or always waits for timeout) breaks stale-lock recovery.",
+    "where": "src/filelock/_soft.py:123-132; src/filelock/_soft.py:192-195; src/filelock/_lease.py:264-268; src/filelock/_marker.py:67-74"
+  },
+  "O6_input_shapes": [
+    "parsed protocol-1 marker whose owner is dead (src/filelock/_soft.py:131-132)",
+    "unparsable/empty/oversized marker aged past MALFORMED_LOCK_AGE_THRESHOLD (src/filelock/_soft.py:123-129)",
+    "marker older than lifetime (src/filelock/_api.py:1676-1679)",
+    "protocol-2 marker with dead owner (src/filelock/_marker.py:82-83)",
+    "protocol-2 lease marker unrefreshed for lease_duration (src/filelock/_lease.py:267-268)",
+    "own ENOSYS placeholder in UnixFileLock fallback (src/filelock/_unix.py:139-143)",
+    "own marker on failed acquire rollback (src/filelock/_soft.py:101-106)",
+    "non-regular node (symlink/FIFO) at the lock path, classified via lstat (src/filelock/_soft.py:342-344)"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "src/filelock/_soft.py:134-141 (_marker_seen keyed on (mtime, ino) only; fix adds st_ctime_ns, fix.diff:911-924) fed by _read_lock_file returning only (mtime, ino) at src/filelock/_soft.py:337-359",
+    "check_calls_producer": true
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "SoftFileLock.release fallback: when the unlink while open fails, the marker is unlinked by (dev, ino) identity after the fd is closed, so the inode is no longer pinned and a successor's marker could carry the same number; the fix did not change this call.",
+      "where": "src/filelock/_soft.py:222-228",
+      "reason_to_dismiss": "Only reached when unlink-while-open fails (SMB-style shares); the in-code comment argues the still-present marker keeps the inode allocated, and it needs a lifetime-expired hold broken by a peer.",
+      "distance": "same file as landing point, release path (~100 lines below)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "src/filelock/_strict.py:184-190", "sibling": "StrictSoftFileLock._occupant_unchanged_for keys an occupant on (mtime, ino, size) without ctime, the same identity key the fix had to extend; a variant that evicts the occupant after the grace would be a reused-inode sibling.", "why_realistic": "Its comment says it copies SoftFileLock's marker rule, so a maintainer could plausibly have made it break rather than raise."},
+    {"where": "src/filelock/_windows.py:223-225", "sibling": "a release that unlinks the lock path by name after close without an identity re-check", "why_realistic": "Same 'unlink by name after close' idiom already exists for the OS-lock backend; a soft-backend copy is natural."},
+    {"where": "src/filelock/_soft_rw/_storage.py:171-176", "sibling": "an eviction in SoftReadWriteLock storage that decides a holder record is the same file by (dev, ino) via _identity before unlinking", "why_realistic": "The helper already compares lstat identities for the link/replace protocol; reusing it for stale eviction is a one-line change."}
+  ],
+  "O9_family": "Race / TOCTOU (CWE-367): identity check by (mtime, inode) then rename/unlink of a lock marker; inode-number reuse and empty-path window",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.11, pyproject.toml:23)",
+    "toolchain": "pip/hatch + tox (tox.toml); pytest, pytest-mock, pytest-asyncio, pytest-timeout (pyproject.toml:61-66); fix uses ctypes renameat2/renamex_np",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/test_soft_stale.py, tests/test_util.py, tests/test_lock_expiry.py, tests/test_soft_lease.py, tests/test_unix_fallback.py, tests/test_marker_records.py"
+  },
+  "O11_fix_minutes": 150,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/filelock/_util.py, src/filelock/_soft.py, src/filelock/_marker.py, src/filelock/_lease.py, src/filelock/_api.py, src/filelock/_unix.py",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Tighten break_lock_file's re-check (e.g. compare mtime with != or add size) in _util.py and stop, leaving the unpinned inode, the (mtime, ino) cache key without ctime, the rename-empties-path window, and the lease/lifetime/ENOSYS/rollback callers unchanged."
+  },
+  "out_of_scope_notes": [
+    "The release commit 60331bb bundles changelog entries for 14 other PRs; only 740ff66 (#843) carries this advisory's source change.",
+    "SoftReadWriteLock holder-record eviction (src/filelock/_soft_rw/_protocol.py:526-541) uses a byte-content ledger, a separate stale mechanism, not inspected further.",
+    "WindowsFileLock release unlinks by name (src/filelock/_windows.py:223-225); OS byte-range lock, not this protection."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); the source package is 22 .py files, so tiny_repo (<5 MB) may hold but was not confirmed.",
+    "O8 route src/filelock/_soft.py:222-228 is conditional on an unlink-while-open failure plus a lifetime-expired break by a peer; reachability on Linux local filesystems not confirmed.",
+    "O1 count (7) groups: SoftFileLock.acquire, SoftFileLock(lifetime).acquire, SoftFileLock.release, MarkerSoftFileLock.acquire, SoftFileLease.acquire, SoftFileLease heartbeat, FileLock ENOSYS fallback; async wrappers counted with their sync classes.",
+    "The published fix (renameat2 via ctypes syscall numbers, stranded-marker recovery) far exceeds a 45-minute fix; fairness depends on hidden tests scoring behaviour, not the exchange design.",
+    "Pinned docs document a residual two-syscall window (docs/how-to.rst:815-816, docs/concepts.rst:700), which a solver may cite as accepted behaviour; present_in_latest not checkable (no latest release given)."
+  ]
+}

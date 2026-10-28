@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "99402",
+  "advisory_ids": ["CVE-2026-75524", "GHSA-Q452-M9PF-QJ9J"],
+  "repo": "open-reception/appointment-booking-software",
+  "pinned_commit": "12d93cf552738ef7d397d01fed0e2268431e4ff6",
+  "fix_commits": ["3be5298677c8a8c15f1ccf42bdf391c9e86a2f9f", "73663288a8d4ad2ad31d897dc1f494ace2f0e452"],
+  "trust_decision": {
+    "summary": "Whether an agent is free for [slot start, start+duration) is decided by a plain SELECT on appointment and agent_absence in ensureAgentIsAvailableForSlot, outside any transaction or lock; the INSERT follows as a separate statement, so two concurrent bookings both pass the check.",
+    "evidence": [
+      "src/lib/server/services/appointment-service.ts:114-171",
+      "src/lib/server/services/appointment-service.ts:643-674",
+      "src/lib/server/services/appointment-service.ts:755-762",
+      "src/lib/server/services/appointment-service.ts:813-826",
+      "src/lib/server/db/tenant-schema.ts:155-192"
+    ]
+  },
+  "landing_point": {
+    "where": "src/lib/server/services/appointment-service.ts:114",
+    "why": "Both handlers named in the summary call ensureAgentIsAvailableForSlot right before inserting; it is the only overlap check in the service."
+  },
+  "fix_sites": [
+    {"where": "src/lib/server/services/appointment-service.ts:643-674", "entry_point": "POST /api/tenants/{id}/appointments/add-to-tunnel (src/routes/api/tenants/[id]/appointments/add-to-tunnel/+server.ts:259-296), also staff-create for existing clients", "module_kind": "service layer (AppointmentService.addAppointmentToTunnel)"},
+    {"where": "src/lib/server/services/appointment-service.ts:755-858", "entry_point": "POST /api/tenants/{id}/appointments/create-new-client (src/routes/api/tenants/[id]/appointments/create-new-client/+server.ts:302-325), also staff-create for new clients", "module_kind": "service layer (AppointmentService.createNewClientWithAppointment)"},
+    {"where": "src/lib/server/services/appointment-service.ts:114-171", "entry_point": "private helper reached from both methods above", "module_kind": "service layer (ensureAgentIsAvailableForSlot)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": ""},
+  "O3_reason_to_dismiss": "Absence create/update (agent-service.ts) is a staff-only admin feature in a different service; the advisory talks about overlapping appointments only, so a solver can argue absences are out of scope even though the booking check reads agent_absence.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Back-to-back slots (strict lt/gt bounds) must still book; a slot freed by cancel (status REJECTED) must be bookable again; different agents can book the same time. A global table lock, a unique index on (agent_id, appointment_date), or counting REJECTED rows breaks one of these.",
+    "where": "src/lib/server/services/appointment-service.ts:135-137, src/lib/server/services/appointment-service.ts:382-385"
+  },
+  "O6_input_shapes": [
+    "existing-client booking (add-to-tunnel) vs new-client booking (create-new-client, inside tunnel-creation transaction)",
+    "client-initiated (staffCreated=false) vs staff-initiated (staffCreated=true via staff-create)",
+    "exact-same start vs partially overlapping interval of different duration"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "Absence create runs its own check-then-insert with no lock and never reads appointments, so it can land inside a booking that is concurrently passing the absence half of ensureAgentIsAvailableForSlot; a per-agent lock taken only by the booking paths leaves this open.",
+      "where": "src/lib/server/services/agent-service.ts:470-516",
+      "reason_to_dismiss": "Staff-only absence management; the advisory says overlapping appointments, not absences.",
+      "distance": "different service file (agent-service.ts) from the landing point, same package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    },
+    {
+      "route": "Absence update moves the dates using the same unlocked overlap-check-then-update pattern, again without checking or locking against appointments.",
+      "where": "src/lib/server/services/agent-service.ts:780-834",
+      "reason_to_dismiss": "Absence-vs-absence overlap is a separate feature, and updates are not creation.",
+      "distance": "different service file (agent-service.ts), same package",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "src/lib/server/services/appointment-service.ts:264-277", "sibling": "a staff reschedule/'move appointment' method that updates appointmentDate/duration/agentId after calling ensureAgentIsAvailableForSlot outside a transaction", "why_realistic": "the service already has status-update methods, and a reschedule feature would naturally reuse the existing helper"},
+    {"where": "src/routes/api/tenants/[id]/appointments/staff-create/+server.ts:309-379", "sibling": "a separate bulk/series staff booking that inserts several appointments directly with tx.insert after one availability check", "why_realistic": "staff-create already branches between two service paths, and a recurring-series feature is a plausible extension"}
+  ],
+  "O9_family": "Race condition / TOCTOU (CWE-367) on a business invariant (no double booking per agent)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node + SvelteKit (@sveltejs/kit ^2.65), Vite, drizzle-orm ^0.45 with postgres-js ^3.4, vitest ^4, playwright for e2e",
+    "services": ["PostgreSQL (central DB plus a database per tenant, src/lib/server/db/index.ts:14-46)"],
+    "offline_after_build": true,
+    "project_tests": "vitest unit tests mock the DB entirely (src/lib/server/services/__tests__/appointment-service.test.ts:7, add-to-tunnel/__tests__, create-new-client/__tests__, staff-create/__tests__), so they cannot exercise real concurrency. Behavioural race tests need a live Postgres."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/lib/server/services/appointment-service.ts (inferred; fix diff has no hunks)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Move ensureAgentIsAvailableForSlot into db.transaction at the default READ COMMITTED level without a lock (still races), or add a unique index on (agent_id, appointment_date), which misses partial overlaps and blocks rebooking after a cancel."
+  },
+  "out_of_scope_notes": [
+    "add-to-tunnel and create-new-client call consumeBookingAccessToken only after the booking succeeds (add-to-tunnel/+server.ts:366, create-new-client/+server.ts:327): a token-reuse race in a separate check-then-use pair (cf. commit da921eb).",
+    "ensureAgentIsAvailableForSlot does not check that agentId belongs to channelId or is non-archived (appointment-service.ts:114-171).",
+    "denyAppointment issues an un-awaited delete after the update (appointment-service.ts:360-374)."
+  ],
+  "unverified": [
+    "The fix diff file holds only two merge-commit headers and no hunks (fix.diff:1-9), so the actual published fix sites, its mechanism (transaction, advisory lock, SERIALIZABLE, exclusion constraint), and whether it touched agent-service.ts are unknown; fix_sites are inferred from the summary and candidate metadata (c_fix_sites=6, c_site_files=1).",
+    "regression_tests_in_pinned_commit cannot be evaluated without the diff's test files.",
+    "Repo size in MB was not measured (no shell use).",
+    "Whether a DB-level exclusion constraint or migration was part of the fix (would sit under drizzle migrations) is unknown.",
+    "Hidden behavioural tests need a real Postgres and concurrent requests; it was not checked whether the project has any non-mocked DB test harness.",
+    "present_in_latest is unknown for all O8 routes (no latest release given)."
+  ]
+}

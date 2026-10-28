@@ -1,0 +1,81 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104051",
+  "advisory_ids": ["GHSA-22FM-4Q7R-F7W4", "CVE-2026-93302"],
+  "repo": "wolfssl/wolfssl",
+  "pinned_commit": "6a43d3355b9bf2732c410718e546d8db36c592fd",
+  "fix_commits": ["22bcd51d553eaac1de37bee91fdac80cc47961e1"],
+  "trust_decision": {
+    "summary": "During the TLS handshake, ProcessPeerCerts decides whether the peer's leaf certificate is a loaded trusted-peer cert. If it is, haveTrustPeer is set and chain and signature verification are skipped. At the pinned commit the match uses subject-name hash + issuer hash + SKID (GetTrustedPeer) + raw signature bytes (MatchTrustedPeer). All of these can be copied into a cert carrying a different public key.",
+    "evidence": ["src/internal.c:18455-18470", "src/internal.c:16888-16893", "src/internal.c:18480-18486", "src/ssl_certman.c:2776-2816", "src/ssl_certman.c:2819-2838"]
+  },
+  "landing_point": {
+    "where": "src/ssl_certman.c:2819",
+    "why": "The summary says 'trusted peer certificate match ignores public key'. MatchTrustedPeer is the function named 'match', and its comment says SKID or subject was already compared in GetTrustedPeer, so the engineer looks there first and adds a public-key compare."
+  },
+  "fix_sites": [
+    {"where": "src/internal.c:18459", "entry_point": "TLS handshake Certificate message: wolfSSL_connect (server cert) / wolfSSL_accept with mutual auth (client cert), via DoCertificate src/internal.c:19523 and TLS1.3 DoTls13Certificate src/tls13.c:12346", "module_kind": "protocol handler (call site of the trust decision)"},
+    {"where": "src/ssl_certman.c:2776", "entry_point": "GetTrustedPeer, reached only from ProcessPeerCerts src/internal.c:18456", "module_kind": "certificate manager lookup (internal API)"},
+    {"where": "src/ssl_certman.c:2819", "entry_point": "MatchTrustedPeer (removed), called from src/internal.c:18459", "module_kind": "certificate manager match (internal API)"},
+    {"where": "src/ssl_certman.c:2738", "entry_point": "AlreadyTrustedPeer, dedup on load: wolfSSL_CTX_trust_peer_cert / wolfSSL_trust_peer_cert / wolfSSL_CTX_trust_peer_buffer via AddTrustedPeer", "module_kind": "loader dedup (table producer side)"},
+    {"where": "src/ssl_certman.c:2986", "entry_point": "AddTrustedPeer, from ProcessBufferCertHandleDer src/ssl_load.c:2448-2460 (trust_peer_* APIs; and load_verify_* under OPENSSL_COMPATIBLE_DEFAULTS src/ssl_load.c:3262-3271, src/ssl_load.c:4273-4277)", "module_kind": "loader / table producer"},
+    {"where": "wolfcrypt/src/asn.c:26120", "entry_point": "FreeTrustedPeer (struct cleanup only)", "module_kind": "lower-level crypto lib memory cleanup"},
+    {"where": "wolfssl/wolfcrypt/asn.h:2387", "entry_point": "struct TrustedPeerCert definition", "module_kind": "header / data layout"},
+    {"where": "wolfssl/internal.h:7591", "entry_point": "MatchTrustedPeer prototype", "module_kind": "header"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "src/ssl_load.c:3262-3271 and src/ssl_load.c:4273-4277: with OPENSSL_COMPATIBLE_DEFAULTS every CA loaded through load_verify_locations/load_verify_buffer is also added as a trusted peer, which is where 'forged CA clones' come from. The central fix in src/ssl_certman.c covers this route. The only separate site in the fix is the load-time dedup AlreadyTrustedPeer, src/ssl_certman.c:2738-2771."},
+  "O3_reason_to_dismiss": "AlreadyTrustedPeer only decides whether to add a cert at load time, not whether to trust a peer at handshake time. A solver can argue that a load-time dedup is not a trust check and leave it name/SKID-based. A legitimately different cert with the same subject, issuer and SKID would then be silently dropped and never trusted.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Self-signed or otherwise unchained trusted-peer certs must still be accepted without CA chain verification (that is the feature: haveTrustPeer skips the chain loop). Two distinct trusted peers that share subject, issuer and SKID (for example a re-issued cert) must both load and match. Loading the same cert twice must still be deduplicated.",
+    "where": "src/internal.c:18480-18486; src/ssl_certman.c:3022-3026"
+  },
+  "O6_input_shapes": [
+    "peer cert carrying an SKID extension copied from the trusted cert (SKID compare in src/ssl_certman.c:2801-2807 is satisfied by the copy)",
+    "trusted cert with no SKID extension (SKID computed from public key at wolfcrypt/src/asn.c:25493-25514) vs clone that adds an explicit SKID extension",
+    "builds with WOLFSSL_NO_ISSUERHASH_TDPEER (issuer hash not compared, src/ssl_certman.c:2795-2798) or NO_SKID (src/ssl_certman.c:2801)",
+    "copied signature bytes of equal length (src/ssl_certman.c:2828-2835)",
+    "trusted peer loaded as PEM/DER file, buffer, or multi-cert chain buffer (src/ssl_load.c:4354-4359)"
+  ],
+  "O7_producer": {"kind": "cache", "where": "src/ssl_certman.c:3028-3072. AddTrustedPeer builds the tpTable entries (identity fields, and the row index from subjectNameHash). The handshake check reads that table but never calls the producer; the row index is also derived from the identity key.", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/x509_str.c:801-827", "sibling": "An X509_STORE partial-chain 'caller-trusted' test that compares subject/issuer/SKID instead of X509DerEquals", "why_realistic": "It is the same 'is this exact cert trusted?' job in a second implementation (OpenSSL compat layer, another file). At the pinned commit it uses full DER equality (src/x509_str.c:779-789); a maintainer could plausibly have written a name-based lookup."},
+    {"where": "src/ssl_certman.c:2738", "sibling": "Keep the load-time dedup name/SKID-keyed while the handshake lookup uses the whole-cert hash", "why_realistic": "Dedup and lookup are separate copies of the same loop, and the fix had to change both. A maintainer updating only the lookup is plausible."},
+    {"where": "src/internal.c:18442", "sibling": "A TLS1.3- or DTLS-specific early trusted-peer shortcut before ProcessPeerCerts that reuses a subject-hash match", "why_realistic": "TLS1.3 has its own Certificate handler (src/tls13.c:12346) that delegates here; a transport-specific pre-check is a realistic optimisation."}
+  ],
+  "O9_family": "CWE-295 improper certificate validation: trusted-peer identity match on spoofable fields (name/issuer/SKID/signature bytes) instead of whole-certificate identity",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C",
+    "toolchain": "autotools (./configure && make) or CMake; gcc/clang; needs CFLAGS=-DWOLFSSL_TRUST_PEER_CERT or --enable-opensslcompatibledefaults (configure.ac:12359, configure.ac:12372-12374)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/api.c (trust_peer tests, 19 matches), tests/api/test_certman.c; memory-based TLS handshake tests in tests/api.c can exercise the trusted-peer path offline"
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/internal.c, src/ssl_certman.c, wolfcrypt/src/asn.c, wolfssl/internal.h, wolfssl/wolfcrypt/asn.h",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Store the public key in AddTrustedPeer and add a public-key compare in MatchTrustedPeer, leaving the subject-hash table index and the name/SKID-based AlreadyTrustedPeer dedup unchanged."
+  },
+  "out_of_scope_notes": [
+    "A trusted-peer match skips ProcessPeerCertParse entirely (src/internal.c:16888-16893); whether OCSP/CRL checks run for trusted peers is by design and was not pursued.",
+    "findSignerByName on extraCAList (wolfcrypt/src/asn.c:25522) is name-based CA lookup under CSR v2: a separate concept, not pursued."
+  ],
+  "unverified": [
+    "No other consumer of tpTable/GetTrustedPeer was found by grep at the pinned commit (only src/internal.c:18456), so O8 is empty. Macro-generated or port-specific callers were not checked.",
+    "repo_mb not measured (no shell used).",
+    "Whether a public-key-only compare would pass the hidden tests depends on whether they also require whole-cert identity (e.g., same key with altered extensions/validity); the fix adopts full-DER hash.",
+    "Recall risk is an estimate; wolfSSL advisories are normally listed in release notes (ChangeLog.md), and no latest release was provided.",
+    "O1 counts the client-side and server-side handshake receipt of a Certificate message; TLS1.2/DTLS/TLS1.3 all funnel into ProcessPeerCerts and were not counted separately."
+  ]
+}

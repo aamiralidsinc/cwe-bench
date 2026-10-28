@@ -1,0 +1,75 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "81010",
+  "advisory_ids": ["GHSA-WJW8-FX44-F93W", "CVE-2026-102567"],
+  "repo": "opennmt/ctranslate2",
+  "pinned_commit": "f0265420caf1ad654befd94ea99124cdf440e829",
+  "fix_commits": ["0d8bcd362ac75ef860ef161d6f0efad0ae439ff0", "d9b991e0700933a0c05373df8b52ed89cdcab96d"],
+  "trust_decision": {
+    "summary": "The binary model loader trusts header fields read from model.bin (string length prefix, declared payload byte count) when sizing reads into heap buffers; the decision is made inside Model::load and the consume<std::string> helper in src/models/model.cc.",
+    "evidence": ["src/models/model.cc:80-87", "src/models/model.cc:637-657", "fix.diff:39-43", "fix.diff:51-53"]
+  },
+  "landing_point": {
+    "where": "src/models/model.cc:637",
+    "why": "Summary says 'OOB read via model deserialization'; the only binary deserializer is the variable loop in Model::load, which is where an engineer would grep first (consume<> helpers sit 550 lines above in the same file)."
+  },
+  "fix_sites": [
+    {"where": "src/models/model.cc:80-87", "entry_point": "ctranslate2.Translator/Generator/Whisper/Encoder(model_path or files=...) -> models::Model::load(ModelReader&) (C++ public API include/ctranslate2/models/model.h)", "module_kind": "core library deserializer helper (string decoder used for spec name, variable names, alias names)"},
+    {"where": "src/models/model.cc:656-657", "entry_point": "same: models::Model::load via ModelFileReader (directory path) or ModelMemoryReader (python files= dict, python/cpp/replica_pool.h:20-32)", "module_kind": "core library deserializer (variable payload read)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": "Both fix sites are in one function family in src/models/model.cc; the in-memory reader (src/models/model_reader.cc:67-76) feeds the same parser, it is not a second implementation."},
+  "O3_reason_to_dismiss": "For the O8 dtype route: 'type ids are produced only by our own converter (python/ctranslate2/specs/model_spec.py:408) and an unknown dtype is a format/compat issue, not a memory bug'; for shape-overflow: 'shape dims are just metadata, the payload size check already guarantees the buffer matches'.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Zero-element variables (a dim of 0, num_bytes 0, consume returns nullptr for n==0) and rank-0 scalars must still load; legacy binary_version<4 path computes num_bytes as count*item_size and must keep loading INT16/INT8/FLOAT32 models; strings are written with a trailing NUL (len+1) so the decoder must strip exactly one byte. An over-broad fix rejecting num_bytes==0, a zero dimension, or requiring no embedded NUL breaks valid models.",
+    "where": "src/models/model.cc:64-67, src/models/model.cc:646-654, python/ctranslate2/specs/model_spec.py:394-397"
+  },
+  "O6_input_shapes": [
+    "string length prefix 0 (consume returns nullptr, std::string(nullptr))",
+    "string payload without terminating NUL (strlen runs past buffer)",
+    "declared num_bytes larger than shape*item_size (heap overflow write into variable buffer)",
+    "declared num_bytes smaller than shape*item_size (buffer partly unread, later ops read uninitialised memory)",
+    "both binary_version>=4 (type_id + byte count) and legacy <4 (item_size * count) header layouts"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "python/ctranslate2/specs/model_spec.py:382-414 (_serialize writes len+1 strings, type id, num_bytes)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "v4 type_id is cast to DataType without validation; for an unknown id TYPE_DISPATCH has no default so item_size() returns 0, the buffer is allocated as size*0 bytes and the fix's size check passes with num_bytes 0 while the shape claims many elements.",
+     "where": "src/models/model.cc:647-648",
+     "reason_to_dismiss": "Unknown dtype looks like a forward-compat/format error, and the published check 'already validates the payload size'.",
+     "distance": "same file; mechanism lives in src/type_dispatch.h:60-68 and src/storage_view.cc:177-181,161-166",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Shape element count is a plain int64 product of up to 255 uint32 dims with no overflow check, so a wrapped small size can match num_bytes and pass the fix's check while dim() values stay huge for later indexing (e.g. tensor-parallel split, ops).",
+     "where": "src/models/model.cc:639-641",
+     "reason_to_dismiss": "Dims are 'metadata'; the fix compares size*item_size to num_bytes so the buffer looks consistent.",
+     "distance": "same file; arithmetic in include/ctranslate2/storage_view.h:31-36",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/models/model.cc:764-772", "sibling": "alias table read could take a count-prefixed alias record with its own length field read into a fixed buffer", "why_realistic": "Aliases were added in binary_version 3 as a separate trailer section; a maintainer extending the format would plausibly hand-roll a reader there."},
+    {"where": "src/models/model_reader.cc:67-76", "sibling": "an in-memory fast path that views variable payloads directly from the registered bytes (offset+num_bytes) instead of copying via consume", "why_realistic": "ModelMemoryReader already holds the whole file in memory; a zero-copy view is a natural optimisation and would need its own bounds check against content.size()."},
+    {"where": "src/models/model.cc:425-437", "sibling": "legacy item_size path variant that maps more widths (e.g. 8) without checking count*item_size overflow", "why_realistic": "Code comment already calls this logic 'old and flawed'; legacy compat patches are common."}
+  ],
+  "O9_family": "memory safety: out-of-bounds read/write from untrusted length fields in a binary file deserializer (CWE-125/CWE-787)",
+  "O9_dos": false,
+  "O10_build": {"language": "C++ (with pybind11 Python bindings)", "toolchain": "CMake + C++17 compiler; CPU build with OpenMP/oneDNN or OpenBLAS (WITH_MKL=OFF possible); pybind11/setuptools for python package", "services": [], "offline_after_build": true,
+                "project_tests": "tests/model_test.cc and tests/translator_test.cc (gtest, need test model data under tests/data); python/tests/test_translator.py covers files= in-memory loading; the fix diff adds no tests."},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/models/model.cc", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add num_bytes == size*item_size check in the variable loop (and maybe NUL-terminate strings) without validating type_id or guarding the shape-product overflow."},
+  "out_of_scope_notes": [
+    "Vocabulary and config.json loaders (src/models/model_reader.cc, src/vocabulary.cc, nlohmann::json at src/models/model.cc:615) are separate text parsers, not this sink.",
+    "Tensor-parallel static model_dim/total_dim at src/models/model.cc:661-662 persist across loads; correctness issue, not pursued."
+  ],
+  "unverified": [
+    "Whether an unknown DataType actually reaches an OOB read downstream or is first rejected by ensure_dtype/to() (src/models/model.cc:302-333, src/storage_view.cc:119) was not traced.",
+    "Whether a wrapped shape product produces exploitable downstream indexing was not traced through ops.",
+    "Repo size in MB not measured (third_party submodules may dominate).",
+    "present_in_latest unknown for all O8 routes: no latest release provided.",
+    "Whether d9b991e also touched files outside the shown diff (diff shows only CHANGELOG.md and src/models/model.cc)."
+  ]
+}

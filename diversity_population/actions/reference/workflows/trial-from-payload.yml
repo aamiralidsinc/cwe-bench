@@ -1,0 +1,143 @@
+name: trial
+# Run CWE-bench trials on Actions with model-API-only egress. One job per task (matrix). Each job:
+# pulls that task's BUILD artifact from a build run (intra-GitHub, fast), decrypts it, pre-builds the
+# image with open net, LOCKS egress to the model API only + self-checks isolation (fails the job if
+# wrong), then runs up to N trials of one model with early-abort on a solve. Breaker logic (both
+# models fail 3/3) is computed later from the per-(task,model) rewards.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run: { description: "ignored for at-risk (task comes from payload)", default: "n/a" }
+      ids:       { description: "comma-separated task ids (e.g. t01,t02) or all(1..21)", default: "t01" }
+      model:     { description: "deepseek or mimo", default: "deepseek" }
+      runs:      { description: "max runs per task (early-abort on solve)", default: "3" }
+      lock:      { description: "lock egress to model API only (true) or skip for diagnosis (false)", default: "true" }
+permissions:
+  contents: read
+  actions: read            # to download artifacts from the build run
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs: { ids: "${{ steps.p.outputs.ids }}" }
+    steps:
+      - id: p
+        env: { IDS: "${{ inputs.ids }}" }
+        run: |
+          if [ "$IDS" = all ]; then seq -f 't%02g' 1 21; else echo "$IDS" | tr ',' '\n'; fi | jq -R . | jq -sc . > ids.json
+          echo "ids=$(cat ids.json)" >> "$GITHUB_OUTPUT"
+  trial:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: { id: "${{ fromJSON(needs.plan.outputs.ids) }}" }
+    env:
+      CLAUDE_VERSION: "2.1.302"
+      HARBOR_VERSION: "0.23.1.dev202609170426"
+      MODEL: "${{ inputs.model }}"
+      RUNS: "${{ inputs.runs }}"
+      BUILD_RUN: "${{ inputs.build_run }}"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk + Docker on larger disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/microsoft 2>/dev/null || true
+          mf=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9); mf=${mf:-0}
+          dr=/var/lib/docker; [ "${mf:-0}" -gt 60 ] && dr=/mnt/docker; sudo mkdir -p "$dr"
+          printf '{"data-root":"%s","default-address-pools":[{"base":"172.31.0.0/16","size":24}]}\n' "$dr" | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+      - name: Tools (harbor + claude)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          "$HOME/.local/bin/uv" tool install -q "harbor==$HARBOR_VERSION"
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Get task from the at-risk payload
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          mkdir -p /tmp/t
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d atrisk-payload.tar.gz.gpg | tar -xz -C /tmp/t
+          slug=$(jq -r --arg id "$ID" '.[$id]' /tmp/t/ids-atrisk.json)
+          echo "::add-mask::$slug"
+          echo "SLUG=$slug" >> "$GITHUB_ENV"
+          echo "TASK=/tmp/t/tasks/$slug" >> "$GITHUB_ENV"
+          test -f "/tmp/t/tasks/$slug/task.toml" && echo "task present" || { echo "no task.toml for $slug"; exit 1; }
+      - name: Pre-build task image (open net), via a nop grade
+        env: { ID: "${{ matrix.id }}" }
+        run: |
+          harbor run -p "$TASK" -a nop -o /tmp/pre --job-name pre -y -q > /tmp/pre.log 2>&1 || true
+          echo "image(s): $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -i "$(basename "$TASK")" | tr '\n' ' ')"
+      # Isolation is native: the task's task.toml sets the agent phase to network_mode=no-network,
+      # and Harbor's --allow-agent-host (below) grants ONLY the model host at run time. This is the
+      # exact mechanism the task documents and the VM used -> model-API-only egress, no iptables needed.
+      - name: Trials (early-abort on solve)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          if [ "$MODEL" = deepseek ]; then
+            export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic ANTHROPIC_API_KEY="$DEEPSEEK_API_KEY"
+            mid='deepseek-flash[1m]'; eff=max; host=api.deepseek.com
+            extra=(--ae CLAUDE_CODE_AUTO_COMPACT_WINDOW=786432 --ae CLAUDE_CODE_MAX_OUTPUT_TOKENS=131072 --ae CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 --ak max_thinking_tokens=96000)
+          else
+            export ANTHROPIC_BASE_URL=https://api.xiaomimimo.com/anthropic ANTHROPIC_API_KEY="$MIMO_API_KEY"
+            mid='mimo-v2.6-pro'; eff=""; host=api.xiaomimimo.com; extra=()
+          fi
+          unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_MODEL
+          lim=$(awk '/^\[/{s=$0} s=="[agent]" && /^timeout_sec/{print int($3)}' "$TASK/task.toml"); lim=${lim:-7200}
+          [ -n "$eff" ] && extra+=(--ak "reasoning_effort=$eff")
+          # Count only CLEAN graded runs. An exception/empty run (UnknownApiError, timeout, no reward)
+          # is a harness/API defect -> retry, never count as a model fail (would manufacture fake breakers).
+          solved=0; counted=0; infra=0; INFRA_MAX=6; attempt=0; rewards=""
+          while [ "$counted" -lt "$RUNS" ] && [ "$infra" -le "$INFRA_MAX" ]; do
+            attempt=$((attempt+1)); jn="$ID-$MODEL-a$attempt"
+            harbor run -p "$TASK" -a claude-code -m "$mid" -k 1 -o "/tmp/jobs" --job-name "$jn" \
+              --allow-agent-host "$host" \
+              --ae "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL" --ae "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" \
+              --ae API_TIMEOUT_MS=1200000 --ae "CWE_AGENT_LIMIT_SEC=$lim" \
+              --ek keep_containers=true --ak "disallowed_tools=WebSearch,WebFetch" \
+              "${extra[@]}" -y -q > "/tmp/$jn.log" 2>&1 || true
+            rw=$(find "/tmp/jobs/$jn" -name reward.txt -exec cat {} \; 2>/dev/null | tail -1)
+            # infra/exception markers in harbor output, or a missing reward = not a counted run
+            # infra/no-op markers: harbor-level exceptions OR agent-side api/auth errors (empty key,
+            # dropped connection, refusal, 0 turns) that grade 0.0 without real work -> NOT a model fail.
+            agent_noop=no
+            if grep -qrsE '"terminal_reason":"api_error"|authentication_failed|Not logged in|Please run /login|API Error: Connection|"num_turns":0[,}]' "/tmp/jobs/$jn" 2>/dev/null; then agent_noop=yes; fi
+            if grep -qiE "UnknownApiError|AgentTimeoutError|EnvironmentStartTimeout|NonZeroAgentExitCode|ApiError|overloaded|Exceptions +. +[1-9]" "/tmp/$jn.log" || [ "$agent_noop" = yes ] || [ -z "$rw" ]; then
+              infra=$((infra+1)); echo "INFRA $ID $MODEL a$attempt (not counted): $(grep -ohiE "UnknownApiError|AgentTimeoutError|authentication_failed|Not logged in|API Error: Connection|api_error" "/tmp/$jn.log" "/tmp/jobs/$jn"/*/*/agent/* 2>/dev/null | head -1)${rw:+ reward=$rw}"
+              sleep $((20*infra)); continue
+            fi
+            counted=$((counted+1)); rewards="$rewards $rw"
+            echo "RUN $ID $MODEL counted=$counted reward=$rw"
+            if [ "$rw" = "1.0" ]; then solved=1; echo "SOLVED -> early-abort (not a breaker for $MODEL)"; break; fi
+          done
+          status=ok; [ "$counted" -lt "$RUNS" ] && [ "$solved" -eq 0 ] && status=TRIAL-INFEASIBLE-too-many-infra-errors
+          echo "SUMMARY $ID $MODEL solved=$solved counted=$counted infra=$infra rewards=[$rewards] status=$status"
+      - name: Pack (encrypted) rewards + logs
+        if: always()
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          ID: ${{ matrix.id }}
+        run: |
+          mkdir -p /tmp/out
+          cp /tmp/*.log /tmp/out/ 2>/dev/null || true
+          find /tmp/jobs -path '*/verifier/*' \( -name 'reward.json' -o -name 'results.json' \) -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
+          find /tmp/jobs -name 'result.json' -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
+          # capture the agent's error detail for diagnosis (exception message/url/status), size-limited
+          find /tmp/jobs -maxdepth 4 \( -name '*.json' -o -name '*.log' -o -name '*.txt' \) ! -path '*/verifier/*' -size -512k -exec cp --parents {} /tmp/out/ \; 2>/dev/null || true
+          grep -rhE "^(RUN|SUMMARY|self-check) " /tmp/*.log 2>/dev/null > /tmp/out/trial_summary.txt || true
+          tar -czf /tmp/o.tgz -C /tmp out
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" --symmetric --cipher-algo AES256 -o "/tmp/$ID-$MODEL.tgz.gpg" /tmp/o.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trial-${{ matrix.id }}-${{ inputs.model }}
+          path: /tmp/${{ matrix.id }}-${{ inputs.model }}.tgz.gpg
+          retention-days: 7
+          if-no-files-found: warn

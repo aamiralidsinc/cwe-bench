@@ -1,0 +1,80 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "98617",
+  "advisory_ids": ["CVE-2026-73548", "BIT-ENVOY-2026-73548", "GHSA-3VHP-C83Q-JQC2"],
+  "repo": "envoyproxy/envoy",
+  "pinned_commit": "50f7bfa48dccfee339822e9846b2b8053e07d325",
+  "fix_commits": ["053a8989382dd91542ecf0cef8f379b9cb761cdd", "cf413bdb37b36d3ffbe570b8a48760abe2b588f5", "ef2d997c1b022cf8b849a1d3521fbf234d79ca26", "b579d07d3ad7ee11d32b105e91a5a39ad24718d7", "309855626966cff176155c821043ed3b44671361", "3c7998545a9c9fb3933a4bc1907d92f0e752bc2b", "4633b8cce3d15b8734eefe232e30c12b0140b91c", "bd6711f2617658e28dfa3df3dace6bfe3cfc0766"],
+  "trust_decision": {
+    "summary": "The router decides whether downstream request payload may be written to a (possibly shared, keep-alive) upstream HTTP/1 connection before the upstream has accepted the upgrade; at the pinned commit it pauses only CONNECT and WebSocket upgrades, so generic-upgrade payload is sent raw (unchunked) and can be parsed by the backend as a pipelined request if the upgrade is rejected.",
+    "evidence": ["source/common/router/upstream_request.cc:389-406", "source/common/router/upstream_codec_filter.cc:88-93", "source/common/router/upstream_codec_filter.cc:154-197", "source/common/http/http1/codec_impl.cc:472-479"]
+  },
+  "landing_point": {"where": "source/common/router/upstream_request.cc:394", "why": "The summary says 'generic (non-WebSocket) upgrade'; this is the only place that branches on isWebSocketUpgradeRequest to set a pause flag before newStream()."},
+  "fix_sites": [
+    {"where": "source/common/router/upstream_request.cc:394-406", "entry_point": "Downstream HTTP/1 request with Connection: upgrade + non-websocket Upgrade, or HTTP/2/3 extended CONNECT with :protocol, routed by the HCM router to an HTTP/1 cluster (UpstreamRequest::acceptHeadersFromRouter)", "module_kind": "router core (sets pause flag)"},
+    {"where": "source/common/router/upstream_request.cc:610-615", "entry_point": "UpstreamRequest::onPoolReady for non-HTTP generic upstreams (TCP/UDP CONNECT termination) — must clear the new flag", "module_kind": "router core (unpause for non-HTTP upstreams)"},
+    {"where": "source/common/router/upstream_codec_filter.cc:88-93", "entry_point": "UpstreamCodecFilter::decodeHeaders (terminal upstream HTTP filter) — returns StopAllIterationAndWatermark to buffer body", "module_kind": "upstream HTTP filter (sink gate)"},
+    {"where": "source/common/router/upstream_codec_filter.cc:154-197", "entry_point": "UpstreamCodecFilter::CodecBridge::decodeHeaders (upstream response headers) — unpauses on 101, or 2xx on non-HTTP/1.1 upstream", "module_kind": "upstream HTTP filter (response-side release)"},
+    {"where": "source/common/router/upstream_request.h:251-254", "entry_point": "UpstreamRequest member flag + UpstreamStreamFilterCallbacks accessors (upstream_request.h:368-373)", "module_kind": "router core state"},
+    {"where": "envoy/http/filter.h:246-247", "entry_point": "Public UpstreamStreamFilterCallbacks interface gains pausedForGenericUpgrade/setPausedForGenericUpgrade (fix.diff:2661-2665)", "module_kind": "public extension API (interface)"},
+    {"where": "source/common/runtime/runtime_features.cc", "entry_point": "Runtime guard envoy.reloadable_features.http_pause_generic_upgrade_request_body (fix.diff:2778)", "module_kind": "runtime config"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All source changes stay inside source/common/router plus the interface in envoy/http/filter.h:246-247 and a runtime guard; no second implementation or lower-level module is changed."},
+  "O3_reason_to_dismiss": "A solver could argue the HTTP/1 connection pool (source/common/http/http1/conn_pool.cc:58-76) is the right/only layer and that pausing the router is out of scope, or conversely that terminated CONNECT-UDP/TCP upstreams 'are not upgrades' and skip the onPoolReady unpause, deadlocking them.",
+  "O4_distance": {"files": 5, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Generic-upgrade payload must still flow: (a) for terminated CONNECT-UDP/TCP (non-HTTP generic upstream, protocol unset) the pause must be cleared at pool-ready or capsules sent before the synthesized 200 deadlock; (b) on HTTP/2/3 upstreams a 2xx accepts the upgrade; (c) on HTTP/1 a 101 releases buffered bytes; (d) headers-only upgrade requests (end_stream) must not be paused; (e) existing WebSocket timeout/4xx-5xx handling must stay intact. An over-broad fix (dropping all pre-accept payload, or pausing every upstream) breaks these.",
+    "where": "source/common/router/upstream_request.cc:608-615; source/common/router/upstream_codec_filter.cc:160-197"
+  },
+  "O6_input_shapes": [
+    "HTTP/1 downstream: Connection: upgrade + Upgrade: <non-websocket token> with body",
+    "HTTP/2 downstream extended CONNECT (:protocol) transformed to H1 upgrade (source/common/http/http2/codec_impl.cc:607-608)",
+    "HTTP/3 downstream extended CONNECT (source/common/quic/envoy_quic_server_stream.cc:76)",
+    "Connection header with multiple tokens e.g. 'keep-alive, Upgrade' (source/common/http/utility.cc:668-674)",
+    "Upstream response 101 vs 2xx on H2/H3 upstream vs 200 on H1 upstream (rejected)",
+    "Non-HTTP generic upstream (TCP/UDP termination) where protocol is unset"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "source/common/http/http1/conn_pool.cc:58-76", "sibling": "HTTP/1 pool returns the connection to the pool after an upgrade request whose upgrade was rejected and whose request side completed; a planted variant could also flag 'upgrade request' streams as reusable.", "why_realistic": "The pool decides reuse only from encode/decode completion and Connection: close (conn_pool.cc:50-51,63-68), never from upgrade state; a maintainer optimising keep-alive could plausibly not consider upgrades."},
+    {"where": "source/common/router/upstream_request.cc:388-389", "sibling": "Pause decision reads parent_.downstreamHeaders() before upstream HTTP filters run, while the HTTP/1 codec decides raw (unchunked) framing on the headers it actually encodes (codec_impl.cc:472-479); a planted upstream filter/header mutation that adds Upgrade/Connection would create a check-vs-use differential.", "why_realistic": "Upstream HTTP filters and header mutation are designed to edit request headers after the router; the two isUpgrade calls are on different header snapshots in different layers."},
+    {"where": "source/common/router/upstream_codec_filter.cc:97-126", "sibling": "decodeTrailers/decodeMetadata only ASSERT on pausedForConnect; a planted path that forwards trailers or metadata while pausedForGenericUpgrade would leak bytes pre-acceptance.", "why_realistic": "Existing asserts cover only CONNECT; extending them to new pause kinds is easy to forget."}
+  ],
+  "O9_family": "HTTP request smuggling / response queue poisoning (CWE-444): front proxy treats bytes as opaque upgrade payload while the HTTP/1 backend parses them as a pipelined request after rejecting the upgrade.",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C++",
+    "toolchain": "Bazel (envoy build image / clang), very heavy first build",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/integration/websocket_integration_test.cc (NonWebsocketUpgrade), test/integration/udp_tunneling_integration_test.cc, test/common/router/upstream_codec_filter_test.cc, test/common/router/upstream_request_test.cc; integration tests use in-process fake upstreams"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": ["many_fix_commits"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "envoy/http/filter.h, source/common/router/upstream_codec_filter.cc, source/common/router/upstream_request.cc, source/common/router/upstream_request.h, source/common/runtime/runtime_features.cc",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Widen the WebSocket branch at upstream_request.cc:394 to all isUpgrade() requests, inheriting the WebSocket sendLocalReply-on-non-101 and timeout behaviour, or forget to clear the pause for non-HTTP (TCP/UDP-terminated) upstreams in onPoolReady."
+  },
+  "out_of_scope_notes": [
+    "tcp_proxy HTTP tunneling builds its own CONNECT/POST headers (source/common/tcp_proxy/upstream.cc:147-179) and is not a generic-upgrade route.",
+    "generic_proxy HTTP/1 codec rejects upgrade and CONNECT outright (source/extensions/filters/network/generic_proxy/codecs/http1/config.cc:101-107).",
+    "The same release bundles ~14 unrelated CVEs in changelogs; the 4 release-tag commits contain only changelog/version changes."
+  ],
+  "unverified": [
+    "repo_mb not measured; giant_repo flag not assessed.",
+    "Whether upstream HTTP filters share the same RequestHeaderMap instance as parent_.downstreamHeaders() (affects the O8b differential) was not traced.",
+    "Whether a rejected generic upgrade with end_stream payload buffered results in connection close via conn_pool.cc:63-65 was inferred from code, not run.",
+    "Pinned tree matches bd6711f constructor offsets (upstream_request.cc:91) but acceptHeadersFromRouter hunk offset differs (pinned ~394-406 vs diff @@ -418); exact backport identity unverified.",
+    "present_in_latest: no latest release given; not applicable as O8 is empty.",
+    "Regression tests (NonWebsocketUpgradeWithPrePayloadDoesNotPoisonConnection, ExchangeCapsulesBeforeResponseHeaders) searched and absent at pinned commit."
+  ]
+}

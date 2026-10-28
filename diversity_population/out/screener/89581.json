@@ -1,0 +1,84 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "89581",
+  "advisory_ids": ["GHSA-GWJF-HG8J-JWVR", "CVE-2026-40560"],
+  "repo": "miyagawa/starman",
+  "pinned_commit": "98a33cab1e10a67e155d5a04cb29e615e5afefe4",
+  "fix_commits": ["636cd8b04e0fb5caba3fb9d24a4dcfc9074c0d1c", "ced205f0805027e9d9c0731f8c40b104220604ed"],
+  "trust_decision": {
+    "summary": "Starman::Server::_prepare_env decides how many request-body bytes belong to the current message (Content-Length vs Transfer-Encoding: chunked); the rest of the socket stream is treated as the next keep-alive request.",
+    "evidence": ["lib/Starman/Server.pm:416-465", "lib/Starman/Server.pm:213-217", "lib/Starman/Server.pm:297", "fix.diff:85-124"]
+  },
+  "landing_point": {
+    "where": "lib/Starman/Server.pm:418",
+    "why": "The only place where CONTENT_LENGTH and the chunked flag are both consulted; the summary ('improper header precedence') points straight at this if/elsif ordering."
+  },
+  "fix_sites": [
+    {"where": "lib/Starman/Server.pm:418", "entry_point": "HTTP request on any Starman listener (starman CLI / plackup -s Starman) -> process_request -> _prepare_env (lib/Starman/Server.pm:297)", "module_kind": "core HTTP request parser (server)"},
+    {"where": "lib/Starman/Server.pm:431", "entry_point": "same as above; chunked branch moved first (fix.diff:101, fix.diff:109)", "module_kind": "core HTTP request parser (server)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "lib/HTTP/Server/PSGI/Net/Server/PreFork.pm:2 and lib/Plack/Handler/Starman.pm:25 only inherit/call Starman::Server; no second body-framing implementation in the tree"},
+  "O3_reason_to_dismiss": "For the O8 routes: 'the advisory is about precedence when both TE: chunked and CL are present; a Transfer-Encoding value that is not exactly \"chunked\" (a list, or a coding Starman does not support) is an unsupported combination, not this bug.'",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate chunked uploads without Content-Length must still be decoded and get CONTENT_LENGTH set to the decoded length; CL-only bodies, CL: 0 with Expect: 100-continue, and pipelined GET/HEAD after a bodyless request must keep working. An over-broad fix (reject any Transfer-Encoding, or drop CONTENT_LENGTH) breaks these.",
+    "where": "lib/Starman/Server.pm:461, lib/Starman/Server.pm:272-276, lib/Starman/Server.pm:303-314, t/chunked_req.t:27, t/chunked_req.t:41, t/expect.t:21"
+  },
+  "O6_input_shapes": [
+    "Transfer-Encoding exactly 'chunked' (case-insensitive) together with a non-zero Content-Length (fix.diff:85, fix.diff:101, fix.diff:109)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Header values come from HTTP::Parser::XS parse_http_request (lib/Starman/Server.pm:241), an external dependency; no in-repo producer", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "Transfer-Encoding present but not exactly 'chunked' (e.g. a coding list ending in chunked, or duplicate TE headers merged by the parser) with Content-Length: the exact-match flag is false, so Content-Length still frames the body after the fix.",
+      "where": "lib/Starman/Server.pm:416",
+      "reason_to_dismiss": "Multi-coding / duplicate TE is an 'unsupported combination'; the advisory test only uses a single 'Transfer-Encoding: chunked'.",
+      "distance": "same function, 2 lines above the fix site",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Transfer-Encoding present with a non-chunked coding and no Content-Length: falls through to the empty-body branch, so body bytes stay on the socket and are read as the next keep-alive request instead of being rejected (RFC 7230 §3.3.3 says reject with 400).",
+      "where": "lib/Starman/Server.pm:463-465",
+      "reason_to_dismiss": "No Content-Length involved, so 'not a precedence issue'; 'Starman never supported other codings'.",
+      "distance": "same function",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/Starman/Server.pm:441-453", "sibling": "Chunk-size line parser is lenient (anything after the hex size up to CRLF, data-terminating CRLF optional, trailers after the 0-chunk not consumed); a planted variant accepting bare-LF or a signed/oversized size would be a parser differential on framing.", "why_realistic": "Hand-rolled dechunker with regex; a maintainer adding LF-only tolerance (cf. t/lf_only_request.t for headers) could plausibly extend it to chunk lines."},
+    {"where": "lib/Starman/Server.pm:418", "sibling": "Content-Length truthiness check with no numeric/duplicate validation; a planted path accepting a comma-joined or signed Content-Length would desync framing.", "why_realistic": "The check is a bare Perl truthiness test; a maintainer could add list tolerance for duplicate headers."},
+    {"where": "lib/Starman/Server.pm:494-507", "sibling": "Response side: when the app sets both Content-Length and Transfer-Encoding: chunked, both headers are emitted and the body is chunked.", "why_realistic": "Mirror of the request bug in the response writer; but it is a direction variant, which lessons-v2 say never made a task hard."}
+  ],
+  "O9_family": "HTTP request smuggling / message-framing parser differential (CWE-444)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Perl",
+    "toolchain": "perl >= 5.8.1, cpanm/Dist::Milla; deps HTTP::Parser::XS (XS, needs C compiler), Net::Server >= 2.007, Plack, Test::TCP, LWP::UserAgent (cpanfile:1-18)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "t/chunked_req.t, t/chunked_termination.t (calls _prepare_env directly with a fake socket, offline unit-style), t/chunked_zero_length.t, t/expect.t, t/eintr.t, t/lf_only_request.t; Test::TCP loopback tests"
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/Starman/Server.pm",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Swap the if/elsif so the chunked branch runs first (exactly the published fix), leaving the exact-match 'chunked' test and non-chunked TE handling untouched."
+  },
+  "out_of_scope_notes": [
+    "Pipelined non-GET/HEAD data in inputbuf is silently discarded (lib/Starman/Server.pm:305-323); framing robustness, not this advisory's precedence property.",
+    "SERVER_STARTER_PORT swaps the base class at runtime (lib/Plack/Handler/Starman.pm:13-16); unrelated to body framing."
+  ],
+  "unverified": [
+    "How HTTP::Parser::XS handles duplicate Transfer-Encoding / Content-Length headers (joined with ', ' or last-wins) and whether it validates Content-Length as numeric; it is an external XS module, not in this repo. The first O8 route's duplicate-header shape depends on this, but the coding-list shape does not.",
+    "Repo size not measured; it is clearly well under 5 MB (6 lib/script files, ~600-line core module).",
+    "present_in_latest is unknown for all O8 routes (no latest release provided). After the fix, line 416's exact-match test is unchanged per fix.diff:85."
+  ]
+}

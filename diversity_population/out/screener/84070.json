@@ -1,0 +1,110 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "claude-opus-5-5",
+  "entry_id": "84070",
+  "advisory_ids": ["GHSA-QCJ9-C87V-PG2G", "CVE-2026-115400"],
+  "repo": "crawlseo/crawlseo",
+  "pinned_commit": "c87c255e0291d78b15bc5496331d9b6b29098b23",
+  "fix_commits": ["7d87de925cc9a8890ece8b453bda677534c22617", "2ce0b4b2bdd6047e0a9ede037fd355381968d9bc"],
+  "trust_decision": {
+    "summary": "Whether Google OAuth access/refresh tokens are encrypted before they are persisted. At the pinned commit they are not: they are written in plain text to User.googleTokens by the sign-in event and the token-refresh writer, and to the Account row by the Auth.js Prisma adapter.",
+    "evidence": [
+      "lib/auth.ts:44-63",
+      "lib/google/google-auth.ts:88-97",
+      "lib/auth.ts:18",
+      "prisma/schema.prisma:18",
+      "prisma/schema.prisma:35-36",
+      "lib/encryption.ts:18"
+    ]
+  },
+  "landing_point": {
+    "where": "lib/auth.ts:44-63",
+    "why": "The Auth.js signIn event writes the tokens into User.googleTokens as a plain JSON object, even though the schema comment says 'Encrypted GSC OAuth tokens' (prisma/schema.prisma:18). This is the first place a reader of 'cleartext storage of Google OAuth tokens' would look."
+  },
+  "fix_sites": [
+    {"where": "lib/auth.ts:48-63", "entry_point": "GET /api/auth/callback/google (Auth.js events.signIn via app/api/auth/[...nextauth]/route.ts), now calls storeSignInTokens (fix.diff:1219)", "module_kind": "auth event handler"},
+    {"where": "lib/google/google-auth.ts:88-97", "entry_point": "Any GSC call that triggers a refresh: getAccessToken from lib/google/gsc-client.ts:34, lib/google/gsc-client.ts:67, lib/google/gsc-client.ts:148, lib/google/url-inspection-client.ts:37 (GSC sync/properties API routes, MCP tools). The refresh write is sealed (fix.diff:1642-1649)", "module_kind": "lower-level token refresh library"},
+    {"where": "lib/google/google-auth.ts:73-77", "entry_point": "Same getAccessToken callers. The read is changed to decrypt and to accept legacy plain rows; an undecryptable row raises ReauthRequiredError (fix.diff:1620-1631)", "module_kind": "lower-level token refresh library"},
+    {"where": "lib/auth.ts:18", "entry_point": "GET /api/auth/callback/google: PrismaAdapter.linkAccount writes access_token/refresh_token in plain text to the Account row. The fix clears them after sign-in (fix.diff:1941-1944)", "module_kind": "third-party adapter (Auth.js Prisma adapter) data producer"},
+    {"where": "fix.diff:1532-1582", "entry_point": "CLI: npx tsx scripts/encrypt-google-tokens.ts [--apply] (fix.diff:1996-2012), a new migration for legacy plain-text rows and Account copies", "module_kind": "migration script / library"},
+    {"where": "fix.diff:1835-1945", "entry_point": "New lib/google/token-store.ts (seal/open/isSealed/storeSignInTokens), used by every site above", "module_kind": "new helper module"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "prisma/schema.prisma:35-36: a second at-rest copy of the same tokens in the Account row, written by PrismaAdapter(db) (lib/auth.ts:18) during the OAuth callback, before and outside the app's events.signIn (lib/auth.ts:44). Also legacy plain User.googleTokens rows, which are read back by lib/google/google-auth.ts:77 and re-sealed only on refresh or by the migration (fix.diff:1642-1649, fix.diff:1532-1582)"
+  },
+  "O3_reason_to_dismiss": "The Account table belongs to Auth.js's adapter schema and is 'library-managed'. Nothing in the app reads tokens from it, and the row must stay for returning-user recognition (lib/registration.ts:16-25), so a solver can argue that touching it is out of scope or risks breaking sign-in. Legacy rows can be argued to be a data migration, not a code fix.",
+  "O4_distance": {"files": 5, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Several things must keep working. The Account row must survive (DISABLE_REGISTRATION recognises returning users by it). Non-secret fields (expiresAt, scope, tokenType) must stay readable for the expiry check and the scope display. Legacy plain-text rows must still be read, without forcing a re-auth. Already-sealed values must not be encrypted twice. An over-broad fix would delete the Account row, encrypt the whole JSON (breaking expiresAt checks), or reject legacy rows.",
+    "where": "lib/registration.ts:16-25; lib/google/google-auth.ts:83; fix.diff:1860-1862; fix.diff:1724-1728"
+  },
+  "O6_input_shapes": [
+    "new sign-in tokens object (accessToken + refreshToken + expiresAt/tokenType/scope)",
+    "refresh write spreading an existing stored object with a new accessToken/expiresAt",
+    "legacy plain-text stored object read as is",
+    "already-prefixed (enc:v1:) values left unchanged (no double seal)",
+    "undefined/null fields dropped",
+    "non-object or array stored value treated as none",
+    "value sealed with another secret (undecryptable), mapped to ReauthRequiredError",
+    "access-token-only row (no refresh token)",
+    "Account-row copy (snake_case access_token/refresh_token columns) vs User.googleTokens (camelCase JSON)"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "lib/auth.ts:18 PrismaAdapter(db): the Auth.js adapter's linkAccount maps the OAuth account to the Account row (prisma/schema.prisma:35-40) inside the callback, before events.signIn",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Account.id_token (Google OIDC ID token) stays in plain text after sign-in: the published sign-in cleanup nulls only access_token and refresh_token, while the new disconnect path also nulls id_token",
+      "where": "prisma/schema.prisma:40",
+      "reason_to_dismiss": "An ID token is an identity assertion, not an API credential, and it expires quickly. The published fix itself leaves it at sign-in (fix.diff:1941-1944 vs fix.diff:1155-1158).",
+      "distance": "same callback route as the landing point; written by a third-party adapter",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "lib/google/google-auth.ts:58-61", "sibling": "The refresh response handler also persists a rotated refresh_token when Google returns one, via a separate db.user.update", "why_realistic": "Google can rotate refresh tokens; a maintainer adding rotation support would write a second googleTokens update next to the existing one."},
+    {"where": "mcp/server.ts:1", "sibling": "A standalone MCP-process token loader/writer that reads or refreshes User.googleTokens directly instead of going through getAccessToken", "why_realistic": "The MCP server runs as a separate process (package.json:27; fix.diff:1347-1349), so a maintainer could plausibly add its own token handling there."},
+    {"where": "scripts/seed-demo.ts:197-205", "sibling": "The demo seeder writes placeholder or copied googleTokens for the demo user", "why_realistic": "Seeders often populate auth fields so GSC pages render; it is a CLI path far from the auth code."},
+    {"where": "app/api/user/api-keys/route.ts:75-85", "sibling": "A 'reconnect Google' or import endpoint next to the API-key settings that accepts and stores Google tokens", "why_realistic": "The settings area already stores encrypted third-party credentials, so a token import or reconnect route would sit naturally beside it."}
+  ],
+  "O9_family": "CWE-312 cleartext storage of sensitive information (OAuth credentials at rest; secret-at-rest/crypto-application family)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "Node 20+, npm, Next.js 16.2.2, Prisma 6.19 (prisma generate), vitest 4",
+    "services": ["PostgreSQL for the app; tests use in-process PGlite (lib/testing/pglite.ts), so no service is needed for tests"],
+    "offline_after_build": true,
+    "project_tests": "At the pinned commit: lib/encryption.test.ts (AES-GCM helpers) and lib/registration.test.ts. No token-store, google-auth or account tests. The fix adds lib/google/token-store.test.ts, lib/google/encrypt-stored-tokens.test.ts and lib/account.test.ts, which use PGlite and stubbed fetch."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "lib/auth.ts, lib/google/google-auth.ts, lib/google/token-store.ts (new), lib/google/encrypt-stored-tokens.ts (new), scripts/encrypt-google-tokens.ts (new), lib/account.ts (new, disconnect/delete), prisma/schema.prisma (comment only)",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap the googleTokens object in encrypt() at lib/auth.ts:51 only, leaving the refresh writer and the adapter's plain Account-row copy, and breaking reads of legacy rows."
+  },
+  "out_of_scope_notes": [
+    "Commit 2ce0b4b bundles unrelated feature work (account page, sign-out form, disconnect/delete account, crawl AbortSignal/stopCrawls); only token-store, auth.ts, google-auth.ts and the migration belong to the advisory.",
+    "Session.sessionToken is stored in plain text by Auth.js (prisma/schema.prisma:50); a different secret, not pursued.",
+    "lib/auth.ts:65 logs the raw error from a failed token update; whether a Prisma error message can echo the token arguments was not checked."
+  ],
+  "unverified": [
+    "Repo size not measured (no shell). About 150 TS/TSX source files suggest well under 5 MB of source, so tiny_repo probably holds but is not flagged.",
+    "node_modules is absent, so PrismaAdapter.linkAccount's writes (access_token, refresh_token, id_token) are inferred from the schema columns and the fix's comments (fix.diff:1917-1921), not read from adapter source.",
+    "The mapping of GSC API routes to the gsc-client functions was not traced route by route.",
+    "Whether id_token falls under the advisory's 'Google OAuth tokens' property is a judgement call; the published fix clears it only on disconnect.",
+    "present_in_latest for the O8 route is unknown (no latest release given)."
+  ]
+}

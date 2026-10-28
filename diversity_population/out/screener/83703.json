@@ -1,0 +1,80 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "83703", "advisory_ids": ["GHSA-FJV6-497G-H4XF", "CVE-2026-113705"], "repo": "a2aproject/a2a-rs",
+  "pinned_commit": "04acbb910b8c7195d2a205b5591b713d4cf70945",
+  "fix_commits": ["713b943af94ab2d521d483b841618b97a2e78a4d"],
+  "trust_decision": {
+    "summary": "Which INTERNAL_ERROR messages may reach a remote client: server-side faults (serializer errors, broadcast lag, push-delivery errors, store invariants) must be replaced by a generic message and logged at the raise site, while an executor's own INTERNAL_ERROR text keeps passing through the response boundary unchanged.",
+    "evidence": ["fix.diff:101-115", "a2a-server/src/rest.rs:398-417", "a2a-server/src/jsonrpc.rs:254-274", "a2a-server/src/sse.rs:44-64"]
+  },
+  "landing_point": {
+    "where": "a2a/src/errors.rs:156",
+    "why": "The summary names error.rs; A2AError::internal and its to_jsonrpc_error/http mapping live in a2a/src/errors.rs, so an engineer starts there or at the response boundaries (a2a-server/src/jsonrpc.rs:254, a2a-server/src/rest.rs:449), not at the raise sites."
+  },
+  "fix_sites": [
+    {"where": "a2a-server/src/rest.rs:401", "entry_point": "REST HTTP routes returning a ProtoJSON body (get task, list tasks, push config, extended agent card) via protojson_json_response", "module_kind": "transport binding (REST)"},
+    {"where": "a2a-server/src/rest.rs:413", "entry_point": "REST streaming routes (message:stream, task subscribe) via protojson_stream", "module_kind": "transport binding (REST, streaming)"},
+    {"where": "a2a-server/src/handler.rs:333", "entry_point": "SubscribeToTask / SendStreamingMessage on every transport when a subscriber lags the broadcast channel", "module_kind": "core request handler (shared by all transports)"},
+    {"where": "a2a-server/src/push/sender.rs:153", "entry_point": "Any SendMessage/stream that triggers push delivery with fail_on_error set (HttpPushSender::send_push via handler.rs:210)", "module_kind": "outbound webhook client (looks out of scope)"},
+    {"where": "a2a-server/src/task_store/inmemory.rs:42", "entry_point": "TaskStore::create via save_task fallback (handler.rs:227) on SendMessage", "module_kind": "storage backend (lower-level public API, TaskStore trait impl)"},
+    {"where": "a2a-server/src/lib.rs:42", "entry_point": "new crate-private helper sanitized_internal_error inserted here (fix.diff:101-115)", "module_kind": "helper"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "a2a-server/src/task_store/inmemory.rs:42 (TaskStore impl); also outbound push client a2a-server/src/push/sender.rs:151-158"},
+  "O3_reason_to_dismiss": "The store's 'task already exists' and the push sender's delivery error look like internal plumbing rather than response code, and the push error only surfaces when the opt-in fail_on_error is set, so a solver can argue they are not client-facing; the JSON-RPC serialization twin can be dismissed as 'the advisory/test only shows REST'.",
+  "O4_distance": {"files": 6, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "An AgentExecutor's own INTERNAL_ERROR (e.g. 'stream failed') must keep its message through the JSON-RPC/REST/SSE boundary, and non-internal errors (task not found, invalid params, parse errors) keep their detail; sanitizing by code at error_response/rest_error_response/to_jsonrpc_error breaks both.",
+    "where": "a2a-server/src/jsonrpc.rs:254-257; a2a-server/src/rest.rs:449-453; a2a-server/src/sse.rs:56-58; a2acli/src/lib.rs:3394; a2acli/tests/e2e.rs:1374-1382; fix.diff:310-320"
+  },
+  "O6_input_shapes": [
+    "unary response serialization fault (rest.rs:401)",
+    "streaming item serialization fault (rest.rs:413), generalized to any ProtoJsonPayload (fix.diff:148-151)",
+    "broadcast Lagged on a subscription stream (handler.rs:330-337)",
+    "push delivery failures: serialize, non-2xx status, transport error (push/sender.rs:110-147)",
+    "store duplicate-create invariant (task_store/inmemory.rs:41-42)"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "a2a-pb protojson_conv::to_value called at a2a-server/src/rest.rs:399, a2a-server/src/rest.rs:412, a2a-server/src/jsonrpc.rs:260, a2a-server/src/jsonrpc.rs:269", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "JSON-RPC unary responses: protojson_value wraps the ProtoJSON serializer error text into a client-visible INTERNAL_ERROR, the exact twin of fixed rest.rs:401",
+     "where": "a2a-server/src/jsonrpc.rs:259-262",
+     "reason_to_dismiss": "The advisory's tests and diff only exercise REST; JSON-RPC is a separate binding and its error_response test is changed to assert pass-through, which reads as 'JSON-RPC intentionally passes messages'.",
+     "distance": "same crate, different file from the fixed REST site; 1 file from landing boundary",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "JSON-RPC streaming (SendStreamingMessage, SubscribeToTask): protojson_stream puts the serializer error text into the SSE JSON-RPC error frame, twin of fixed rest.rs:413",
+     "where": "a2a-server/src/jsonrpc.rs:264-274",
+     "reason_to_dismiss": "Same as above; streaming errors on this path are mostly executor-originated so a solver may assume the boundary must stay untouched and miss that this map_err is a raise site.",
+     "distance": "same file as previous route",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "a2a-grpc/src/server.rs:60-61", "sibling": "A fallible pbconv conversion on the gRPC response path that maps its error into A2AError::internal with the conversion detail", "why_realistic": "The REST/JSON-RPC bindings already do fallible ProtoJSON transcoding with formatted errors; a maintainer making the gRPC conversion fallible would copy that idiom."},
+    {"where": "a2a-slimrpc/src/server.rs:302-307", "sibling": "map_stream_response encoding failure formatted into an internal error with encoder detail", "why_realistic": "a2a-slimrpc/src/common.rs:53 already formats decode errors into A2AError::internal on the client side; a server-side encode check would mirror it."},
+    {"where": "a2a-server/src/push/store.rs:87", "sibling": "An InMemoryPushConfigStore invariant (duplicate id / capacity) raised as A2AError::internal with internal state in the message", "why_realistic": "Same shape as the fixed InMemoryTaskStore duplicate-create error in a sibling store."},
+    {"where": "a2a-server/src/handler.rs:216-231", "sibling": "save_task wrapping a store update failure into an internal error carrying the store's message", "why_realistic": "save_task is the persistence chokepoint and already special-cases store error codes."}
+  ],
+  "O9_family": "information exposure through error messages (CWE-209/CWE-200)", "O9_dos": false,
+  "O10_build": {"language": "Rust", "toolchain": "cargo workspace (stable Rust; axum/tokio/prost/tonic)", "services": [],
+                "offline_after_build": true,
+                "project_tests": "Unit tests in a2a-server/src/{rest,jsonrpc,sse,handler}.rs mod tests (axum oneshot, no network); CLI e2e in a2acli/tests/e2e.rs spins a local server; a2a-slimrpc/tests/e2e.rs may need SLIM."},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "a2a-server/src/lib.rs, a2a-server/src/rest.rs, a2a-server/src/handler.rs, a2a-server/src/push/sender.rs, a2a-server/src/task_store/inmemory.rs",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Rewrite every INTERNAL_ERROR message to 'Internal error' in error_response/rest_error_response/to_jsonrpc_error, which hides executor failure reports (breaks a2acli e2e 'stream failed') and still is not where the fix belongs."},
+  "out_of_scope_notes": [
+    "a2a-server/src/jsonrpc.rs:99 and :111 echo serde parse error text to clients (PARSE_ERROR/INVALID_REQUEST); client-input feedback, not this advisory's INTERNAL_ERROR property.",
+    "Client-side crates (a2a-client, a2a-grpc client, a2a-slimrpc client) build many A2AError::internal with detail; these are local errors, not server-to-client exposure."
+  ],
+  "unverified": [
+    "repo size in MB (no shell available to measure); tiny_repo/giant_repo not assessed",
+    "Whether a2a-pb needs protoc at build time (generated code present at a2a-pb/src/gen/lf.a2a.v1.rs suggests not)",
+    "Whether a2a-slimrpc tests need an external SLIM service",
+    "present_in_latest for O8 routes: no latest release provided",
+    "Whether a protojson_conv::to_value failure is reachable from real handler output (fix tests reach it only via a synthetic payload, fix.diff:193-219)"
+  ]
+}

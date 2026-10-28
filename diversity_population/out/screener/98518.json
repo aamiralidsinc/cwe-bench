@@ -1,0 +1,81 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "98518",
+  "advisory_ids": ["CVE-2026-73216", "GHSA-F6HC-79W3-P8PQ"],
+  "repo": "coturn/coturn",
+  "pinned_commit": "d397f0ddebcac653aeca52926cc13c25bedf975c",
+  "fix_commits": ["54ef76cebfff2bb99b35438858a4ef412d84128d", "3c5b2615fd405c4e7c5bf3fbeef895c94a90671b"],
+  "trust_decision": {
+    "summary": "Whether a client's live allocation still holds its user/total quota unit (and bps charge) is decided by inc_quota/dec_quota pairing on the session; shutdown_client_connection releases the charge before checking for a first-stage mobility close that keeps the allocation alive.",
+    "evidence": [
+      "src/server/ns_turn_server.c:195-226",
+      "src/server/ns_turn_server.c:1403",
+      "src/server/ns_turn_server.c:4551-4552",
+      "src/server/ns_turn_server.c:4559-4580",
+      "src/apps/relay/userdb.c:664-728"
+    ]
+  },
+  "landing_point": {
+    "where": "src/server/ns_turn_server.c:4551",
+    "why": "Summary says 'mobility disconnects bypass quotas'; the disconnect handler releases quota (dec_quota) right before the is_mobile first-stage early return at :4559."
+  },
+  "fix_sites": [
+    {"where": "src/server/ns_turn_server.c:4551-4552", "entry_point": "TURN ALLOCATE with MOBILITY-TICKET (sets is_mobile at src/server/ns_turn_server.c:1232) then client TCP/TLS close -> src/apps/relay/ns_ioalib_engine_impl.c:3663 -> shutdown_client_connection", "module_kind": "core server session teardown"},
+    {"where": "src/server/ns_turn_server.c:1638-1653", "entry_point": "copy_auth_parameters helper (static), reached from the two callers below", "module_kind": "core server auth/quota helper"},
+    {"where": "src/server/ns_turn_server.c:1980", "entry_point": "TURN REFRESH with MOBILITY-TICKET from a new 5-tuple (handle_turn_refresh, dispatched at src/server/ns_turn_server.c:4117)", "module_kind": "core server request handler"},
+    {"where": "src/server/ns_turn_server.c:1756", "entry_point": "first Send indication / ChannelData on the new path promoting the pending resume (mobile_complete_transition called at src/server/ns_turn_server.c:4981)", "module_kind": "core server mobility handoff"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All changed sites are in src/server/ns_turn_server.c; the resume-side changes (:1980, :1756) are the coupled must-keep-working half, not a separate module."},
+  "O3_reason_to_dismiss": "A solver who moves dec_quota below the mobility early return can argue the REFRESH resume path (:1980) is 'auth, not quota' and leave it, so the resuming session is charged a second unit while orig_ss still holds one; conversely a solver may skip mobile_complete_transition (:1756) since it already re-charges orig_ss.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A legitimate mobility resume (REFRESH+MOBILITY-TICKET from a fresh 5-tuple) must keep working under quota=1. Once the suspended allocation keeps its charge, the unconditional inc_quota in copy_auth_parameters charges the temporary resuming session a second unit. The fix's own comment and test say this rejects legitimate resumes.",
+    "where": "src/server/ns_turn_server.c:1652, src/server/ns_turn_server.c:1980, src/server/ns_turn_server.c:1751-1757"
+  },
+  "O6_input_shapes": [
+    "ALLOCATE+MOBILITY over TCP then disconnect (BEV_EVENT_EOF, src/apps/relay/ns_ioalib_engine_impl.c:3663)",
+    "socket error disconnect (src/apps/relay/ns_ioalib_engine_impl.c:3691)",
+    "TLS/DTLS read-error disconnect (src/apps/relay/dtls_listener.c:948)",
+    "bps charge as well as allocation-count quota (dec_bps moved with dec_quota, fix.diff:425-450)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Quota counters live in src/apps/relay/userdb.c:664-728 (check_new_allocation_quota/release_allocation_quota via callbacks); they are invoked directly by inc_quota/dec_quota, no serialized/cached state.", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/server/ns_turn_server.c:841-848", "sibling": "turn_cancel_session (admin CLI/web cancel) calls shutdown_client_connection with force=0; a copy that releases quota before honouring the mobility first-stage close would be a second release route.", "why_realistic": "Admin cancel is a separate public surface (RMT_CANCEL_SESSION) a maintainer could give its own teardown preamble."},
+    {"where": "src/server/ns_turn_server.c:3561-3565", "sibling": "realm switch after async auth does dec_quota then inc_quota ignoring the return; a variant applied to an already-allocated session would leave a live allocation uncharged.", "why_realistic": "Same dec/inc re-key idiom already used in copy_auth_parameters; the ignored return value is existing style."},
+    {"where": "src/apps/relay/netengine.c:663", "sibling": "cross-relay-thread mobility resume (RMT_MOBILE_SOCKET) could get its own resume handler duplicating the copy_auth_parameters charge logic.", "why_realistic": "Cross-thread resume is a distinct transport path in a different file/package (apps/relay vs server)."}
+  ],
+  "O9_family": "resource exhaustion: quota accounting released while resource retained (CWE-400)",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "C",
+    "toolchain": "CMake (CMakeLists.txt) or autotools configure; libevent2 and OpenSSL; optional DB backends",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Shell-driven loopback tests in examples/ (examples/run_tests_mobile.sh, examples/run_tests_mobility_resume_flood.sh); the fix adds examples/run_tests_mobility_quota.sh + examples/scripts/mobility_quota_flood.py (raw STUN over loopback TCP)."
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/server/ns_turn_server.c",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Move dec_quota/dec_bps below the is_mobile first-stage return in shutdown_client_connection and stop, leaving copy_auth_parameters at :1980 to charge the resuming session a second unit."
+  },
+  "out_of_scope_notes": [
+    "copy_auth_parameters ignores inc_quota's return (src/server/ns_turn_server.c:1652); with counters shared across relay threads a dec/inc gap could leave orig_ss uncharged after handoff (not pursued)."
+  ],
+  "unverified": [
+    "The exact way a double charge rejects a resume is unconfirmed: the inc_quota failure at src/server/ns_turn_server.c:1652 is ignored, so the rejection claim rests on the fix comment (fix.diff:413-416) and the added test (fix.diff:153-155).",
+    "Repo size not measured (no shell); coturn source is likely near the 5 MB tiny_repo threshold, so tiny_repo may apply.",
+    "O8 empty after checking all shutdown_client_connection callers (src/server/ns_turn_server.c:846,1691,4701,4786,5274; src/apps/relay/ns_ioalib_engine_impl.c:3472-3691; src/apps/relay/dtls_listener.c:948,985); no other route found that keeps an allocation alive while releasing its charge.",
+    "Latest release is 'none', so present_in_latest could not be assessed.",
+    "Build not attempted (reading only)."
+  ]
+}

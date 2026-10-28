@@ -1,0 +1,73 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104490", "advisory_ids": ["CVE-2026-95859", "GHSA-G3G5-X568-QVQX"], "repo": "libp2p/rust-libp2p",
+  "pinned_commit": "55e4a64630f66d55fec5955c8f9905413c5d0859",
+  "fix_commits": ["51ed5f00e1b0620ded3444ecadf18477052148ea"],
+  "trust_decision": {
+    "summary": "Whether a remote peer may add topics to its per-peer topic set (connected_peer.topics, plus topic metrics): via SUBSCRIBE it passes the configured TopicSubscriptionFilter (default AllowAll, so no cap), and via GRAFT the pinned code inserts every grafted topic with no check at all.",
+    "evidence": [
+      "protocols/gossipsub/src/behaviour.rs:1389-1398",
+      "protocols/gossipsub/src/behaviour.rs:1949-1970",
+      "protocols/gossipsub/src/behaviour.rs:264",
+      "protocols/gossipsub/src/subscription_filter.rs:87-95"
+    ]
+  },
+  "landing_point": {
+    "where": "protocols/gossipsub/src/behaviour.rs:1375",
+    "why": "Summary says 'GRAFT topics unbounded growth'; handle_graft is the obvious target, and its first loop inserts every grafted topic into connected_peer.topics."
+  },
+  "fix_sites": [
+    {"where": "protocols/gossipsub/src/behaviour.rs:1389-1398", "entry_point": "remote GRAFT control message via NetworkBehaviour::on_connection_handler_event (behaviour.rs:3360,3391) -> handle_graft", "module_kind": "protocol handler (removed unconditional topic insert)"},
+    {"where": "protocols/gossipsub/src/behaviour.rs:1485", "entry_point": "remote GRAFT -> handle_graft (fix inserts a 'peer not subscribed -> drop, no PX' check after the backoff penalty and before the mesh_n_high check; fix.diff:117-123)", "module_kind": "protocol handler"},
+    {"where": "protocols/gossipsub/src/behaviour.rs:264", "entry_point": "public API Behaviour::new / new_with_transform (behaviour.rs:351-366, 389-408), where F defaults from the struct type parameter; affects remote SUBSCRIBE via handle_received_subscriptions (behaviour.rs:3285,1949-1951)", "module_kind": "public type default (defaults route)"},
+    {"where": "protocols/gossipsub/src/subscription_filter.rs:108", "entry_point": "public type MaxCountSubscriptionFilter (adds derive Debug/Clone; fix.diff:178)", "module_kind": "lower-level library filter"},
+    {"where": "protocols/gossipsub/src/subscription_filter.rs:159", "entry_point": "new Default impl for MaxCountSubscriptionFilter with caps 2000/2000 (fix.diff:186-197)", "module_kind": "lower-level library filter / defaults"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "protocols/gossipsub/src/behaviour.rs:264 together with protocols/gossipsub/src/subscription_filter.rs:107-159 (the default filter type changes from AllowAllSubscriptionFilter to MaxCountSubscriptionFilter<AllowAll> with a new Default impl)"},
+  "O3_reason_to_dismiss": "The report is about GRAFT, and the SUBSCRIBE path already has a pluggable filter (MaxCountSubscriptionFilter exists, subscription_filter.rs:107-159), so a solver can argue that capping subscriptions is the application's configuration choice, not a bug.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A peer that sends SUBSCRIBE and GRAFT for a topic we joined must still be meshed. SUBSCRIBE is processed before control messages in the same RPC (behaviour.rs:3284-3285 before 3391), and the existing tests rely on that. A GRAFT during backoff must still be penalised (the changelog explicitly keeps this; fix.diff:39-41). An over-broad fix that drops all GRAFTs from peers lacking a recorded topic before the backoff check, or rejects GRAFT for joined topics, breaks meshing or loses the penalty. A too-low default cap would reject legitimate SUBSCRIBE RPCs, because the filter's Err drops the whole RPC's subscriptions (behaviour.rs:1954-1961).",
+    "where": "protocols/gossipsub/src/behaviour.rs:1422-1466"
+  },
+  "O6_input_shapes": [
+    "GRAFT for a topic the local node has not joined (already ignored for mesh at behaviour.rs:1520-1530, but the topic was still recorded at 1391-1398)",
+    "GRAFT for a topic the local node joined but the peer never SUBSCRIBEd to",
+    "many distinct topics in one SUBSCRIBE RPC (max_subscriptions_per_request, subscription_filter.rs:124)",
+    "subscriptions accumulated across RPCs (max_subscribed_topics, subscription_filter.rs:151-155)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "A PRUNE for any topic, including one never joined, always records a (topic, peer) backoff entry, so the per-topic backoffs map grows with remote-chosen topics; the fix did not touch it.",
+     "where": "protocols/gossipsub/src/behaviour.rs:1610-1611",
+     "reason_to_dismiss": "Entries expire via the heartbeat (backoff.rs:154-178), and the remote backoff is capped at 3600 s (behaviour.rs:88,1590), so a solver can call it already bounded and a different structure from per-peer topics.",
+     "distance": "same file as the landing point (behaviour.rs), with the sink in protocols/gossipsub/src/backoff.rs:96 via remove_peer_from_mesh(.., always_update_backoff=true) at behaviour.rs:1587-1596",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "protocols/gossipsub/src/behaviour.rs:1610-1617", "sibling": "PRUNE handler recording a remote topic into a per-peer set (for example 'peer left topic' bookkeeping) without checking local or peer subscription", "why_realistic": "It mirrors the removed GRAFT reasoning ('if a peer prunes us it must have been subscribed'), the same comment style as behaviour.rs:1389-1390."},
+    {"where": "protocols/gossipsub/src/behaviour.rs:1244-1252", "sibling": "IHAVE recording the advertised topic for the peer before the mesh.contains_key check", "why_realistic": "IHAVE implies the peer is subscribed to the topic, so a maintainer could plausibly record it for gossip targeting."}
+  ],
+  "O9_family": "CWE-770 allocation without limits: unbounded per-peer topic state from remote control/subscription messages", "O9_dos": true,
+  "O10_build": {"language": "Rust", "toolchain": "cargo workspace, rust-version 1.83.0 (Cargo.toml:73), resolver 2", "services": [],
+                "offline_after_build": true,
+                "project_tests": "protocols/gossipsub/src/behaviour/tests.rs (unit tests calling handle_graft/handle_received_subscriptions directly, e.g. test_graft_without_subscribe at line 5313); protocols/gossipsub/src/subscription_filter.rs:211+ filter tests"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "protocols/gossipsub/src/behaviour.rs, protocols/gossipsub/src/subscription_filter.rs", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Delete the topic-insert loop in handle_graft (or gate it on mesh.contains_key), leaving the uncapped AllowAll default on SUBSCRIBE and no 'peer not subscribed' graft check."},
+  "out_of_scope_notes": [
+    "handle_received_subscriptions runs before the graylist check (behaviour.rs:3284-3295), so graylisted peers still reach the subscription filter."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "O8 PRUNE/backoff route: whether the advisory's property is meant to cover the backoffs map (time-bounded, at most 3600 s) is a judgement call; growth within the window is bounded only by RPC rate and max_transmit_size (protocol.rs:86).",
+    "Weakness class is resource exhaustion, which lessons-v2 records as 0 of 7 hard tasks; this is not a listed red-flag definition, so it is noted here only.",
+    "Line protocols/gossipsub/src/behaviour.rs:1485 is the pinned-tree position where the fix's new check is inserted (before the mesh_n_high check), inferred from fix.diff hunk context.",
+    "present_in_latest unknown: no latest release given."
+  ]
+}

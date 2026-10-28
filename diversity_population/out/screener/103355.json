@@ -1,0 +1,77 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "103355", "advisory_ids": ["GHSA-C3MH-7H6X-XH3F", "CVE-2026-91095"], "repo": "facebook/proxygen",
+  "pinned_commit": "0c172c5eece5d4d4f0af79cdb1c28a1cc65c6f3c", "fix_commits": ["479eb5574195764e80e6cedebef669f6baa85083"],
+  "trust_decision": {
+    "summary": "Whether a WebTransport StreamReadHandle may still be handed to (or left in) the QUIC socket as a read callback after the application handler ran: at the pinned commit HQSession registers whatever handle HTTPTransaction returns, without checking whether the handler closed the session, aborted the txn or stopped reading (which frees the handle or its owner), and teardown only unregisters streams that are still open().",
+    "evidence": [
+      "proxygen/lib/http/session/HTTPTransaction.cpp:1829-1833",
+      "proxygen/lib/http/session/HTTPTransaction.cpp:1844-1848",
+      "proxygen/lib/http/session/HQSession.cpp:3596-3603",
+      "proxygen/lib/http/webtransport/WebTransportImpl.cpp:44-46"
+    ]
+  },
+  "landing_point": {
+    "where": "proxygen/lib/http/session/HTTPTransaction.cpp:1844-1848",
+    "why": "The summary names HTTPTransaction::onWebTransportUniStream/onWebTransportBidiStream returning handles; the in-code comment 'what if the handler killed handle (stop sending)?' sits right there."
+  },
+  "fix_sites": [
+    {"where": "proxygen/lib/http/session/HTTPTransaction.cpp:1819-1834", "entry_point": "peer opens a bidi WT stream on an HTTP/3 CONNECT session (HTTPTransaction::onWebTransportBidiStream, public method)", "module_kind": "session/transaction core"},
+    {"where": "proxygen/lib/http/session/HTTPTransaction.cpp:1836-1849", "entry_point": "peer opens a uni WT stream (HTTPTransaction::onWebTransportUniStream)", "module_kind": "session/transaction core"},
+    {"where": "proxygen/lib/http/session/HQSession.cpp:3587-3604", "entry_point": "HQSession::dispatchUniWTStream / dispatchBidiWTStream -> deliverWTStream (peer WT stream on HTTP/3)", "module_kind": "HTTP/3 session (caller that registers the read callback)"},
+    {"where": "proxygen/lib/http/session/HQSession.cpp:3657-3682", "entry_point": "streams buffered before CONNECT upgrade completes, drained by deliverPendingWTStreams", "module_kind": "HTTP/3 session buffering path"},
+    {"where": "proxygen/lib/http/session/HQSession.cpp:4030-4044", "entry_point": "StreamReadHandle::stopSending from inside the handler -> HQStreamTransport::stopReadingWebTransportIngress", "module_kind": "transport provider adapter"},
+    {"where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:37-48", "entry_point": "WebTransport::closeSession / destroy / connection end -> terminateSessionStreams (shared by HQ and QuicWebTransport)", "module_kind": "lower-level shared WebTransport implementation"},
+    {"where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:216-222", "entry_point": "any stopReadingWebTransportIngress via WebTransportImpl (EOF read, stopSending)", "module_kind": "lower-level shared WebTransport implementation"},
+    {"where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:432-441", "entry_point": "cancelling the SemiFuture from StreamReadHandle::readStreamData (interrupt handler)", "module_kind": "lower-level shared WebTransport implementation"},
+    {"where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:516-518", "entry_point": "QUIC readError on a WT stream (peer RESET_STREAM)", "module_kind": "lower-level shared WebTransport implementation"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:44-46 (terminateSessionStreams unregisters only open() streams; fix.diff:958-976 adds a readCallbackRegistered state tracked across WebTransportImpl.cpp:219, :437, :518)"},
+  "O3_reason_to_dismiss": "The advisory names the HTTPTransaction return-value APIs; session teardown in the shared WebTransportImpl (also used by QuicWebTransport) looks like a separate, pre-existing lifecycle path, and an EOF-closed stream looks already 'done'.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "A handler that calls stopSending inside onWebTransportUniStream must still emit STOP_SENDING even though the read callback is not yet registered (fix falls back to sock_->stopSending); and a handler that keeps the stream must still get its handle registered and read data. An over-broad fix (skip registration, or reject all streams once the handler touched the handle) breaks reading or silently drops STOP_SENDING.",
+    "where": "proxygen/lib/http/session/HQSession.cpp:4038-4040"
+  },
+  "O6_input_shapes": [
+    "uni stream vs bidi stream (read+write handle)",
+    "stream delivered immediately vs buffered and drained by deliverPendingWTStreams (handler aborts mid-loop)",
+    "handler ends the session via closeSession vs txn sendAbort vs per-stream stopSending",
+    "stream that saw FIN with no outstanding read (closed but still registered) at teardown",
+    "read cancellation via future interrupt bypassing WebTransportImpl's stop-reading bookkeeping"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "StreamReadHandle::readAvailable sync read-error path calls readError locally then closeIngressStream, freeing the handle without unregistering it from the QUIC socket (post-fix readError also marks it unregistered)",
+     "where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:463-470",
+     "reason_to_dismiss": "Synchronous read errors are an internal transport failure path, not something the handler does; the fix's own comment claims the transport drops the callback on readError.",
+     "distance": "same file as O2 site, other file/package from landing point (lib/http/webtransport vs lib/http/session)",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "proxygen/lib/http/webtransport/QuicWebTransport.cpp:55-57", "sibling": "register the read callback after handler_->onNewUniStream instead of before, mirroring the HQ ordering", "why_realistic": "The bidi path right above carries a comment explaining the ordering (QuicWebTransport.cpp:41-42); a maintainer unifying both transports could easily copy the HQ order."},
+    {"where": "proxygen/lib/http/webtransport/WebTransportImpl.cpp:424-426", "sibling": "readStreamData error branch frees the handle via closeIngressStream without clearing a still-registered callback", "why_realistic": "Same closeIngressStream helper already used on three error paths (WebTransportImpl.cpp:426, :469, :550) with no unregister step."}
+  ],
+  "O9_family": "memory safety: use-after-free of a WebTransport stream read handle left registered as a QUIC read callback (CWE-416)", "O9_dos": false,
+  "O10_build": {"language": "C++", "toolchain": "CMake via build/fbcode_builder/getdeps.py (folly, fizz, wangle, mvfst deps)", "services": [], "offline_after_build": true,
+                "project_tests": "proxygen/lib/http/session/test/HTTPTransactionWebTransportTest.cpp, proxygen/lib/http/session/test/HQDownstreamSessionTest.cpp (HQDownstreamSessionTestWebTransport), proxygen/lib/http/webtransport/test/QuicWebTransportTest.cpp"},
+  "O11_fix_minutes": 75,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "proxygen/lib/http/session/HTTPTransaction.cpp, proxygen/lib/http/session/HQSession.cpp, proxygen/lib/http/webtransport/WebTransportImpl.cpp, proxygen/lib/http/webtransport/WebTransportImpl.h",
+        "j_sibling_sites": "unknown",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a DestructorGuard and return nullptr from HTTPTransaction::onWebTransport*Stream when the txn ended, leaving the stopSending-before-registration case and the teardown open()-only unregister untouched."},
+  "out_of_scope_notes": [
+    "The same re-sync commit also changes HTTPBinaryCodec field-section parsing (fix.diff:5-167); unrelated to this CWE-416 advisory and accounts for much of c_fix_sites=22.",
+    "QuicWtSession uses a session-level read callback (proxygen/lib/http/webtransport/QuicWtSession.cpp:147) and is not reached by this flaw."
+  ],
+  "unverified": [
+    "O8 route: whether mvfst still holds the read callback after a synchronous sock_->read error (HQSession.h:1943) was not checked; if it drops it, the route is not a real UAF.",
+    "Repo size in MB not measured.",
+    "present_in_latest for O8 unknown (no latest release provided).",
+    "Build not attempted; offline_after_build assumes getdeps fetched dependencies beforehand."
+  ]
+}

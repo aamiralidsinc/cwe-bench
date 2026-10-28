@@ -1,0 +1,82 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "101119",
+  "advisory_ids": ["CVE-2026-83803", "GHSA-XM86-7C47-GJM4"],
+  "repo": "getsentry/sentry",
+  "pinned_commit": "ec1db98291e44c6da78bdae603c0799313037b7a",
+  "fix_commits": ["279c0c4b6a73518ec9d070309703c8d0abdd58e9", "d7fd44193c282102f9fcd2c73973820f3d10ac3a"],
+  "trust_decision": {
+    "summary": "Whether a record in an uploaded backup/relocation export may be turned into a model instance (which runs each field's to_python, including GzippedDictField's pickle fallback) is decided by model-kind/exclusion/scope checks; at the pinned commit those checks run only AFTER Django's deserializer has already built the instance, in import_by_model and in the org-filter pre-pass of _import.",
+    "evidence": [
+      "src/sentry/backup/services/import_export/impl.py:213-228",
+      "src/sentry/backup/imports.py:197-214",
+      "src/sentry/db/models/fields/gzippeddict.py:31-45",
+      "src/sentry/models/grouptombstone.py:25",
+      "src/sentry/models/grouptombstone.py:38-40"
+    ]
+  },
+  "landing_point": {
+    "where": "src/sentry/relocation/tasks/process.py:1413",
+    "why": "Summary names the Relocation feature; its importing task is the one place relocation hands the uploaded export to the backup importer (import_in_organization_scope). A pickle-first reader would instead land on src/sentry/db/models/fields/gzippeddict.py:39."
+  },
+  "fix_sites": [
+    {"where": "src/sentry/backup/imports.py:197", "entry_point": "import_in_organization_scope(org_filter=...) -> _import org-slug filter pre-pass; reached from relocation importing task (src/sentry/relocation/tasks/process.py:1413-1422), CLI `sentry import organizations --filter-org-slugs` (src/sentry/runner/commands/backup.py:762), and the Cloud Build validation step (src/sentry/relocation/utils.py:720-728)", "module_kind": "orchestrator / read-only filter pre-pass (backup package)"},
+    {"where": "src/sentry/backup/services/import_export/impl.py:213", "entry_point": "ImportExportService.import_by_model RPC (src/sentry/backup/services/import_export/service.py:52-54), called per batch by _import.do_write (src/sentry/backup/imports.py:360-368) for every import_in_*_scope: CLI import users/organizations/config/global (src/sentry/runner/commands/backup.py:690,762,832,896) and relocation importing task", "module_kind": "lower-level hybrid-cloud RPC service implementation (backup/services/import_export package)"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "src/sentry/backup/services/import_export/impl.py:213-228"},
+  "O3_reason_to_dismiss": "For impl.py: it is an internal RPC service that already rejects non-BaseModel/excluded/out-of-scope models and only writes allowed ones, so it 'looks validated'; for imports.py:197: it is a read-only filter pass that only looks at org slugs and members and writes nothing, so it 'cannot import anything'. Both miss that building the instance itself runs the pickle fallback.",
+  "O4_distance": {"files": 4, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "GzippedDictField must still read legacy pickled+compressed rows coming from the database (from_db_value -> to_python pickle fallback); removing the pickle fallback outright closes the import sink but breaks reading old GroupTombstone.data rows. Also: in-scope models must still import, unknown fields must still be tolerated (ignorenonexistent), and org-slug filtering must still select the right orgs and their members' users.",
+    "where": "src/sentry/db/models/fields/gzippeddict.py:47-48"
+  },
+  "O6_input_shapes": [
+    "record of an Excluded-scope Sentry model carrying a GzippedDictField (GroupTombstone) in its own batch",
+    "record whose model is outside the batch's expected model (mismatch) — now rejected before deserialize",
+    "record of a non-BaseModel / EXCLUDED_APPS model (auth, contenttypes, fixtures) — now rejected before deserialize",
+    "record of a model whose possible relocation scopes do not intersect the import scope — now skipped before deserialize",
+    "any record placed before the first OrganizationMember in the org-filter pre-pass — pre-pass now reads raw dicts only"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "Django serializers.deserialize at src/sentry/backup/services/import_export/impl.py:213 and src/sentry/backup/imports.py:197 invoking field to_python at src/sentry/db/models/fields/gzippeddict.py:31-39", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/sentry/db/models/fields/gzippeddict.py:31-39", "sibling": "a relocatable (User/Organization scope) model carrying a legacy GzippedDictField, so the fix's pre-checks pass and the deserializer still runs the pickle fallback", "why_realistic": "GzippedDictField is a legacy field kept for old rows (gzippeddict.py:17-21); many relocatable models carry legacy blob fields (e.g. LegacyTextJSONField at src/sentry/models/rule.py:51, src/sentry/models/projectkey.py:125); a maintainer could leave one unmigrated. HOW-type: needs the insight that the sink is field conversion, not the scope check."},
+    {"where": "src/sentry/relocation/tasks/process.py:605", "sibling": "preprocessing_scan building model instances via Django's deserializer to read org slugs/usernames instead of raw json dicts", "why_realistic": "Same job as the _import org-filter pre-pass, which used serializers.deserialize at the pinned commit (src/sentry/backup/imports.py:197); a second implementation in another package (relocation)."},
+    {"where": "src/sentry/runner/commands/backup.py:380", "sibling": "`sentry backup compare`/`sanitize` loading exports into model instances via Django serializers for model-aware comparison", "why_realistic": "Both commands parse the same export format (backup.py:414, backup.py:591) and a model-aware comparator is a plausible refactor."}
+  ],
+  "O9_family": "CWE-502 deserialization of untrusted data (pickle reached via ORM field conversion during Django JSON deserialization; check-after-use ordering)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python",
+    "toolchain": "Python 3 + Django, pip/uv per repo requirements; pytest",
+    "services": ["postgres", "redis"],
+    "offline_after_build": true,
+    "project_tests": "tests/sentry/backup/test_imports.py, tests/sentry/backup/test_rpc.py, tests/sentry/backup/test_models.py, tests/sentry/relocation/ (task tests)"
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/sentry/backup/imports.py, src/sentry/backup/services/import_export/impl.py",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Delete the pickle.loads fallback in GzippedDictField.to_python (or only reorder checks in impl.py), leaving either legacy DB reads broken or the imports.py org-filter pre-pass still building instances."
+  },
+  "out_of_scope_notes": [
+    "Other pickle.loads sinks exist in unrelated features (src/sentry/services/nodestore/django/backend.py:33, src/sentry/buffer/redis.py:546-559, src/sentry/digests/codecs.py:19); not on the import path.",
+    "impl.py:227 condition `app_label not in EXCLUDED_APPS or model_instance` is always truthy for a model instance, so the excluded-apps check was ineffective at the pinned commit (the fix replaces it)."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check); giant_repo red flag not assessed.",
+    "Fix passes misspelled kwarg `ignorenotexistent=True` (fix.diff:2270) instead of `ignorenonexistent`; effect on unknown-field tolerance for direct RPC callers not checked (the _import path strips unknown fields first at src/sentry/backup/imports.py:89-109).",
+    "Assumed Django's Python deserializer calls field.to_python for non-relational fields (Django library code, not in this repo).",
+    "O1 count of 6 = relocation HTTP upload (src/sentry/relocation/api/endpoints/index.py:227) via task chain, 4 CLI import commands, internal RPC import_by_model; RPC auth/exposure not examined.",
+    "Whether GroupTombstone is the only model with a pickle-capable field was checked by grep of src/sentry only; getsentry/plugins not examined.",
+    "present_in_latest not applicable (O8 empty; latest release: none)."
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "84421",
+  "advisory_ids": ["GHSA-JPX9-Q676-JRJX", "CVE-2026-14160"],
+  "repo": "samsung/escargot",
+  "pinned_commit": "7d9fcf89eac067ae4ae9000da31ffaeefc208cc0",
+  "fix_commits": ["9e8084ecc2f68e8584d389414c3f37fda12dab7d"],
+  "trust_decision": {
+    "summary": "Atomics builtins decide that the typed-array byte position is in bounds of a live (non-detached) buffer once, in validateAtomicAccess, before running user-controlled coercions (ToIndex/ToInteger/ToBigInt valueOf) that can detach or shrink the ArrayBuffer; the raw buffer access afterwards trusts that stale decision, and the low-level getValueFromBuffer/setValueInBuffer only ASSERT bounds (debug-only).",
+    "evidence": [
+      "src/builtins/BuiltinAtomics.cpp:66-78",
+      "src/builtins/BuiltinAtomics.cpp:172-182",
+      "src/builtins/BuiltinAtomics.cpp:208-225",
+      "src/builtins/BuiltinAtomics.cpp:139-143",
+      "src/runtime/ArrayBufferObject.cpp:183-189",
+      "src/runtime/ArrayBufferObject.cpp:201-207"
+    ]
+  },
+  "landing_point": {
+    "where": "src/builtins/BuiltinAtomics.cpp:168",
+    "why": "A TOCTOU in Atomics leads straight to atomicReadModifyWrite, the shared helper behind add/and/or/sub/xor/exchange, where the value coercion runs after the bounds check."
+  },
+  "fix_sites": [
+    {"where": "src/builtins/BuiltinAtomics.cpp:182", "entry_point": "JS Atomics.add/and/or/sub/xor/exchange via atomicReadModifyWrite", "module_kind": "builtin (JS public API implementation)"},
+    {"where": "src/builtins/BuiltinAtomics.cpp:221-222", "entry_point": "JS Atomics.compareExchange", "module_kind": "builtin (JS public API implementation)"},
+    {"where": "src/builtins/BuiltinAtomics.cpp:292", "entry_point": "JS Atomics.load", "module_kind": "builtin (JS public API implementation)"},
+    {"where": "src/builtins/BuiltinAtomics.cpp:315", "entry_point": "JS Atomics.store", "module_kind": "builtin (JS public API implementation)"},
+    {"where": "src/runtime/ArrayBufferObject.cpp:186-188", "entry_point": "ArrayBufferObject::getValueFromBuffer (lower-level runtime API used by Atomics.load, TypedArray element get, DataView get, TypedArray builtins)", "module_kind": "runtime lower-level buffer API"},
+    {"where": "src/runtime/ArrayBufferObject.cpp:204-206", "entry_point": "ArrayBufferObject::setValueInBuffer (lower-level runtime API used by Atomics.store, TypedArray element set, DataView set, TypedArray builtins)", "module_kind": "runtime lower-level buffer API"}
+  ],
+  "O1_entry_points": 9,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "src/runtime/ArrayBufferObject.cpp:183-217 (getValueFromBuffer/setValueInBuffer: ASSERT-only checks turned into runtime TypeError/RangeError)"
+  },
+  "O3_reason_to_dismiss": "The runtime getValueFromBuffer/setValueInBuffer are generic helpers whose callers (DataView, TypedArray element get/set, copyWithin, slice) already check detach/bounds after coercion, so a solver can argue the ASSERTs are a valid caller contract and only the Atomics callers are buggy; conversely a solver who hardens only these helpers misses add/sub/and/or/xor/exchange and compareExchange, which bypass them and write through buffer->data() directly.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Atomics on a SharedArrayBuffer, or on a resizable ArrayBuffer that a valueOf grows or leaves alone, must keep succeeding, and the spec order (coerce index, then value, then re-check) must hold; checking detach before coercion, or rejecting length-tracking/resizable views outright, breaks legitimate calls. TypedArray element set on a detached buffer must still silently return true rather than throw.",
+    "where": "src/builtins/BuiltinAtomics.cpp:66-78; src/runtime/TypedArrayObject.cpp:227-229; src/builtins/BuiltinArrayBuffer.cpp:123-136"
+  },
+  "O6_input_shapes": [
+    "Number-typed integer arrays (Int8/16/32, Uint8/16/32) with value coerced via ToInteger",
+    "BigInt64/BigUint64 arrays with value coerced via ToBigInt",
+    "index coercion (ToIndex valueOf) as the trigger, which covers Atomics.load with no value argument",
+    "compareExchange with two coerced operands (expected and replacement)",
+    "buffer detached (ArrayBuffer.prototype.transfer/transferToFixedLength) vs. resizable buffer shrunk via resize()"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/builtins/BuiltinAtomics.cpp:519-532", "sibling": "Atomics.notify coerces count (toInteger) after validateAtomicAccess, then derives an address from buffer->data(); a variant that reads or writes the slot after the count coercion would be a direct sibling.", "why_realistic": "notify already follows the same validate-then-coerce order; a maintainer adding a debug read or a non-shared fast path would reuse the stale indexedPosition."},
+    {"where": "src/builtins/BuiltinAtomics.cpp:340-395", "sibling": "doWait coerces value and timeout after validateAtomicAccess and then calls getValueFromBuffer; if the SharedArrayBuffer-only check at :335 were relaxed (e.g. waitAsync on non-shared buffers), it becomes a second TOCTOU route.", "why_realistic": "Engines have debated allowing wait on non-shared buffers; moving or dropping the isSharedArrayBufferObject check is a plausible refactor."},
+    {"where": "src/runtime/SharedArrayBufferObject.cpp:153-157", "sibling": "The SharedArrayBufferObject second implementation of getValueFromBuffer/setValueInBuffer keeps ASSERT-only bounds checks (:155-157, :228-230) that the fix did not harden.", "why_realistic": "It is a parallel override of the patched function in another file; a planted shrinkable or detachable path there would pass review easily."}
+  ],
+  "O9_family": "TOCTOU / stale bounds check after user-code coercion leading to out-of-bounds memory access on a detached or shrunk ArrayBuffer (CWE-367 -> memory safety)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C++",
+    "toolchain": "CMake + GCC/Clang; Atomics is compiled only with ESCARGOT_THREADING (-DENABLE_THREADING, build/config.cmake:148-149); bundled bdwgc in third_party",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "test/vendortest submodule (test262 and others); the fix only bumps the submodule pointer (fix.diff:118-124), so regression tests sit in the vendortest repo, not in this tree"
+  },
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/builtins/BuiltinAtomics.cpp, src/runtime/ArrayBufferObject.cpp",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add a re-check only in atomicReadModifyWrite, or only harden ArrayBufferObject::getValueFromBuffer/setValueInBuffer, missing compareExchange and the RMW ops that write through buffer->data() directly (src/builtins/BuiltinAtomics.cpp:143, :225)."
+  },
+  "out_of_scope_notes": [
+    "Atomics.notify and doWait compute an address as int32_t* + byte position (src/builtins/BuiltinAtomics.cpp:374, :532), scaling the byte index by 4; it is only used as a waiter-list key, not dereferenced, so it is not this advisory's flaw.",
+    "TypedArray %TypedArray%.prototype.set uses memmove without re-reading lengths at src/builtins/BuiltinTypedArray.cpp:870-871; not checked further."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "Whether a length-tracking view over a growable SharedArrayBuffer can make validateAtomicAccess's arrayLength stale in a harmful direction (SAB can only grow) was not fully traced.",
+    "Contents of the vendortest submodule at 4c69299c vs 937f349a not inspected; regression_tests_in_pinned_commit assumed not to apply.",
+    "Other getValueFromBuffer callers (src/builtins/BuiltinTypedArray.cpp:285-287, :878-880) were only partly read; O8 is empty because the reachable non-Atomics callers read (TypedArrayObject.cpp:227-233, DataViewObject.h:93-105, BuiltinTypedArray.cpp:484-490, :1827-1831) re-check after coercion.",
+    "present_in_latest not assessed (no latest release given)."
+  ]
+}

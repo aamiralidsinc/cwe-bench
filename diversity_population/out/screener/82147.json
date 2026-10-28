@@ -1,0 +1,72 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82147",
+  "advisory_ids": ["GHSA-CWHP-RXHR-43PP", "CVE-2026-108580"],
+  "repo": "phoenixthrush/aniworld-downloader",
+  "pinned_commit": "593f9eabb6a1346649d4310950bb7f146e177723",
+  "fix_commits": ["7d088b78bec3bf32a58d6c95b3b710b3f7807834", "3c070bd10665377308a3092e11933681c18a5fd1"],
+  "trust_decision": {
+    "summary": "Whether a form-submitted username/password pair signs the client in is decided in auth.login via db.verify_user, with no limit on how many failed attempts a client or username may make.",
+    "evidence": ["src/aniworld/web/auth.py:239-256", "src/aniworld/web/db.py:262-271"]
+  },
+  "landing_point": {"where": "src/aniworld/web/auth.py:246-254", "why": "The advisory names POST /login; this is the only handler for that form and it calls db.verify_user with no attempt counting."},
+  "fix_sites": [
+    {"where": "src/aniworld/web/auth.py:246-254", "entry_point": "POST /login (auth.login)", "module_kind": "HTTP handler (Flask blueprint)"},
+    {"where": "src/aniworld/web/db.py:262-271", "entry_point": "POST /login via db.verify_user (dummy-hash timing equalisation for unknown users)", "module_kind": "storage / lower-level API"},
+    {"where": "src/aniworld/web/app.py:85-91", "entry_point": "create_app -> _setup_auth (installs LoginThrottle in app.extensions)", "module_kind": "app factory / wiring"},
+    {"where": "src/aniworld/web/app.py:283-285", "entry_point": "aniworld --web-ui -> start_web_ui -> waitress.serve (trusted proxy options so remote_addr is the real client)", "module_kind": "server bootstrap / config"},
+    {"where": "fix.diff:198-300", "entry_point": "new module src/aniworld/web/throttle.py (LoginThrottle), used only by POST /login", "module_kind": "new helper module"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "src/aniworld/web/app.py:283-285 (waitress.serve called without proxy options; fix.diff:77-103 adds ANIWORLD_WEB_TRUSTED_PROXY so per-IP counting sees the real client behind a reverse proxy)"},
+  "O3_reason_to_dismiss": "The server bootstrap and reverse-proxy handling look like deployment configuration rather than the login handler, so a solver keys the throttle on request.remote_addr (or trusts X-Forwarded-For) and never touches start_web_ui.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A correct password must still sign in after a few failures below the limit, a success resets only the username counter (not the IP counter), and lockout of one username must not block other users from other IPs; an over-broad fix (global lock, lock on every request, resetting the IP counter on success) breaks these.", "where": "src/aniworld/web/auth.py:251-253 (fix.diff:147-150, fix.diff:296-300)"},
+  "O6_input_shapes": [
+    "existing local username, wrong password",
+    "unknown username (must lock out the same way so lockout does not reveal account existence; fix.diff:421-425)",
+    "many usernames from one IP (per-IP limit; fix.diff:414-418)",
+    "one username from many IPs (per-username limit; fix.diff:398-404)",
+    "username longer than 64 chars (truncated key; fix.diff:221-223, fix.diff:244-245)",
+    "client behind trusted reverse proxy vs spoofed X-Forwarded-For from an untrusted peer (fix.diff:495-515)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "src/aniworld/web/app.py:283-285 (waitress serve options decide what request.remote_addr holds; the fix adds _proxy_options at fix.diff:77-93)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/aniworld/web/auth.py:382-387", "sibling": "A self-service 'change my password' endpoint next to the admin user API that re-verifies the current password through db.verify_user without the throttle.", "why_realistic": "The user-management API block already lives here and has no password-change route; a maintainer adding one would naturally reuse verify_user and forget the throttle that lives only in login()."},
+    {"where": "src/aniworld/web/apikeys.py:44-51", "sibling": "An HTTP Basic auth branch in _from_request/authenticate that accepts username:password for scripted /api/ access and calls db.verify_user directly.", "why_realistic": "This function already parses Authorization: Bearer; adding Basic for curl users is a common request, and it sits in a different module from the login throttle."},
+    {"where": "src/aniworld/web/app.py:280-281", "sibling": "The debug app.run path (and any second server path) not receiving the proxy options, so a planted alternative server bootstrap keys the throttle on the proxy IP.", "why_realistic": "The fix only wires _proxy_options into waitress.serve; a second serve path is already present at this line."}
+  ],
+  "O9_family": "Authentication: missing brute-force / failed-login rate limiting (CWE-307), with a side fix for username-enumeration timing (CWE-208)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (>=3.11)",
+    "toolchain": "pip install -e .[test] (setuptools, pytest); Flask, flask-wtf, waitress, werkzeug",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/test_auth.py (local login, setup, logout via Flask test client using auth_client/admin fixtures), tests/test_db_users.py (verify_user, SSO accounts); the fix adds tests/test_login_throttle.py"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 0,
+    "j_sites_touched": "src/aniworld/web/auth.py, src/aniworld/web/db.py, src/aniworld/web/app.py, src/aniworld/web/throttle.py (new)",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add an in-memory per-IP failure counter in login() keyed on request.remote_addr (or X-Forwarded-For), with no per-username limit, no lockout for unknown usernames and no trusted-proxy handling."
+  },
+  "out_of_scope_notes": [
+    "db.verify_user at src/aniworld/web/db.py:269 skips hashing for unknown usernames (timing-based username enumeration); the same fix closes it, but it is a different CWE.",
+    "API keys at src/aniworld/web/apikeys.py:64 have no failure throttle, but the key is 32 random bytes (src/aniworld/web/apikeys.py:31-32), so brute force does not apply; not counted as an O8 route."
+  ],
+  "unverified": [
+    "Repository size in MB was not measured (no shell); tiny_repo cannot be ruled in or out.",
+    "Whether the latest release still has these routes was not checked: no latest release was given.",
+    "Whether src/aniworld/web/discord_bot.py has any credential check was only grep-checked (allowed() at line 281 gates Discord interactions, no passwords); not read in full.",
+    "Recall risk is estimated from the project's size and how recent the advisory is, not measured."
+  ]
+}

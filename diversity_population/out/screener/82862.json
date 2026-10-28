@@ -1,0 +1,59 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82862", "advisory_ids": ["GHSA-M6XH-MJQ9-HV5W", "CVE-2026-110603"], "repo": "laszip/laszip",
+  "pinned_commit": "b17291db32150970ad36d77f1dc560c6dcf71ab0",
+  "fix_commits": ["c9bfd3e68d65c84d513a2286ae06cbbe17afda02"],
+  "trust_decision": {
+    "summary": "Teardown (laszip_clean) decides whether each header.vlrs[i].data is an owned heap pointer by testing it for non-NULL; that only holds if every slot of the VLR array was zeroed or written before any error return, but the array is allocated with uninitialised malloc and error paths return mid-loop.",
+    "evidence": ["src/laszip_dll.cpp:499-511", "src/laszip_dll.cpp:3983", "src/laszip_dll.cpp:4004-4034", "src/laszip_dll.cpp:883", "src/laszip_dll.cpp:893-897"]
+  },
+  "landing_point": {"where": "src/laszip_dll.cpp:3983", "why": "Summary names laszip_read_header and a truncated VLR header; the VLR array malloc and the per-field try/catch returns at 4004-4034 are the obvious place."},
+  "fix_sites": [
+    {"where": "src/laszip_dll.cpp:3983", "entry_point": "laszip_open_reader / laszip_open_reader_stream -> laszip_read_header, freed later by laszip_clean / laszip_destroy (fix.diff:958-959)", "module_kind": "C API reader (header parser)"},
+    {"where": "src/laszip_dll.cpp:883", "entry_point": "laszip_set_header (writer-side header copy; error return at 893-897 leaves later slots uninitialised), freed by laszip_clean (fix.diff:918-926)", "module_kind": "C API writer/header setter (looks out of scope for a read-side report)"},
+    {"where": "src/lasattributer.hpp:606-631", "entry_point": "LASattributer::init_attributes, called from laszip_set_header (src/laszip_dll.cpp:919) and laszip_read_header extra-bytes setup (src/laszip_dll.cpp:2301); failure paths leave partially freed/inconsistent members (fix.diff:13-44)", "module_kind": "header-only lower-level C++ class"},
+    {"where": "src/lasreaditemcompressed_v3.cpp:476", "entry_point": "laszip_read_point -> LASreadPoint -> LASreadItemCompressed_*14_v3::init; delete[] bytes then new may throw, leaving dangling pointer freed again in destructor (fix.diff:543-614, also lines 1268, 1626, 2010, 2350)", "module_kind": "second decoder implementation (v3)"},
+    {"where": "src/lasreaditemcompressed_v4.cpp:476", "entry_point": "same as v3 for v4 layered items (fix.diff:623-693, also lines 1268, 1626, 2009, 2348)", "module_kind": "second decoder implementation (v4)"},
+    {"where": "src/laszip.cpp:173", "entry_point": "LASzip::pack (public C++ class, used by laszip_dll writer and LASzipper); this->bytes deleted and not nulled before possible early return (fix.diff:897-906)", "module_kind": "lower-level C++ API (VLR serializer)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "src/laszip_dll.cpp:883 (laszip_set_header, writer-side copy of a caller-supplied header; same uninitialised VLR array freed by laszip_clean at src/laszip_dll.cpp:499-511)"},
+  "O3_reason_to_dismiss": "The report is about parsing a truncated file in laszip_read_header; laszip_set_header takes a caller-built struct on the write side, so a solver can argue it is trusted API input, not attacker file data.",
+  "O4_distance": {"files": 5, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Files whose offset_to_point_data leaves too few bytes for all declared VLRs must keep loading with a warning (count truncated, not an error), and the LASzip VLR must still be stripped from the array via realloc shrink; a fix that turns truncation into a hard error or frees on that path breaks valid-but-sloppy files.", "where": "src/laszip_dll.cpp:3995-4000; src/laszip_dll.cpp:4047-4053; src/laszip_dll.cpp:4200-4216"},
+  "O6_input_shapes": [
+    "file truncated inside any of the five VLR header fields (reserved/user_id/record_id/record_length/description) at src/laszip_dll.cpp:4004-4034",
+    "file truncated inside the LASzip VLR payload, whose slot never gets .data written (src/laszip_dll.cpp:4059-4176)",
+    "file truncated inside a normal VLR's data bytes after .data allocated (src/laszip_dll.cpp:4179-4186)",
+    "API caller passes header with record_length_after_header>0 and data NULL at a non-first VLR (src/laszip_dll.cpp:891-897)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "LASzip::unpack deletes items then re-allocates with new without nulling; a throwing new leaves a dangling pointer that ~LASzip deletes again", "where": "src/laszip.cpp:99-100", "reason_to_dismiss": "unpack has no caller inside this repo (only external consumers), and the fix already touched pack() in the same file so a solver may assume the file is done", "distance": "different file and class from the landing point (laszip.cpp vs laszip_dll.cpp)", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "LASattributer::add_attribute failure paths bump number_attributes and leave attributes/starts/sizes out of step, the same inconsistent-state pattern the fix closed in init_attributes", "where": "src/lasattributer.hpp:633-669", "reason_to_dismiss": "only reachable on allocation failure, and realloc_las returns the old pointer on failure (src/mydefs.cpp:596-602), so it can be argued unreachable", "distance": "header-only class, separate file from the landing point", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/laszip_dll.cpp:1674", "sibling": "laszip_add_vlr's first-VLR allocation could skip the memset at 1684 on an early error path, leaving .data uninitialised for laszip_clean", "why_realistic": "the same function already allocates with malloc_las and relies on a later memset; moving an error check between them is a plausible maintainer edit"},
+    {"where": "src/laszip_dll.cpp:4230", "sibling": "user_data_after_header deleted then re-newed without nulling, freed again by laszip_clean at 513-517 if new throws", "why_realistic": "it matches the delete-then-new pattern the fix patched in the v3/v4 decoders and LASzip::pack"}
+  ],
+  "O9_family": "memory safety: invalid free of an uninitialised/dangling pointer on error and teardown paths (CWE-824)", "O9_dos": false,
+  "O10_build": {"language": "C++", "toolchain": "CMake + C++ compiler (gcc/clang)", "services": [], "offline_after_build": true,
+                "project_tests": "No unit tests for this area; only example/laszipdllexample.cpp and example/laszippertest.cpp drivers and example/5points_14.las sample."},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/laszip_dll.cpp, src/lasattributer.hpp, src/lasreaditemcompressed_v3.cpp, src/lasreaditemcompressed_v4.cpp, src/laszip.cpp (plus unrelated hardening in lasindex/lasinterval/lasquadtree/lasreadpoint/laspoint/laswritepoint/lasunzipper/laszipper/mydefs)", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Switch the malloc at src/laszip_dll.cpp:3983 to calloc (or null .data before each return in read_header) and stop, leaving laszip_set_header:883 and the delete-then-new sites in other files."},
+  "out_of_scope_notes": [
+    "realloc_las returns the old pointer on failure (src/mydefs.cpp:596-602), so laszip_add_vlr's count++ followed by realloc at src/laszip_dll.cpp:1660-1684 can memset one past the array: out-of-bounds write, a different class.",
+    "The fix commit is an omnibus LAStools sync: quadtree/interval/index bounds checks, GPS-time recursion to loop, chunk-table checks and header_size<227 underflow are unrelated weaknesses."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); the repo is probably small, so tiny_repo may apply but is not flagged without evidence.",
+    "Whether src/laszip_dll.cpp:2301 (init_attributes in the reader path) is reached with zero attributes from a crafted file was not traced.",
+    "present_in_latest unknown: no latest release given.",
+    "The advisory text was not available beyond the summary; scope was inferred from the summary and the diff."
+  ]
+}

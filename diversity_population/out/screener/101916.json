@@ -1,0 +1,97 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "101916", "advisory_ids": ["CVE-2026-88024"], "repo": "mongodb/mongo-rust-driver",
+  "pinned_commit": "e72eafbe78642358c09a4497e5825e9efc7a799d",
+  "fix_commits": ["16bc932cf4d8a161a49e8161b2158228a6ca8956"],
+  "trust_decision": {
+    "summary": "A caller-supplied (or server-stored) GridFS file id of type Bson is put directly as the value of `_id` / `files_id` in a server-side filter, so a document id like {$gt: MinKey} is read by the server as a query operator instead of a literal; the driver decides 'literal match only' by wrapping the value in $eq at each filter construction site.",
+    "evidence": [
+      "driver/src/action/gridfs/delete.rs:71",
+      "driver/src/action/gridfs/delete.rs:77",
+      "driver/src/action/gridfs/download.rs:49",
+      "driver/src/action/gridfs/rename.rs:79",
+      "driver/src/gridfs/download.rs:95",
+      "driver/src/gridfs/upload.rs:447",
+      "fix.diff:79-80"
+    ]
+  },
+  "landing_point": {
+    "where": "driver/src/action/gridfs/delete.rs:71",
+    "why": "Summary says 'disclosure and deletion via ... file IDs'; GridFsBucket::delete(id: Bson) (driver/src/action/gridfs/delete.rs:17) and open_download_stream(id) (driver/src/action/gridfs/download.rs:20) are the obvious id-taking public APIs in the action/gridfs module."
+  },
+  "fix_sites": [
+    {"where": "driver/src/action/gridfs/delete.rs:71", "entry_point": "GridFsBucket::delete(id) (+ sync wrapper driver/src/action/gridfs/delete.rs:41) -> files.delete_one", "module_kind": "public action handler"},
+    {"where": "driver/src/action/gridfs/delete.rs:77", "entry_point": "GridFsBucket::delete(id) -> chunks.delete_many", "module_kind": "public action handler"},
+    {"where": "driver/src/action/gridfs/download.rs:49", "entry_point": "GridFsBucket::open_download_stream(id) via find_file_by_id (driver/src/action/gridfs/download.rs:143)", "module_kind": "internal helper of public action"},
+    {"where": "driver/src/action/gridfs/rename.rs:79", "entry_point": "GridFsBucket::rename(id, new_filename) -> files.update_one", "module_kind": "public action handler"},
+    {"where": "driver/src/gridfs/download.rs:95", "entry_point": "GridFsDownloadStream::new, reached from open_download_stream (driver/src/action/gridfs/download.rs:144) and open_download_stream_by_name (driver/src/action/gridfs/download.rs:171) with file.id read back from the files collection", "module_kind": "lower-level stream implementation (driver/src/gridfs, not action/)"},
+    {"where": "driver/src/gridfs/upload.rs:447", "entry_point": "clean_up_chunks, reached from GridFsUploadStream::abort (driver/src/gridfs/upload.rs:257), poll_close while writing (driver/src/gridfs/upload.rs:350), write_bytes insert failure (driver/src/gridfs/upload.rs:407), close insert failure (driver/src/gridfs/upload.rs:438); id set by OpenUploadStream::id (driver/src/action/gridfs/upload.rs:57)", "module_kind": "lower-level stream implementation, error/cleanup path"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "driver/src/gridfs/download.rs:95 reached from open_download_stream_by_name (driver/src/action/gridfs/download.rs:166-171): the files_id filter uses file.id deserialized from the stored FilesCollectionDocument (driver/src/gridfs.rs:47-50), an id that was stored earlier via the upload stream with a caller-chosen id (driver/src/action/gridfs/upload.rs:57, driver/src/gridfs/upload.rs:431). Secondary: upload abort/cleanup path driver/src/gridfs/upload.rs:447, which does not look like an id lookup at all."
+  },
+  "O3_reason_to_dismiss": "Download-by-name never takes an id from the caller and the id comes from the server's own files document, so a solver can say it is 'trusted data'; the upload abort/cleanup path deletes 'our own' chunks for a stream the caller just opened, so it does not look like a lookup by an untrusted id.",
+  "O4_distance": {"files": 5, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "GridFS file ids are arbitrary Bson, including documents, and stay legitimate (compound or document ids must still download, rename and delete by exact match). Also, GridFsBucket::find/find_one take a raw user filter Document by design, and find_file_by_id itself goes through self.find_one. A fix that rejects document-typed ids or $-prefixed keys, or that sanitizes find/find_one filters, breaks legitimate use.",
+    "where": "driver/src/action/gridfs/upload.rs:54-60; driver/src/action/gridfs/find.rs:20; driver/src/action/gridfs/find.rs:34; driver/src/action/gridfs/download.rs:49"
+  },
+  "O6_input_shapes": [
+    "id given as a Bson document whose top-level key is a query operator (e.g. {$gt: MinKey}) passed to delete/rename/open_download_stream (fix.diff:79-113)",
+    "the same operator-shaped id stored as a file's _id via open_upload_stream().id() and later used as file.id from the stored document (fix.diff:125-126)",
+    "the same operator-shaped id held by an upload stream and used in abort/error cleanup (fix.diff:147-148)"
+  ],
+  "O7_producer": {
+    "kind": "serializer",
+    "where": "driver/src/gridfs.rs:47-50 (FilesCollectionDocument.id: Bson, deserialized from the files collection in find_file_by_name, driver/src/action/gridfs/download.rs:72-79)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Upload stream Drop handler (stream dropped without abort/close, including the sync GridFsUploadStream wrapper which owns the async stream) spawns chunks.delete_many with an unwrapped files_id filter; the published fix changed clean_up_chunks but not this inline duplicate.",
+      "where": "driver/src/gridfs/upload.rs:263-272",
+      "reason_to_dismiss": "Fire-and-forget best-effort cleanup in Drop whose result is discarded (`let _result`), and docs tell users to prefer abort (driver/src/gridfs/upload.rs:154-157), so a solver can call it a non-API background path, or assume it already routes through clean_up_chunks.",
+      "distance": "same file as the clean_up_chunks fix site (driver/src/gridfs/upload.rs:447), different module from the landing point (driver/src/action/gridfs/delete.rs)",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "driver/src/action/gridfs/delete.rs:124-129", "sibling": "delete_by_name currently gathers server-stored ids and uses $in (literal per element). A variant that loops and deletes chunks per stored id with {files_id: id} would be a stored-id sibling.", "why_realistic": "A per-file loop is a natural rewrite (e.g. for per-file error reporting), and the ids come from the server so a maintainer would see them as trusted."},
+    {"where": "driver/src/gridfs/download.rs:95", "sibling": "A seek/resume or retry-after-cursor-error path in GridFsDownloadStream that re-queries chunks with {files_id: file.id, n: {$gte: k}}", "why_realistic": "Resuming a chunk cursor after a transient error is a plausible feature and would rebuild the filter from stored file.id away from the patched constructor."},
+    {"where": "driver/src/gridfs/upload.rs:27-47", "sibling": "An upload 'overwrite/replace existing id' option that first deletes existing files/chunks matching the caller-chosen id", "why_realistic": "Replace-on-upload is a common GridFS convenience in other drivers and would add a delete keyed on the caller id inside upload machinery."}
+  ],
+  "O9_family": "NoSQL query-operator injection (CWE-943) via Bson document values in filter positions",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo (workspace: driver/, macros/); mongodb-internal-macros proc-macro crate",
+    "services": ["MongoDB server (mongod; >=5.0 for $-prefixed id values per fix.diff:340-341)"],
+    "offline_after_build": true,
+    "project_tests": "driver/src/test/spec/gridfs.rs (unified spec runner over spec/gridfs/*.json at driver/src/test/spec/gridfs.rs:22, plus prose tests incl. drop_aborts at driver/src/test/spec/gridfs.rs:252); all need a running mongod via Client::for_test"
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "driver/src/action/gridfs/delete.rs, driver/src/action/gridfs/download.rs, driver/src/action/gridfs/rename.rs, driver/src/gridfs/download.rs, driver/src/gridfs/upload.rs",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Wrap the id in $eq only in delete/rename/open_download_stream in action/gridfs, or reject document-typed or $-keyed ids up front, missing the stored-id and upload-cleanup/Drop paths or breaking legitimate document ids."
+  },
+  "out_of_scope_notes": [
+    "ClientEncryption key-vault filters use {_id: id} unwrapped (driver/src/client/csfle/client_encryption.rs:127, :133, :152, :183), but id is typed &Binary, so operator documents cannot be passed; different feature, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size tool used).",
+    "present_in_latest for the Drop route is unknown (no latest release given).",
+    "Whether the unified test runner at the pinned commit already supports every operation used by spec/gridfs/queries-use-eq.json was not checked.",
+    "Recall risk is estimated: the prose test is in the shared cross-driver GridFS spec (fix.diff:330-358), so the same fix probably landed in several MongoDB drivers; not confirmed."
+  ]
+}

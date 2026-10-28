@@ -1,0 +1,85 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "103184",
+  "advisory_ids": ["GHSA-6H2J-GHFM-664V", "CVE-2026-90562"],
+  "repo": "langbot-app/langbot",
+  "pinned_commit": "d6443b10bcf319c59a826573cbabcd6353b9b3a9",
+  "fix_commits": ["273b8839b91cb74dfd083644efea18849a3fcee1", "267232c24f93c515d6fd3f7f81c0676066ab1ab8"],
+  "trust_decision": {
+    "summary": "The unauthenticated POST /api/v1/user/reset-password lets anyone who presents system.recovery_key reset any account's password. At the pinned commit that key is 6 hex characters (24 bits) generated at boot, compared with plain !=, and guarded only by a 3 s per-request sleep, so concurrent guessing is not throttled.",
+    "evidence": [
+      "src/langbot/pkg/api/http/controller/groups/user.py:82-106",
+      "src/langbot/pkg/api/http/controller/groups/user.py:90-91",
+      "src/langbot/pkg/api/http/controller/groups/user.py:101",
+      "src/langbot/pkg/core/stages/genkeys.py:22-23",
+      "src/langbot/pkg/api/http/service/user.py:510-519"
+    ]
+  },
+  "landing_point": {
+    "where": "src/langbot/pkg/core/stages/genkeys.py:23",
+    "why": "The summary says 'weak recovery key', so a search for recovery_key leads first to the generator (secrets.token_hex(3)). The comparison at src/langbot/pkg/api/http/controller/groups/user.py:101 is the only other hit."
+  },
+  "fix_sites": [
+    {"where": "src/langbot/pkg/core/stages/genkeys.py:22-23", "entry_point": "Application boot (GenKeysStage, run on `langbot` start) when system.recovery_key is empty", "module_kind": "boot stage / config default generator (core)"},
+    {"where": "src/langbot/pkg/core/stages/genkeys.py:22", "entry_point": "Application boot with an existing short (legacy) key: the fix adds a warning branch (fix.diff:149-154)", "module_kind": "boot stage (core)"},
+    {"where": "src/langbot/pkg/api/http/controller/groups/user.py:82-84", "entry_point": "POST /api/v1/user/reset-password: process-local fixed-window admission quota checked before any await (fix.diff:58-77, fix.diff:89-90)", "module_kind": "HTTP controller (unauthenticated)"},
+    {"where": "src/langbot/pkg/api/http/controller/groups/user.py:101", "entry_point": "POST /api/v1/user/reset-password: constant-time compare that also rejects non-str values and survives UnicodeEncodeError (fix.diff:100-112)", "module_kind": "HTTP controller (unauthenticated)"},
+    {"where": "web/src/app/reset-password/page.tsx:139-160", "entry_point": "WebUI /reset-password form: a 6-slot OTP input that upper-cases its value is replaced by a verbatim text input (fix.diff:591-623)", "module_kind": "frontend (React/TS)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "defaults_or_merge_route", "where": "src/langbot/pkg/core/stages/genkeys.py:22-23 (boot-time default generation of system.recovery_key, far from the HTTP handler); also web/src/app/reset-password/page.tsx:139-160, a frontend input hard-wired to 6 upper-cased characters"},
+  "O3_reason_to_dismiss": "From the handler, a solver can argue that key strength is an operator config concern and only add throttling. Or, from the generator, they can argue that a longer key fixes it and skip the throttling. The 6-character frontend OTP input looks like UI, not security, yet a longer key cannot be entered through it.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Existing keys, whether configured by an operator or left over from older versions (6-char legacy, long mixed-case base64url, non-ASCII), must keep working verbatim. They must not be regenerated, and the stored file must not be re-dumped when unchanged. A fix that regenerates every short key, normalises case, or limits charset or length breaks legitimate resets. The frontend must also stop upper-casing the key.",
+    "where": "src/langbot/pkg/core/stages/genkeys.py:19-24; web/src/app/reset-password/page.tsx:139-160; fix.diff:343-351; fix.diff:410-419"
+  },
+  "O6_input_shapes": [
+    "recovery_key as a non-string JSON value (int): must fail closed with 403, not raise a 500 (fix.diff:432-446)",
+    "recovery_key with non-ASCII characters or a lone surrogate (\\ud800): the encode-based compare must not crash (fix.diff:449-459, fix.diff:107-109)",
+    "concurrent burst of guesses that interleave at await points: admission must happen before the first await (fix.diff:527-553)",
+    "a correct key after the quota is used up: must be rejected with 429; a success does not refill the quota (fix.diff:462-477, fix.diff:506-524)",
+    "stored key empty, short legacy, 8-char, long, or non-ASCII (fix.diff:343-351)"
+  ],
+  "O7_producer": {"kind": "config_loader", "where": "src/langbot/pkg/core/stages/genkeys.py:22-24 (generates the key and persists it with instance_config.dump_config). The value can also come from SYSTEM__RECOVERY_KEY via src/langbot/pkg/core/stages/load_config.py:268-269", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/langbot/pkg/api/http/controller/groups/system.py:82-114", "sibling": "A recovery-key-authenticated system route (e.g. an unauthenticated 'unlock/reset admin' or lbctl bootstrap endpoint) that compares system.recovery_key with plain == and has no quota", "why_realistic": "This group already reads instance_config['system'] values for unauthenticated or lbctl callers, and a lbctl system-context endpoint was added just before the pinned commit (commit bc32eb3c)."},
+    {"where": "src/langbot/pkg/api/http/service/apikey.py:157", "sibling": "A second recovery or global secret path that generates its own short secret or compares it without the shared quota", "why_realistic": "The global API-key secret is already compared in a separate service module. A maintainer could plausibly add a recovery-key fallback there for lbctl."},
+    {"where": "src/langbot/pkg/api/http/controller/groups/user.py:346-373", "sibling": "/set-password accepting recovery_key as an alternative to current_password", "why_realistic": "This route already makes current_password optional for Space accounts, so a 'forgot current password' branch keyed on recovery_key is a natural feature addition."}
+  ],
+  "O9_family": "weak randomness / insufficient entropy in a recovery secret, combined with missing brute-force throttling (CWE-331 / CWE-307 / CWE-208)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Python (backend); TypeScript/React (web frontend)",
+    "toolchain": "uv + pyproject.toml (Python, Quart, pytest-asyncio); pnpm/Next for web, plus Playwright for the frontend e2e test",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "tests/integration/api/test_smoke.py:361-377 (existing recovery-key reset smoke test); tests/unit_tests/api/service/test_user_service.py:502-514 (UserService.reset_password). The fix adds tests/unit_tests/api/test_user_reset_password.py and tests/integration/api/test_recovery_password_journey.py, which use the Quart test client and SQLite."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/langbot/pkg/api/http/controller/groups/user.py; src/langbot/pkg/core/stages/genkeys.py; web/src/app/reset-password/page.tsx",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Replace token_hex(3) with token_hex(16) in genkeys.py, and perhaps add a failure counter that is incremented after the awaits. This leaves the reset route racy and unthrottled, leaves the 6-slot frontend input unable to submit a longer key, and may regenerate legacy keys."
+  },
+  "out_of_scope_notes": [
+    "POST /api/v1/user/auth (src/langbot/pkg/api/http/controller/groups/user.py:61-74) has no login throttling. That is a different secret and protection.",
+    "WeCom message crypto nonces use random.randint (src/langbot/libs/wecom_api/WXBizMsgCrypt3.py:202, src/langbot/libs/wecom_ai_bot_api/WXBizMsgCrypt3.py:201). This is separate weak randomness in a third-party-style lib.",
+    "The published quota is process-local (fix.diff:66). Multi-worker deployments are not covered, as the fix itself notes."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check was run).",
+    "Latest release is 'none', so present_in_latest could not be assessed.",
+    "The hidden tests reference private module names (_reset_password_state, _MAX_RESET_ATTEMPTS_PER_WINDOW, _RESET_WINDOW_SECONDS) and exact numbers (5 per 15 min, {403:5,429:15}). The task would need to state or relax these to be fair. This is a fairness risk, not one of the listed red flags.",
+    "The new generated key format (8 chars from a 32-symbol alphabet) is a design choice. Tests asserting len==8 and the alphabet cannot be derived from a report unless the report states them.",
+    "O1 counts the boot stage as an entry point (it runs on application start, not on a user request)."
+  ]
+}

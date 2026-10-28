@@ -1,0 +1,54 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "101337",
+  "advisory_ids": ["GHSA-37PQ-FMVF-2FWX", "CVE-2026-85221"],
+  "repo": "misp/misp",
+  "pinned_commit": "0ee0585486cd2c9df49e4f14d48a32a953666e3a",
+  "fix_commits": ["20f72101371d18afc5578d52e1543de1a19ef219", "e06f69858"],
+  "trust_decision": {
+    "summary": "Whether curl verifies the remote TLS peer certificate is decided in CurlClient::generateDefaultOptions: whenever ssl_allow_self_signed is truthy, CURLOPT_SSL_VERIFYPEER is set to $verifyPeer. That property has no default (null), so verification is off unless a caller passes ssl_verify_peer explicitly. SyncTool::setupHttpSocket decides which params to pass based on the server's self_signed/cert_file columns.",
+    "evidence": ["app/Lib/Tools/CurlClient.php:28-29", "app/Lib/Tools/CurlClient.php:64-66", "app/Lib/Tools/CurlClient.php:345-348", "app/Lib/Tools/SyncTool.php:24-30"]
+  },
+  "landing_point": {"where": "app/Lib/Tools/CurlClient.php:345-348", "why": "The summary names CurlClient and peer verification; this is the only CURLOPT_SSL_VERIFYPEER write in the class, and it is fed by the uninitialised $verifyPeer at line 29."},
+  "fix_sites": [
+    {"where": "app/Lib/Tools/CurlClient.php:29", "entry_point": "Every CurlClient construction: SyncTool::createHttpSocket (server sync pull/push/testConnection in app/Controller/ServersController.php:1111, app/Console/Command/ServerShell.php:196, Cerebrate, webhook/Splunk workflow modules, EventReport LLM) and Module::initHttpSocket (enrichment/Cortex modules, app/Model/Module.php:453)", "module_kind": "low-level HTTP client library (app/Lib/Tools)"},
+    {"where": "app/Lib/Tools/SyncTool.php:27", "entry_point": "SyncTool::setupHttpSocket, reached from server sync (AppModel::setupHttpSocket app/Model/AppModel.php:3974-3983, ServersController testConnection, ServerShell), Cerebrate (app/Model/Cerebrate.php:39) and workflow doRequest (app/Model/WorkflowModules/action/Module_webhook.php:179)", "module_kind": "wrapper / param-builder that maps the saved server row to client options"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "app/Model/Module.php:442-457 builds a CurlClient on its own from Plugin.<family>_ssl_* config and never goes through SyncTool. Its `if ($value && ...)` filter at line 446 drops ssl_verify_peer=false/unset, so Cortex/enrichment with *_ssl_allow_self_signed=true lands on the null $verifyPeer. The CurlClient default closes it; a fix limited to SyncTool would leave it open."},
+  "O3_reason_to_dismiss": "A solver who fixes only SyncTool's param building can argue that enrichment/Cortex module sockets are a separate plugin feature with their own admin settings (app/Model/Server.php:8710-8733) and outside 'sync TLS'. For the O8 workflow routes they can argue that the self-signed/verify_tls options are explicit user choices in a neighbouring feature, not the CurlClient default.",
+  "O4_distance": {"files": 4, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "A server with self_signed=1 and no pinned CA must keep connecting with verification off. After a CA is removed, cert_file is saved as '' (not null), so flipping the default to true without the SyncTool isset->empty change would verify against the system CA store and break that server. A server with self_signed=1 and a pinned CA must verify against that CA.", "where": "app/Lib/Tools/SyncTool.php:18-29; app/Controller/ServersController.php:1233-1236"},
+  "O6_input_shapes": ["cert_file null (never set): verify off", "cert_file '' (CA removed and saved): verify off after the fix", "cert_file non-empty with self_signed: verify on against the pinned CA", "ssl_verify_peer absent from params: CurlClient default now true", "ssl_verify_peer explicitly false/true passed by the caller"],
+  "O7_producer": {"kind": "handler", "where": "app/Controller/ServersController.php:1234-1236 (__saveCert delete path writes cert_file = '') plus schema default NULL for cert_file (app/Model/AppModel.php:1898, cerebrates table). The value crosses a save/reload boundary before SyncTool reads it.", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "The Splunk HEC export workflow module reads $params inside sendToSplunk, where it is not defined, so self_signed is always true. setupHttpSocket then sets ssl_verify_peer=false explicitly, and TLS verification is off even when the user picks 'Verify HTTPS Certificate = True' (default 1).", "where": "app/Model/WorkflowModules/action/Module_splunk_hec_export.php:131-133", "reason_to_dismiss": "Looks like an unrelated workflow-module scoping bug, and self_signed is a deliberate user option; it is not the CurlClient default.", "distance": "Another package (app/Model/WorkflowModules/action) from the landing point in app/Lib/Tools; reached via Module_webhook::doRequest -> SyncTool::setupHttpSocket", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "The webhook workflow module falls back to allowing self-signed certificates when the self_signed param is missing (for example a node saved before the option existed), although the declared default is 'deny'. With no cert_file this explicitly turns peer verification off.", "where": "app/Model/WorkflowModules/action/Module_webhook.php:133", "reason_to_dismiss": "Backward-compatibility default for older saved workflows; the UI default (line 59) is already 'deny'.", "distance": "Another package (app/Model/WorkflowModules/action); state comes from a saved workflow node", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "CurlClient sets CURLOPT_SSL_VERIFYHOST=0 whenever allowSelfSigned is truthy, even when a CA is pinned or the system store is used with verifyPeer true. It also ignores the ssl_verify_host param that Module.php and Sightingdb pass, so hostname checking is lost in self-signed mode.", "where": "app/Lib/Tools/CurlClient.php:345-348", "reason_to_dismiss": "Accepting self-signed certificates conventionally relaxes hostname matching, and the advisory says 'peer verification', not hostname.", "distance": "Same file as the landing point", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "app/Model/Module.php:443-449", "sibling": "A second option-mapping loop that translates Plugin.<family>_ssl_verify_peer into a separate client or a no-curl fallback, defaulting to off when the key is absent", "why_realistic": "Module.php already re-implements socket setup outside SyncTool, with a falsy filter that silently drops explicit false values."},
+    {"where": "app/Lib/Tools/SyncTool.php:42-45", "sibling": "setupHttpSocketFeed accepting a per-feed self_signed/cert_file pair with the same isset-vs-empty mismatch", "why_realistic": "Feeds are fetched over HTTPS through the same factory; a maintainer adding per-feed CA pinning would copy the server branch."}
+  ],
+  "O9_family": "CWE-295 improper certificate validation (TLS peer verification disabled by an uninitialised default)", "O9_dos": false,
+  "O10_build": {"language": "PHP", "toolchain": "PHP 7.4/8.x with ext-curl, Composer (app/composer.json), CakePHP 2 as a git submodule (.gitmodules; app/Lib/cakephp is not checked out in the pinned tree)", "services": ["MySQL/MariaDB", "Redis", "web server (for full MISP)"], "offline_after_build": true,
+                "project_tests": "No unit tests for CurlClient or SyncTool found; tests/ holds live/integration scripts (tests/testlive_sync.py, tests/testlive_security.py, tests/curl_tests_GH.sh). Hidden tests could unit-test CurlClient option generation with a local TLS server or by inspecting the generated options."},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "app/Lib/Tools/CurlClient.php, app/Lib/Tools/SyncTool.php", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Set $verifyPeer = true (or always set CURLOPT_SSL_VERIFYPEER true) in CurlClient and stop. This breaks self-signed servers whose CA was removed (cert_file ''), and leaves the Splunk/webhook workflow routes passing verify_peer=false explicitly."},
+  "out_of_scope_notes": [
+    "app/Controller/ApiController.php:157-165 (REST client) uses HttpSocketExtended/Cake HttpSocket directly with a user-chosen skip_ssl_validation; that is a different client, and Cake defaults could not be checked because the submodule is absent.",
+    "app/Console/Command/TrainingShell.php:762-765 disables verification explicitly for a training CLI."
+  ],
+  "unverified": [
+    "Repo size in MB not measured.",
+    "CakePHP HttpSocket defaults for the no-curl fallback (SyncTool.php:92-93, Module.php:455-456) could not be read: app/Lib/cakephp submodule not present at the pinned tree.",
+    "PHP curl_setopt behaviour for CURLOPT_SSL_VERIFYPEER = null (assumed coerced to false/0) not checked in this tree.",
+    "present_in_latest for every O8 route is unknown (no latest release provided).",
+    "Whether the advisory text describes the hostname (VERIFYHOST) aspect or the workflow modules: only the summary line was available."
+  ]
+}

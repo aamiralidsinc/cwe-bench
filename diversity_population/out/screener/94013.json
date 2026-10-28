@@ -1,0 +1,106 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "claude-opus-5-5",
+  "entry_id": "94013",
+  "advisory_ids": ["CVE-2026-55769", "GHSA-X8C2-3P4R-V9R6"],
+  "repo": "cloudnative-pg/cloudnative-pg",
+  "pinned_commit": "ea904e92413a7699db1c622fe479f8cedcf1dea3",
+  "fix_commits": [
+    "f74344b4d3a6d9fbe06748ba1747901f6077db2a",
+    "94ee3117858765c77d0dbfde381a037944a48a64",
+    "02b5c6289b7609dc87fcb1ae9c113160e3d43308",
+    "db38f4d80315c8f1b21bf511ef0f28871820c14d",
+    "e0e2d53adbd907a61f583b1431904b5969f3fd22",
+    "4b5e244a7d031f67e025c83c1555e7726ecbbfa1"
+  ],
+  "trust_decision": {
+    "summary": "Whether the operator/instance-manager's privileged SQL sessions resolve unqualified names through a tenant-controlled search_path (ALTER DATABASE/ROLE SET search_path) or a fixed one; decided per connection in the pool profile defaults, plus on the SECURITY DEFINER pgbouncer lookup function and in the monitoring transaction.",
+    "evidence": [
+      "pkg/management/postgres/pool/profiles.go:78-87",
+      "pkg/management/postgres/pool/connection.go:37-45",
+      "internal/management/controller/instance_controller.go:817-824",
+      "pkg/management/postgres/metrics/collector.go:591-596",
+      "fix.diff:41340-41363"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/management/postgres/metrics/collector.go:594",
+    "why": "The only search_path handling in Go source at the pinned commit; a grep for search_path from the advisory summary lands here (it prepends pg_catalog but keeps the tenant path)."
+  },
+  "fix_sites": [
+    {"where": "pkg/management/postgres/pool/profiles.go:78", "entry_point": "every instance-manager SQL connection via pool.NewDBConnection / ConnectionPool (reconcilers for Cluster, Database, Publication, Subscription, roles; metrics exporter)", "module_kind": "connection defaults (shared library)"},
+    {"where": "pkg/management/postgres/pool/profiles.go:69", "entry_point": "Pooler/PgBouncer admin connections (pool.go:68); fix removes search_path there so PgBouncer keeps accepting the connection", "module_kind": "connection defaults (coupled exemption)"},
+    {"where": "pkg/management/postgres/wal.go:66", "entry_point": "replica instance startup: WAL archive check against primary (newWalArchiveAnalyzerForReplicaInstance)", "module_kind": "raw sql.Open bypassing the pool profile"},
+    {"where": "pkg/management/postgres/wal.go:132", "entry_point": "primary bootstrap: first-WAL archive check (newWalArchiveBootstrapperForPrimary)", "module_kind": "raw sql.Open bypassing the pool profile"},
+    {"where": "pkg/management/postgres/instance.go:1009", "entry_point": "Instance.WaitForPrimaryAvailable (replica join/switchover)", "module_kind": "raw sql.Open bypassing the pool profile"},
+    {"where": "internal/management/controller/instance_controller.go:810", "entry_point": "Pooler CR with PgBouncer integration -> reconcilePgbouncerAuthUser existence check (must recreate pre-fix function)", "module_kind": "persisted DB object detection (upgrade path)"},
+    {"where": "internal/management/controller/instance_controller.go:818-824", "entry_point": "Pooler CR -> CREATE FUNCTION public.user_search SECURITY DEFINER, called by PgBouncer auth_query", "module_kind": "SQL DDL generator"},
+    {"where": "internal/management/controller/instance_controller.go:739", "entry_point": "Cluster postgresql.parameters enabling a managed extension -> reconcileExtensions CREATE EXTENSION (keeps \"$user\", public)", "module_kind": "coupled legitimate behaviour"},
+    {"where": "internal/management/controller/database_controller_sql.go:279", "entry_point": "Database CR spec.extensions -> createDatabaseExtension (keeps \"$user\", public)", "module_kind": "coupled legitimate behaviour"},
+    {"where": "pkg/management/postgres/initdb.go:433-441", "entry_point": "Cluster bootstrap.initdb postInitSQL / postInitTemplateSQL / postInitApplicationSQL (+Refs) (keeps \"$user\", public)", "module_kind": "coupled legitimate behaviour"},
+    {"where": "pkg/management/postgres/logicalimport/database.go:272-291", "entry_point": "Cluster bootstrap.initdb.import postImportApplicationSQL (keeps \"$user\", public)", "module_kind": "coupled legitimate behaviour"},
+    {"where": "pkg/management/postgres/metrics/collector.go:594-596", "entry_point": "metrics exporter /metrics HTTP endpoint running default and custom monitoring queries", "module_kind": "HTTP handler-side transaction setup"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {
+    "kind": "lower_level_api",
+    "where": "pkg/management/postgres/wal.go:66, pkg/management/postgres/wal.go:132, pkg/management/postgres/instance.go:1009 (raw sql.Open(\"pgx\", ...) that never passes through pool.NewDBConnection/Enrich, so a defaults-only fix misses them); secondary: persisted SECURITY DEFINER function detection at internal/management/controller/instance_controller.go:810 (save_reload-style upgrade state)"
+  },
+  "O3_reason_to_dismiss": "The raw sql.Open sites only connect to the 'postgres' maintenance database as superuser to read pg_stat_archiver / probe availability, which a tenant does not own, so they look outside the tenant search_path threat; the pgbouncer function lives in the postgres DB and already reads pg_catalog.pg_shadow qualified, so a solver can argue it needs no SET clause and that already-deployed functions are not their concern.",
+  "O4_distance": {"files": 8, "packages": 5, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "User-authored postInit*/post-import SQL and operator CREATE EXTENSION without SCHEMA must still resolve into \"$user\", public (a pg_catalog-first pin makes CREATE EXTENSION target pg_catalog and fail); PgBouncer admin connections must NOT carry a search_path startup parameter or PgBouncer rejects them; the session-level SET used for user SQL must be RESET before the pooled connection is reused.",
+    "where": "pkg/management/postgres/initdb.go:433-441; pkg/management/postgres/logicalimport/database.go:291; internal/management/controller/database_controller_sql.go:279; internal/management/controller/instance_controller.go:739; pkg/management/postgres/pool/profiles.go:69-76"
+  },
+  "O6_input_shapes": [
+    "tenant search_path set via ALTER DATABASE ... SET search_path",
+    "tenant search_path set via ALTER ROLE ... SET search_path",
+    "implicit pg_temp-first resolution when pg_temp is not listed (fixed by listing pg_temp last)",
+    "shadowed operator (e.g. =(name,name)) vs shadowed function/relation/type",
+    "SECURITY DEFINER function body resolved under caller's search_path"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "pkg/management/postgres/pool/profiles.go:78-87 (fillDefaultParameters builds the startup-packet RuntimeParams for every pooled connection); the persisted user_search function at internal/management/controller/instance_controller.go:810-824 is a second producer of resolved state across upgrades",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/management/postgres/wal.go:66", "sibling": "another health/readiness probe opening sql.Open(\"pgx\", connInfo) directly against an application database", "why_realistic": "The pinned tree already has three such raw opens next to the pool helper; a maintainer adding a quick probe would copy this pattern."},
+    {"where": "internal/management/controller/instance_controller.go:818-824", "sibling": "a second operator-created SECURITY DEFINER helper (e.g. for the metrics exporter role or a role-sync lookup) created without SET search_path", "why_realistic": "reconcileMetricsExporterAuthUser right below (instance_controller.go:849) provisions a dedicated role; a lookup function for it would follow the user_search template."},
+    {"where": "pkg/management/postgres/metrics/collector.go:594-596", "sibling": "a per-target-database monitoring path that opens its own transaction without createMonitoringTx", "why_realistic": "Custom queries can target multiple databases; a separate tx setup for them is a plausible refactor."}
+  ],
+  "O9_family": "CWE-426 untrusted search path (PostgreSQL search_path / object shadowing, CVE-2018-1058 class)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.4 (go.mod:3), Ginkgo/Gomega unit tests with go-sqlmock",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "go-sqlmock unit tests: pkg/management/postgres/pool, pkg/management/postgres/metrics/collector_test.go, pkg/management/postgres/initdb_test.go, pkg/management/postgres/logicalimport/database_test.go, internal/management/controller/database_controller_sql_test.go; the e2e hijack test (tests/e2e/initdb_test.go) needs Kubernetes and is not usable offline"
+  },
+  "O11_fix_minutes": 60,
+  "O12_red_flags": ["many_fix_commits"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/management/postgres/pool/profiles.go, pkg/management/postgres/wal.go, pkg/management/postgres/instance.go, pkg/management/postgres/metrics/collector.go, pkg/management/postgres/initdb.go, pkg/management/postgres/logicalimport/database.go, internal/management/controller/instance_controller.go, internal/management/controller/database_controller_sql.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Harden only the monitoring transaction (collector.go:594) or add search_path to fillDefaultParameters for all profiles, missing the raw sql.Open sites and the persisted SECURITY DEFINER function, and breaking PgBouncer admin connections and CREATE EXTENSION/postInit SQL."
+  },
+  "out_of_scope_notes": [
+    "externalClusters connection parameters could carry an 'options=-c search_path=...' string; cluster-admin controlled, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "The six fix commits are three backports of one change (#10774) plus three release-manifest commits; many_fix_commits holds literally but the source change is one commit.",
+    "Exact count of tenant-reachable reconcilers sharing the pool was not enumerated; O1 counts distinct entry kinds (pooled reconcilers, metrics endpoint, Pooler auth function, replica WAL check, primary WAL bootstrap, WaitForPrimaryAvailable).",
+    "No uncovered route found: every other SQL connection at the pinned commit goes through pool.NewDBConnection (pool.go:114, join.go:43), so the defaults fix covers them; checked only sql.Open/pgx connect primitives in Go source.",
+    "recall_risk is an estimate; advisory published 2026-08-20."
+  ]
+}

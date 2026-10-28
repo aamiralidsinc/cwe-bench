@@ -1,0 +1,76 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "103251", "advisory_ids": ["GHSA-FG45-QCJM-JCJR", "CVE-2026-90780"], "repo": "sipp/sipp",
+  "pinned_commit": "c496186356b9089fc70b311607be4d2853809625",
+  "fix_commits": ["8ddfb43359703e665041a955543e07f504f80232"],
+  "trust_decision": {
+    "summary": "Header text taken from a peer-supplied SIP message is trusted to fit the fixed static buffer last_header[MAX_HEADER_LEN*10]; get_header() appends name, separators and content with unbounded sprintf, and nothing checks the size.",
+    "evidence": ["src/sip_parser.cpp:124", "src/sip_parser.cpp:168", "src/sip_parser.cpp:213", "src/sip_parser.cpp:215", "src/sip_parser.cpp:218", "include/sip_parser.hpp:26"]
+  },
+  "landing_point": {"where": "src/sip_parser.cpp:121", "why": "The summary says 'oversized SIP header content'. The only generic header extractor is get_header()/get_header_content() in the mini SIP parser, and it writes into the static last_header buffer."},
+  "fix_sites": [
+    {"where": "src/sip_parser.cpp:168", "entry_point": "received SIP message -> call::get_last_header() ([last_*] scenario keyword, content=false), src/call.cpp:1675 / src/call.cpp:4049", "module_kind": "core parser (shared library-style helper)"},
+    {"where": "src/sip_parser.cpp:213", "entry_point": "received SIP message with repeated headers (e.g. Via) -> get_header() concatenation; reached from call::process_incoming src/call.cpp:4655, src/call.cpp:5589", "module_kind": "core parser"},
+    {"where": "src/sip_parser.cpp:215", "entry_point": "same as above (', ' separator between repeated headers)", "module_kind": "core parser"},
+    {"where": "src/sip_parser.cpp:218", "entry_point": "received SIP message -> get_header_content() from call::process_incoming (src/call.cpp:5589, src/call.cpp:5602), call::extract_transaction (src/call.cpp:4433), socket trace (src/socket.cpp:1128), scenario Content-Length (src/scenario.cpp:852)", "module_kind": "core parser"},
+    {"where": "fix.diff:61", "entry_point": "truncated: label, the shared exit after truncation (not a separate route)", "module_kind": "core parser"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All published fix sites are in one function, get_header() in src/sip_parser.cpp:121-265. No second module is touched."},
+  "O3_reason_to_dismiss": "The advisory names get_header()'s last_header buffer. extract_transaction/extract_cseq_method in call.cpp copy into caller-owned buffers in another file, and get_first_line() handles the request/status line, not a 'header', and only runs under the -trace_shortmsg logging option. A solver can argue all of these are other buffers or features.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "get_header() must keep concatenating repeated headers (multiple Via / Record-Route, multiline folding) into one value, with name prefix when content=false. A fix that caps output at MAX_HEADER_LEN, returns empty on overflow, or stops after the first header breaks the [last_Via:] keyword and route-set computation. Callers (rr/contact/auth) already truncate with strncat to MAX_HEADER_LEN-1 and expect a non-empty prefix.",
+    "where": "src/sip_parser.cpp:201-218; src/sip_parser.cpp:656-670 (existing concatenation tests); src/call.cpp:5589-5590; src/call.cpp:5602-5604"
+  },
+  "O6_input_shapes": [
+    "single oversized header value (content=true)",
+    "many repeated headers whose concatenation exceeds the buffer (separator writes)",
+    "content=false path that prefixes the header name",
+    "compact header forms (v:, i:, m:, f:, t: ...) matched via internal_compact_header_name",
+    "folded multiline headers (continuation lines with space/tab)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Data comes straight from the received network message (src/socket.cpp:474 bufrcv[SIPP_MAX_MSG_SIZE]); there is no schema, serializer or cache between them.", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "call::extract_transaction copies the Via branch from get_header_content() (up to ~20 KB) into txn[MAX_HEADER_LEN] with no bound; reached for every received response", "where": "src/call.cpp:4446-4449", "reason_to_dismiss": "Different function, different file, and the caller owns the buffer. After the get_header fix the source is 'already truncated', but only to 20490 bytes, not 2049.", "distance": "src/call.cpp, a different file from the landing point; caller at src/call.cpp:5326, buffer at src/call.cpp:4613", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "call::extract_cseq_method copies the CSeq method up to CR/LF from the raw message into responsecseqmethod[65] with no bound", "where": "src/call.cpp:4418-4426", "reason_to_dismiss": "Does not go through get_header() at all and parses the raw message with strstr. It reads as a separate CSeq helper, not 'header content' extraction.", "distance": "src/call.cpp, a different file; buffer at src/call.cpp:4612, caller at src/call.cpp:5325", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "get_first_line copies the start line into a static last_header[MAX_HEADER_LEN*10] with no index bound; a received message can be up to SIPP_MAX_MSG_SIZE (65536)", "where": "src/sip_parser.cpp:318-338", "reason_to_dismiss": "Start line, not a header. It is reached only via the -trace_shortmsg logging option (src/socket.cpp:1128, src/socket.cpp:2223).", "distance": "same file as the landing point, sibling function sharing the same buffer size", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/call.cpp:1639-1655", "sibling": "get_header_field_code could copy the header content (not just the int) into static code[MAX_HEADER_LEN] with sprintf", "why_realistic": "It already uses an unbounded sprintf into a fixed static buffer, right next to get_header_content()."},
+    {"where": "src/call.cpp:4048-4052", "sibling": "the [last_*] keyword expansion already does an unbounded sprintf of get_last_header() output into msg_buffer; a header-copy helper writing into a fixed local could sit here", "why_realistic": "The same idiom (dest += sprintf(dest, \"%s\", ...)) is used throughout createSendingMessage."},
+    {"where": "src/sip_parser.cpp:343-368", "sibling": "a get_call_id-style extractor for another header (e.g. Contact URI) that omits the length check", "why_realistic": "get_call_id has an explicit length check. A copied helper that drops it is a plausible maintainer slip."}
+  ],
+  "O9_family": "memory-safety: fixed-size buffer overflow (CWE-120) on attacker-controlled SIP header text",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "C++",
+    "toolchain": "CMake + g++; needs OpenSSL (or wolfSSL), ncurses/tinfo, pkg-config. PCAP/SCTP are optional. Unit tests need GoogleTest: the gtest submodule is not populated at the pinned tree, so system libgtest-dev is required (CMakeLists.txt:283-313).",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "gtest unit tests are compiled into sipp_unittest with -DGTEST and are embedded at the bottom of src/sip_parser.cpp (src/sip_parser.cpp:550 onward, get_header tests at src/sip_parser.cpp:656-680). There is also a shell regression suite in regress/runtests."
+  },
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/sip_parser.cpp",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Replace the sprintf calls in get_header() with snprintf bounded by the remaining buffer and stop there. That leaves extract_transaction/extract_cseq_method in call.cpp and get_first_line open."
+  },
+  "out_of_scope_notes": [
+    "createSendingMessage expands [last_message] / [last_*] with unbounded sprintf into msg_buffer[SIPP_MAX_MSG_SIZE+2] (src/call.cpp:4051, src/call.cpp:4064). That is a different sink, not pursued.",
+    "Recent history (d913c75 get_peer_tag bound, 09916a9 auth) shows a series of similar bounding fixes in the same parser."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "present_in_latest is unknown for all O8 routes because no latest release was provided.",
+    "Advisory text beyond the summary was not available; the 'through 3.7.7' scope was not checked against tags.",
+    "Whether ASan-based hidden tests can reach extract_transaction/extract_cseq_method without a full call object was not checked; they are call:: members, so they may need test scaffolding."
+  ]
+}

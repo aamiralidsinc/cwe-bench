@@ -1,0 +1,61 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82327", "advisory_ids": ["GHSA-36W2-FFQW-GX86", "CVE-2026-108821"], "repo": "tencent/weknora",
+  "pinned_commit": "2bc1261b87636c8ed4fddf9aabb4b998ba424cd9",
+  "fix_commits": ["d7ccd5ba517cc3968e6d5000a2ab0f4b51ef1dda", "3e8b0bfc80b845b2d4b2ed683994748741450a97"],
+  "trust_decision": {
+    "summary": "Whether LLM/agent-supplied SQL is a read-only SELECT that touches only allowlisted tables and only safe functions (and, for the Postgres tool, gets tenant/soft-delete/scope predicates on every table scope) is decided by the pg_query AST validator ValidateSQL/ValidateAndSecureSQL in internal/utils/inject.go, configured per caller in internal/agent/tools.",
+    "evidence": ["internal/utils/inject.go:694-845", "internal/utils/inject.go:849-904", "internal/utils/inject.go:1343-1414", "internal/agent/tools/data_analysis.go:258-262", "internal/agent/tools/database_query.go:257-265"]
+  },
+  "landing_point": {"where": "internal/utils/inject.go:1483", "why": "The advisory summary names inject.go validateSubquery; it recurses into FROM subqueries but skips WithClause, Op (UNION), SortClause/Limit, and its tables never reach the allowlist."},
+  "fix_sites": [
+    {"where": "internal/utils/inject.go:787-831", "entry_point": "agent tool data_analysis (DuckDB) and database_query via ValidateSQL; chat pipeline DataAnalysis plugin", "module_kind": "core validator (shared util)"},
+    {"where": "internal/utils/inject.go:877-903", "entry_point": "agent tool database_query via ValidateAndSecureSQL (internal/agent/tools/database_query.go:257)", "module_kind": "SQL rewriter / tenant-filter injection"},
+    {"where": "internal/utils/inject.go:955-989", "entry_point": "exported utils.InjectAndConditions, called by every inject*Conditions helper (internal/utils/inject.go:1014)", "module_kind": "lower-level text rewriting API"},
+    {"where": "internal/agent/tools/data_analysis.go:240-262", "entry_point": "agent tool data_analysis registered at internal/application/service/agent_service.go:1084; chat pipeline at internal/application/service/chat_pipeline/data_analysis.go:92,137", "module_kind": "caller wrapper (read-only prefix gate + validator option set)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "internal/agent/tools/data_analysis.go:241-262 (accepts SHOW/DESCRIBE/EXPLAIN/PRAGMA prefixes and calls ValidateSQL without WithSelectOnly, so a non-SELECT statement skips all AST checks at internal/utils/inject.go:775,798)"},
+  "O3_reason_to_dismiss": "The report points at validateSubquery in the shared validator; the DuckDB tool's prefix allowlist and missing WithSelectOnly look like deliberate caller-side product choices (SHOW/DESCRIBE/EXPLAIN are 'read-only'), not part of the subquery bug.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "FROM subqueries over the allowed table must stay valid in the DuckDB tool (fix test requires it), JOINs of knowledge tables with aliases must get per-alias tenant predicates, and string literals/quoted aliases containing WHERE/ORDER BY must remain legal; a fix that bans subqueries or rejects keywords in text breaks these.", "where": "fix.diff:3254-3256; fix.diff:3259-3279; internal/agent/tools/data_analysis.go:258-262"},
+  "O6_input_shapes": [
+    "FROM subquery hiding a CTE (WITH) body",
+    "FROM subquery with UNION branch",
+    "FROM subquery over a non-allowlisted table",
+    "scalar subquery (SubLink) in target list",
+    "subquery in LIMIT clause",
+    "quoted mixed-case table name (\"ALLOWED\")",
+    "catalog/schema-qualified table",
+    "non-SELECT statements via EXPLAIN/SHOW/DESCRIBE/PRAGMA prefix",
+    "string literal or quoted alias containing WHERE/ORDER BY/LIMIT (text-regex predicate injection)",
+    "self-JOIN needing predicates on both aliases"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "internal/utils/inject.go:884-901 (pg_query.Deparse then regex-based InjectAndConditions at internal/utils/inject.go:955-989 produce the executed SQL)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "internal/agent/tools/data_analysis.go:273", "sibling": "DuckDB executes the original text validated only by the Postgres grammar; a DuckDB-only construct (dialect differential) could be planted or exists", "why_realistic": "Maintainers reuse a Postgres parser as a generic SQL checker for DuckDB; the fix keeps executing input.Sql rather than the validated AST."},
+    {"where": "internal/application/service/agent_service.go:1070", "sibling": "a second agent SQL tool (e.g. a lite-mode SQLite query tool) calling ValidateSQL with a hand-picked option list that omits WithSelectOnly or WithNoSubqueries", "why_realistic": "Options are opt-in per caller (internal/utils/inject.go:438-575); DB_DRIVER=sqlite is supported (internal/container/container.go:706-720)."},
+    {"where": "internal/utils/inject.go:404-407", "sibling": "a separate table-name extractor (used for allowlist/metadata) that ignores RangeSubselect, mirroring extractTableNamesFromNode", "why_realistic": "The pinned code already has this pattern with a 'could recursively parse' comment."}
+  ],
+  "O9_family": "SQL injection / query-validator bypass (CWE-89/CWE-74): incomplete AST validation and text-based predicate rewriting of untrusted SQL", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "Go 1.26 with cgo (pg_query_go v6.2.2, duckdb-go v2 bindings)", "services": [], "offline_after_build": true,
+                "project_tests": "internal/utils/inject_test.go (ValidateSQL, InjectAndConditions, ValidateAndSecureSQL tests); fix adds internal/utils/query_and_redirect_boundaries_test.go"},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "internal/utils/inject.go, internal/agent/tools/data_analysis.go", "j_sibling_sites": "unknown",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add WithClause/Op checks inside validateSubquery only, leaving subquery tables off the allowlist, SubLink/LIMIT bodies unwalked, regex InjectAndConditions and the DuckDB prefix gate unchanged."},
+  "out_of_scope_notes": [
+    "Fix commit d7ccd5ba is a bundled hardening commit: SSRF redirect handling (internal/utils/security.go, doris/streamload.go, docreader), IM channel transports, MCP OAuth redirects, presign signing key, desktop auth, embed sessions, chat special tokens; none are part of this SQL advisory.",
+    "Chat-pipeline DataAnalysis plugin constructs DataAnalysisTool without scope enforcement (internal/application/service/chat_pipeline/data_analysis.go:92); authorization, not SQL validation."
+  ],
+  "unverified": [
+    "Second fix commit 3e8b0bfc is not in the provided diff; its contents are unknown.",
+    "Whether a DuckDB-only syntax passes pg_query validation and reaches a forbidden table/function at internal/agent/tools/data_analysis.go:273 was not checked (no execution allowed).",
+    "Repo size in MB unknown (no shell).",
+    "Latest release is none, so present_in_latest cannot be assessed."
+  ]
+}

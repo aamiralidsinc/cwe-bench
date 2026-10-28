@@ -1,0 +1,88 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "80608", "advisory_ids": ["GHSA-CV8H-J5CX-FG4F", "CVE-2026-10043"], "repo": "mosaicml/composer",
+  "pinned_commit": "26a0f3114c366ba43afd26f3048aafe5f0c61d15",
+  "fix_commits": ["6405188805a0054b4551ec49e4919c54c971d0e8"],
+  "trust_decision": {
+    "summary": "Composer decides that checkpoint bytes loaded from a user-given path or URI can be fully unpickled: the monolithic torch checkpoint loader passes weights_only=False and the resumption-state loader calls raw pickle.load, so no allowlist of globals is ever applied.",
+    "evidence": ["composer/utils/checkpoint.py:111-118", "composer/checkpoint/load.py:632-641", "fix.diff:46-61", "fix.diff:153-158"]
+  },
+  "landing_point": {
+    "where": "composer/utils/checkpoint.py:118",
+    "why": "The summary names checkpoint deserialization. The single torch.load(..., weights_only=False) call in the central helper is the first thing a grep for torch.load/pickle.load finds, and the Trainer load_path flow reaches it through safe_torch_load."
+  },
+  "fix_sites": [
+    {"where": "composer/utils/checkpoint.py:118", "entry_point": "Trainer(load_path=..., autoresume=...) -> composer/trainer/trainer.py:1715 checkpoint.load_checkpoint -> safe_torch_load (composer/utils/checkpoint.py:928); also composer.utils.load_checkpoint, LoadCheckpoint callback (composer/callbacks/load_checkpoint.py:64)", "module_kind": "core checkpoint utility (central torch.load helper)"},
+    {"where": "composer/utils/checkpoint.py:907", "entry_point": "safe_torch_load(load_monolith_rank0_only=True), the monolith FSDP rank-0 path, via the same helper; covered implicitly by the helper change", "module_kind": "core checkpoint utility"},
+    {"where": "composer/utils/checkpoint.py:937-946", "entry_point": "safe_torch_load error handling (the fix adds an 'Unsupported global' -> load_ignore_keys message, fix.diff:166-174)", "module_kind": "core checkpoint utility (compat / error path)"},
+    {"where": "composer/checkpoint/load.py:318", "entry_point": "composer.checkpoint.load_model_checkpoint / load_checkpoint (new checkpoint API, unsharded model) via _torch_load_with_validation", "module_kind": "second public checkpoint API package (composer/checkpoint)"},
+    {"where": "composer/checkpoint/load.py:439", "entry_point": "composer.checkpoint.load_optim_checkpoint (unsharded optim) via _torch_load_with_validation", "module_kind": "second public checkpoint API package"},
+    {"where": "composer/checkpoint/load.py:641", "entry_point": "composer.checkpoint.load_checkpoint(load_options={'load_resumption_state': True}) -> load_resumption_checkpoint (composer/checkpoint/load.py:133-136); load_resumption_checkpoint is itself public", "module_kind": "separate raw-pickle format (resumption.pkl) in the new checkpoint API"}
+  ],
+  "O1_entry_points": 8,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "composer/checkpoint/load.py:641 (resumption.pkl raw pickle.load, written by composer/checkpoint/save.py:283), in the newer composer/checkpoint package, separate from the Trainer's composer/utils/checkpoint.py loader"},
+  "O3_reason_to_dismiss": "resumption.pkl is a plain-pickle side file of the newer, less-used composer.checkpoint API rather than a torch checkpoint, and loading it is opt-in (load_resumption_state defaults to False, composer/checkpoint/load.py:70); for the sharded dist_cp routes (O8), unpickling happens inside PyTorch's torch.distributed.checkpoint FileSystemReader/DefaultLoadPlanner, so a solver can call it 'upstream PyTorch, not Composer'.",
+  "O4_distance": {"files": 2, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate full Trainer checkpoints and resumption files hold non-tensor objects: timedelta in timestamp, numpy RNG state (ndarray/dtype/_reconstruct), python random state, TorchVersion in metadata, plus scheduler/callback/algorithm state dicts. A blanket weights_only=True or an over-tight allowlist breaks resuming; the fix adds explicit safe globals and a load_ignore_keys hint for older metric objects.",
+    "where": "composer/checkpoint/state_dict.py:187-215; fix.diff:22-38; fix.diff:109-135; fix.diff:166-174"
+  },
+  "O6_input_shapes": [
+    "monolithic torch .pt checkpoint (zip/torch.save format) via torch.load",
+    "raw pickle resumption.pkl via pickle.Unpickler",
+    "pickle that embeds torch storage bytes (torch.storage._load_from_bytes nested torch.load), redirected to a weights_only load (fix.diff:41-43, fix.diff:54-55)",
+    "numpy 1.x vs 2.x module names for _reconstruct (numpy.core vs numpy._core) and numpy.dtypes subclasses (fix.diff:116-135)"
+  ],
+  "O7_producer": {"kind": "serializer", "where": "composer/checkpoint/state_dict.py:172-217 get_resumption_state_dict and composer/checkpoint/save.py:280-283 (pickle.dump); the Trainer state_dict for .pt files", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Sharded (dist_cp) Trainer load: FileSystemReaderWithValidation.read_metadata delegates to torch dist_cp FileSystemReader.read_metadata, which unpickles .metadata; no allowlist is applied and the fix does not touch it",
+     "where": "composer/utils/checkpoint.py:191-199",
+     "reason_to_dismiss": "the unpickling is inside PyTorch's dist_cp reader, and sharded loading requires FSDP; the Composer code only 'validates'",
+     "distance": "same file as landing point, different class (~70 lines up); reached from load_sharded_checkpoint composer/utils/checkpoint.py:643-651",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Object-store sharded download: DistCPObjectStoreReader downloads .metadata and shards from a URI, then reads them through the same inherited read_metadata/read_data",
+     "where": "composer/utils/checkpoint.py:221-254",
+     "reason_to_dismiss": "remote/object-store transport, seen as a download concern rather than deserialization",
+     "distance": "same file; reached via composer/utils/checkpoint.py:636 and composer/checkpoint/load.py:607",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Sharded non-tensor items (rng, timestamp, etc.) go through dist_cp.load with the DefaultLoadPlanner or a user load_planner; byte items are deserialized by the planner, with no Composer allowlist",
+     "where": "composer/utils/checkpoint.py:557-599",
+     "reason_to_dismiss": "planner behaviour belongs to PyTorch, and a user-provided load_planner is a neighbouring feature",
+     "distance": "same file; also composer/checkpoint/load.py:628 DCP.load in the new API package",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "New-API sharded model/optim load (composer.checkpoint.load_model_checkpoint with sharded_checkpoint=True) reads metadata via FileSystemReaderWithValidation without any restriction",
+     "where": "composer/checkpoint/load.py:585-629",
+     "reason_to_dismiss": "sharded path in the newer API, 'TODO: Auto-detect sharded', FSDP-only",
+     "distance": "second package (composer/checkpoint) from the landing point",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "composer/models/huggingface.py:479", "sibling": "hf_from_composer_checkpoint loading the composer state with its own torch.load instead of safe_torch_load", "why_realistic": "HF conversion helpers often re-implement loading to avoid the Trainer's dist/broadcast logic; at present it delegates to safe_torch_load."},
+    {"where": "composer/utils/inference.py:193", "sibling": "export_for_inference reading a raw state dict directly for an ONNX/torchscript export", "why_realistic": "export is a standalone utility whose maintainer could plausibly bypass the Trainer helper."},
+    {"where": "composer/checkpoint/load.py:632-641", "sibling": "a second pickle-format side file (e.g. dataset/callback state) loaded with pickle.load next to resumption.pkl", "why_realistic": "the newer API already writes resumption state as plain pickle (composer/checkpoint/save.py:283), so a similar side file fits the existing idiom."}
+  ],
+  "O9_family": "CWE-502 deserialization of untrusted data (pickle / torch.load weights_only=False)", "O9_dos": false,
+  "O10_build": {"language": "Python", "toolchain": "pip install -e . (setup.py: python>=3.10, torch>=2.6.0,<2.7.1, numpy<2.3.0, torchmetrics)", "services": [],
+                "offline_after_build": true,
+                "project_tests": "tests/checkpoint/test_load.py (the new API; the fix adds tests here), tests/trainer/test_checkpoint.py (Trainer load paths); sharded tests mostly need FSDP/multi-GPU"},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "composer/checkpoint/load.py, composer/utils/checkpoint.py", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Flip weights_only=False to True in _torch_load_with_validation and stop, which leaves resumption.pkl raw pickle.load and the sharded dist_cp metadata/bytes routes open and breaks resume for checkpoints holding timedelta/numpy RNG state."},
+  "out_of_scope_notes": [
+    "composer/utils/dist.py:79-97 HPU all_gather path unpickles bytes received from peer ranks (inter-rank channel, a different trust boundary).",
+    "composer/utils/checkpoint.py:917 broadcast_object_list pickles state between ranks after the rank-0 load (inter-rank).",
+    "download_checkpoint (composer/utils/checkpoint.py:723) extracts tar archives; possible path-traversal concern, a separate weakness."
+  ],
+  "unverified": [
+    "That torch 2.6.x dist_cp FileSystemReader.read_metadata uses pickle.load and that DefaultLoadPlanner.load_bytes uses torch.load(weights_only=False): torch sources are not in the pinned tree, so the O8 sinks rest on PyTorch internals.",
+    "repo_mb: could not measure (no shell).",
+    "Whether sharded routes can be exercised on CPU-only with a single process (FileSystemReader.read_metadata likely can; load_sharded_checkpoint requires an FSDP config).",
+    "present_in_latest for all O8 routes: no latest release given.",
+    "Docs warn 'Do not load checkpoints from untrusted sources' (docs/source/trainer/checkpointing.rst:579-581). This is the opposite of a protection documented without exceptions, but it could weaken the fairness of requiring the sharded routes.",
+    "Recall risk: a CVSS 10 CVE on a popular ML library is probably widely indexed; the extent of write-ups was not checked."
+  ]
+}

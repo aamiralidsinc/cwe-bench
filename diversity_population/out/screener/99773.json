@@ -1,0 +1,78 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "99773",
+  "advisory_ids": ["GHSA-599V-36J6-3RJ2", "CVE-2026-77798"],
+  "repo": "velocidex/velociraptor",
+  "pinned_commit": "beaf975bccbe33fab85ee19acfeb35b97f6ac2ce",
+  "fix_commits": ["c0c9dd609140139efcb37c47e2afa79ed57e6c84", "b64d915422da2e8366781bea2b5c5e6808df829c"],
+  "trust_decision": {
+    "summary": "The user storage manager decides whether a message's target user exists in its in-memory cache while holding the shared user-cache mutex; on the not-found branch it returns without releasing the mutex, so one authenticated user_message() call for an unknown user deadlocks every later user lookup (auth, options, listing). The CWE-833 fix is the added Unlock on that branch.",
+    "evidence": [
+      "services/users/storage.go:760-765",
+      "fix.diff:1676-1681",
+      "services/users/storage.go:191-194",
+      "vql/server/users/message.go:54-56"
+    ]
+  },
+  "landing_point": {
+    "where": "services/users/storage.go:760",
+    "why": "An authenticated-DoS / deadlock advisory leads straight to the user manager's mutex. The bundled test (fix.diff:1364-1366) sends a message to an unknown user, which points at the Message branch of handleMessageEvent."
+  },
+  "fix_sites": [
+    {"where": "services/users/storage.go:763-765", "entry_point": "VQL function user_message() (vql/server/users/message.go:56) -> UserManager.MessageUser (services/users/users.go:189-195) -> WriteUserMessage -> sendMutation -> handleMessageEvent (master short-circuit, services/users/storage.go:281-282)", "module_kind": "service (user storage cache)"},
+    {"where": "services/users/storage.go:803-804", "entry_point": "Journal queue Server.Internal.UserManager watcher (messages pushed by minion frontends, services/users/storage.go:290-291) -> handleMessageEvent; same branch, not a separate edit", "module_kind": "internal journal callback"},
+    {"where": "services/users/storage.go:586-589", "entry_point": "SetUserOptions mutation now sends the original-case username instead of the lower-case key (fix.diff:1661-1662); consistency fix, not the deadlock", "module_kind": "service (user storage cache)"},
+    {"where": "services/client_monitoring/client_monitoring.go:124-133", "entry_point": "SetClientMonitoringState (GUI/API client event table, VQL set_client_monitoring); bundled permission fix and lock-scope change (fix.diff:233-249), a different weakness from the DoS", "module_kind": "service (client monitoring)"},
+    {"where": "services/client_monitoring/client_monitoring.go:163-169", "entry_point": "compileArtifactCollectorArgs uses NullACLManager; bundled permission fix (fix.diff:264-268), not DoS", "module_kind": "service (client monitoring)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": "The deadlock fix is one branch in one function (services/users/storage.go:763-765). The other diff hunks (client_monitoring ACLs, ttlcache SetTTL, notebook template escaping, OrgId header matcher, hunt CompiledCollectorArgs) are separate bundled bugfixes, not other routes into this sink."},
+  "O3_reason_to_dismiss": "MessageAllUsers only messages users it just listed from the cache, so a solver can argue the not-found branch is unreachable from there. That holds unless a concurrent delete or BuildCache swap removes the user between the list and the message.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Messaging an existing user must still increment gui_options.Messages under the lock and append to the notifications result set. Messaging a user without gui_options must lazily create them. Self-originated Update mutations must stay skipped while SetUser/DeleteUser hold the lock (re-entrant path on master).",
+    "where": "services/users/storage.go:766-780; services/users/storage.go:214-215 with services/users/storage.go:261-264 and services/users/storage.go:717-720"
+  },
+  "O6_input_shapes": [
+    "user_message(user=<name not in cache>) on the master, via the direct short-circuit",
+    "the same Message event arriving through the USER_MANAGER journal from a minion",
+    "cache entry present but user_record nil (same condition !pres || cache.user_record == nil)"
+  ],
+  "O7_producer": {"kind": "cache", "where": "services/users/storage.go:393-439 (BuildCache rebuilds and swaps self.cache periodically, services/users/storage.go:818-833) and services/users/storage.go:653-674 (DeleteUser removes entries)", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "MessageAllUsers lists users and then messages each one; a user deleted, or dropped by a BuildCache swap, between the list and the message hits the same lock-leaking branch (check-then-use)",
+     "where": "services/users.go:170-188",
+     "reason_to_dismiss": "Users come from the cache itself, so they 'always exist'. This route also goes through the single fixed branch, so the published fix covers it too.",
+     "distance": "different package (services vs services/users); callers in datastore/filebased_supported.go:89 and services/sanity/lockdown.go:62",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "services/users/storage.go:144-162", "sibling": "SetUserStats with a manual Lock/Unlock and an early not-found return, instead of defer", "why_realistic": "It has the same lookup shape as the Message branch (cache[key], !pres || user_record == nil). A maintainer moving the datastore write out of the critical section would plausibly drop the defer."},
+    {"where": "services/users/tracker.go:31-56", "sibling": "WriteProfile holds self.mu across org/policy lookups; an early return on GetOrgConfig/GetPolicy error, instead of continue, would leak the lock", "why_realistic": "Manual Lock/Unlock around a loop is already the idiom here; changing continue to return is a one-word edit."},
+    {"where": "services/users/storage.go:596-606", "sibling": "GetUserOptions rewritten with manual unlock and a not-found return", "why_realistic": "It has the same cache lookup and not-found error as the fixed branch."}
+  ],
+  "O9_family": "concurrency: lock not released on an error path (CWE-833 deadlock), leading to authenticated denial of service",
+  "O9_dos": true,
+  "O10_build": {"language": "Go", "toolchain": "go 1.25.3 (go.mod:413), make/go run make.go; GUI is a separate node build not needed for Go tests", "services": [], "offline_after_build": true,
+                "project_tests": "services/users/*_test.go (users_test.go, set_user_test.go, delete_test.go, get_test.go, ...); golden VQL test artifacts/testdata/server/testcases/user_messages.in.yaml"},
+  "O11_fix_minutes": 10,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "services/users/storage.go (deadlock); bundled: services/client_monitoring/client_monitoring.go, services/launcher/acls.go, services/launcher/launcher.go, services/notebook/backup.go, services/notebook/notebook.go, services/hunt_dispatcher/hunt_dispatcher.go, services/users/grpc.go, api/proxy.go, vql/golang/verify.go, vql/server/hunts/create.go, vql/server/users/create.go, vql/sigma/sigma.go, plus ttlcache SetTTL in crypto/client/client.go, datastore/memcache.go, datastore/memcache_data.go, services/labels/labels.go, utils/logger.go, vql/common/lru.go, vql/functions/log.go, vql/readers/paged.go",
+        "j_sibling_sites": "no", "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add self.mu.Unlock() before the not-found return (or convert to defer). This is in fact the complete fix, so there is no scope trap."},
+  "out_of_scope_notes": [
+    "user_message() has no ACL check: the comment at vql/server/users/message.go:30 says the users module checks ACLs, but MessageUser (services/users/users.go:189-195) checks none.",
+    "Client monitoring compiled event artifacts with NullACLManager at the pinned commit (services/client_monitoring/client_monitoring.go:163-164). This is a separate permission-bypass fix bundled in c0c9dd60 and could be screened as its own host.",
+    "Notebook backup restore rendered cell.Input as a template (fix.diff:963-967), a separate template-injection fix bundled in c0c9dd60.",
+    "hunt_dispatcher let callers supply CompiledCollectorArgs (fix.diff:1585-1597), a separate bundled fix in b64d9154."
+  ],
+  "unverified": [
+    "Repo size in MB was not measured.",
+    "Whether MessageAllUsers can reach a missing user in practice (race with DeleteUser / BuildCache) was reasoned from code, not exercised.",
+    "Lock-leak search across the whole tree was limited to services/users and a sampled regex over services/; other packages were not exhaustively checked.",
+    "Whether the advisory text covers the bundled client-monitoring or ttlcache changes is unknown; the advisory body was not available, only the summary and diff.",
+    "present_in_latest is unknown (no latest release provided)."
+  ]
+}

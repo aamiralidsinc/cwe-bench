@@ -1,0 +1,57 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "81244", "advisory_ids": ["GHSA-PW7Q-9788-X566", "CVE-2026-103484"], "repo": "pgvector/pgvector",
+  "pinned_commit": "70fb225dc0b9a6abb9aa05508a1f770dd1b05a23",
+  "fix_commits": ["f37c13f68b57d2c3472b2214fbcff699d6d34876", "ee00d39ab30c2a7cf9510abf9288c624d91db156"],
+  "trust_decision": {
+    "summary": "Index code trusts that every indexed/query value has the dimension recorded for the index (column atttypmod at build, metapage dimensions afterwards); fixed-size k-means buffers are sized from that dimension while per-type sumCenter loops trust the value's own dim header, and VectorArraySet only rejects values larger than itemsize, so smaller/mismatched values are accepted.",
+    "evidence": ["src/ivfbuild.c:346", "src/ivfbuild.c:392", "src/ivfflat.h:333-342", "src/ivfutils.c:341-348", "src/ivfutils.c:363-368", "src/ivfkmeans.c:152-159"]
+  },
+  "landing_point": {"where": "src/ivfbuild.c:57-102", "why": "Summary says 'buffer overflow in IVFFlat index build'; AddSample copies sampled values into the fixed-itemsize VectorArray that k-means then sums into per-center rows."},
+  "fix_sites": [
+    {"where": "src/ivfbuild.c:63", "entry_point": "CREATE INDEX ... USING ivfflat (sampling phase, AddSample)", "module_kind": "index build (primary)"},
+    {"where": "src/ivfbuild.c:171-180", "entry_point": "CREATE INDEX ... USING ivfflat, serial and parallel workers (AddTupleToSort via BuildCallback, src/ivfbuild.c:685, src/ivfbuild.c:1006)", "module_kind": "index build (assignment phase)"},
+    {"where": "src/ivfutils.c:341-368", "entry_point": "CREATE INDEX ... USING ivfflat (k-means SumCenters/CheckElements -> typeInfo->sumCenter)", "module_kind": "per-type support callbacks (vector/halfvec/bit) in utils module"},
+    {"where": "src/ivfkmeans.c:158", "entry_point": "CREATE INDEX ... USING ivfflat (k-means SumCenters)", "module_kind": "k-means internals"},
+    {"where": "src/ivfkmeans.c:501", "entry_point": "CREATE INDEX ... USING ivfflat (k-means CheckElements)", "module_kind": "k-means internals"},
+    {"where": "src/ivfutils.c:109-111", "entry_point": "CREATE INDEX ... USING ivfflat with cosine/inner-product opclass (IvfflatNormVectors on samples/centers)", "module_kind": "normalisation helper (hardening)"},
+    {"where": "src/ivfinsert.c:103", "entry_point": "INSERT/UPDATE on a table with an ivfflat index (ivfflatinsert -> InsertTuple)", "module_kind": "index insert"},
+    {"where": "src/ivfscan.c:212-230", "entry_point": "SELECT ... ORDER BY col <op> query using ivfflat (GetScanValue)", "module_kind": "index scan"},
+    {"where": "src/hnswbuild.c:500", "entry_point": "CREATE INDEX ... USING hnsw (in-memory build InsertTuple)", "module_kind": "second implementation (HNSW access method), hardening"},
+    {"where": "src/hnswinsert.c:713", "entry_point": "INSERT/UPDATE on a table with an hnsw index, and HNSW build on-disk fallback (HnswInsertTupleOnDisk)", "module_kind": "second implementation (HNSW), hardening"},
+    {"where": "src/hnswscan.c:39", "entry_point": "SELECT ... ORDER BY using hnsw (GetScanItems)", "module_kind": "second implementation (HNSW), hardening"},
+    {"where": "src/hnswutils.c:408-429", "entry_point": "all HNSW value paths (HnswTypeInfo gains .dimensions; HnswGetMetaPageInfo gains dimensions out-param; fix.diff:354-406)", "module_kind": "shared HNSW utils / type-info table"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "src/hnswbuild.c:500, src/hnswinsert.c:713, src/hnswscan.c:39 (HNSW access method, hardened in the same commit fix.diff:212-310)"},
+  "O3_reason_to_dismiss": "Advisory and changelog say IVFFlat build only; HNSW stores each value with VARSIZE-sized allocations (src/hnswbuild.c:504) rather than fixed-dim arrays, so a solver can argue HNSW has no overflow and needs no dimension check; likewise insert/scan can be argued safe because built-in distance functions already reject mismatched dims (src/vector.c:71-76).",
+  "O4_distance": {"files": 9, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "NULL query values in scans must keep working (ZeroDistance path; HNSW fix guards the check with value != NULL) and zero vectors under cosine/IP opclasses must still be silently skipped by IvfflatCheckNorm rather than raising; an unconditional dim check before these guards or on a NULL datum would break them.", "where": "src/ivfscan.c:207-211, src/ivfbuild.c:69-73, src/ivfinsert.c:92-100"},
+  "O6_input_shapes": ["vector (vector_dims)", "halfvec (halfvec_vector_dims)", "bit (core bitlength; VARBITLEN-based loop)", "sparsevec (HNSW only; new sparsevec_vector_dims, fix.diff:677-684)", "values after normalisation (checked post-IvfflatNormValue / HnswNormValue)", "NULL scan query (skipped)"],
+  "O7_producer": {"kind": "schema", "where": "src/ivfbuild.c:346 (dimensions taken from index tupdesc atttypmod) and src/ivfbuild.c:500 (persisted to metapage, read back at src/ivfscan.c:266 and in insert)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/ivfbuild.c:537", "sibling": "CreateListPages memcpy of each center by its own VARSIZE into a list item sized from itemsize", "why_realistic": "Same 'trust the value header' copy pattern as VectorArraySet; a maintainer copying centers would naturally use VARSIZE_ANY."},
+    {"where": "src/ivfbuild.c:674", "sibling": "Parallel worker rebuilds centers VectorArray from shared memory using leader's itemsize/maxlen", "why_realistic": "Serialization boundary between leader and worker; a variant that sizes from worker-side dimensions or value headers is a plausible maintainer change."},
+    {"where": "src/ivfkmeans.c:180-230", "sibling": "ComputeNewCenters/spherical update loops that could be made to iterate by a sample's own dim instead of newCenters->dim", "why_realistic": "Same how-type mismatch (buffer stride from index dim, loop bound from value header) as the sumCenter callbacks."},
+    {"where": "src/hnswbuild.c:504", "sibling": "HNSW in-memory build copying value into a graph slot sized from index dimensions instead of VARSIZE", "why_realistic": "Second implementation already present; switching to fixed-size slots for memory accounting is a realistic optimisation."}
+  ],
+  "O9_family": "memory safety (native): out-of-bounds write from untrusted per-value dimension vs index dimension (CWE-787/CWE-1284)", "O9_dos": false,
+  "O10_build": {"language": "C", "toolchain": "PGXS make against PostgreSQL 13+ server headers (Makefile)", "services": ["PostgreSQL server (extension loaded into postgres)"], "offline_after_build": true,
+                "project_tests": "pg_regress: test/sql/ivfflat_vector.sql, test/sql/ivfflat_halfvec.sql, test/sql/ivfflat_bit.sql (+ hnsw_*); fix diff adds no tests"},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": ["tiny_repo"],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/ivfbuild.c, src/ivfinsert.c, src/ivfscan.c, src/ivfkmeans.c, src/ivfutils.c, src/ivfflat.h, src/hnsw.c, src/hnsw.h, src/hnswbuild.c, src/hnswinsert.c, src/hnswscan.c, src/hnswutils.c, src/hnswvacuum.c, src/sparsevec.c", "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Clamp the sumCenter loops to the array's dim (or tighten VectorArraySet to require size == itemsize) and stop, leaving insert, scan and HNSW without a dimension check."},
+  "out_of_scope_notes": [],
+  "unverified": [
+    "Exact SQL route by which a value whose dimension differs from the index atttypmod reaches the build was not determined; built-in casts/input enforce typmod (src/vector.c:83-88) and distance procs reject mismatches (src/vector.c:71-76), so the trigger likely involves a non-default opclass/support proc or expression index; not confirmed.",
+    "j_defence_ineffective=1 rests on VectorArraySet's size check (src/ivfflat.h:337-339) accepting undersized values; whether that was the actual bypass is not confirmed.",
+    "repo_mb not measured; tiny_repo inferred from 27 files under src/ (no du run).",
+    "present_in_latest not applicable (no latest release given; O8 empty).",
+    "TAP tests under test/t not inspected."
+  ]
+}

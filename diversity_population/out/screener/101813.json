@@ -1,0 +1,107 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "101813", "advisory_ids": ["CVE-2026-86836"], "repo": "eclipse-ankaios/ankaios",
+  "pinned_commit": "4f100c4b7c1cf4fa3f374b15984adc8f98cc1c83",
+  "fix_commits": ["3f7ab7f148e814c57cb7de1e2bb11b9a05b7814b"],
+  "trust_decision": {
+    "summary": "The agent decides whether a pre-existing object on its predictable run-folder path (base run dir, <agent>_io dir, per-workload control_interface dir, input/output FIFOs, workload files dir/file) may be reused; at the pinned commit it reuses anything that exists (exists()/is_fifo() only) and even chmods the default base dir 0777.",
+    "evidence": [
+      "agent/src/io_utils/dir_utils.rs:47-57",
+      "agent/src/io_utils/directory.rs:27-36",
+      "agent/src/control_interface/fifo.rs:27-37",
+      "agent/src/workload_files/workload_files_creator.rs:149-158",
+      "agent/src/workload_files/workload_files_creator.rs:165-191"
+    ]
+  },
+  "landing_point": {
+    "where": "agent/src/control_interface/fifo.rs:28",
+    "why": "The summary names Control Interface FIFOs under a predictable path; Fifo::new is where an existing FIFO is silently reused ('Reusing existing fifo file')."
+  },
+  "fix_sites": [
+    {"where": "agent/src/control_interface/fifo.rs:28", "entry_point": "Workload with controlInterfaceAccess deployed via server manifest / `ank apply` -> RuntimeFacade create/resume/update -> ControlInterface::new -> InputOutput::new -> Fifo::new", "module_kind": "control-interface FIFO wrapper (agent crate)"},
+    {"where": "agent/src/io_utils/directory.rs:27-36", "entry_point": "Agent startup (agent_io dir) and every ControlInterface::new (per-workload control_interface dir via agent/src/control_interface/input_output.rs:35)", "module_kind": "low-level io_utils Directory helper shared by startup and control interface"},
+    {"where": "agent/src/io_utils/dir_utils.rs:47-55", "entry_point": "`ank-agent` startup: --run-folder CLI flag, run_folder in agent config, or default $TMPDIR/ankaios (agent/src/main.rs:160, agent/src/agent_config.rs:49-50,136-137)", "module_kind": "startup run-folder preparation"},
+    {"where": "agent/src/io_utils/fs.rs:100-105", "entry_point": "New primitives is_owner_exclusive / is_safe_write_target added next to is_fifo (fix.diff:830-851); used by all sites", "module_kind": "low-level filesystem abstraction (mockable)"},
+    {"where": "agent/src/workload_files/workload_files_creator.rs:149", "entry_point": "Workload `files` field in manifest -> WorkloadControlLoop::handle_mount_point_creation (agent/src/workload/workload_control_loop.rs:390) -> create_files directory creation", "module_kind": "workload files feature (separate module from control interface)"},
+    {"where": "agent/src/workload_files/workload_files_creator.rs:165-191", "entry_point": "Same `files` route -> write_file (symlink/foreign-owner rejection added, fix.diff:1159-1168)", "module_kind": "workload files writer"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "agent/src/workload_files/workload_files_creator.rs:149-191 (workload `files` feature creates its own dirs with filesystem::make_dir and writes with tokio::fs::write via filesystem_async::write_file, agent/src/io_utils/fs.rs:141-148, bypassing Directory/Fifo entirely)"
+  },
+  "O3_reason_to_dismiss": "The report is about Control Interface FIFOs; the workload `files` mount feature is a separate module that never touches FIFOs, and its files live in a subfolder of the (now checked) workload dir, so a solver can argue it is already covered by the parent-directory check and needs no own symlink/owner check on the final file.",
+  "O4_distance": {"files": 5, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Resuming workloads after an agent restart must keep reusing the existing per-workload control_interface dir and input/output FIFOs owned by the agent (the container still has them bind-mounted); an over-broad fix that rejects or deletes/recreates any existing FIFO/dir breaks resume, as does rejecting a user-supplied run_folder that is agent-owned 0700, or rejecting reuse of an existing agent-owned regular workload file.",
+    "where": "agent/src/runtime_connectors/runtime_facade.rs:257-294"
+  },
+  "O6_input_shapes": [
+    "existing directory owned by another user (base run dir, <agent>_io, control_interface dir, workload files dir)",
+    "existing directory owned by agent but group/other-accessible (mode & 0o077 != 0), including group-readable only",
+    "existing FIFO owned by another user or with group/other access",
+    "missing multi-level directory chain: each newly created level explicitly set to 0700, nearest existing ancestor checked (fix.diff:453-475)",
+    "workload file path that is a pre-existing symlink (checked with symlink_metadata)",
+    "workload file path that is a pre-existing regular file owned by another user",
+    "default base dir created fresh: mode changed from 0777 to 0700"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "ankaios_api/src/ank_base/workload_instance_name.rs:75-80 (pipes_folder_name builds the predictable <run_folder>/<workload>.<id> path used by agent/src/control_interface/control_interface_path.rs:39-40 and agent/src/workload_files/workload_files_path.rs:33-35)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "Default base-dir creation branch: exists() false -> create_dir_all (succeeds on a dir/symlink planted in the race window) -> set_permissions follows the path; the fix only changes 0777->0700 and never verifies ownership of what was actually created/followed.",
+      "where": "agent/src/io_utils/dir_utils.rs:47-51",
+      "reason_to_dismiss": "The fix's own check is in the 'already exists' else-branch; the 'we just created it' branch looks trusted by construction.",
+      "distance": "same file as a fix site (dir_utils.rs), different branch",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Directory ownership checks (path.exists() and the new is_owner_exclusive) use metadata(), which follows symlinks, so a planted symlink at the predictable base path to a dir that the agent user owns with mode 0700 passes and redirects the run folder (and the recursive delete in Drop) there; only the workload-file check uses symlink_metadata.",
+      "where": "agent/src/io_utils/directory.rs:28",
+      "reason_to_dismiss": "The target must already be agent-owned and private, so it looks 'secure'; the advisory only lists symlinks for workload files.",
+      "distance": "io_utils (directory.rs / fs.rs), shared helper",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "Control Interface pipes are reopened by path name after the Fifo::new check (OutputPipe::ensure_file on broken pipe, InputPipe::ensure_file on EOF), a check-then-use pair the fix does not revalidate.",
+      "where": "agent/src/control_interface/output_pipe.rs:110-114",
+      "reason_to_dismiss": "Reopen is legitimate reconnect behaviour inside a dir that is now checked to be 0700 agent-owned; argued as already protected by the parent check.",
+      "distance": "same package (control_interface), different files from fifo.rs (also agent/src/control_interface/input_pipe.rs:99-106)",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "agent/src/runtime_connectors/runtime_facade.rs:373-374", "sibling": "Workload-dir deletion on workload delete does remove_dir_all on the predictable pipes_folder_name path with no ownership/symlink check; a planted copy that also (re)creates a per-workload state/log file there would be a realistic sibling.", "why_realistic": "Runtime facade already owns the workload subfolder lifecycle; a maintainer adding e.g. a workload log or status file would naturally write it there with filesystem::make_dir/write_file rather than Directory."},
+    {"where": "agent/src/io_utils/fs.rs:141-148", "sibling": "A second async writer (e.g. write_file_with_mode or an append helper) in filesystem_async used by a new feature, missing is_safe_write_target.", "why_realistic": "filesystem_async is the shared write primitive; adding a variant there for a new workload artefact is an ordinary change."},
+    {"where": "agent/src/control_interface/input_output.rs:33-37", "sibling": "An additional per-workload FIFO/socket (e.g. a logs or events channel) created next to input/output via a separate helper instead of Fifo::new.", "why_realistic": "InputOutput is the natural place to add another pipe; a maintainer could create it with nix mkfifo directly as tests in input_pipe.rs already do."}
+  ],
+  "O9_family": "Insecure reuse of predictable temp paths / TOCTOU on pre-created files, dirs and FIFOs (CWE-276/367/379)", "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo workspace (Cargo.toml, agent/Cargo.toml, ankaios_api/Cargo.toml); unix-only (nix crate, mkfifo)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "Unit tests with mockall mocks of io_utils::filesystem in agent/src/io_utils/{fs,directory,dir_utils}.rs, agent/src/control_interface/fifo.rs, agent/src/workload_files/workload_files_creator.rs; real-FIFO tests using tempfile in agent/src/control_interface/{input_pipe,output_pipe}.rs; Robot system test tests/stests/agents/tmpdir_default_run_folder.robot (needs podman + server, not offline-friendly)."
+  },
+  "O11_fix_minutes": 55,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "agent/src/control_interface/fifo.rs, agent/src/io_utils/dir_utils.rs, agent/src/io_utils/directory.rs, agent/src/io_utils/fs.rs, agent/src/io_utils/mod.rs, agent/src/workload_files/workload_files_creator.rs",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add an owner/mode check only in Fifo::new (or only on the base run folder) and stop, leaving the per-workload dir creation, the workload `files` writer (symlink/foreign file) and the 0777 default-dir chmod untouched."},
+  "out_of_scope_notes": [
+    "grpc/src/lib.rs has its own permission check for PEM files (read_pem_file) - different protection, not pursued."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell/du used).",
+    "Whether the symlink-following and reopen residuals in O8 are exploitable after the fix depends on the parent-directory checks; assessed from code reading only.",
+    "present_in_latest for all O8 routes: no latest release supplied.",
+    "O1 count (5) groups entry points as: agent startup run folder (CLI/config/default), workload create with control interface, workload resume, workload update (agent/src/workload.rs:131), workload `files` field."
+  ]
+}

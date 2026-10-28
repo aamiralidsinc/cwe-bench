@@ -1,0 +1,138 @@
+name: trial
+# divq trial: one run of one model on one already-built task. Pull that task's build artifact from the build run
+# (intra-GitHub), decrypt, run common/trial/trial.py for a single run under the VM's own network policy
+# (model API only, no web tools), and write divq-result.json. Breaker logic (both models 3/3) is computed by divq.
+on:
+  workflow_dispatch:
+    inputs:
+      job:          { description: "divq job token (artifact name)", required: true }
+      tid:          { description: "opaque task id", required: true }
+      model:        { description: "deepseek or mimo", required: true }
+      run:          { description: "run number", default: "1" }
+      build_run:    { description: "build run id in THIS repo", required: true }
+      build_token:  { description: "build artifact name", required: true }
+      release:      { description: "release id", default: "" }
+      retention:    { description: "artifact retention days", default: "7" }
+permissions:
+  contents: read
+  actions: read
+jobs:
+  trial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      CLAUDE_VERSION: "2.1.302"
+      HARBOR_VERSION: "0.23.1.dev202609170426"
+      RUNNER_ROOT: "/tmp/divq/root"
+    steps:
+      - name: Check secrets
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          [ -n "$PAYLOAD_KEY" ] || { echo "PAYLOAD_KEY empty"; exit 1; }
+          if [ "$MODEL" = deepseek ]; then [ -n "$DEEPSEEK_API_KEY" ] || { echo "DEEPSEEK_API_KEY empty"; exit 1; }
+          else [ -n "$MIMO_API_KEY" ] || { echo "MIMO_API_KEY empty"; exit 1; }; fi
+      - uses: actions/checkout@v4
+      - name: Free disk + Docker on the larger disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /opt/microsoft 2>/dev/null || true
+          mf=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9); mf=${mf:-0}
+          dr=/var/lib/docker; [ "$mf" -gt 60 ] && dr=/mnt/docker; sudo mkdir -p "$dr"
+          printf '{"data-root":"%s","default-address-pools":[{"base":"172.31.0.0/16","size":24}],"shutdown-timeout":60}\n' "$dr" | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+      - name: Tools
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          "$HOME/.local/bin/uv" tool install -q "harbor==$HARBOR_VERSION"
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Pull the built task from the build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          BUILD_RUN: ${{ inputs.build_run }}
+          BUILD_TOKEN: ${{ inputs.build_token }}
+          TID: ${{ inputs.tid }}
+        run: |
+          gh run download "$BUILD_RUN" -R "$GITHUB_REPOSITORY" -n "$BUILD_TOKEN" -D /tmp/art
+          f=$(find /tmp/art -name '*.tgz.gpg' | head -1)
+          mkdir -p /tmp/t
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d "$f" | tar -xz -C /tmp/t
+          pv=$(cat /tmp/t/root/pv_path); echo "::add-mask::$pv"
+          slug=$(python3 -c "import json,sys;print(json.load(open('/tmp/t/root/ids.json'))[sys.argv[1]])" "$TID"); echo "::add-mask::$slug"
+          sudo mkdir -p "$(dirname "$pv")"; sudo chown -R "$(id -u):$(id -g)" "$(dirname "$pv")"
+          mkdir -p "$pv"; cp -a /tmp/t/root/. "$pv"/
+          test -f "$pv/tasks/$slug/task.toml" || { echo "no built task.toml for $TID"; exit 1; }
+          { echo "PV=$pv"; echo "SLUG=$slug"; } >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.tb-graders/cwe/slots"
+          printf 'DISK_MIN_FREE_GB_GATE=5\nDISK_MIN_FREE_GB_TRIAL=5\nDISK_MIN_FREE_GB_BUILD=8\n' > "$HOME/.tb-graders/cwe/slots/limits.env"
+      - name: Model keys + harbor patches
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MIMO_API_KEY: ${{ secrets.MIMO_API_KEY }}
+        run: |
+          umask 077
+          { printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY"; printf 'MIMO_API_KEY=%s\n' "$MIMO_API_KEY"; } > "$HOME/.tb-graders/cwe/models.env"
+          cd "$PV_ROOT"; bash common/trial/harbor/patch_probe_timeout.sh 2>/dev/null || true; bash common/trial/harbor/patch_teardown.sh 2>/dev/null || true
+      - name: One trial run (same policy as the VM: model API only, no web tools)
+        env:
+          MODEL: ${{ inputs.model }}
+          RUN: ${{ inputs.run }}
+          TID: ${{ inputs.tid }}
+        run: |
+          cd "$PV_ROOT"
+          ( while sleep 300; do echo "alive $(date -u +%H:%M) free $(df -BG --output=avail / | tail -1 | tr -d ' ')"; done ) &
+          CWE_AGENT_TIMEOUT_MULT=1.5 python3 common/trial/trial.py "$SLUG" --models "$MODEL" \
+            --first-run "$RUN" --max-runs 1 --no-verdict > /tmp/trial.out 2>&1 || true
+          tail -5 /tmp/trial.out || true
+      - name: divq-result.json + pack
+        if: always()
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          MODEL: ${{ inputs.model }}
+          RUN: ${{ inputs.run }}
+          TID: ${{ inputs.tid }}
+          REL: ${{ inputs.release }}
+        run: |
+          [ -n "${SLUG:-}" ] || { echo "no slug"; exit 0; }
+          cd "$PV_ROOT"
+          S=/tmp/stage; mkdir -p "$S/jobs"
+          # the newest job folder trial.py wrote for this slug+model
+          jd=$(ls -dt "$HOME/.tb-graders/cwe/jobs/$SLUG-$MODEL"* 2>/dev/null | head -1 || true)
+          python3 - "$S/divq-result.json" "$TID" "$MODEL" "$RUN" "$REL" "$jd" "${{ github.repository_owner }}" <<'PY'
+          import json, sys, glob, os
+          out, tid, model, run, rel, jd, acct = sys.argv[1:8]
+          reward, graded, infra = None, False, None
+          if jd and os.path.isdir(jd):
+              rf = glob.glob(os.path.join(jd, "**", "verifier", "reward.json"), recursive=True) or \
+                   glob.glob(os.path.join(jd, "**", "reward.txt"), recursive=True)
+              for p in rf:
+                  try:
+                      t = open(p).read().strip()
+                      reward = json.loads(t).get("reward") if p.endswith(".json") else float(t)
+                      graded = reward is not None
+                  except Exception:
+                      pass
+          if not graded:
+              infra = "no reward (infra/ungraded; divq retries, never counts as a model fail)"
+          json.dump({"kind": "trial", "tid": tid, "model": model, "run": int(run), "release": rel,
+                     "account": acct, "graded": graded, "reward": reward, "infra_reason": infra}, open(out, "w"))
+          print("DIVQ-RESULT", tid, model, "run", run, "graded", graded, "reward", reward)
+          PY
+          # transcript + grading for the VM audit (bounded)
+          [ -n "$jd" ] && find "$jd" -maxdepth 5 \( -name '*.json' -o -name '*.log' -o -name '*.txt' \) -size -512k \
+            -exec cp --parents {} "$S/jobs/" \; 2>/dev/null || true
+          cp /tmp/trial.out "$S/" 2>/dev/null || true
+          tar -czf /tmp/out.tgz -C "$S" .
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" --symmetric --cipher-algo AES256 -o "/tmp/${{ inputs.job }}.tgz.gpg" /tmp/out.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.job }}
+          path: /tmp/${{ inputs.job }}.tgz.gpg
+          retention-days: ${{ inputs.retention }}
+          if-no-files-found: warn

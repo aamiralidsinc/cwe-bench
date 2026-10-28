@@ -1,0 +1,112 @@
+name: build
+# divq build: one task per run. Decrypt the active-release payload (code + baked BUILD-PROMPTs), build + gate
+# one task, write divq-result.json into an encrypted artifact. Public logs show the opaque id, versions, disk,
+# heartbeats and the gate marker only; the slug and project path are masked.
+on:
+  workflow_dispatch:
+    inputs:
+      job:       { description: "divq job token (artifact name)", required: true }
+      tid:       { description: "opaque task id (d001..)", required: true }
+      release:   { description: "release id this job was dispatched under", default: "" }
+      retention: { description: "artifact retention days", default: "7" }
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      CLAUDE_VERSION: "2.1.302"
+      HARBOR_VERSION: "0.23.1.dev202609170426"
+      BUILD_TIMEOUT: "14400"           # 4 h builder limit, inside the 6 h job limit
+      RUNNER_ROOT: "/tmp/divq/root"
+    steps:
+      - name: Check secrets (fail fast, not a fake 0.0)
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          [ -n "$PAYLOAD_KEY" ] || { echo "PAYLOAD_KEY secret is empty"; exit 1; }
+          [ -n "$DEEPSEEK_API_KEY" ] || { echo "DEEPSEEK_API_KEY secret is empty"; exit 1; }
+      - uses: actions/checkout@v4
+      - name: Free disk + Docker on the larger disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell /opt/microsoft 2>/dev/null || true
+          docker image prune -af >/dev/null 2>&1 || true
+          rf=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+          mf=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc 0-9); mf=${mf:-0}
+          dr=/var/lib/docker; [ "$mf" -gt "$rf" ] && dr=/mnt/docker; sudo mkdir -p "$dr"
+          printf '{"data-root":"%s","default-address-pools":[{"base":"172.16.0.0/12","size":24}],"shutdown-timeout":60}\n' "$dr" | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+          echo "docker root: $(docker info --format '{{.DockerRootDir}}'); free / ${rf}G /mnt ${mf}G; cpus $(nproc); mem $(free -g | awk '/Mem/{print $2}')G"
+      - name: Tools (pinned to the VM's versions)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+          "$HOME/.local/bin/uv" tool install -q "harbor==$HARBOR_VERSION"
+          curl -fsSL https://claude.ai/install.sh | bash -s "$CLAUDE_VERSION" >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version; "$HOME/.local/bin/harbor" --version
+      - name: Decrypt payload (code + baked BUILD-PROMPTs)
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          TID: ${{ inputs.tid }}
+        run: |
+          mkdir -p /tmp/pl
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" -d payload.tgz.gpg | tar -xz -C /tmp/pl
+          pv=$(cat /tmp/pl/root/pv_path); echo "::add-mask::$pv"
+          sudo mkdir -p "$(dirname "$pv")"; sudo chown -R "$(id -u):$(id -g)" "$(dirname "$pv")"
+          mv /tmp/pl/root "$pv"
+          slug=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$pv/ids.json" "$TID"); echo "::add-mask::$slug"
+          test -f "$pv/build/$slug/BUILD-PROMPT.md" || { echo "no BUILD-PROMPT for $TID"; exit 1; }
+          { echo "PV=$pv"; echo "SLUG=$slug"; } >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.tb-graders/cwe/work"
+          # runner-sized disk floors (the VM's 150/250 would never be met on a runner)
+          mkdir -p "$HOME/.tb-graders/cwe/slots"
+          printf 'DISK_MIN_FREE_GB_GATE=5\nDISK_MIN_FREE_GB_TRIAL=5\nDISK_MIN_FREE_GB_BUILD=8\n' > "$HOME/.tb-graders/cwe/slots/limits.env"
+      - name: Model key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          umask 077; printf 'DEEPSEEK_API_KEY=%s\n' "$DEEPSEEK_API_KEY" > "$HOME/.tb-graders/cwe/models.env"
+      - name: Harbor patches (probe timeout + teardown; reverted by the install above)
+        run: |
+          cd "$PV_ROOT"
+          bash common/trial/harbor/patch_probe_timeout.sh 2>/dev/null || true
+          bash common/trial/harbor/patch_teardown.sh 2>/dev/null || true
+      - name: Build + gate
+        env: { TID: "${{ inputs.tid }}" }
+        run: |
+          cd "$PV_ROOT"
+          ( while sleep 300; do echo "alive $(date -u +%H:%M) load $(cut -d' ' -f1 /proc/loadavg) free $(df -BG --output=avail / | tail -1 | tr -d ' ')"; done ) &
+          BUILD_TIMEOUT="$BUILD_TIMEOUT" bash pipelines/sibling/6-build/run_pipeline.sh deepseek "$SLUG" > /tmp/pipe.out 2>&1 || true
+          m=build_incomplete; for x in .sound:sound .unsound:unsound .gate_error:gate_error; do f=${x%%:*}; [ -f "build/$SLUG/$f" ] && m=${x##*:}; done
+          echo "result $TID: gate=$m"
+      - name: divq-result.json + pack (encrypted)
+        if: always()
+        env:
+          PAYLOAD_KEY: ${{ secrets.PAYLOAD_KEY }}
+          TID: ${{ inputs.tid }}
+          REL: ${{ inputs.release }}
+        run: |
+          [ -n "${SLUG:-}" ] || { echo "no slug; nothing to pack"; exit 0; }
+          cd "$PV_ROOT"
+          m=build_incomplete; for x in .sound:sound .unsound:unsound .gate_error:gate_error; do f=${x%%:*}; [ -f "build/$SLUG/$f" ] && m=${x##*:}; done
+          fp=$(python3 -c "import json;print(json.load(open('build/$SLUG/gate_fingerprint.json')).get('digest','')[:16])" 2>/dev/null || echo "")
+          # stage so the artifact extracts as <token>/divq-result.json and <token>/root/... (read_results' layout)
+          S=/tmp/stage; mkdir -p "$S/root"
+          python3 -c "import json;json.dump({'kind':'build','tid':'$TID','status':'$m','release':'$REL','fingerprint':'$fp','account':'${{ github.repository_owner }}'}, open('$S/divq-result.json','w'))"
+          cp pv_path ids.json "$S/root/" 2>/dev/null || true
+          mkdir -p "$S/root/build"; cp -r "build/$SLUG" "$S/root/build/$SLUG"
+          [ -d "tasks/$SLUG" ] && { mkdir -p "$S/root/tasks"; cp -r "tasks/$SLUG" "$S/root/tasks/$SLUG"; }
+          cp /tmp/pipe.out "$S/" 2>/dev/null || true
+          tar -czf /tmp/out.tgz -C "$S" .
+          gpg --batch --quiet --pinentry-mode loopback --passphrase "$PAYLOAD_KEY" --symmetric --cipher-algo AES256 -o "/tmp/${{ inputs.job }}.tgz.gpg" /tmp/out.tgz
+          echo "DIVQ-RESULT $TID status=$m fp=$fp"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.job }}
+          path: /tmp/${{ inputs.job }}.tgz.gpg
+          retention-days: ${{ inputs.retention }}
+          if-no-files-found: warn

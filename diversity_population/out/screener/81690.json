@@ -1,0 +1,55 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "81690", "advisory_ids": ["CVE-2026-105768", "GHSA-RJ6X-HWPV-VHVF"], "repo": "chainguard-dev/apko",
+  "pinned_commit": "7f2522454c5502b446e24397d9559498b42eb099",
+  "fix_commits": ["739e7ce3f675ffb232e16849b51ff93657f1570c"],
+  "trust_decision": {
+    "summary": "Whether a package-supplied numeric owner (uid/gid from /etc/passwd, /etc/group lines, APK tar headers, or installed-db M:/a: lines) fits a uint32 before it is narrowed and written back or applied; at the pinned commit every site parses into an int and narrows (or passes through) without a range check.",
+    "evidence": ["pkg/passwd/passwd.go:136-146", "pkg/passwd/group.go:132-136", "pkg/apk/apk/install.go:263", "pkg/apk/apk/install.go:302", "pkg/apk/apk/installed.go:90-93", "pkg/apk/apk/installed.go:504-510"]
+  },
+  "landing_point": {"where": "pkg/passwd/passwd.go:136", "why": "Summary names /etc/passwd and /etc/group truncation; UserEntry.Parse does strconv.Atoi then uint32(uid) at :140, and the read-modify-write in pkg/build/accounts.go:101-145 persists it."},
+  "fix_sites": [
+    {"where": "pkg/passwd/passwd.go:136", "entry_point": "apko build/publish (accounts mutation: pkg/build/build_implementation.go:272 -> pkg/build/accounts.go:101) and tarball user-name mapping (pkg/build/tarball.go:83); public API passwd.ReadUserFile/ReadOrCreateUserFile/UserEntry.Parse", "module_kind": "parser (landing)"},
+    {"where": "pkg/passwd/passwd.go:142", "entry_point": "same as above (passwd GID field)", "module_kind": "parser (landing)"},
+    {"where": "pkg/passwd/group.go:132", "entry_point": "apko build accounts groups (pkg/build/accounts.go:80) and tarball group mapping (pkg/build/tarball.go:84); public API passwd.ReadGroupFile/GroupEntry.Parse", "module_kind": "parser (sibling file, same package)"},
+    {"where": "pkg/apk/apk/install.go:232", "entry_point": "APK.InstallPackages streaming path for non-WriteHeaderer filesystems (pkg/apk/apk/implementation.go:1364) -> doInstallAPKFiles; Chown at pkg/apk/apk/install.go:263 and :302", "module_kind": "package installer, archive decoder consumer (other package)"},
+    {"where": "pkg/apk/apk/install.go:437", "entry_point": "apko build/publish/build-minirootfs via tarfs WriteHeaderer (pkg/apk/apk/implementation.go:1342-1347) -> doLazilyInstallAPKFiles", "module_kind": "second install implementation (lazy fast path)"},
+    {"where": "pkg/apk/apk/installed.go:90", "entry_point": "APK.AddInstalledPackage (exported), called from pkg/apk/apk/implementation.go:952 and base-image merge pkg/build/build_implementation.go:226", "module_kind": "installed-database serializer (write side)"},
+    {"where": "pkg/apk/apk/installed.go:504", "entry_point": "apk.ParseInstalled / APK.GetInstalled (exported), base image load pkg/baseimg/base_image.go:106", "module_kind": "installed-database parser (read side)"},
+    {"where": "fix.diff:214-263", "entry_point": "new helpers checkOwner/checkArchiveOwner incl. 32-bit-int refusal for decoded headers", "module_kind": "shared validation helper"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "save_reload_or_serialization", "where": "pkg/apk/apk/installed.go:90-128 (AddInstalledPackage writes M:/a: owner lines) and pkg/apk/apk/installed.go:504-510 (parseInstalledPerms reads them back, including base-image idb via pkg/baseimg/base_image.go:106); also the archive decoder path pkg/apk/apk/install.go:232,437 in a different package from the passwd landing point"},
+  "O3_reason_to_dismiss": "The advisory is about /etc/passwd and /etc/group text files; the APK installer and the installed-database M:/a: lines are a different file format in a different package (pkg/apk/apk), and memFS/tarfs WriteHeader does not even copy owners today (pkg/tarfs/fs.go:107-124), so a solver can argue those paths are not the reported truncation.",
+  "O4_distance": {"files": 4, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Legitimate owners up to MaxUint32 (4294967295, 2147483648 > MaxInt32, 65534 nobody, 0 root) must still parse, install and round-trip byte-identically; checkOwner on caller-built headers in AddInstalledPackage must not inherit the 32-bit refusal; parsing via ParseInt(...,32) or rejecting > MaxInt32 breaks them.", "where": "pkg/passwd/passwd.go:157 (Write round-trip); fix.diff:117-127 (boundary matrix); fix.diff:250-255 (guard split)"},
+  "O6_input_shapes": ["passwd UID field", "passwd GID field", "group GID field", "value 2^32 (narrows to 0)", "value 2^32+1000", "negative -1 (wraps to MaxUint32)", "tar PAX uid/gid records", "tar GNU base-256 numeric owner", "installed-db M: (directory) line", "installed-db a: (file) line", "caller-supplied tar.Header vs archive/tar-decoded header", "32-bit int platform (linux/386, .goreleaser.yaml:21) where archive/tar narrows before apko sees the value"],
+  "O7_producer": {"kind": "serializer", "where": "pkg/apk/apk/installed.go:118 and :128 (AddInstalledPackage emits M:/a: owner lines consumed by parseInstalledPerms pkg/apk/apk/installed.go:436,471); the narrowing producer for the 32-bit case is stdlib archive/tar, outside the repo", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/apk/fs/apkfs.go:116-117", "sibling": "NewAPKFS decodes package tar headers and stores header.Uid/Gid on each node with no range check; wiring it into an image emitter would be a realistic unvalidated decoder", "why_realistic": "It is an existing exported second APK reader (pkg/apk/fs/apkfs.go:75) that already copies owners; a maintainer adding a 'build from expanded APK FS' path would naturally reuse it."},
+    {"where": "pkg/build/erofs.go:343-348", "sibling": "uidGidFromInfo hands int owners from FileInfo.Sys() to the EROFS writer Chown (pkg/build/erofs.go:312, pkg/build/erofs_layers.go:393), the uint32 sink the fix comment names; a planted Sys() source carrying a raw decoded header would bypass install-time checks", "why_realistic": "The function already trusts any *tar.Header in Sys(); a cache or layer-import path that returns the original header is a plausible addition."},
+    {"where": "pkg/tarfs/fs.go:107-124", "sibling": "memFS.WriteHeader copying hdr.Uid/hdr.Gid onto the node (the 'natural completion of the mode/ownership work' per fix.diff:283-287)", "why_realistic": "The fix commit itself predicts this change; a planted version that copies owners before the check runs is a how-type ordering sibling."},
+    {"where": "pkg/build/tarball.go:87-92", "sibling": "a second passwd/group parser for Uname/Gname mapping using Atoi+int narrowing instead of passwd.ReadUserFile", "why_realistic": "Name-mapping code is often reimplemented locally; currently it reuses the fixed parser."}
+  ],
+  "O9_family": "integer truncation / narrowing conversion of uid/gid (CWE-197) leading to privilege (root ownership) confusion",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.27.0 (go.mod:3); GOARCH=386 cross-test needed for the width guard", "services": [], "offline_after_build": true,
+                "project_tests": "pkg/passwd/passwd_test.go, pkg/passwd/group_test.go, pkg/apk/apk/install_test.go, pkg/apk/apk/installed_test.go, pkg/apk/apk/empty_package_name_test.go, pkg/build/accounts_test.go"},
+  "O11_fix_minutes": 50,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "pkg/passwd/passwd.go, pkg/passwd/group.go, pkg/apk/apk/install.go, pkg/apk/apk/installed.go", "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Replace Atoi with ParseUint(s,10,32) in UserEntry.Parse only, leaving group.go, the APK install paths, the installed-db writer/reader and the 32-bit archive/tar narrowing untouched."},
+  "out_of_scope_notes": [
+    "pkg/cpio/layer.go:46-115 drops uid/gid entirely when converting layers to cpio (all entries root-owned); a different property, not pursued."
+  ],
+  "unverified": [
+    "go-erofs Writer.Chown signature and whether it narrows int to uint32 internally (module not in tree); the fix comment at fix.diff:216-219 asserts it does.",
+    "Repo size in MB not measured (no shell used).",
+    "No non-test in-tree caller of NewAPKFS (pkg/apk/fs/apkfs.go:75) was found by grep; it is listed only as injection room, not as an O8 route.",
+    "Whether hidden tests can run GOARCH=386 on the grading host (needed to exercise checkArchiveOwner's width guard)."
+  ]
+}

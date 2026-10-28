@@ -1,0 +1,57 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104877",
+  "advisory_ids": ["GHSA-9786-JC2R-F539", "CVE-2026-97737", "GHSA-X48W-3RQ3-W2PQ"],
+  "repo": "muety/wakapi",
+  "pinned_commit": "1a08af5f78d4161f8b573de6ad82615b4f2b76f4",
+  "fix_commits": ["ce91eac2c2d9b29a00873554d2ecef76f10b9087"],
+  "trust_decision": {
+    "summary": "UserService.GetUserByKey decides which user an API-key credential authenticates as; it first consults a single shared user cache that GetUserById/GetUserByOidc populate keyed by bare user ID, so a cache hit on a username (or any other cached key) is accepted as a valid API key and returned before any key or read_only check.",
+    "evidence": ["services/user.go:92-101", "services/user.go:110-112", "services/user.go:116", "services/user.go:122", "services/user.go:195", "middlewares/authenticate.go:147", "middlewares/authenticate.go:161"]
+  },
+  "landing_point": {"where": "services/user.go:110", "why": "Summary names the user caching service and a lookup resolved in the wrong context; GetUserByKey's cache.Get(key) is the API-key auth lookup that reads the shared cache."},
+  "fix_sites": [
+    {"where": "services/user.go:92", "entry_point": "GetUserById: cookie auth, trusted-header auth, public user-param routes (middlewares/authenticate.go:212, middlewares/authenticate.go:184, routes/api/badge.go:46) prime the cache", "module_kind": "service (producer of cache entries)"},
+    {"where": "services/user.go:101", "entry_point": "same as above (cache write keyed by bare u.ID)", "module_kind": "service (producer of cache entries)"},
+    {"where": "services/user.go:110", "entry_point": "API key via Authorization Basic/Bearer header or ?api_key= query on every authenticated route (middlewares/authenticate.go:147, middlewares/authenticate.go:161)", "module_kind": "service (auth lookup / check)"},
+    {"where": "services/user.go:116", "entry_point": "same as above (main user api_key match, cache write)", "module_kind": "service (auth lookup)"},
+    {"where": "services/user.go:122", "entry_point": "same as above (additional api_keys table match, cache write)", "module_kind": "service (auth lookup)"},
+    {"where": "services/user.go:195", "entry_point": "OIDC id-token cookie auth (middlewares/authenticate.go:228)", "module_kind": "service (producer of cache entries)"},
+    {"where": "services/user.go:391-393", "entry_point": "FlushUserCache via Update/ResetApiKey/Delete/settings actions (services/user.go:297, services/user.go:333, routes/settings.go:464)", "module_kind": "service (cache invalidation)"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All changed sites are in services/user.go; the OIDC producer at services/user.go:195 sits in the same file, so it is not an out-of-scope module."},
+  "O3_reason_to_dismiss": "The cache hit at services/user.go:110-112 also returns before the requireFullAccessKey/read_only filter (repositories/api_key.go:33-35); a solver could argue read-only vs full-access keys are a separate authorization feature and the report is about username/API-key collision only.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Legitimate API-key lookups must still be served from cache (existing cache-hit test), read-only additional keys must keep working on non-heartbeat routes, and ResetApiKey/Update must still invalidate the old key; disabling the cache or keying without matching invalidation breaks one of these.", "where": "services/user_test.go:84; services/user.go:332-336; routes/settings.go:956-962; routes/api/heartbeat.go:40"},
+  "O6_input_shapes": ["user ID used as API key (GetUserById-primed entry)", "main user api_key (users.api_key column)", "additional api_keys-table key", "OIDC-primed user entry", "header (Basic/Bearer base64) and ?api_key= query transports (both reach the same call)"],
+  "O7_producer": {"kind": "cache", "where": "services/user.go:101 and services/user.go:195 write *models.User into srv.cache keyed by bare user ID; services/user.go:249 and services/user.go:196 write other value types into the same cache", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "Cache hit in GetUserByKey ignores requireFullAccessKey; the published fix keys by 'key_'+key only, so a read-only additional key cached by a non-heartbeat request is then accepted on the full-access heartbeat route.", "where": "services/user.go:110-112", "reason_to_dismiss": "Read-only key enforcement is a neighbouring feature (repositories/api_key.go:33-35, routes/api/heartbeat.go:40), not the username/key collision in the report.", "distance": "same file as landing point; filter lives in repositories/api_key.go (another package), route in routes/api", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Shared srv.cache also holds non-user values under unprefixed keys (OIDC 'provider_sub' -> user ID string, '<date>--active' -> []*User); the fix leaves the OIDC write unprefixed, so a provider named 'id' or 'key' collides with the new prefixes.", "where": "services/user.go:196", "reason_to_dismiss": "Requires an operator-chosen provider name; the value is a string, so the type assertion at services/user.go:93 would panic rather than authenticate.", "distance": "same file", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "services/api_key.go:53-61", "sibling": "ApiKeyService.GetByUser caches []*ApiKey under bare userId in a cache whose invalidation matches keys by strings.Contains(key, userId) (services/api_key.go:97-103); a sibling cache lookup by raw key in this service would recreate the same collision.", "why_realistic": "The same maintainer pattern (bare-ID cache keys, shared cache) is already used there."},
+    {"where": "services/user.go:129-136", "sibling": "Add caching to GetUserByWebAuthnID / GetUserByResetToken (services/user.go:149-154) using the same srv.cache with unprefixed keys.", "why_realistic": "The comment at services/user.go:134 says caching was skipped only because the lookup is rare; adding it the same way as GetUserById is a natural optimisation."}
+  ],
+  "O9_family": "authentication bypass via cache-key confusion (type confusion of lookup context, CWE-843)", "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.26 (go.mod:3)", "services": [], "offline_after_build": true,
+                "project_tests": "services/user_test.go (testify suite with mocked repos, incl. TestUserService_GetByKeyFromCache_Success at services/user_test.go:84) and middlewares/authenticate_test.go (WithFullAccessOnly at middlewares/authenticate_test.go:84); runs with sqlite/mocks, no external services needed"},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "B",
+  "j": {"j_multi_site": 1, "j_sites_touched": "services/user.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Prefix the cache keys per lookup type ('id_'/'key_'), which is the published fix, and leave requireFullAccessKey and key revocation out of the cache key/invalidation."},
+  "out_of_scope_notes": [
+    "After the published fix, deleting an additional API key (services/api_key.go:76-84, routes/settings.go:990) does not flush the UserService 'key_' entry, so a revoked key may stay valid up to the 1h cache TTL; not present at the pinned commit.",
+    "GetUserByOidc writes the sub->id mapping into srv.cache (services/user.go:196) while reading it from subjectCache (services/user.go:175), so the subject cache never hits; correctness bug only."
+  ],
+  "unverified": [
+    "repo size in MB not measured (tiny_repo/giant_repo not assessed).",
+    "Whether routes/api/badge.go:46 is reachable without authentication (used only as a cache-priming example; cookie/trusted-header routes also prime).",
+    "Whether the published fix or a later release closes the requireFullAccessKey cache bypass (no latest release given).",
+    "Advisory text itself was not available beyond the summary; second GHSA id may cover a related variant."
+  ]
+}

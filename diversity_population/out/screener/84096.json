@@ -1,0 +1,60 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "84096",
+  "advisory_ids": ["CVE-2026-115567", "GHSA-5WJR-9356-4WC8", "RUSTSEC-2026-0384"],
+  "repo": "tokio-rs/tokio",
+  "pinned_commit": "66d34e45c9c850ed72bc61f2ad107368217f040d",
+  "fix_commits": ["2b4eba7833864c04ecd2f3e5f4a97ff4f6fa28d0", "5ed619bbaba87357ee5103d71b75e7c84cad99c9", "b53b2001ed2ccfd9b87e32a0c6da1a1eebdc80b8"],
+  "trust_decision": {
+    "summary": "Interval::poll_tick decides that the timer entry is no longer referenced by the time driver because its state reads 'elapsed', and then frees it without taking the driver lock. But the driver publishes the elapsed state before it finishes touching the entry (take_waker), so the timer memory is released or reused while the driver thread still accesses it.",
+    "evidence": ["tokio/src/time/interval.rs:480-483", "tokio/src/time/sleep.rs:386-394", "tokio/src/runtime/time/entry.rs:225-229", "tokio/src/runtime/time/mod.rs:311-316", "tokio/src/runtime/time/entry.rs:484-509"]
+  },
+  "landing_point": {"where": "tokio/src/time/interval.rs:483", "why": "The advisory title names tokio::time::Interval, and poll_tick holds the only `unsafe` call, with the comment 'SAFETY: the internal timer is elapsed'."},
+  "fix_sites": [
+    {"where": "tokio/src/time/interval.rs:457-487", "entry_point": "tokio::time::Interval::poll_tick / Interval::tick (tokio/src/time/interval.rs:428)", "module_kind": "public API (time)"},
+    {"where": "tokio/src/time/sleep.rs:229-236", "entry_point": "drop of tokio::time::Sleep (sleep/sleep_until/timeout); the fix removes the Sleep-level PinnedDrop cancel", "module_kind": "public API wrapper"},
+    {"where": "tokio/src/time/sleep.rs:390-394", "entry_point": "Sleep::reset_without_timer, pub(super), reached only from Interval::poll_tick", "module_kind": "internal helper"},
+    {"where": "tokio/src/time/sleep.rs:373-379", "entry_point": "Sleep::reset / Interval::reset*", "module_kind": "public API"},
+    {"where": "tokio/src/time/sleep.rs:417-444", "entry_point": "Sleep as Future::poll", "module_kind": "public API"},
+    {"where": "tokio/src/runtime/mod.rs:463-552", "entry_point": "crate-internal runtime::Timer enum (dispatches between the traditional and alt flavours)", "module_kind": "runtime internal dispatcher"},
+    {"where": "tokio/src/runtime/time/entry.rs:286-294", "entry_point": "TimerEntry (the fix adds an owned driver handle and a PinnedDrop that cancels)", "module_kind": "runtime time driver internals"},
+    {"where": "tokio/src/runtime/time/entry.rs:463-537", "entry_point": "TimerEntry::new/init/cancel/reset/poll_elapsed", "module_kind": "runtime time driver internals"},
+    {"where": "tokio/src/runtime/time_alt/timer.rs:21-45", "entry_point": "time_alt::Timer (the fix adds Drop that cancels; tokio_unstable + rt-multi-thread only)", "module_kind": "second timer implementation"}
+  ],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "tokio/src/runtime/time_alt/timer.rs:43-45 (alternative timer wheel; the published fix adds Drop->cancel here too)"},
+  "O3_reason_to_dismiss": "The alt timer is gated behind tokio_unstable and rt-multi-thread (tokio/src/runtime/mod.rs:459), and its EntryHandle is lock-protected and refcounted (tokio/src/runtime/time_alt/entry.rs:246-264), so dropping it without cancel looks like a leak rather than memory unsafety.",
+  "O4_distance": {"files": 5, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "After poll_tick returns Ready, it must not register a timer or waker. The next tick is registered lazily on the next poll, and the tests check that a stream stalls when it does not re-wake. Re-registering eagerly, for example by calling Sleep::reset instead of dropping the timer, would break this. The lock-free extend_expiration fast path in reset must also stay.", "where": "tokio/tests/time_interval.rs:383-392; tokio/src/time/interval.rs:480-481; tokio/src/runtime/time/entry.rs:511-514"},
+  "O6_input_shapes": ["traditional timer flavour (TimerEntry, intrusive wheel)", "alternative timer flavour (time_alt::Timer, tokio_unstable)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "tokio/src/time/interval.rs:549-551", "sibling": "reset_immediately (or reset_at with a past deadline) implemented through reset_without_timer to skip registering a timer that is already due", "why_realistic": "The same 'do not register yet, it will be registered on next poll' optimisation as poll_tick, plausibly justified by a 'SAFETY: deadline already passed' comment"},
+    {"where": "tokio/src/runtime/mod.rs:525-529", "sibling": "Timer::reset Alternative branch replacing the entry with entry.set(...) without the preceding cancel()", "why_realistic": "The new entry overwrites the old one, so cancel looks redundant to a maintainer optimising reset"},
+    {"where": "tokio/src/time/sleep.rs:436-437", "sibling": "this.timer.set(Some(timer)) reached while a previous elapsed timer is still Some (e.g. a 're-arm after Ready' path in poll_elapsed)", "why_realistic": "A re-arm after Ready would be tempting for periodic users. It would be the same 'state reads elapsed, so the driver is done' assumption, without taking the lock"}
+  ],
+  "O9_family": "race condition / premature release of driver-shared intrusive timer memory (CWE-362, use-after-free class)",
+  "O9_dos": false,
+  "O10_build": {"language": "Rust", "toolchain": "cargo, rust-version 1.85 (tokio/Cargo.toml); loom for the published regression test (cfg loom)", "services": [], "offline_after_build": true,
+                "project_tests": "tokio/src/runtime/time/tests/mod.rs (loom model tests; the fix adds interval_poll_tick_races_with_fire), tokio/tests/time_interval.rs, tokio/tests/time_sleep.rs"},
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "none",
+  "j": {"j_multi_site": 1, "j_sites_touched": "tokio/src/time/interval.rs, tokio/src/time/sleep.rs, tokio/src/runtime/mod.rs, tokio/src/runtime/time/entry.rs, tokio/src/runtime/time_alt/timer.rs",
+        "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Call timer.cancel(driver) inside Sleep::reset_without_timer before set(None). This is a one-line fix that is in fact sufficient, because it takes the driver lock. So the task collapses to a single location."},
+  "out_of_scope_notes": [
+    "tokio/CHANGELOG.md:40 names the regressing change ('time: remove the runtime handle from timers' #8458), so a solver with git history can simply revert it. Strip history and the changelog line in our copy.",
+    "fix commits 2b4eba78 and 5ed619bb carry identical source diffs; b53b2001 is release prep only."
+  ],
+  "unverified": [
+    "repo_mb not measured",
+    "Whether the alt-timer flavour is actually memory-unsafe without its new Drop was not established; it may be only a stale-entry leak",
+    "Whether a non-loom behavioural test can reproduce the race reliably was not checked; the published test needs a loom model",
+    "O1 counts Interval::poll_tick and Interval::tick; wrappers (tokio-stream IntervalStream at tokio-stream/src/wrappers/interval.rs:53, timeout_repeating at tokio-stream/src/stream_ext/timeout_repeating.rs:47) reach the same call and were not counted separately",
+    "j_defence_ineffective=1 refers to the unsafe-contract comment 'SAFETY: the internal timer is elapsed' (tokio/src/time/interval.rs:482), which did not hold, rather than to a runtime check"
+  ]
+}

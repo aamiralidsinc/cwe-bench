@@ -1,0 +1,53 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82332", "advisory_ids": ["GHSA-R9X7-54RC-VQ7H", "CVE-2026-108830"], "repo": "meetecho/janus-gateway",
+  "pinned_commit": "052718ad867049e205cf761e91977c414000e34a",
+  "fix_commits": ["27c0d1af888153e818675b56a4e6267f62d57097"],
+  "trust_decision": {
+    "summary": "VideoRoom decides whether a new WebRTC publisher may publish by counting other publishers whose session->started is set (only set later, asynchronously, in setup_media), so several concurrent offers all pass the max_publishers check before any becomes 'started'; the fix adds a 'starting' reservation set under the room mutex and cleared on every exit path.",
+    "evidence": ["src/plugins/janus_videoroom.c:12764-12783", "src/plugins/janus_videoroom.c:8645", "src/plugins/janus_videoroom.c:10775", "fix.diff:88", "fix.diff:13"]
+  },
+  "landing_point": {"where": "src/plugins/janus_videoroom.c:12764-12783", "why": "The only place max_publishers is enforced ('Maximum number of publishers (%d) already reached'); the summary names a VideoRoom race on publishers, so grep for max_publishers lands here."},
+  "fix_sites": [
+    {"where": "src/plugins/janus_videoroom.c:2380", "entry_point": "struct janus_videoroom_session (new 'starting' field)", "module_kind": "state definition"},
+    {"where": "src/plugins/janus_videoroom.c:12764-12783", "entry_point": "videoroom 'publish' / 'configure' / 'joinandconfigure' with a JSEP offer (async handler)", "module_kind": "plugin async request handler (check + reservation)"},
+    {"where": "src/plugins/janus_videoroom.c:10775", "entry_point": "videoroom 'publish' request (already-published guard)", "module_kind": "plugin async request handler"},
+    {"where": "src/plugins/janus_videoroom.c:8645", "entry_point": "plugin callback setup_media, invoked by the core when ICE/DTLS completes", "module_kind": "plugin lifecycle callback (media thread)"},
+    {"where": "src/plugins/janus_videoroom.c:9341", "entry_point": "plugin callback hangup_media (PeerConnection closed)", "module_kind": "plugin lifecycle callback"},
+    {"where": "src/plugins/janus_videoroom.c:6728", "entry_point": "videoroom 'kick' synchronous request", "module_kind": "plugin sync request handler (admin/moderator)"},
+    {"where": "src/plugins/janus_videoroom.c:11203", "entry_point": "videoroom 'unpublish' request", "module_kind": "plugin async request handler"},
+    {"where": "src/plugins/janus_videoroom.c:12613", "entry_point": "videoroom 'leave' request", "module_kind": "plugin async request handler"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": "All sites are in src/plugins/janus_videoroom.c; the nearest 'other-looking' site is the setup_media core callback at src/plugins/janus_videoroom.c:8645, which is the same file."},
+  "O3_reason_to_dismiss": "Reset sites (kick/unpublish/leave/hangup) look like unrelated teardown code, and a solver who adds a reservation at the check can argue the existing 'started=0' resets already cover it; error exits after the reservation (e2ee rejection, SDP failure) look like 'request failed, nothing to undo'.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "An already-publishing participant renegotiating (offer with core-set jsep.update=true) must not be counted against itself or rejected when the room is full; dummy publishers and the requesting participant are excluded from the count; unpublish then re-publish on the same handle must work once the slot is freed.", "where": "src/plugins/janus_videoroom.c:12764-12771"},
+  "O6_input_shapes": ["'publish' request with JSEP offer", "'configure' request with JSEP offer on a not-yet-publishing handle", "'joinandconfigure' with JSEP offer"],
+  "O7_producer": {"kind": "handler", "where": "src/plugins/janus_videoroom.c:8645 (janus_videoroom_setup_media sets started=1 asynchronously after ICE/DTLS)", "check_calls_producer": false},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/plugins/janus_videoroom.c:12785-12793", "sibling": "Error exits after the reservation point (require_e2ee rejection, SDP parse/answer failures further down) that would need to clear the reservation, else a slot leaks until leave/hangup.", "why_realistic": "The published fix sets starting=1 at fix.diff:88 but adds no reset on these goto-error exits; a maintainer adding a reservation naturally forgets the failure exits of a 500-line block."},
+    {"where": "src/plugins/janus_videoroom.c:7818", "sibling": "add_remote_publisher creates a started=1 publisher with no max_publishers check; a planted count-then-insert on this path would be a second implementation of the publisher-admission check.", "why_realistic": "Remote publishers are counted by the WebRTC check (not dummy, src/plugins/janus_videoroom.c:7835) so a maintainer could plausibly add a limit here, copying the racy pattern."},
+    {"where": "src/plugins/janus_videoroom.c:10775", "sibling": "The 'already published' guard only covers 'publish', not 'configure' with a fresh offer; a planted per-handle double-offer race between two queued offers.", "why_realistic": "The guard is request-name keyed, a realistic shortcut."}
+  ],
+  "O9_family": "race condition / TOCTOU on admission-count state (check-then-act across an async state transition)", "O9_dos": false,
+  "O10_build": {"language": "C", "toolchain": "autotools (autogen.sh/configure/make), glib, jansson, libnice, libsrtp, libconfig, OpenSSL; libwebsockets/libmicrohttpd for transports", "services": [], "offline_after_build": true,
+                "project_tests": "No VideoRoom unit/behavioural tests found in the tree (no test/**/*videoroom* files); behavioural tests would need a WebRTC client harness (ICE/DTLS) to reach setup_media."},
+  "O11_fix_minutes": 35,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "src/plugins/janus_videoroom.c", "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Change 'count == max_publishers' to '>=' or set started=1 at check time, which breaks subscriber notifications/started semantics, or add a reservation without clearing it on kick/unpublish/leave/hangup/error exits."},
+  "out_of_scope_notes": [
+    "add_remote_publisher (src/plugins/janus_videoroom.c:7602-7835) admits remote publishers with no max_publishers check; the docs scope max_publishers to WebRTC publishers (src/plugins/janus_videoroom.c:411) and the request is room-secret gated, so not treated as an uncovered route."
+  ],
+  "unverified": [
+    "Whether unpublish (started=0 set synchronously at src/plugins/janus_videoroom.c:11203) can leave the core NEGOTIATED flag set (cleared only in async hangup, src/ice.c:1647) so a quick re-offer arrives with jsep.update=true (src/janus.c:1524, src/janus.c:1871) and skips the !sdp_update count block (src/plugins/janus_videoroom.c:12764); would be an O8 route if real.",
+    "Repo size in MB not measured.",
+    "Whether every later error exit in the offer block is followed by hangup_media (which would clear 'starting' after the fix) was not traced.",
+    "Advisory text beyond the summary line was not available; reasoning is from the fix diff."
+  ]
+}

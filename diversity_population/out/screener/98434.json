@@ -1,0 +1,57 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "98434",
+  "advisory_ids": ["CVE-2026-72913", "GHSA-CCP2-Q4V6-RW94"],
+  "repo": "kovidgoyal/kitty",
+  "pinned_commit": "4dd3156ca7ef429eeb449a4ae857f6406b83e0ef",
+  "fix_commits": ["2cb1d95c3accadd536bd66ba6bda044973440177", "9dca948e9bec3c926ab3370f2cd10f9b9b10821f"],
+  "trust_decision": {
+    "summary": "kitty decides in Window.handle_remote_echo that the payload of a child-emitted DCS @kitty-echo| message may be written back into the child's tty input. At the pinned commit the only check is a filter that keeps printable ASCII. That leaves shell text which a later newline (for example the leading newline that the unauthenticated @kitty-ssh| handler writes) commits as a command.",
+    "evidence": ["kitty/vt-parser.c:665-666", "kitty/window.py:1629-1634", "kitty/window.py:1636-1639", "kittens/ssh/utils.py:137-139", "kitty/window.py:1200-1205"]
+  },
+  "landing_point": {"where": "kitty/window.py:1629", "why": "The summary names the @kitty-echo DCS. handle_remote_echo is its Python handler, and its comment already discusses command injection."},
+  "fix_sites": [
+    {"where": "kitty/window.py:1629-1634", "entry_point": "Any program output in a kitty window carrying DCS @kitty-echo|<base64> (dispatched at kitty/vt-parser.c:665)", "module_kind": "terminal escape-code handler (Python core)"},
+    {"where": "kittens/ssh/main.go:565", "entry_point": "CLI `kitten ssh`: drain_potential_tty_garbage runs on ssh exit (kittens/ssh/main.go:823) and is the only legitimate producer of the echo DCS", "module_kind": "client-side kitten in Go (different language and package; produces the protocol message)"},
+    {"where": "tools/utils/secrets/tokens.go:15-41", "entry_point": "Internal Go library API; the fix adds TokenAlphabet/encode_bytes (fix.diff:1375-1422), called only by the ssh kitten", "module_kind": "lower-level utility library (Go)"}
+  ],
+  "O1_entry_points": 1,
+  "O2_out_of_scope_site": {"kind": "none", "where": "No second implementation or alternative route into the echo sink. The fix's other sites are the Go producer of the echo canary (kittens/ssh/main.go:565) and a helper library (tools/utils/secrets/tokens.go). These keep legitimate behaviour working (see O5); they are not routes to the flaw."},
+  "O3_reason_to_dismiss": "The report points at the Python escape-code handler. The Go ssh kitten is client-side code in another language that 'only generates a random canary', so a solver argues it is not part of the vulnerable surface. They also argue that the ssh handler's leading newline (kittens/ssh/utils.py:139) is part of the authenticated ssh data protocol and is needed to discard leading garbage.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "kitten ssh flushes tty garbage on exit by sending its canary through the echo DCS and reading it back until the canary shows up. An echo allowlist tighter than the canary alphabet (digits-only while the canary is still TokenHex), or dropping echo entirely, makes the drain time out after 2 s and leaves garbage. So the fix must change the Go producer in step with the Python check.", "where": "kittens/ssh/main.go:560-593"},
+  "O6_input_shapes": ["The echo payload is base64-decoded bytes. The published fix accepts only ASCII digits (\\d+$) and rejects and logs anything else. Before the fix, non-printable bytes were stripped and printable shell text passed (fix.diff:695-699)", "Canary alphabet changed from hex [0-9a-f] to digits only (fix.diff:44-45)"],
+  "O7_producer": {"kind": "none", "where": "The legitimate echo payload is produced by Go code (kittens/ssh/main.go:565 via tools/utils/secrets/tokens.go). That is a token generator, not one of the listed producer kinds. The Python check does not call it.", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "The @kitty-ssh handler writes a leading newline and line-terminated status/error lines to the child's tty before it checks any password. This is the newline half of the advisory's chain, and the fix leaves it unchanged.", "where": "kittens/ssh/utils.py:139-160", "reason_to_dismiss": "Once echo accepts digits only, no attacker-controlled pre-text remains, and the error text is restricted to [a-zA-Z0-9 ] with a fixed first word. So the newline is argued to be harmless protocol framing.", "distance": "other package (kittens/ssh) from landing point kitty/window.py", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "edit-in-kitty sync writes 'KITTY_DATA_START\\n<type>\\n' and base64 lines into the source window's tty. A child DCS @kitty-edit| starts it, and it is another newline terminator that commits any pending typed input.", "where": "kitty/launch.py:1049-1064", "reason_to_dismiss": "It needs the user to have an editor window open from a child edit request. The payload is fixed or base64, so it is a neighbouring feature, not the echo path.", "distance": "other file (kitty/launch.py), same package", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "kitty/vt-parser.c:661-670", "sibling": "Another @kitty-<name>| DCS handler in kitty/window.py that writes a decoded child payload back to the child with only a printable-ASCII filter, as echo did before the fix.", "why_realistic": "The dispatch table is open-ended and several kittens need a round-trip through the tty, so a maintainer could add one copying the old echo pattern."},
+    {"where": "kittens/ssh/utils.py:156-160", "sibling": "Error reply that puts the attacker-supplied rq_id first or keeps shell metacharacters (filter widened from [a-zA-Z0-9 ]).", "why_realistic": "The message already embeds rq_id with !r for diagnostics, and a maintainer could reorder or loosen the sanitiser for readability."},
+    {"where": "kitty_tests/__init__.py:203-207", "sibling": "Test-harness copy of handle_remote_echo that writes the payload unfiltered. A planted source-side copy (for example in a kitten's own Python fallback) would be a second implementation.", "why_realistic": "The test callbacks already mirror the Window handlers one-to-one."}
+  ],
+  "O9_family": "Terminal escape-sequence / tty-input (CRLF-like) injection leading to command injection in the child shell (CWE-150/77/93)",
+  "O9_dos": false,
+  "O10_build": {"language": "Python + C (core), Go (kittens/tools)", "toolchain": "C compiler with kitty's setup.py build (HarfBuzz, FreeType/fontconfig, etc.), Go toolchain for kitten", "services": [], "offline_after_build": null,
+                "project_tests": "kitty_tests/ (ssh.py covers the ssh kitten). kitty_tests/__init__.py:197-207 reimplements the ssh/echo callbacks for a test pty. No test exercises Window.handle_remote_echo itself, and the fix diff adds no tests."},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "kitty/window.py, kittens/ssh/main.go, tools/utils/secrets/tokens.go", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 1, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Strip more characters (spaces, ';', shell metacharacters) or allow hex [0-9a-f]+ in handle_remote_echo without touching the Go canary. Hex still lets through runnable words such as 'fc' or 'dd', and a digits-only check without the Go change breaks the ssh tty drain."},
+  "out_of_scope_notes": [
+    "kitty/rc/send_text.py:252-256 writes remote-control text to children; it is gated by remote-control permissions and is a separate protection.",
+    "kitty/terminfo.py:530-541 XTGETTCAP echoes the queried name (hex-validated) inside a DCS reply; this is a different response-injection class."
+  ],
+  "unverified": [
+    "Advisory text beyond the summary was not available; that the chain relies on the ssh handler's leading newline is inferred from kittens/ssh/utils.py:139 and the summary.",
+    "repo_mb not measured (no shell); giant_repo/tiny_repo not assessed but kitty is neither tiny nor >1.5 GB by expectation.",
+    "offline_after_build unknown: Go module dependencies may need to be fetched at build time.",
+    "needs_gpu_kernel_gui not flagged: Window.handle_remote_echo looks unit-testable by stubbing get_boss().child_monitor (kitty/window.py:1204), but this was not confirmed.",
+    "present_in_latest unknown for all O8 routes (no latest release given).",
+    "The claim that hex-only echo stays exploitable via words such as 'fc' was not tested; it is reasoning, not evidence."
+  ]
+}

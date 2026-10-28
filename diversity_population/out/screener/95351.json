@@ -1,0 +1,98 @@
+{
+  "screener_version": "screener-v2",
+  "lessons_version": "lessons-v2",
+  "model": "claude-opus-5-5",
+  "entry_id": "95351",
+  "advisory_ids": ["GHSA-XMW5-W4C2-CP2G", "CVE-2026-63094"],
+  "repo": "signoz/signoz",
+  "pinned_commit": "cc45c1bef18e9a4d204b472ce7401bcb4b1b576c",
+  "fix_commits": ["8c6a0de8c36e7982099437bfe2476c1a4ccbc553", "253ca7dd7eb4f7a32a694c249eb0d5d0804d5619"],
+  "trust_decision": {
+    "summary": "Whether the client-supplied site URL (the ?ref= on session context, which is carried through the SSO state/RelayState and parsed back on the callback) is a trusted origin before the server issues a 303 redirect carrying freshly minted access/refresh tokens to that origin. It is decided nowhere at the pinned commit; the fix adds global.Config.IsOriginAllowed and calls it in implsession at the ref and callback steps.",
+    "evidence": [
+      "pkg/modules/session/implsession/handler.go:38",
+      "pkg/types/authtypes/authn.go:57-88",
+      "pkg/modules/session/implsession/module.go:137-143",
+      "pkg/modules/session/implsession/module.go:179-186",
+      "pkg/modules/session/implsession/handler.go:84",
+      "fix.diff:98-110",
+      "fix.diff:305-307",
+      "fix.diff:316-318"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/modules/session/implsession/module.go:179",
+    "why": "The summary says 'OAuth state manipulation, session token theft'. The token-bearing redirect URL is built here from callbackIdentity.State.URL, so this is the first place an engineer would look."
+  },
+  "fix_sites": [
+    {"where": "pkg/modules/session/implsession/module.go:143", "entry_point": "GET /api/v1/complete/google, POST /api/v1/complete/saml, GET /api/v1/complete/oidc (pkg/apiserver/signozapiserver/session.go:80,97,117) via CreateCallbackAuthNSession", "module_kind": "core session module (callback handling)"},
+    {"where": "pkg/modules/session/implsession/module.go:220", "entry_point": "GET /api/v2/sessions/context?email=&ref= (pkg/apiserver/signozapiserver/session.go:29) via GetSessionContext -> getOrgSessionContext", "module_kind": "core session module (login-URL / state producer step)"},
+    {"where": "pkg/global/config.go:17-53", "entry_point": "config loading (global::allowed_origins, YAML or env) plus the new public method Config.IsOriginAllowed", "module_kind": "global config package (looks out of scope)"},
+    {"where": "pkg/modules/session/implsession/module.go:25-47", "entry_point": "constructor NewModule gains a global.Config parameter", "module_kind": "constructor / dependency injection"},
+    {"where": "pkg/signoz/module.go:152", "entry_point": "server wiring NewModules", "module_kind": "composition root"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "defaults_or_merge_route",
+    "where": "pkg/global/config.go:17-53 (Config struct, newConfig defaults, Validate); the fix adds an allow-list key with an allow-all default when unset (fix.diff:98-101) and validates its entries (fix.diff:85-93)"
+  },
+  "O3_reason_to_dismiss": "The SAML/OIDC/Google provider packages already build the state and seem to own it, so a solver could patch only the callback redirect at module.go:179 and treat the ref check at session-context time (which only returns an IdP login URL and never redirects) plus the global config allow-list as unnecessary.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "IdP-initiated SAML uses a host-less relative RelayState ('login'). The callback check is skipped when State.URL.Host is empty (fix.diff:305), and when allowed_origins is unset all origins stay allowed (fix.diff:99-101). A blanket 'state must carry an allow-listed host' rule, or a default-deny, would break IdP-initiated SAML login and existing installs that have no allowed_origins.",
+    "where": "ee/authn/callbackauthn/samlcallbackauthn/authn.go:125-131"
+  },
+  "O6_input_shapes": [
+    "absolute URL with a foreign host",
+    "scheme mismatch (http vs https)",
+    "port mismatch",
+    "host-suffix confusion (evilsignoz.example.com)",
+    "userinfo confusion (allowed@attacker)",
+    "scheme-relative //attacker (Host populated by url.Parse)",
+    "case-insensitive host/scheme match (must be allowed)",
+    "host-less relative state (skipped by design at the callback)"
+  ],
+  "O7_producer": {
+    "kind": "config_loader",
+    "where": "pkg/config/conf.go:67-72 (StringToSliceHookFunc(',') and StringToURLHookFunc at pkg/config/conf.go:107-124 decode global::allowed_origins into []*url.URL); state producer authtypes.NewState pkg/types/authtypes/authn.go:57-71",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/modules/session/implsession/handler.go:164-173", "sibling": "the error redirect gains a 'next'/return-to parameter taken from the callback query or state and is redirected to without the origin check", "why_realistic": "Returning users to where they came from after a failed SSO is a common UX request, and the helper already builds redirect URLs from request-derived data."},
+    {"where": "pkg/types/authtypes/authn.go:73-88", "sibling": "a second state parser (e.g. a base64/JSON-encoded state for a new provider) whose URL bypasses the Host!='' gate, a separator or identity differential on the protected item", "why_realistic": "Providers each parse their own state field (state vs RelayState); a new provider with its own encoding is a plausible addition."},
+    {"where": "ee/authn/callbackauthn/samlcallbackauthn/authn.go:125-131", "sibling": "IdP-initiated SAML RelayState built with an absolute URL taken from the auth domain's stored config (save/reload of a domain field) rather than the relative 'login'", "why_realistic": "Admins host the UI on a different origin than the API; a stored 'redirect after IdP login' field on the auth domain is a natural feature, and it crosses a DB save/reload boundary the check never calls."}
+  ],
+  "O9_family": "open redirect / token leakage via unvalidated OAuth/SAML state (CWE-601, CWE-345)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.25.7 (go.mod:3)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/global/config_test.go (TestValidate only at the pinned commit); there are no unit tests for pkg/modules/session/implsession or the callback authn packages at the pinned commit. Module-level tests need fakes for authNs, the authdomain store, the tokenizer and the user setter."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/global/config.go, pkg/modules/session/implsession/module.go, pkg/signoz/module.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Compare the callback State.URL host against the request Host or external_url at module.go:179, or force a relative redirect. This leaves the ref step open, breaks deployments where the UI and API are on different origins, and invents no configurable allow-list."
+  },
+  "out_of_scope_notes": [
+    "Fix commit 8c6a0de8 only edits a GCP Memorystore dashboard JSON (fix.diff:1-35) and is unrelated to the advisory.",
+    "Google/OIDC oauth2 redirect_uri and the SAML ACS URL are derived from the unvalidated state host (pkg/authn/callbackauthn/googlecallbackauthn/authn.go:182-186, ee/authn/callbackauthn/samlcallbackauthn/authn.go:139). This is a token-exchange parameter, not the redirect sink; not pursued."
+  ],
+  "unverified": [
+    "Possible how-type residual in the published fix, not verified because I could not read the Go stdlib source in this sandbox or run code. url.Parse('https:/evil.example/x') yields Host=='' (Go sets OmitHost). The callback gate is skipped when Host=='' (fix.diff:305), but module.go:179-184 rebuilds a fresh url.URL without OmitHost, so String() may emit 'https:///evil.example/x', which browsers resolve to evil.example. If this holds, it is a parser differential on the protected item's identity at the fix's own guard. Hidden tests could target it only if our copy fixes it too.",
+    "repo_mb not measured (no shell); signoz includes a large frontend tree, so the size is likely well above 5 MB, but tiny_repo/giant_repo were not assessed.",
+    "Fairness concern: the published fix introduces a new opt-in config key (global::allowed_origins) and a method name (IsOriginAllowed). Hidden tests that depend on that exact API would need the report to name it; with the key unset, behaviour is unchanged (allow-all).",
+    "present_in_latest not applicable (no latest release given)."
+  ]
+}

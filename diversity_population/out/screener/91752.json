@@ -1,0 +1,86 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "91752", "advisory_ids": ["CVE-2026-46622", "GHSA-QJFC-H39R-CGWQ"], "repo": "solidinvoice/solidinvoice",
+  "pinned_commit": "b7d8ac5b7e5137a7e1a59d2f8ac596b9d63c042e",
+  "fix_commits": ["da3f479c9ef1782023738d4fb81c5f78dd9d18b0", "864539182572e1a3b2d76999b03060661ffa00f1"],
+  "trust_decision": {
+    "summary": "Whether a presented API token matches a stored credential is decided by comparing the plaintext value directly against the api_tokens.token column (no hash), in the token-lookup queries used by the API firewall authenticator; every writer stores the raw value and the UI reads it back.",
+    "evidence": [
+      "src/UserBundle/Repository/ApiTokenRepository.php:36-44",
+      "src/ApiBundle/Security/ApiTokenAuthenticator.php:94",
+      "src/UserBundle/Entity/ApiToken.php:50-51",
+      "src/ApiBundle/ApiTokenManager.php:50"
+    ]
+  },
+  "landing_point": {
+    "where": "src/ApiBundle/ApiTokenManager.php:46-60",
+    "why": "The summary says 'API tokens stored as plaintext'; ApiTokenManager::create is the named token factory that generates and persists the token."
+  },
+  "fix_sites": [
+    {"where": "src/ApiBundle/ApiTokenManager.php:50", "entry_point": "POST /api/login (form_login success handler, config/packages/security.php:62-71) via getOrCreate/create", "module_kind": "service (token factory)"},
+    {"where": "src/ApiBundle/Event/Listener/AuthenticationSuccessHandler.php:36-38", "entry_point": "POST /api/login (src/ApiBundle/Resources/config/routing.php:17)", "module_kind": "security success handler (returns the token in JSON)"},
+    {"where": "src/ApiBundle/Security/ApiTokenAuthenticator.php:66", "entry_point": "any /api/* request with X-API-TOKEN header or ?token= query (config/packages/security.php:73-78)", "module_kind": "security authenticator (company switch lookup)"},
+    {"where": "src/UserBundle/Repository/ApiTokenRepository.php:36-44", "entry_point": "any /api/* request; ApiTokenAuthenticator::authenticate -> ApiTokenUserProvider::getUsernameForToken (src/ApiBundle/Security/Provider/ApiTokenUserProvider.php:35-37)", "module_kind": "Doctrine repository in another bundle (lower-level lookup)"},
+    {"where": "src/UserBundle/Repository/ApiTokenHistoryRepository.php:33-42", "entry_point": "any /api/* request; ApiTokenAuthenticator::onAuthenticationSuccess (src/ApiBundle/Security/ApiTokenAuthenticator.php:64)", "module_kind": "Doctrine repository for a neighbouring entity (usage history)"},
+    {"where": "src/UserBundle/Repository/ApiTokenRepository.php:62", "entry_point": "profile page API-token list (ApiTokens live component, src/UserBundle/Twig/Components/ApiTokens.php:43-45)", "module_kind": "repository read-back for UI"},
+    {"where": "src/UserBundle/Resources/views/Components/ApiTokens.html.twig:34", "entry_point": "profile page API-token list", "module_kind": "Twig template (renders stored token value)"},
+    {"where": "src/UserBundle/Twig/Components/CreateApiToken.php:56-60", "entry_point": "profile page 'Create API Token' live action save()", "module_kind": "UI live component; second writer that bypasses ApiTokenManager::create"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {
+    "kind": "second_implementation",
+    "where": "src/UserBundle/Twig/Components/CreateApiToken.php:56-60 persists a new ApiToken itself with generateToken() and the EntityManager, never calling ApiTokenManager::create (src/ApiBundle/ApiTokenManager.php:46-60); separately, three independent token lookups in two bundles (src/ApiBundle/Security/ApiTokenAuthenticator.php:66, src/UserBundle/Repository/ApiTokenRepository.php:43, src/UserBundle/Repository/ApiTokenHistoryRepository.php:40) must all hash"
+  },
+  "O3_reason_to_dismiss": "CreateApiToken is a UI widget in UserBundle/Twig that already 'uses ApiTokenManager' (it injects it, line 38), so a solver who hashes inside ApiTokenManager::create can believe every writer is covered; the history-repository lookup looks like logging, not authentication.",
+  "O4_distance": {"files": 9, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Authentication must remain an indexed equality lookup (the fix uses deterministic HMAC keyed by kernel.secret); an over-hardened fix with password_hash/bcrypt breaks findOneBy/WHERE token = :token lookups and stops all API auth. POST /api/login and the create UI must still return the plaintext exactly once, and getOrCreate on an existing name can no longer return a usable token (fix returns 409 instead).",
+    "where": "src/UserBundle/Repository/ApiTokenRepository.php:42-43; src/ApiBundle/Event/Listener/AuthenticationSuccessHandler.php:36-38; fix.diff:187-207; fix.diff:307-328"
+  },
+  "O6_input_shapes": [
+    "token presented in X-API-TOKEN header (src/ApiBundle/Security/ApiTokenAuthenticator.php:86)",
+    "token presented in ?token= query parameter (src/ApiBundle/Security/ApiTokenAuthenticator.php:86)",
+    "token created via POST /api/login with or without token_name (src/ApiBundle/Event/Listener/AuthenticationSuccessHandler.php:36)",
+    "token created via profile UI live action (src/UserBundle/Twig/Components/CreateApiToken.php:57)",
+    "login for a token name that already exists (fix.diff:190-203)"
+  ],
+  "O7_producer": {
+    "kind": "mapper",
+    "where": "src/UserBundle/Repository/ApiTokenRepository.php:61-85 selects t.token and maps it into the array the UI renders (src/UserBundle/Resources/views/Components/ApiTokens.html.twig:34); the stored value itself is produced by the writers in src/ApiBundle/ApiTokenManager.php:50 and src/UserBundle/Twig/Components/CreateApiToken.php:57",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "src/ApiBundle/ApiTokenManager.php:32-44", "sibling": "a token-rotation/regenerate method or console command that sets a new token on an existing ApiToken via setToken() directly", "why_realistic": "the entity exposes a public setToken (src/UserBundle/Entity/ApiToken.php:91-96) and the UI writer already bypasses the manager, so a maintainer adding 'regenerate' to the profile page would plausibly copy CreateApiToken's pattern"},
+    {"where": "src/UserBundle/Repository/ApiTokenRepository.php:36-52", "sibling": "a second lookup (e.g. findByToken for a webhook or 'revoke by token value' API) querying t.token with the raw value", "why_realistic": "lookups by token value are already duplicated in three places with different styles (QueryBuilder, findOneBy via registry, findOneBy via repository)"},
+    {"where": "src/UserBundle/Entity/ApiTokenHistory.php:52-53", "sibling": "history requestData/serialized entity that carries the presented token value (a serialization boundary the hash check never touches)", "why_realistic": "onAuthenticationSuccess already copies the request into history (src/ApiBundle/Security/ApiTokenAuthenticator.php:55-59) right next to where the raw token is in hand"}
+  ],
+  "O9_family": "CWE-312 cleartext storage of credentials (API bearer tokens stored and displayed unhashed)", "O9_dos": false,
+  "O10_build": {
+    "language": "PHP",
+    "toolchain": "PHP >=8.3, Composer, Symfony 7.1, Doctrine ORM 2.15, PHPUnit (composer.json:19,41,99)",
+    "services": ["MySQL for functional/DB tests (.github/workflows/db-tests.yml:31-34)"],
+    "offline_after_build": true,
+    "project_tests": "src/ApiBundle/Tests/ApiTokenManagerTest.php (Mockery unit tests, no DB); src/ApiBundle/Test/ApiTestCase.php functional API base that logs in via ApiTokenManager (needs DB); no authenticator unit test at the pinned commit"
+  },
+  "O11_fix_minutes": 55,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "src/ApiBundle/ApiTokenManager.php, src/ApiBundle/Event/Listener/AuthenticationSuccessHandler.php, src/ApiBundle/GeneratedApiToken.php (new), src/ApiBundle/Security/ApiTokenAuthenticator.php, src/ApiBundle/Security/ApiTokenHasher.php (new), src/UserBundle/Repository/ApiTokenHistoryRepository.php, src/UserBundle/Repository/ApiTokenRepository.php, src/UserBundle/Twig/Components/ApiTokens.php, src/UserBundle/Twig/Components/CreateApiToken.php, src/UserBundle/Resources/views/Components/ApiTokens.html.twig, src/UserBundle/Resources/views/Components/CreateApiToken.html.twig",
+        "j_sibling_sites": "no",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Hash in ApiTokenManager::create and in ApiTokenRepository::getUsernameForToken only, leaving the UI writer (CreateApiToken::save), the history-repository and authenticator findOneBy lookups, and the UI read-back unchanged (or use password_hash, which breaks equality lookup)."},
+  "out_of_scope_notes": [
+    "API token accepted in the URL query string (?token=) at src/ApiBundle/Security/ApiTokenAuthenticator.php:46,86, so it can land in access/proxy logs; separate CWE-598 concern.",
+    "Raw request body of every API call is persisted in ApiTokenHistory.requestData (src/ApiBundle/Security/ApiTokenAuthenticator.php:57, src/UserBundle/Entity/ApiTokenHistory.php:52-53), which may store other secrets.",
+    "ApiTokenHistoryRepository::addHistory dereferences a possibly-null token (src/UserBundle/Repository/ApiTokenHistoryRepository.php:42); the fix adds a null guard."
+  ],
+  "unverified": [
+    "UPGRADE.md in the fix (fix.diff:85-87) names a Version20317 migration that re-hashes existing rows, but no such migration is in the fix diff or the pinned tree (migrations/ has no Version2031*); whether it landed in another commit is unknown. The existing-row re-hash is the save/reload part and would need to be in our hidden tests' scope.",
+    "Repo size in MB was not measured.",
+    "Whether functional tests can run on SQLite instead of MySQL was not checked (config/packages/doctrine.php:32 reads SOLIDINVOICE_DATABASE_URL).",
+    "Latest release not provided, so present_in_latest could not be assessed (O8 is empty anyway)."
+  ]
+}

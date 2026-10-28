@@ -1,0 +1,92 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "15495",
+  "advisory_ids": ["GHSA-3Q34-RX83-R6MQ", "CVE-2026-42274", "GO-2026-5097"],
+  "repo": "dadrus/heimdall",
+  "pinned_commit": "3d05e56a9e7ef0355f17482b4322054af4e85943",
+  "fix_commits": ["b5dfa484b7a8c2ce6d8691c026f9da867719947a"],
+  "trust_decision": {
+    "summary": "Which access rule (and so which authenticators/authorizers) applies to a request is decided by matching the request path heimdall builds (from X-Forwarded-Uri or the request URL, or from Envoy's CheckRequest path) against the rule trie; the path is used as-is, without removing dot segments, so heimdall and the upstream can read it differently.",
+    "evidence": [
+      "internal/handler/requestcontext/extract_url.go:46-61",
+      "internal/handler/envoyextauth/grpcv3/request_context.go:103-118",
+      "internal/rules/repository_impl.go:62-68",
+      "internal/rules/rule_executor_impl.go:34-47"
+    ]
+  },
+  "landing_point": {
+    "where": "internal/handler/requestcontext/extract_url.go:46",
+    "why": "The summary names a path normalization mismatch; the X-Forwarded-Uri / request URL path extraction is the obvious place where the matched path gets built."
+  },
+  "fix_sites": [
+    {"where": "internal/handler/requestcontext/extract_url.go:61", "entry_point": "HTTP decision service (any path) and HTTP proxy service, both through requestcontext.RequestContext.Init (internal/handler/requestcontext/request_context.go:66)", "module_kind": "handler-side request extraction (shared by decision and proxy transports)"},
+    {"where": "internal/rules/rule_executor_impl.go:42", "entry_point": "rule.Executor.Execute, called by HTTP service handler (internal/handler/service/handler.go:42) and Envoy ext_authz gRPC Check (internal/handler/envoyextauth/grpcv3/handler.go:36)", "module_kind": "rule engine core (transport-independent)"},
+    {"where": "internal/x/urlx/path.go:24", "entry_point": "new helpers PathHasDotSegments / NormalizePath (fix.diff:372, fix.diff:456) used by the two sites above", "module_kind": "internal utility library"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "internal/rules/rule_executor_impl.go:42 (fix.diff:265-268)"},
+  "O3_reason_to_dismiss": "Once paths are normalized at extraction, a solver can argue a second reject-check in the transport-agnostic rule executor is redundant, and that the Envoy gRPC path needs nothing because Envoy normalizes paths itself (normalize_path/merge_slashes).",
+  "O4_distance": {"files": 4, "packages": 4, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Dots inside segments (/foo/bar.baz, /foo/bar..baz) and encoded slashes without dot segments (/foo%2Fbar, needed with allow_encoded_slashes for object keys) must still pass; trailing slash and the root path must be kept after normalization; encoded segments like %5Bval%5D must stay escaped.",
+    "where": "fix.diff:519-530, fix.diff:571-573, fix.diff:212-243, fix.diff:461-468, internal/rules/rule_impl.go:57-66"
+  },
+  "O6_input_shapes": [
+    "plain dot segments /a/../b and /a/./b (normalized in HTTP extraction, rejected otherwise)",
+    "percent-encoded dots %2e, case-insensitive",
+    "mixed .%2e",
+    "encoded slash %2f / %2F as separator next to dots",
+    "encoded backslash %5c and raw backslash as separator",
+    "dot segment at path end without trailing separator",
+    "double slashes collapsed by path.Clean (HTTP only)",
+    "path coming from X-Forwarded-Uri vs from req.URL"
+  ],
+  "O7_producer": {"kind": "handler", "where": "internal/handler/requestcontext/extract_url.go:27 and internal/handler/envoyextauth/grpcv3/request_context.go:94", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "Envoy ext_authz gRPC request context builds the matched URL from CheckRequest path without NormalizePath, so the HTTP transports collapse '//' (and normalize) while gRPC matches the raw path.",
+      "where": "internal/handler/envoyextauth/grpcv3/request_context.go:103-118",
+      "reason_to_dismiss": "Dot segments on this route are still rejected by the shared executor check, and Envoy is expected to normalize paths before calling ext_authz, so it looks covered or out of scope.",
+      "distance": "different package (internal/handler/envoyextauth/grpcv3) and transport (gRPC) from the landing point internal/handler/requestcontext",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "internal/rules/route_matcher.go:128", "sibling": "path-parameter captures are percent-decoded after the dot-segment check, so a capture containing %2e%2e becomes '..' when it is later used", "why_realistic": "Decoding captures for matching is a deliberate feature; a maintainer could easily skip a dot-segment check on the decoded capture value."},
+    {"where": "internal/rules/config/url_rewriter.go:87-96", "sibling": "the upstream URL rewrite (prefix strip/add) runs after the check and could reintroduce or expose dot segments for the forwarded path", "why_realistic": "The rewriter works on EscapedPath and unescapes again, which is the same raw/decoded split the advisory is about."},
+    {"where": "internal/handler/envoyextauth/grpcv3/request_context.go:103", "sibling": "a planted copy of extractURL logic for a second transport that skips normalization", "why_realistic": "The gRPC context already builds its URL separately; a new transport (e.g. a v4 handler) would copy this code."}
+  ],
+  "O9_family": "parser differential / path normalization mismatch (CWE-35, CWE-436) leading to authorization rule bypass",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go",
+    "toolchain": "go 1.26.2 (go.mod:3)",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "internal/handler/requestcontext/extract_url_test.go, internal/rules/rule_executor_impl_test.go, internal/x/urlx/path_test.go, internal/handler/envoyextauth/grpcv3 tests; unit tests with mocks, no services"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "internal/handler/requestcontext/extract_url.go, internal/rules/rule_executor_impl.go, internal/x/urlx/path.go",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Add path.Clean in extractURL only, which leaves encoded %2e%2e%2f/%5c variants and the Envoy gRPC transport unchecked, or reject any '..' substring and break /foo/bar..baz."
+  },
+  "out_of_scope_notes": [
+    "Double-encoded dots (%252e) are decoded only once by heimdall; whether upstreams decode twice was not checked.",
+    "Sibling advisories (#3207 encoded slashes, #3208 host case) touched nearby URL handling just before the pin."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check run).",
+    "O2 kind: the executor check is a transport-agnostic composition layer; 'wrapper_or_composition' is the closest enum value.",
+    "Whether radixtrie lookup treats '//' segments such that the gRPC route actually reaches a more permissive rule was not traced.",
+    "present_in_latest unknown: no latest release given."
+  ]
+}

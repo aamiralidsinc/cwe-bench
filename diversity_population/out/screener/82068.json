@@ -1,0 +1,88 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82068",
+  "advisory_ids": ["GHSA-2XRM-QGGP-HR4M", "CVE-2026-108104", "GHSA-C73M-R934-8QVG"],
+  "repo": "xerial/snappy-java",
+  "pinned_commit": "71ae47c460a072259c08dc2d631c4b7d84af74bd",
+  "fix_commits": ["e993fe1c8e790526054566cd8f4f01ed9af4cad0", "139a53090a6662298924fd75d21f4769b4a219ea"],
+  "trust_decision": {
+    "summary": "SnappyFramedInputStream decides when a pooled buffer it owns is handed back to the shared BufferPool; a buffer must be returned exactly once and never used after return, but the field still points at a returned buffer if the reallocation that follows the release throws, so close() returns it a second time and the pool can give it to two streams.",
+    "evidence": [
+      "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:243-261",
+      "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:561-566",
+      "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:442-469",
+      "src/main/java/org/xerial/snappy/pool/CachingBufferPool.java:188-206"
+    ]
+  },
+  "landing_point": {
+    "where": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:243",
+    "why": "The summary names SnappyFramedInputStream and double release; allocateBuffersBasedOnSize is the method whose name says release-and-reallocate, and close() at :442 is the second release."
+  },
+  "fix_sites": [
+    {"where": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:245-255", "entry_point": "public SnappyFramedInputStream constructors (:96-208, via :222) and read()/read(byte[],int,int)/read(ByteBuffer)/transferTo(...) through ensureBuffer() at :538-539 when a frame exceeds input capacity", "module_kind": "core stream decoder (public API)"},
+    {"where": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:561-566", "entry_point": "public read()/read(byte[],int,int)/read(ByteBuffer)/transferTo(OutputStream)/transferTo(WritableByteChannel) via ensureBuffer() when a frame's uncompressed length exceeds uncompressedDirect capacity", "module_kind": "core stream decoder (public API), same file and class"}
+  ],
+  "O1_entry_points": 5,
+  "O2_out_of_scope_site": {"kind": "none", "where": "Both CWE-415 sites are in one class (SnappyFramedInputStream). The other source changes in commit 139a530 (SnappyInputStream.java hasNextChunk header loop and incremental chunk buffer, fix.diff:345-427) belong to a different advisory (GHSA-6gp7-6wmv-gxqw per fix.diff:437,460); Snappy.java changes are javadoc only (fix.diff:281-307)."},
+  "O3_reason_to_dismiss": "For the O8 route: transferTo(WritableByteChannel) never releases anything itself, it only keeps reading from an array that ensureBuffer already returned to the pool, so a solver can argue it is a use-after-release in a convenience method rather than the reported double release.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Growing buffers in place for large frames (up to 16 MiB lengths accepted by getFrameMetaData) and returning them to the pool for reuse must keep working; a fix that stops releasing on resize, or stops pooling, leaks or degrades performance; a fix that nulls fields but leaves read paths assuming non-null buffers turns later reads into NPEs. transferTo(WritableByteChannel) over multi-frame input must still produce identical bytes.",
+    "where": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:538-566; src/test/java/org/xerial/snappy/SnappyFramedStreamTest.java:250-266"
+  },
+  "O6_input_shapes": [
+    "compressed frame whose uncompressed length exceeds the current uncompressedDirect capacity (ensureBuffer resize at :561)",
+    "frame whose on-wire length exceeds the current input buffer capacity (allocateBuffersBasedOnSize via :538-539)",
+    "failure of the first, second or third allocation in allocateBuffersBasedOnSize (each field cleared individually, fix.diff:318-331)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Buffer lifecycle is entirely inside SnappyFramedInputStream; the pool (src/main/java/org/xerial/snappy/pool/CachingBufferPool.java:188-206) only stores what it is given and does not detect duplicates.", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {
+      "route": "transferTo(WritableByteChannel) wraps the current buffer array once before the loop; when ensureBuffer() later releases that array to the pool and allocates a larger one, the loop keeps writing from the released array (stale wrapper), so the stream reads from a buffer another stream may now own.",
+      "where": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java:422-437",
+      "reason_to_dismiss": "Not a double release: nothing is released twice, and the method only reads; the published fix did not touch it and the transferTo test uses small frames.",
+      "distance": "same file, ~140 lines above the fix site at :561",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "src/main/java/org/xerial/snappy/SnappyFramedOutputStream.java:471-476", "sibling": "a resize/realloc path on the framed output side (e.g. per-call block size or reset()) that releases buffer/directInputBuffer/outputBuffer and reallocates without clearing the fields, so close() releases them again", "why_realistic": "close() already releases the three fields without nulling them, relying only on the closed flag; a maintainer adding a resize would copy the input-stream pattern at SnappyFramedInputStream.java:243-261."},
+    {"where": "src/main/java/org/xerial/snappy/SnappyFramedOutputStream.java:387-399", "sibling": "transferFrom(InputStream) caches buffer.array() before the loop; a flushBuffer that swapped the pooled array would leave a stale reference like transferTo(WritableByteChannel)", "why_realistic": "Same cached-array idiom as SnappyFramedInputStream.java:422 already exists here."},
+    {"where": "src/main/java/org/xerial/snappy/SnappyOutputStream.java:437-443", "sibling": "a buffer-growth path in SnappyOutputStream (BufferAllocator release then allocate) that throws between release and reassign, leaving close() to release the same array to CachedBufferAllocator twice", "why_realistic": "A second pooling implementation (buffer/CachedBufferAllocator.java:74-79 appends without duplicate check) used by a different stream class in the same package."}
+  ],
+  "O9_family": "memory lifecycle: double release of pooled buffers (CWE-415, JVM buffer pool, not native free)",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Java (plus prebuilt JNI native libs)",
+    "toolchain": "sbt (build.sbt), JUnit 4.13.2 via junit-interface; native libsnappyjava prebuilt under src/main/resources/org/xerial/snappy/native/",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "src/test/java/org/xerial/snappy/SnappyFramedStreamTest.java (transferTo, larger frames), src/test/java/org/xerial/snappy/SnappyBoundsCheckTest.java (fix adds framedStreamDoesNotReleaseBuffersTwiceWhenAllocationFails using a custom BufferPool)"
+  },
+  "O11_fix_minutes": 20,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "injection_only",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/main/java/org/xerial/snappy/SnappyFramedInputStream.java",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Null the fields after release only inside allocateBuffersBasedOnSize (the method the report leads to) and miss the inline resize at :561-566, or add a duplicate check in the pool."
+  },
+  "out_of_scope_notes": [
+    "Constructor leaks pooled buffers when the stream header is invalid or allocation partially fails (SnappyFramedInputStream.java:222-237): leak, not double release.",
+    "Commit 139a530 also fixes SnappyInputStream header recursion and eager chunk allocation (separate advisory GHSA-6gp7-6wmv-gxqw, resource exhaustion).",
+    "Snappy.rawCompress/rawUncompress address APIs only got unsafe-use javadoc (fix.diff:287-305)."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell); source is small but bundled native libs add several MB; tiny_repo not asserted.",
+    "O8 transferTo(WritableByteChannel) stale-wrapper behaviour derived by reading :422-437 against :538-566; not executed. After reallocation bb.limit(position+available()) may also exceed the old array and throw instead of reading stale data, depending on sizes.",
+    "present_in_latest unknown: no latest release given.",
+    "Recall risk judged low from publication date (2026-10-09) only; write-up coverage not checked.",
+    "O1 counts read(), read(byte[],int,int), read(ByteBuffer), transferTo(OutputStream), transferTo(WritableByteChannel) as public entry points into ensureBuffer; constructors also reach allocateBuffersBasedOnSize but buffers start null there."
+  ]
+}

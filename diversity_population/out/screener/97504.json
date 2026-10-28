@@ -1,0 +1,52 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "97504", "advisory_ids": ["CVE-2026-70656", "GHSA-4C6J-P2CV-WF56"], "repo": "bluewave-labs/checkmate",
+  "pinned_commit": "825bcc5fdbd0dbde9e78033ce844ab880a46083a",
+  "fix_commits": ["d368ec5bd7af1cd81628c47a89d1d830cd415590", "0df71d6356c87c747e0b796b0c34e33f2a5203fa", "adba25269c455878bf8065bc28cfe5d74e58692f", "d5ec2936ad77ab773529057b442a6eb55dd578eb"],
+  "trust_decision": {
+    "summary": "An admin-supplied monitor expectedValue is compiled as a backtracking JS RegExp and run against the remote HTTP response body on every check in the worker; the fix decides that only RE2-compatible (linear-time) patterns may be compiled, both at check time (AdvancedMatcher) and at save time (zod superRefine on create/edit/import schemas).",
+    "evidence": ["server/src/service/network/AdvancedMatcher.ts:15", "server/src/service/network/HttpProvider.ts:99", "server/src/api/validation/monitorValidation.ts:107", "fix.diff:65", "fix.diff:101-112"]
+  },
+  "landing_point": {"where": "server/src/service/network/AdvancedMatcher.ts:15", "why": "The summary names 'Monitor Advanced Matching' with a user-controlled regex; the only `new RegExp(expected)` in the server is in AdvancedMatcher.compare."},
+  "fix_sites": [
+    {"where": "server/src/service/network/AdvancedMatcher.ts:12-17", "entry_point": "Worker HTTP check of any stored http monitor with useAdvancedMatching (HttpProvider.buildResponse -> advancedMatcher.validate), fed by POST /monitors, PATCH /monitors/:monitorId, POST /monitors/import/json", "module_kind": "runtime matcher service (worker side)"},
+    {"where": "server/src/api/validation/monitorValidation.ts:84-123", "entry_point": "POST /monitors (createMonitorBodyValidation, server/src/api/controllers/monitorController.ts:206)", "module_kind": "zod request schema"},
+    {"where": "server/src/api/validation/monitorValidation.ts:125-162", "entry_point": "PATCH /monitors/:monitorId (editMonitorBodyValidation, server/src/api/controllers/monitorController.ts:277)", "module_kind": "zod request schema (partial update)"},
+    {"where": "server/src/api/validation/monitorValidation.ts:185-235", "entry_point": "POST /monitors/import/json (importMonitorsBodyValidation, server/src/api/controllers/monitorController.ts:227)", "module_kind": "zod request schema (bulk import / export round-trip)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "save_reload_or_serialization", "where": "server/src/api/validation/monitorValidation.ts:185-235 (importedMonitorSchema, used by POST /monitors/import/json at server/src/api/routes/monitorRoute.ts:49); also patterns already stored in MongoDB (server/src/domain/monitors/monitor.model.ts:263-269 has no regex check) are only covered by the runtime change"},
+  "O3_reason_to_dismiss": "Import is an admin-only restore of previously exported monitors, so a solver can argue its data was already validated at create time; a solver who fixes only the create/edit schemas leaves stored and imported patterns running through native RegExp in the worker.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Legitimate regex matching must keep working (e.g. `^2\\d{2}$` against an extracted status code), and so must the equal/include methods and the empty-expectedValue falsy check. Over-broad fixes (escaping the pattern, dropping the regex method, rejecting all quantifiers) break this.", "where": "server/test/unit/providers/network/advancedMatcher.test.ts:102-120; server/src/service/network/AdvancedMatcher.ts:13-14,42-47"},
+  "O6_input_shapes": ["expectedValue as a plain string on create/edit/import bodies", "extracted JMESPath value of any JSON type (object/array/number) coerced with String() before matching (fix.diff:53-58)", "invalid or RE2-unsupported pattern (backreferences/lookaround) -> 'Invalid regex pattern' instead of a throw (fix.diff:64-68, fix.diff:101-111)"],
+  "O7_producer": {"kind": "schema", "where": "server/src/api/validation/monitorValidation.ts:107,141,200 (expectedValue accepted as any string); persisted via server/src/domain/monitors/monitor.repository.mongo.ts:274-283 and read back at server/src/domain/monitors/monitor.repository.mongo.ts:548", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "PATCH /monitors/:monitorId with only matchMethod='regex' (or only expectedValue) in the body. The added refineRegexPattern returns early unless both fields are in the same body, and the repository $sets the partial patch onto the stored value, so the save-time check is bypassed. The runtime RE2 change still covers the sink.", "where": "server/src/domain/monitors/monitor.repository.mongo.ts:274-283", "reason_to_dismiss": "The runtime matcher already uses RE2, so the save-time check is only UX; and PATCH semantics are 'validate what you send'.", "distance": "validation file -> domain repository, same server package", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "server/src/service/network/HttpProvider.ts:99", "sibling": "A header- or status-message matcher, or a second provider (e.g. a geo-check or JSON body provider) that reuses a copy of compare() with native RegExp", "why_realistic": "Providers are pluggable (IStatusProvider) and a maintainer adding matching to another monitor type would plausibly copy the old compare() helper."},
+    {"where": "server/src/domain/monitors/monitor.service.ts:592-603", "sibling": "An import/duplicate path that builds monitors from data the fixed zod schema never parses (e.g. a CSV import or a 'duplicate monitor' service call)", "why_realistic": "importMonitorsFromJSON already maps unvalidated-looking objects into createMonitors; a duplicate or template feature would naturally bypass the request schema."}
+  ],
+  "O9_family": "ReDoS (CWE-1333): user-controlled pattern compiled by a backtracking regex engine", "O9_dos": true,
+  "O10_build": {"language": "TypeScript (Node >=20)", "toolchain": "npm, tsc, jest (ESM via --experimental-vm-modules); the fix adds the native 're2' addon, which is not a dependency at the pinned commit", "services": ["MongoDB (for full API/worker; not needed for AdvancedMatcher/zod unit tests)", "Redis/queue for the worker (unverified)"], "offline_after_build": true,
+                "project_tests": "server/test/unit/providers/network/advancedMatcher.test.ts (regex/equal/include cases), server/test/unit/validation/monitorValidation.test.ts"},
+  "O11_fix_minutes": 25,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "server/src/service/network/AdvancedMatcher.ts, server/src/api/validation/monitorValidation.ts", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add a zod refine on POST /monitors that rejects 'dangerous' regexes, or wrap new RegExp in try/catch or a length cap, leaving the native backtracking engine running in the worker for stored, imported and PATCHed patterns."},
+  "out_of_scope_notes": [
+    "GET /monitors/team and /team/with-checks pass the 'filter' query string unescaped as a MongoDB $regex (server/src/domain/monitors/monitor.repository.mongo.ts:69,111); it is a different sink (DB engine, regex injection), not pursued."
+  ],
+  "unverified": [
+    "repo_mb: no shell available to measure tree size; tiny_repo/giant_repo not assessed (783+ tracked files, client+server monorepo, likely >5 MB).",
+    "Candidate metadata reports 21 fix sites in 10 files; the provided fix diff contains only 2 source files (AdvancedMatcher.ts, monitorValidation.ts) and no test changes. Other files may be missing from the diff.",
+    "Whether re2 prebuilt binaries install offline for the target Node version was not checked; a node-gyp fallback may need build tools.",
+    "Worker queue service dependency (Redis vs Mongo-backed queue) not checked.",
+    "present_in_latest for O8 is unknown (no latest release given).",
+    "Pattern A fit is weak: the only real sink is one function; the schema sites are WHERE-type siblings, and the family is resource exhaustion (lessons: 0 of 7 made hard)."
+  ]
+}

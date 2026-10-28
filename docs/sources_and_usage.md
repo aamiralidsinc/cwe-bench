@@ -39,6 +39,24 @@ each is pulled from and how, and which are held in reserve**. Plan, counts and r
 The NVD terms ask for the notice "This product uses the NVD API but is not endorsed or certified by
 the NVD."
 
+## Allocated to the diversity experiment (from 2026-10-27)
+
+The `diversity_population/` experiment takes its candidates **only** from the slices below, so it never competes with
+the main pipeline.
+
+| Id | Slice | Why it is separate |
+|---|---|---|
+| **D1** | S0 entries with status `deferred`, published 2025-01-01 to 2026-05-31 | the main pipeline's window starts on 2026-06-01, so it never reads them |
+| **D2** | R1–R3 entries in the sources2 index (any status), published from 2025-01-01 | the main pipeline reads only S0 |
+
+**Rules:**
+- **No shared repos.** D1 and D2 exclude any repo that has a candidate in the main pool, or that any pipeline has
+  built.
+- **One owner per slice.** If the main pipeline ever widens its window, or starts drawing on R1–R3, first agree which
+  side owns D1 and D2.
+- **Work on a copy.** The experiment fetches diffs and scores on its own copy of the index. The main index is read
+  only.
+
 ## Reserve: pulled, indexed, not used until S0 runs short
 
 | Id | Source | Pulled from | How | Local data | Licence / terms | Where it is | Pending (2026-10-24) |

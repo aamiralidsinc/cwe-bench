@@ -1,0 +1,83 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "91960", "advisory_ids": ["CVE-2026-47702", "GHSA-9C96-GCG3-2662"], "repo": "baptistearno/typebot.io",
+  "pinned_commit": "060033b8cf029b0a124f00d77d5d52b1a52c3dfd",
+  "fix_commits": ["fdcc1784c9318904c180703e1ef4f1e06e6dd50e", "31c360a342e40d1423e5421c046e8f821b1154c4"],
+  "trust_decision": {
+    "summary": "Whether a stored ApiToken row may hold the bearer secret itself: at the pinned commit the token is generated and persisted in plaintext at creation, and bearer auth compares the raw header value against the stored column, so a DB/backup reader gains full account access.",
+    "evidence": [
+      "apps/builder/src/features/user/server/handleCreateApiToken.ts:24-26",
+      "packages/auth/src/helpers/authenticateWithBearerToken.ts:9-11",
+      "apps/viewer/src/helpers/authenticateUser.ts:14-16",
+      "packages/prisma/postgresql/schema.prisma:71-78"
+    ]
+  },
+  "landing_point": {
+    "where": "apps/builder/src/features/user/server/handleCreateApiToken.ts:25",
+    "why": "The summary says 'API tokens stored in plaintext'; the only write of ApiToken.token is in the create handler behind POST /v1/users/me/api-tokens."
+  },
+  "fix_sites": [
+    {"where": "apps/builder/src/features/user/server/handleCreateApiToken.ts:24-33", "entry_point": "POST /v1/users/me/api-tokens (builder oRPC userRouter.createApiToken, apps/builder/src/features/user/server/routers.ts:48-60)", "module_kind": "HTTP handler (builder app)"},
+    {"where": "packages/auth/src/helpers/authenticateWithBearerToken.ts:4-17", "entry_point": "Bearer auth for every /api/* route in builder (apps/builder/src/app/api/[[...rest]]/route.ts:118-121) and viewer (apps/viewer/src/app/api/[[...rest]]/route.ts:97-98)", "module_kind": "shared auth library package (lower-level helper)"},
+    {"where": "apps/viewer/src/helpers/authenticateUser.ts:5-20", "entry_point": "none found at pinned commit: exported but no importer in the tree (second implementation of bearer lookup, Next pages-API style)", "module_kind": "second implementation / legacy helper (viewer app)"},
+    {"where": "fix.diff:125-139", "entry_point": "new helper packages/lib/src/apiToken.ts (hashApiToken/generateApiToken/isHashedApiToken) used by the three sites above", "module_kind": "shared library utility (new file)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "second_implementation", "where": "apps/viewer/src/helpers/authenticateUser.ts:10-20 (separate bearer lookup in the viewer app, same plaintext comparison, unreferenced at the pinned commit); also packages/auth/src/helpers/authenticateWithBearerToken.ts:9-11 sits in a different package from the landing point"},
+  "O3_reason_to_dismiss": "The viewer authenticateUser helper has no callers at the pinned commit (dead/legacy code), and the auth package 'only reads' tokens, so a solver fixing 'storage' can argue only the create handler writes the secret.",
+  "O4_distance": {"files": 3, "packages": 3, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Existing plaintext tokens already in the DB (and seeded test tokens) must keep authenticating after the change (the fix falls back to a raw lookup and rehashes on use), and the create response must still return the plaintext once for the UI copy dialog; hashing-only lookups or dropping the token from the create response break both.",
+    "where": "fix.diff:56-66; fix.diff:109-119; apps/builder/src/features/user/components/CreateApiTokenDialog.tsx:32; packages/playwright/src/databaseSetup.ts:62-79"
+  },
+  "O6_input_shapes": [
+    "newly created tokens (hashed at write, plaintext returned once)",
+    "legacy plaintext rows already stored (raw-match fallback, then rehash in place)",
+    "presented value that equals a stored hash (rejected via isHashedApiToken so the hash itself is not a credential)",
+    "Authorization header scheme variants: case-insensitive 'Bearer' and extra whitespace (regex replaces slice(7))"
+  ],
+  "O7_producer": {"kind": "handler", "where": "apps/builder/src/features/user/server/handleCreateApiToken.ts:24-26 produces the stored value; packages/auth/src/helpers/authenticateWithBearerToken.ts:9-11 consumes it", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {
+      "route": "DELETE /v1/users/me/api-tokens/{tokenId} returns the full deleted row including the stored token column via an output schema that declares `token`; untouched by the fix (after the fix it echoes the hash).",
+      "where": "apps/builder/src/features/user/server/handleDeleteApiToken.ts:10-16",
+      "reason_to_dismiss": "The token is being revoked in the same call, so echoing it is harmless; and after hashing it is 'only a hash'.",
+      "distance": "same directory as the landing point (apps/builder/src/features/user/server), separate handler and schema",
+      "present_in_latest": "unknown",
+      "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "apps/builder/src/features/user/server/handleListApiTokens.ts:18-22", "sibling": "a list/export path that selects the token column (e.g. for a 'last 4 chars' hint) and so keeps depending on plaintext storage", "why_realistic": "UIs commonly show a masked token suffix; a maintainer could add `token: true` to the select to build it."},
+    {"where": "packages/auth/src/helpers/authenticateWithBearerToken.ts:16-17", "sibling": "a second token source (query param ?token= or x-api-key header) in a separate helper that compares the raw value to the column", "why_realistic": "Webhook/embed integrations often cannot set headers; a fallback lookup in another package would be written independently of the hashed path."},
+    {"where": "packages/playwright/src/databaseSetup.ts:62-79", "sibling": "a seed/admin script or CLI in packages/scripts that inserts tokens directly with prisma.apiToken.create", "why_realistic": "Ops scripts that provision service users write rows directly and would skip the create handler's hashing (a producer the check never calls)."}
+  ],
+  "O9_family": "cleartext storage of credentials (CWE-312) / API-token at-rest protection", "O9_dos": false,
+  "O10_build": {
+    "language": "TypeScript",
+    "toolchain": "bun 1.3.9 workspaces + nx 22.5.4, Node 24, Prisma (package.json:30,62,67,72)",
+    "services": ["PostgreSQL (or MySQL) for Prisma"],
+    "offline_after_build": true,
+    "project_tests": "No unit tests for apiToken/auth at pinned commit; only Playwright e2e that use the seeded token (apps/viewer/src/test/chat.spec.ts:54, apps/viewer/src/test/webhookListener.spec.ts:30). Vitest exists for packages/lib (packages/lib/src/safeKy.test.ts)."
+  },
+  "O11_fix_minutes": 40,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1,
+        "j_sites_touched": "apps/builder/src/features/user/server/handleCreateApiToken.ts, packages/auth/src/helpers/authenticateWithBearerToken.ts, apps/viewer/src/helpers/authenticateUser.ts, packages/lib/src/apiToken.ts (new)",
+        "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Hash in handleCreateApiToken and in authenticateWithBearerToken only, comparing hash(header) to the column, which locks out every existing plaintext token and leaves the viewer helper and the delete response unchanged."},
+  "out_of_scope_notes": [
+    "Account model stores OAuth refresh/access/id tokens as plain String columns (packages/prisma/postgresql/schema.prisma:21-29); separate NextAuth concern, not pursued.",
+    "Migration packages/prisma/postgresql/migrations/20220603074700_add_tokens/migration.sql:21 copied legacy User.apiToken values into ApiToken in plaintext; historical, not a runtime route."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check performed).",
+    "present_in_latest for the delete route is unknown (no latest release given).",
+    "Whether apps/viewer/src/helpers/authenticateUser.ts is reachable via any dynamic import or non-TS file was checked only by text search across the tree (no importer found).",
+    "Advisory text itself was not available; trust decision inferred from the summary and the fix diff.",
+    "Whether a behavioural test harness can run the oRPC handlers without a live Postgres (e.g. prisma mock) was not checked."
+  ]
+}

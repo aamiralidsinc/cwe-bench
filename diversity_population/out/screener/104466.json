@@ -1,0 +1,87 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "104466",
+  "advisory_ids": ["GHSA-HV4V-F9V2-R8C2", "CVE-2026-95702"],
+  "repo": "google/gvisor",
+  "pinned_commit": "d6d96478d24c3e8f9b4e3df9ac553f4cb049205f",
+  "fix_commits": ["fd2f6b2674208086e324c2f739155eb7e1b48ff2", "90bc4fc36fe442257a06ba15df00371561c183ed", "25c75149bc0eeaa6a3a49b9bbe3473588b2af6df", "e4efb89c787ef15b09e68d561f1303380e1d5a77"],
+  "trust_decision": {
+    "summary": "VFS decides who owns the mount-point reference (parent mount + point dentry) of a lazily/partly umounted mount, and whether a detached (umounted) mount may be used as a bind source; at the pinned commit umount drops the whole mount-point ref early, and later disconnects of the partly-umounted mount drop nothing for the dentry, so the point dentry ref count is wrong (UAF / double put), and BindAt accepts an umounted nsfs/cgroupfs source.",
+    "evidence": [
+      "pkg/sentry/vfs/mount.go:1021-1034",
+      "pkg/sentry/vfs/dentry.go:341-347",
+      "pkg/sentry/vfs/mount.go:1220-1232",
+      "pkg/sentry/vfs/mount.go:791-795",
+      "pkg/sentry/vfs/mount.go:710-713"
+    ]
+  },
+  "landing_point": {
+    "where": "pkg/sentry/pgalloc/pgalloc.go:52",
+    "why": "The advisory summary names 'VFS MemoryFile' double free, so a summary-only reader goes to the MemoryFile allocator; none of the fix commits touch it. A reader who knows the area lands on umountTreeLocked (pkg/sentry/vfs/mount.go:986)."
+  },
+  "fix_sites": [
+    {"where": "pkg/sentry/vfs/mount.go:1021-1034", "entry_point": "umount2(2) with MNT_DETACH -> UmountAt -> umountTreeLocked (also InvalidateDentry -> forgetDeadMountpoint -> umountTreeLocked)", "module_kind": "core VFS mount-tree refcounting"},
+    {"where": "pkg/sentry/vfs/dentry.go:343-347", "entry_point": "unlink/rmdir/rename or filesystem revalidation of a mount point -> VirtualFilesystem.InvalidateDentry -> forgetDeadMountpoint", "module_kind": "core VFS dentry lifecycle (different file from umount code)"},
+    {"where": "pkg/sentry/vfs/mount.go:1220-1232", "entry_point": "last DecRef on a parent mount (close of last fd / cwd on a detached mount) -> Mount.DecRef -> Mount.destroy", "module_kind": "core VFS refcount destructor"},
+    {"where": "pkg/sentry/vfs/mount.go:791-795", "entry_point": "mount(2) MS_BIND [|MS_REC] (pkg/sentry/syscalls/linux/sys_mount.go:101-112) -> BindAt", "module_kind": "syscall-facing VFS API"},
+    {"where": "pkg/sentry/vfs/mount.go:710-713", "entry_point": "cloneMountTree, reached by BindAt recursive, open_tree(OPEN_TREE_CLONE|AT_RECURSIVE) (pkg/sentry/vfs/namespace.go:288), CLONE_NEWNS copy (pkg/sentry/vfs/namespace.go:212), mount propagation (pkg/sentry/vfs/propagation.go:323)", "module_kind": "shared internal helper"},
+    {"where": "pkg/sentry/socket/unix/transport/host.go:363-370", "entry_point": "poll/epoll on a host-backed unix socket -> HostSender.HostReadiness", "module_kind": "socket transport (unrelated subsystem bundled in the fix commits)"},
+    {"where": "pkg/sentry/socket/unix/transport/host.go:453-463", "entry_point": "checkpoint/save -> stateify beforeSave on SCMSender", "module_kind": "save/restore hook (unrelated subsystem bundled in the fix commits)"}
+  ],
+  "O1_entry_points": 4,
+  "O2_out_of_scope_site": {"kind": "wrapper_or_composition", "where": "pkg/sentry/vfs/dentry.go:343-347 (forgetDeadMountpoint, reached from InvalidateDentry on file deletion, not from umount) and pkg/sentry/vfs/mount.go:1224-1231 (Mount.destroy child cleanup)"},
+  "O3_reason_to_dismiss": "The comments at pkg/sentry/vfs/dentry.go:341-342 and pkg/sentry/vfs/mount.go:1220-1221 explicitly assert 'the mount point has already been decrefed by umount', so a solver who rebalances only umountTreeLocked can argue the destroy/forgetDeadMountpoint paths are already correct by design.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Locked children of a lazily umounted parent must stay connected (partly umounted) and keep the parent alive until its last reference drops; nsfs/cgroupfs/cgroup2fs mounts from another namespace must stay bindable non-recursively. An over-broad fix that always disconnects, or rejects all non-namespace bind sources, breaks these.",
+    "where": "pkg/sentry/vfs/mount.go:1025-1033; pkg/sentry/vfs/mount.go:957-980; pkg/sentry/vfs/mount.go:791-795"
+  },
+  "O6_input_shapes": [
+    "lazy umount (MNT_DETACH) of a parent with a locked child, child later disconnected by parent destroy",
+    "same, child later disconnected by mount-point invalidation (forgetDeadMountpoint)",
+    "non-recursive MS_BIND of a detached nsfs/cgroupfs/cgroup2fs mount",
+    "recursive MS_BIND|MS_REC of a mount outside the namespace (exemption removed for recursive)",
+    "recursive clone skipping umounted children (cloneMountTree)"
+  ],
+  "O7_producer": {"kind": "none", "where": "Reference ownership is produced by connectLocked (pkg/sentry/vfs/mount.go:1101-1127) and consumed by disconnectLocked (pkg/sentry/vfs/mount.go:1136-1164); no schema/serializer involved.", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "pkg/sentry/vfs/propagation.go:58-62", "sibling": "commitMount disconnects an existing child at the target point and drops its full mount-point ref; a partly umounted child found by mounts.Lookup would be double-put on the parent mount after the fix.", "why_realistic": "Partly umounted mounts stay in the mount hash table and the guard against mounting on umounted parents lives elsewhere (pkg/sentry/vfs/mount.go:453, pkg/sentry/vfs/propagation.go:269); removing or omitting one of those guards is a plausible maintainer slip."},
+    {"where": "pkg/sentry/vfs/mount.go:1059-1062", "sibling": "changeMountpoint drops the full old key; if called on an umounted-but-connected mount the parent ref is dropped twice.", "why_realistic": "Same disconnect-and-decref idiom used in umount propagation reparenting; a maintainer extending propagateUmount to restore umounted mounts would hit it."},
+    {"where": "pkg/sentry/vfs/mount.go:372-377", "sibling": "MoveMountAt submount disconnect drops the full old key without considering partly umounted state.", "why_realistic": "Move path checks umounted on the source (pkg/sentry/vfs/mount.go:592) but a variant lacking that check would be a natural sibling."}
+  ],
+  "O9_family": "memory safety / reference-count imbalance (use-after-free, double put) in Go refcounted VFS objects",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Go (sentry) plus C++ syscall tests",
+    "toolchain": "Bazel (BUILD files, go_test in pkg/sentry/vfs/BUILD); pkg/sentry/vfs unit tests are plain Go tests runnable without a sandbox",
+    "services": [],
+    "offline_after_build": true,
+    "project_tests": "pkg/sentry/vfs/mount_test.go (Go unit tests; fix adds TestPartlyUmountedMountKeepsMountpointRef, TestForgetDeadMountpointReleasesMountpointRef), test/syscalls/linux/cgroup.cc and cgroup2.cc (syscall tests needing runsc), pkg/sentry/socket/unix/transport (fix adds host_test.go)"
+  },
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "pkg/sentry/vfs/mount.go, pkg/sentry/vfs/dentry.go, pkg/sentry/socket/unix/transport/host.go, pkg/sentry/fsimpl/overlay/overlay.go",
+    "j_sibling_sites": "no",
+    "j_cause_other_layer": 0,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Drop the extra delayDecRef(mnt.getKey()) or add an IncRef in umountTreeLocked's restore branch only, leaving forgetDeadMountpoint and Mount.destroy (whose comments say the point is already released) leaking or still unbalanced."
+  },
+  "out_of_scope_notes": [
+    "HostSender.Readable polls c.fd without an fd<0 check (pkg/sentry/socket/unix/transport/host.go:373-378); unrelated to the VFS refcount property.",
+    "Advisory summary names 'VFS MemoryFile'; no fix commit touches pkg/sentry/pgalloc. The four commits look like a bundle of unrelated hardening (socket readiness, save idempotence, overlay refcount panic, VFS mount refcount)."
+  ],
+  "unverified": [
+    "Repo size in MB not measured (no shell available); O4 repo_mb left null. gVisor is large but well under 1.5 GB.",
+    "Commit 25c75149 (overlay IncRef panic) appears already present at the pinned commit: pkg/sentry/fsimpl/overlay/overlay.go:693-695 already contains the r <= 0 panic. Pinned tree may not be the exact parent of every fix commit.",
+    "Whether propagation.go:323 cloneMountTree (mount propagation) can reach umounted children of prevSrc was not traced.",
+    "Whether CLONE_NEWNS copy (pkg/sentry/vfs/namespace.go:212) can reach partly umounted mounts was not traced; ns.root's tree normally excludes umounted parents.",
+    "No latest release supplied; present_in_latest not applicable since O8 is empty.",
+    "Regression tests: grep found none of the added test names in pkg/sentry/vfs, pkg/sentry/socket/unix/transport or test/syscalls/linux/cgroup*.cc, and host_test.go does not exist at the pinned commit, so regression_tests_in_pinned_commit not flagged."
+  ]
+}

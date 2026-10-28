@@ -1,0 +1,108 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "91867",
+  "advisory_ids": ["CVE-2026-47218", "GHSA-CC25-VQ59-RCJX"],
+  "repo": "containerd/runwasi",
+  "pinned_commit": "d9154c263427ae6c462ba82c21d944b2d1cd58e8",
+  "fix_commits": ["5a8fc8e9ee0df28b0485da7419ee74c72127dfba", "d28ab73c2c8a6c50d1927078821bd418b9e51638"],
+  "trust_decision": {
+    "summary": "Whether wasm bytes may be fed to wasmtime's unsafe Module/Component::deserialize (native code, no sandbox) is decided purely by sniffing the bytes (detect_precompiled) in WasmtimeSandbox::execute and WasmtimeCompiler::compile, instead of by provenance (bytes produced by runwasi's own compiler and read back from the containerd cache).",
+    "evidence": [
+      "crates/containerd-shim-wasmtime/src/instance.rs:348-372",
+      "crates/containerd-shim-wasmtime/src/instance.rs:177-181",
+      "crates/containerd-shim-wasm/src/containerd/client.rs:537-559",
+      "crates/containerd-shim-wasm/src/containerd/client.rs:562-572"
+    ]
+  },
+  "landing_point": {
+    "where": "crates/containerd-shim-wasmtime/src/instance.rs:358",
+    "why": "The summary says 'forged Wasmtime precompiled layer'; the only unsafe { Module::deserialize } / Component::deserialize calls are in WasmtimeSandbox::execute, reached when bytes are not plain wasm but detect_precompiled matches."
+  },
+  "fix_sites": [
+    {"where": "crates/containerd-shim-wasmtime/src/instance.rs:342-374", "entry_point": "containerd task start of a wasm container -> Executor::exec -> Sandbox::run_wasi -> WasmtimeSandbox::execute (deserialize gated on provenance flag)", "module_kind": "engine runtime (sink)"},
+    {"where": "crates/containerd-shim-wasmtime/src/instance.rs:162-164", "entry_point": "Sandbox::run_wasi (passes Source::is_precompiled into execute)", "module_kind": "engine runtime"},
+    {"where": "crates/containerd-shim-wasmtime/src/instance.rs:177-181", "entry_point": "containerd task create -> Instance::new -> Client::load_modules -> Compiler::compile (forged layer was treated as 'already precompiled' and passed through unchanged)", "module_kind": "precompilation cache producer"},
+    {"where": "crates/containerd-shim-wasm/src/sandbox/context.rs:53-57", "entry_point": "public shared-crate type WasmLayer (serde-serialized across the zygote boundary)", "module_kind": "shared library data model / serialized state"},
+    {"where": "crates/containerd-shim-wasm/src/sandbox/context.rs:59-76", "entry_point": "public API Source::is_precompiled (new), covers Source::File rootfs route and Source::Oci route", "module_kind": "shared library API"},
+    {"where": "crates/containerd-shim-wasm/src/containerd/client.rs:522-525", "entry_point": "Client::load_modules first-run compile path (freshly compiled layer -> precompiled=true)", "module_kind": "containerd content-store client (shared crate)"},
+    {"where": "crates/containerd-shim-wasm/src/containerd/client.rs:555-558", "entry_point": "Client::read_precompiled_layer (cache hit via runwasi label -> precompiled=true)", "module_kind": "containerd content-store client / cache loader"},
+    {"where": "crates/containerd-shim-wasm/src/containerd/client.rs:568-571", "entry_point": "Client::read_original_layer (image layer -> precompiled=false; used with and without a compiler and as cache-miss fallback)", "module_kind": "containerd content-store client"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "crates/containerd-shim-wasm/src/containerd/client.rs:537-572 (provenance must be produced in the shared containerd client/cache loader, two crates away from the wasmtime sink) and carried through the serde-derived WasmLayer that crosses the zygote process boundary at crates/containerd-shim-wasm/src/sys/unix/container/container.rs:23-31 via crates/containerd-shim-wasm/src/sys/unix/container/instance.rs:86-121"
+  },
+  "O3_reason_to_dismiss": "The client.rs cache loader is shared infrastructure for every engine and 'just reads content from containerd', so a solver can argue the fix belongs only in the wasmtime crate (e.g. tighten detect_precompiled or check media type) and that the rootfs Source::File route is a different, non-OCI feature that users legitimately use for .cwasm files.",
+  "O4_distance": {"files": 3, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Legitimate cached precompiled layers (runwasi's own output read back via the runwasi.io/precompiled label) must still be deserialized, both on first run (freshly compiled) and on cache-hit runs, and plain wasm modules/components must still compile; an over-broad fix that never deserializes, or that drops the flag across the zygote serde boundary (#[serde(skip)] / side table), breaks the precompile cache tests.",
+    "where": "crates/containerd-shim-wasm/src/containerd/client.rs:436-450; crates/containerd-shim-wasmtime/src/tests.rs:48; crates/containerd-shim-wasmtime/src/tests.rs:86"
+  },
+  "O6_input_shapes": [
+    "precompiled core module bytes (Precompiled::Module) in an OCI wasm layer",
+    "precompiled component bytes (Precompiled::Component) in an OCI wasm layer",
+    "precompiled bytes in a rootfs file entrypoint (Source::File -> is_precompiled false)",
+    "forged layer reaching compile() on cache miss (detect_precompiled 'Already precompiled' pass-through)",
+    "layer marked precompiled whose bytes are not valid precompiled (now rejected in compile)"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "crates/containerd-shim-wasm/src/containerd/client.rs:537-559 (read_precompiled_layer, label-driven cache loader) and crates/containerd-shim-wasm/src/containerd/client.rs:452-529 (compile-and-store path)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {
+      "route": "WasmEdge shim loads OCI layer / rootfs bytes with Module::from_bytes using default config; WasmEdge's loader may execute an embedded AOT native section (universal wasm) from untrusted bytes, with no provenance check.",
+      "where": "crates/containerd-shim-wasmedge/src/instance.rs:98-99",
+      "reason_to_dismiss": "Different engine crate and a different precompiled format than the Wasmtime one named in the advisory; behaviour lives in the wasmedge-sdk dependency.",
+      "distance": "separate crate containerd-shim-wasmedge, 2 packages from the landing point",
+      "present_in_latest": "unknown", "latest_where": ""
+    },
+    {
+      "route": "WAMR shim loads bytes with Module::from_buf; WAMR's runtime load accepts AOT (native) files when built with AOT support, with no provenance check.",
+      "where": "crates/containerd-shim-wamr/src/instance.rs:47-58",
+      "reason_to_dismiss": "Different engine and format; whether AOT loading is compiled in depends on wamr-rust-sdk build flags outside this repo.",
+      "distance": "separate crate containerd-shim-wamr, 2 packages from the landing point",
+      "present_in_latest": "unknown", "latest_where": ""
+    }
+  ],
+  "O8b_injection_room": [
+    {"where": "crates/containerd-shim-wasm/src/containerd/client.rs:441-447", "sibling": "A second cache-read helper (e.g. reading the precompiled digest from an image-level label or annotation) that builds WasmLayer with precompiled=true from attacker-influenceable metadata.", "why_realistic": "The code already mirrors precompile labels onto the image info (client.rs:512-520) 'since image labels can be mutated'; a maintainer could add an image-label fast path for the cache."},
+    {"where": "crates/containerd-shim-wasm/src/sandbox/context.rs:122-126", "sibling": "A Source::File variant that trusts a '.cwasm' extension or sidecar file in rootfs as precompiled.", "why_realistic": "Pre-fix, precompiled files in rootfs worked; a maintainer restoring that feature would plausibly key it on file name rather than provenance."},
+    {"where": "crates/containerd-shim-wasmtime/src/instance.rs:173-196", "sibling": "A wasmtime component-linking path that deserializes additional (non-first) layers by sniffing, since Source::Oci docs allow several component layers.", "why_realistic": "context.rs:42-48 documents multi-layer components; adding linking would add a second deserialize site."}
+  ],
+  "O9_family": "Deserialization of untrusted data (CWE-502): unsafe native-code deserialization chosen by byte sniffing instead of provenance; sandbox bypass",
+  "O9_dos": false,
+  "O10_build": {
+    "language": "Rust",
+    "toolchain": "cargo workspace (stable Rust); wasmtime 36.0.10; wasmedge/wamr crates need native libs and are separate workspace members",
+    "services": ["containerd (for OCI-layer integration tests)", "root / Linux namespaces via youki libcontainer"],
+    "offline_after_build": true,
+    "project_tests": "crates/containerd-shim-wasm/src/containerd/client.rs:675-1022 (load_modules precompile tests with a fake Compiler, need containerd); crates/containerd-shim-wasmtime/src/tests.rs:48-110 (OCI precompile cache integration tests)"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "crates/containerd-shim-wasm/src/containerd/client.rs, crates/containerd-shim-wasm/src/sandbox/context.rs, crates/containerd-shim-wasmtime/src/instance.rs",
+    "j_sibling_sites": "unknown",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Inside WasmtimeSandbox::execute only, refuse or validate precompiled bytes by media type / magic / extra header check, leaving compile()'s 'Already precompiled' pass-through and the provenance-free cache loader untouched (or simply never deserialize, breaking the cache)."
+  },
+  "out_of_scope_notes": [
+    "read_precompiled_layer trusts a digest taken from a content label on the original layer (crates/containerd-shim-wasm/src/containerd/client.rs:543-549); who can write containerd content labels is a containerd-API trust question, not pursued.",
+    "WasmtimeCompiler::compile `continue`s without pushing on unknown binary types (crates/containerd-shim-wasmtime/src/instance.rs:186-189), causing a length-mismatch error; correctness bug, not security."
+  ],
+  "unverified": [
+    "O8 WasmEdge and WAMR routes: whether wasmedge-sdk 0.14 Module::from_bytes with default config executes an embedded AOT section, and whether wamr-rust-sdk v1.1.0 is built with AOT loading, could not be checked (dependency sources not readable under the limits).",
+    "Wasmer shim (crates/containerd-shim-wasmer/src/instance.rs:55-56) uses Module::from_binary, which is believed to compile only and not deserialize; not verified against the wasmer source.",
+    "repo_mb not measured.",
+    "Whether the project docs describe running precompiled .cwasm from rootfs as a supported feature was not checked.",
+    "Latest release is 'none', so present_in_latest is unknown for all routes."
+  ]
+}

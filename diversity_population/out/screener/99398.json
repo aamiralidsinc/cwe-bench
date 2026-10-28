@@ -1,0 +1,102 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "99398",
+  "advisory_ids": ["GHSA-RFX3-98H7-V3XP", "CVE-2026-75513"],
+  "repo": "jasperfx/marten",
+  "pinned_commit": "4b4dbd18cd2a42ef7cdaf548f9796523ce598508",
+  "fix_commits": ["a61ef90b210ab7981be7f622406e1c3e39fcc0f0", "61882d0424854cb48703f08bdb246894ac576bed"],
+  "trust_decision": {
+    "summary": "Runtime values (LINQ dictionary keys, projected constants, tenant ids) are treated as data by Marten's SQL generation only if each emitter quotes/escapes or binds them; at the pinned commit several emitters inline them raw into single-quoted SQL literals.",
+    "evidence": [
+      "src/Marten/Linq/Members/Dictionaries/DictionaryItemMember.cs:19",
+      "src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs:41",
+      "src/Marten/Linq/Parsing/SelectParser.cs:78",
+      "src/Marten/Internal/Operations/DeleteAllForTenant.cs:43-45",
+      "src/Marten/Events/Daemon/Internals/EventLoader.cs:145-147",
+      "src/Marten/Schema/DatabaseScopedTenantPartitions.cs:226"
+    ]
+  },
+  "landing_point": {
+    "where": "src/Marten/Linq/Members/Dictionaries/DictionaryItemMember.cs:19",
+    "why": "Summary says 'LINQ provider ... unescaped string literals'; the dictionary indexer key interpolated into ->> '{key}' is the most obvious LINQ literal built from a runtime value."
+  },
+  "fix_sites": [
+    {"where": "src/Marten/Linq/Members/Dictionaries/DictionaryItemMember.cs:19", "entry_point": "IQueryable<T>.Where/OrderBy/Select over x.Dict[key] (indexer resolved at src/Marten/Linq/Parsing/SimpleExpression.cs:372-374)", "module_kind": "LINQ member locator (core query builder)"},
+    {"where": "src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs:41", "entry_point": "Where(x => x.Dict.ContainsKey(k)) (src/Marten/Linq/Members/Dictionaries/DictionaryContainsKey.cs:32-34), x.Dict.Keys.Contains(k) (src/Marten/Linq/Members/Dictionaries/DictionaryKeysMember.cs:110), x.Dict.Any(p => p.Key == k) (src/Marten/Linq/Members/Dictionaries/DictionaryMember.cs:127)", "module_kind": "LINQ where-filter fragment"},
+    {"where": "src/Marten/Linq/Parsing/SelectParser.cs:78", "entry_point": "IQueryable<T>.Select(x => new P { Label = capturedString, ... })", "module_kind": "LINQ select projection parser"},
+    {"where": "src/Marten/Internal/Operations/DeleteAllForTenant.cs:43-45", "entry_point": "IEventStore.DeleteProjectionProgressAsync(database, name, tenantId) (src/Marten/DocumentStore.EventStore.cs:293) -> TeardownForTenant (src/Marten/Events/Daemon/AsyncOptionsExtensions.cs:44,49)", "module_kind": "internal storage operation (lower-level, event-daemon teardown; looks out of LINQ scope)"},
+    {"where": "src/Marten/Events/Daemon/Internals/EventLoader.cs:146", "entry_point": "async projection daemon / per-tenant rebuild with UseTenantPartitionedEvents (tenant from ShardName, src/Marten/Events/Daemon/Internals/EventLoader.cs:102-104)", "module_kind": "event daemon loader (raw SQL builder, looks out of LINQ scope)"},
+    {"where": "src/Marten/Events/Daemon/Internals/EventLoader.cs:341", "entry_point": "same daemon loader, MIN(seq) skip-ahead query", "module_kind": "event daemon loader (second query in same class)"},
+    {"where": "src/Marten/Schema/DatabaseScopedTenantPartitions.cs:226", "entry_point": "schema migration of managed tenant partitions (AddMartenManagedTenantsAsync / ApplyAllConfiguredChangesToDatabaseAsync); values hydrated from mt_tenant_partitions at src/Marten/Schema/DatabaseScopedTenantPartitions.cs:134-151", "module_kind": "schema/DDL partition builder fed from a reloaded registry table (save/reload)"}
+  ],
+  "O1_entry_points": 6,
+  "O2_out_of_scope_site": {
+    "kind": "save_reload_or_serialization",
+    "where": "src/Marten/Schema/DatabaseScopedTenantPartitions.cs:226 (tenant ids re-read from mt_tenant_partitions at src/Marten/Schema/DatabaseScopedTenantPartitions.cs:134-151 and emitted into FOR VALUES IN literals); also lower_level_api src/Marten/Internal/Operations/DeleteAllForTenant.cs:43-45"
+  },
+  "O3_reason_to_dismiss": "Tenant-side sites are not 'the LINQ provider', and code comments claim tenant ids are already validated by AssertValidPostgresqlIdentifiers (src/Marten/Events/Daemon/Internals/EventLoader.cs:141-144) — but that check only validates partition suffixes, not tenant ids (src/Marten/AdvancedOperations.cs:544, src/Marten/AdvancedOperations.cs:626-628).",
+  "O4_distance": {"files": 6, "packages": 5, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The daemon tenant predicate must stay an inline literal (not a bound parameter) so Postgres partition-prunes mt_events at plan time; fix must escape, not parameterize. Legit keys/labels containing quotes (e.g. O'Brien) must round-trip, and numeric HAVING constants (g.Count() > 1) must keep working.",
+    "where": "src/Marten/Events/Daemon/Internals/EventLoader.cs:140-147"
+  },
+  "O6_input_shapes": [
+    "string dictionary key via indexer x.Dict[key]",
+    "ContainsKey key via serializer ToCleanJson (string/object) and via Enum.ToString() bypassing the serializer (src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs:21)",
+    "ContainsKey via Keys.Contains and Any(p => p.Key == k) (second constructor, src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs:26-29)",
+    "captured string constant in Select projection (after quote-trimming)",
+    "tenant id in daemon WHERE literal (two queries)",
+    "tenant id in DELETE predicate (switched to bound parameter)",
+    "tenant id list in partition FOR VALUES IN DDL"
+  ],
+  "O7_producer": {
+    "kind": "cache",
+    "where": "src/Marten/Schema/DatabaseScopedTenantPartitions.cs:117-161 (per-database partition cache hydrated from mt_tenant_partitions)",
+    "check_calls_producer": false
+  },
+  "O8_uncovered_routes": [
+    {"route": "GroupBy HAVING resolver inlines comparison constants via ToString() with no quoting at all (g.Key == capturedString)", "where": "src/Marten/Linq/Parsing/GroupBySelectParser.cs:387-389", "reason_to_dismiss": "HAVING is an aggregate/numeric feature; string-key comparisons arguably 'never supported' (a plain string literal yields invalid SQL), so it looks like an unsupported combination rather than the reported literal-escaping bug", "distance": "different file and parser (Linq/Parsing/GroupBySelectParser.cs, wired from src/Marten/Linq/CollectionUsage.Compilation.cs:706-710); appended raw at src/Marten/Linq/Parsing/GroupBySelectParser.cs:459-463", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Same HAVING resolver, captured-local branch (TryToParseConstant) also inlines raw ToString()", "where": "src/Marten/Linq/Parsing/GroupBySelectParser.cs:405-407", "reason_to_dismiss": "same as above; looks like a fallback for evaluated numeric locals", "distance": "same file as previous route", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Select projection non-string constant branch emits raw.ToString() unquoted (e.g. char or captured object whose ToString carries text)", "where": "src/Marten/Linq/Parsing/SelectParser.cs:86", "reason_to_dismiss": "intended for numbers/bools; published fix only touched the string branch two lines above", "distance": "same function as fix site src/Marten/Linq/Parsing/SelectParser.cs:78", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "src/Marten/Linq/Members/QueryableMember.cs:48-50", "sibling": "base constructor builds JSONBLocator from the raw (unescaped) dictionary key before DictionaryItemMember overrides only RawLocator/TypedLocator; a consumer of JSONBLocator on a dictionary item would re-open the hole", "why_realistic": "a maintainer adding e.g. IsSupersetOf/containment support for dictionary items would naturally use member.JSONBLocator (as src/Marten/Linq/Parsing/Methods/IsSupersetOf.cs:28 does) — a how-type producer the fix never touched"},
+    {"where": "src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs:34-42", "sibling": "key text inside the '{a, b, key}' text-array path literal: escaping ' is fixed but path-array grammar (comma/brace/quote in key, enum branch unserialized) is a separator-split differential on the key's identity", "why_realistic": "path segments are joined by ', ' with no array-element quoting; a maintainer extending ContainsKey to nested dictionaries would add segments the same way"},
+    {"where": "src/Marten/Events/Projections/Flattened/SetValueMap.cs:34", "sibling": "flattened-table projection writes a configured value as '{_value}' literal", "why_realistic": "same quoting idiom; a variant fed by event data instead of configuration would be a natural feature addition"},
+    {"where": "src/Marten/Linq/Parsing/Operators/Ordering.cs:80-83", "sibling": "planted copy of the ngram-rank literal without the existing Replace(\"'\", \"''\")", "why_realistic": "the fix comments cite this as the escaping precedent; a second ranking operator copied from an older version would lack it"}
+  ],
+  "O9_family": "SQL injection (CWE-89) via runtime values interpolated into single-quoted SQL/DDL literals in a query builder", "O9_dos": false,
+  "O10_build": {
+    "language": "C#",
+    "toolchain": ".NET SDK for net9.0;net10.0 (Directory.Build.props:12), build/build.csproj",
+    "services": ["PostgreSQL 17 (custom image with PostGIS + pgvector, docker-compose.yml:3-18)"],
+    "offline_after_build": true,
+    "project_tests": "src/LinqTests (Bugs/ dictionary and select tests), src/CoreTests (DeleteAllForTenant unit test needs no DB), daemon tests for EventLoader; all LINQ tests need a live Postgres"
+  },
+  "O11_fix_minutes": 45,
+  "O12_red_flags": [],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A+B",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "src/Marten/Linq/Members/Dictionaries/DictionaryItemMember.cs, src/Marten/Linq/Members/Dictionaries/DictionaryContainsKeyFilter.cs, src/Marten/Linq/Parsing/SelectParser.cs, src/Marten/Internal/Operations/DeleteAllForTenant.cs, src/Marten/Events/Daemon/Internals/EventLoader.cs, src/Marten/Schema/DatabaseScopedTenantPartitions.cs",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 1,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Escape the dictionary indexer key in DictionaryItemMember (and maybe ContainsKey) only, trusting the 'already validated' comments on tenant-id sites and ignoring GroupBy HAVING."
+  },
+  "out_of_scope_notes": [
+    "Weasel's base ManagedListPartitions.Partitions() (external package, not in this repo) likely builds the same FOR VALUES literals; not checked.",
+    "ExplicitSql/OrderBySql/MatchesSql intentionally accept raw SQL (src/Marten/Linq/Parsing/SelectParser.cs:131-137) — by-design, not this advisory.",
+    "Patch expressions build a jsonpath string from constants (src/Marten/Linq/Parsing/JsonPathCreator.cs:115-116) but it travels inside a bound jsonb patch parameter; jsonpath-level injection, not SQL."
+  ],
+  "unverified": [
+    "repo_mb not measured (no shell size check).",
+    "Whether any current code path reads JSONBLocator of a DictionaryItemMember (src/Marten/Linq/Members/QueryableMember.cs:50) — hence O8b, not O8.",
+    "Whether System.Text.Json default encoder escapes ' as \\u0027 (making ContainsKey exploitable only under Newtonsoft, per the fix's own test comment).",
+    "present_in_latest for all O8 routes: no latest release provided.",
+    "Compiled-query variants of the dictionary indexer were not traced.",
+    "End-to-end exploitability of GroupBy HAVING with a string key was not run (reading only); SQL text inlining is confirmed at src/Marten/Linq/Parsing/GroupBySelectParser.cs:387-389 and 459-463."
+  ]
+}

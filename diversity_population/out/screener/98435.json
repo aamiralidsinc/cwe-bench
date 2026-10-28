@@ -1,0 +1,95 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "98435",
+  "advisory_ids": ["CVE-2026-72914", "BIT-MASTODON-2026-72914", "GHSA-7JVV-FHMG-WPFW"],
+  "repo": "mastodon/mastodon",
+  "pinned_commit": "9e5f298350d9b05dbb60ba122cd8cb72d40c8997",
+  "fix_commits": ["da47a1bd3cd07935d7ca55a1f4f1a76f7f167e0d", "18c61f286f1f5718a8f517940ba384866ffa3892", "930aa9fee26bf9eaefe27826fa1061288d83373b", "467c933459c7d0e5513475b9e4888afaedfb1074", "827f63a8fe976e07921ab0f5c9fcca8420c56858"],
+  "trust_decision": {
+    "summary": "Admin metrics API decides who may trigger expensive date-range analytics queries and how wide the range may be; the retention controller runs the cohort query in a before_action before `authorize :dashboard, :index?` (auth is skipped entirely without a token), and none of retention/measures/dimensions bound start_at..end_at.",
+    "evidence": [
+      "app/controllers/api/v1/admin/retention_controller.rb:6-7",
+      "app/controllers/api/v1/admin/retention_controller.rb:12",
+      "app/controllers/api/v1/admin/retention_controller.rb:18-24",
+      "app/controllers/api/base_controller.rb:90-92",
+      "app/lib/admin/metrics/retention.rb:18-23",
+      "app/lib/admin/metrics/retention.rb:90-100"
+    ]
+  },
+  "landing_point": {
+    "where": "app/controllers/api/v1/admin/retention_controller.rb:18-24",
+    "why": "Summary names the unauthenticated admin retention API; the before_action that eagerly calls `.cohorts` ahead of `authorize` is the obvious first stop."
+  },
+  "fix_sites": [
+    {"where": "app/controllers/api/v1/admin/retention_controller.rb:7", "entry_point": "POST /api/v1/admin/retention (config/routes/api.rb:326)", "module_kind": "controller: before_action made lazy (cohorts computed after authorize) + params.require(:start_at/:end_at)"},
+    {"where": "app/lib/admin/metrics/retention.rb:18-23", "entry_point": "POST /api/v1/admin/retention", "module_kind": "metrics library: range clamp to 31 days (day) / 12 months (month)"},
+    {"where": "app/controllers/api/v1/admin/measures_controller.rb:18-25", "entry_point": "POST /api/v1/admin/measures (config/routes/api.rb:324)", "module_kind": "sibling controller: params.require(:keys/:start_at/:end_at)"},
+    {"where": "app/lib/admin/metrics/measure/base_measure.rb:14-19", "entry_point": "POST /api/v1/admin/measures via Admin::Metrics::Measure.retrieve (app/lib/admin/metrics/measure.rb:21-26)", "module_kind": "base class in metrics library: 2-year clamp shared by 14 measure subclasses"},
+    {"where": "app/lib/admin/metrics/dimension/base_dimension.rb:14-20", "entry_point": "POST /api/v1/admin/dimensions (config/routes/api.rb:325) via Admin::Metrics::Dimension.retrieve (app/lib/admin/metrics/dimension.rb:16-21)", "module_kind": "base class in metrics library: conditional 2-year clamp; its controller app/controllers/api/v1/admin/dimensions_controller.rb was NOT changed"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "app/lib/admin/metrics/dimension/base_dimension.rb:14-20 (and app/lib/admin/metrics/measure/base_measure.rb:14-19): range clamp lives in the shared base classes behind the measures/dimensions endpoints, not in the retention path the report names"},
+  "O3_reason_to_dismiss": "Measures and dimensions compute lazily at render time, after `authorize` (app/controllers/api/v1/admin/measures_controller.rb:11-13, app/lib/admin/metrics/measure.rb:24 only instantiates), so they are not reachable unauthenticated; a solver can argue they are admin-only and outside an 'unauthenticated retention' report.",
+  "O4_distance": {"files": 6, "packages": 2, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "Admin instance-impact report posts to /api/v1/admin/measures with start_at: null / end_at: null for instance_accounts/follows/followers measures whose totals are not time-ranged; also dashboard retention uses frequency 'month' over 6 months and dimensions with small limits. A fix that requires/rejects missing dates or clamps too tightly breaks these. Note: the published fix's params.require(:start_at) on measures appears to break this null-date call itself (unverified).",
+    "where": "app/javascript/mastodon/components/admin/ImpactReport.jsx:30-37; app/lib/admin/metrics/measure/instance_accounts_measure.rb:14-24; app/views/admin/dashboard/index.html.haml:93-95"
+  },
+  "O6_input_shapes": [
+    "missing start_at/end_at (nil) -> params.require now 400s instead of nil-safe &.to_date (fix.diff:46-48, fix.diff:79-80)",
+    "very wide range with frequency=day (clamped to 31 days, fix.diff:134)",
+    "very wide range with frequency=month or invalid frequency falling back to day (fix.diff:131-134)",
+    "wide range on any of 14 measure keys via keys[] array (fix.diff:114)",
+    "wide range on dimension keys only when both dates present (fix.diff:95)"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "Dimensions endpoint: user-supplied `limit` is passed unbounded (to_i) into the SQL LIMIT of every dimension query; the fix clamped only the date range.",
+     "where": "app/lib/admin/metrics/dimension/base_dimension.rb:17",
+     "reason_to_dismiss": "Admin-only (computed after authorize), a row cap rather than an input-driven loop, and the dashboard always sends small limits (app/views/admin/dashboard/index.html.haml:72).",
+     "distance": "different controller and base class from the landing point (app/controllers/api/v1/admin/dimensions_controller.rb:23 -> app/lib/admin/metrics/dimension/*.rb)",
+     "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "Dimensions controller still reads params[:keys]/[:start_at]/[:end_at] without require and keeps them nil-tolerant, so the base_dimension clamp is skipped when either date is absent.",
+     "where": "app/controllers/api/v1/admin/dimensions_controller.rb:18-26",
+     "reason_to_dismiss": "Several dimensions (instance_accounts, space_usage, software_versions) legitimately ignore dates, and nil dates do not widen the scanned range.",
+     "distance": "sibling controller in the same directory",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "app/lib/activity_tracker.rb:26-27", "sibling": "a new admin/API caller passing a request-supplied start_at to ActivityTracker#get, which maps one Redis read per day", "why_realistic": "ActivityTracker already backs active_users/interactions measures (app/lib/admin/metrics/measure/active_users_measure.rb:19) and a public instance-activity endpoint (app/controllers/api/v1/instances/activity_controller.rb:39-47); a maintainer exposing a configurable window would forward params naturally."},
+    {"where": "app/lib/admin/metrics/measure/tag_accounts_measure.rb:23", "sibling": "a tag-history measure that overrides time_period or builds its own range from params, bypassing the base_measure clamp", "why_realistic": "Subclasses already call time_period.map per day; an override in one subclass is a plausible maintenance change and sits outside the base-class clamp (HOW-type)."},
+    {"where": "app/controllers/api/v1/admin/dimensions_controller.rb:7", "sibling": "a before_action that eagerly calls `.data`/`.map(&:data)` ahead of authorize, like the retention controller did", "why_realistic": "Identical controller template to retention; copying the old retention pattern is realistic."}
+  ],
+  "O9_family": "uncontrolled resource consumption (unbounded date-range analytics queries, quadratic cohort cross join) combined with authorization evaluated after expensive work in a before_action",
+  "O9_dos": true,
+  "O10_build": {
+    "language": "Ruby (Rails) + JS frontend",
+    "toolchain": "Ruby/Bundler, Rails, RSpec; Node/Yarn only for frontend assets",
+    "services": ["PostgreSQL", "Redis"],
+    "offline_after_build": true,
+    "project_tests": "spec/requests/api/v1/admin/retention_spec.rb, spec/requests/api/v1/admin/measures_spec.rb, spec/lib/admin/metrics/measure/*_spec.rb, spec/lib/admin/metrics/dimension/*_spec.rb, spec/lib/admin/metrics/measure_spec.rb, spec/lib/admin/metrics/dimension_spec.rb"
+  },
+  "O11_fix_minutes": 25,
+  "O12_red_flags": ["many_fix_commits"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "A",
+  "j": {
+    "j_multi_site": 1,
+    "j_sites_touched": "app/controllers/api/v1/admin/retention_controller.rb, app/controllers/api/v1/admin/measures_controller.rb, app/lib/admin/metrics/retention.rb, app/lib/admin/metrics/measure/base_measure.rb, app/lib/admin/metrics/dimension/base_dimension.rb",
+    "j_sibling_sites": "yes",
+    "j_cause_other_layer": 1,
+    "j_defence_ineffective": 0,
+    "j_overbroad_breaks_legit": 1,
+    "j_tempting_wrong_fix": "Move `.cohorts` after `authorize` (or call doorkeeper_authorize! unconditionally) in the retention controller only, leaving every date range unbounded for retention, measures and dimensions."
+  },
+  "out_of_scope_notes": [
+    "Fix commits bundle other advisories: app/lib/private_address_check.rb ipv4_compat SSRF fix (GHSA-vwhj-3g83-v276) and app/controllers/admin/collections_controller.rb policy fix (GHSA-hx34-2pfw-2qfj); not part of this advisory.",
+    "Commit 827f63a8 is only a version bump/changelog; the five commits are backports of one fix across 4.4/4.5/4.6/main."
+  ],
+  "unverified": [
+    "Whether params.require(:start_at) with a JSON null raises ParameterMissing and so breaks ImpactReport.jsx in the published fix (not run).",
+    "repo_mb not measured.",
+    "Whether the dimension `limit` is treated as within this advisory's property by maintainers; listed as a weak O8 route.",
+    "O13 recall risk estimated from the advisory being in a widely-read project's changelog; write-up extent not checked (no network)."
+  ]
+}

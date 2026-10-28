@@ -1,0 +1,79 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "81536",
+  "advisory_ids": ["CVE-2026-105140", "GHSA-929V-V9HQ-5XHR"],
+  "repo": "obot-platform/obot",
+  "pinned_commit": "2d2aaca9dc9b26777f8a2d213e0e1ec47f47508e",
+  "fix_commits": ["09e4d5b5d1e4a5f35a6cbcff96f3c460c3f9e278", "7ca8c2dbd9c85aea9833b7727ab52366de9aaca3", "6f81dac8d344cf6b2161f500460fb7b2a975c415"],
+  "trust_decision": {
+    "summary": "Which auth-provider group list becomes the user's stored memberships (and so their group-derived roles/access): at the pinned commit ensureGroups fetches over HTTP and persistGroups unconditionally reconciles group_memberships to that fetch, so a slower, stale fetch can commit after a newer one and re-insert a revoked membership; the fix makes the write a compare-and-swap on identities.auth_provider_groups_last_checked and stops other identity writes from rewriting that column.",
+    "evidence": [
+      "pkg/gateway/client/group.go:624-646",
+      "pkg/gateway/client/group.go:652-703",
+      "pkg/gateway/client/group.go:756-787",
+      "pkg/gateway/client/identity.go:444-455",
+      "pkg/gateway/client/auth.go:67-81",
+      "fix.diff:1086-1104"
+    ]
+  },
+  "landing_point": {"where": "pkg/gateway/client/group.go:612", "why": "ensureGroups is the only function that fetches provider groups and calls persistGroups; 'group membership refresh race' leads straight to it."},
+  "fix_sites": [
+    {"where": "pkg/gateway/client/group.go:624", "entry_point": "every authenticated HTTP request via UserDecorator.AuthenticateRequest -> EnsureIdentity -> ensureIdentityProviderData -> ensureGroups (pkg/gateway/client/auth.go:67, pkg/gateway/client/identity.go:100)", "module_kind": "core group-refresh logic (throttle check, now singleflight + cooldown + DB re-read)"},
+    {"where": "pkg/gateway/client/group.go:652", "entry_point": "same auth path; persistGroups gains the CAS claim on auth_provider_groups_last_checked (fix.diff:1086-1104)", "module_kind": "persistence / transaction"},
+    {"where": "pkg/gateway/client/identity.go:448", "entry_point": "same auth path; follow-up full-struct identity write of the new check time removed (fix.diff:1613-1631)", "module_kind": "caller-side write-back"},
+    {"where": "pkg/gateway/client/identity.go:497", "entry_point": "encryptAndUpdateIdentity, reached from ensureIdentity (identity.go:361) and lookup-ID persistence (identity.go:434-436) on the auth path", "module_kind": "generic ORM update helper (struct mapper)"},
+    {"where": "pkg/gateway/client/identity.go:146", "entry_point": "POST /api/encrypt-all-users (pkg/gateway/server/router.go:42 -> pkg/gateway/server/user.go:124)", "module_kind": "admin maintenance / re-encryption"},
+    {"where": "pkg/gateway/client/user.go:434", "entry_point": "GET /api/me (pkg/gateway/server/router.go:31 -> pkg/gateway/server/user.go:45 UpdateProfileIfNeeded)", "module_kind": "profile/icon refresh"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "save_reload_or_serialization", "where": "pkg/gateway/client/user.go:329-335 + pkg/gateway/client/user.go:430-435 (identity row loaded, provider profile fetched over HTTP at user.go:346, then the whole stale struct is written back with gorm Updates, rewriting auth_provider_groups_last_checked); same shape at pkg/gateway/client/identity.go:146 and pkg/gateway/client/identity.go:497"},
+  "O3_reason_to_dismiss": "UpdateProfileIfNeeded is an icon/display-name refresh on GET /api/me and EncryptIdentities is an admin re-encryption job; neither touches groups or group_memberships, so a solver can argue they are unrelated to a membership race, even though rewriting the timestamp column defeats any CAS keyed on it.",
+  "O4_distance": {"files": 3, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {
+    "what": "The HTTP fetch must stay outside any DB transaction (holding a pooled connection across it deadlocks in-process providers on the single SQLite connection), so the obvious 'lock the identity row across fetch+persist' fix is ruled out; first-ever refresh with a zero/NULL check time must still claim; profile icon, group lookup ID and user_id updates on the identity row must still persist; DeleteAuthProviderGroupData must still reset the check time.",
+    "where": "pkg/gateway/client/group.go:605-611; pkg/gateway/client/identity.go:96-101; pkg/gateway/client/identity.go:428-439; pkg/gateway/client/user.go:413-418; pkg/gateway/client/group.go:560-563"
+  },
+  "O6_input_shapes": [
+    "stored check time non-zero and unchanged since read (claim succeeds)",
+    "stored check time zero or NULL on a first refresh (claim uses '= ? OR IS NULL', fix.diff:1089-1092)",
+    "stored check time advanced by another flight/replica during the fetch (claim fails, fetched groups discarded, cached groups returned, fix.diff:1035-1039)",
+    "in-memory identity copy stale vs DB (re-read before fetch, fix.diff:1011-1017)",
+    "concurrent same-process callers (singleflight) and failed fetches (cooldown) - rate-limit side of the same commit"
+  ],
+  "O7_producer": {"kind": "mapper", "where": "gorm struct Updates of types.Identity, which writes every non-zero field including AuthProviderGroupsLastChecked (pkg/gateway/types/identity.go:23): pkg/gateway/client/identity.go:497, pkg/gateway/client/identity.go:146, pkg/gateway/client/user.go:434", "check_calls_producer": false},
+  "O8_uncovered_routes": [
+    {"route": "DeleteAuthProviderGroupData resets every identity's check time to zero; an in-flight refresh that itself read a zero check time can still pass the zero/NULL claim afterwards and re-create groups and memberships for the removed provider (ABA on zero)",
+     "where": "pkg/gateway/client/group.go:547-571",
+     "reason_to_dismiss": "provider deconfiguration cleanup is a separate controller feature, and the provider is probably unreachable by then",
+     "distance": "same file as the landing point",
+     "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pkg/gateway/client/identity.go:434-436", "sibling": "a second identity write-back path (e.g. persisting a refreshed ProviderGroupLookupID or email correction) using a full-struct tx.Save/Updates that rewrites auth_provider_groups_last_checked", "why_realistic": "the lookup-ID refresh already persists the whole struct after an HTTP call; a maintainer adding another provider-profile field would copy that pattern"},
+    {"where": "pkg/jwt/persistent/persistent.go:223", "sibling": "token/JWT auth path that triggers its own group refresh (fetch + reconcile) instead of only reading ListGroupIDsForUser", "why_realistic": "recent commit f385f2f3 added group population for token auth; a refresh-on-token variant in another package would be a real second implementation at distance"},
+    {"where": "pkg/gateway/server/apikey_auth.go:204", "sibling": "API-key auth path that refreshes groups from the provider with a separate persist helper lacking the claim", "why_realistic": "API keys need fresh group-based access too; a maintainer could add a refresh here in a different package"}
+  ],
+  "O9_family": "race condition / TOCTOU: stale concurrent write (lost update) restoring revoked authorization state",
+  "O9_dos": false,
+  "O10_build": {"language": "Go", "toolchain": "go 1.27 (go.mod:3); golang.org/x/sync v0.22.0 already required (go.mod:74)", "services": [], "offline_after_build": true,
+                "project_tests": "pkg/gateway/client/group_test.go (testGroupContext, seedGroups) and in-memory SQLite client from pkg/gateway/client/auditlogcleanup_test.go:15-19; fix adds pkg/gateway/client/group_refresh_test.go using httptest provider stubs"},
+  "O11_fix_minutes": 60,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "A",
+  "j": {"j_multi_site": 1, "j_sites_touched": "pkg/gateway/client/group.go, pkg/gateway/client/identity.go, pkg/gateway/client/user.go, pkg/gateway/client/client.go", "j_sibling_sites": "unknown",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Wrap ensureGroups in a per-identity mutex or singleflight: it only serialises one process, so another replica or a stale full-struct identity write (profile refresh, re-encryption) still lets an old fetch overwrite newer memberships."},
+  "out_of_scope_notes": [
+    "Commit 7ca8c2db is an unrelated UI/docs change (message policy nav links); commit 09e4d5b5 is the 0.25.x backport of 6f81dac8 - the pinned tree matches 6f81dac8's hunk offsets.",
+    "fix.diff also touches tools/dev.sh (printf format string), unrelated.",
+    "fetchGroups uses http.DefaultClient with no timeout at pkg/gateway/client/group.go:841 (fixed incidentally); resource-exhaustion, not pursued."
+  ],
+  "unverified": [
+    "O8 route (zero-ABA after DeleteAuthProviderGroupData) is from reading the code only; whether a refresh can actually be in flight while the provider is being deconfigured was not checked.",
+    "repo_mb not measured.",
+    "Whether the identity.go:361 write in ensureIdentity can actually carry a stale check time during a concurrent commit depends on SQLite/Postgres isolation; not verified.",
+    "present_in_latest unknown: no latest release supplied.",
+    "Distance is low (one package), so the Pattern A lever relies on the how-type mapper clobber rather than on distance."
+  ]
+}

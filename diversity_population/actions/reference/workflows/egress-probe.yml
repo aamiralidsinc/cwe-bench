@@ -1,0 +1,49 @@
+name: probe
+# Payload-free network-isolation probe. Answers: (1) does a container on an Actions runner have open
+# internet by default? (2) can we fully cut egress? (3) can we allow ONLY the model API (the policy
+# valid CWE-bench trials need)? Decides whether trials can run validly on Actions.
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 1) Baseline — default container egress (expect ALL reachable = open internet)
+        run: |
+          c(){ docker run --rm curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo FAIL; }
+          echo "example.com      -> $(c https://example.com)"
+          echo "github.com       -> $(c https://github.com)"
+          echo "api.deepseek.com -> $(c https://api.deepseek.com)"
+          echo "api.xiaomimimo   -> $(c https://api.xiaomimimo.com)"
+      - name: 2) Cut egress — docker --network none (expect ALL FAIL)
+        run: |
+          c(){ docker run --rm --network none curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo FAIL; }
+          echo "example.com      -> $(c https://example.com)"
+          echo "api.deepseek.com -> $(c https://api.deepseek.com)"
+      - name: 3) Allow ONLY the model API (iptables allowlist on a user bridge)
+        run: |
+          set -x
+          net=trialnet
+          docker network create --driver bridge --subnet 172.31.9.0/24 "$net"
+          # resolve model-API IPs on the host, allow only those out of the bridge subnet; drop the rest
+          ips=$(for h in api.deepseek.com api.xiaomimimo.com; do getent ahostsv4 "$h" | awk '{print $1}' | sort -u; done)
+          echo "model API IPs: $ips"
+          sudo iptables -N trialguard 2>/dev/null || sudo iptables -F trialguard
+          for ip in $ips; do sudo iptables -A trialguard -d "$ip" -j ACCEPT; done
+          sudo iptables -A trialguard -d 172.31.9.0/24 -j ACCEPT      # intra-net (DNS to docker)
+          sudo iptables -A trialguard -p udp --dport 53 -j ACCEPT     # DNS
+          sudo iptables -A trialguard -j REJECT
+          sudo iptables -I DOCKER-USER -s 172.31.9.0/24 -j trialguard
+          c(){ docker run --rm --network "$net" curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo FAIL; }
+          set +x
+          echo "RESULT example.com      -> $(c https://example.com)     (want FAIL/blocked)"
+          echo "RESULT github.com       -> $(c https://github.com)      (want FAIL/blocked)"
+          echo "RESULT api.deepseek.com -> $(c https://api.deepseek.com) (want reachable)"
+          sudo iptables -D DOCKER-USER -s 172.31.9.0/24 -j trialguard 2>/dev/null || true
+      - name: Verdict
+        run: |
+          echo "If step1=open, step2=all FAIL, step3 blocks example/github but allows deepseek,"
+          echo "then an iptables allowlist gives model-API-only egress on Actions -> valid trials here."

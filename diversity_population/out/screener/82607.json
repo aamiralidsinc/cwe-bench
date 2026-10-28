@@ -1,0 +1,58 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "82607", "advisory_ids": ["CVE-2026-109448", "GHSA-CMFX-RM3R-P2JR"],
+  "repo": "postgresql-interfaces/psqlodbc",
+  "pinned_commit": "bb536a1915f178a085bd7254b03dc4d862869a63",
+  "fix_commits": ["f6da5647355b110fc9cc005100e23ba980e20e33"],
+  "trust_decision": {
+    "summary": "An application-supplied parameter number (SQLUSMALLINT) is accepted as a binding count stored in SQLSMALLINT APD/IPD/put-data 'allocated' fields; the range check 1..SHRT_MAX lives in PGAPI_BindParameter and is ALREADY present at the pinned commit.",
+    "evidence": ["bind.c:36", "bind.c:61-70", "descriptor.h:146", "descriptor.h:164", "bind.h:96", "fix.diff:27"]
+  },
+  "landing_point": {"where": "bind.c:66", "why": "Summary names SQLBindParameter and the 32767 limit; PGAPI_BindParameter is the first stop, and the guard is already there at the pinned commit."},
+  "fix_sites": [],
+  "O1_entry_points": 2,
+  "O2_out_of_scope_site": {"kind": "lower_level_api", "where": "pgapi30.c:760-762 (APD SQL_DESC_COUNT) and pgapi30.c:921-922 (IPD SQL_DESC_COUNT) via PGAPI_SetDescField pgapi30.c:2112,2120"},
+  "O3_reason_to_dismiss": "SQLSetDescField(SQL_DESC_COUNT) is a descriptor API rather than SQLBindParameter, and the driver manager (unixODBC) is expected to reject negative counts before the driver sees them.",
+  "O4_distance": {"files": 2, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "Exactly 32767 bound parameters must still bind and execute, and SQL_DESC_COUNT=0 must still free/unbind all parameters; a guard using < instead of <= or rejecting 0 breaks these.", "where": "test/expected/param-count-limit.out:7-9; pgapi30.c:707-711"},
+  "O6_input_shapes": ["parameter number 0 (bind.c:66)", "parameter number 32768..65535 wrapping a SQLSMALLINT count (bind.c:66)"],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [
+    {"route": "SQLSetDescField(APD, SQL_DESC_COUNT, negative) sets apdopts->allocated negative without freeing; the next bind extends with a memset starting at a negative index.",
+     "where": "pgapi30.c:760-762", "reason_to_dismiss": "Descriptor API, not SQLBindParameter; driver manager may pre-validate the count.",
+     "distance": "different file (pgapi30.c) from landing point bind.c; sink at bind.c:543", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "SQLSetDescField(IPD, SQL_DESC_COUNT, negative) sets ipdopts->allocated negative; the next extend_iparameter_bindings memsets from a negative index.",
+     "where": "pgapi30.c:921-922", "reason_to_dismiss": "IPD is the implementation descriptor; a solver may treat it as read-mostly and outside the bind path.",
+     "distance": "pgapi30.c -> bind.c:576-577", "present_in_latest": "unknown", "latest_where": ""},
+    {"route": "SQLBindCol with column number 32768..65535 wraps the SQLSMALLINT ARD/getdata 'allocated'; a later extend_getdata_info copies with a size_t index bounded by the negative count.",
+     "where": "bind.c:255-259", "reason_to_dismiss": "Column binding, not parameter binding; the advisory only names SQLBindParameter and parameters.",
+     "distance": "same file, different function; sink bind.c:922-927", "present_in_latest": "unknown", "latest_where": ""}
+  ],
+  "O8b_injection_room": [
+    {"where": "pgapi30.c:691-712", "sibling": "parameter_bindings_set accepts any int count, including negative, and stores it in SQLSMALLINT allocated.", "why_realistic": "The helper is shared by SQL_DESC_COUNT and the per-record path; a maintainer guarding only the public bind call would naturally leave it alone."},
+    {"where": "pgapi30.c:501-522", "sibling": "column_bindings_set gets the same negative/oversized count from ARD SQL_DESC_COUNT.", "why_realistic": "ARD mirrors APD (descriptor.h:134-136 says APD must match ARD), so the bug pattern is shared."},
+    {"where": "bind.c:976-1007", "sibling": "extend_putdata_info memsets from &pdata[allocated] with a SQLSMALLINT allocated.", "why_realistic": "It is the same realloc+memset-from-old-count idiom as extend_parameter_bindings."}
+  ],
+  "O9_family": "integer overflow / signedness truncation (SQLUSMALLINT -> SQLSMALLINT count) leading to heap buffer underwrite (CWE-190, CWE-124)", "O9_dos": false,
+  "O10_build": {"language": "C", "toolchain": "autoconf/automake + gcc, libpq, unixODBC (driver manager) headers", "services": ["PostgreSQL server for the regression suite"],
+                "offline_after_build": true,
+                "project_tests": "test/src/param-count-limit-test.c with test/expected/param-count-limit.out (registered at test/tests:70); test/src/many-params-test.c"},
+  "O11_fix_minutes": 30,
+  "O12_red_flags": [],
+  "O13_recall_risk": "low",
+  "pattern_fit": "none",
+  "j": {"j_multi_site": 1, "j_sites_touched": "none (fix diff changes configure.ac, docs/release.html, version.h only)", "j_sibling_sites": "yes",
+        "j_cause_other_layer": 1, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Add 'ipar < 1 || ipar > SHRT_MAX' in PGAPI_BindParameter only, leaving descriptor SQL_DESC_COUNT and SQLBindCol unguarded."},
+  "out_of_scope_notes": [
+    "SC_scanQueryAndCountParams writes the placeholder count into SQLSMALLINT *pcpar (bind.c:485) and stmt->num_params is Int2 (statement.h:258); counts above 32767 could wrap, not pursued."
+  ],
+  "unverified": [
+    "CRITICAL: the published fix commit f6da564 contains no source changes (fix.diff:5-61: version bump and release notes only). The actual guard (bind.c:61-70) and its regression test (test/src/param-count-limit-test.c, test/tests:70) are already in the pinned tree, most likely from 86e4418 'Merge commit from fork'. The pinned commit is therefore post-fix for the advertised protection; the correct pin would be the parent of 86e4418 (not checked, since git history was not run).",
+    "regression_tests_in_pinned_commit was not listed because, by its strict definition, the fix diff adds no tests. In substance the advisory's regression test is already present at the pinned commit.",
+    "test/expected/param-count-limit.out:2,4 expects 07009 for SQL_DESC_COUNT=-1, but the driver code at pgapi30.c:760-762/921-922 returns SQL_SUCCESS. The expectation probably relies on the unixODBC driver manager rejecting negative counts (not verified, since no other repos were read), so O8 routes 1-2 may only be reachable without that DM.",
+    "Heap effect of SQLBindCol route (bind.c:922-927 size_t vs negative SQLSMALLINT) inferred from reading; not executed.",
+    "repo_mb unknown; psqlodbc is a single-directory driver and may meet tiny_repo (<5 MB), not measured.",
+    "present_in_latest unknown for all O8 routes (no latest release given)."
+  ]
+}

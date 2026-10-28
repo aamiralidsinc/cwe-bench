@@ -1,0 +1,61 @@
+{
+  "screener_version": "screener-v2", "lessons_version": "lessons-v2", "model": "claude-opus-5-5",
+  "entry_id": "98760",
+  "advisory_ids": ["GHSA-FM4F-G9JH-3QFQ", "CVE-2026-74222"],
+  "repo": "u-boot/u-boot",
+  "pinned_commit": "5c8ac7ebfcde2e9a40e7ad6d560145842359676f",
+  "fix_commits": ["a06e89ab05eaa2b8344d521319399333cd760ae5", "2d94618a58aeb7630f18eee33419ce48d0fd3616"],
+  "trust_decision": {
+    "summary": "The lwIP wget receive callback decides whether the TCP/TLS connection is still alive after it rejects a block (buffer-size or LMB check fails). It calls altcp_abort(), which frees the pcb (and through the err callback the httpc state), but then returns ERR_BUF instead of ERR_ABRT. The caller (tcp_in.c, or altcp_tls_mbedtls.c for HTTPS) then treats the pcb or state as live and stores the already-freed pbuf as refused data.",
+    "evidence": [
+      "net/lwip/wget.c:206-217",
+      "net/lwip/wget.c:152-171",
+      "lib/lwip/lwip/src/core/tcp_in.c:501-518",
+      "lib/lwip/lwip/src/apps/altcp_tls/altcp_tls_mbedtls.c:352-365",
+      "lib/lwip/lwip/src/apps/http/http_client.c:342-344",
+      "lib/lwip/lwip/src/apps/http/http_client.c:355-362",
+      "fix.diff:40-47"
+    ]
+  },
+  "landing_point": {"where": "net/lwip/wget.c:193", "why": "The summary names the lwIP wget receive callback, which is httpc_recv_cb, and its only error branch sits at net/lwip/wget.c:207-211."},
+  "fix_sites": [
+    {"where": "net/lwip/wget.c:209", "entry_point": "U-Boot shell command `wget` (cmd/lwip/wget.c:222), plus EFI HTTP boot (lib/efi_loader/efi_bootmgr.c:523) and EFI_HTTP_PROTOCOL via wget_request (lib/efi_loader/efi_net.c:1676)", "module_kind": "network application callback (lwIP HTTP client receive callback in U-Boot's lwIP glue)"}
+  ],
+  "O1_entry_points": 3,
+  "O2_out_of_scope_site": {"kind": "none", "where": "The HTTPS path through lib/lwip/lwip/src/apps/altcp_tls/altcp_tls_mbedtls.c:352-365 reaches the same callback, and the same one-line change closes it. No separate site exists."},
+  "O3_reason_to_dismiss": "Removing altcp_abort() and keeping ERR_BUF looks like a fix, and a solver could argue that the vendored lwIP core/TLS code is third-party and out of scope. It is not a fix: with a non-OK return, lwIP expects the callee to keep the pbuf (tcp_in.c:512-518), so freeing it at wget.c:216 is still a double free.",
+  "O4_distance": {"files": 1, "packages": 1, "repo_mb": null},
+  "O5_coupled_behaviour": {"what": "After the fix, failure reporting changes. httpc_result_cb suppresses the error message only for err == ERR_BUF, which is the headers_done oversize rejection that EFI HTTP relies on to re-request with a larger buffer. The abort path now arrives as ERR_ABRT through httpc_tcp_err. An over-broad fix that rewrites the err/ERR_BUF handling, or that makes headers_done abort as well, would break the EFI HTTP grow-buffer retry.", "where": "net/lwip/wget.c:228-231; net/lwip/wget.c:283-284; lib/efi_loader/efi_net.c:1671-1690"},
+  "O6_input_shapes": [
+    "body longer than wget_info->buffer_size (EFI HTTP sets buffer_size, net/lwip/wget.c:159)",
+    "body overlapping LMB-reserved memory or wrapping the address space when set_bootdev is set (net/lwip/wget.c:162-170)",
+    "plain HTTP (tcp_in.c refused_data route) and HTTPS (altcp_tls_mbedtls pass_rx_data route), both through the same callback"
+  ],
+  "O7_producer": {"kind": "none", "where": "", "check_calls_producer": null},
+  "O8_uncovered_routes": [],
+  "O8b_injection_room": [
+    {"where": "net/lwip/wget.c:283-284", "sibling": "headers_done callback that rejects an oversize Content-Length by calling altcp_abort() before returning an error, after which httpc_close/httpc_free_state reuses req->pcb", "why_realistic": "A maintainer who wants the oversize case to fail fast would naturally copy the abort-on-error idiom from the recv callback 70 lines above."},
+    {"where": "net/lwip/wget.c:213-217", "sibling": "a second abort-then-continue branch in the recv callback (for example an HTTP status or Content-Length mismatch check) that frees the pbuf and returns a non-ABRT error", "why_realistic": "The callback is the natural place for extra transfer validation, and the error-return contract is non-obvious (tcp.h:67-79)."}
+  ],
+  "O9_family": "memory safety: use-after-free / double free from a callback return-code contract violation (CWE-416)",
+  "O9_dos": false,
+  "O10_build": {"language": "C", "toolchain": "GNU make + gcc, Kconfig (sandbox defconfig with CONFIG_NET_LWIP and CMD_WGET)", "services": ["HTTP server reachable from the sandbox ethernet (or an emulated peer) to drive the receive path"], "offline_after_build": null, "project_tests": "test/cmd/wget.c (unit test, built via test/cmd/Makefile:45 for CONFIG_CMD_WGET; appears to target the legacy net/wget.c stack); test/py/tests/test_efi_loader.py references wget. No lwIP-specific wget test for the abort path was found."},
+  "O11_fix_minutes": 10,
+  "O12_red_flags": ["single_site"],
+  "O13_recall_risk": "medium",
+  "pattern_fit": "injection_only",
+  "j": {"j_multi_site": 1, "j_sites_touched": "net/lwip/wget.c", "j_sibling_sites": "no",
+        "j_cause_other_layer": 0, "j_defence_ineffective": 0, "j_overbroad_breaks_legit": 1,
+        "j_tempting_wrong_fix": "Drop the altcp_abort() call and keep returning ERR_BUF (or skip pbuf_free). This trades the UAF for a double free through refused_data, or for a stalled connection."},
+  "out_of_scope_notes": [
+    "net/lwip/wget.c:373-377: on ctrl-C the loop breaks without closing the httpc connection, while callback_arg points at the stack ctx of wget_do_request (net/lwip/wget.c:391); this may be a separate dangling-callback issue, not pursued.",
+    "Legacy stack net/wget.c uses a different TCP implementation (net/tcp.c stream callbacks) with no abort/return-code contract; not a sibling of this mechanism."
+  ],
+  "unverified": [
+    "repo_mb not measured.",
+    "Whether net_lwip_remove_netif() aborts pending pcbs (relevant only to the ctrl-C note).",
+    "Whether the sandbox lwIP build can exercise wget fully offline (offline_after_build left null).",
+    "Whether test/cmd/wget.c builds against the lwIP stack or only against the legacy stack.",
+    "present_in_latest not applicable: no O8 routes, and no latest release was given."
+  ]
+}
