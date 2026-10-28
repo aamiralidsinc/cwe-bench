@@ -27,7 +27,7 @@ tar -cf "$SNAP/before.tar" "tasks/$SLUG" "$B/manifest.json" $( [ -d "$B/checks" 
 before=$(fp)
 timeout 1200 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --restricted --safe-mode --strict-mcp-config --no-session-persistence \
-  --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$R" \
+  --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$R" --add-dir "$CWE_DATA_ROOT" \
   --output-format json > "$B/listing-run.json" 2> "$B/listing-run.err"
 rc=$?
 st=$(python3 "$CWE_AGENT_STATUS" "$B/listing-run.json" "$rc")

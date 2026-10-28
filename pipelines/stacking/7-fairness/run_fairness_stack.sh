@@ -25,7 +25,7 @@ echo "running" > "$B/fairness_status.txt"
 date -u +%FT%TZ > "$B/fairness_start.txt"
 timeout 2400 "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --restricted --safe-mode --strict-mcp-config --no-session-persistence \
-  --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$CWE_ROOT" \
+  --tools "Read,Grep,Glob,Write" --permission-mode acceptEdits --add-dir "$CWE_ROOT" --add-dir "$CWE_DATA_ROOT" \
   --output-format json > "$B/fairness-run.json" 2> "$B/fairness-run.err"
 rc=$?
 st=$(python3 "$CWE_AGENT_STATUS" "$B/fairness-run.json" "$rc" --details "$B/fairness_status.json")
