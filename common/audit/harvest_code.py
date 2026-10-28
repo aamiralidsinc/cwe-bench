@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import tarfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,27 +67,8 @@ def save_tmp_logs(out: Path, container: str) -> int:
     return n
 
 
-def harvest(trial: Path, stage: str, container: str = None, out: Path = None) -> dict:
-    out = out or trial / "final-code"
-    if out.exists():
-        return {"skipped": "final-code already exists"}
-    container = container or f"{trial.name.lower()}__env-main-1"
-    rc, image = sh("docker", "inspect", "-f", "{{.Image}}", container)
-    if rc != 0:
-        return {"error": f"container {container} not found"}
-    image = image.strip()
-    rc, diff = sh("docker", "diff", container)
-    changes = []
-    skipped = 0
-    for line in diff.splitlines():
-        kind, _, path = line.partition(" ")
-        if not path.startswith(ROOTS):
-            continue
-        if SKIP.search(path):
-            skipped += 1
-            continue
-        changes.append((kind, path))
-    # A changed directory shows up as "C /app/src": keep files only (decided below).
+def read_changes(container, image, changes):
+    """(patch lines, rows, rewritten-but-identical count) for the docker diff entries of a container."""
     orig_ctr = f"harvest-orig-{uuid.uuid4().hex[:8]}"
     unchanged = 0
     sh("docker", "create", "--name", orig_ctr, image, "true")
@@ -117,6 +99,42 @@ def harvest(trial: Path, stage: str, container: str = None, out: Path = None) ->
             rows.append((kind, path, len(new or old or b""), note))
     finally:
         sh("docker", "rm", "-f", orig_ctr)
+    return patch, rows, unchanged
+
+
+def harvest(trial: Path, stage: str, container: str = None, out: Path = None) -> dict:
+    out = out or trial / "final-code"
+    if out.exists():
+        return {"skipped": "final-code already exists"}
+    container = container or f"{trial.name.lower()}__env-main-1"
+    rc, image = sh("docker", "inspect", "-f", "{{.Image}}", container)
+    if rc != 0:
+        return {"error": f"container {container} not found"}
+    image = image.strip()
+    rc, diff = sh("docker", "diff", container)
+    if rc != 0:                                            # never record "no changes" from a failed diff
+        return {"error": f"docker diff {container} failed (exit {rc}); nothing written, retry later"}
+    changes = []
+    skipped = 0
+    for line in diff.splitlines():
+        kind, _, path = line.partition(" ")
+        if not path.startswith(ROOTS):
+            continue
+        if SKIP.search(path):
+            skipped += 1
+            continue
+        changes.append((kind, path))
+    # A changed directory shows up as "C /app/src": keep files only (decided below).
+    patch, rows, unchanged = read_changes(container, image, changes)
+    retried = False
+    if changes and not rows and not unchanged and any(k == "A" for k, _ in changes):
+        # Added paths but not one file read back: docker cp failed (a loaded daemon), not "no edits".
+        time.sleep(5)
+        patch, rows, unchanged = read_changes(container, image, changes)
+        retried = True
+        if not rows and not unchanged:
+            return {"error": f"{len(changes)} changed paths in docker diff but no file could be read from "
+                             f"{container}; nothing written, retry later"}
     out.mkdir()
     (out / "changes.patch").write_text("".join(patch))
     (out / "changed_files.tsv").write_text("kind\tpath\tbytes\tnote\n" +
@@ -125,7 +143,7 @@ def harvest(trial: Path, stage: str, container: str = None, out: Path = None) ->
     info = {"trial": str(trial), "container": container, "image": image, "stage": stage,
             "harvested_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "files_changed": len(rows), "skipped_build_or_cache_paths": skipped,
-            "rewritten_but_identical": unchanged,
+            "rewritten_but_identical": unchanged, "diff_entries": len(changes), "retried": retried,
             "truncated": len(changes) > MAX_FILES, "tmp_logs_saved": logs}
     (out / "HARVEST.json").write_text(json.dumps(info, indent=1))
     return info

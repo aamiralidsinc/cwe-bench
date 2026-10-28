@@ -12,8 +12,12 @@ Two modes, chosen the way Harbor chooses them (task.toml [verifier]):
     1. build the verifier image from tasks/<task>/tests/ (build context = tests/, its
        Dockerfile, no build args); the image owns /tests (no tests are copied in);
     2. start it like Harbor's compose service: `sh -c "sleep infinity"`, cpus / memory_mb /
-       network (no-network = --network none) / env from [verifier.environment], the result
-       folder bind-mounted at /logs/verifier;
+       network / env from [verifier.environment], the result
+       folder bind-mounted at /logs/verifier. no-network: Harbor's docker environment puts the verifier
+       behind an egress-control sidecar that denies all traffic, so the container keeps a bridge IPv4
+       address with no route out. The regrade matches that with an internal Docker network
+       (`docker network create --internal`); `--network none` would leave only loopback and fail
+       tests that need a non-loopback local address (stk-bifrost-19592, 2026-10-28);
     3. as root: create + chmod 777 /logs/verifier; for /logs/artifacts and every task.toml
        `artifacts` entry: empty the target dir (chmod 777) and `docker cp <host>/. <target>`;
     4. as root: chmod +x /tests/test.sh; then run
@@ -66,6 +70,7 @@ from cwe_reuse_tag import ensure_image_sync, reuse_tag  # noqa: E402  (images sh
 from harvest_code import save_tmp_logs  # noqa: E402
 
 CONVENTION_ARTIFACTS = "/logs/artifacts"   # Harbor's implicit artifact entry (agent publish dir)
+NO_NETWORK = "cwe-regrade-no-network"      # internal Docker network: a bridge address, no route out
 VERIFIER_LOGS = "/logs/verifier"
 
 
@@ -97,6 +102,33 @@ def reuse_image(context):
     except RuntimeError as e:
         sys.exit(f"image build failed ({context}):\n{e}")
     return tag
+
+
+def network_args(net, run=None):
+    """docker run arguments that give the verifier the network Harbor gave the original grading.
+    public: the default bridge. no-network: an internal network (created on first use), the equivalent of
+    Harbor's deny-all egress sidecar: the container has a non-loopback address and no outside access."""
+    run = run or sh
+    if net in (None, "", "public"):
+        return []
+    if net != "no-network":
+        sys.exit(f"verifier network_mode {net!r} is not supported by the regrade")
+    if run("docker", "network", "inspect", NO_NETWORK).returncode != 0:
+        r = run("docker", "network", "create", "--internal", "--label", "cwe.purpose=regrade-no-network",
+                NO_NETWORK)
+        if r.returncode != 0 and run("docker", "network", "inspect", NO_NETWORK).returncode != 0:
+            sys.exit(f"cannot create the internal network {NO_NETWORK}:\n{r.stderr}")   # (a parallel regrade may win)
+    return ["--network", NO_NETWORK]
+
+
+def refuse_empty_patch(trial):
+    """An empty saved patch next to a collected workspace that holds files means the harvest missed the
+    model's edits (docker diff/cp failed under load): grading the patch would grade the unmodified code."""
+    p = trial / "final-code" / "changes.patch"
+    ws = trial / "artifacts" / "workspace"
+    if p.is_file() and p.stat().st_size == 0 and ws.is_dir() and any(f.is_file() for f in ws.rglob("*")):
+        sys.exit(f"{trial.name}: final-code/changes.patch is empty but artifacts/workspace holds files: the harvest "
+                 "likely missed the edits; regrade from the workspace (drop --from-patch) or re-harvest")
 
 
 def start_env_container(name, image, mem, extra=()):
@@ -197,6 +229,7 @@ def env_mode(trial, task, tdir, cfg, out, why):
     code = trial / "final-code"
     if not (code / "changes.patch").is_file():
         sys.exit(f"no saved final code in {code}")
+    refuse_empty_patch(trial)
     mem = int((cfg.get("environment") or {}).get("memory_mb") or 4096)
     vtimeout = int((cfg.get("verifier") or {}).get("timeout_sec") or 1800)
     image = reuse_image(tdir / "environment")
@@ -270,6 +303,7 @@ def rebuild_inputs(trial, task, tdir, cfg, arts, tmp):
     code = trial / "final-code"
     if not (code / "changes.patch").is_file():
         sys.exit(f"no saved workspace usable and no saved final code in {code}")
+    refuse_empty_patch(trial)
     mem = int((cfg.get("environment") or {}).get("memory_mb") or 4096)
     image = reuse_image(tdir / "environment")
     name = f"regrade-ws-{trial.name.lower()}"
@@ -399,8 +433,7 @@ def verifier_mode(trial, task, tdir, cfg, out, why, from_patch, keep_image):
             run_args += ["--cpus", str(float(cpus))]
         if mem:
             run_args += ["--memory", f"{int(mem)}m"]            # compose mem_limit (no swap override)
-        if net == "no-network":
-            run_args += ["--network", "none"]
+        run_args += network_args(net)
         for k, val in start_env.items():
             run_args += ["-e", f"{k}={val}"]
         r = sh("docker", "run", "-d", *run_args, image, "sh", "-c", "sleep infinity")
@@ -422,6 +455,7 @@ def verifier_mode(trial, task, tdir, cfg, out, why, from_patch, keep_image):
             "test_sh_sha256": hashlib.sha256((tdir / "tests" / "test.sh").read_bytes()).hexdigest(),
             "files_applied": len(applied), "skipped": skipped,
             "verifier": {"build_context": str(tdir / "tests"), "cpus": cpus, "network": net,
+                         "docker_network": NO_NETWORK if net == "no-network" else "bridge",
                          "workdir": workdir, "user": user if user is not None else "image default",
                          "timeout_sec": vtimeout, "exec_env": sorted(exec_env)},
             "input": input_note, "restored": restored,
