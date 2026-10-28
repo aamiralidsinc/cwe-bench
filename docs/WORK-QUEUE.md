@@ -265,7 +265,7 @@ No job starts while any limit is exceeded:
 
 | Limit | Value |
 |---|---|
-| Running per kind (`[limits.max_running]`) | build 24, trial_run 56, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1, delivery_prep 1 |
+| Running per kind (`[limits.max_running]`) | build 24, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1, delivery_prep 1 |
 | Running in total (`max_running_total`) | 69 base; `[autolimit]` raises it in steps of 4 up to 85 after CPU idle stayed at 25% or more for 60 minutes with work queued, and steps back toward the base after 30 minutes at 5% idle or less (`autolimit.py`, table `autolimit`, event `limit.changed`) |
 | Free disk | a floor per kind (`[limits.disk_floor]`), read live from `limits.env` through `common/util/diskguard.py` |
 | Machine | maximum load, minimum available memory, ceiling on `/tmp` inodes (from the monitor's latest sample while it is under 2 minutes old, otherwise measured) |
