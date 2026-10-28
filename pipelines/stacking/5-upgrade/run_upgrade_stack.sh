@@ -66,7 +66,7 @@ for the CURRENT report. Rewrite again so every hidden trap it still labels NAMED
 GENERAL or ABSENT, under the same rules."
   timeout "${UPGRADE_TIMEOUT:-3600}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
     --restricted --safe-mode --strict-mcp-config --no-session-persistence \
-    --tools "Read,Grep,Glob,Edit,Write" --permission-mode acceptEdits --add-dir "$R" \
+    --tools "Read,Grep,Glob,Edit,Write" --permission-mode acceptEdits --add-dir "$R" --add-dir "$CWE_DATA_ROOT" \
     --output-format json > "$B/upgrade_stack-run$round.json" 2> "$B/upgrade_stack-run$round.err"
   rc=$?
   st=$(python3 "$CWE_AGENT_STATUS" "$B/upgrade_stack-run$round.json" "$rc")
