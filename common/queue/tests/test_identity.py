@@ -131,6 +131,39 @@ def test_stop_removes_the_jobs_compose_project(conn, monkeypatch):
     assert any("removed 2 container" in x for x in lines)
 
 
+def test_stop_removes_both_projects_networks(conn, monkeypatch):
+    """`docker rm` never removes a compose network (reports/gate-compose-rca-20261029.md): stop() also removes the
+    verifier project's containers and the networks of both of the trial's projects, and no other trial's."""
+    fake_start(monkeypatch)
+    jid, _ = qdb.enqueue(conn, "trial_run", "t-s2", {"model": "mimo"})
+    ctrs = [{"ID": "aaa", "Names": "t-s2__x__env-main-1", "State": "exited",
+             "Labels": f"cwe.job_id={jid},com.docker.compose.project=t-s2__x__env"},
+            {"ID": "vvv", "Names": "t-s2__x__verifier__trial-main-1", "State": "exited",
+             "Labels": "com.docker.compose.project=t-s2__x__verifier__trial"},
+            {"ID": "ccc", "Names": "other__y__env-main-1", "State": "running",
+             "Labels": "cwe.job_id=999,com.docker.compose.project=other__y__env"}]
+    nets = {"t-s2__x__env": "n-env", "t-s2__x__verifier__trial": "n-ver", "other__y__env": "n-other"}
+    calls = []
+
+    def docker(args):
+        calls.append(list(args))
+        live = [c for c in ctrs if c["ID"] not in {i for a in calls if a[:1] == ["rm"] for i in a}]
+        if args[:2] == ["ps", "-a"]:
+            return "\n".join(json.dumps(c) for c in live)
+        if args[:2] == ["ps", "-aq"]:
+            proj = args[3].split("=", 2)[2]
+            return "\n".join(c["ID"] for c in live if c["Labels"].endswith(f"project={proj}"))
+        if args[:3] == ["network", "ls", "-q"]:
+            return nets.get(args[4].split("=", 2)[2], "")
+        return ""
+    lines = identity.stop(conn, jid, docker=docker)
+    assert ["rm", "-f", "-v", "vvv"] in calls
+    removed = [n for a in calls if a[:2] == ["network", "rm"] for n in a[2:]]
+    assert sorted(removed) == ["n-env", "n-ver"]
+    assert not any("ccc" in a for a in calls if a[:1] == ["rm"])
+    assert any("1 more container(s) and 2 network(s)" in x for x in lines)
+
+
 # ---------- orphans
 
 def test_orphans_lists_what_no_live_job_owns(conn):

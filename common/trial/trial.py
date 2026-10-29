@@ -34,6 +34,7 @@ JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 sys.path.insert(0, str(paths.UTIL))
 import evidence as ev  # noqa: E402  (full error evidence: common/util/evidence.py)
 import diskguard  # noqa: E402  (disk-aware admission: common/util/diskguard.py)
+import compose_cleanup  # noqa: E402  (whole compose projects and their networks: common/util/compose_cleanup.py)
 # harvest_code, review_flags and postmortem (imported lazily below) live in common/audit/. Before the
 # 2026-10-25 reorganisation they sat next to this file in build/, where the script directory made them importable.
 sys.path.insert(0, str(paths.AUDIT_TOOLS))
@@ -75,12 +76,18 @@ KEPT = ROOT / "build" / "audit" / "kept_containers.tsv"
 
 
 def remove_container(container):
-    """Delete a kept container and the image Harbor built for it, plus its netguard sidecar
-    (never the shared cwe-netguard image)."""
+    """Delete a kept container and the image Harbor built for it, with the rest of its trial's compose projects
+    (never the shared cwe-netguard image).
+
+    Harbor runs trials with keep_containers=true (compose stop only), so the egress sidecar, the separate verifier's
+    containers and both compose networks (<trial>__env_default, <trial>__verifier__trial_default) are still there.
+    Each network holds one /24 of the 4,096-network pool (reports/gate-compose-rca-20261029.md), so the whole
+    trial goes, as `compose down` would."""
     image = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}}", container],
                            capture_output=True, text=True).stdout.strip()
     subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-    subprocess.run(["docker", "rm", "-f", container.replace("-main-1", "-netguard-1")], capture_output=True)
+    project = container[:-len("-main-1")] if container.endswith("-main-1") else container   # <trial>__env
+    compose_cleanup.remove_projects(compose_cleanup.harbor_projects(project))
     if image and not image.startswith("cwe-reuse/"):   # shared per-task image: aged out by hourly_cleanup.sh
         subprocess.run(["docker", "rmi", image], capture_output=True)   # fails harmlessly if shared
 

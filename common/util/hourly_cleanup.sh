@@ -2,6 +2,9 @@
 # hourly_cleanup.sh: the owner-approved Docker/disk cleanup, PERMANENT and part of the pipeline (owner decision
 # 2026-10-27). Removes only leftovers that nothing uses:
 #   1. stopped run containers that exited more than 1 h ago
+#   1b. leaked Harbor compose networks (<trial>__env_default, <trial>__verifier__trial_default) created more
+#      than 2 h ago that no container in any state references (common/util/compose_cleanup.py leaked); each holds
+#      one /24 of daemon.json's 4,096-network pool, which ran out on 2026-10-29 (reports/gate-compose-rca-20261029.md)
 #   2. per-run images (names with __<7 chars>__) older than 1 h; Docker refuses any image still in use
 #   3. gate-run folders under ~/.tb-graders/cwe/gate-jobs older than 1 h that no running gate names
 #   4. unused Docker build cache (docker builder prune --all; Docker keeps cache an active build uses)
@@ -35,6 +38,10 @@ pass() {
     done > /tmp/hc-containers.$$
   xargs -a /tmp/hc-containers.$$ -r -P 8 -n 20 sh -c 'timeout 300 docker rm -v "$@" > /dev/null 2>&1; true' _
   log "  stopped containers removed: $(wc -l < /tmp/hc-containers.$$)"
+  # 1b. leaked Harbor compose networks. `docker rm` of a run's containers (step 1, trial.py, identity.stop) never
+  #     removes the project's network; only `compose down` does. Serial, with a short pause, to spare the network
+  #     creates of live gates. Tasks under repair keep theirs; a network any container (kept ones too) uses stays.
+  log "  leaked compose networks: $(timeout 1800 python3 "$(dirname "$0")/compose_cleanup.py" leaked --min-age-h 2 --keep "$keep" --pause 0.2 --max-sec 1500 2>&1 | tail -1); networks now: $(timeout 120 docker network ls -q 2>/dev/null | wc -l)"
   # 2. per-run images older than 1 h
   timeout 300 docker images --filter "until=1h" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null |
     grep -E '__[a-z0-9]{7}__' | grep -viE "$keep" > /tmp/hc-images.$$

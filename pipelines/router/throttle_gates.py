@@ -37,11 +37,21 @@ for s in stop:
 print(f"gate processes {'killed' if apply else 'to kill'}: {total}")
 if apply:
     time.sleep(3)
-    names = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture_output=True, text=True).stdout.split()
-    rm = [n for n in names for s in stop if n.startswith(s.lower() + "__") or n.startswith(s + "__")]
+    rows = subprocess.run(["docker", "ps", "-a", "--format", '{{.Names}}\t{{.Label "com.docker.compose.project"}}'],
+                          capture_output=True, text=True).stdout.splitlines()
+    rows = [(r.split("\t") + [""])[:2] for r in rows if r.strip()]
+    hit = [(n, proj) for n, proj in rows for s in stop if n.startswith(s.lower() + "__") or n.startswith(s + "__")]
+    rm = [n for n, _ in hit]
     for i in range(0, len(rm), 40):
         subprocess.run(["docker", "rm", "-f"] + rm[i:i+40], capture_output=True)
     print("containers removed:", len(rm))
+    # `docker rm` never removes a compose network (each holds one /24 of the 4,096-network pool,
+    # reports/gate-compose-rca-20261029.md): remove the killed gates' compose projects whole, networks included.
+    sys.path.insert(0, str(paths.UTIL))
+    import compose_cleanup  # noqa: E402  (common/util/compose_cleanup.py)
+    projects = sorted({q for _, proj in hit if proj for q in compose_cleanup.harbor_projects(proj)})
+    n_ctr, n_net = compose_cleanup.remove_projects(projects)
+    print(f"compose projects removed: {len(projects)} ({n_ctr} more containers, {n_net} networks)")
     open("pipelines/router/out/queue/regate-b1.txt", "w").write("\n".join(stop) + "\n")
     print("re-gate list: pipelines/router/out/queue/regate-b1.txt")
 print("keep:", keep)

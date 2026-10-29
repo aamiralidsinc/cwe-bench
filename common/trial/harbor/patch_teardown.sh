@@ -1,40 +1,56 @@
 #!/bin/bash
-# (A) Harbor: make a compose-DOWN non-zero exit non-fatal (teardown/network-removal race under
-#     concurrency must not fail a run whose test already completed during 'up'). Backed up + ast-checked.
-# (B) gate_one_ds.sh: fix the stale-marker bug (remove the opposite marker when marking unsound).
-set -uo pipefail
-. "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
-D="$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker.py"
-cp "$D" "$D.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-python3 - "$D" <<"PY"
-import sys, ast
-p = sys.argv[1]; s = open(p).read()
-old = '''        if check and result.return_code != 0:
-            raise RuntimeError('''
-new = '''        if check and result.return_code != 0:
-            if "down" in full_command:
+# Re-apply harbor patch (A): a non-zero exit from `docker compose down` does not fail a run, but is logged.
+#
+# Why (2026-10-20): a teardown/network-removal race under concurrency failed runs whose tests had already finished,
+# so a failed `down` returns instead of raising. Since 2026-10-29 the branch also logs a warning first
+# ("compose down failed (rc N), ignored: ..."), in the trial's log: a failed `down` can leave the project's network
+# behind, and leaked networks exhausted Docker's address pool (reports/gate-compose-rca-20261029.md). The verdict
+# still ignores it.
+#
+# Idempotent: patches an unpatched docker.py, upgrades the 2026-10-20 silent version, and leaves the logging version
+# alone. Writes atomically (a harbor process starting meanwhile reads the old or the new file, never half of one)
+# after a backup and an ast check. Running harbor processes keep the code they loaded.
+# A harbor reinstall or upgrade reverts this patch: run this script again afterwards.
+# Usage (on the VM): bash common/trial/harbor/patch_teardown.sh
+#
+# (The old part B, a one-time fix to gate_one_ds.sh's stale .sound marker, is in common/gate/gate_one_ds.sh since
+# 2026-10-20 and was removed from this script: a release is read-only.)
+set -euo pipefail
+D="${HARBOR_DOCKER_PY:-$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages/harbor/environments/docker/docker.py}"
+[ -f "$D" ] || { echo "harbor docker.py not found: $D" >&2; exit 1; }
+python3 - "$D" <<'PY'
+import ast, os, shutil, sys, tempfile, time
+p = sys.argv[1]
+s = open(p).read()
+head = '''        if check and result.return_code != 0:
+'''
+silent = '''            if "down" in full_command:
                 return result  # teardown is best-effort; a network-removal race must not fail a completed run
-            raise RuntimeError('''
-n = s.count(old)
-assert n == 1, f"expected exactly 1 match, found {n}"
-s2 = s.replace(old, new)
-ast.parse(s2)  # fail loudly on any syntax error BEFORE writing
-open(p, "w").write(s2)
-print("harbor docker.py: patched + ast OK")
+'''
+logged = '''            if "down" in full_command:
+                # patched by common/trial/harbor/patch_teardown.sh: logged, then ignored for the verdict
+                self.logger.warning(
+                    f"compose down failed (rc {result.return_code}), ignored; the project's network may be left "
+                    f"behind: {(result.stdout or '')[-500:]} {(result.stderr or '')[-500:]}"
+                )
+                return result  # teardown is best-effort; a network-removal race must not fail a completed run
+'''
+if s.count(head) != 1:
+    sys.exit(f"expected exactly one '{head.strip()}', found {s.count(head)}: harbor changed; patch by hand")
+if head + logged in s:
+    print("already patched (teardown failures logged)"); sys.exit(0)
+if head + silent in s:
+    s2 = s.replace(head + silent, head + logged, 1); what = "silent teardown patch upgraded to a logged one"
+else:
+    s2 = s.replace(head, head + logged, 1); what = "teardown patch applied (logged)"
+ast.parse(s2)                                   # fail loudly on any syntax error BEFORE writing
+bak = p + ".bak-teardown-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+shutil.copy2(p, bak)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".docker.py.")
+with os.fdopen(fd, "w") as f:
+    f.write(s2)
+shutil.copymode(p, tmp)
+os.replace(tmp, p)
+print(f"patched: {what}; backup {bak}")
 PY
-echo "--- harbor patch verify ---"; grep -n -A3 "if check and result.return_code != 0:" "$D" | head -6
-echo "--- harbor still imports? ---"
-( cd "$HOME/.local/share/uv/tools/harbor/lib/python3.13/site-packages" && python3 -c "import ast; ast.parse(open('harbor/environments/docker/docker.py').read()); print('ast OK')" )
-cd "$CWE_ROOT"
-cp common/gate/gate_one_ds.sh "common/gate/gate_one_ds.sh.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-python3 - common/gate/gate_one_ds.sh <<"PY"
-import sys
-p=sys.argv[1]; s=open(p).read()
-old='else touch "build/$s/.unsound"; echo "$s unsound"'
-new='else rm -f "build/$s/.sound"; touch "build/$s/.unsound"; echo "$s unsound"'
-assert s.count(old)==1, f"gate_one_ds: expected 1 match, found {s.count(old)}"
-open(p,"w").write(s.replace(old,new))
-print("gate_one_ds.sh: stale-marker bug fixed")
-PY
-bash -n common/gate/gate_one_ds.sh && echo "gate_one_ds.sh: syntax OK"
-grep -n "\.sound\|\.unsound" common/gate/gate_one_ds.sh | tail -2
+grep -n -A4 'if "down" in full_command' "$D" | head -6

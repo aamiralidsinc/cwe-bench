@@ -165,10 +165,19 @@ WRONG_FIX_CLASSES = {
 }
 # Infrastructure errors worth one immediate in-place retry (Docker name lookups are flaky here).
 RETRYABLE = ("NetworkConnectionError", "Could not resolve", "ENOTFOUND", "TLS handshake")
+# Docker's address pool ran out (2026-10-29, reports/gate-compose-rca-20261029.md): `compose up` fails at once while
+# creating the project network. The pool frees up within seconds as other trials end, so the one trial is retried
+# in place after a randomised 30-60 s backoff (up to POOL_RETRIES times) instead of failing the whole stage.
+POOL_EXHAUSTED = re.compile(r"fully subnetted|could not find an available, non-overlapping IPv4 address pool")
+POOL_RETRIES = 2
+POOL_BACKOFF_SEC = (30, 60)
 # Known infrastructure signatures, seen on the VM, and the label the report gives them. Any
 # exception Harbor records for a trial is infrastructure (the trial did not run to a result);
 # the label only says which kind, so a person can tell a load flake from a broken Dockerfile.
 INFRA_SIGNATURES = [
+    (r"fully subnetted|could not find an available, non-overlapping IPv4 address pool",
+     "docker address pool exhausted: no free subnet for the compose network (leaked compose networks? "
+     "reports/gate-compose-rca-20261029.md)"),
     (r"network \S+ not found", "docker network vanished between create and attach"),
     (r"context deadline exceeded|Client\.Timeout|i/o timeout", "docker/compose timeout under load"),
     (r"only one connection allowed", "buildkit session collision"),
@@ -388,6 +397,40 @@ class global_slot:
             self.f.close()          # closing releases the lock
 
 
+def pool_exhausted(proc, trials) -> bool:
+    """True when the run failed because Docker had no free subnet for a compose network: Harbor made no trial and
+    said so, or the trial's recorded exception says so. A trial without an exception is never retried."""
+    if not trials:
+        return bool(POOL_EXHAUSTED.search(f"{proc.stdout}\n{proc.stderr}"))
+    for t in trials:
+        try:
+            exc = json.loads((t / "result.json").read_text()).get("exception_info")
+        except (json.JSONDecodeError, OSError):
+            continue
+        if exc and POOL_EXHAUSTED.search(json.dumps(exc)):
+            return True
+    return False
+
+
+def harbor_attempt(task_dir: Path, agent: str, label: str, sleep=None):
+    """One `harbor run` of the trial, run again in place (up to POOL_RETRIES times, 30-60 s apart) while Docker's
+    address pool is exhausted. Returns (job name, process, [trial folders with a result.json])."""
+    for pool_try in range(POOL_RETRIES + 1):
+        name = f"{task_dir.name}-{label}-{int(time.time())}"
+        cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
+               "--job-name", name, "-y", "-q", "--allow-agent-host", "api.deepseek.com", *REUSE_ARGS]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=harbor_env())
+        trials = [p for p in (JOBS / name).glob("*/") if (p / "result.json").exists()]
+        if pool_try < POOL_RETRIES and pool_exhausted(proc, trials):
+            delay = random.uniform(*POOL_BACKOFF_SEC)
+            print(f"[gate] {label}: docker address pool exhausted (job {name}); retrying this trial in place in "
+                  f"{delay:.0f} s ({pool_try + 1}/{POOL_RETRIES})", flush=True)
+            (sleep or time.sleep)(delay)
+            continue
+        return name, proc, trials
+    raise AssertionError("unreachable")
+
+
 def run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     with global_slot():
         return _run_harbor(task_dir, agent, label)
@@ -401,15 +444,11 @@ def _run_harbor(task_dir: Path, agent: str, label: str) -> dict:
     if problems:
         raise GateFailure(f"{label}: " + "; ".join(problems))
     wait_for_disk()
-    # No network prune here (removed 2026-10-20): pruning raced concurrent compose runs
-    # ("network ... not found"), and daemon.json now gives 172.16.0.0/12 in /24 pools
-    # (~4096 networks), so address-pool exhaustion is no longer a risk.
+    # No network prune here (removed 2026-10-20): pruning raced concurrent compose runs ("network ... not found").
+    # daemon.json gives 172.16.0.0/12 in /24 pools (4,096 networks), but leaked networks filled it on 2026-10-29;
+    # hourly_cleanup.sh now removes leaked Harbor networks, and harbor_attempt() retries a pool-exhausted trial.
     for attempt in (1, 2):
-        name = f"{task_dir.name}-{label}-{int(time.time())}"
-        cmd = ["harbor", "run", "-p", str(task_dir), "-a", agent, "-o", str(JOBS),
-               "--job-name", name, "-y", "-q", "--allow-agent-host", "api.deepseek.com", *REUSE_ARGS]
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=harbor_env())
-        trials = [p for p in (JOBS / name).glob("*/") if (p / "result.json").exists()]
+        name, proc, trials = harbor_attempt(task_dir, agent, label)
         if not trials:
             out = f"{proc.stdout}\n{proc.stderr}"
             if attempt == 1:

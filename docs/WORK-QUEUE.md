@@ -295,7 +295,7 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 | `audit_prep` | A failing run waits for its audit. Not for a task held or busy with a repair (its grading is about to change), and not when the run's model already solved the task. A folder prepared before a regrade is replaced. Also a repaired untrusted run whose regrade kept the reward (its old audit is carried over): it is audited again on the regrade (`untrusted.py` `reaudit`) | `postmortem.py prepare <trial>` |
 | `audit_record` | An auditor's `verdict.json` is not recorded yet, or a trial result is newer than the ledger | `postmortem.py record-ready`, then `audit_results.py` |
 | `fairness` | The ledger marks a batch task a BREAKER candidate, and no review is current or running. Never while held or busy. A review is current only when it is newer than the newest trial and was made on the current tests (see below) | the stacking or sibling fairness review |
-| `cleanup` | Every UTC hour | `common/util/hourly_cleanup.sh once` |
+| `cleanup` | Every UTC hour | `common/util/hourly_cleanup.sh once`; its step 1b removes leaked Harbor compose networks (see below) |
 | `step3` | Every UTC half hour | the router's step 3: routes stacked tasks any model solved into the general sibling pool and refreshes the pool file; never prepares or selects |
 
 - **A fresh review after a repair (2026-10-28).** The job records the tests hash the reviewer was shown in
@@ -304,6 +304,15 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
   `FAIRNESS.md.prev-<UTC>`. langflow-s3 and hypequery-s2 were stuck on the `{"after"}` key alone.
 - **Audit list.** Every pass rewrites `pipelines/router/out/queue/audit_ready.txt` with the prepared folders waiting
   for an auditor. The audit itself is an independent reviewer's job; the queue prepares and records.
+- **Leaked compose networks (step 1b, 2026-10-29).** Docker's pool (`172.16.0.0/12` in `/24`s) holds 4,096 networks,
+  and only `compose down` removes one. Paths that remove containers with `docker rm` leaked them until the pool ran
+  out and gates failed with "all predefined address pools have been fully subnetted"
+  (reports/gate-compose-rca-20261029.md). Every pass now runs `common/util/compose_cleanup.py leaked`: it removes,
+  one at a time with a 0.2 s pause, Harbor run networks (project label ending `__env` or `__verifier__trial`, name
+  `<project>_default`) created more than 2 h ago that no container in any state references, except those of tasks
+  under repair. It stops after 25 min and leaves the rest to the next pass. The log line is `leaked compose
+  networks: candidates N, removed R, in use U, failed F; networks now: T`. `trial.py remove_container`, `cweq stop` and `throttle_gates.py` remove a trial's compose projects whole
+  (`compose_cleanup.remove_projects`), and the gate retries a pool-exhausted trial in place (30–60 s backoff, twice).
 - **Pseudo tasks.** `audit_record`, `cleanup` and `step3` run as the pseudo tasks `_ledger`, `_machine` and
   `_router`.
 
@@ -461,7 +470,9 @@ Further rules:
 - **`cweq stop <id> [--grace N] [--why TEXT]`** stops one job. It works in this order:
   1. It checks that the recorded worker pid still has the recorded start time, so a reused pid is never signalled.
   2. It sends SIGTERM to the job's process group, then SIGKILL after the grace period.
-  3. It removes every container of the job's compose projects, sidecars included.
+  3. It removes every container of the job's compose projects, sidecars included. Since 2026-10-29 it also removes
+     the trial's other Harbor project (`<trial>__verifier__trial` for `<trial>__env`) and the networks of both:
+     `docker rm` never removes a compose network (reports/gate-compose-rca-20261029.md).
   4. It marks the job `blocked`.
 - **Log rotation.** The same compose override sets json-file log rotation (50 MB x 3) on `main` and on Harbor's
   egress-control sidecar, so every new pipeline container rotates its logs without a Docker daemon restart

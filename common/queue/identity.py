@@ -175,10 +175,18 @@ def stop(conn, job_id, grace=30, why="stopped by cweq stop", docker=None, sleep=
             out.append(f"#{job_id}: worker {p['worker_pid']} is gone or its pid was reused; nothing signalled")
     elif row["state"] in RUNNING:
         out.append(f"#{job_id}: no process record; nothing signalled")
+    projects = job_projects(job_id, docker=docker)       # read before the labelled containers go
     ids = job_containers(job_id, docker=docker)
     if ids:
         (docker or _docker)(["rm", "-f", *ids])
         out.append(f"#{job_id}: removed {len(ids)} container(s) of its compose project(s)")
+    # `docker rm` never removes a compose network; each holds one /24 of the 4,096-network pool
+    # (reports/gate-compose-rca-20261029.md). Remove the job's projects whole, as `compose down` would: the
+    # verifier project's containers too, then every network of both.
+    if projects:
+        n_ctr, n_net = _compose_cleanup().remove_projects(projects, docker=docker or _docker)
+        out.append(f"#{job_id}: compose projects {', '.join(projects)}: removed {n_ctr} more container(s) "
+                   f"and {n_net} network(s)")
     if row["state"] not in ("done", "failed", "blocked"):
         qdb.set_state(conn, job_id, "blocked", why)
         out.append(f"#{job_id}: blocked ({why})")
@@ -195,6 +203,25 @@ def _docker(args):
 def containers(label_filter=None, docker=None):
     args = ["ps", "-aq"] + (["--filter", f"label={label_filter}"] if label_filter else [])
     return [x for x in (docker or _docker)(args).split() if x]
+
+
+def _compose_cleanup():
+    import sys
+    util = str(Path(__file__).resolve().parents[1] / "util")
+    if util not in sys.path:
+        sys.path.insert(0, util)
+    import compose_cleanup                               # common/util/compose_cleanup.py
+    return compose_cleanup
+
+
+def job_projects(job_id, docker=None):
+    """The compose projects of the job's labelled containers, with each Harbor trial's other project
+    (<trial>__env and <trial>__verifier__trial), sorted."""
+    cc = _compose_cleanup()
+    projects = {c["labels"].get("com.docker.compose.project") for c in container_list(docker)
+                if c["labels"].get("cwe.job_id") == str(job_id)}
+    projects.discard(None)
+    return sorted({q for p in projects for q in cc.harbor_projects(p)})
 
 
 def job_containers(job_id, docker=None):
