@@ -135,9 +135,14 @@ def test_held_or_blocked_model_gets_no_run(root, conn, cfg):
     audit(t1, trusted=False, attribution="harness-or-infra")
     for n in (2, 3):
         run(root, "un-h", "mimo", n)
-    (root / "build" / "un-h" / "hold_mimo").write_text("blocked by the provider\n")
+    (root / "build" / "un-h" / "hold_mimo").write_text("paused while the harness is fixed\n")
     p3(conn, cfg)
-    assert trial_jobs(conn, "un-h") == []                           # hold_mimo: blocked models get no runs
+    assert trial_jobs(conn, "un-h") == []                           # hold_mimo: no runs of a held model
+    (root / "build" / "un-h" / "MIMO-BLOCKED.md").write_text("# MiMo verdict: blocked\n")
+    mm = read("un-h", cfg)["models"]["mimo"]
+    # blocked: never owed a run, even before the ledger cell says "blocked"
+    assert mm["rerun"] == [] and mm["untrusted"] == {}
+    (root / "build" / "un-h" / "MIMO-BLOCKED.md").unlink()
     (root / "build" / "un-h" / "hold_mimo").unlink()
     (root / "build" / "un-h" / ".hold-repair").write_text("repair in progress\n")
     p3(conn, cfg)

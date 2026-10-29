@@ -39,6 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import repairstep  # noqa: E402  (audits, repair folders and test versions; also puts common/ on sys.path)
+import markers  # noqa: E402
 import paths  # noqa: E402
 import qdb  # noqa: E402
 
@@ -166,8 +167,10 @@ def classify(slug, ctx=None):
 
 
 def for_model(slug, model, ledger_cell, ctx=None):
-    """The untrusted entries of one model, or [] when its ledger cell counts no untrusted audit."""
-    if not ledger_untrusted(ledger_cell):
+    """The untrusted entries of one model, or [] when its ledger cell counts no untrusted audit or the model is
+    blocked on the task (<MODEL>-BLOCKED.md, a hold_<model> that says blocked: never a run, even when the ledger
+    has not caught up with the block yet)."""
+    if not ledger_untrusted(ledger_cell) or markers.blocked(paths.BUILD / slug, model):
         return []
     try:
         return classify(slug, ctx).get(model, [])
