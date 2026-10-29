@@ -162,6 +162,12 @@ for d in dirs:
     except OSError:
         pass
 idirs = {os.path.dirname(p) for p in targets}
+if git_ok:
+    # The git baseline (A6) creates .git in the tree root after everything else, so the root folder's mtime is the
+    # baseline's time in every task: it says nothing about which files were patched. Left out of T3 (2026-10-28,
+    # seen on amqp091-go-s2 after B2b, whose patched files sit in the root).
+    D.pop("", None)
+    idirs.discard("")
 out["dir_mtime_cohort"] = cohort(lambda s: int(s.st_mtime), {d: _M(v) for d, v in D.items()}, idirs) if D else None
 if idirs and D:
     order = sorted(D, key=lambda d: D[d], reverse=True)

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[3]
-for p in ("common/gate", "common/builder", "common/harbor_ext", "common/audit", "common"):
+for p in ("common/gate", "common/builder", "common/harbor_ext", "common/audit", "common/util", "common"):
     sys.path.insert(0, str(REPO / p))
 
 import cwe_tree_reset  # noqa: E402
