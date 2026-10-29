@@ -226,7 +226,12 @@ class Job:
         return ["bash", SCRIPTS["stk" if self.slug.startswith("stk-") else "sibling"], self.slug]
 
     def run_agent(self, inputs, t0):
+        # REPAIR_ID (the inputs folder's UTC stamp) names this repair's folders: repaired-tests-<id>-repair/,
+        # removed-tests-<id>-repair/, history/<id>-repair.md. Until 2026-10-29 they carried the day only, so a second
+        # repair of a task on the same day reused the first one's folder, the job saw no new folder, failed the repair
+        # and restored the old tests (cline-s2 #2741).
         env = dict(os.environ, REPAIR_INPUTS=str(inputs), REPAIR_DATE=self.date, REPAIR_JOB=str(self.job_id or "manual"),
+                   REPAIR_ID=self.repair_id_of(inputs),
                    FAIRFIX_TIMEOUT=str(int(self.st["timeout_sec"])))
         argv = self.agent_argv(inputs)
         self.log("agent: " + " ".join(argv))
@@ -241,6 +246,12 @@ class Job:
         else:
             st = "ok" if rc == 0 else f"error: exit {rc}"
         return rc, st
+
+    @staticmethod
+    def repair_id_of(inputs):
+        """The repair's id: the UTC stamp of its repair-inputs-<UTC> folder (unique per repair)."""
+        name = Path(inputs).name
+        return name[len("repair-inputs-"):] if name.startswith("repair-inputs-") else utc_stamp()
 
     def static_ok(self):
         if not self.st["static_check"]:
@@ -348,11 +359,13 @@ class Job:
         if not changed:
             problems.append("the agent changed no gated file (tests/, solution/, checks/, manifest patch_checks)")
         if not any((b / n / "README.md").is_file() for n in new):
-            problems.append("no new repaired-tests-* / removed-tests-* folder with README.md")
+            rid = self.repair_id_of(inputs)
+            problems.append(f"no new repaired-tests-* / removed-tests-* folder with README.md (this repair's folder is "
+                            f"repaired-tests-{rid}-repair/ or removed-tests-{rid}-repair/)")
         hist = [p for p in (b / "history").glob("*repair*.md") if p.stat().st_mtime >= t0 - 2] \
             if (b / "history").is_dir() else []
         if not hist:
-            problems.append(f"no history/{self.date}-repair.md record")
+            problems.append(f"no history/{self.repair_id_of(inputs)}-repair.md record")
         if not problems:
             ok, why = self.static_ok()
             if not ok and pre_static[0]:

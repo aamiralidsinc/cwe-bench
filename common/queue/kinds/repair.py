@@ -65,6 +65,6 @@ register(Kind(name="repair", command=command, check=check, plan=plan, exclusive=
               reads=("<trial>/postmortem-*/POSTMORTEM.json", "<trial>/verifier/", "<trial>/final-code/",
                      "<trial>/agent/claude-code.txt", "build/<slug>/FAIRNESS.md", "build/<slug>/HUMAN-DECISION.md",
                      "build/<slug>/notes.md", "build/<slug>/history/"),
-              writes=("build/<slug>/repair-inputs-<UTC>/", "build/<slug>/repaired-tests-<date>-repair/",
-                      "build/<slug>/history/<date>-repair.md", "tasks/<slug>/tests/", "build/<slug>/.hold-repair",
+              writes=("build/<slug>/repair-inputs-<UTC>/", "build/<slug>/repaired-tests-<UTC>-repair/",
+                      "build/<slug>/history/<UTC>-repair.md", "tasks/<slug>/tests/", "build/<slug>/.hold-repair",
                       "build/<slug>/repair-<date>.log", "a regate job")))

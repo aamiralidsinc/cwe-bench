@@ -8,7 +8,9 @@
 #
 # Started by run_fairfix.sh / run_fairfix_stack.sh when REPAIR_INPUTS is set; the job sets it, never a person:
 #   common/launch/drive.sh deepseek python3 -I common/queue/repairjob.py SLUG     (the job runs the fairfix script)
-# Env: MODEL (drive.sh), REPAIR_INPUTS (build/SLUG/repair-inputs-<UTC>/), REPAIR_DATE (YYYYMMDD),
+# Env: MODEL (drive.sh), REPAIR_INPUTS (build/SLUG/repair-inputs-<UTC>/), REPAIR_DATE (YYYYMMDD), REPAIR_ID (the
+# repair's own id, the <UTC> of its inputs folder: it names repaired-tests-<id>-repair/, removed-tests-<id>-repair/ and
+# history/<id>-repair.md, so a second repair on the same day gets new folders; 2026-10-29, cline-s2 #2741),
 # FAIRFIX_TIMEOUT (default 10800). The job holds the task, backs it up, checks the agent's work and restores the
 # originals when a check fails: this script only runs the agent. No snapshot_experiment.sh here: a post-run repair
 # keeps the runs in jobs/ so the queue can regrade them on the repaired tests (the snapshot would move them away).
@@ -22,10 +24,12 @@ B=build/$SLUG
 [ -n "${MODEL:-}" ] || { echo "error: MODEL not set; the repair job launches this through common/launch/drive.sh deepseek" | tee "$B/repair_status.txt"; exit 1; }
 [ -d "${REPAIR_INPUTS:-}" ] || { echo "error: REPAIR_INPUTS is not a folder (${REPAIR_INPUTS:-unset})" | tee "$B/repair_status.txt"; exit 1; }
 D=${REPAIR_DATE:-$(date -u +%Y%m%d)}
-SCRATCH="$HOME/.tb-graders/cwe/work/$SLUG/repair-$D"
+ID=${REPAIR_ID:-$(basename "$REPAIR_INPUTS" | sed -n 's/^repair-inputs-//p')}
+[ -n "$ID" ] || ID=$(date -u +%Y%m%dT%H%M%SZ)
+SCRATCH="$HOME/.tb-graders/cwe/work/$SLUG/repair-$ID"
 mkdir -p "$SCRATCH"
 fill() { sed -e "s|{{SLUG}}|$SLUG|g" -e "s|{{ROOT}}|$CWE_ROOT|g" -e "s|{{INPUTS}}|$REPAIR_INPUTS|g" \
-             -e "s|{{DATE}}|$D|g" -e "s|{{SCRATCH}}|$SCRATCH|g"; }
+             -e "s|{{DATE}}|$D|g" -e "s|{{REPAIR_ID}}|$ID|g" -e "s|{{SCRATCH}}|$SCRATCH|g"; }
 P=$(sed -n '/^---8<---$/,$p' "$CWE_COMMON/fairness/REPAIR-BRIEF.md" | tail -n +2 | fill)
 # The other-reading check of the repair step (client audit PO-3, common/fairness/OTHER-READING-CHECK.md).
 if [ -f "$CWE_COMMON/fairness/OTHER-READING-CHECK.md" ]; then

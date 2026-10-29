@@ -191,18 +191,19 @@ FAKE_AGENT = r'''
 import json, os, sys, shutil
 from pathlib import Path
 slug, inputs, mode = sys.argv[1], Path(sys.argv[2]), os.environ.get("FAKE_MODE", "ok")
-t, b, date = Path("tasks") / slug, Path("build") / slug, os.environ["REPAIR_DATE"]
+t, b, rid = Path("tasks") / slug, Path("build") / slug, os.environ["REPAIR_ID"]
+assert os.environ["REPAIR_DATE"] == rid[:8] and inputs.name == "repair-inputs-" + rid
 assert (inputs / "FINDING.md").is_file() and (inputs / "INPUTS.md").is_file() and (inputs / "runs").is_dir()
 if mode == "no_repair":
     (inputs / "OUTCOME.json").write_text(json.dumps({"outcome": "no_repair_needed", "reason": "the audit is wrong"}))
     sys.exit(0)
-rep = b / f"repaired-tests-{date}-repair"
+rep = b / f"repaired-tests-{rid}-repair"                       # the brief's folder name: unique per repair
 (rep / "original").mkdir(parents=True)
 shutil.copy2(t / "tests/security/a_test.rs", rep / "original" / "a_test.rs")
 (rep / "README.md").write_text("why and what\n")
-(t / "tests/security/a_test.rs").write_text("new")
+(t / "tests/security/a_test.rs").write_text("new " + rid)
 (b / "history").mkdir(exist_ok=True)
-(b / "history" / f"{date}-repair.md").write_text("record\n")
+(b / "history" / f"{rid}-repair.md").write_text("record\n")
 (b / "notes.md").write_text("the agent wrote here\n")
 if mode == "instruction":
     (t / "instruction.md").write_text("Fix it, and here is the answer.\n")
@@ -248,6 +249,37 @@ def test_job_repairs_holds_and_queues_the_regate(tmp_path, conn, cfg, root):
     assert all(ok for _n, ok, _d, _p in kinds.get("repair").check("rp-a", {}, t0, c))
     # the finding is now covered by the new repair folder: nothing more to plan
     assert repairstep.findings("rp-a", c)["items"] == []
+
+
+def test_second_repair_on_the_same_day_gets_its_own_folder(tmp_path, conn, cfg, root):
+    """cline-s2 #2741: a second repair of a task on the same day reused repaired-tests-<date>-repair/, the job saw no
+    new folder, failed the repair and restored the old tests. Each repair now has its own folder (REPAIR_ID)."""
+    b, c = job_setup(tmp_path, root, cfg)
+    job = repairjob.Job("rp-a", c, job_id=21, conn=conn, proc_lister=lambda: [], out=lambda *_: None)
+    assert job.run(repairstep.findings("rp-a", c)["key"]) == repairjob.EXIT_REPAIRED
+    first, = b.glob("repaired-tests-*")
+    # a new audit after the first repair: a new finding, repaired again the same day
+    t = next((root / "jobs").glob("rp-a-m-r1/rp-a__T1"))
+    audit(t, [dict(UNFAIR, test="security::t_unfair_2")], stamp="20991231T000000Z")
+    key2 = repairstep.findings("rp-a", c)["key"]
+    assert key2 and repairstep.findings("rp-a", c)["items"]
+    time.sleep(1.1)                                          # the repair id is a UTC stamp to the second
+    job = repairjob.Job("rp-a", c, job_id=22, conn=conn, proc_lister=lambda: [], out=lambda *_: None)
+    assert job.run(key2) == repairjob.EXIT_REPAIRED
+    folders = sorted(p.name for p in b.glob("repaired-tests-*"))
+    assert len(folders) == 2 and first.name in folders
+    assert all(f.endswith("-repair") and f[len("repaired-tests-"):][:8] == folders[0][15:23] for f in folders)
+    inputs = sorted(b.glob("repair-inputs-*"))
+    assert [json.loads((i / "JOB-RESULT.json").read_text())["folder"] for i in inputs] == \
+        [f"repaired-tests-{i.name[len('repair-inputs-'):]}-repair" for i in inputs]
+    # every reader still sees both repairs: T1 coverage (a folder newer than the finding), the repair kind (R2), the
+    # marker list
+    second = [f for f in folders if f != first.name][0]
+    assert repairstep.covering(b, repairstep.folder_time(first) - 1) == second
+    assert reconcile.repair_kind("rp-a")[0] == "regrade"
+    assert [n for n, _t in repairstep.repair_folders(b)] == folders
+    import markers
+    assert markers.repairs(b) == folders
 
 
 def test_job_restores_the_originals_when_the_agent_edits_the_instruction(tmp_path, conn, cfg, root):

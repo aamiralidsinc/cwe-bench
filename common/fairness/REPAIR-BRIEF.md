@@ -8,7 +8,8 @@ The audit-driven brief of the repair step: the fairfix step restored as a work-q
   They append `common/fairness/OTHER-READING-CHECK.md` (when present) and, for a stacked task, the
   stacking addendum.
 - **What is sent:** only the text below the marker, with `{{SLUG}}`, `{{ROOT}}`, `{{INPUTS}}`, `{{DATE}}`,
-  `{{SCRATCH}}` filled in.
+  `{{REPAIR_ID}}`, `{{SCRATCH}}` filled in. `{{REPAIR_ID}}` is the UTC stamp of the repair's inputs folder: it names
+  the repair's folders, so a second repair on the same day never reuses the first one's (2026-10-29, cline-s2 #2741).
 - **Who holds the task:** the job, never the agent. It sets `.hold-repair` before the agent starts, checks the
   result in code, restores the originals when a check fails, queues the re-gate, and the queue lifts the hold
   after the regrades (reconcile R6).
@@ -62,7 +63,7 @@ put the task on hold. It re-gates and regrades every run after you, and it lifts
   - It computes expected values in the test. It needs no network.
 - **Keep the bite.**
   - Keep every assertion that is fair.
-  - Drop a case only when it cannot be made fair; a removal goes to `removed-tests-{{DATE}}/`.
+  - Drop a case only when it cannot be made fair; a removal goes to `removed-tests-{{REPAIR_ID}}-repair/`.
   - Never remove or weaken the test of a real unfixed upstream route, or of a route where the protection
     never existed, just because it is hard. Such a route is fair when the instruction's general property
     covers it.
@@ -98,17 +99,18 @@ put the task on hold. It re-gates and regrades every run after you, and it lifts
 
 ## Swap, and record
 
-1. Keep everything in build/{{SLUG}}/repaired-tests-{{DATE}}-repair/:
+1. Keep everything in build/{{SLUG}}/repaired-tests-{{REPAIR_ID}}-repair/ (a NEW folder: never write into an
+   earlier repair's folder, even one of today):
    - original/: the files before the repair;
    - new/: the repaired files;
    - tests.diff;
    - validation-results.txt;
    - README.md. Per finding item: the test, what was unfair, what you changed and why. Then the validation
      table: nop, oracle, every check patch, every run's old and new result.
-   Use removed-tests-{{DATE}}-repair/ with the same README for whole files you remove.
+   Use removed-tests-{{REPAIR_ID}}-repair/ with the same README for whole files you remove.
 2. Swap atomically, each file at once: stage the new file next to its target in the same folder, then
    `mv -f` it over the target. Touch every changed test file afterwards.
-3. Write build/{{SLUG}}/history/{{DATE}}-repair.md: the finding, the decision per item, the changes and the
+3. Write build/{{SLUG}}/history/{{REPAIR_ID}}-repair.md: the finding, the decision per item, the changes and the
    validation. Do not edit notes.md: it holds build facts only, and the job reverts any edit to it.
 4. Write {{INPUTS}}/OUTCOME.json:
    `{"outcome": "repaired" | "no_repair_needed" | "could_not_repair", "reason": "...", "folder": "repaired-tests-...",
