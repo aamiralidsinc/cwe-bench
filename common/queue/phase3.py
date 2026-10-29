@@ -19,6 +19,12 @@ These rules replace pipelines/router/scale_queue.py. They look only at tasks lis
       exactly one fresh run per such run: args {"model", "first_run", "max_runs": 1, "group", "version",
       "rerun_of": <the untrusted run's job>}, never a second one for the same run (any job with that rerun_of that
       is not superseded). Holds and max_launches apply as to every trial_run.
+      MiMo after DeepSeek (owner rule 2026-10-29, [phase3] mimo_after_deepseek, default on): MiMo's API concurrency is
+      limited, so no trial_run of mimo (first runs or the fresh runs of a stuck mimo) is planned until DeepSeek has 3
+      valid graded fails: its launch state (trial_state, not the audited ledger, so MiMo does not wait for audits)
+      is failed, or the ledger already says failed. Untrusted runs being re-run do not count (taskstate drops them).
+      DeepSeek solved (or blocked): MiMo is never planned, the task is not a breaker. Queued or running mimo jobs are
+      left alone. The note "mimo waits: DeepSeek has n/3 graded fails" says why (cweq explain prints it).
   P3  stage stale_gate -> regate {"fp", "listing"} (the same key phase-1 rule R1 uses, so the two never double up),
       except when reconcile rule R4 applies (tests only removed, both models already solved)
 
@@ -69,6 +75,20 @@ def rerun_plan(m, mm, version, active=()):
              "rerun_of": j} for i, j in enumerate(fresh)]
 
 
+def mimo_wait(t, p3):
+    """None when MiMo trials may be planned, else the note that says why not ([phase3] mimo_after_deepseek)."""
+    ds = t["models"].get("deepseek")
+    if not p3.get("mimo_after_deepseek", True) or ds is None:
+        return None
+    if ds["ledger"] == "solved" or (ds["launch"] == "solved" and ds["ledger"] != "failed"):
+        return "mimo not planned: DeepSeek solved the task (not a breaker; mimo_after_deepseek)"
+    if ds["ledger"] == "blocked":
+        return "mimo not planned: DeepSeek is blocked by the provider (mimo_after_deepseek)"
+    if ds["ledger"] == "failed" or ds["launch"] == "failed":
+        return None
+    return f"mimo waits: DeepSeek has {ds['graded']}/3 graded fails (mimo_after_deepseek)"
+
+
 def wants(t, cfg, conn, ctx_ledger=None, meta=None, reruns=None):
     """(jobs wanted [{kind, args}], notes) for one task reading. meta: its batch's header ({priority, hold}).
     reruns: untrusted.rerun_jobs() of this pass."""
@@ -93,6 +113,9 @@ def wants(t, cfg, conn, ctx_ledger=None, meta=None, reruns=None):
                 continue
             active = ((reruns or {}).get((slug, m)) or {}).get("active", set())
             if mm["launch"] == "stuck" and not rerun_plan(m, mm, version, active):
+                continue
+            if m == "mimo" and (why := mimo_wait(t, p3)):
+                notes.append(why)
                 continue
             if (paths.BUILD / slug / f"hold_{m}").exists():
                 notes.append(f"{m} held (hold_{m})")

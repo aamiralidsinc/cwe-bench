@@ -258,6 +258,14 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
       or rule T1 plans one): nothing until the repair, regrade or re-audit is done.
     Holds (`.hold-repair`, `hold_<model>`; a blocked model never gets a run) and `max_launches` apply as to every trial.
     `cweq explain <slug>` lists each untrusted run with its action.
+  - **MiMo after DeepSeek (owner rule 2026-10-29; `[phase3] mimo_after_deepseek = true`).** MiMo's API concurrency is
+    limited, so MiMo `trial_run` jobs (first runs and a stuck MiMo's fresh runs alike) are planned only once DeepSeek
+    has 3 valid graded fails: its launch state (`trial_state`, not the audited ledger, so MiMo does not wait for audits)
+    is `failed`, or its ledger cell already says failed. Untrusted DeepSeek runs being re-run do not count. Until then
+    only DeepSeek is planned and the reconcile report and `cweq explain <slug>` show `mimo waits: DeepSeek has n/3
+    graded fails`. If DeepSeek solves the task (or is blocked), MiMo is never planned (`mimo not planned: DeepSeek
+    solved ...`); the task stays in stage `waiting_trials` with that note. MiMo jobs already queued or running are left
+    alone. With the flag false, both models are planned side by side as before.
 - **Stale gate.** A sound task whose files changed since its gate gets a `regate`.
 - **Paused build.** A builder that ended with exit 124 long after its time limit (more than 25 % over) was paused and
   cut by its overdue timer when it resumed; it is not a timeout. Its stage is `build_interrupted` and it gets one

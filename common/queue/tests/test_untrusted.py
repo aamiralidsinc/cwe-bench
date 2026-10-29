@@ -195,6 +195,53 @@ def test_stuck_model_gets_one_fresh_run_per_untrusted_run(root, conn, cfg):
     assert read("un-s", cfg, ctx)["stage"] == "trials_stuck"
 
 
+# ---------------------------------------------------------------- mimo after DeepSeek (owner rule 2026-10-29)
+
+def ds_task(root, slug, untrusted_first=True):
+    """DeepSeek ran 3 graded fails; the first one's audit is untrusted (infra) when untrusted_first: owed a re-run."""
+    batch(root, "scale-b9", [slug])
+    built(root, slug)
+    (root / "tasks" / slug / "tests" / "security").mkdir(parents=True, exist_ok=True)
+    (root / "tasks" / slug / "tests" / "security" / "a_test.py").write_text("assert True\n")
+    for n in (1, 2, 3):
+        _job, t = run(root, slug, "deepseek", n)
+        audit(t, trusted=not (untrusted_first and n == 1), attribution="harness-or-infra" if untrusted_first and n == 1
+              else "model-failed")
+    return slug
+
+
+def test_untrusted_deepseek_run_being_rerun_does_not_count_for_mimo(root, conn, cfg):
+    ds_task(root, "mw-u")
+    ledger(root, [("mw-u", "0/2 so far, needs 3 [0.5, 0.5] (+1 audit: untrusted)", "", "open")])
+    rep = p3(conn, cfg)
+    assert [a["model"] for _s, a in trial_jobs(conn, "mw-u")] == ["deepseek"]       # DeepSeek's run is re-run
+    assert "mimo waits: DeepSeek has 2/3 graded fails (mimo_after_deepseek)" in rep["mw-u"]["notes"]
+    _j, t4 = run(root, "mw-u", "deepseek", 4)                                        # the fresh run fails: 3 valid
+    audit(t4)
+    rep = p3(conn, cfg)
+    assert sorted(a["model"] for _s, a in trial_jobs(conn, "mw-u")) == ["deepseek", "mimo"]
+
+
+def test_stuck_mimo_gets_no_fresh_run_before_deepseek_failed(root, conn, cfg):
+    slug = "mw-s"
+    batch(root, "scale-b9", [slug])
+    built(root, slug)
+    for n in (1, 2):
+        run(root, slug, "deepseek", n)
+    ledger(root, [(slug, "0/2 so far, needs 3 [0.5, 0.5]", "0/1 so far, needs 3 [0.8] (+6 provider stop) "
+                   "(+1 audit: untrusted)", "open")])
+    _j, t1 = run(root, slug, "mimo", 1, reward=0.0)
+    audit(t1, trusted=False, attribution="harness-or-infra")
+    for i in range(6):
+        log_row(root, slug, "mimo", None, f"{slug}-mimo-r{2 + i}-20261028-030000-n00{i}")
+    _j, t7 = run(root, slug, "mimo", 7, reward=0.8)
+    audit(t7)
+    assert read(slug, cfg)["models"]["mimo"]["launch"] == "stuck"
+    rep = p3(conn, cfg)
+    assert [a["model"] for _s, a in trial_jobs(conn, slug)] == ["deepseek"]
+    assert "mimo waits: DeepSeek has 2/3 graded fails (mimo_after_deepseek)" in rep[slug]["notes"]
+
+
 # ---------------------------------------------------------------- test faults: re-audit, wait, or re-run
 
 def repaired_task(root, slug, regrade_on_current=True, reward_after=0.5):

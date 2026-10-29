@@ -68,6 +68,7 @@ def test_running_or_unlisted_tasks_get_nothing(root, conn, cfg):
 
 
 def test_trial_rule_plans_runs_like_the_scheduler(root, conn, cfg):
+    cfg["phase3"]["mimo_after_deepseek"] = False           # flag off: both models side by side, as before 2026-10-29
     batch(root, "scale-b9", ["fresh-s2", "onefail-s2"])
     built(root, "fresh-s2")
     built(root, "onefail-s2", runs={"deepseek": [0.5], "mimo": [1.0]})
@@ -82,6 +83,7 @@ def test_trial_rule_plans_runs_like_the_scheduler(root, conn, cfg):
 
 
 def test_trial_rule_respects_ledger_holds_and_launch_limit(root, conn, cfg):
+    cfg["phase3"]["mimo_after_deepseek"] = False           # flag off: mimo planned whatever DeepSeek's state
     batch(root, "scale-b9", ["led-s2", "held-s2", "tired-s2"])
     built(root, "led-s2", runs={"deepseek": [0.5]})
     ledger(root, [("led-s2", "**failed 0/3** [0.5]", "", "open")])     # older version's runs gave deepseek a verdict
@@ -98,6 +100,63 @@ def test_trial_rule_respects_ledger_holds_and_launch_limit(root, conn, cfg):
     assert {a["model"] for _k, a in jobs_of(conn, "held-s2")} == {"deepseek"}
     assert "mimo held (hold_mimo)" in rep["held-s2"]["notes"]
     assert len(jobs_of(conn, "tired-s2")) == 3 and any("a person looks" in n for n in rep["tired-s2"]["notes"])
+
+
+def mimo_jobs(conn, task):
+    return [a for _k, a in jobs_of(conn, task) if a["model"] == "mimo"]
+
+
+def test_mimo_waits_until_deepseek_has_three_graded_fails(root, conn, cfg):
+    assert cfg["phase3"]["mimo_after_deepseek"] is True     # the default
+    batch(root, "scale-b9", ["ds0-s2", "ds1-s2", "ds2-s2", "ds3-s2"])
+    built(root, "ds0-s2")
+    built(root, "ds1-s2", runs={"deepseek": [0.5]})
+    built(root, "ds2-s2", runs={"deepseek": [0.5, 0.2], "mimo": [None]})
+    built(root, "ds3-s2", runs={"deepseek": [0.5, 0.2, 0.0]})
+    rep = p3(conn, cfg)
+    for slug, n in (("ds0-s2", 0), ("ds1-s2", 1), ("ds2-s2", 2)):
+        assert mimo_jobs(conn, slug) == [], slug
+        assert f"mimo waits: DeepSeek has {n}/3 graded fails (mimo_after_deepseek)" in rep[slug]["notes"]
+    assert {a["model"] for _k, a in jobs_of(conn, "ds0-s2")} == {"deepseek"}   # DeepSeek is still planned
+    v = taskstate.gate_sha16("ds3-s2")
+    assert mimo_jobs(conn, "ds3-s2") == [{"model": "mimo", "first_run": 1, "max_runs": 3, "group": 0, "version": v}]
+    assert not any("mimo waits" in n for n in (rep.get("ds3-s2") or {}).get("notes", []))
+    # the third DeepSeek fail lands: mimo is planned on the next pass
+    (root / "build" / "ds2-s2" / "runs_deepseek.log").write_text("".join(f"run {i} reward=0.5\n" for i in range(3)))
+    p3(conn, cfg)
+    assert [a["model"] for a in mimo_jobs(conn, "ds2-s2")] == ["mimo"]
+
+
+def test_deepseek_solved_means_no_mimo(root, conn, cfg):
+    batch(root, "scale-b9", ["dss-s2", "dsl-s2"])
+    built(root, "dss-s2", runs={"deepseek": [0.5, 1.0]})
+    built(root, "dsl-s2", runs={"deepseek": [0.5, 0.5, 0.5]})
+    ledger(root, [("dsl-s2", "**solved 1/3** [0.5, 1.0, 0.5]", "", "rejected")])   # a regrade solved it
+    rep = p3(conn, cfg)
+    for slug in ("dss-s2", "dsl-s2"):
+        assert jobs_of(conn, slug) == [], slug
+        assert any(n.startswith("mimo not planned: DeepSeek solved") for n in rep[slug]["notes"]), slug
+
+
+def test_mimo_gate_leaves_queued_mimo_jobs_alone(root, conn, cfg):
+    batch(root, "scale-b9", ["old-s2"])
+    built(root, "old-s2", runs={"deepseek": [0.5]})
+    v = taskstate.gate_sha16("old-s2")
+    jid, _ = qdb.enqueue(conn, "trial_run", "old-s2", {"model": "mimo", "first_run": 1, "max_runs": 3, "group": 0,
+                                                       "version": v}, origin="reconciler")
+    p3(conn, cfg)
+    assert qdb.get(conn, jid)["state"] == "queued" and len(mimo_jobs(conn, "old-s2")) == 1
+    starts, _waits = disp(conn, cfg).plan()                 # and the dispatcher still starts it
+    assert jid in [r["id"] for r, _ in starts]
+
+
+def test_mimo_gate_flag_off_plans_mimo_beside_deepseek(root, conn, cfg):
+    cfg["phase3"]["mimo_after_deepseek"] = False
+    batch(root, "scale-b9", ["off-s2"])
+    built(root, "off-s2", runs={"deepseek": [0.5]})
+    rep = p3(conn, cfg)
+    assert [(a["first_run"], a["max_runs"]) for a in mimo_jobs(conn, "off-s2")] == [(1, 3)]
+    assert not any("mimo" in n for n in rep.get("off-s2", {}).get("notes", []))
 
 
 def test_stale_gate_rule_shares_the_phase1_key(root, conn, cfg):
@@ -237,3 +296,12 @@ def test_starts_are_staggered_longer_during_the_first_fill(root, conn, cfg):
         qdb.enqueue(conn, "regrade", f"t{i}", {"trial": f"j/{i}"})
     d.tick()
     assert pauses[2:] == [1]
+
+
+def test_explain_prints_why_mimo_waits(root, conn, cfg, capsys):
+    import argparse
+    import cweq
+    batch(root, "scale-b9", ["why-s2"])
+    built(root, "why-s2", runs={"deepseek": [0.5, 0.5]})
+    assert cweq.cmd_explain(conn, cfg, argparse.Namespace(task="why-s2")) == 0
+    assert "phase3       mimo waits: DeepSeek has 2/3 graded fails (mimo_after_deepseek)" in capsys.readouterr().out

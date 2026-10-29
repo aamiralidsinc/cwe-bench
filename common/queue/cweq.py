@@ -418,6 +418,11 @@ def cmd_explain(conn, cfg, a):
         ctx.update(cfg=cfg, reruns=untrusted.rerun_jobs(conn), repairs_active=untrusted.active_repairs(conn))
         st = taskstate.read(a.task, ctx)
         print(f"  stage        {st['stage']}: {st['next']}")
+        import phase3                                    # why phase 3 plans no build or trial (e.g. "mimo waits")
+        _w, p3notes = phase3.wants(st, cfg, conn, ctx["ledger"], (ctx.get("batch_meta") or {}).get(st["batch"]),
+                                   ctx["reruns"])
+        for n in p3notes:
+            print(f"  phase3       {n}")
         if any(untrusted.ledger_untrusted(c) for c in (ctx["ledger"].get(a.task) or {}).values()):
             for m, entries in sorted(untrusted.classify(a.task, ctx).items()):
                 why = untrusted.markers.blocked(paths.BUILD / a.task, m)

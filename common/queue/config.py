@@ -23,7 +23,7 @@ DEFAULTS = {
     "dispatch": {"tick_sec": 30, "start_spacing_sec": [2, 8], "fill_spacing_sec": [15, 40], "max_starts_per_tick": 3,
                  "lease_sec": 600, "aging_per_hour": 10, "max_running_total": 69, "max_running_per_task": 6,
                  "trials_wait_builds": 20},
-    "phase3": {"enabled": True, "batches": [], "max_launches": 3},
+    "phase3": {"enabled": True, "batches": [], "max_launches": 3, "mimo_after_deepseek": True},
     "phase4": {"enabled": True, "audits": True, "fairness": True, "cleanup": True, "step3": True},
     "build_resume": {"auto_timeouts": False, "max_auto_resumes": 1},
     "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True,
