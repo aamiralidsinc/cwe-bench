@@ -6,6 +6,7 @@ Tests: `python3 -m pytest common/queue/tests` (Python 3.11 or newer, for `tomlli
 One queue starts every stage of the pipeline:
 - builds and gates;
 - trials;
+- test repairs (the `repair` job: the fairfix step, on DeepSeek);
 - the re-gate, regrade and rescore that follow a test repair;
 - audit preparation and recording;
 - fairness reviews;
@@ -112,17 +113,123 @@ These rules apply to tasks that have a test repair (`build/<slug>/repaired-tests
 |---|---|
 | A repair, the gate fingerprint is **stale**, and no gate `RESULT` is newer than the last change to the gated files | `regate` (`--listing` for `stk-` tasks) |
 | A repair, the fingerprint is current, and `.gate_passed` is present with no re-gate running | `regate` |
-| A repair, the fingerprint is current, and the last `RESULT` is `SOUND` | For each graded run whose grading (the original or its newest `regrade-*`) is older than the newest change under `tasks/<slug>/tests/`: a `rescore` or a `regrade` |
+| A repair, the fingerprint is current, and the last `RESULT` is `SOUND` | For each graded run whose grading in use (the original or its newest `regrade-*` that scored) was not made on the current tests: a `rescore` or a `regrade` |
 | The regate rule fires | The regrade and rescore jobs are queued at the same time, with `depends_on` set to the regate |
 | The repair only removed tests, and both models already solved the task | No job: removing tests cannot change that verdict |
 | `.hold-repair` (or `hold_<model>`) | No `trial_run` of the task starts. Re-gates and regrades still run |
 | A gate `RESULT` newer than the change that is not `SOUND` | No job: a person looks |
+| `.hold-repair`, the re-gate `SOUND` on the current files, every graded run graded on the current tests, no re-gate, regrade, rescore or repair job of the task queued, running, failed or blocked, and the hold not newer than that `RESULT` and not saying `repair failed` | The queue lifts the hold: `.hold-repair` -> `.sound`, logged in `build/<slug>/repair-<date>.log` (rule R6; `[repair] lift_holds`) |
+| A repair job of the task is running | Nothing is planned for the task this pass |
 
+- **Regrades follow the test content, never file times (2026-10-28).**
+  - A grading's test version is the content hash of `tasks/<slug>/tests/` that graded it. It is the same 20-hex hash
+    as the verifier image tag (`common/harbor_ext/cwe_reuse_tag.py`). It comes from `REGRADE.json` `tests_hash`
+    (written by `regrade_from_code.py` and `rescore_from_results.py`), or from the tag in its `image`. For the original
+    grading, it comes from the `cwe-reuse/<task>:verifier-<hash>` image that the run's `trial.log` names.
+  - The older rule compared test-file times with the grading time. It missed repairs that copied files with `cp -p`
+    or touched nothing.
+  - A regrade whose job failed a post-condition (no numeric reward) is not a grading, so the run is still owed one.
+  - A grading that records no version (runs before image reuse, 2026-10-27) follows
+    `[reconcile] unknown_tests_version`:
+    - `regrade`: regrade it once (the default);
+    - `repair_folder`: it counts when it is newer than the task's newest repair folder;
+    - `mtime`: the older rule.
+  - The regrade check `regrade.tests_current` fails a regrade made on other tests.
 - **Rescore or regrade.** A rescore (`rescore_from_results.py --drop`) is used only when the repair removed whole
   test files and changed nothing else, and each dropped name hits the same test ids as a whole word and as a
   substring. In every other case the queue uses `regrade_from_code.py`.
 - **Job keys.** They include `fp`, the first 16 hex digits of the gate digest, so a repair queues its jobs once per
   test version. When the files change again, jobs still queued for the old version are superseded.
+
+### Test repairs (`common/queue/repairstep.py`, `repairjob.py`, `kinds/repair.py`)
+
+**History (owner, 2026-10-28).**
+- The repair step already existed as the **fairfix** step: `pipelines/sibling/10-fairfix/run_fairfix.sh` and
+  `pipelines/stacking/8-fairfix/run_fairfix_stack.sh`. An Opus orchestrator agent started it, but the work itself
+  ran on the VM through DeepSeek (`common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh
+  SLUG`).
+- It was **lost when the pipeline moved to the SQLite work queue**: the queue had no repair or fairfix job kind, so
+  since then repairs were done by hand with Opus sub-agents. The owner wants repairs to go through the pipeline and
+  to run on **DeepSeek, not Opus**: the `repair` kind does that.
+- The owner once fixed a step that was not receiving the model runs' results: the hardening step (now dropped,
+  `pipelines/sibling/archive/hardening-dropped/`).
+  - `run_harden.sh` gained a `trial_summary.py` call, run before its snapshot moved the runs out of `jobs/`, and
+    `HARDENING-PROMPT.md` names `build/<slug>/trial_summary.md` as an input. This was done on 2026-10-21, after
+    `run_harden.sh.bak-20261021T154104Z`.
+  - Fairfix never got the same input: its prompt names no run, log or transcript, and its snapshot moves the runs away.
+  - The repair job writes `trial_summary.md` first and passes every graded run's evidence. It never snapshots, so the
+    runs stay in `jobs/` to be regraded.
+
+**Planning (rule T1, `repairstep.plan`).** A task gets one `repair` job per finding, keyed `{"finding": <key>}`. A
+finding is everything below that no newer `repaired-tests-*` / `removed-tests-*` / `testfix-*` folder covers:
+- (a) A recorded post-run audit on the grading in use (or carried over) names failing tests as unfair: an item
+  verdict of `test-fault` or `instruction-ambiguity`, or an `unfair_kind` other than `none`. It is planned when:
+  - those tests decided a run: the run's attribution is test-fault or instruction-ambiguity, or the run fails no
+    fair test; or
+  - the task is kept or delivered (the owner's standing rule: fix every unfair test).
+- (b) The fairness review is NOT_READY, its required changes are test-only, and there is no current human decision.
+  Or its `CONFLICTS` line counts a deciding conflict and there is no current `CONFLICTS-RULED` KEEP or DROP.
+- (c) `HUMAN-DECISION.md` records a current `DECISION: REPAIR`.
+
+A repair is never planned:
+- for a dropped or withdrawn task;
+- for a finding a repair already ran for (`repair-inputs-*/FINDING.json`);
+- while another repair of the task is queued or running (a queued one for an older finding is superseded);
+- for a held task (a repair cycle is in progress);
+- after `[repair] max_per_task` repairs;
+- with `skip_solved`, for a task a model solved that is not kept or delivered.
+
+**`[repair] auto = false` for the first deploy.** Nothing is queued. `cweq explain <slug>`, `cweq repairs` and the
+inbox show the plan (event `repair.planned`). The owner queues a repair with:
+
+```
+cweq enqueue repair <slug> --args '{"finding": "f-<key from cweq explain>"}'
+cweq enqueue repair <slug> --args '{"finding": "the owner'"'"'s own finding, in words or as an object"}'
+```
+
+**The job** (`repairjob.py`, run as `common/launch/drive.sh deepseek python3 -I common/queue/repairjob.py <slug>`).
+It runs alone on its task (exclusive), at most 4 at a time. It starts only when the task has no other queued or
+running work (rule D9); a queued trial that the hold stops does not count. The hold protocol is code, never the
+agent's:
+1. It sets `.hold-repair` (from `.sound`), then waits for old-script work on the task. After `wait_sec` the hold goes
+   back as it was and the job exits 75. The job is then blocked for a person (`cweq retry <id>`): like a build, a
+   repair is never restarted on its own.
+2. It writes `build/<slug>/trial_summary.md`, then `build/<slug>/repair-inputs-<UTC>/`:
+   - `FINDING.md` / `FINDING.json`: each audit item with its test, verdict, `unfair_kind`, conflicting sentences and
+     the model's behaviour; or the review's required changes; or the decision.
+   - `runs/<model>-r<n>-<id>/` for EVERY graded run, audited or not:
+     - `RUN.md` and `results.json`;
+     - `failures.md`: each failing test with the verifier output that names it;
+     - `changes.patch`, with a pointer to `artifacts/workspace` when it is cut or truncated;
+     - `transcript-excerpts.md`: the transcript around the failing tests and the files the run changed, then its last
+       lines.
+   - `INPUTS.md`: everything else to read. That includes the full `notes.md`, `history/`, and a prior
+     `*-repair-analysis.md` / `*-repair-proposal/` (a starting point to verify, never to apply blindly).
+   - `backup/`: tests/, solution/, environment/, instruction.md, task.toml, manifest.json, checks/, notes.md.
+3. It runs the fairfix script with `REPAIR_INPUTS` set. In that mode the script runs
+   `pipelines/sibling/10-fairfix/run_repair_agent.sh` with the brief `common/fairness/REPAIR-BRIEF.md`, and makes no
+   snapshot. The brief also gets `OTHER-READING-CHECK.md` when present, and the stacking addendum for `stk-` tasks.
+4. It checks the result in code:
+   - the agent finished;
+   - instruction.md, task.toml and environment/ are unchanged;
+   - the gated files changed;
+   - there is a new repair folder with `README.md`, and `history/<date>-repair.md`;
+   - the static gate stage still passes.
+   An edit to notes.md is reverted (and kept as `notes.md.agent-edit`).
+5. On success (exit 0), the changed test files are touched and the hold stays, with a text naming the next steps. A
+   `regate` is queued with the same key as rule R1, so a task gated before fingerprints existed (no
+   `gate_fingerprint.json`, e.g. surrealdb-ds) is re-gated too. The R2 regrades and the R6 hold lift follow.
+6. On failure, the originals are restored from `backup/` and the agent's repair folder goes to `failed/`. The hold
+   says `repair failed ...` with the reason: exit 1, or exit 3 when the agent made no repair. `job.failed` is an
+   event. The queue never lifts a failed repair's hold: a person decides (`cweq retry <id>`, or `.hold-repair` ->
+   `.sound`).
+
+**Lost repairs.** `cweq repairs --lost`, and one inbox line, list the tasks with a test-fault audit and no later
+`repaired-tests-*` / `removed-tests-*` / `testfix-*` folder.
+
+**Validating a scratch copy.** `gate.py` and `regrade_from_code.py` read `tasks/` and `build/` under the data root.
+`CWE_DATA_ROOT=<scratch> python3 -I common/gate/gate.py <slug> --only nop` gates a copy in `<scratch>/tasks/<slug>`
+and `<scratch>/build/<slug>`.
 
 ### Builds and trials (`common/queue/phase3.py`)
 
@@ -153,10 +260,14 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 |---|---|---|
 | `audit_prep` | A failing run waits for its audit. Not for a task held or busy with a repair (its grading is about to change), and not when the run's model already solved the task. A folder prepared before a regrade is replaced | `postmortem.py prepare <trial>` |
 | `audit_record` | An auditor's `verdict.json` is not recorded yet, or a trial result is newer than the ledger | `postmortem.py record-ready`, then `audit_results.py` |
-| `fairness` | The ledger marks a batch task a BREAKER candidate, and no review is current or running. Never while held or busy | the stacking or sibling fairness review |
+| `fairness` | The ledger marks a batch task a BREAKER candidate, and no review is current or running. Never while held or busy. A review is current only when it is newer than the newest trial and was made on the current tests (see below) | the stacking or sibling fairness review |
 | `cleanup` | Every UTC hour | `common/util/hourly_cleanup.sh once` |
 | `step3` | Every UTC half hour | the router's step 3: routes stacked tasks any model solved into the general sibling pool and refreshes the pool file; never prepares or selects |
 
+- **A fresh review after a repair (2026-10-28).** The job records the tests hash the reviewer was shown in
+  `fairness_tests.json`. Without that record, a review is stale when a repair folder is newer than the last review.
+  The job key is `{"after", "tests"}`, so a repair gets a fresh review, and the stale review is moved to
+  `FAIRNESS.md.prev-<UTC>`. langflow-s3 and hypequery-s2 were stuck on the `{"after"}` key alone.
 - **Audit list.** Every pass rewrites `pipelines/router/out/queue/audit_ready.txt` with the prepared folders waiting
   for an auditor. The audit itself is an independent reviewer's job; the queue prepares and records.
 - **Pseudo tasks.** `audit_record`, `cleanup` and `step3` run as the pseudo tasks `_ledger`, `_machine` and
@@ -237,7 +348,9 @@ delivery packages. The sections are:
 - fairness reviews that are NOT READY, with the required change quoted;
 - kept tasks that are not delivered yet, with their prepared package;
 - blocked jobs;
-- tasks that need a person (listing check failed, trials stuck).
+- tasks that need a person (listing check failed, trials stuck);
+- test repairs: one line for the lost repairs, repairs planned but not queued (`[repair] auto = false`), and failed
+  repairs that keep their task held.
 
 ## Job kinds
 
@@ -280,11 +393,11 @@ No job starts while any limit is exceeded:
 
 | Limit | Value |
 |---|---|
-| Running per kind (`[limits.max_running]`) | build 16, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, cleanup 1, delivery_prep 1 |
+| Running per kind (`[limits.max_running]`) | build 16, trial_run 40, regate 15, regrade 3, rescore 2, fairness 3, repair 4, cleanup 1, delivery_prep 1 |
 | Running in total (`max_running_total`) | 69 base; `[autolimit]` raises it in steps of 4 up to 85 after CPU idle stayed at 25% or more for 60 minutes with work queued, and steps back toward the base after 30 minutes at 5% idle or less (`autolimit.py`, table `autolimit`, event `limit.changed`) |
 | Free disk | a floor per kind (`[limits.disk_floor]`), read live from `limits.env` through `common/util/diskguard.py` |
 | Machine | maximum load, minimum available memory, ceiling on `/tmp` inodes (from the monitor's latest sample while it is under 2 minutes old, otherwise measured) |
-| Per task | one build, gate, re-gate, regrade or rescore at a time; a task's trial runs may run together |
+| Per task | one build, gate, re-gate, regrade, rescore or repair at a time; a task's trial runs may run together; a repair waits until the task has no other queued or running work |
 
 Batch files (`pipelines/router/out/batches/*.txt`) are served in file order. Header lines: `# priority: <int>` is added
 to the batch's build and trial priorities, so a later batch (for example `# priority: -2`) starts its builds after the
@@ -390,6 +503,7 @@ python3 common/queue/cweq.py verify [--kind K] [--state S]   # post-condition ch
 python3 common/queue/cweq.py selfcheck [--tool regrade|rescore|all] [--run]   # reproduce a known grading
 python3 common/queue/cweq.py events [--open] | events next | events handle ID --action TEXT
 python3 common/queue/cweq.py inbox [--html PATH] [--json]
+python3 common/queue/cweq.py repairs [--lost] [--json]   # the test-repair plan (rule T1) and the lost repairs
 python3 common/queue/cweq.py delivered TASK NAME COMMIT [--date D] [--note TEXT]
 python3 common/queue/cweq.py config [--show HASH] [--kinds]
 python3 common/queue/cweq.py stop ID [--grace N] [--why TEXT]

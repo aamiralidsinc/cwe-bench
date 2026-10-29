@@ -15,8 +15,24 @@ the CWE-bench threshold rule of tests/score.py: 1.0 when every security and func
 """
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
+import paths  # noqa: E402  (repo locations: common/paths.py)
+sys.path.insert(0, str(paths.COMMON / "harbor_ext"))
+from cwe_reuse_tag import context_hash  # noqa: E402  (the test version: the verifier image's content hash)
+
+
+def tests_hash(trial):
+    """The content hash of the task's current tests/ (the version this rescore stands for), or None."""
+    try:
+        task = Path(json.loads((trial / "result.json").read_text())["config"]["task"]["path"]).name
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    t = paths.TASKS / task / "tests"
+    return context_hash(t)[:20] if t.is_dir() else None
 
 
 def reward_of(sec, fun):
@@ -56,7 +72,7 @@ def main():
     (out / "verifier" / "reward.json").write_text(json.dumps({"reward": new}))
     info = {"method": "rescore-from-results (test removal; no code re-run)", "why": a.why,
             "dropped": dropped, "original_reward": old, "reward": new,
-            "utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"), "tests_hash": tests_hash(trial)}
     (out / "REGRADE.json").write_text(json.dumps(info, indent=1))
     print(f"{trial.parent.name}/{trial.name}: {old} -> {new} ({out.name})")
 

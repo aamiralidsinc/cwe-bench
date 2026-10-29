@@ -4,11 +4,23 @@
 # Usage: common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh SLUG   Env: MODEL (required, set by common/launch/drive.sh),
 # FAIRFIX_TIMEOUT (default 10800). Exit 0 = the agent finished; 1 = it did not (fairfix_status.txt
 # says why: quota, API error, timeout, crash) and the task must not be treated as fixed.
+# History (owner, 2026-10-28): this fairfix step WAS the repair step. An Opus orchestrator started it and the work ran
+# on the VM through DeepSeek (`common/launch/drive.sh deepseek bash <this script> SLUG`). It was lost when the pipeline
+# moved to the SQLite work queue (common/queue/: no repair/fairfix job kind), so repairs were then done by hand with
+# Opus sub-agents. The queue's `repair` kind (common/queue/kinds/repair.py, common/queue/repairjob.py) runs it again on
+# DeepSeek: with REPAIR_INPUTS set this script runs the audit-driven repair brief (common/fairness/REPAIR-BRIEF.md,
+# pipelines/sibling/10-fairfix/run_repair_agent.sh). The owner once fixed the hardening step, which did not get the
+# runs' results (run_harden.sh ran trial_summary.py before its snapshot, 2026-10-21); fairfix never got the same input.
+# The repair job now passes the failing runs' evidence (per-test failures, final diffs, transcript excerpts).
 set -uo pipefail
 . "$(d=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd); while [ ! -f "$d/.cwe-bench-root" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "$d")/common/paths.sh"
 SLUG=${1:?usage: pipelines/sibling/10-fairfix/run_fairfix.sh SLUG}
 cd "$CWE_ROOT" || exit 1
 [ -n "${MODEL:-}" ] || { echo "error: MODEL not set; launch via common/launch/drive.sh deepseek bash pipelines/sibling/10-fairfix/run_fairfix.sh $SLUG" | tee "build/$SLUG/fairfix_status.txt"; exit 1; }
+
+# Repair mode (the queue's repair job sets REPAIR_INPUTS): the audit-driven, test-only repair brief; no snapshot
+# (the runs stay in jobs/ to be regraded) and no restore here (the job restores from its own backup).
+[ -n "${REPAIR_INPUTS:-}" ] && exec bash pipelines/sibling/10-fairfix/run_repair_agent.sh "$SLUG"
 echo "running" > "build/$SLUG/fairfix_status.txt"
 mkdir -p "$HOME/.tb-graders/cwe/work/$SLUG"
 bash "$CWE_SNAPSHOT" "$SLUG"  # preserve prior version before in-place edit (provenance)

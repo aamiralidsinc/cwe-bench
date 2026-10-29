@@ -12,7 +12,9 @@ Each tick:
               up to max_running_per_task), its kind is at max_running or the total at max_running_total (old-script
               builds and trials count too: count_foreign), a trial_run while builds running + queued >=
               trials_wait_builds (builds first, as scale_queue.py did), the machine is over a limit, or the kind's
-              disk floor (limits.disk_floor -> common/util/diskguard.py) is not met. At most max_starts_per_tick
+              disk floor (limits.disk_floor -> common/util/diskguard.py) is not met, or a repair whose task still
+              has other work queued or running (trials, re-gates, regrades, builds, reviews; a held trial_run that
+              cannot start does not count; old scripts count). At most max_starts_per_tick
               starts per tick, start_spacing_sec apart (fill_spacing_sec during the first fill; [low, high] = random).
 
 The worker is `cweq.py _work <id>` in its own session (setsid): it runs the existing script, refreshes the lease and
@@ -51,6 +53,22 @@ def batch_hold(row, ctx):
         return f"batch {b} on hold (# hold: yes in its batch file)"
     if not b and row["origin"] == "reconciler":
         return "no longer in a batch file (the reconciler queued it for a batch)"
+    return None
+
+
+def repair_waits(row, queued, active, ctx, light):
+    """Why a repair job must wait: other work of its task is queued or running (a repair edits the tests that work
+    reads or writes). Queued trial_runs held by .hold-repair / hold_<model> cannot start, so they do not count."""
+    t = row["task"]
+    mine = [r for r in list(active) + list(queued) if r["task"] == t and r["id"] != row["id"]
+            and r["kind"] not in light and r["kind"] != "repair"
+            and not (r["state"] == "queued" and held(t, r["kind"], qdb.args_of(r)))]
+    if mine:
+        return "repair waits for the task's other work: " + ", ".join(f"{r['kind']} #{r['id']} {r['state']}"
+                                                                      for r in mine[:4])
+    run = ctx.get("running", {}).get(t, [])
+    if run:
+        return "repair waits for the task's old-script work: " + ", ".join(f"{k} pid {p}" for k, _m, p in run[:4])
     return None
 
 
@@ -213,6 +231,8 @@ class Dispatcher:
             elif k in taskstate.REDO_CHECKED and (redo := taskstate.redo_reason(k, t, qdb.args_of(r), ctx)):
                 # Finished work closes the job; work the old scripts are running only makes it wait.
                 why = ("task busy (old script): " + redo) if redo.endswith("running") else REDO + redo
+            elif k == "repair" and (rw := repair_waits(r, queued, active, ctx, light)):
+                why = rw
             elif t in busy:
                 why = f"task busy (old script pid {busy[t][0][0]}: {busy[t][0][1][:80]})"
             elif t in excl_task or (k in exclusive and per_task.get(t, 0)):

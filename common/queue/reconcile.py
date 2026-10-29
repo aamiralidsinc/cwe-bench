@@ -6,7 +6,13 @@ or a hold (.hold-repair) are looked at.
   R1  repair + gate fingerprint STALE + no gate RESULT since the files last changed      -> regate
       repair + fingerprint current + .gate_passed (a re-gate stopped before its RESULT)  -> regate
   R2  repair + fingerprint current + last RESULT is SOUND                                 -> per graded run whose
-      grading is older than the newest change under tasks/<slug>/tests/ and has no newer regrade-*:
+      grading in use was not made on the current tests (by content, never by file times, 2026-10-28): the
+      grading's test version (repairstep.grading_in_use: REGRADE.json tests_hash / its verifier image tag, or the
+      verifier image the run's trial.log names) differs from the content hash of tasks/<slug>/tests/. A regrade that
+      did not score (its post-conditions) is not a grading. A grading that records no test version is regraded
+      once ([reconcile] unknown_tests_version = "regrade"; "repair_folder": it counts when it is newer than the
+      newest repair folder, which a repair makes at its time even when it copies files with cp -p; "mtime" keeps the
+      older rule for those: graded before the newest change under tests/):
         rescore (rescore_from_results.py --drop) when the repair only removed whole test files and the drop
         names match exactly the same test ids as a word and as a substring; otherwise regrade (regrade_from_code.py)
   R1+R2  when R1 fires, the R2 jobs are queued at once with depends_on = the regate (they wait for it, and are
@@ -15,7 +21,14 @@ or a hold (.hold-repair) are looked at.
   R4  the repairs only removed tests (removed-tests-*, no repaired-tests-*) and the audited ledger says both models
       SOLVED -> no job: fewer
       tests cannot turn a solve into a failure (note "both models solved; removing tests cannot change the verdict").
-  --  fingerprint missing (gated before 2026-10-25): no job, reported. A gate that failed on the current files: no
+  R6  .hold-repair + a repair + fingerprint current + last RESULT SOUND + every graded run graded on the current
+      tests (R2 wants nothing, no run without saved code) + no regate/regrade/rescore/repair job of the task queued,
+      running, failed or blocked for this version + the hold is not newer than that RESULT (a newer hold is a repair
+      starting) and does not say "repair failed" -> the queue lifts the hold: .hold-repair -> .sound (post-condition:
+      .sound present, .hold-repair gone, fingerprint still current; logged in build/<slug>/repair-<date>.log).
+      [repair] lift_holds = false turns it off.
+  --  a repair job of the task is queued-and-started or running (kinds/repair.py): nothing planned this pass.
+  --  fingerprint missing (gated before 2026-10-25): no job, reported (the repair job queues its own re-gate). A gate that failed on the current files: no
       job, reported (needs a person). A task busy with an old script: no job this pass.
 
 Job keys carry the 16-hex gate digest of the current files ("fp"), so a regrade is queued once per test version and
@@ -37,6 +50,7 @@ import fingerprint  # noqa: E402  (the gate fingerprint: what a SOUND gate cover
 import procs  # noqa: E402
 import qdb  # noqa: E402
 import markers  # noqa: E402  (common/markers.py)
+import repairstep  # noqa: E402  (test versions of gradings, repair folders: common/queue/repairstep.py)
 
 PHASE1_KINDS = ("regate", "regrade", "rescore")
 SKIP = fingerprint.SKIP
@@ -152,13 +166,15 @@ def graded_runs(slug, jobs_dir):
         if reward is None:
             continue                                     # never graded: nothing to re-grade
         graded = qdb.parse_utc(res.get("finished_at")) or (t / "result.json").stat().st_mtime
-        regrades = []
+        regrades, regrade_dirs = [], []
         for r in sorted(t.glob("regrade-*/REGRADE.json")):
             m = re.match(r"regrade-(\d{8}T\d{6}Z)$", r.parent.name)
             when = calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%SZ")) if m else r.stat().st_mtime
-            regrades.append((when, jload(r) or {}))
+            info = jload(r) or {}
+            regrades.append((when, info))
+            regrade_dirs.append((when, info, r.parent))
         out.append({"job": t.parent.name, "trial": t.name, "path": t, "reward": reward, "graded": graded,
-                    "regrades": regrades,
+                    "regrades": regrades, "regrade_dirs": regrade_dirs,
                     "has_code": (t / "final-code" / "changes.patch").is_file() or (t / "artifacts" / "workspace").is_dir()})
     return out
 
@@ -232,13 +248,24 @@ def analyse(slug, cfg, busy=None, ledger=None):
         listing = any(slug.startswith(p) for p in cfg["reconcile"]["listing_prefixes"])
         a["want"].append({"kind": "regate", "args": {"fp": fp16, "listing": listing}})
 
-    # R2: the graded runs whose grading predates the current tests.
+    # R2: the graded runs whose grading in use was not made on the current tests (by content).
     kind, drops = repair_kind(slug)
     why = f"test-only repair ({', '.join(a['repairs'])}); cweq after gate {fp16[:12]}"
+    cur_tests = repairstep.tests_hash(slug)
+    a["tests_hash"] = cur_tests
+    unknown_rule = cfg["reconcile"].get("unknown_tests_version", "regrade")
+    newest_repair = max((t for _n, t in repairstep.repair_folders(b)), default=0.0)
+    a["no_code"] = []
     for r in graded_runs(slug, cfg["jobs_dir"]):
-        last = max([r["graded"]] + [w for w, _ in r["regrades"]])
-        if last >= tests_changed:
+        gname, ghash, gwhen = repairstep.grading_in_use(r)
+        if ghash is not None and ghash == cur_tests:
             continue                                     # graded (or regraded) on the current tests
+        if ghash is None and unknown_rule == "repair_folder" and gwhen > newest_repair:
+            continue                                     # no recorded version, graded after the newest repair folder
+        if ghash is None and unknown_rule == "mtime":
+            last = max([r["graded"]] + [w for w, info, d in r["regrade_dirs"] if repairstep.valid_regrade(d, info)])
+            if last >= tests_changed:
+                continue                                 # no recorded test version: the older rule (file times)
         rel = f"{r['job']}/{r['trial']}"
         if kind == "rescore":
             done = any(all(any(d in x for x in info.get("dropped", [])) for d in drops) for _, info in r["regrades"])
@@ -251,9 +278,65 @@ def analyse(slug, cfg, busy=None, ledger=None):
                 continue
         if not r["has_code"]:
             a["notes"].append(f"{r['trial']}: graded before the repair but no saved code; regrade.py by hand")
+            a["no_code"].append(rel)
             continue
         a["want"].append({"kind": "regrade", "args": {"trial": rel, "fp": fp16, "why": why}, "after_regate": regate})
+    # R6 (facts only; reconcile() checks the job table and lifts): the held task's re-gate and regrades are in.
+    if a["held"] and not regate and not a["want"] and not a["no_code"] and sound and a["fp"] == "current":
+        hold = b / ".hold-repair"
+        text = markers.read_text(hold).strip()
+        hm = hold.stat().st_mtime if hold.exists() else 0
+        if text.startswith("repair failed"):
+            a["notes"].append("hold kept: the last repair failed (see .hold-repair); a person decides")
+        elif hm > (rts or 0) + HOLD_SLACK:
+            a["notes"].append("hold kept: set after the last SOUND re-gate (a repair is starting or in progress)")
+        else:
+            a["lift"] = True
     return a
+
+
+HOLD_SLACK = 120                                         # .hold-repair keeps the mtime of the .sound it replaced
+
+
+def lift_hold(conn, cfg, slug, a, dry_run=False):
+    """R6: .hold-repair -> .sound once the re-gate is SOUND on the current files and every graded run is regraded.
+    Returns a note. Post-condition: .sound present, .hold-repair gone, the fingerprint still matches the files."""
+    import repairstep as rs
+    if not rs.settings(cfg)["lift_holds"]:
+        return "hold not lifted: [repair] lift_holds = false"
+    busy = qdb.jobs(conn, "task=? AND kind IN ('regate','regrade','rescore','repair') AND "
+                          "state IN ('queued','leased','running')", (slug,))
+    if busy:
+        return f"hold kept: {busy[0]['kind']} #{busy[0]['id']} is {busy[0]['state']}"
+    bad = [r for r in qdb.jobs(conn, "task=? AND kind IN ('regate','regrade','rescore') AND state IN ('failed','blocked')",
+                               (slug,)) if qdb.args_of(r).get("fp") == a.get("fp16")]
+    if bad:
+        return f"hold kept: {bad[0]['kind']} #{bad[0]['id']} {bad[0]['state']} for this version (a person looks)"
+    if dry_run:
+        return "would lift the hold (.hold-repair -> .sound): re-gate SOUND and every graded run regraded"
+    b = paths.BUILD / slug
+    rec = jload(b / "gate_fingerprint.json") or {}
+    if rec.get("sha256") != fingerprint.digest(slug)[0]:   # fresh, uncached: the files may have just changed
+        return "hold kept: the files changed since this pass started"
+    if (b / ".sound").exists():
+        os.unlink(b / ".hold-repair")
+    else:
+        os.replace(b / ".hold-repair", b / ".sound")
+    ok = (b / ".sound").exists() and not (b / ".hold-repair").exists() and \
+        (jload(b / "gate_fingerprint.json") or {}).get("sha256") == fingerprint.digest(slug)[0]
+    line = (f"{qdb.utc()} hold lifted by the queue (reconcile R6): .hold-repair -> .sound; re-gate SOUND on "
+            f"{a.get('fp16', '')[:12]}, every graded run graded on tests {a.get('tests_hash', '')[:12]}"
+            + ("" if ok else "; POST-CONDITION FAILED (.sound / .hold-repair / fingerprint), a person looks"))
+    with open(b / f"repair-{time.strftime('%Y%m%d', time.gmtime())}.log", "a") as f:
+        f.write(line + "\n")
+    if not ok:
+        try:
+            import events
+            events.ensure(conn)
+            events.emit(conn, "repair.hold_lift_failed", f"liftfail:{slug}:{qdb.utc()}", slug, {"line": line})
+        except Exception:
+            pass
+    return line[21:] if ok else line
 
 
 def candidate_slugs():
@@ -271,10 +354,18 @@ def reconcile(conn, cfg, slugs=None, proc_list=None, dry_run=False):
     busy = procs.busy_tasks(slugs, cfg["busy"]["patterns"], proc_list, skip_dirs=(paths.COMMON,))
     import taskstate
     ledger = taskstate.ledger()
+    repairing = {r["task"]: r for r in qdb.jobs(conn, "kind='repair' AND state IN ('leased','running')")} \
+        if conn is not None else {}
     out = []
     for slug in slugs:
+        if slug in repairing:                            # the repair job owns the task until it ends
+            out.append({"task": slug, "want": [], "notes": [f"repair job #{repairing[slug]['id']} running: nothing "
+                                                            "planned this pass"], "busy": [], "repairs": []})
+            continue
         a = analyse(slug, cfg, busy, ledger)
         out.append(a)
+        if a.get("lift") and conn is not None:
+            a["notes"].append(lift_hold(conn, cfg, slug, a, dry_run=dry_run))
         if dry_run or a["busy"]:
             continue
         wanted, regate_id = set(), None

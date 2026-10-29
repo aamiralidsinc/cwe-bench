@@ -6,6 +6,7 @@ import time
 
 import qdb
 import reconcile
+import repairstep
 from conftest import gate_log, make_task, make_trial, set_mtime, write_fingerprint
 
 DAY = 86400
@@ -67,7 +68,9 @@ def test_after_regate_only_runs_without_a_current_regrade(conn, cfg, root, tmp_p
     t1 = root / "jobs" / "stk-a-m-r1" / "stk-a__T1"
     rg = t1 / f"regrade-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(time.time() + 5))}"
     (rg / "verifier").mkdir(parents=True)
-    (rg / "REGRADE.json").write_text(json.dumps({"reward": 1.0}))
+    (rg / "verifier" / "reward.json").write_text(json.dumps({"reward": 1.0}))
+    # graded on the current tests (the regrade tool records their content hash since 2026-10-28)
+    (rg / "REGRADE.json").write_text(json.dumps({"reward": 1.0, "tests_hash": repairstep.tests_hash("stk-a")}))
     rep, = reconcile.reconcile(conn, cfg, proc_list=[])
     assert rep["fp"] == "current" and [w["kind"] for w in rep["want"]] == ["regrade"]
     st = {(r["kind"], qdb.args_of(r).get("trial", "")): r["state"] for r in qdb.jobs(conn)}

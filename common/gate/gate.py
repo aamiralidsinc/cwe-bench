@@ -42,6 +42,8 @@ Checks, in order (it stops at the first failing group):
                             a `[gate] CONFLICT-PROVEN:` line); the test is unfair, the task stays sound.
 
 The result is written to build/<slug>/gate_report.json (gate_report.partial.json with --only).
+tasks/<slug> and build/<slug> are read under the data root (common/paths.py), so CWE_DATA_ROOT=<dir> gates a
+copy in <dir>/tasks and <dir>/build (the repair step validates a scratch copy this way, 2026-10-28).
 Decisions here are made by scripts only; no model judgement is involved.
 
 Every failure is classified, because confusing the kinds is what kept marking sound tasks
@@ -1047,7 +1049,9 @@ def main() -> int:
                     "files (repeatable); postbuild.sh uses it for the blind patch after the blind fix")
     args = ap.parse_args()
 
-    task, build = ROOT / "tasks" / args.slug, ROOT / "build" / args.slug
+    # The data root (common/paths.py: $CWE_DATA_ROOT, else the release's .cwe-data-root, else the code root), so a
+    # repair can gate a scratch copy: CWE_DATA_ROOT=<scratch> python3 -I common/gate/gate.py <slug> (2026-10-28).
+    task, build = paths.TASKS / args.slug, paths.BUILD / args.slug
     report = {"slug": args.slug, "only": args.only, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
               "passed": False, "verdict": None, "stages": {}}
     stages = ["static", "nop", "oracle", "patches"]

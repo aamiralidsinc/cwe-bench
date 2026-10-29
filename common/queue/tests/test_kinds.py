@@ -64,10 +64,14 @@ def test_builtin_declarations_give_the_defaults(tmp_path, root):
     assert cfg["env"]["trial_run"] == {"CWE_AGENT_TIMEOUT_MULT": "1.5"}
     assert cfg["limits"]["disk_floor"]["build"] == "DISK_MIN_FREE_GB_BUILD"
     assert set(cfg["dispatch"]["light_kinds"]) == {"audit_prep", "audit_record", "cleanup", "step3", "lint"}
-    assert set(cfg["dispatch"]["count_foreign"]) == {"build", "trial_run", "regate", "fairness"}
+    assert set(cfg["dispatch"]["count_foreign"]) == {"build", "trial_run", "regate", "fairness", "repair"}
     assert "gate" not in cfg["limits"]["max_running"]           # declared without a worker
-    assert kinds.exclusive() == {"build", "build_resume", "gate", "regate", "regrade", "rescore", "fairness"}
-    assert kinds.foreign_map() == {"build": "build", "trial": "trial_run", "regate": "regate", "fairness": "fairness"}
+    assert kinds.exclusive() == {"build", "build_resume", "gate", "regate", "regrade", "rescore", "fairness", "repair"}
+    assert kinds.foreign_map() == {"build": "build", "trial": "trial_run", "regate": "regate", "fairness": "fairness",
+                                   "repair": "repair"}
+    assert cfg["limits"]["max_running"]["repair"] == 4 and cfg["retry_exit_codes"]["repair"] == [75]
+    assert cfg["max_attempts"]["repair"] == 1
+    assert cfg["repair"]["auto"] is False and cfg["limits"]["disk_floor"]["repair"] == "DISK_MIN_FREE_GB_GATE"
 
 
 def test_toml_overrides_a_declared_default(tmp_path, root):

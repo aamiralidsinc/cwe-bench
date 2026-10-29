@@ -66,7 +66,7 @@ import paths  # noqa: E402  (repo locations: common/paths.py)
 ROOT = paths.ROOT
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "common" / "harbor_ext"))
-from cwe_reuse_tag import ensure_image_sync, reuse_tag  # noqa: E402  (images shared with gate/trial runs)
+from cwe_reuse_tag import context_hash, ensure_image_sync, reuse_tag  # noqa: E402  (images shared with gate/trial runs)
 from harvest_code import save_tmp_logs  # noqa: E402
 
 CONVENTION_ARTIFACTS = "/logs/artifacts"   # Harbor's implicit artifact entry (agent publish dir)
@@ -474,8 +474,9 @@ def main():
     trial = Path(a.trial_dir).resolve()
     res = json.loads((trial / "result.json").read_text())
     task = Path(res["config"]["task"]["path"]).name
-    tdir = ROOT / "tasks" / task
+    tdir = paths.TASKS / task                     # the data root: CWE_DATA_ROOT, so a scratch copy can be graded
     cfg = tomllib.loads((tdir / "task.toml").read_text())
+    tests_hash = context_hash(tdir / "tests")[:20]   # the test version graded (reconcile R2 compares it)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = trial / f"regrade-{stamp}"
@@ -483,6 +484,7 @@ def main():
         info = verifier_mode(trial, task, tdir, cfg, out, a.why, a.from_patch, a.keep_image)
     else:
         info = env_mode(trial, task, tdir, cfg, out, a.why)
+    info["tests_hash"] = tests_hash
     (out / "REGRADE.json").write_text(json.dumps(info, indent=1))
     print(json.dumps(info, indent=1))
 

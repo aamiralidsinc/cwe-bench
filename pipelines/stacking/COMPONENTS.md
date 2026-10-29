@@ -29,7 +29,7 @@ was replaced, and `archive/README.md` lists every file with its original path, d
 | Audit | `common/audit/postmortem.py` + Opus 5.5-high sub-agents; verdicts from `common/audit/audit_results.py` | proven | same | `common/archive/versions/build/` |
 | Fairness addendum | `7-fairness/STACKING-FAIRNESS-ADDENDUM.md` (v2 + "edit only the stacked instruction") | proven: every review from 10-24 22:18Z | same | `.bak-20261024T0900Z` (v1, used by the 10-23 batch), `.bak-20261024T1809Z` |
 | Fairness launcher | `7-fairness/run_fairness_stack.sh` + `common/fairness/FAIRNESS-REVIEW-BRIEF.md` | proven | same | brief history: `common/archive/versions/builder/` |
-| Fairfix | `8-fairfix/run_fairfix_stack.sh` (`FAIRFIX_BRIEF` override; copies to the control; re-runs the listing check) | proven: every repair chain | same | `.bak-20261024T1809Z`, `.bak-brief-20261024` |
+| Fairfix | `8-fairfix/run_fairfix_stack.sh` (`FAIRFIX_BRIEF` override; copies to the control; re-runs the listing check; with `REPAIR_INPUTS` set by the queue's `repair` job it runs `pipelines/sibling/10-fairfix/run_repair_agent.sh --stacked` instead, 2026-10-28) | proven: every repair chain (repair mode: not yet run) | same | `.bak-20261024T1809Z`, `.bak-brief-20261024` |
 | Docs | this file, `GUIDE.md` | — | — | `archive/README-before-reorg.md` (the old stacking/README.md) |
 
 ## One-off scripts (archived, not part of the run order)

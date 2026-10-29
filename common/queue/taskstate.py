@@ -151,6 +151,9 @@ PROC_RULES = (   # (kind, regex over the joined command line; group 1 = slug, op
     ("regate", re.compile(r"regate\.sh (\S+)(?: |$)")),
     ("trial", re.compile(r"trial\.py (\S+) --models (\w+)")),
     ("fairness", re.compile(r"run_fairness(?:_stack)?\.sh (\S+)(?: |$)")),
+    # The repair step (the queue's repair job when it runs outside the queue, or fairfix started by hand).
+    ("repair", re.compile(r"(?:run_fairfix(?:_stack)?|run_repair_agent)\.sh (\S+)(?: |$)")),
+    ("repair", re.compile(r"repairjob\.py (\S+)(?: |$)")),
 )
 
 
@@ -265,7 +268,8 @@ def read(slug, ctx):
     if hd and not hd[2]:
         if hd[0] == "KEEP":
             return done("kept", "deliver (after the owner's KEEP)")
-        return done("dropped", "nothing" if hd[0] == "DROP" else "repair by a person (decision REPAIR)")
+        return done("dropped", "nothing" if hd[0] == "DROP" else
+                    "repair (decision REPAIR: a queue repair job, common/queue/kinds/repair.py; [repair] auto)")
 
     if "build" in kinds:
         return done("building", "wait: build running")
