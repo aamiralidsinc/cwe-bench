@@ -412,6 +412,18 @@ def cmd_explain(conn, cfg, a):
     import lintstep
     if lintstep.line(a.task):
         print(f"  lint         {lintstep.line(a.task)}")
+    try:                                                 # stage, and what each untrusted run is owed (untrusted.py)
+        import untrusted
+        ctx = taskstate.context(procs.list_processes())
+        ctx.update(cfg=cfg, reruns=untrusted.rerun_jobs(conn), repairs_active=untrusted.active_repairs(conn))
+        st = taskstate.read(a.task, ctx)
+        print(f"  stage        {st['stage']}: {st['next']}")
+        if any(untrusted.ledger_untrusted(c) for c in (ctx["ledger"].get(a.task) or {}).values()):
+            for m, entries in sorted(untrusted.classify(a.task, ctx).items()):
+                for e in entries:
+                    print(f"  untrusted    {m} {e['job']}: {e['action']} ({e['why']})")
+    except Exception as e:
+        print(f"  stage        unreadable: {type(e).__name__}: {e}")
     for n in t["notes"]:
         print(f"  note         {n}")
     for w in t["want"]:

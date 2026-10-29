@@ -13,6 +13,10 @@ They replace pipelines/router/auto_advance.sh (run on every heartbeat) and the s
                    current grading is a solve (a regrade newer than awaiting_audit.tsv; solves are not audited).
                    A prepared folder that is still waiting for its auditor is not prepared again; one prepared for an
                    older grading (a regrade came after it) is replaced by a new one (auto_advance reused it).
+                   Re-audits (2026-10-29, untrusted.py): a run whose untrusted test-fault audit a repair covers, and
+                   whose regrade on the repaired tests left the reward unchanged, keeps that audit in the ledger
+                   (carry-over) and is never listed in awaiting_audit.tsv. It gets an audit_prep of its regrade too,
+                   with the same skips, so it is audited again instead of being re-run or left untrusted for good.
      audit_ready   every pass rewrites pipelines/router/out/queue/audit_ready.txt with the prepared folders waiting
                    for an auditor (the orchestrator's Opus sub-agents read it; audits are never run by a CLI).
   A2 audit_record  when an auditor's verdict.json is not recorded yet, or a trial result / regrade is newer than the
@@ -146,10 +150,31 @@ def held_or_busy(slugs, cfg, proc_list, ctx):
     return out
 
 
+def reaudits(cfg, ctx):
+    """[(job, trial)] of untrusted runs owed a re-audit on their regrade (untrusted.py action reaudit)."""
+    import untrusted
+    ctx.setdefault("cfg", cfg)
+    out = []
+    for slug, lrow in sorted((ctx.get("ledger") or {}).items()):
+        if not any(untrusted.ledger_untrusted(lrow.get(m, "")) for m in taskstate.MODELS):
+            continue
+        if not (paths.TASKS / slug).is_dir():
+            continue
+        try:
+            per_model = untrusted.classify(slug, ctx)
+        except Exception:                                # one unreadable task must not stop the pass
+            continue
+        for entries in per_model.values():
+            out += [(e["job"], e["trial"]) for e in entries if e["action"] == "reaudit"]
+    return out
+
+
 def audit_plan(cfg, ctx, proc_list):
     """(jobs [{kind, task, args}], ready folders [Path], notes [str])."""
     jobs, ready, notes = [], [], []
     rows = awaiting()
+    seen = set(rows)
+    rows += [r for r in reaudits(cfg, ctx) if r not in seen]
     tasks = {}
     for job, trial in rows:
         m = JOB_RE.match(job)

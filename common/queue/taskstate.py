@@ -6,7 +6,9 @@ already done (redo_reason). It reuses the readers the current pipeline relies on
     build finished?      the same rules as pipelines/router/scale_queue.py build_done()
     gate                 build/<slug>/ markers (.sound .unsound .gate_error .listing_fail .gate_passed) and the
                          gate fingerprint (common/gate/fingerprint.py: a SOUND gate on older files is stale)
-    trials (launching)   common/trial/trial_state.py state(): none / incomplete / stuck / solved / failed
+    trials (launching)   common/trial/trial_state.py state(): none / incomplete / stuck / solved / failed, without
+                         the graded runs an untrusted audit left out of the ledger that the queue re-runs
+                         (common/queue/untrusted.py, 2026-10-29)
     verdicts (audited)   build/audit/ledger.md, written by common/audit/audit_results.py from the raw trial folders
     fairness, decision   common/fairness/fairness_verdict.py (FAIRNESS.md, HUMAN-DECISION.md)
     delivery             build/audit/delivered.tsv (the delivery register: slug, delivered name, client commit),
@@ -28,6 +30,8 @@ import fairness_verdict  # noqa: E402
 import markers  # noqa: E402  (common/markers.py: marker names and readers)
 import fingerprint  # noqa: E402
 import trial_state  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import untrusted  # noqa: E402  (runs an audit marked untrusted: re-run, re-audit or wait for a repair)
 
 MODELS = ("deepseek", "mimo")
 LEDGER_MODEL_COL = {"deepseek": 3, "mimo": 4}          # | Track | Task | DeepSeek | MiMo | Verdict |
@@ -253,10 +257,18 @@ def read(slug, ctx):
         t["fairness"] = f"{v}: {why}"
 
     for m in MODELS:
-        s, graded, ungraded = trial_state.state(slug, m)
+        # Runs the ledger leaves out for an untrusted audit and that are owed a fresh run do not count as graded
+        # (untrusted.py); the other untrusted runs wait for a re-audit, a regrade or a repair.
+        unt = untrusted.for_model(slug, m, led.get(m, ""), ctx)
+        drop = {e["job"] for e in unt if e["action"] == "rerun"}
+        s, graded, ungraded = trial_state.state(slug, m, drop=drop)
+        rerun = sorted({j for r, j in trial_state.rows(slug, m) if r is not None and j in drop})
+        ended = ((ctx.get("reruns") or {}).get((slug, m)) or {}).get("ended", set())
         t["models"][m] = {"launch": s, "graded": len(graded), "ungraded": ungraded,
                           "running": sum(1 for k, mm, _p in run if k == "trial" and mm == m),
-                          "ledger": ledger_model(led.get(m, "")), "awaiting_audit": awaiting_audit(led.get(m, ""))}
+                          "ledger": ledger_model(led.get(m, "")), "awaiting_audit": awaiting_audit(led.get(m, "")),
+                          "untrusted": untrusted.counts(unt), "rerun": rerun,
+                          "rerun_owed": [j for j in rerun if j not in ended]}
 
     def done(stage, nxt):
         t["stage"], t["next"] = stage, nxt
@@ -315,11 +327,13 @@ def read(slug, ctx):
     if any(ms[m]["running"] for m in MODELS):
         return done("trialing", "wait: trials running (" +
                     ", ".join(f"{m} {ms[m]['running']}" for m in MODELS if ms[m]["running"]) + ")")
-    if any(ms[m]["launch"] == "stuck" and not final[m] for m in MODELS):
+    # A stuck model still gets one fresh run per untrusted run (untrusted.py); after that a person looks.
+    if any(ms[m]["launch"] == "stuck" and not final[m] and not ms[m]["rerun_owed"] for m in MODELS):
         return done("trials_stuck", "a person looks (runs keep producing no result)")
     todo = [m for m in MODELS if not final[m]]
     if todo:
-        return done("waiting_trials", "trial " + ", ".join(todo))
+        why = [f"{m} re-runs {len(ms[m]['rerun'])} untrusted run(s)" for m in todo if ms[m]["rerun"]]
+        return done("waiting_trials", "trial " + ", ".join(todo) + (f" ({'; '.join(why)})" if why else ""))
     return verdict_stage(t, final, kinds, done)
 
 
@@ -332,7 +346,13 @@ def verdict_stage(t, final, kinds, done):
         return done("not_breaker", "nothing (" + ", ".join(m for m in MODELS if final[m] == "blocked")
                     + " blocked by the provider)")
     if any(ms[m]["awaiting_audit"] for m in MODELS) or "BREAKER" not in t["ledger_verdict"]:
-        return done("awaiting_audit", "audit the failing runs")
+        waits = {}
+        for m in MODELS:
+            for k, n in ms[m].get("untrusted", {}).items():
+                if k != "rerun":
+                    waits[k] = waits.get(k, 0) + n
+        return done("awaiting_audit", "audit the failing runs" + (" (untrusted runs: " + ", ".join(
+            f"{n} {k.replace('_', ' ')}" for k, n in sorted(waits.items())) + ")" if waits else ""))
     if "fairness" in kinds:
         return done("awaiting_fairness", "wait: fairness review running")
     if not t["fairness"] or t["fairness"].startswith("ERROR"):
