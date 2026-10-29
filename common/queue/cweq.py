@@ -336,7 +336,7 @@ def cmd_inbox(conn, cfg, a):
     import events
     import inbox
     states = events.read_all(taskstate.context(procs.list_processes()))
-    items = inbox.collect(conn, states, delivery.prepared())
+    items = inbox.collect(conn, states, delivery.prepared(), cfg=cfg)
     if a.html:
         Path(a.html).write_text(inbox.page(items))
         print(f"wrote {a.html} ({sum(len(v) for v in items.values())} items)")
@@ -344,6 +344,32 @@ def cmd_inbox(conn, cfg, a):
         print(inbox.as_json(items))
     elif not a.html:
         print(inbox.text(items), end="")
+    return 0
+
+
+def cmd_repairs(conn, cfg, a):
+    """Test repairs: the plan of rule T1 for every task (nothing is queued) and the lost repairs."""
+    import repairstep
+    reps = [] if a.lost else repairstep.plan(conn, cfg, None, {}, dry_run=True)
+    lost = repairstep.lost(cfg)
+    if a.json:
+        print(json.dumps({"plan": [{"task": r["task"], "want": r["want"], "notes": r["notes"],
+                                    "finding": (r.get("finding") or {}).get("key")} for r in reps],
+                          "lost": lost}, indent=1, default=str))
+        return 0
+    if not a.lost:
+        auto = repairstep.settings(cfg)["auto"]
+        print(f"repair plan (rule T1; [repair] auto = {str(auto).lower()}; nothing is queued by this command):")
+        for r in reps:
+            for w in r["want"]:
+                print(f"  {r['task']:<34} {'queue' if auto else 'would queue'} repair {json.dumps(w['args'])}: {w['why']}")
+            for n in r["notes"]:
+                if not n.startswith("repair planned, not queued"):
+                    print(f"  {r['task']:<34} {n}")
+    print(f"lost repairs ({len(lost)}): a test-fault audit and no later repaired-tests-* / removed-tests-* / testfix-*")
+    for r in lost:
+        print(f"  {r['task']:<34} since {r['since']}  runs {r['runs']}{'  [' + r['excluded'] + ']' if r['excluded'] else ''}"
+              f"  repairs so far: {', '.join(r['repairs']) or '-'}")
     return 0
 
 
@@ -391,6 +417,19 @@ def cmd_explain(conn, cfg, a):
     for w in t["want"]:
         print(f"  rules want   {w['kind']} {json.dumps({k: v for k, v in w['args'].items() if k != 'why'})}"
               f"{' (after the regate)' if w.get('after_regate') else ''}")
+    if t.get("lift"):
+        print("  rules want   lift the hold (.hold-repair -> .sound): re-gate SOUND, every graded run regraded")
+    import repairstep
+    for rep in repairstep.plan(conn, cfg, None, {}, dry_run=True, slugs=[a.task]):
+        f = rep.get("finding") or {}
+        if f.get("key"):
+            print(f"  finding      {f['key']}: {len(f['items'])} item(s) "
+                  f"({', '.join(sorted({i['source'] for i in f['items']}))}); {'plan' if f['plan'] else 'no plan'}: "
+                  f"{f['why']}")
+        for n in rep["notes"]:
+            print(f"  repair       {n}")
+        for w in rep["want"]:
+            print(f"  rules want   repair {json.dumps(w['args'])}{' (auto off: not queued)' if w.get('planned_only') else ''}")
     rows = qdb.jobs(conn, "task=?", (a.task,))
     print(f"  jobs ({len(rows)}):")
     for r in rows:
@@ -504,6 +543,9 @@ def main(argv=None):
     p.add_argument("--open", action="store_true", help="only open events")
     p.add_argument("--limit", type=int)
     p.add_argument("--action", help="with handle: what was done")
+    p = sub.add_parser("repairs", help="test repairs: the planned repairs and the lost repairs (read-only)")
+    p.add_argument("--lost", action="store_true", help="only the lost repairs")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("inbox", help="every decision waiting on the owner")
     p.add_argument("--html", help="write one self-contained HTML page here")
     p.add_argument("--json", action="store_true")
@@ -522,7 +564,7 @@ def main(argv=None):
     cfg = config.load(a.config)
     a.db = a.db or cfg["db"]
     # Looking never creates the database: a dry run, status or explain on a missing file uses an empty one in memory.
-    looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks", "verify", "inbox",
+    looking = getattr(a, "dry_run", False) or a.cmd in ("orphans", "status", "explain", "tasks", "verify", "inbox", "repairs",
                                                          "preflight", "config")
     conn = qdb.connect(":memory:" if looking and not Path(a.db).exists() else a.db)
     if a.cmd == "init":
@@ -532,7 +574,7 @@ def main(argv=None):
         return worker.run(conn, cfg, a.id)
     return {"adopt": cmd_adopt, "tasks": cmd_tasks, "reconcile": cmd_reconcile, "dispatch": cmd_dispatch, "status": cmd_status, "enqueue": cmd_enqueue,
             "retry": cmd_retry, "block": cmd_block, "explain": cmd_explain, "verify": cmd_verify,
-            "selfcheck": cmd_selfcheck, "events": cmd_events, "inbox": cmd_inbox,
+            "selfcheck": cmd_selfcheck, "events": cmd_events, "inbox": cmd_inbox, "repairs": cmd_repairs,
             "delivered": cmd_delivered, "stop": cmd_stop, "orphans": cmd_orphans, "monitor": cmd_monitor,
             "preflight": cmd_preflight, "config": cmd_config}[a.cmd](conn, cfg, a)
 

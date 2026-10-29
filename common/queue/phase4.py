@@ -17,10 +17,18 @@ They replace pipelines/router/auto_advance.sh (run on every heartbeat) and the s
   A2 audit_record  when an auditor's verdict.json is not recorded yet, or a trial result / regrade is newer than the
                    ledger: `postmortem.py record-ready` then `audit_results.py` (one at a time; keyed by the newest
                    input, so the same state never runs twice).
-  F1 fairness      a batch task the ledger marks BREAKER candidate, with no FAIRNESS.md newer than its newest trial
-                   job folder and no review running: `common/launch/drive.sh deepseek bash <review script> <slug>`
-                   with output to build/<slug>/fairness.nohup (stacking: 7-fairness/run_fairness_stack.sh; sibling:
+  F1 fairness      a batch task the ledger marks BREAKER candidate, with no current review and no review running:
+                   `common/launch/drive.sh deepseek bash <review script> <slug>` with output to
+                   build/<slug>/fairness.nohup (stacking: 7-fairness/run_fairness_stack.sh; sibling:
                    9-fairness/run_fairness.sh), exactly as auto_advance. New: never for held or busy tasks.
+                   A review is current when FAIRNESS.md is newer than the newest trial job folder AND it reviewed
+                   the current tests: build/<slug>/fairness_tests.json (written by the job before the review) holds
+                   the content hash of tests/ it was shown; a review without that record is stale when a
+                   repaired-tests-* / removed-tests-* / testfix-* folder is newer than it (2026-10-28: langflow-s3
+                   and hypequery-s2 kept a review of their tests from before the repair). A stale review is moved
+                   aside (FAIRNESS.md.prev-<UTC>) when its new job is queued. Job key {"after": <newest trial job
+                   folder>, "tests": <tests hash>}: a repair gets a fresh review; an older job keyed {"after"} only
+                   still counts for the same trial folder when the review is not stale.
   C1 cleanup       one job per UTC hour: `common/util/hourly_cleanup.sh once` (never two at once; it runs in its own
                    worker, so its long dangling-image removal holds no other kind's slot). Not while the old
                    `hourly_cleanup.sh loop` still runs. A queued job of an earlier hour is superseded.
@@ -186,7 +194,28 @@ def record_plan(cfg):
     return []
 
 
-def fairness_plan(cfg, ctx, proc_list):
+FAIRNESS_TESTS = "fairness_tests.json"
+
+
+def review_stale(slug, tests16):
+    """Why the last fairness review of build/<slug>/ reviewed other tests than the current ones, or None (see F1).
+    The last review is FAIRNESS.md, or, when someone moved it away (langflow-s3, 2026-10-28), the last review run
+    (fairness_start.txt)."""
+    import repairstep
+    b = paths.BUILD / slug
+    rec = _json(b / FAIRNESS_TESTS)
+    if rec and rec.get("tests_hash"):
+        return None if rec["tests_hash"] == tests16 else \
+            f"the review saw tests {rec['tests_hash'][:12]}, now {tests16[:12]}"
+    when = next((p.stat().st_mtime for p in (b / "FAIRNESS.md", b / "fairness_start.txt") if p.is_file()), None)
+    if when is None:
+        return None                                      # never reviewed: planned as before
+    cov = repairstep.covering(b, when)
+    return f"{cov} is newer than the last review" if cov else None
+
+
+def fairness_plan(cfg, ctx, proc_list, conn=None):
+    import repairstep
     jobs, notes = [], []
     scale = sorted(ctx["batches"])
     cands = [s for s in scale if "BREAKER" in ctx["ledger"].get(s, {}).get("verdict", "")]
@@ -201,10 +230,36 @@ def fairness_plan(cfg, ctx, proc_list):
         dirs = [p for p in jd.glob(f"{s}-*/") if p.is_dir()]
         last = max(dirs, key=lambda p: p.stat().st_mtime) if dirs else None
         f = paths.BUILD / s / "FAIRNESS.md"
-        if f.exists() and last is not None and f.stat().st_mtime > last.stat().st_mtime:
-            continue                                     # reviewed after the newest trial
-        jobs.append({"kind": "fairness", "task": s, "args": {"after": last.name if last else ""}})
+        th = repairstep.tests_hash(s)
+        stale = review_stale(s, th)
+        if f.exists() and last is not None and f.stat().st_mtime > last.stat().st_mtime and not stale:
+            continue                                     # reviewed after the newest trial, on the current tests
+        after = last.name if last else ""
+        if conn is not None and not stale:
+            # An older job keyed on the trial folder alone (before 2026-10-28) still stands for the same tests.
+            old = [r for r in qdb.jobs(conn, "kind='fairness' AND task=?", (s,))
+                   if qdb.args_of(r).get("after") == after and "tests" not in qdb.args_of(r)]
+            if old:
+                continue
+        job = {"kind": "fairness", "task": s, "args": {"after": after, "tests": th}}
+        if stale:
+            job["stale"] = stale
+            notes.append(f"{s}: fresh fairness review, the current one is stale ({stale})")
+        jobs.append(job)
     return jobs, notes
+
+
+def move_review_aside(slug, why):
+    """FAIRNESS.md -> FAIRNESS.md.prev-<UTC> (a stale review must never pass for the repaired tests)."""
+    b = paths.BUILD / slug
+    f = b / "FAIRNESS.md"
+    if not f.is_file():
+        return None
+    dst = b / f"FAIRNESS.md.prev-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+    f.replace(dst)
+    with open(b / "fairness.nohup", "a") as log:
+        log.write(f"{qdb.utc()} cweq: FAIRNESS.md moved to {dst.name}: {why}; a fresh review is queued\n")
+    return dst.name
 
 
 def cleanup_plan(proc_list, now=None):
@@ -245,7 +300,7 @@ def reconcile(conn, cfg, ctx, proc_list, dry_run=False, now=None):
         notes.append(f"audit_ready.txt: {len(ready)} folders waiting for an auditor"
                      + (" (dry run: not written)" if dry_run else ""))
     if p4.get("fairness", True):
-        j, n = fairness_plan(cfg, ctx, proc_list)
+        j, n = fairness_plan(cfg, ctx, proc_list, conn)
         want += j
         notes += n
     if p4.get("cleanup", True):
@@ -258,8 +313,15 @@ def reconcile(conn, cfg, ctx, proc_list, dry_run=False, now=None):
     for w in want:
         r = rep.setdefault(w["task"], {"task": w["task"], "stage": "phase4", "want": [], "notes": []})
         if not dry_run:
-            w["id"], _ = qdb.enqueue(conn, w["kind"], w["task"], w["args"], priority=cfg["priority"].get(w["kind"], 0),
-                                     max_attempts=cfg["max_attempts"].get(w["kind"], 1), origin="reconciler")
+            w["id"], created = qdb.enqueue(conn, w["kind"], w["task"], w["args"],
+                                           priority=cfg["priority"].get(w["kind"], 0),
+                                           max_attempts=cfg["max_attempts"].get(w["kind"], 1), origin="reconciler")
+            if created and w.get("stale"):
+                moved = move_review_aside(w["task"], w["stale"])
+                if moved:
+                    r["notes"].append(f"FAIRNESS.md moved aside to {moved} ({w['stale']})")
+        elif w.get("stale"):
+            r["notes"].append(f"would move FAIRNESS.md aside ({w['stale']}) and queue a fresh review")
         r["want"].append(w)
     if not dry_run:
         # A queued periodic job of an earlier slot is not needed once a newer slot is queued.
@@ -286,8 +348,10 @@ def command(row, cfg):
         # Not -I: audit_results.py imports its helpers from its own folder (status_report.py note, 2026-10-26).
         return ["bash", "-c", "python3 common/audit/postmortem.py record-ready && python3 common/audit/audit_results.py"]
     if k == "fairness":
+        # The tests the reviewer is shown are recorded first (fairness_tests.json, rule F1's staleness test).
         script = FAIRNESS_SCRIPT["stk" if task.startswith("stk-") else "sibling"]
-        return ["bash", "-c", 'common/launch/drive.sh deepseek bash "$1" "$2" > "build/$2/fairness.nohup" 2>&1 < /dev/null',
+        return ["bash", "-c", 'python3 -I common/queue/repairstep.py record-tests "$2" ' + FAIRNESS_TESTS + '; '
+                'common/launch/drive.sh deepseek bash "$1" "$2" > "build/$2/fairness.nohup" 2>&1 < /dev/null',
                 "_", script, task]
     if k == "cleanup":
         return ["bash", "common/util/hourly_cleanup.sh", "once"]

@@ -32,6 +32,7 @@ and sha256.
 | Audit | `common/audit/postmortem.py` + Opus sub-agents; `common/audit/audit_results.py` | proven | same | `common/archive/versions/build/audit_results.py.bak-20261020T230715Z` |
 | Fairness | `9-fairness/run_fairness.sh` + `common/fairness/FAIRNESS-REVIEW-BRIEF.md` (two-gate split) | proven (10-22) | same | `archive/versions/run_fairness.sh.bak-*` ×2; brief `.bak-*` ×3 in `common/archive/versions/builder/` |
 | Fairfix | `10-fairfix/run_fairfix.sh` (snapshot first, restore on failure) | **not yet run in this pipeline** (current since 10-21) | `archive/versions/run_fairfix.sh.bak-20261021T001849Z` | `.bak-20261019`, `.bak-20261020T233033Z`, `.bak-20261021T001849Z` |
+| Repair mode (2026-10-28) | `10-fairfix/run_repair_agent.sh`, started by `run_fairfix.sh` / `run_fairfix_stack.sh` when the queue's `repair` job sets `REPAIR_INPUTS` (`common/queue/repairjob.py`; brief `common/fairness/REPAIR-BRIEF.md`; no snapshot, the job holds, backs up and restores) | **not yet run** (new) | same | none |
 | Orchestrators | `10-fairfix/advance_one.sh`, `validate_fresh.sh`, `validate_loop.sh`, `validate_common.sh` | proven (10-20) | same | none |
 | Upgrade | `upgrade/run_upgrade.sh` + `UPGRADE-PROMPT.md` | **launcher not yet run** (current since 10-21) | `archive/versions/run_upgrade.sh.bak-20261020T233033Z` ran "upgrade run 2" (37 tasks) | `.bak-20261020T233033Z`, `.bak-20261021T001849Z`; batch scripts in `archive/batch1-oneoffs/` |
 | Hardening | **dropped** (user, 2026-10-22) | — | — | `archive/hardening-dropped/` |

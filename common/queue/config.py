@@ -25,7 +25,12 @@ DEFAULTS = {
                  "trials_wait_builds": 20},
     "phase3": {"enabled": True, "batches": [], "max_launches": 3},
     "phase4": {"enabled": True, "audits": True, "fairness": True, "cleanup": True, "step3": True},
-    "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True},
+    "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True,
+                  "unknown_tests_version": "regrade"},
+    # Test repairs (repairstep.py, repairjob.py, kinds/repair.py). auto = false: planned repairs are shown, not queued.
+    "repair": {"auto": False, "lift_holds": True, "max_per_task": 3, "skip_solved": True, "timeout_sec": 10800,
+               "wait_sec": 7200, "static_check": True, "agent_cmd": [], "cleanup_image": "alpine:3",
+               "trial_summary": True},
     "busy": {"patterns": ["regate", "regrade", "rescore", "postbuild.sh", "gate_one_ds.sh", "common/gate/gate.py",
                           "repair", "fairfix", "upgrade", "run_stack_pipeline.sh", "run_pipeline.sh", "run_build.sh",
                           "fingerprint.py"]},

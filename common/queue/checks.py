@@ -9,7 +9,8 @@ Checks read files only: markers, logs, JSON written by the pipeline's own script
 tests. `t0` is the job's start (UTC, second precision); a file counts as the job's output when its time is at or
 after t0 - SLACK.
 
-    regrade     a new <trial>/regrade-<UTC>/ with REGRADE.json carrying a numeric reward, and verifier/reward.json
+    regrade     a new <trial>/regrade-<UTC>/ with REGRADE.json carrying a numeric reward, and verifier/reward.json,
+                graded on the current tests (REGRADE.json tests_hash = the content hash of tasks/<slug>/tests/)
     rescore     the same, made by the rescore tool, every --drop name listed in `dropped` and absent from the new
                 verifier/results.json
     regate      a gate RESULT line in postbuild.log at or after t0 saying SOUND, the .sound marker (or .hold-repair
@@ -22,6 +23,8 @@ after t0 - SLACK.
     audit_record build/audit/ledger.md and trials.tsv rewritten at or after t0
     fairness    FAIRNESS.md written at or after t0, fairness_status.txt says ok, and the review states a verdict
     cleanup     a "pass done" line in build/audit/hourly_cleanup.log at or after t0
+    repair      kinds/repair.py: JOB-RESULT.json (result repaired) written after t0 in build/<slug>/repair-inputs-*/,
+                the new repair folder with README.md, instruction.md unchanged, .hold-repair kept
     step3, gate no file outcome to check: the exit code decides
 
 Self-checks (`cweq selfcheck`): each grading tool reproduces a known graded run whose tests have not changed since,
@@ -154,6 +157,12 @@ def c_regrade(task, a, t0, cfg, rescore=False):
     out.append((f"{kind}.scored", is_num(reward), f"REGRADE.json reward = {reward!r}", not is_num(reward)))
     rj = (jload(d / "verifier" / "reward.json") or {}).get("reward")
     out.append((f"{kind}.reward_file", is_num(rj), f"verifier/reward.json reward = {rj!r}", False))
+    # Graded on the current tests (by content: the test version reconcile R2 compares). A grading that records no
+    # test version (a tool from before 2026-10-28) is not judged here.
+    import repairstep
+    got, cur = repairstep.regrade_tests_hash(info), repairstep.tests_hash(task)
+    out.append((f"{kind}.tests_current", got is None or got == cur,
+                f"graded on tests {got or 'unrecorded'}, current {cur}", False))
     if not rescore:
         # Same code, same or repaired tests: a functional test that passed in the original grading and fails
         # in the regrade points at the grading environment (stk-bifrost-19592 2026-10-28: --network none left no

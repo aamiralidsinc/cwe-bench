@@ -57,15 +57,27 @@ MARKERS = {m.name: m for m in (
     Marker("postbuild.log", "log", "Post-build and re-gate log; its last `RESULT:` line is the gate outcome.",
            "common/gate/postbuild.sh, regate.sh, repair and waiver steps", "reconcile.py, checks.py, people"),
     # ---- repair and holds
-    Marker(".hold-repair", "flag", "A test repair is between its edit and its regrades: no new trials of the task.",
-           "repair steps (people / repair scripts), the queue after a held re-gate", "taskstate.py, dispatch.py, "
-           "scale_queue.py, phase4.py"),
+    Marker(".hold-repair", "flag", "A test repair is between its edit and its regrades: no new trials of the task. "
+           "Its text says who holds it; `repair failed ...` keeps it for a person.",
+           "repair steps (the queue's repair job, people), the queue after a held re-gate; lifted by reconcile R6",
+           "taskstate.py, dispatch.py, scale_queue.py, phase4.py, reconcile.py (R6)"),
     Marker("hold_{model}", "flag", "No new runs of this model on this task.", "people",
            "common/trial/run_trial.sh, trial.py, phase3.py, dispatch.py"),
     Marker("repaired-tests-*", "folder", "Originals (*.orig) and README.md of tests changed by a repair.",
            "repair steps", "reconcile.py (R1-R4), people"),
     Marker("removed-tests-*", "folder", "Originals and README.md of tests removed by a repair.",
            "repair steps", "reconcile.py (R1-R4), people"),
+    Marker("testfix-*", "folder", "An older test repair's record (originals and notes); counts as a repair for the "
+           "lost-repair check and for repair coverage.", "repair steps (before 2026-10-26)",
+           "repairstep.py (coverage, lost repairs), people"),
+    Marker("repair-inputs-*", "folder", "One queue repair job: FINDING.md/.json, INPUTS.md, runs/ (the failing runs' "
+           "evidence), backup/, OUTCOME.json (the agent), JOB-RESULT.json (the job), failed/ (a reverted repair).",
+           "common/queue/repairjob.py", "the repair agent, kinds/repair.py check, repairstep.py, people"),
+    Marker("repair_status.txt", "record", "Whether the last repair agent run finished (`ok` or `error: ...`).",
+           "pipelines/sibling/10-fairfix/run_repair_agent.sh", "common/queue/repairjob.py"),
+    Marker("fairness_tests.json", "record", "The content hash of tests/ the last queued fairness review was shown; a "
+           "different hash makes the review stale (phase4 rule F1).", "the fairness job (phase4.command)",
+           "phase4.py"),
     # ---- build
     Marker("BUILD-PROMPT.md", "record", "The builder's prompt for this task.", "common/builder/build_prepare.py",
            "common/launch/run_build.sh, phase3.py"),
@@ -276,8 +288,10 @@ def delivered_line(b):
 
 
 def repairs(b):
+    """The task's repair folders: repaired-tests-*, removed-tests-*, and the older testfix-* (a repair too)."""
     b = Path(b)
-    return sorted(p.name for p in b.glob("repaired-tests-*")) + sorted(p.name for p in b.glob("removed-tests-*"))
+    return (sorted(p.name for p in b.glob("repaired-tests-*")) + sorted(p.name for p in b.glob("removed-tests-*"))
+            + sorted(p.name for p in b.glob("testfix-*")))
 
 
 def runs_log(b, model):

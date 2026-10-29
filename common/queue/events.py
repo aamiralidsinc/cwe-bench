@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS marks (
 """
 
 DEFAULTS = {
-    "job_done_kinds": ["build", "regate", "regrade", "rescore", "fairness", "delivery_prep"],
+    "job_done_kinds": ["build", "regate", "regrade", "rescore", "fairness", "delivery_prep", "repair"],
     "stages": ["awaiting_audit", "awaiting_fairness", "fairness_not_ready", "awaiting_decision", "kept", "delivered",
                "trials_stuck", "listing_fail", "gate_failed", "build_stopped", "not_breaker", "stale_gate"],
     "urgent": ["disk.critical", "adoption.conflict", "process.frozen"],

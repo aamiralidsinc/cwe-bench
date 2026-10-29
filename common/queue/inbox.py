@@ -11,6 +11,8 @@ packages); nothing is inferred beyond what those say:
   3. deliver        KEEP recorded, not delivered yet (with the prepared package when delivery_prep has run)
   4. blocked        queue jobs blocked for a person
   5. person         tasks the pipeline cannot move on its own: listing check failed, trials stuck
+  6. repair         test repairs: lost repairs (a test-fault audit and no later repair folder), repairs planned but
+                    not queued ([repair] auto = false), failed repairs that keep the task held (repairstep.py)
 """
 import html
 import json
@@ -26,6 +28,7 @@ SECTIONS = (
     ("deliver", "Kept, not delivered yet", "KEEP is recorded; the task is not in the delivery register."),
     ("blocked", "Blocked jobs", "Queue jobs that stopped for a person."),
     ("person", "Needs a person", "Tasks the pipeline cannot move on its own."),
+    ("repair", "Test repairs", "Lost repairs, repairs planned but not queued (auto off), and failed repairs."),
 )
 
 
@@ -54,8 +57,9 @@ def scores(t):
     return ", ".join(out)
 
 
-def collect(conn, states, packages=None):
-    """{section: [item dict]} — each item has task, summary and detail."""
+def collect(conn, states, packages=None, cfg=None):
+    """{section: [item dict]} — each item has task, summary and detail. cfg: the queue settings (the repair
+    section needs the jobs folder; without cfg it stays empty)."""
     items = {k: [] for k, _t, _d in SECTIONS}
     pk = {}
     for p in packages or []:
@@ -83,6 +87,12 @@ def collect(conn, states, packages=None):
             items["deliver"].append({"task": slug, "summary": f"{t['decision']}; {scores(t)}", "detail": d})
         elif st in ("listing_fail", "trials_stuck"):
             items["person"].append({"task": slug, "summary": st.replace("_", " "), "detail": t["next"]})
+    if cfg is not None:
+        try:
+            import repairstep
+            items["repair"] = repairstep.inbox_items(conn, cfg)
+        except Exception as e:                           # the inbox must render whatever one reader does
+            items["repair"] = [{"task": "-", "summary": "repair section unavailable", "detail": f"{type(e).__name__}: {e}"}]
     for r in conn.execute("SELECT * FROM jobs WHERE state='blocked' ORDER BY id"):
         items["blocked"].append({"task": r["task"], "summary": f"job #{r['id']} {r['kind']} {qdb.canon(qdb.args_of(r))[:120]}",
                                  "detail": r["result"] or ""})
