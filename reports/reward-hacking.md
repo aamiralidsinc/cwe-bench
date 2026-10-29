@@ -152,7 +152,8 @@ The misled-runs analysis of 2026-10-28 (`build/audit/timestamp-leak-20261028/MIS
 | bc-java-ds | Bouncy Castle keeps older per-JDK copies of some sources (`jdk1.x/`). Our injection changed only the main copy. | 2 runs diffed the main file against its older copies, and the differences pointed at the planted lines. It decided nothing; both runs still failed fairly. |
 | siyuan-ds | The two injected routes are referenced nowhere: not in the frontend, the docs or the tests. | 3 DeepSeek runs reasoned "nothing calls these, so the benchmark added them". That pointed them at the planted siblings, which they fixed. |
 | nocobase-ds | The injected `storages:probe` action does not follow the product's naming. | 2 runs called it planted; it decided nothing. |
-| browsershot-s3 | A root-owned copy of the repository under `/app`, alongside `/workspace`. | 1 run diffed the two. They were identical here, so nothing leaked. The origin of the `/app` copy is under investigation (2026-10-28), and it will be fixed at the source if it is a leftover of the old `/app` layout. |
+| browsershot-s3 | A root-owned copy of the repository under `/app`, alongside `/workspace`. | 1 run diffed the two copies; they were identical (post-injection), so nothing leaked through the content, but /app keeps the planted files' newer times (the time reset only covers /workspace). Root cause: builders added the copy as a blind-fix workaround (2026-10-21..25); briefs fixed 2026-10-29. |
+| bifrost-s2 | The Go module cache holds the released bifrost/framework@v1.3.16, whose modelcatalog/sync.go is close to the pre-injection file (17 diff lines vs 110 from the injected one) — a diff against /workspace would show the planted hunk. | Exposure only: none of the 13 bifrost trials opened the module cache. Recorded, no rule (owner 2026-10-29). |
 
 ## 5. Fix
 

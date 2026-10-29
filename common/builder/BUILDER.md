@@ -30,7 +30,7 @@ cwe-bench/tasks/SLUG/
   instruction.md          the vulnerability report
   task.toml               from the template, [metadata] filled in
   environment/Dockerfile  repo at the vulnerable commit, everything installed
-  solution/solve.sh       applies /solution/fix.patch to /app
+  solution/solve.sh       applies /solution/fix.patch to /workspace
   solution/fix.patch      the reference fix (source changes only)
   tests/test.sh           from the template; runs both groups, then score.py
   tests/score.py          copied unchanged from the template
@@ -56,9 +56,11 @@ never inside `cwe-bench/`.
 
 ### 3a. Environment
 - `environment/Dockerfile`: start from a small official base image, fetch the
-  repository at the VULNERABLE commit into `/app` (`git init` + `git fetch
+  repository at the VULNERABLE commit into `/workspace` (`git init` + `git fetch
   --depth 1 origin <sha>` + checkout works when the sha is reachable), then
-  delete `/app/.git` so the later history is not in the image.
+  replace its history with the fresh one-commit git baseline (the FORMAT note
+  above), so the later history is not in the image.
+- The product lives only in /workspace. Never copy the tree, or part of it, anywhere else in the agent image (no /app copy, no non-editable install of the product). Copies needed for grading go in tests/Dockerfile. The blind-fix script reads /workspace (since 2026-10-25).
 - Install every dependency, test tool and service the project and your tests
   need. The task must run with NO network after the image is built: no
   downloads in `test.sh`, in the tests, or at service start-up. If the project
@@ -122,7 +124,7 @@ never inside `cwe-bench/`.
 ### 3d / 3e. Oracle and the before/after proof
 - `solution/fix.patch`: the upstream fix reduced to SOURCE changes only (drop
   edits to the repo's own test files, changelogs, docs). `solve.sh` applies it
-  to `/app`.
+  to `/workspace`.
 - The gate runs this for you, but convince yourself first: vulnerable code →
   security tests fail, functional pass; after the patch → all pass, twice,
   identically.
@@ -355,7 +357,7 @@ Do not claim a task is good because the upstream fix exists — claim it only
 when the gate prints PASSED.
 
 ## Common build gotchas (from pilot builds)
-- **setuptools-scm / git-derived versions:** stripping `/app/.git` breaks
+- **setuptools-scm / git-derived versions:** replacing `/workspace/.git` breaks
   `pip install -e .` for projects that derive their version from git. Set
   `ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<PKG>=<version>` before the install,
   or install before removing `.git`.

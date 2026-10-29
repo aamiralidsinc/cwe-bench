@@ -383,7 +383,7 @@ from when a source changes.
 
    What never works: the list in 3.1, item 3.
 4. **Environment rules** (BUILDER 3a, 3h):
-   - the vulnerable commit, with `/app/.git` removed;
+   - the vulnerable commit in `/workspace`, with the fresh one-commit git baseline;
    - every dependency installed, offline after the build;
    - no test code in the image (stubs only);
    - the agent layer appended;

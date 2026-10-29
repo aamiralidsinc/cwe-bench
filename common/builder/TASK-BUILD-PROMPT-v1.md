@@ -64,6 +64,9 @@
   logs under the work folder, nothing left running at the report), target daemons only in Docker, no gate
   limits, no markers or start/end stamps. Eleven builds hit the 5-h limit waiting on gate slots for stages the
   post-build gate repeats; four builders were killed by name-based kills.
+- 2026-10-29 (no version bump): stale `/app` references replaced by `/workspace`; one rule: the product lives only
+  in /workspace (builders had added `RUN cp -a /workspace /app` as a blind-fix workaround; the copy kept the planted
+  files' times). For future builds only.
 
 ---
 
@@ -240,8 +243,9 @@ Record both in the trap's manifest entry (`instruction_scope`, `entry_point`).
   - `disclosure_status` (`pending client decision`).
 
 ## Environment (`tasks/{{SLUG}}/environment/Dockerfile`)
-- **Base and code.** A small official base image. The repo goes into `/app` at the pinned commit,
-  and `/app/.git` is then deleted.
+- **Base and code.** A small official base image. The repo goes into `/workspace` at the pinned commit,
+  with the fresh one-commit git baseline (the FORMAT note above).
+- **One copy of the product.** The product lives only in /workspace. Never copy the tree, or part of it, anywhere else in the agent image (no /app copy, no non-editable install of the product). Copies needed for grading go in tests/Dockerfile. The blind-fix script reads /workspace (since 2026-10-25).
 - **Offline.** Install every dependency, tool and service the project and tests need; nothing may
   be downloaded at test time. Services start from `test.sh`.
 - **Packages:** `patch`, `curl`, `ca-certificates`, `bash`, `git`.
@@ -340,7 +344,7 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 ## Proof
 - **The oracle.** `solution/fix.patch` is the published fix reduced to source changes, plus fixes
   for every uncovered route and injected sibling in the task. `solution/solve.sh` applies it to
-  `/app`.
+  `/workspace`.
 - **Wrong-fix patches** go in `build/{{SLUG}}/checks/`, listed in `manifest.patch_checks`:
   - one `security_fail` per lever (the fix that misses only that lever);
   - a `functional_fail` (an over-broad or feature-removing fix);
