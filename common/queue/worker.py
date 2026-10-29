@@ -12,6 +12,8 @@ environment variables (trial_run: CWE_AGENT_TIMEOUT_MULT, as the scheduler set i
 exits that count as done (trial.py exits 2 when some runs were ungraded: the reconciler plans the next run).
 The job records the settings version the worker loaded (jobs.settings_hash; settings.py).
 A job that exits with an ok code is `done` only after its post-condition checks pass (checks.py, docs/RULES.md).
+A kind with an exit record (kinds: exit_of) has a nonzero code from it stored as the job's exit code: a build job shows
+the builder's own exit (124 for a timeout) although run_pipeline.sh exits 0 (2026-10-28: job #482 showed 0 for 124).
 """
 import os
 import re
@@ -83,6 +85,7 @@ def run(conn, cfg, job_id):
         log.flush()
         env = dict(os.environ, **{k2: str(v) for k2, v in (cfg.get("env", {}).get(row["kind"]) or {}).items()})
         env.update(identity.job_env(row, paths.PIPELINES / "router" / "out" / "batches"))   # labels (identity.py)
+        t0 = time.time()
         child = subprocess.Popen(argv, cwd=str(paths.ROOT), stdin=subprocess.DEVNULL, stdout=log,
                                  stderr=subprocess.STDOUT, env=env)
         try:
@@ -109,12 +112,22 @@ def run(conn, cfg, job_id):
             # Same as the repair scripts: the task stays held until its regrades are in.
             os.replace(b / ".sound", b / ".hold-repair")
             log.write(f"{qdb.utc()} cweq: task was held: .sound moved back to .hold-repair\n")
-        log.write(f"{qdb.utc()} cweq job {job_id} exit {rc}{' (job no longer ours)' if lost else ''}\n")
+        shown = None
+        kd = kinds.get(row["kind"])
+        if kd and kd.exit_of and not lost:
+            try:
+                shown = kd.exit_of(row["task"], t0)
+                if not shown:                            # a clean builder exit never hides the script's own code
+                    shown = None
+            except Exception as e:                       # bookkeeping: never fail the job over it
+                log.write(f"{qdb.utc()} cweq: exit record not read ({type(e).__name__}: {e})\n")
+        note = f" (job records exit {shown}, from the kind's exit record)" if shown is not None else ""
+        log.write(f"{qdb.utc()} cweq job {job_id} exit {rc}{' (job no longer ours)' if lost else ''}{note}\n")
     if lost:
         return rc
     state = qdb.finish(conn, job_id, me, rc, last_line(log_path),
                        retry_codes=tuple(cfg["retry_exit_codes"].get(row["kind"], ())),
-                       ok_codes=tuple(cfg.get("ok_exit_codes", {}).get(row["kind"], (0,))))
+                       ok_codes=tuple(cfg.get("ok_exit_codes", {}).get(row["kind"], (0,))), recorded_exit=shown)
     if state == "done":                                  # done only when the files show the outcome (checks.py)
         import checks
         state = checks.after_done(conn, cfg, job_id, log_path)

@@ -30,8 +30,9 @@ bx=$(cwe_read "build/$S" build-exit.txt || echo '-')
 # half-built task must not be gated (it would read as "unsound"). Until 2026-10-20 a quota stop
 # was logged exactly like a real build failure.
 st=$(python3 "$CWE_AGENT_STATUS" "build/$S/build-run.json" "${bx//-/1}" --details "build/$S/build_status.json")
-if [ "$st" != ok ]; then log build "BUILD-INCOMPLETE (agent did not finish: $st; tf=$tf; not a candidate verdict)"; exit 0; fi
-if [ "$tf" -lt 5 ]; then log build "stopped/failed: agent finished but left tf=$tf task files (exit=$bx)"; exit 0; fi
+# The job's last output line (the queue shows it as the build job's result; the job records the builder's exit itself).
+if [ "$st" != ok ]; then log build "BUILD-INCOMPLETE (agent did not finish: $st; tf=$tf; not a candidate verdict)"; echo "$S: builder exit $bx, BUILD-INCOMPLETE"; exit 0; fi
+if [ "$tf" -lt 5 ]; then log build "stopped/failed: agent finished but left tf=$tf task files (exit=$bx)"; echo "$S: builder exit $bx, stopped/failed (tf=$tf)"; exit 0; fi
 
 # The gate (nop/oracle/patches) and its retry policy live in one place: gate_one_ds.sh retries
 # only infrastructure errors, never task failures, and leaves exactly one of .sound / .unsound /
@@ -43,9 +44,10 @@ res="$S $(tail -1 "build/$S/postbuild.log" 2>/dev/null)"
 echo "gate: $res" >> "$LOG"
 case $rc in
   0) : ;;
-  1) log gate "UNSOUND (task failure: ${res#"$S "})"; exit 0 ;;
-  *) log gate "GATE-ERROR (infra/internal, not a task verdict: ${res#"$S "})"; exit 0 ;;
+  1) log gate "UNSOUND (task failure: ${res#"$S "})"; echo "$S: builder exit $bx, post-build exit 1 (unsound)"; exit 0 ;;
+  *) log gate "GATE-ERROR (infra/internal, not a task verdict: ${res#"$S "})"; echo "$S: builder exit $bx, post-build exit $rc (gate error)"; exit 0 ;;
 esac
 # Build+gate only. Trials are run per-stage by common/trial/trial_set.sh (see pipelines/sibling/archive/batch1-lane-pilot/QUEUE.md).
 log gate "sound"
 echo "=== $S BUILT + SOUND (ready to trial) $(date -u +%FT%TZ) ===" >> "$LOG"
+echo "$S: builder exit $bx, sound"

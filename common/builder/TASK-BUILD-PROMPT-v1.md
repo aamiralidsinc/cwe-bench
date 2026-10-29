@@ -39,7 +39,8 @@
 1. Blind fix: `common/blindfix/BLIND-FIX-BRIEF.md`, a fresh agent. A target model never writes the blind fix
    for its own task.
 2. Fairness review: `common/fairness/FAIRNESS-REVIEW-BRIEF.md`, another fresh agent.
-3. Full strict gate: `python3 -I common/gate/gate.py <slug>`.
+3. Full strict gate: `python3 -I common/gate/gate.py <slug>` (the post-build gate, `common/gate/postbuild.sh`; the
+   builder runs only static and nop, 2026-10-28).
 4. Trials: both models, up to 3 runs each, offline, 2 h limit.
 5. Post-run audit of every graded run.
 6. Pattern B: check that every route has its row in `build/audit/uncovered-routes.tsv`, with
@@ -52,6 +53,11 @@
 
 ### Change log
 - build-v1 (2026-10-16): first version, written from the spec.
+- 2026-10-28 (pipeline fixes, item 3; no version bump): the builder runs only the static and nop stages (oracle
+  and patches are the post-build gate's; local proofs instead); rules on waiting (no `pgrep -f`/`pkill -f`,
+  logs under the work folder, nothing left running at the report), target daemons only in Docker, no gate
+  limits, no markers or start/end stamps. Eleven builds hit the 5-h limit waiting on gate slots for stages the
+  post-build gate repeats; four builders were killed by name-based kills.
 
 ---
 
@@ -352,23 +358,42 @@ Pattern B: the register rows (see Design).
 Use `common/builder/templates/` and `common/trial/smoke-task/` for the layout.
 
 ## Run the gate
-Run the stages in order, one at a time:
+Run these two stages yourself, in order, one at a time, from the project root above:
 ```
 python3 -I common/gate/gate.py {{SLUG}} --only static
 python3 -I common/gate/gate.py {{SLUG}} --only nop
-python3 -I common/gate/gate.py {{SLUG}} --only oracle
-python3 -I common/gate/gate.py {{SLUG}} --only patches
 ```
 In static, only the missing `blind` patch and the missing `FAIRNESS.md` may remain; others write
 those after you. Do NOT write them yourself, and do NOT run trials or any target model.
+
+The oracle and patches stages are NOT yours: the post-build gate runs every stage after you report
+(the gate refuses them from a builder). Prove them locally instead: apply `solution/` and each
+`checks/` patch to a copy of the pinned code in your scratch folder and run the tests there (every
+test passes with the reference fix; each patch gives the result its manifest entry expects). Report
+those local results as "local", and the static and nop results as the gate's.
+
+**Waiting and processes.**
+- Run each stage in the foreground, or start it with its output in
+  `~/.tb-graders/cwe/work/{{SLUG}}/logs/<stage>.log` and wait in bounded foreground loops (under 10
+  minutes each) for its last line, or with `tail --pid=<the pid you started>`. Never wait with, and
+  never kill by, `pgrep -f` or `pkill -f`: the pattern matches its own command line and other jobs'.
+  Stop only processes you started, by the pid you recorded.
+- Before your final report, nothing of yours may still run: no background task, Monitor, waiter,
+  server or container. Stop them, or this session never ends.
+- Run the target's daemons, background services, updaters and self-repair routes only inside Docker,
+  never on the host: some kill every process on the machine whose name matches theirs.
+- Never set `GATE_GLOBAL_SLOTS`, `GATE_PARALLEL` or any other gate limit.
+- Never write gate markers (`.sound`, `.unsound`, `.gate_error`, `gate_fingerprint.json`) or
+  `start_utc.txt` / `end_utc.txt`: the pipeline writes them.
 
 ## Machine and files
 - **The machine:** one shared 8-CPU / 12 GB Docker VM that is running trials.
   - At most one Docker build or gate stage of yours at a time.
   - Never prune Docker images or the build cache.
-  - Never stop containers you did not start.
+  - Never stop containers or processes you did not start.
 - **Files:**
-  - scratch work goes in `~/.tb-graders/cwe/work/{{SLUG}}/`;
+  - scratch work and logs go in `~/.tb-graders/cwe/work/{{SLUG}}/`, never in shared `/tmp` names
+    (another builder's log of the same name overwrote one);
   - edit only `tasks/{{SLUG}}/`, `build/{{SLUG}}/` and, for pattern B, the register;
   - do not commit.
 
@@ -381,7 +406,7 @@ those after you. Do NOT write them yourself, and do NOT run trials or any target
 - no design meets the bar.
 
 ## Report back (under 400 words)
-- The gate result for each stage.
+- The gate result for static and nop, and your local oracle and patch results.
 - Each lever in one line: pattern, shape, file:line, reason to dismiss.
 - Pattern B: each register row.
 - The instruction's word count.

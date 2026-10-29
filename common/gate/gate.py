@@ -268,19 +268,46 @@ GATE_SLOTS_DIR = Path.home() / ".tb-graders" / "cwe" / "slots" / "gate"
 GATE_LIMITS_FILE = Path.home() / ".tb-graders" / "cwe" / "slots" / "limits.env"
 
 
+_IGNORED_ENV = set()
+
+
 def gate_limit(name: str, default: int) -> int:
-    """A gate concurrency limit (2026-10-26): the environment variable if set, else the VM-wide limits file
-    (~/.tb-graders/cwe/slots/limits.env, lines NAME=VALUE, read on every call so changes apply at once), else default."""
-    if os.environ.get(name, "").strip():
-        return int(os.environ[name])
+    """A gate concurrency limit (2026-10-26): the VM-wide limits file (~/.tb-graders/cwe/slots/limits.env, lines
+    NAME=VALUE, read on every call so changes apply at once), else the environment variable, else default.
+    Since 2026-10-28 the file wins: a value in the environment never overrides one the file sets (spinnaker-s2's
+    builder ran its stages with GATE_GLOBAL_SLOTS=0 and bypassed the VM-wide cap), and a builder's environment is
+    never read at all; gate.py says so once per name."""
+    env = os.environ.get(name, "").strip()
+
+    def ignored(why):
+        if name not in _IGNORED_ENV:
+            _IGNORED_ENV.add(name)
+            print(f"[gate] ignoring {name}={env} from the environment: {why}", flush=True)
     try:
         for line in GATE_LIMITS_FILE.read_text().splitlines():
             k, _, v = line.partition("=")
             if k.strip() == name and v.strip():
-                return int(v.strip())
+                val = int(v.strip())
+                if env and env != str(val):
+                    ignored(f"the limits file sets {val} ({GATE_LIMITS_FILE}); only the file changes a VM-wide limit")
+                return val
     except (OSError, ValueError):
         pass
-    return default
+    if env and builder_run():
+        ignored(f"a builder never sets a gate limit (default {default})")
+        return default
+    return int(env) if env else default
+
+
+def builder_run() -> str:
+    """The build tag (CWE_BUILD_RUN) when a builder agent started this gate (common/launch/run_build.sh), else ''."""
+    return os.environ.get("CWE_BUILD_RUN", "").strip()
+
+
+# Stages a builder runs itself (2026-10-28, item 3 h1): oracle and patches are the post-build gate's (postbuild.sh
+# runs every stage after the builder reports), so a builder never gates twice or waits on the shared slots for them.
+BUILDER_STAGES = ("static", "nop")
+GATE_BUILDER_SLOTS_DIR = Path.home() / ".tb-graders" / "cwe" / "slots" / "gate-builder"
 
 
 GATE_PRIORITY_FILE = Path.home() / ".tb-graders" / "cwe" / "slots" / "priority.txt"
@@ -297,7 +324,7 @@ def is_priority_task() -> bool:
 
 class global_slot:
     """VM-wide cap on concurrent gate Harbor runs (2026-10-26). Scale batch 1 ran 56 parallel gates at ~15
-    Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (limits file or env, see gate_limit; default
+    Harbor runs each (651 at once, load ~1000 on 64 CPUs). A run waits for one of GATE_GLOBAL_SLOTS (limits file, else env, see gate_limit; default
     60 since 2026-10-26 afternoon; 40 before) lock files under ~/.tb-graders/cwe/slots/gate/; locks are released when the process ends, so a killed
     gate never leaks a slot. GATE_GLOBAL_SLOTS=0 disables the cap."""
 
@@ -308,6 +335,22 @@ class global_slot:
         # Disk-aware admission (2026-10-27): every gate run builds images, so none starts below the disk floor.
         diskguard.wait("DISK_MIN_FREE_GB_GATE", f"gate run of {sys.argv[1] if len(sys.argv) > 1 else '?'}")
         while True:
+            # Builder lane (2026-10-28, item 3 h2): a builder's own nop runs take one of GATE_BUILDER_RUN_SLOTS
+            # (limits file, default 8) under slots/gate-builder/, beside the shared slots, so a builder never waits
+            # on the post-build gates' slots against its 5-hour limit. 0 = no lane (the shared slots below).
+            lane = gate_limit("GATE_BUILDER_RUN_SLOTS", 8) if builder_run() else 0
+            if lane > 0:
+                GATE_BUILDER_SLOTS_DIR.mkdir(parents=True, exist_ok=True)
+                for i in range(lane):
+                    f = open(GATE_BUILDER_SLOTS_DIR / f"slot-{i:03d}.lock", "w")
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self.f = f
+                        return self
+                    except OSError:
+                        f.close()
+                time.sleep(5 + random.random() * 5)
+                continue
             # Re-read on every attempt, so a change in the limits file reaches gates that are already waiting.
             n = gate_limit("GATE_GLOBAL_SLOTS", 60)
             if n <= 0:
@@ -714,11 +757,11 @@ def run_parallel(jobs: list, raise_errors: bool = True) -> list:
     """Run independent Harbor trials at the same time (2026-10-24: the runs inside one stage are
     independent; sequential runs made a gate ~45 min). Returns results in input order and raises
     the first error in input order, so the verdict is the one the sequential loop would reach.
-    GATE_PARALLEL caps how many run at once (default: all)."""
+    GATE_PARALLEL caps how many run at once (default: all; limits file first, then the environment: gate_limit)."""
     import concurrent.futures as cf
     if not jobs:
         return []
-    width = max(1, min(len(jobs), int(os.environ.get("GATE_PARALLEL", "0") or 0) or len(jobs)))
+    width = max(1, min(len(jobs), gate_limit("GATE_PARALLEL", 0) or len(jobs)))
     with cf.ThreadPoolExecutor(max_workers=width) as pool:
         futs = []
         for i, job in enumerate(jobs):
@@ -825,6 +868,13 @@ def main() -> int:
     ap.add_argument("--patch", action="append", default=[], help="with --only patches: check only these patch "
                     "files (repeatable); postbuild.sh uses it for the blind patch after the blind fix")
     args = ap.parse_args()
+    if builder_run() and args.only not in BUILDER_STAGES:
+        # Refused before anything is written: no report, no evidence, no slot.
+        print(f"[gate] REFUSED: a builder runs only --only static and --only nop (this was "
+              f"{'--only ' + args.only if args.only else 'the full gate'}). Oracle and patches run in the post-build "
+              f"gate after you report; prove the reference fix and the patch checks locally instead. Do not retry.",
+              flush=True)
+        return 3
 
     task, build = ROOT / "tasks" / args.slug, ROOT / "build" / args.slug
     report = {"slug": args.slug, "only": args.only, "started": time.strftime("%Y-%m-%dT%H:%M:%S"),

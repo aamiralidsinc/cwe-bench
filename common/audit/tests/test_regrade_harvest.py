@@ -101,3 +101,47 @@ def test_regrade_check_flags_a_functional_test_lost_with_the_same_code(tmp_path)
     assert checks.functional_drops(o, n) == ["f::TestA"]
     n.write_text(json.dumps({"functional": {"f::TestA": "passed", "f::TestB": "passed"}}))
     assert checks.functional_drops(o, n) == []
+
+
+def test_harvest_keeps_the_source_diff_when_caches_and_build_output_crowd_the_cap(tmp_path, monkeypatch):
+    """core-s2 / mollieplugin-s2 (var/cache under tests/) and deepseek-harness-s2 (a compiled lib/) lost their source
+    diffs to the 500-file cap on 2026-10-28: caches are skipped first, and source edits are read before new folders."""
+    cache = [f"A /workspace/tests/Fixtures/app/var/cache/test/c{i}.php" for i in range(700)]
+    built = ["A /workspace/apps/cli/lib"] + [f"A /workspace/apps/cli/lib/m{i}.js" for i in range(600)] + \
+        [f"A /workspace/apps/cli/lib/m{i}.js.map" for i in range(50)]
+    src = ["C /workspace/src", "C /workspace/src/Serializer", "C /workspace/src/Serializer/AbstractItemNormalizer.php",
+           "A /workspace/src/Serializer/Guard.php", "D /workspace/src/Old.php"]
+    diff = "\n".join(cache + built + src) + "\n"
+
+    def fake_sh(*a, binary=False):
+        if a[:2] == ("docker", "inspect"):
+            return 0, "sha256:img\n"
+        if a[:2] == ("docker", "diff"):
+            return 0, diff
+        return 0, b"" if binary else ""
+    reads = []
+
+    def fake_read(container, path):
+        reads.append(path)
+        if path in ("/workspace/src", "/workspace/src/Serializer", "/workspace/apps/cli/lib"):
+            return None                                      # a directory
+        if container.startswith("harvest-orig"):
+            return None if path.endswith("Guard.php") else b"old\n"
+        return None if path.endswith("Old.php") else b"new\n"
+    monkeypatch.setattr(hv, "sh", fake_sh)
+    monkeypatch.setattr(hv, "read_file", fake_read)
+    monkeypatch.setattr(hv, "save_tmp_logs", lambda out, c: 0)
+    info = hv.harvest(tmp_path / "t__x", "after-run", "ctr", tmp_path / "out")
+    patch = (tmp_path / "out" / "changes.patch").read_text()
+    head = patch.split("lib/m0.js")[0]                       # everything diffed before the first build-output file
+    for f in ("Serializer/AbstractItemNormalizer.php", "Serializer/Guard.php", "Old.php"):
+        assert f"/workspace/src/{f}" in head
+    assert "var/cache" not in patch and ".js.map" not in patch
+    assert info["skipped_build_or_cache_paths"] == 750 and info["truncated"] and info["not_read"] == 103
+    assert not any(p in reads for p in ("/workspace/src", "/workspace/src/Serializer"))   # directories never read
+    assert reads.index("/workspace/src/Serializer/AbstractItemNormalizer.php") < reads.index("/workspace/apps/cli/lib/m0.js")
+
+
+def test_prioritise_orders_edits_before_new_folders():
+    ch = [("A", "/app/out"), ("A", "/app/out/a.js"), ("A", "/app/x.py"), ("C", "/app/y.py"), ("C", "/app")]
+    assert hv.prioritise(ch) == [("C", "/app/y.py"), ("A", "/app/x.py"), ("A", "/app/out/a.js")]

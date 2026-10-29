@@ -25,6 +25,7 @@ DEFAULTS = {
                  "trials_wait_builds": 20},
     "phase3": {"enabled": True, "batches": [], "max_launches": 3},
     "phase4": {"enabled": True, "audits": True, "fairness": True, "cleanup": True, "step3": True},
+    "build_resume": {"auto_timeouts": False, "max_auto_resumes": 1},
     "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True},
     "busy": {"patterns": ["regate", "regrade", "rescore", "postbuild.sh", "gate_one_ds.sh", "common/gate/gate.py",
                           "repair", "fairfix", "upgrade", "run_stack_pipeline.sh", "run_pipeline.sh", "run_build.sh",

@@ -39,6 +39,18 @@ def is_pipeline(cmd):
     return any(k in cmd for k in MARKERS)
 
 
+def build_tag(path):
+    """The CWE_BUILD_SLUG a process carries in its environment (a builder and everything it started, since
+    2026-10-28: run_build.sh passes the brief on stdin, so the command line no longer names the task), or ''."""
+    try:
+        for kv in Path(path).read_bytes().split(b"\0"):
+            if kv.startswith(b"CWE_BUILD_SLUG="):
+                return kv[len(b"CWE_BUILD_SLUG="):].decode(errors="replace")
+    except OSError:
+        pass
+    return ""
+
+
 def read_stat(path):
     """(state, starttime) from a /proc/<pid>/stat file, or (None, None)."""
     try:
@@ -67,9 +79,10 @@ def scan(proc_root="/proc"):
             cmd = " ".join(a.decode(errors="replace") for a in (root / pid / "cmdline").read_bytes().split(b"\0") if a)
         except OSError:
             continue
-        if not is_pipeline(cmd):
+        tag = build_tag(root / pid / "environ")
+        if not is_pipeline(cmd) and not tag:
             continue
-        out.append({"pid": int(pid), "start": start, "task": task_of(cmd), "cmd": cmd[:200]})
+        out.append({"pid": int(pid), "start": start, "task": task_of(cmd) or tag, "cmd": cmd[:200]})
     return out
 
 
