@@ -49,7 +49,8 @@ verbs, other protocols, other role/direction, anything the instruction names. Do
    build or gate stage of your own running at a time.
 8. Scratch work goes in `~/.tb-graders/cwe/work/SLUG/`. Edit only `tasks/SLUG/` and `build/SLUG/`.
 9. Record in `build/SLUG/notes.md`: start/end UTC, each trap (`manifest.traps`: shape, file:line,
-   covering tests, why it is realistic), what you verified, and what you could not.
+   covering tests, why it is realistic), what you verified, and what you could not. Build facts only:
+   never trial results, audit or fairness verdicts, or owner decisions.
 
 ## Lesson from marshmallow-readonly-sib (2026-10-16)
 DeepSeek solved it in 10 minutes and found every trap within 2 minutes of starting: the whole

@@ -24,9 +24,11 @@ added without breaking the next one.
 | `gate_fingerprint.json` | record | What the last SOUND gate covered (sha256 of tests, solution, environment, checks); a different digest means the gate is stale. | common/gate/fingerprint.py write (via gate_one_ds.sh / postbuild.sh / regate.sh) | run_trial.sh, regrade tools, taskstate.py, reconcile.py, phase3.py |
 | `postbuild.log` | log | Post-build and re-gate log; its last `RESULT:` line is the gate outcome. | common/gate/postbuild.sh, regate.sh, repair and waiver steps | reconcile.py, checks.py, people |
 | `.hold-repair` | flag | A test repair is between its edit and its regrades: no new trials of the task. | repair steps (people / repair scripts), the queue after a held re-gate | taskstate.py, dispatch.py, scale_queue.py, phase4.py |
-| `hold_{model}` | flag | No new runs of this model on this task. | people | common/trial/run_trial.sh, trial.py, phase3.py, dispatch.py |
+| `hold_{model}` | flag | No new runs of this model on this task. When its text says the model was blocked (or {MODEL}-BLOCKED.md exists), the ledger shows that model as blocked. | people | common/trial/run_trial.sh, trial.py, phase3.py, dispatch.py |
 | `repaired-tests-*` | folder | Originals (*.orig) and README.md of tests changed by a repair. | repair steps | reconcile.py (R1-R4), people |
 | `removed-tests-*` | folder | Originals and README.md of tests removed by a repair. | repair steps | reconcile.py (R1-R4), people |
+| `history` | folder | Records of the steps after the build (fairfix, upgrade, test repair, regrade), one file each (<YYYYMMDD>-<kind>.md), so notes.md keeps build facts only (2026-10-28). | fairfix and upgrade agents, repair steps, people | people (never the fairness reviewer or the auditor) |
+| `notes.for-review.md` | record | The build notes without earlier conclusions, regenerated before each fairness review (common/util/notes_filter.py); the reviewer reads it instead of notes.md. | pipelines/sibling/9-fairness, pipelines/stacking/7-fairness | the fairness reviewer |
 | `BUILD-PROMPT.md` | record | The builder's prompt for this task. | common/builder/build_prepare.py | common/launch/run_build.sh, phase3.py |
 | `start_utc.txt` | record | UTC start of the last build. | common/launch/run_build.sh | taskstate.py, scale_queue.py |
 | `end_utc.txt` | record | UTC end of the last build (written when the builder exits, whatever the outcome). | common/launch/run_build.sh, resume_pipeline.sh | taskstate.py, scale_queue.py, orphan_builder_guard.sh |
@@ -36,9 +38,9 @@ added without breaking the next one.
 | `pipeline.log` | log | Sibling build log; STOP / BUILD-INCOMPLETE / stopped/failed lines end a build. | pipelines/sibling/6-build/run_pipeline.sh | taskstate.py, scale_queue.py |
 | `stack_pipeline.log` | log | Stacking build log; same end lines as pipeline.log. | pipelines/stacking/3-build-gate/run_stack_pipeline.sh | taskstate.py, scale_queue.py |
 | `runs_{model}.log` | log | One line per run of the current task version (`reward=`), moved away with each new version. | common/trial/trial.py | common/trial/trial_state.py, taskstate.py |
-| `FAIRNESS.md` | record | The fairness review; its GATE_A line is the verdict. | pipelines/sibling/9-fairness, pipelines/stacking/7-fairness | common/fairness/fairness_verdict.py, inbox.py |
+| `FAIRNESS.md` | record | The fairness review; its GATE_A line is the verdict, its CONFLICTS line the tests that disagree with the instruction (since 2026-10-28). | pipelines/sibling/9-fairness, pipelines/stacking/7-fairness | common/fairness/fairness_verdict.py, inbox.py, delivery.py, export_delivery.py |
 | `fairness_status.txt` | record | Whether the last fairness run finished (`ok ...`). | pipelines/sibling/9-fairness, pipelines/stacking/7-fairness | common/fairness/fairness_verdict.py |
-| `HUMAN-DECISION.md` | record | The owner's decision (DECISION: KEEP|REPAIR|DROP, DATE:) and, after a delivery, a DELIVERED: line. | people; `cweq delivered` | fairness_verdict.py, taskstate.py, delivery.py, inbox.py |
+| `HUMAN-DECISION.md` | record | The owner's decision (DECISION: KEEP|REPAIR|DROP, DATE:), the ruling on deciding conflicts (CONFLICTS-RULED: <date> <KEEP|DROP|REPAIR> <reason>), client-audit outcomes (CLIENT-AUDIT:) and, after a delivery, a DELIVERED: line. | people; `cweq delivered` | fairness_verdict.py, taskstate.py, delivery.py, inbox.py |
 | `LISTING_WAIVER.md` | record | The owner's decision to trial a stacking task despite the listing check. | people | people, this checker |
 | `lint` | folder | Task-quality lint results, one JSON per gate version. | common/queue/lintstep.py | cweq explain, inbox.py |
 
@@ -59,7 +61,7 @@ added without breaking the next one.
 | audit_record | common/audit/postmortem.py record-ready + audit_results.py | <trial>/postmortem-*/verdict.json | build/audit/ledger.md; build/audit/trials.tsv | ledger and trials.tsv rewritten after the start |
 | fairness | pipelines/sibling/9-fairness/run_fairness.sh | pipelines/stacking/7-fairness/run_fairness_stack.sh | tasks/<slug>/; audited runs | FAIRNESS.md; fairness_status.txt | FAIRNESS.md newer than the start, fairness_status.txt ok, a GATE_A READY or NOT_READY verdict |
 | decision | people (the owner); `cweq delivered` appends the DELIVERED line | FAIRNESS.md; audited ledger | HUMAN-DECISION.md (DECISION, DATE, WHY; DELIVERED after the push); LISTING_WAIVER.md | a dated DECISION line; DELIVERED only after KEEP |
-| delivery_prep | common/queue/delivery.py (export_delivery.py) | HUMAN-DECISION.md (KEEP); build/audit/delivered.tsv; counted runs | ~/.tb-graders/cwe/deliveries/<UTC>-<slug>/ (tasks/, trajectory/, ready.json) | ready.json with ready=true and a clean secret scan |
+| delivery_prep | common/queue/delivery.py (export_delivery.py) | HUMAN-DECISION.md (KEEP, CONFLICTS-RULED, CLIENT-AUDIT); FAIRNESS.md (NEEDS_HUMAN_REVIEW, CONFLICTS); gate_report.json (conflict_proven); build/audit/delivered.tsv; counted runs | ~/.tb-graders/cwe/deliveries/<UTC>-<slug>/ (tasks/, trajectory/, ready.json) | ready.json with ready=true and a clean secret scan; refused (exit 3, reasons in ready.json) without DECISION: KEEP, when the newest CLIENT-AUDIT line is not a KEEP, with an unrepaired conflict_proven test, with an open NEEDS_HUMAN_REVIEW and a stale KEEP, or with a deciding conflict and no current CONFLICTS-RULED: <date> KEEP line |
 | lint | common/queue/lintstep.py (common/lint/task_lint.py) | tasks/<slug>/tests/; gate_fingerprint.json | lint/<fp16>.json | lint/<fp16>.json for the current gate version (warning-only; never blocks) |
 | cleanup | common/util/hourly_cleanup.sh once | .hold-repair (held tasks keep their containers and images) | build/audit/hourly_cleanup.log | a `pass done` line |
 

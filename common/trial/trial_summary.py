@@ -2,7 +2,8 @@
 """Write build/<slug>/trial_summary.md: per-trap, per-model results of the task's graded trial runs.
 
 Input for the hardening agent: which model solved, and which traps each model's runs fixed or left
-open. Reads the runs in ~/.tb-graders/cwe/jobs/<slug>-<model>-r*/ (the current version). When none
+open. Input for the fairness review too (2026-10-28): the failing tests of every run, so the review can tell
+which tests decided a run. A run's newest regrade-*/ grading is used when it has one. Reads the runs in ~/.tb-graders/cwe/jobs/<slug>-<model>-r*/ (the current version). When none
 are there (already moved by snapshot_experiment.sh), it reads the latest experiment version's runs.
 Never fails the caller: on any problem it writes what it can and exits 0.
 
@@ -48,8 +49,14 @@ def run_dirs(slug):
     return [], "none"
 
 
+def grading_of(td):
+    """The run's grading folder: its newest regrade-*/ with a verifier/, else the run folder (postmortem.grading_dir)."""
+    regs = sorted(d for d in glob.glob(os.path.join(td, "regrade-*")) if os.path.isdir(os.path.join(d, "verifier")))
+    return regs[-1] if regs else td
+
+
 def reward_of(td):
-    for p in (os.path.join(td, "verifier", "reward.json"),):
+    for p in (os.path.join(grading_of(td), "verifier", "reward.json"), os.path.join(td, "verifier", "reward.json")):
         try:
             return json.load(open(p)).get("reward")
         except Exception:
@@ -85,11 +92,12 @@ def main(slug):
     per = {}  # trap -> model -> [failed runs, total runs]
     models = {}
     unmapped = {}
+    fails = []  # (model, job, grading, [(kind, test)]) of every run with a failing test
     lines += ["## Runs", "", "| Model | Run | Reward | Security passed | Functional passed | Failing tests |", "|---|---|---|---|---|---|"]
     for model, job, td in runs:
         rw = reward_of(td)
         try:
-            res = json.load(open(os.path.join(td, "verifier", "results.json")))
+            res = json.load(open(os.path.join(grading_of(td), "verifier", "results.json")))
         except Exception:
             res = {}
         sec, fun = res.get("security") or {}, res.get("functional") or {}
@@ -116,6 +124,9 @@ def main(slug):
         sp = f"{sum(v == 'pass' for v in sec.values())}/{len(sec)}" if sec else "-"
         fp = f"{sum(v == 'pass' for v in fun.values())}/{len(fun)}" if fun else "-"
         lines.append(f"| {model} | {job} | {rw} | {sp} | {fp} | {len(failing)} |")
+        if failing:
+            fails.append((model, job, os.path.basename(grading_of(td).rstrip("/")) if grading_of(td) != td else "original",
+                          failing))
     lines += ["", "## Who solved", ""]
     for model, rws in sorted(models.items()):
         solved = sum(1 for r in rws if r == 1.0)
@@ -132,6 +143,13 @@ def main(slug):
             f, n = per.get(tid, {}).get(model, [0, 0])
             cells.append(f"{f}/{n}" + (" (fixed every run)" if n and not f else ""))
         lines.append(f"| {tid} | {shape} | " + " | ".join(cells) + " |")
+    if fails:
+        lines += ["", "## Failing tests per run", "",
+                  "A test decides a run when the run fails it and fails no fair test (the fairness review's step 1a).", ""]
+        for model, job, grading, failing in fails:
+            names = [f"{kind}: {name}" for kind, name in failing]
+            more = f" (+{len(names) - 40} more)" if len(names) > 40 else ""
+            lines.append(f"- {model} {job} ({grading}): " + "; ".join(names[:40]) + more)
     if unmapped:
         lines += ["", "## Failing tests not mapped to a trap", ""]
         lines += [f"- {n} (in {c} run(s))" for n, c in sorted(unmapped.items())]

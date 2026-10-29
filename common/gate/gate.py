@@ -28,6 +28,18 @@ Checks, in order (it stops at the first failing group):
              security_fail    at least one security test fails, functional all pass
              functional_fail  at least one functional test fails
              pass             reward 1.0 (an independent correct fix)
+           and upstream's own fix (checks/upstream_fix.patch, listed or not) is reviewed as a check,
+           WARN only (2026-10-28, client audit PO-3: two delivered tests could not be passed even by
+           upstream's fix): it must pass every functional test and the security tests of the sites
+           the published fix covers (manifest traps with a published origin); tests of uncovered or
+           injected traps are expected to fail it. The patches stage records "upstream_fix" and
+           "warnings"; a warning never fails the gate. Static warns (never fails) when a trap beyond
+           the advisory names no entry_point or instruction_scope (the builder's scope rule).
+           kind=other_reading (2026-10-28, the repair step: common/fairness/OTHER-READING-CHECK.md):
+                            a fix that follows the OTHER instruction sentence of a flagged
+                            conflict. Never a verdict: per named test the stage reports PASS (no
+                            conflict) or FAIL (conflict proven: "conflict_proven" in the report and
+                            a `[gate] CONFLICT-PROVEN:` line); the test is unfair, the task stays sound.
 
 The result is written to build/<slug>/gate_report.json (gate_report.partial.json with --only).
 Decisions here are made by scripts only; no model judgement is involved.
@@ -647,6 +659,7 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
     for c in manifest.get("patch_checks", []):
         if c.get("kind") != "blind" and not (build / "checks" / str(c.get("patch"))).is_file():
             problems.append(f"patch check file missing: checks/{c.get('patch')}")
+    problems.extend(other_reading_problems(manifest))
     kinds = {c.get("expect") for c in manifest.get("patch_checks", [])}
     for need in ("security_fail", "functional_fail"):
         if need not in kinds:
@@ -669,7 +682,10 @@ def check_static(task: Path, build: Path, manifest: dict) -> dict:
     leak_warnings = static_leak.warnings(task)
     for w in leak_warnings:
         print(f"[gate] WARNING (static, not blocking): {w}", flush=True)
-    return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings, "leak_warnings": leak_warnings,
+    scope = scope_warnings(manifest)
+    for w in scope:
+        print(f"[gate] WARN scope: {w}", flush=True)
+    return {"ok": True, "patch_checks": sorted(declared), "warnings": warnings + scope, "leak_warnings": leak_warnings,
             "security_test_product_imports": product_imports(task)}
 
 
@@ -757,17 +773,187 @@ def check_oracle(task: Path, n: int = 2) -> dict:
     return {"ok": True, "trials": [r["trial_dir"] for r in runs]}
 
 
+# ---- upstream's own fix as a check (WARN only; client audit PO-3, 2026-10-28)
+UPSTREAM_RE = re.compile(r"(?i)upstream")
+FIRST_FIX_RE = re.compile(r"(?i)first")          # H3a/H3b: fix A alone, a wrong fix by design
+UPSTREAM_DEFAULT = ("upstream_fix.patch", "upstream-fix.patch")
+# Trap origins whose sites the published fix itself covers: upstream's fix must pass their security tests.
+PUBLISHED_ORIGINS = {"advisory_route", "published_fix", "published_fix_site", "published_site",
+                     "published_fix_far_site", "published_far_site"}
+ADVISORY_ORIGINS = {"advisory_route", "published_fix", "published_fix_site", "published_site"}   # the advisory's own route
+EXPECTED_FAIL_RE = re.compile(r"(?i)uncovered|inject|room|never|real_unmodified|real_upstream")
+
+
+def upstream_patches(build: Path, manifest: dict) -> list:
+    """[(patch, listed)]: upstream fix patches listed in patch_checks; else checks/upstream_fix.patch if present."""
+    listed = [c["patch"] for c in manifest.get("patch_checks", [])
+              if UPSTREAM_RE.search(str(c.get("patch", ""))) and c.get("kind") not in ("blind", OTHER_READING)
+              and (build / "checks" / str(c["patch"])).is_file()]
+    if listed:
+        return [(p, True) for p in listed]
+    return [(p, False) for p in UPSTREAM_DEFAULT if (build / "checks" / p).is_file()][:1]
+
+
+def _norm_test(name: str) -> str:
+    return re.sub(r"\(\)$", "", str(name).strip()).replace("#", "::")
+
+
+def _tail(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _norm_test(name).split("::")[-1].lower())
+
+
+def _tokens(name: str) -> list:
+    return [x for x in re.split(r"[/.:]+", _norm_test(name)) if x and x.lower() not in ("security", "functional")]
+
+
+def same_test(result: str, declared: str) -> bool:
+    """Does a result test name (from the verifier) denote the test a manifest or check names? The same name, a
+    boundary suffix ('github.com/x/pkg/a::TestX' vs 'a::TestX'), a file-level id ('security/T2-pull' for
+    'security/T2-pull::pull with ...') or the same last two parts ('security/SecX#m' or 'SecX.m' for 'org.x.SecX::m')."""
+    t, m = _norm_test(result), _norm_test(declared)
+    if not m:
+        return False
+    if t == m or any(t.endswith(sep + m) or m.endswith(sep + t) for sep in ("/", ".", "::", " ")) or t.startswith(m + "::"):
+        return True
+    mt = _tokens(m)
+    return len(mt) >= 2 and _tokens(t)[-2:] == mt[-2:]
+
+
+def trap_of_test(test: str, traps: list):
+    """The manifest trap whose security_tests name this result test, or None. Manifests name tests loosely, so in
+    order: the same name; a boundary suffix ('github.com/x/pkg/a::TestX' vs 'a::TestX'); a file-level id
+    ('security/T2-pull' for 'security/T2-pull::pull with ...'); the same last two parts ('security/SecX#m' or
+    'SecX.m' for 'org.x.SecX::m'); else a unique last-name match. A test the manifest cannot place is reported,
+    never warned about."""
+    t = _norm_test(test)
+    by_tail = []
+    for trap in traps:
+        if not isinstance(trap, dict):
+            continue
+        for m in trap.get("security_tests") or []:
+            m = _norm_test(m)
+            if not m:
+                continue
+            if same_test(t, m):
+                return trap
+            if _tail(m) and _tail(m) == _tail(t):
+                by_tail.append(trap)
+    ids = {id(x) for x in by_tail}
+    return by_tail[0] if len(ids) == 1 else None
+
+
+def origin_class(origin) -> str:
+    o = str(origin or "").strip()
+    if not o:
+        return "unknown"
+    if EXPECTED_FAIL_RE.search(o):
+        return "expected"
+    return "published" if o in PUBLISHED_ORIGINS else "unknown"
+
+
+def upstream_review(manifest: dict, patch: str, result: dict) -> dict:
+    """What upstream's own fix failed, and the warnings: a functional failure, or a security failure on a site the
+    published fix covers, means a test may pin one implementation, contradict the rule, or need a dead path."""
+    traps = [t for t in manifest.get("traps") or [] if isinstance(t, dict)]
+    partial = bool(FIRST_FIX_RE.search(patch))
+    sec, fun = failing(result.get("security", {})), failing(result.get("functional", {}))
+    rows, warnings, notes = [], [], []
+    for test in sec:
+        trap = trap_of_test(test, traps)
+        cls = "unmapped" if trap is None else origin_class(trap.get("origin"))
+        rows.append({"test": test, "trap": trap.get("id") if trap else None,
+                     "origin": trap.get("origin") if trap else None, "class": cls})
+    def names(cls):
+        return [r["test"] for r in rows if r["class"] == cls]
+    if fun:
+        warnings.append(f"upstream fix {patch} fails {len(fun)} functional test(s): a keep-working test the "
+                        f"published fix breaks may contradict the security rule or pin one implementation: {fun}")
+    if names("published"):
+        (notes if partial else warnings).append(
+            f"upstream fix {patch} fails {len(names('published'))} security test(s) of sites the published fix "
+            f"covers: {names('published')}" + (" (a first fix alone: expected to miss part of them)" if partial else
+            ": the test may demand more than the advisory, or need a state no pinned code creates"))
+    if names("unmapped"):
+        notes.append(f"upstream fix {patch} fails {len(names('unmapped'))} security test(s) the manifest does not map "
+                     f"to a trap, so original-site tests cannot be told from variants (review them): {names('unmapped')}")
+    if names("unknown"):
+        notes.append(f"upstream fix {patch} fails {len(names('unknown'))} security test(s) of traps whose origin is "
+                     f"not classified: " + ", ".join(f"{r['test']} ({r['trap']}: {r['origin'] or 'no origin'})"
+                                                     for r in rows if r["class"] == "unknown"))
+    if names("expected"):
+        notes.append(f"upstream fix {patch} fails {len(names('expected'))} test(s) of uncovered or injected traps "
+                     "(by design); each needs an entry point that reaches it at the pinned commit (fairness step 4a)")
+    return {"patch": patch, "partial": partial, "reward": result.get("reward"), "functional_failing": fun,
+            "security_failing": rows, "warnings": warnings, "notes": notes}
+
+
+# ---- the other-reading check (the repair step; owner 2026-10-28)
+OTHER_READING = "other_reading"
+
+
+def other_reading_problems(manifest: dict) -> list:
+    """Static: every other_reading check names the tests it is about and the instruction sentence it follows."""
+    out = []
+    for c in manifest.get("patch_checks", []):
+        if c.get("kind") != OTHER_READING:
+            continue
+        tests = c.get("tests")
+        if not isinstance(tests, list) or not tests or not all(str(t).strip() for t in tests):
+            out.append(f"other_reading check {c.get('patch')}: 'tests' must list the flagged test(s)")
+        if not str(c.get("follows") or "").strip():
+            out.append(f"other_reading check {c.get('patch')}: 'follows' must quote the instruction sentence it follows")
+    return out
+
+
+def other_reading_result(check: dict, result: dict) -> dict:
+    """Per named test: PASS (the test accepts a fix following the other sentence: no conflict), FAIL (conflict
+    proven) or MISSING (no such test in the results: nothing proven)."""
+    grades = {**result.get("functional", {}), **result.get("security", {})}
+    tests, matched = {}, {}
+    for name in check.get("tests") or []:
+        hits = [k for k in grades if same_test(k, name)]
+        if not hits:
+            tests[name] = "MISSING"
+            continue
+        matched[name] = hits[0] if len(hits) == 1 else hits
+        tests[name] = "PASS" if all(grades[k] == "pass" for k in hits) else "FAIL"
+    named = {k for v in matched.values() for k in (v if isinstance(v, list) else [v])}
+    return {"kind": OTHER_READING, "ok": True, "follows": check.get("follows"), "flagged_by": check.get("flagged_by"),
+            "reward": result.get("reward"), "tests": tests, "matched": matched,
+            "other_failing": sorted(k for k, v in grades.items() if v != "pass" and k not in named)}
+
+
+def scope_warnings(manifest: dict) -> list:
+    """Traps beyond the advisory without the builder's scope citation (TASK-BUILD-PROMPT-v1 'Scope of every lever').
+    Only for builds from build-v1.1 on: older manifests never had the fields."""
+    m = re.match(r"build-v(\d+)(?:\.(\d+))?$", str(manifest.get("builder_prompt_version") or ""))
+    if not m or (int(m.group(1)), int(m.group(2) or 0)) < (1, 1):
+        return []
+    out = []
+    for t in manifest.get("traps") or []:
+        if not isinstance(t, dict) or not t.get("origin") or t.get("origin") in ADVISORY_ORIGINS:
+            continue
+        missing = [k for k in ("entry_point", "instruction_scope") if not str(t.get(k) or "").strip()]
+        if missing:
+            out.append(f"trap {t.get('id')} (origin {t.get('origin')}) has no {' / '.join(missing)}: cite the entry "
+                       "point that reaches it at the pinned commit and the instruction sentence that covers it")
+    return out
+
+
 def check_patches(task: Path, build: Path, manifest: dict, only=()) -> dict:
     out = {}
     checks = [c for c in manifest.get("patch_checks", [])
               # blind fix produced later by run_blindfix; validated in the --only patches re-gate
               if not (c.get("kind") == "blind" and not (build / "checks" / c["patch"]).is_file())]
+    upstream = upstream_patches(build, manifest)
+    extra = [p for p, listed in upstream if not listed]       # not declared: run for the review only
     if only:
         checks = [c for c in checks if c["patch"] in only]
         missing = sorted(set(only) - {c["patch"] for c in checks})
         if missing:
             # a wrong call, not a task verdict: main() reports it as an internal error
             raise RuntimeError(f"patches: --patch {missing} not in manifest patch_checks (or file missing)")
+        extra = []
 
     def one(patch):
         with tempfile.TemporaryDirectory(prefix="gate-") as tmp:
@@ -778,8 +964,25 @@ def check_patches(task: Path, build: Path, manifest: dict, only=()) -> dict:
 
     # Errors are returned, not raised, so they surface in manifest order exactly as the old
     # one-at-a-time loop met them (an earlier failing patch still wins over a later infra error).
-    results = run_parallel([lambda p=c["patch"]: one(p) for c in checks], raise_errors=False)
+    results = run_parallel([lambda p=c["patch"]: one(p) for c in checks] + [lambda p=p: one(p) for p in extra],
+                           raise_errors=False)
+    results, extra_results = results[:len(checks)], results[len(checks):]
+    proven = []
     for check, r in zip(checks, results):
+        if check.get("kind") == OTHER_READING:        # never a verdict: report, do not raise
+            if isinstance(r, BaseException):
+                out[check["patch"]] = {"kind": OTHER_READING, "ok": True, "error": f"{type(r).__name__}: {r}"[:300]}
+                continue
+            rec = other_reading_result(check, r)
+            out[check["patch"]] = rec
+            for name, status in rec["tests"].items():
+                print(f"[gate] other-reading {check['patch']}: {name}: {status}", flush=True)
+                if status == "FAIL":
+                    proven.append({"test": name, "result_test": rec["matched"].get(name), "patch": check["patch"],
+                                   "follows": check.get("follows")})
+                    print(f"[gate] CONFLICT-PROVEN: {name} (check {check['patch']}, follows: "
+                          f"{str(check.get('follows'))[:160]})", flush=True)
+            continue
         if isinstance(r, BaseException):
             raise r
         patch, expect = check["patch"], check["expect"]
@@ -802,7 +1005,25 @@ def check_patches(task: Path, build: Path, manifest: dict, only=()) -> dict:
                               f"security failing {sec_bad}, functional failing {fun_bad}",
                               failure_evidence(r["trial_dir"]),
                               details=ev.collect(r["trial_dir"]))
-    return {"ok": True, "checks": out}
+    stage = {"ok": True, "checks": out}
+    if proven:
+        stage["conflict_proven"] = proven
+    reviews, warnings = [], []
+    by_patch = dict(zip([c["patch"] for c in checks], results))
+    for p, r in list((p, by_patch.get(p)) for p, listed in upstream if listed and p in by_patch) + list(zip(extra, extra_results)):
+        if isinstance(r, BaseException):                 # warn-only: an undeclared check never fails the gate
+            reviews.append({"patch": p, "error": f"{type(r).__name__}: {r}"[:300]})
+            continue
+        rev = upstream_review(manifest, p, r)
+        reviews.append(rev)
+        warnings += rev["warnings"]
+    if reviews:
+        stage["upstream_fix"] = reviews
+    if warnings:
+        stage["warnings"] = warnings
+    for w in warnings:
+        print(f"[gate] WARN upstream-fix: {w}", flush=True)
+    return stage
 
 
 def write_evidence(build: Path, slug: str, stage: str, kind: str, summary: str, details: dict):

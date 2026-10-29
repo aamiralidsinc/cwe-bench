@@ -39,8 +39,15 @@ cwe-bench/tasks/SLUG/
 cwe-bench/build/SLUG/
   manifest.json           see "Manifest"
   checks/*.patch          the wrong fixes used to test the tests
-  notes.md                short: what you verified, what you could not
+  notes.md                short: what you verified, what you could not (build facts only)
+  history/                later steps' records, one file each (<YYYYMMDD>-<kind>.md); never written by the builder
 ```
+
+`notes.md` holds build facts only: how the task is built (sites, traps, the test-to-site mapping, environment,
+build steps) and what was verified. It never holds trial results, audit or fairness verdicts, owner decisions, or
+repair and regrade outcomes. Each later step (fairfix, upgrade, test repair, regrade) writes its own record to
+`build/SLUG/history/<YYYYMMDD>-<kind>.md`, so the fairness reviewer and the auditor can read the build notes
+without earlier conclusions (2026-10-28).
 
 Scratch work (clones, experiments) goes in `~/.tb-graders/cwe/work/SLUG/`,
 never inside `cwe-bench/`.
@@ -280,6 +287,18 @@ host the functional tests treat as public, Hypothesis without `deadline=None`, p
 workspace, and a `score.py` that misses setup errors. Shared refusal helpers for pytest, JS/TS, Go, JUnit and
 PHPUnit are in `common/builder/templates/support/refusal/`. The lint complements, and never replaces, the
 fairness review after trials.
+
+### 3l. Scope, reachability and conflicts (2026-10-28, client audit PO-3)
+- **Scope.** Every trap or variant beyond the advisory's own route sits inside the scope the instruction
+  describes: the manifest trap quotes the sentence that covers the change its test needs (`instruction_scope`).
+- **Reachability.** It is reachable at the pinned commit: the trap cites the entry point a real caller uses and the
+  pinned code that creates every state its test sets up (`entry_point`). A state only the test or the reference
+  creates is a dead path: drop the trap.
+- **Conflicts.** If a test and the instruction disagree, the test is unfair, whatever the reference does: no
+  keep-working test may demand what a security rule refuses, no security test may refuse what a keep-working
+  sentence protects, and no test may pin an implementation detail the instruction does not state.
+- **Upstream's fix.** `checks/upstream_fix.patch` (every published fix commit) is reviewed by the gate (WARN): it
+  must pass every functional test and the security tests of the sites the published fix covers.
 
 ## Manifest (`build/SLUG/manifest.json`)
 

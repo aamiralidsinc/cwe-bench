@@ -213,6 +213,7 @@ def test_export_refuses_a_leaking_task(tmp_path, monkeypatch):
     (tmp_path / "tasks" / "k-s2" / "environment").mkdir(parents=True)
     (tmp_path / "tasks" / "k-s2" / "task.toml").write_text("")
     monkeypatch.setattr(ed.cwe_reuse_tag, "ensure_image_sync", lambda ctx, tag: None)
+    monkeypatch.setattr(ed.fairness_verdict, "delivery_blockers", lambda slug: [])   # the leak check alone
     monkeypatch.setattr(ed.env_leak_check, "check", lambda task, tag: {"status": "leak", "summary": "LEAK (x)",
                                                                         "leaks": ["T1 mtime"]})
     monkeypatch.setattr(sys, "argv", ["export_delivery.py", str(tmp_path / "out"), "k-s2"])

@@ -271,13 +271,19 @@ it) is not unfair: leave it.
 
 - **Remove the test:**
   1. Move the test file, or delete the one test function, into `build/<slug>/removed-tests-<YYYYMMDD>/`. Keep the
-     original there, with a `README.md` saying what was removed, why, and which audit said so.
+     original there, with a `README.md` saying what was removed, why, and which audit said so. Never write this into
+     `build/<slug>/notes.md` (build facts only); any further record goes to `build/<slug>/history/<YYYYMMDD>-<kind>.md`.
   2. Check that nothing else references it (`grep -rn <name> tasks/<slug>/`).
   3. Rescore every graded run of the task:
      `python3 common/audit/rescore_from_results.py <trial_dir> --drop <test-id-substring> --why "<audit reason>"`.
   4. Prepare and audit again any failing run whose reward changed (4.5).
   5. Rebuild the ledger.
 - **If the test needs changing, not removing:** don't do it. Ask the owner (6.3).
+- **If the auditor or the fairness review labels it a `conflict`** (it disagrees with an instruction sentence), prove
+  it first with the other-reading check (`common/fairness/OTHER-READING-CHECK.md`): a fix that follows the other
+  sentence, declared in `manifest.patch_checks` as `kind: "other_reading"`, run by the patches stage. FAIL
+  (`[gate] CONFLICT-PROVEN:`) confirms the removal or repair; PASS means there was no conflict, so leave the test.
+  A proven conflict blocks delivery until a later test repair (`fairness_verdict.py --delivery`).
 - Report every removal in that tick's report under "Actions".
 
 ---
@@ -311,8 +317,15 @@ Never run `apply` on a list the owner did not approve.
 For each breaker whose fairness is NOT READY or has questions for a human, ask with:
 - the slug;
 - the ledger row;
-- the questions from `build/<slug>/FAIRNESS.md`, quoted;
+- the questions from `build/<slug>/FAIRNESS.md`, quoted, and its Conflicts table (tests that disagree with an
+  instruction sentence, pin one implementation, or are out of scope or unreachable), with which ones decided a run;
 - the options: KEEP (with or without a follow-up repair), REPAIR, DROP.
+
+The standing owner rule (fairness READY with NEEDS_HUMAN_REVIEW: NO is kept without asking) applies only when
+`python3 common/fairness/fairness_verdict.py --auto-keep <slug>` exits 0. It refuses a review with any conflict, an
+open human question, or no CONFLICTS line (a review written before 2026-10-28); ask the owner instead. A deciding
+conflict needs the owner's own ruling line in `HUMAN-DECISION.md`, `CONFLICTS-RULED: <YYYY-MM-DD> <KEEP|DROP|REPAIR>
+<short reason>`: a KEEP decision alone does not rule on it, and the delivery refuses the task without it.
 
 The owner writes `HUMAN-DECISION.md`, never you.
 
@@ -339,8 +352,9 @@ Check each run for harness or infrastructure causes: timeouts, environment error
 refusals, the agent cut short. A reward of exactly 0.0 needs extra care: tell apart a model fix that breaks
 compilation or functional tests (a model failure) from a verifier crash, a build error or missing results (not
 trustworthy). A 3-hour agent timeout while the model was still working counts as a model failure. Name any test you
-judge unfair (it demands something the instruction never states, or a correct fix could fail it; merely lenient is
-not unfair), and say whether it alone decided the run.
+judge unfair (it demands something the instruction never states, it disagrees with an instruction sentence, or a
+correct fix could fail it; merely lenient is not unfair), and say whether it alone decided the run. If a test and
+the instruction disagree, the failure is unfair, even when the reference fix passes the test.
 
 Rules: read-only except the verdict.json files; do not run code; do not use the internet. Check that each
 verdict.json parses and has the keys trustworthy, attribution, confidence, summary, items, lookup_or_leak,
@@ -350,9 +364,11 @@ Report back (under 250 words): one line per folder (task, trial, model, reward, 
 confidence, decisive failing tests), then one sentence per task; name any unfair test that alone decided a run.
 ```
 
-Add context from earlier audits of the same task when you have it: the failing tests and how they were judged.
-`build/audit/ledger.md` and earlier `POSTMORTEM.md` files in the task's job folders hold it. That keeps verdicts
-consistent; the auditor still judges each run on its own.
+Never add context from earlier audits, fairness reviews or owner decisions to this prompt (client audit PO-3,
+2026-10-28: auditors that were handed earlier verdicts repeated them). Each run is judged on its own evidence; the
+evidence folder already leaves earlier conclusions out (`common/util/notes_filter.py`). For every failing test
+the brief asks for the conflict check (the instruction sentences the test could conflict with, and whether a fix
+following the other sentence fails it); `postmortem.py record` refuses a verdict that skips it.
 
 ---
 

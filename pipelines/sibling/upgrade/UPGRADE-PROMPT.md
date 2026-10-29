@@ -44,6 +44,8 @@ HARD RULES:
   rebuild. Rebuild the image ONLY if you changed repo code in step 2, and then rebuild it the same
   way the task was originally built. State clearly in your report whether a rebuild was needed.
 - Edit only under tasks/{{SLUG}}/ and build/{{SLUG}}/. Scratch in ~/.tb-graders/cwe/work/{{SLUG}}/.
+- Do not edit build/{{SLUG}}/notes.md: it holds build facts only. Record what you changed and why in a new file
+  build/{{SLUG}}/history/<YYYYMMDD>-upgrade.md (create the folder if needed), never in notes.md.
 - Do NOT look up the upstream fix online.
 - If the task cannot support a fair §2 task without a from-scratch rebuild (bad lever, no how-type
   potential), STOP and report why — do not ship a weak task.

@@ -28,6 +28,12 @@ Rules:
     SOLVED       = at least one graded run with reward 1.0
     failed       = at least one graded run and none at 1.0
     BREAKER      = both models failed (and each has >= 3 graded runs for a full pass@3)
+    blocked      = the model's provider refused the task (content filter, safety classifier, repeated truncation
+                   stops; owner 2026-10-28): build/<slug>/<MODEL>-BLOCKED.md, or a hold_<model> whose text says
+                   blocked. The cell reads "**blocked** (provider safety filter)", never solved or failed, and the
+                   task is rejected ("rejected (DeepSeek-only; MiMo blocked)"), so blocked tasks can be filtered.
+    confidence   = the owner's label in build/<slug>/HUMAN-DECISION.md (`CONFIDENCE: THIN`, also inside a
+                   `CLIENT-AUDIT: KEEP, CONFIDENCE: THIN` line) is shown after the verdict, e.g. "(thin)".
 
 Notes (2026-10-28): build/audit/ledger_notes.tsv (task, model, job, trial, kind, note) adds remarks about a
 per-model verdict, e.g. a solve that used the file-time leak (reports/reward-hacking.md). Notes never change a
@@ -44,6 +50,7 @@ from review_flags import setup_flags
 
 sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / ".cwe-bench-root").is_file()) / "common"))
 import paths  # noqa: E402  (repo locations: common/paths.py)
+import markers  # noqa: E402  (blocked models, confidence labels: common/markers.py)
 
 ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
@@ -340,6 +347,35 @@ def cell(runs, limit, tainted=frozenset(), decided=None, excluded=None):
     return f"**failed 0/{len(graded)}** [{scores}]{tail}", "failed"
 
 
+BLOCKED_CELL = "**blocked** (provider safety filter)"
+
+
+def task_verdict(states, blocked=(), confidence=None):
+    """The verdict column. states: {model key: solved | failed | open | none | None}; blocked: model keys the
+    provider refused (never solved or failed); confidence: the owner's label, shown as '(thin)'."""
+    labels = dict(MODELS)
+    if blocked:
+        rest = [k for k, _ in MODELS if k not in blocked]
+        who = " + ".join(labels[k] for k in blocked)
+        if not rest:
+            verdict = "rejected (both blocked)"
+        else:
+            parts = []
+            for k in rest:
+                st = states.get(k)
+                parts.append(f"{labels[k]} solved" if st == "solved" else f"{labels[k]}-only" if st == "failed"
+                             else f"{labels[k]} open")
+            verdict = f"rejected ({'; '.join(parts)}; {who} blocked)"
+    elif all(s == "failed" for s in states.values()):
+        verdict = "**BREAKER candidate**"
+    elif "solved" in states.values():
+        who = [lab for k, lab in MODELS if states[k] == "solved"]
+        verdict = "rejected (" + (" + ".join(who) + " solved" if len(who) < 2 else "both solved") + ")"
+    else:
+        verdict = "open"
+    return verdict + (f" ({confidence})" if confidence else "")
+
+
 def main():
     rows = []
     for job in sorted(JOBS.iterdir()):
@@ -366,22 +402,21 @@ def main():
     decided = reviews()
     excl = excluded_runs()
     for t in tasks:
+        b = ROOT / "build" / t
+        blocked = [k for k, _ in MODELS if markers.blocked(b, k)]
         cells = {}
         for key, _ in MODELS:
+            if key in blocked:       # no verdict, and no audits or 3 h re-runs owed for a model the provider refused
+                cells[key] = (BLOCKED_CELL, "blocked")
+                continue
             cells[key] = cell([r for r in rows if r["task"] == t and model_key(r["model"]) == key],
                               task_limit(t), tainted, decided, excl)
         states = {k: s for k, (_, s) in cells.items()}
-        if all(s == "failed" for s in states.values()):
-            verdict = "**BREAKER candidate**"
-        elif "solved" in states.values():
-            who = [lab for k, lab in MODELS if states[k] == "solved"]
-            verdict = "rejected (" + (" + ".join(who) + " solved" if len(who) < 2 else "both solved") + ")"
-        else:
-            verdict = "open"
+        verdict = task_verdict(states, blocked, markers.confidence(b))
         line = f"| {track_of(t)} | {t} | {cells['deepseek'][0]} | {cells['mimo'][0]} | {verdict} |"
         full.append(line)
         failed = [lab for k, lab in MODELS if states[k] == "failed"]
-        if failed and "solved" in states.values():
+        if failed and "solved" in states.values() and not blocked:
             onefail.append(f"| {track_of(t)} | {t} | {cells['deepseek'][0]} | {cells['mimo'][0]} | {failed[0]} |")
 
     hdr = "| Track | Task | DeepSeek | MiMo | {} |\n|---|---|---|---|---|"

@@ -44,15 +44,22 @@ Hard rules:
   route (widen the property in general terms), or a test that fails a correct fix (make it drive
   the real entry point and assert the outcome, accepting any refusal the instruction allows).
 - Edit only under tasks/${SLUG}/ and build/${SLUG}/. Scratch in ~/.tb-graders/cwe/work/${SLUG}/.
+- Do not edit build/${SLUG}/notes.md: it holds build facts only. Record what you changed and why in a new file
+  build/${SLUG}/history/$(date -u +%Y%m%d)-fairfix.md (create the folder if needed), never in notes.md.
 
 Then run the gate yourself, one stage at a time, and iterate until all pass:
   python3 -I common/gate/gate.py ${SLUG} --only static
   python3 -I common/gate/gate.py ${SLUG} --only nop
   python3 -I common/gate/gate.py ${SLUG} --only oracle
   python3 -I common/gate/gate.py ${SLUG} --only patches
-A missing blind.patch in static is allowed (it is wired separately). Report, under 300 words: each
+A missing blind.patch in static is allowed (it is wired separately).
+
+$(sed -n '/^---8<---$/,$p' "$CWE_COMMON/fairness/OTHER-READING-CHECK.md" | tail -n +2)
+
+Report, under 300 words: each
 FAIRNESS 'Required' item and how you addressed it, the final gate result per stage, and any item you
-could not fully satisfy and why."
+could not fully satisfy and why, and for each other_reading check the PASS / FAIL / MISSING result
+per test and the repair you made."
 date -u +%FT%TZ > "build/$SLUG/fairfix_start.txt"
 timeout "${FAIRFIX_TIMEOUT:-10800}" "$HOME/.local/bin/claude" -p "$P" --model "$MODEL" \
   --permission-mode bypassPermissions --add-dir "$CWE_ROOT" --add-dir "$HOME/.tb-graders/cwe/work" \

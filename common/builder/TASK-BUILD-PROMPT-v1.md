@@ -5,7 +5,7 @@
 
 | | |
 |---|---|
-| Version | `build-v1`, 2026-10-16 |
+| Version | `build-v1.1`, 2026-10-28 (`build-v1`, 2026-10-16) |
 | Spec | `common/builder/PROMPT-TEMPLATES-SPEC.md` §1.3, §1.5, §3.2 |
 | Rules digest made from | `common/builder/BUILDER.md` (§3a–3j as of 2026-10-16), `common/builder/BRIEF-trap-stack.md`, `docs/research/round1-analysis/B-failure-modes.md` §3b/§4, `docs/research/peer-analysis-2026-10-16.md` |
 | Replaces | `common/archive/old-prompts/PROMPT-task-build.md` (first draft, kept for reference) |
@@ -52,6 +52,12 @@
 
 ### Change log
 - build-v1 (2026-10-16): first version, written from the spec.
+- build-v1.1 (2026-10-28, client audit PO-3): "Scope of every lever" (each lever beyond the advisory cites the
+  instruction sentence that covers it and its entry point at the pinned commit; manifest `instruction_scope`,
+  `entry_point`); the keep-working cross-check in Tests; `checks/upstream_fix.patch` for every build (the gate
+  reviews it, WARN only). Rancher's request-path test needed a state no pinned code creates; passenger's needed a
+  change outside the described scope; litellm's and dbhub's functional tests contradicted the security rule.
+  notes.md holds build facts only; later steps write `build/<slug>/history/`.
 
 ---
 
@@ -203,6 +209,17 @@ Never add:
 Every lever must be findable by a blind engineer from the report and the code. A lever that a blind
 fix cannot find is unfair: remove it.
 
+**Scope of every lever.** Every trap or variant beyond the advisory's own route (far sites, uncovered
+routes, injected siblings, shapes, producers) must meet both conditions, or be dropped:
+- **inside the scope the report describes:** quote the report sentence whose protected data, outcome
+  or component covers the change the lever's test needs. "The general property covers it" counts only
+  when you can quote it and it applies literally;
+- **reachable at the pinned commit:** cite the entry point a real caller uses (file:function, route or
+  command) and the pinned product code that creates every state the test sets up (a stored record, a
+  token field, a configuration). A state that only the test or the reference creates is a dead path:
+  the lever is unfair even when the reference passes it.
+Record both in the trap's manifest entry (`instruction_scope`, `entry_point`).
+
 **Pattern B rules:**
 - Confirm each route with a behavioural test on the pinned copy before relying on it. The
   screener's claim is only a lead.
@@ -285,6 +302,13 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 - **Stubs** of permission or authority answer per resource and verb, like the real thing.
 - **Scope.** A test may vary only what the instruction names, and drive only the entry point it
   names.
+- **Keep-working against the rules.** Check every keep-working sentence of the report against every
+  security test, and every security rule against every functional test, both directions: no
+  functional test may demand accepting an input a security rule, read literally, refuses, and no
+  security test may demand refusing something a keep-working sentence protects. No test may pin a
+  detail the report does not state (one character class, an internal helper's exact boundary, one
+  layer, one data structure): another correct implementation must pass it. If a test and the report
+  disagree, the test is unfair, whatever the reference does.
 - **Refusals.** Where a security test drives a hardened function or handler directly (not through an HTTP
   or CLI entry point), a refusal is a secure outcome: use the shared helper from
   `common/builder/templates/support/refusal/` (copy it into `tests/support/`) and pass the product's own
@@ -316,7 +340,11 @@ Put every identifier that must not appear in `manifest.leak_terms`.
   - a `functional_fail` (an over-broad or feature-removing fix);
   - a `pass` of kind `hardening` (the oracle plus defensive hardening of the product code the
     security tests import);
-  - a `pass` alternative fix where a second valid design is plausible.
+  - a `pass` alternative fix where a second valid design is plausible;
+  - `checks/upstream_fix.patch`: every published fix commit, applied together to the pinned commit
+    (expect `security_fail` when the task has routes upstream left open, else `pass`). The gate
+    reviews it: it must pass every functional test and the security tests of the sites the published
+    fix covers. A failure there means a test demands more than the advisory or needs a dead path.
 - **`manifest.wrong_fix_catalogue`:** for each class, a `checks/` patch, or `n/a: <why>`:
   `refuse_all`, `crash_as_refusal`, `wrong_resource`, `one_role_or_direction`, `reads_only`,
   `check_after_adjustment`, `unlisted_route`, `malformed_identity`, `missing_authority`,
@@ -334,18 +362,22 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 **`build/{{SLUG}}/manifest.json`:**
 - `slug`, `candidate`;
 - `pattern`: `{{PATTERN}}`;
-- `builder_prompt_version`: `build-v1`;
+- `builder_prompt_version`: `build-v1.1`;
 - `"strict_gate": true`;
 - `verified`: entry point, sites, routes, services, project tests run;
 - `leak_terms`, `patch_checks`, `wrong_fix_catalogue`;
 - `traps`: one entry per lever, with `shape`, `where` (file:line), `security_tests`,
   `coupled_functional_tests`, `security_fail_patch`, and `realistic_because` (for pattern B: "real,
-  unmodified upstream code");
+  unmodified upstream code"); `origin` (`advisory_route`, `published_fix_far_site`,
+  `uncovered_upstream`, `injected_sibling`); and, for every lever beyond the advisory's own route,
+  `instruction_scope` (the quoted report sentence) and `entry_point` (see "Scope of every lever");
 - `status`.
 
 **Also in `build/{{SLUG}}/`:**
 - `checks/*.patch`;
-- `notes.md`: start and end UTC, each lever in one line, what you verified, what you could not.
+- `notes.md`: start and end UTC, each lever in one line, what you verified, what you could not. It holds
+  build facts only: never trial results, audit or fairness verdicts, or owner decisions (later steps write
+  `build/{{SLUG}}/history/`, never notes.md).
 
 Pattern B: the register rows (see Design).
 
@@ -376,6 +408,8 @@ those after you. Do NOT write them yourself, and do NOT run trials or any target
 - the flaw does not reproduce through a real entry point at the pinned commit;
 - a planned route or site is not reachable, or the check calls the producer directly (substitute
   another lever the code supports if you can, and say so);
+- a lever's test needs a state no pinned code creates, or a change outside the scope the report
+  describes (drop the lever; substitute one if you can);
 - the task needs network at run time, or a GPU, kernel or GUI;
 - the tests are flaky;
 - no design meets the bar.

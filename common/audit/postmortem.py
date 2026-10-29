@@ -14,7 +14,9 @@ tests (docs/research/own-runs/FINDINGS.md). No result is final until an independ
 read the instruction, the tests, the grading output, the model's final code and its transcript.
 
 What the auditor gets (copied into <trial>/postmortem-<UTC>/evidence/, read-only tools only):
-    instruction.md, task.toml, tests/, solution/fix.patch, build notes (BRIEF.md / notes.md)
+    instruction.md, task.toml, tests/, solution/fix.patch, build notes (BRIEF.md / notes.md) without
+        earlier conclusions (common/util/notes_filter.py: audit, fairness, decision and run outcomes go;
+        how the task is built stays)
     the grading the audit uses (original verifier/ or the newest regrade-*/): results.json,
         reward.json, the tail of test-stdout.txt, REGRADE.json
     final-code/changes.patch and changed_files.tsv (when harvested)
@@ -27,6 +29,14 @@ and the main session then runs `record`.
 Output: <trial>/postmortem-<UTC>/POSTMORTEM.json (structured verdict, see SCHEMA) and
 POSTMORTEM.md, plus the raw CLI output. audit_results.py counts a graded run only when its
 newest postmortem audited the grading now in use and says trustworthy=true.
+
+Conflict check (client audit PO-3, 2026-10-28; BRIEF_VERSION): for every failing test the auditor quotes the
+instruction sentences the test could conflict with, says whether a fix following the other sentence (or another
+correct implementation) fails it, and labels it (`unfair_kind`). Owner rule: if a test and the instruction
+disagree, the failure is unfair. `record` enforces it for folders prepared with this brief: a failing item
+labelled unfair cannot be a genuine-fail, and a run whose failing tests are all unfair cannot be model-failed.
+The evidence carries no earlier verdict: earlier audits, fairness reviews and owner decisions are left out, so
+each run is judged on its own.
 """
 import argparse
 import csv
@@ -42,6 +52,8 @@ import paths  # noqa: E402  (repo locations: common/paths.py)
 ROOT = paths.ROOT
 JOBS = Path.home() / ".tb-graders" / "cwe" / "jobs"
 AUDITOR = "sub-agent, Claude Opus 5.5, effort high"
+BRIEF_VERSION = "v2-conflict-check-2026-10-28"
+UNFAIR_KINDS = ("conflict", "one-implementation", "out-of-scope", "unreachable")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 SCHEMA = {
@@ -69,6 +81,14 @@ SCHEMA = {
                 "verdict": {"type": "string", "enum": [
                     "genuine-pass", "genuine-fail", "test-fault", "instruction-ambiguity",
                     "harness-or-infra", "lenient-test", "unclear"]},
+                "conflicting_sentences": {"type": "array", "items": {"type": "string"},
+                                          "description": "failing tests: every instruction sentence the test "
+                                                         "could conflict with, quoted ([] if none)"},
+                "other_reading_fails": {"type": "boolean",
+                                        "description": "failing tests: would a fix that follows the other "
+                                                       "sentence, or another correct implementation, fail it?"},
+                "unfair_kind": {"type": "string", "enum": ["none", *UNFAIR_KINDS],
+                                "description": "failing tests: none, or why the test is unfair"},
             }}},
         "lookup_or_leak": {"type": "string",
                            "description": "did the run copy an upstream fix or read hidden tests? how"},
@@ -90,6 +110,20 @@ Check, at least:
    evidence/transcript.md)? Did the test demand something the instruction never states (an exact
    status code, a constant, a specific layer, a specific config knob)? Would a reasonable correct
    fix pass it? Did the test crash on its own (e.g. it calls product code the fix hardened)?
+1a. Conflict check, for every FAILING test (rule: if a test and the instruction disagree, the
+   failure is unfair):
+   (i) quote every instruction sentence the test could conflict with, in conflicting_sentences.
+       Check first a "keeps working" / "exactly as today" / "existing deployments" sentence against
+       the security rules, in both directions, and a stated mechanism against an unstated detail;
+   (ii) other_reading_fails: would a fix that follows the OTHER sentence, or a different correct
+       implementation the instruction allows (another layer, character class, data structure or
+       allowed refusal form), fail this test? The reference fix passing does not answer this;
+   (iii) unfair_kind: "conflict" (the test sides with one of two sentences), "one-implementation"
+       (it pins a detail the instruction does not state), "out-of-scope" (the change it needs lies
+       outside the scope the instruction describes), "unreachable" (it needs a state no code at the
+       pinned commit creates), else "none". Any kind but "none" makes the item a test-fault with
+       correct_fix_would_pass=false, whatever the model did, and if every failing test of the run is
+       unfair, the run is not model-failed.
 2. Every PASSING test that matters: is the pass real, or is the test too lenient?
 3. Harness/infra: grader setup errors, timeouts, crashes, provider refusals, missing results
    (evidence/grading/test-stdout.tail.txt, evidence/run.json). On a timeout the agent may have kept
@@ -108,12 +142,27 @@ instruction-ambiguity / harness-or-infra / contaminated / unclear. trustworthy=t
 model-solved or model-failed with at least medium confidence. Cite evidence as file:line or short
 quotes. Judge ONLY from the files under this folder (and the full transcript path in
 evidence/run.json if you need more); do not rely on any earlier conclusions about this task or
-benchmark you may have seen elsewhere. Do not run code and do not modify anything except the
-one output file.
+benchmark you may have seen elsewhere. The evidence leaves out earlier audits, fairness reviews and
+owner decisions on purpose: do not look for them. Do not run code and do not modify anything except
+the one output file.
 
 Write your answer as JSON to {out}/verdict.json, matching the schema in {out}/verdict.schema.json
 (keys: trustworthy, attribution, confidence, summary, items[], lookup_or_leak, evidence[],
-recommended_action). One item per test that failed, plus any passing test you judge lenient."""
+recommended_action). One item per test that failed, plus any passing test you judge lenient. Every
+failing item carries conflicting_sentences, other_reading_fails and unfair_kind."""
+
+
+# Build notes may carry earlier conclusions (audit verdicts, fairness outcomes, owner decisions, regrade outcomes).
+# The auditor must judge the run on its own evidence, so the copies in evidence/ go through the shared filter
+# (common/util/notes_filter.py), which keeps everything about how the task is built.
+sys.path.insert(0, str(paths.UTIL))
+import notes_filter  # noqa: E402
+
+
+def strip_earlier_conclusions(text):
+    """(text without earlier conclusions, [headings of sections left out whole], lines left out)."""
+    res, dropped, n, _removed = notes_filter.strip_conclusions(text)
+    return res, dropped, n
 
 
 def jload(p):
@@ -211,9 +260,12 @@ def build_evidence(trial, out):
     shutil.copytree(tdir / "tests", ev / "tests")
     (ev / "solution").mkdir()
     shutil.copy2(tdir / "solution" / "fix.patch", ev / "solution" / "fix.patch")
+    filtered = {}
     for f in ("BRIEF.md", "notes.md"):
         if (bdir / f).exists():
-            shutil.copy2(bdir / f, ev / f"build-{f}")
+            text, dropped, n = strip_earlier_conclusions((bdir / f).read_text(errors="replace"))
+            (ev / f"build-{f}").write_text(text)
+            filtered[f] = {"sections_left_out": dropped, "lines_left_out": n}
     gdir, gname = grading_dir(trial)
     for f in ("results.json", "reward.json"):
         if (gdir / "verifier" / f).exists():
@@ -235,7 +287,8 @@ def build_evidence(trial, out):
            "timing": timing(trial, res),
            "tests_note": "evidence/tests is the task's CURRENT version; if test names in grading/results.json "
                          "differ, the task changed after this run: judge by the graded names and results",
-           "exception_info": res.get("exception_info"), "full_transcript": str(transcript)}
+           "exception_info": res.get("exception_info"), "full_transcript": str(transcript),
+           "build_notes_filtered": filtered}
     (ev / "run.json").write_text(json.dumps(run, indent=1, default=str))
     return task, gname, row
 
@@ -259,12 +312,15 @@ def prepare(trial):
         model=row.get("model", "?"), minutes=row.get("agent_min", "?"), reward=row.get("reward", "?"),
         out=out))
     (out / "PREPARED.json").write_text(json.dumps(
-        {"trial": trial.name, "task": task, "grading_audited": gname,
+        {"trial": trial.name, "task": task, "grading_audited": gname, "brief_version": BRIEF_VERSION,
          "prepared_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}, indent=1))
     return out
 
 
-def validate(v):
+def validate(v, conflict_check=False):
+    """Schema errors of a verdict. conflict_check (folders prepared with BRIEF_VERSION): every failing item carries
+    the conflict fields, an item labelled unfair is not a genuine-fail, and a run whose failing tests are all
+    unfair is not model-failed."""
     errs = []
     for k in SCHEMA["required"]:
         if k not in v:
@@ -277,6 +333,25 @@ def validate(v):
     for it in v.get("items", []):
         if it.get("verdict") not in item_enum:
             errs.append(f"bad item verdict {it.get('verdict')!r}")
+    if not conflict_check:
+        return errs
+    failing = [it for it in v.get("items", []) if it.get("outcome") == "fail"]
+    for it in failing:
+        name = it.get("test", "?")
+        kind = it.get("unfair_kind")
+        if kind not in ("none", *UNFAIR_KINDS):
+            errs.append(f"{name}: unfair_kind must be one of none, {', '.join(UNFAIR_KINDS)}")
+        if not isinstance(it.get("conflicting_sentences"), list):
+            errs.append(f"{name}: conflicting_sentences must be a list of quoted sentences ([] if none)")
+        if not isinstance(it.get("other_reading_fails"), bool):
+            errs.append(f"{name}: other_reading_fails must be true/false")
+        if it.get("other_reading_fails") is True and kind == "none":
+            errs.append(f"{name}: a fix following the other reading fails it, so unfair_kind cannot be none")
+        if kind in UNFAIR_KINDS and it.get("verdict") in ("genuine-fail", "genuine-pass"):
+            errs.append(f"{name}: labelled {kind} (unfair) but judged {it.get('verdict')}")
+    if failing and v.get("attribution") == "model-failed" and all(it.get("unfair_kind") in UNFAIR_KINDS
+                                                                   for it in failing):
+        errs.append("every failing test is labelled unfair, so the run cannot be model-failed")
     return errs
 
 
@@ -286,7 +361,7 @@ def record(out, auditor=AUDITOR):
     verdict = jload(out / "verdict.json")
     if not prep or verdict is None:
         sys.exit(f"{out}: needs PREPARED.json and verdict.json")
-    errs = validate(verdict)
+    errs = validate(verdict, conflict_check=prep.get("brief_version") == BRIEF_VERSION)
     if errs:
         sys.exit(f"{out}/verdict.json invalid: {errs}")
     row = jload(out / "evidence" / "run.json").get("audit_row", {})
@@ -297,10 +372,12 @@ def record(out, auditor=AUDITOR):
           f"Auditor: {auditor}; grading audited: {prep['grading_audited']}; reward {row.get('reward')}.", "",
           f"**Trustworthy:** {verdict.get('trustworthy')}  **Attribution:** {verdict.get('attribution')}  "
           f"**Confidence:** {verdict.get('confidence')}", "", verdict.get("summary", ""), "",
-          "| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass |", "|---|---|---|---|---|"]
+          "| Test | Outcome | Verdict | Stated in instruction | Correct fix would pass | Unfair kind |",
+          "|---|---|---|---|---|---|"]
     for it in verdict.get("items", []):
         md.append(f"| {it.get('test')} | {it.get('outcome')} | {it.get('verdict')} | "
-                  f"{it.get('stated_in_instruction')} | {it.get('correct_fix_would_pass')} |")
+                  f"{it.get('stated_in_instruction')} | {it.get('correct_fix_would_pass')} | "
+                  f"{it.get('unfair_kind', '-')} |")
     md += ["", "**Lookup or leak:** " + str(verdict.get("lookup_or_leak", "")), "", "**Evidence:**"] + \
           [f"- {e}" for e in verdict.get("evidence", [])] + \
           ["", "**Recommended action:** " + str(verdict.get("recommended_action", ""))]

@@ -21,6 +21,19 @@ File-time leak refusal (owner decision 5 of 2026-10-28, reports/reward-hacking.m
 task's agent image (its reuse tag; built if missing) goes through common/gate/env_leak_check.py. A task that LEAKS,
 or that could not be checked, is refused: the export stops with exit 4 and writes nothing. There is no override;
 fix the task first (common/builder/tree_time_reset.py, then a re-gate).
+
+No delivery with an open question (client audit PO-3, 2026-10-28): before anything is written, every slug must pass
+common/fairness/fairness_verdict.py delivery_blockers(): HUMAN-DECISION.md must record DECISION: KEEP and no
+newest client-audit outcome other than a KEEP; no test the gate proved to conflict (other_reading check) may be left
+unrepaired; an open NEEDS_HUMAN_REVIEW: YES, no finished review or a NOT_READY one needs that
+KEEP dated on or after FAIRNESS.md (not stale); a deciding conflict (CONFLICTS line) needs its own current
+`CONFLICTS-RULED: <date> KEEP <reason>` line. A refusal exits 1 (like the other refusals here) and names every
+reason.
+
+Internal-path comments (owner 2026-10-28): a comment in the exported package that points at our own files (for
+example `# Task source state (see build/<slug>/notes.md).` in environment/Dockerfile) loses that pointer: a
+parenthetical naming the path is cut, and a comment that still names one is removed. Only whole-line comments
+change (#, //, /* and * lines); code, strings and every other line stay as they are. The report lists each change.
 """
 import argparse
 import csv
@@ -39,6 +52,8 @@ import audit_results as ar  # noqa: E402  (same exclusion rules as the ledger)
 sys.path.insert(0, str(paths.COMMON / "gate"))
 import env_leak_check  # noqa: E402  (file-time leak check; also puts common/harbor_ext on sys.path)
 import cwe_reuse_tag  # noqa: E402
+sys.path.insert(0, str(paths.COMMON / "fairness"))
+import fairness_verdict  # noqa: E402  (delivery_blockers: no delivery with an open question)
 
 MODEL_NAMES = {"deepseek": "deepseek-v4.1-flash", "mimo": "mimo-v2.6-pro"}
 HARBOR_PY = Path.home() / ".local/share/uv/tools/harbor/bin/python"
@@ -66,6 +81,54 @@ def counted_runs(slug, trials):
 
 
 KEY_FILES = [Path.home() / ".config/cwe/models.env", Path.home() / ".tb-graders/cwe/models.env"]
+
+
+# Paths into our own repository or machines, and only those (upstream code may well have a common/util/ folder, and
+# Gradle writes build/classes): build/<this slug>/..., a build-record file under build/<x>/, build/audit/,
+# ~/.tb-graders/, the builder's templates and the pipelines' folders.
+INTERNAL_PATH = (r"(?:\bbuild/{slug}(?:-control)?/[^\s)`'\"]*|\bbuild/[\w.-]+/(?:notes\.md|FAIRNESS\.md|"
+                 r"HUMAN-DECISION\.md|manifest\.json|checks/|repaired-tests-|removed-tests-|BRIEF\.md|history/)"
+                 r"[^\s)`'\"]*|\bbuild/audit/[^\s)`'\"]*|~?/?\.tb-graders/[^\s)`'\"]*|"
+                 r"\bcommon/builder/templates/[^\s)`'\"]*|\bpipelines/(?:sibling|stacking|router)/[^\s)`'\"]*)")
+HASH = re.compile(r"(?:^Dockerfile[\w.-]*|\.(?:sh|bash|py|toml|ya?ml|rb|properties|cfg|ini|conf))$")
+SLASH = re.compile(r"\.(?:js|mjs|cjs|ts|mts|cts|go|java|kt|rs|php|c|h|cc|cpp|cs|swift|scala|gradle)$")
+HASH_LINE = re.compile(r"^(\s*)(#(?!!))(.*)$")
+SLASH_LINE = re.compile(r"^(\s*)(//|/\*+|\*(?!/))(.*)$")
+UPSTREAM_DIRS = {"pristine", "project", "node_modules", "vendor", ".git"}   # copies of upstream code: never touched
+
+
+def strip_internal_comments(root, slug):
+    """Cut pointers to internal paths out of whole-line comments under root. Returns ['file:line: what']."""
+    path_re = re.compile(INTERNAL_PATH.format(slug=re.escape(slug)))
+    paren_re = re.compile(r"\s*\([^()]*?" + path_re.pattern + r"[^()]*\)")
+    changed = []
+    for p in sorted(Path(root).rglob("*")):
+        if not p.is_file() or UPSTREAM_DIRS & set(p.relative_to(root).parts[:-1]):
+            continue
+        comment = HASH_LINE if HASH.search(p.name) else SLASH_LINE if SLASH.search(p.name) else None
+        if comment is None:
+            continue
+        try:
+            lines = p.read_text().split("\n")
+        except (UnicodeDecodeError, OSError):
+            continue
+        out, hit = [], False
+        for i, line in enumerate(lines, 1):
+            m = comment.match(line)
+            if not m or not path_re.search(m.group(3)):
+                out.append(line)
+                continue
+            hit = True
+            body = paren_re.sub("", m.group(3))
+            rel = f"{p.relative_to(root)}:{i}"
+            if path_re.search(body) or not re.search(r"\w", body):
+                changed.append(f"{rel}: comment removed")
+                continue
+            out.append(m.group(1) + m.group(2) + body)
+            changed.append(f"{rel}: path reference cut")
+        if hit:
+            p.write_text("\n".join(out))
+    return changed
 
 
 def secret_values():
@@ -137,6 +200,9 @@ def main():
     ap.add_argument("--name", action="append", default=[], help="slug=delivered-task-name")
     a = ap.parse_args()
     names = dict(n.split("=", 1) for n in a.name)
+    refused = [f"{slug}: {r}" for slug in a.slugs for r in fairness_verdict.delivery_blockers(slug)]
+    if refused:
+        sys.exit("REFUSED: not exported (no delivery with an open question):\n  " + "\n  ".join(refused))
     out = Path(a.out)
     for slug in a.slugs:
         if not (paths.TASKS / slug / "task.toml").is_file():
@@ -150,7 +216,7 @@ def main():
         sys.exit(4)
     trials = list(csv.DictReader(open(paths.AUDIT_DIR / "trials.tsv"), delimiter="\t"))
     report = ["# Export report", "", "| task | model | rollout | job/trial | reward | trajectory |", "|---|---|---|---|---|---|"]
-    skipped = []
+    skipped, stripped = [], []
     for slug in a.slugs:
         name = names.get(slug, slug)
         src = paths.TASKS / slug
@@ -160,6 +226,7 @@ def main():
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*SKIP_TASK_FILES))
+        stripped += strip_internal_comments(dst, slug)
         n = {}
         for t in counted_runs(slug, trials):
             mk = ar.model_key(t["model"])
@@ -181,6 +248,7 @@ def main():
         print(f"{name}: " + ", ".join(f"{MODEL_NAMES[k]} {v}" for k, v in n.items()))
     if skipped:
         report += ["", "## Skipped (no trajectory)", ""] + [f"- {s}" for s in skipped]
+    report += ["", f"## Internal-path comments: {len(stripped)} changed", ""] + [f"- {s}" for s in stripped]
     vals = secret_values()
     if not vals:
         sys.exit("secret scan impossible: no key values found in " + ", ".join(map(str, KEY_FILES)))

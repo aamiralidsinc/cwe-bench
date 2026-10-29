@@ -1,4 +1,8 @@
-# Stacking build addendum (step 4 of the stacking pipeline), v2, 2026-10-24
+# Stacking build addendum (step 4 of the stacking pipeline), v3, 2026-10-28
+
+**v3 (2026-10-28, client audit PO-3):** rule 14 (scope and reachability of every trap; manifest
+`instruction_scope` and `entry_point`), and rule 5 now runs both ways (a keep-working sentence must not
+protect what a security test refuses).
 
 **v2 (2026-10-24):** rules 5, 7 and 10 rewritten. In batch 1 (30 tasks), 137 of 155 traps had a
 sentence of their own in instruction.md (`pipelines/stacking/out/listing_audit.json`), so each task read as a
@@ -35,7 +39,9 @@ pinned code before you rely on it. The record is a lead.
    report covers it ONLY through the general keep-working sentence ("everything that works today
    keeps working"); it never names or describes the value. If a security rule, read literally, would
    forbid that value, reword the security rule over its protected outcome instead of adding an
-   exception that names the value.
+   exception that names the value. The other way round too: no security test may refuse what a
+   keep-working sentence ("exactly as today") protects. If a test and the report disagree, the test
+   is unfair.
 6. **Effort budget.** A careful engineer who knows where to look fixes everything in about 45-60
    minutes. If the stack needs more, drop the weakest concept.
 
@@ -80,6 +86,13 @@ pinned code before you rely on it. The record is a lead.
     for the task's whole life: any later change to the stacked report (fairfix, upgrade) is copied to
     the control. `check_stack.py` checks it.
 
+**Scope**
+14. **Every trap beyond the advisory's own route is in scope and reachable** (build template, "Scope
+    of every lever"): quote the report sentence that covers the change its test needs, and cite the
+    entry point that reaches it at the pinned commit plus the pinned code that creates every state its
+    test sets up. A test that needs a state no pinned code writes (a field only the test fills in) is
+    a dead path: drop the trap. Record `instruction_scope` and `entry_point` on each such trap.
+
 **Manifest:** add a `stacking` block containing:
 - `pattern`;
 - `reader_record`;
@@ -95,6 +108,7 @@ pinned code before you rely on it. The record is a lead.
 - `id` (string) — referenced by `stacking.concepts`.
 - `type` — exactly one of `"deepseek"`, `"mimo"`, or `"both"`. At least one trap must be `"deepseek"` or `"both"`, and at least one must be `"mimo"` or `"both"`.
 - `origin` — for a hidden route, one of `"uncovered_upstream"`, `"published_fix_far_site"`, `"injection_room"`. Any trap with such an `origin` must also carry `coupled_functional_tests`: a non-empty list of the functional-test ids that keep its must-keep-working value honest.
+- `instruction_scope` and `entry_point` — for a trap with such an `origin` (rule 14): the quoted report sentence that covers it, and the entry point plus the pinned code that creates its test's state. The gate warns when either is missing (not yet a failure).
 
 `manifest.stacking` — an object with exactly these keys (all required):
 - `pattern` — e.g. `"H3a"`, `"H3b1"`, `"H3b2"`, `"H4"`.

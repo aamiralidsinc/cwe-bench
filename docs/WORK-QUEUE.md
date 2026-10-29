@@ -179,6 +179,21 @@ A task gets one `delivery_prep` job per keep decision when all of these hold:
 A kept task that is not a both-model breaker is reported and never prepared.
 
 The job runs `delivery.py prep <slug>`:
+0. No delivery with an open question (client audit PO-3, 2026-10-28). The task is refused, nothing is exported,
+   `ready.json` lists the reasons and the job exits 3 when:
+   - `HUMAN-DECISION.md` records no `DECISION`, or one that is not KEEP (a clean READY review is not enough);
+   - `FAIRNESS.md` sets `NEEDS_HUMAN_REVIEW: YES`, or there is no finished review, or a NOT_READY one, and the KEEP
+     is dated before the review (stale);
+   - its `CONFLICTS` line counts a deciding conflict and there is no current
+     `CONFLICTS-RULED: <YYYY-MM-DD> KEEP <short reason>` line (a KEEP decision alone does not rule on a conflict; a
+     DROP or REPAIR ruling refuses);
+   - the newest `CLIENT-AUDIT:` line is not a KEEP (`WITHDRAW`, `REPAIR FIRST`, `WAITING`; `KEEP (confirmed)` and
+     `KEEP, CONFIDENCE: ...` pass, and a later KEEP section clears an earlier outcome);
+   - `gate_report.json` lists a test as `conflict_proven` (an `other_reading` check failed it,
+     `common/fairness/OTHER-READING-CHECK.md`) and no `repaired-tests-*` / `removed-tests-*` folder is newer than
+     that report.
+   `export_delivery.py` applies the same check (exit 1), so a hand-run export refuses too. Check one task with
+   `python3 common/fairness/fairness_verdict.py --delivery <slug>`.
 1. `common/util/export_delivery.py` writes the task package and its counted rollouts into
    `~/.tb-graders/cwe/deliveries/<UTC>-<slug>/` (`[delivery] out_dir`). The export redacts every model key value.
 2. `task.toml` gets `name = "cwe-bench/<name>"`; nothing else in the package changes.

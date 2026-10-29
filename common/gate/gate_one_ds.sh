@@ -184,6 +184,15 @@ cwe_gate_verdict "$B" "$mark"
 # A SOUND is valid only for the files it gated (common/gate/fingerprint.py): record them, so a later
 # change to tests/solution/environment/checks makes run_trial.sh and regrade.py refuse until re-gated.
 if [ "$mark" = .sound ]; then python3 -I "$CWE_ROOT/common/gate/fingerprint.py" write "$s" >> "$LOG" 2>&1; else rm -f "$B/gate_fingerprint.json"; fi
-echo "  $s RESULT $word $(date -u +%FT%TZ)" >> "$LOG"
-echo "$s $word${verror:+ :: ${verror:0:400}}"
+# Upstream's own fix and the other-reading checks, reviewed in the patches stage (never a verdict): say so on the
+# result line.
+gwarn=$(python3 -c 'import json,sys
+try: st = json.load(open(sys.argv[1]))["stages"].get("patches") or {}
+except Exception: st = {}
+w, c = st.get("warnings") or [], st.get("conflict_proven") or []
+out = ([f"[WARN: {len(w)} upstream-fix warning(s), gate_report.json stages.patches.warnings]"] if w else []) + \
+      ([f"[CONFLICT-PROVEN: {len(c)} test(s), gate_report.json stages.patches.conflict_proven]"] if c else [])
+print(" ".join(out))' "$B/gate_report.json" 2>/dev/null)
+echo "  $s RESULT $word${gwarn:+ $gwarn} $(date -u +%FT%TZ)" >> "$LOG"
+echo "$s $word${gwarn:+ $gwarn}${verror:+ :: ${verror:0:400}}"
 exit $code

@@ -1,4 +1,9 @@
-# Stacking fairness addendum, v2, 2026-10-24
+# Stacking fairness addendum, v3, 2026-10-28
+
+**v3 (2026-10-28, client audit PO-3):** S1 also runs the other direction (a security test against a
+keep-working sentence) and every S1-S6 finding goes into the brief's Conflicts table and CONFLICTS
+line; new S8 (scope and reachability of every trap beyond the advisory). Rancher's request-path test
+needed a state no pinned code creates, and passenger's needed a change outside the described scope.
 
 **v2 (2026-10-24):** S1 no longer asks for a clause that states each coupled value; the general
 keep-working sentence covers it (batch 1 instructions listed their traps through such clauses). The
@@ -29,6 +34,10 @@ value next to a hidden one:
 Gate a fails only on that contradiction: a correct fix cannot pass both. The remedy is to reword the
 security rule over its protected outcome, never to add a clause that names the value (that lists the
 trap; see build rule 7).
+The other direction too: for every security test, check that no keep-working sentence ("exactly as
+today", "existing deployments behave as today") protects what the test demands be refused. Each
+contradiction is a `conflict` row in the brief's Conflicts table (step 1a), so it counts in the
+CONFLICTS line.
 
 **S2. Shape traps (gate a when it fails).** For every input shape a security test refuses, check that
 it lies outside the legitimate set that every keep-working clause, example and fixture describes.
@@ -62,8 +71,17 @@ refused leading slash, where another route must accept it.
 **S7. Decisive tests (after the trial; NEEDS_HUMAN_REVIEW when it fires).**
 - Read `build/<slug>/trial_summary.md` if it exists.
 - For each failed run, list the tests that decided it.
-- If a single test decides a model's result, re-check that test first against S1-S6, and set
+- If a single test decides a model's result, re-check that test first against S1-S6 and S8, and set
   NEEDS_HUMAN_REVIEW: YES with that test named.
+- These are the "deciding" tests of the brief's Conflicts table: mark each conflict row deciding yes/no.
+
+**S8. Scope and reachability (gate a when it fails).** The brief's step 4a, for every trap whose
+origin is not `advisory_route` (uncovered_upstream, published_fix_far_site, injection_room, injected):
+- quote the instruction sentence whose described scope covers the change the trap's test needs;
+- cite the entry point that reaches it at the pinned commit, and the pinned product code that creates
+  every state the test sets up (a token field, a stored record, a configuration). A test whose state no
+  pinned code creates is `unreachable` (a dead path), even when the reference passes it;
+- `out-of-scope` and `unreachable` tests go into the Conflicts table.
 
 **Fairfix rules for stacked tasks:**
 - Resolve a contradiction by keeping the instruction and changing the test and the reference

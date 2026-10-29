@@ -7,7 +7,13 @@
                      breakers are delivered.
 
 The job runs `delivery.py prep <slug>`:
-  0. export_delivery.py first runs the file-time leak check (common/gate/env_leak_check.py) on the task's agent image
+  0. No delivery with an open question (client audit PO-3, 2026-10-28): fairness_verdict.delivery_blockers() must
+     be empty. It refuses a task with no DECISION (or one that is not KEEP), a newest `CLIENT-AUDIT:` line that is
+     not a KEEP (WITHDRAW, REPAIR FIRST, WAITING), a gate-proven conflict (other_reading check) not repaired since, an
+     open NEEDS_HUMAN_REVIEW: YES without a KEEP dated on or after the review, and a deciding conflict (CONFLICTS
+     line) without a current `CONFLICTS-RULED: <date> KEEP <reason>` line. A refused task is not exported:
+     ready.json records the reasons and the job exits 3, like any other unready package.
+  0b. export_delivery.py first runs the file-time leak check (common/gate/env_leak_check.py) on the task's agent image
      and refuses a task that is not clean (exit 4, nothing exported; owner decision 2026-10-28).
   1. common/util/export_delivery.py exports the task package and its counted rollouts into
      <out_dir>/<UTC>-<slug>/ ([delivery] out_dir, default ~/.tb-graders/cwe/deliveries). The export redacts every model
@@ -185,6 +191,15 @@ def prep(slug, cfg, name=None, out_dir=None, export=None):
     name = name or propose_name(slug, taken)
     out = Path(out_dir or Path(st["out_dir"]) / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{slug}")
     out.mkdir(parents=True, exist_ok=True)
+    refused = taskstate.fairness_verdict.delivery_blockers(slug)
+    if refused:
+        ready = {"slug": slug, "name": name, "out": str(out), "readme_row": readme_row(name, slug),
+                 "export_exit": None, "prepared": qdb.utc(), "ready": False, "rollouts": {},
+                 "problems": ["fairness: " + r for r in refused]}
+        (out / "ready.json").write_text(json.dumps(ready, indent=2) + "\n")
+        print(json.dumps({k: ready[k] for k in ("slug", "name", "out", "ready", "problems", "rollouts")}))
+        print(f"REFUSED: {slug} is not delivered: " + "; ".join(refused), file=sys.stderr)
+        return 3, ready
     argv = export or [sys.executable, "-I", str(paths.COMMON / "util" / "export_delivery.py"), str(out), slug,
                       "--name", f"{slug}={name}"]
     r = subprocess.run(argv, cwd=str(paths.ROOT), capture_output=True, text=True)

@@ -14,7 +14,13 @@ B=build/$SLUG
 BRIEF=$(cat "$CWE_FAIRNESS_BRIEF")
 P="$BRIEF
 
-Review SLUG=$SLUG. The project root here is $CWE_ROOT (NOT the path in the brief): read tasks/$SLUG/instruction.md, tasks/$SLUG/tests/, tasks/$SLUG/solution/fix.patch, build/$SLUG/manifest.json, build/$SLUG/notes.md, build/$SLUG/checks/*.patch; write build/$SLUG/FAIRNESS.md. Do not run anything."
+Review SLUG=$SLUG. The project root here is $CWE_ROOT (NOT the path in the brief): read tasks/$SLUG/instruction.md, tasks/$SLUG/tests/, tasks/$SLUG/solution/fix.patch, build/$SLUG/manifest.json, build/$SLUG/notes.for-review.md (the build notes without earlier conclusions; never open build/$SLUG/notes.md, build/$SLUG/history/, FAIRNESS.md.prev-*, HUMAN-DECISION.md or any audit or postmortem file), build/$SLUG/checks/*.patch, build/$SLUG/gate_report.json, build/$SLUG/trial_summary.md (if present); write build/$SLUG/FAIRNESS.md. Do not run anything."
+# The failing tests of each run, for the brief's "deciding" column (step 1a); never fails the review.
+python3 -I "$CWE_TRIAL_SUMMARY" "$SLUG" > /dev/null 2>&1 || true
+# The reviewer judges on its own: it reads the build notes without earlier conclusions (audit, fairness, decision and
+# run outcomes; common/util/notes_filter.py). If the filter fails it gets no notes, never the raw ones.
+python3 -I "$CWE_COMMON/util/notes_filter.py" "$B/notes.md" "$B/notes.for-review.md" > /dev/null 2>&1 \
+  || echo "(build notes unavailable)" > "$B/notes.for-review.md"
 # A stale review must never pass for this run's result.
 [ -f "$B/FAIRNESS.md" ] && mv "$B/FAIRNESS.md" "$B/FAIRNESS.md.prev-$(date -u +%Y%m%dT%H%M%SZ)"
 echo "running" > "$B/fairness_status.txt"

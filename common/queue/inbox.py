@@ -40,7 +40,7 @@ def quote(slug, *labels):
     """The paragraph after the first `<label>:` line in build/<slug>/FAIRNESS.md (the reviewer's own words)."""
     text = _read(paths.BUILD / slug / "FAIRNESS.md")
     for label in labels:
-        m = re.search(rf"(?ims)^[\W_]*{label}[\W_]*:?[*_]*\s*(.+?)(?:\n\s*\n|\n#|\nGATE_A|\nNEEDS_HUMAN|\Z)", text)
+        m = re.search(rf"(?ims)^[\W_]*{label}[\W_]*:?[*_]*\s*(.+?)(?:\n\s*\n|\n#|\nGATE_A|\nCONFLICTS|\nNEEDS_HUMAN|\Z)", text)
         if m:
             return re.sub(r"\s+", " ", m.group(1)).strip()[:700]
     return ""

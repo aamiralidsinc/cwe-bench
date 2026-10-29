@@ -123,10 +123,12 @@ def ledger():
 
 
 def ledger_model(cell):
-    """A ledger cell -> solved | failed | partial | none (no graded run) | '' (not in the ledger)."""
+    """A ledger cell -> solved | failed | blocked | partial | none (no graded run) | '' (not in the ledger)."""
     if not cell:
         return ""
     c = cell.lstrip("*").lower()
+    if c.startswith("blocked"):                        # the provider refused the model (audit_results.py)
+        return "blocked"
     if c.startswith("solved"):
         return "solved"
     if c.startswith("failed"):
@@ -272,8 +274,8 @@ def read(slug, ctx):
     if not t["batch"] and ".sound" not in t["markers"] and not kinds:
         if slug in ctx["ledger"]:
             ms = t["models"]
-            final = {m: ms[m]["ledger"] if ms[m]["ledger"] in ("solved", "failed") else "" for m in MODELS}
-            if all(final.values()) or "solved" in final.values():       # one solve already rules a breaker out
+            final = {m: ms[m]["ledger"] if ms[m]["ledger"] in ("solved", "failed", "blocked") else "" for m in MODELS}
+            if all(final.values()) or {"solved", "blocked"} & set(final.values()):   # either rules a breaker out
                 return verdict_stage(t, final, kinds, done)
             return done("outside_batches", "nothing: no verdict for " + ", ".join(m for m in MODELS if not final[m])
                         + " and not in a batch (a person adds it to a batch to schedule it)")
@@ -304,7 +306,7 @@ def read(slug, ctx):
 
     ms = t["models"]
     # Verdict per model: the audited ledger when it has one, else the launch state.
-    final = {m: (ms[m]["ledger"] if ms[m]["ledger"] in ("solved", "failed") else
+    final = {m: (ms[m]["ledger"] if ms[m]["ledger"] in ("solved", "failed", "blocked") else
                  ms[m]["launch"] if ms[m]["launch"] in ("solved", "failed") else "") for m in MODELS}
     if any(ms[m]["running"] for m in MODELS):
         return done("trialing", "wait: trials running (" +
@@ -322,6 +324,9 @@ def verdict_stage(t, final, kinds, done):
     ms = t["models"]
     if any(final[m] == "solved" for m in MODELS):
         return done("not_breaker", "nothing")
+    if any(final[m] == "blocked" for m in MODELS):     # a refused model can never make a both-model breaker
+        return done("not_breaker", "nothing (" + ", ".join(m for m in MODELS if final[m] == "blocked")
+                    + " blocked by the provider)")
     if any(ms[m]["awaiting_audit"] for m in MODELS) or "BREAKER" not in t["ledger_verdict"]:
         return done("awaiting_audit", "audit the failing runs")
     if "fairness" in kinds:
@@ -374,6 +379,6 @@ def redo_reason(kind, slug, args, ctx=None, t=None):
         mm = t["models"][m]
         if mm["running"]:
             return f"{m} trials are running"
-        if mm["ledger"] in ("solved", "failed") or mm["launch"] in ("solved", "failed"):
+        if mm["ledger"] in ("solved", "failed", "blocked") or mm["launch"] in ("solved", "failed"):
             return f"{m} already has a verdict ({mm['ledger'] or mm['launch']})"
     return None

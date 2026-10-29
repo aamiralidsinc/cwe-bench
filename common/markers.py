@@ -60,12 +60,19 @@ MARKERS = {m.name: m for m in (
     Marker(".hold-repair", "flag", "A test repair is between its edit and its regrades: no new trials of the task.",
            "repair steps (people / repair scripts), the queue after a held re-gate", "taskstate.py, dispatch.py, "
            "scale_queue.py, phase4.py"),
-    Marker("hold_{model}", "flag", "No new runs of this model on this task.", "people",
+    Marker("hold_{model}", "flag", "No new runs of this model on this task. When its text says the model was blocked "
+           "(or {MODEL}-BLOCKED.md exists), the ledger shows that model as blocked.", "people",
            "common/trial/run_trial.sh, trial.py, phase3.py, dispatch.py"),
     Marker("repaired-tests-*", "folder", "Originals (*.orig) and README.md of tests changed by a repair.",
            "repair steps", "reconcile.py (R1-R4), people"),
     Marker("removed-tests-*", "folder", "Originals and README.md of tests removed by a repair.",
            "repair steps", "reconcile.py (R1-R4), people"),
+    Marker("history", "folder", "Records of the steps after the build (fairfix, upgrade, test repair, regrade), one "
+           "file each (<YYYYMMDD>-<kind>.md), so notes.md keeps build facts only (2026-10-28).",
+           "fairfix and upgrade agents, repair steps, people", "people (never the fairness reviewer or the auditor)"),
+    Marker("notes.for-review.md", "record", "The build notes without earlier conclusions, regenerated before each "
+           "fairness review (common/util/notes_filter.py); the reviewer reads it instead of notes.md.",
+           "pipelines/sibling/9-fairness, pipelines/stacking/7-fairness", "the fairness reviewer"),
     # ---- build
     Marker("BUILD-PROMPT.md", "record", "The builder's prompt for this task.", "common/builder/build_prepare.py",
            "common/launch/run_build.sh, phase3.py"),
@@ -88,12 +95,15 @@ MARKERS = {m.name: m for m in (
     Marker("runs_{model}.log", "log", "One line per run of the current task version (`reward=`), moved away with each "
            "new version.", "common/trial/trial.py", "common/trial/trial_state.py, taskstate.py"),
     # ---- review, decision, delivery
-    Marker("FAIRNESS.md", "record", "The fairness review; its GATE_A line is the verdict.",
-           "pipelines/sibling/9-fairness, pipelines/stacking/7-fairness", "common/fairness/fairness_verdict.py, inbox.py"),
+    Marker("FAIRNESS.md", "record", "The fairness review; its GATE_A line is the verdict, its CONFLICTS line the tests "
+           "that disagree with the instruction (since 2026-10-28).",
+           "pipelines/sibling/9-fairness, pipelines/stacking/7-fairness", "common/fairness/fairness_verdict.py, inbox.py, "
+           "delivery.py, export_delivery.py"),
     Marker("fairness_status.txt", "record", "Whether the last fairness run finished (`ok ...`).",
            "pipelines/sibling/9-fairness, pipelines/stacking/7-fairness", "common/fairness/fairness_verdict.py"),
-    Marker("HUMAN-DECISION.md", "record", "The owner's decision (DECISION: KEEP|REPAIR|DROP, DATE:) and, after a "
-           "delivery, a DELIVERED: line.", "people; `cweq delivered`", "fairness_verdict.py, taskstate.py, "
+    Marker("HUMAN-DECISION.md", "record", "The owner's decision (DECISION: KEEP|REPAIR|DROP, DATE:), the ruling on "
+           "deciding conflicts (CONFLICTS-RULED: <date> <KEEP|DROP|REPAIR> <reason>), client-audit outcomes "
+           "(CLIENT-AUDIT:) and, after a delivery, a DELIVERED: line.", "people; `cweq delivered`", "fairness_verdict.py, taskstate.py, "
            "delivery.py, inbox.py"),
     Marker("LISTING_WAIVER.md", "record", "The owner's decision to trial a stacking task despite the listing check.",
            "people", "people, this checker"),
@@ -108,6 +118,12 @@ RESULT_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) \S+ RESULT: (.*)$")
 DECISION_RE = re.compile(r"(?mi)^\s*DECISION\s*:\s*(KEEP|REPAIR|DROP)\b")
 DATE_RE = re.compile(r"(?mi)^\s*DATE\s*:\s*(\d{4}-\d{2}-\d{2})")
 DELIVERED_RE = re.compile(r"(?mi)^\s*DELIVERED\s*:\s*(.+)$")
+# Owner rulings added by the client audit PO-3 (2026-10-28), both in HUMAN-DECISION.md:
+#   CONFLICTS-RULED: <YYYY-MM-DD> <KEEP|DROP|REPAIR> <short reason>   the ruling on the review's deciding conflicts
+#   CLIENT-AUDIT: WITHDRAW | KEEP (confirmed) | KEEP, CONFIDENCE: THIN | ...   a client-audit section's outcome
+CONFLICTS_RULED_LINE = re.compile(r"(?mi)^\s*CONFLICTS-RULED\s*:(.*)$")
+CONFLICTS_RULED_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})\s+(KEEP|DROP|REPAIR)\b\s*[-:;,]?\s*(\S.*)$", re.I)
+CLIENT_AUDIT_RE = re.compile(r"(?mi)^\s*CLIENT-AUDIT\s*:\s*(.+)$")
 
 
 # ---------------------------------------------------------------- paths and raw access
@@ -270,6 +286,55 @@ def human_decision(b, fairness_mtime_date=None):
     return d.group(1).upper(), (dt.group(1) if dt else "undated"), stale
 
 
+def _fairness_day(b):
+    import datetime as _dt
+    fair = Path(b) / "FAIRNESS.md"
+    return _dt.datetime.fromtimestamp(fair.stat().st_mtime, _dt.timezone.utc).strftime("%Y-%m-%d") \
+        if fair.is_file() else None
+
+
+def conflicts_ruled(b):
+    """(ruling, date, reason, stale) from the LAST well-formed `CONFLICTS-RULED:` line of HUMAN-DECISION.md, or None.
+    stale: dated before FAIRNESS.md was last written (the same per-day rule as human_decision)."""
+    lines = CONFLICTS_RULED_LINE.findall(read_text(Path(b) / "HUMAN-DECISION.md"))
+    for rest in reversed(lines):
+        m = CONFLICTS_RULED_RE.match(rest)
+        if m:
+            day = _fairness_day(b)
+            return m.group(2).upper(), m.group(1), m.group(3).strip(), bool(day and m.group(1) < day)
+    return None
+
+
+def client_audit(b):
+    """Every `CLIENT-AUDIT:` value in HUMAN-DECISION.md, in file order (e.g. ['WITHDRAW'], ['KEEP, CONFIDENCE: THIN'])."""
+    return [v.strip() for v in CLIENT_AUDIT_RE.findall(read_text(Path(b) / "HUMAN-DECISION.md"))]
+
+
+CONFIDENCE_RE = re.compile(r"(?mi)\bCONFIDENCE\s*:\s*(high|medium|low|thin)\b")
+BLOCKED_HOLD_RE = re.compile(r"(?i)\bblocked\b")
+
+
+def confidence(b):
+    """The breaker's confidence label (high | medium | low | thin) from HUMAN-DECISION.md, or None. A `CONFIDENCE:`
+    line or one inside a `CLIENT-AUDIT: KEEP, CONFIDENCE: THIN` line; the last one in the file wins."""
+    hits = CONFIDENCE_RE.findall(read_text(Path(b) / "HUMAN-DECISION.md"))
+    return hits[-1].lower() if hits else None
+
+
+def blocked(b, model):
+    """Why `model` is blocked on this task (the provider refused it: content filter, safety classifier, repeated
+    truncation stops), or None. Blocked = a <MODEL>-BLOCKED.md record, or a hold_<model> whose text says blocked;
+    a hold for another reason (a pause, a solve elsewhere) is not a block."""
+    b = Path(b)
+    for f in b.glob("*-BLOCKED.md") if b.is_dir() else ():
+        if f.name.upper() == f"{model.upper()}-BLOCKED.MD":
+            return f.name
+    hold = path(b, "hold_{model}", model)
+    if hold.exists() and BLOCKED_HOLD_RE.search(read_text(hold)):
+        return hold.name
+    return None
+
+
 def delivered_line(b):
     m = DELIVERED_RE.search(read_text(Path(b) / "HUMAN-DECISION.md"))
     return m.group(1).strip() if m else ""
@@ -354,6 +419,10 @@ def check(slug, b=None, fp_digest=None):
             out.append(("warn", "decision-undated", "HUMAN-DECISION.md has no `DATE:` line"))
         if DELIVERED_RE.search(hd_text) and not (d and d.group(1).upper() == "KEEP"):
             out.append(("error", "delivered-without-keep", "DELIVERED line but the decision is not KEEP"))
+        bad = [r for r in CONFLICTS_RULED_LINE.findall(hd_text) if not CONFLICTS_RULED_RE.match(r)]
+        if bad:
+            out.append(("error", "conflicts-ruled-unparseable", "CONFLICTS-RULED line is not "
+                        "`CONFLICTS-RULED: <YYYY-MM-DD> <KEEP|DROP|REPAIR> <short reason>`: " + bad[0].strip()[:80]))
 
     reps = repairs(b)
     for r in reps:

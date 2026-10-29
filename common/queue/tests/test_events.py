@@ -1,6 +1,9 @@
 """The event queue (events.py), the decisions inbox (inbox.py) and delivery preparation (delivery.py)."""
+import calendar
 import json
+import os
 import sys
+import time
 
 import delivery
 import events
@@ -134,6 +137,8 @@ for m in ("deepseek-v4.1-flash", "mimo-v2.6-pro"):
 
 def test_prep_writes_ready_json(root, cfg, tmp_path):
     built(root, "k-s2")
+    fairness(root, "k-s2", extra="CONFLICTS: 0; DECIDING: 0")
+    keep(root, "k-s2", date="2099-01-01")
     (root / "tasks" / "k-s2" / "task.toml").write_text('[metadata]\nrepo = "https://github.com/acme/Widget.js"\n'
                                                        'cwe_id = "CWE-918"\n')
     (root / "tasks" / "k-s2" / "instruction.md").write_text("# Widgets fetch any address\n")
@@ -151,6 +156,8 @@ def test_prep_writes_ready_json(root, cfg, tmp_path):
 
 def test_prep_blocks_on_a_key_in_a_trajectory(root, cfg, tmp_path):
     built(root, "k-s2")
+    fairness(root, "k-s2")
+    keep(root, "k-s2", date="2099-01-01")
     script = fake_export(tmp_path, body="ANTHROPIC_API_KEY=sk-" + "a" * 40 + " task-" + "b" * 40)
     out = tmp_path / "pkg"
     rc, ready = delivery.prep("k-s2", cfg, name="k-task", out_dir=out,
@@ -210,6 +217,8 @@ def test_worker_command_for_delivery_prep(conn, cfg):
 def test_prep_refuses_a_file_time_leak(root, cfg, tmp_path):
     """export_delivery.py exits 4 when the leak check is not clean (owner decision 2026-10-28): never ready."""
     built(root, "k-s2")
+    fairness(root, "k-s2")
+    keep(root, "k-s2", date="2099-01-01")                       # past the fairness check, so the export runs
     script = tmp_path / "refusing_export.py"
     script.write_text('import sys\nprint("k-s2: leak check leak: LEAK (injection files: 4, tracked 10)")\n'
                       'print("REFUSED: file-time leak", file=sys.stderr)\nsys.exit(4)\n')
@@ -219,3 +228,193 @@ def test_prep_refuses_a_file_time_leak(root, cfg, tmp_path):
     assert rc == 3 and not ready["ready"]
     assert any(p.startswith("refused: file-time leak") for p in ready["problems"])
     assert ready["leak_refusal"] == ["k-s2: leak check leak: LEAK (injection files: 4, tracked 10)"]
+
+
+# ---------- no delivery with an open question (client audit PO-3, 2026-10-28)
+
+def review(root, slug, verdict="READY", human="NO", conflicts=None, day="2026-10-21"):
+    """FAIRNESS.md in the brief's format, its mtime set to `day` (noon UTC): staleness compares against it."""
+    lines = [f"GATE_A: {verdict}"] + ([conflicts] if conflicts else []) + [f"NEEDS_HUMAN_REVIEW: {human}"]
+    f = root / "build" / slug / "FAIRNESS.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("# Fairness review\n\nHuman review: confirm the reading of rule 2.\n\n" + "\n".join(lines) + "\n")
+    t = calendar.timegm(time.strptime(day + " 12", "%Y-%m-%d %H"))
+    os.utime(f, (t, t))
+
+
+def refuse(root, cfg, tmp_path, slug):
+    script = fake_export(tmp_path)
+    out = tmp_path / f"pkg-{slug}"
+    rc, ready = delivery.prep(slug, cfg, name="k-task", out_dir=out,
+                              export=[sys.executable, str(script), str(out), slug, "--name", f"{slug}=k-task"])
+    return rc, ready, out
+
+
+def test_prep_refuses_an_open_human_question(root, cfg, tmp_path):
+    built(root, "k-s2")
+    review(root, "k-s2", human="YES")
+    rc, ready, out = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 3 and not ready["ready"] and not (out / "tasks").exists()      # nothing exported
+    assert any("no DECISION recorded" in p for p in ready["problems"])
+    assert json.loads((out / "ready.json").read_text())["problems"] == ready["problems"]
+
+
+def test_prep_refuses_a_stale_ruling_and_accepts_a_later_one(root, cfg, tmp_path):
+    built(root, "k-s2")
+    review(root, "k-s2", human="YES", day="2026-10-21")
+    keep(root, "k-s2", date="2026-10-20")                       # before the review: stale
+    rc, ready, _ = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 3 and any("open human question" in p and "stale" in p for p in ready["problems"])
+    keep(root, "k-s2", date="2026-10-21")                       # on the day of the review: a ruling
+    rc, ready, _ = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 0 and ready["ready"], ready["problems"]
+
+
+def ruled(root, slug, line, date="2026-10-22"):
+    (root / "build" / slug / "HUMAN-DECISION.md").write_text(f"DECISION: KEEP\nDATE: {date}\n{line}\n")
+
+
+def test_prep_refuses_a_deciding_conflict_until_ruled(root, cfg, tmp_path):
+    fv = delivery.taskstate.fairness_verdict
+    built(root, "k-s2")
+    review(root, "k-s2", conflicts="CONFLICTS: 2; DECIDING: 1")
+    keep(root, "k-s2", date="2026-10-22")                       # a KEEP alone does not rule on the conflict
+    rc, ready, _ = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 3 and any("1 deciding test(s) conflict" in p and "CONFLICTS-RULED" in p for p in ready["problems"])
+    assert "without a current CONFLICTS-RULED" in fv.final("k-s2")[1]
+    ruled(root, "k-s2", "CONFLICTS-RULED: 2026-10-20 KEEP the reading is fair")          # before the review: stale
+    assert any("stale" in r for r in fv.delivery_blockers("k-s2"))
+    ruled(root, "k-s2", "CONFLICTS-RULED: 2026-10-22 DROP the test contradicts rule 2")
+    assert any("ruled DROP on 2026-10-22: the test contradicts rule 2" in r for r in fv.delivery_blockers("k-s2"))
+    ruled(root, "k-s2", "CONFLICTS-RULED: 2026-10-22 KEEP")                              # no reason: not a ruling
+    assert any("has no `CONFLICTS-RULED" in r for r in fv.delivery_blockers("k-s2"))
+    ruled(root, "k-s2", "CONFLICTS-RULED: 2026-10-22 DROP x\nCONFLICTS-RULED: 2026-10-23 keep - rule 2 covers it")
+    assert fv.conflicts_ruled("k-s2") == ("KEEP", "2026-10-23", "rule 2 covers it", False)   # the last line wins
+    rc, ready, _ = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 0 and ready["ready"], ready["problems"]
+    review(root, "k-s2", conflicts="CONFLICTS: 2; DECIDING: 0", day="2026-10-21")
+    keep(root, "k-s2", date="2026-10-22")
+    assert fv.delivery_blockers("k-s2") == []                   # non-deciding: repair, not a block
+
+
+def test_delivery_blockers_cover_missing_reviews_drops_and_controls(root):
+    fv = taskstate.fairness_verdict
+    built(root, "stk-k-1")
+    (root / "build" / "stk-k-1-control").mkdir(parents=True)
+    keep(root, "stk-k-1", date="2026-10-25")
+    assert fv.delivery_blockers("stk-k-1") == []                 # no review yet: the owner's KEEP decides
+    keep(root, "stk-k-1", date="2026-10-20")
+    review(root, "stk-k-1", human="YES")                          # 2026-10-21: the KEEP is stale
+    got = fv.delivery_blockers("stk-k-1-control")                # judged by the stacked task's files
+    assert got and all(r.startswith("stk-k-1: ") for r in got)
+    review(root, "stk-k-1", verdict="NOT_READY")
+    assert any("NOT_READY" in r for r in fv.delivery_blockers("stk-k-1"))
+    (root / "build" / "stk-k-1" / "HUMAN-DECISION.md").write_text("DECISION: DROP\nDATE: 2026-10-25\n")
+    assert any("DROP" in r for r in fv.delivery_blockers("stk-k-1"))
+    review(root, "stk-k-1")
+    keep(root, "stk-k-1", date="2026-10-25")
+    assert fv.delivery_blockers("stk-k-1") == []
+
+
+def test_delivery_needs_a_decision_even_for_a_clean_review(root):
+    fv = taskstate.fairness_verdict
+    built(root, "k-s2")
+    review(root, "k-s2", conflicts="CONFLICTS: 0; DECIDING: 0")
+    assert [r for r in fv.delivery_blockers("k-s2") if "no DECISION recorded" in r]
+    (root / "build" / "k-s2" / "HUMAN-DECISION.md").write_text("# Human decision\n\n## Client audit PO-3\n\n"
+                                                           "CLIENT-AUDIT: KEEP (confirmed)\nDATE: 2026-10-28\n")
+    assert [r for r in fv.delivery_blockers("k-s2") if "no DECISION recorded" in r]   # an audit line is no DECISION
+
+
+def test_delivery_refuses_a_client_audit_withdrawal(root):
+    fv = taskstate.fairness_verdict
+    built(root, "k-s2")
+    review(root, "k-s2")
+    hd = root / "build" / "k-s2" / "HUMAN-DECISION.md"
+    base = "DECISION: KEEP\nDATE: 2026-10-27\nDELIVERED: 2026-10-27 to x, commit abc, as tasks/k\n\n"
+    hd.write_text(base + "## Client audit PO-3 (2026-10-28)\n\nCLIENT-AUDIT: KEEP, CONFIDENCE: THIN\nDATE: 2026-10-28\n")
+    assert fv.delivery_blockers("k-s2") == []                    # a THIN keep is still a keep
+    assert taskstate.markers.client_audit(root / "build" / "k-s2") == ["KEEP, CONFIDENCE: THIN"]
+    hd.write_text(base + "## Client audit PO-3 (2026-10-28)\n\nCLIENT-AUDIT: KEEP (confirmed)\nDATE: 2026-10-28\n")
+    assert fv.delivery_blockers("k-s2") == []
+    hd.write_text(base + "## Client audit PO-3 (2026-10-28)\n\nCLIENT-AUDIT: WITHDRAW\nDATE: 2026-10-28\n")
+    assert fv.delivery_blockers("k-s2") == ["withdrawn by a client audit (CLIENT-AUDIT: WITHDRAW); only a KEEP "
+                                            "outcome is delivered"]
+    later = "\n## Client audit PO-3 follow-up (2026-10-29)\n\nCLIENT-AUDIT: KEEP (confirmed)\nDATE: 2026-10-29\n"
+    hd.write_text(hd.read_text() + later)                         # the newest outcome decides: a later KEEP clears
+    assert fv.delivery_blockers("k-s2") == []
+    hd.write_text(base + "CLIENT-AUDIT: KEEP (confirmed)\n\n## Later\n\nCLIENT-AUDIT: WITHDRAW\n")
+    assert fv.delivery_blockers("k-s2") and "WITHDRAW" in fv.delivery_blockers("k-s2")[0]
+    for value in ("REPAIR FIRST (PO-3 batch)", "WAITING (owner)"):         # any non-KEEP outcome refuses
+        hd.write_text(base + f"## Client audit PO-3 (2026-10-28)\n\nCLIENT-AUDIT: {value}\nDATE: 2026-10-28\n")
+        assert fv.delivery_blockers("k-s2") == [f"not kept by a client audit (CLIENT-AUDIT: {value}); only a KEEP "
+                                                "outcome is delivered"]
+
+
+def test_markers_check_flags_a_malformed_ruling(root):
+    built(root, "k-s2")
+    (root / "build" / "k-s2" / "HUMAN-DECISION.md").write_text("DECISION: KEEP\nDATE: 2026-10-27\n"
+                                                           "CONFLICTS-RULED: yes, fine\n")
+    codes = [c for _sev, c, _m in taskstate.markers.check("k-s2", fp_digest=lambda s: None)]
+    assert "conflicts-ruled-unparseable" in codes
+
+
+def test_conflicts_line_and_auto_keep(root):
+    fv = taskstate.fairness_verdict
+    built(root, "k-s2")
+    review(root, "k-s2")                                          # no CONFLICTS line: written before the check
+    assert fv.conflicts("k-s2") is None and fv.final("k-s2")[0] == "READY"
+    assert any("no CONFLICTS line" in r for r in fv.auto_keep_blockers("k-s2"))
+    review(root, "k-s2", conflicts="CONFLICTS: 0; DECIDING: 0")
+    assert fv.conflicts("k-s2") == (0, 0) and fv.auto_keep_blockers("k-s2") == []
+    review(root, "k-s2", conflicts="**CONFLICTS:** 3 (deciding: unknown)")
+    assert fv.conflicts("k-s2") == (3, 3)
+    v, why = fv.final("k-s2")                                     # a READY review cannot stand with it
+    assert v == "NOT_READY" and "deciding" in why
+    assert fv.auto_keep_blockers("k-s2")
+    review(root, "k-s2", conflicts="CONFLICTS: 1; DECIDING: 0")
+    v, why = fv.final("k-s2")
+    assert v == "READY" and "decided no run" in why and fv.auto_keep_blockers("k-s2")
+    review(root, "k-s2", human="YES", conflicts="CONFLICTS: 0; DECIDING: 0")
+    assert any("NEEDS_HUMAN_REVIEW" in r for r in fv.auto_keep_blockers("k-s2"))
+
+
+def test_a_gate_proven_conflict_blocks_until_a_later_test_repair(root, cfg, tmp_path):
+    fv = taskstate.fairness_verdict
+    built(root, "k-s2")
+    review(root, "k-s2", conflicts="CONFLICTS: 0; DECIDING: 0")
+    keep(root, "k-s2", date="2026-10-22")
+    b = root / "build" / "k-s2"
+    gr = b / "gate_report.json"
+    proven = {"stages": {"patches": {"ok": True, "conflict_proven": [
+        {"test": "functional/05::keeps DEL a comment", "patch": "other_reading_del.patch", "follows": "exactly as today"}]}}}
+    gr.write_text(json.dumps(proven))
+    os.utime(gr, (2_000_000_000, 2_000_000_000))
+    assert fv.conflicts_proven("k-s2") == ["functional/05::keeps DEL a comment"]
+    rc, ready, _ = refuse(root, cfg, tmp_path, "k-s2")
+    assert rc == 3 and any("proven to conflict" in p and "keeps DEL" in p for p in ready["problems"])
+    assert "CONFLICT-PROVEN" in fv.final("k-s2")[1] and fv.auto_keep_blockers("k-s2")
+    ruled(root, "k-s2", "CONFLICTS-RULED: 2026-10-22 KEEP the reading is fair")    # a ruling does not clear it
+    assert any("proven to conflict" in r for r in fv.delivery_blockers("k-s2"))
+    old = b / "repaired-tests-20261020"
+    old.mkdir()
+    os.utime(old, (1_900_000_000, 1_900_000_000))                # a repair BEFORE the gate report: still proven
+    assert fv.conflicts_proven("k-s2")
+    new = b / "repaired-tests-20261029"
+    new.mkdir()
+    os.utime(new, (2_000_000_100, 2_000_000_100))                # a later test repair: the re-gate decides now
+    assert fv.conflicts_proven("k-s2") == [] and fv.delivery_blockers("k-s2") == []
+    gr.write_text(json.dumps({"stages": {"patches": {"ok": True}}}))       # re-gated: PASS, nothing proven
+    assert fv.conflicts_proven("k-s2") == []
+
+
+def test_a_blocked_model_ends_the_task_and_is_never_trialed(root):
+    built(root, "b-s2", runs={"deepseek": [0.5] * 3, "mimo": [0.4]})
+    ledger(root, [("b-s2", "**failed 0/3** [0.5]", "**blocked** (provider safety filter)",
+                   "rejected (DeepSeek-only; MiMo blocked)")])
+    _ctx, st = states()
+    t = st["b-s2"]
+    assert t["models"]["mimo"]["ledger"] == "blocked"
+    assert t["stage"] == "not_breaker" and "mimo blocked" in t["next"]
+    assert delivery.plan(st)[0] == []
+    assert taskstate.redo_reason("trial_run", "b-s2", {"model": "mimo"}, t=t)
