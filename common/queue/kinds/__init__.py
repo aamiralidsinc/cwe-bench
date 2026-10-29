@@ -30,6 +30,9 @@ A declaration states what the queue needs to run the kind:
                  when count_foreign is set.
   priority, max_running, max_attempts, retry_exit_codes, ok_exit_codes, env, disk_floor
                  defaults; queue.toml overrides every one of them ([priority], [limits.max_running], ...).
+  exit_of        (task, t0) -> int or None: an exit code the job records instead of its script's when it is nonzero,
+                 e.g. the builder's own exit under a pipeline script that exits 0 (build, build_resume:
+                 build-exit.txt). The script's exit still decides the job's state.
 
 config.load() merges the declared defaults under the TOML file, so the settings file stays the one source of the
 values in force.
@@ -69,6 +72,7 @@ class Kind:
     ok_exit_codes: tuple = ()
     env: dict = field(default_factory=dict)
     disk_floor: Optional[str] = None
+    exit_of: Optional[Callable] = None
     doc: str = ""
     source: str = ""                                  # the file that declared it
 
@@ -188,6 +192,18 @@ def trial_dir(cfg, args):
     """The trial folder a job's args name ({"trial": "<job>/<trial>"}), as a path string ('' when none)."""
     from pathlib import Path as _P
     return str(_P(cfg["jobs_dir"]) / args["trial"]) if args.get("trial") else ""
+
+
+def builder_exit_file(task, t0, slack=2.0):
+    """The builder's exit code from build/<task>/build-exit.txt when this job wrote it (at or after t0), else None."""
+    import paths
+    f = paths.BUILD / task / "build-exit.txt"
+    try:
+        if f.stat().st_mtime < t0 - slack:
+            return None
+        return int(f.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 def check_from(name, **kw):

@@ -249,6 +249,17 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
   `build_resume` job (`common/queue/kinds/build_resume.py`): the builder continues in its own session through
   `resume_pipeline.sh`, then the post-build gate runs as usual. Such a build never gets a fresh `build` job, which
   would wipe `tasks/<slug>/`. Stacking builds have no resume script and are reported for a person.
+- **Timed-out or killed build** (owner rule 2026-10-28: debugged, then resumed in its own session, never restarted).
+  A genuine 5-hour timeout (exit 124 within the limit) gets a `build_resume` job only with `[build_resume]
+  auto_timeouts = true` (default false), at most `max_auto_resumes` times per task; otherwise the reconcile report
+  gives the enqueue command. An outside kill (exit 137/143) and a declined build (`STOP.md`) are never planned. A
+  job's message is its `args.msg`, else `build/<slug>/resume_msg.txt` written after the interruption, else the
+  default for the interruption; every message names the job's release as the project root. By hand:
+  `cweq enqueue build_resume <slug> --args '{"end": "<end_utc>", "msg": "..."}'`. A resume runs `postbuild.sh` (gate
+  and blind fix) like a fresh build.
+- **Exit codes of builds.** `build` and `build_resume` jobs record the builder's own exit when it is nonzero
+  (`build-exit.txt` written during the job; kind field `exit_of`) instead of the pipeline script's; the script's exit
+  still decides the state, and the job log has both.
 - Workers run the pipeline's own commands:
   - build: `run_stack_pipeline.sh` or `run_pipeline.sh`;
   - trial: `trial.py --no-verdict --first-run N --max-runs K`, with the agent time-limit multiplier from

@@ -28,9 +28,9 @@ flock -n 9 || { echo "$s: another gate already holds $B/.gate.lock; not starting
 # VM. Scale batch 1 put 56 tasks into their gates together (~15 Harbor runs each, ~650 runs, load ~1000 on 64 CPUs).
 # A slot is one of N lock files; the lock lives on fd 8 for this script's lifetime (its stage subshells inherit it),
 # so a killed gate never leaks its slot. gate.py also caps Harbor runs VM-wide (GATE_GLOBAL_SLOTS). 0 disables.
-# The limit is the env var if set, else GATE_TASK_SLOTS in ~/.tb-graders/cwe/slots/limits.env (re-read on every attempt,
-# so a change reaches gates that are already waiting), else 10.
-task_slots() { local v="${GATE_TASK_SLOTS:-}"; [ -n "$v" ] || v=$(sed -n 's/^GATE_TASK_SLOTS=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1); echo "${v:-10}"; }
+# The limit is GATE_TASK_SLOTS in ~/.tb-graders/cwe/slots/limits.env (re-read on every attempt, so a change reaches
+# gates that are already waiting), else the env var, else 10. The file wins since 2026-10-28 (as in gate.py gate_limit).
+task_slots() { local v; v=$(sed -n 's/^GATE_TASK_SLOTS=\([0-9]*\).*/\1/p' "$HOME/.tb-graders/cwe/slots/limits.env" 2>/dev/null | tail -1); [ -n "$v" ] || v="${GATE_TASK_SLOTS:-}"; echo "${v:-10}"; }
 TS=$(task_slots)
 if [ "$TS" -gt 0 ]; then
   SD="$HOME/.tb-graders/cwe/slots/task-gate"; mkdir -p "$SD"; got=""

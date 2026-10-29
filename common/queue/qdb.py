@@ -220,9 +220,11 @@ def refresh(conn, job_id, pid, lease_sec):
     return cur.rowcount == 1
 
 
-def finish(conn, job_id, pid, exit_code, result, retry_codes=(), ok_codes=(0,)):
+def finish(conn, job_id, pid, exit_code, result, retry_codes=(), ok_codes=(0,), recorded_exit=None):
     """Record a worker's end. Exit 0 -> done; a retryable exit -> queued again (or blocked at max_attempts);
-    anything else -> failed. Returns the new state, or None when the job was no longer ours."""
+    anything else -> failed. Returns the new state, or None when the job was no longer ours.
+    recorded_exit: the exit code to store instead of exit_code (a kind's exit_of: a builder's own exit under a
+    pipeline script that exits 0); exit_code still decides the state."""
     with tx(conn):
         row = conn.execute("SELECT * FROM jobs WHERE id=? AND owner_pid=? AND state='running'", (job_id, pid)).fetchone()
         if row is None:
@@ -235,7 +237,8 @@ def finish(conn, job_id, pid, exit_code, result, retry_codes=(), ok_codes=(0,)):
             state = "failed"
         conn.execute("UPDATE jobs SET state=?, exit_code=?, result=?, finished=?, owner_pid=NULL, lease_expires=NULL,"
                      " queued_at=CASE WHEN ?='queued' THEN ? ELSE queued_at END WHERE id=?",
-                     (state, exit_code, (result or "")[:300], utc(), state, utc(), job_id))
+                     (state, exit_code if recorded_exit is None else recorded_exit, (result or "")[:300], utc(), state,
+                      utc(), job_id))
         return state
 
 

@@ -340,6 +340,12 @@ It runs static → nop → oracle → patches and writes
 `build/SLUG/gate_report.json`. The task is built only when it prints PASSED.
 Use `--only static` while iterating to check the cheap things first.
 
+A builder agent runs only `--only static` and `--only nop` (2026-10-28): the post-build gate
+(`common/gate/postbuild.sh`) runs every stage after the builder reports, and gate.py refuses oracle,
+patches and the full gate from a builder (its environment carries `CWE_BUILD_RUN`). The builder
+proves the reference fix and the patch checks locally. Its nop runs use the builder lane
+(`GATE_BUILDER_RUN_SLOTS` in the limits file), not the shared gate slots.
+
 ## Report back
 State plainly: PASSED or not; the funnel facts (did the exploit reproduce, how
 many variants, how many security/functional tests, which services); every

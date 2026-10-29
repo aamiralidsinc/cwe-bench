@@ -26,10 +26,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOTS = ("/workspace/", "/app/")
+# Build output and caches, skipped BEFORE the file cap (2026-10-28: Symfony's var/cache under tests/ crowded the source
+# diff out of core-s2's and mollieplugin-s2's harvests, and a compiled lib/ out of deepseek-harness-s2's).
 SKIP = re.compile(r"/(node_modules|\.git|dist|build|\.turbo|target|__pycache__|\.pytest_cache|"
-                  r"\.cache|\.next|coverage|\.gradle|\.m2|vendor|\.prisma|generated|\.phpunit\.cache|bootstrap/cache)(/|$)"
-                  r"|\.(pyc|pyo|class|o|so|log|tsbuildinfo)$|/\.tbfixtures\.ts$")
+                  r"\.cache|\.next|coverage|\.gradle|\.m2|vendor|\.prisma|generated|\.phpunit\.cache|bootstrap/cache|"
+                  r"var/cache|var/log|var/sessions|storage/framework|storage/logs|tmp/cache|\.mypy_cache|\.ruff_cache|"
+                  r"\.tox|\.nox|\.nyc_output|\.parcel-cache|\.vite|\.svelte-kit|\.nuxt|\.angular|\.sass-cache|"
+                  r"\.terraform|\.dart_tool|\.eslintcache|\.stylelintcache)(/|$)"
+                  r"|\.(pyc|pyo|class|o|so|log|tsbuildinfo|map)$|\.phpunit\.result\.cache$|/\.tbfixtures\.ts$")
 MAX_FILES, MAX_BYTES, MAX_LOG = 500, 2_000_000, 2_000_000
+
+
+def prioritise(changes):
+    """docker diff entries -> the file entries, likeliest source edits first, so the file cap never drops them.
+    Directory entries ("C /app/src", "A /app/lib": a path that is the parent of another entry) are left out: they are
+    not files and no longer use up the cap. Order: changed or deleted files, then files added in an existing
+    directory, then files inside a directory that is itself new (build output the skip list does not know, such as a
+    compiled lib/). The order within each group is kept."""
+    parents = set()
+    for _k, p in changes:
+        parts = p.rstrip("/").split("/")
+        parents.update("/".join(parts[:i]) for i in range(2, len(parts)))
+    new_dirs = {p.rstrip("/") for k, p in changes if k == "A" and p.rstrip("/") in parents}
+
+    def rank(item):
+        kind, path = item
+        if kind in ("C", "D"):
+            return 0
+        parts = path.split("/")
+        return 2 if any("/".join(parts[:i]) in new_dirs for i in range(2, len(parts))) else 1
+    return sorted((c for c in changes if c[1].rstrip("/") not in parents), key=rank)
 
 
 def sh(*args, binary=False):
@@ -125,6 +151,7 @@ def harvest(trial: Path, stage: str, container: str = None, out: Path = None) ->
             continue
         changes.append((kind, path))
     # A changed directory shows up as "C /app/src": keep files only (decided below).
+    changes = prioritise(changes)
     patch, rows, unchanged = read_changes(container, image, changes)
     retried = False
     if changes and not rows and not unchanged and any(k == "A" for k, _ in changes):
@@ -144,7 +171,8 @@ def harvest(trial: Path, stage: str, container: str = None, out: Path = None) ->
             "harvested_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "files_changed": len(rows), "skipped_build_or_cache_paths": skipped,
             "rewritten_but_identical": unchanged, "diff_entries": len(changes), "retried": retried,
-            "truncated": len(changes) > MAX_FILES, "tmp_logs_saved": logs}
+            "truncated": len(changes) > MAX_FILES, "not_read": max(0, len(changes) - MAX_FILES),
+            "tmp_logs_saved": logs}
     (out / "HARVEST.json").write_text(json.dumps(info, indent=1))
     return info
 

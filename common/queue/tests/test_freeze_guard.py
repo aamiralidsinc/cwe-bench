@@ -147,7 +147,8 @@ def test_paused_build_is_interrupted_and_resumed_never_rebuilt(root, conn, cfg, 
     jobs = qdb.jobs(conn, "kind='build_resume'")
     assert [(r["task"], qdb.args_of(r)) for r in jobs] == [("cut-s2", {"end": "2026-10-27T14:18:42Z"})]
     assert out["stk-cut-1"]["want"] == [] and "a person" in out["stk-cut-1"]["notes"][0]
-    assert "timeout-s2" not in out
+    # a genuine timeout is reported with the enqueue command, never planned while [build_resume] auto_timeouts = false
+    assert out["timeout-s2"]["want"] == [] and "auto_timeouts = false" in out["timeout-s2"]["notes"][0]
 
 
 def test_running_resume_counts_as_a_build(root):

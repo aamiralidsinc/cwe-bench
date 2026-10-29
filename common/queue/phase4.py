@@ -9,7 +9,8 @@ They replace pipelines/router/auto_advance.sh (run on every heartbeat) and the s
                    Skipped, as in auto_advance: tasks the ledger marks "rejected (both solved)".
                    Skipped, new: tasks held for a repair (.hold-repair) or busy with a re-gate/regrade/repair script
                    (their grading is about to change), and runs of a model that already SOLVED the task in the
-                   ledger (an audit cannot change that model's verdict; e.g. oauth-s2 MiMo).
+                   ledger (an audit cannot change that model's verdict; e.g. oauth-s2 MiMo), and runs whose
+                   current grading is a solve (a regrade newer than awaiting_audit.tsv; solves are not audited).
                    A prepared folder that is still waiting for its auditor is not prepared again; one prepared for an
                    older grading (a regrade came after it) is replaced by a new one (auto_advance reused it).
      audit_ready   every pass rewrites pipelines/router/out/queue/audit_ready.txt with the prepared folders waiting
@@ -98,6 +99,20 @@ def grading_name(trial):
     return regs[-1].name if regs else "original"
 
 
+def grading_reward(trial, grading):
+    """The reward of one grading of a trial (audit_results.grading_reward): 'original' from result.json, else the
+    regrade folder's REGRADE.json; None when unknown."""
+    if grading == "original":
+        res = _json(trial / "result.json") or {}
+        r = ((res.get("verifier_result") or {}).get("rewards") or {}).get("reward")
+    else:
+        r = (_json(trial / grading / "REGRADE.json") or {}).get("reward")
+    try:
+        return float(r) if r is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def postmortem_state(trial, grading):
     """('ready', folder) waiting for its auditor on the current grading; ('recording', folder) verdict written, not
     recorded; ('none', None) nothing usable (no folder, a recorded one, or one prepared for an older grading)."""
@@ -157,6 +172,12 @@ def audit_plan(cfg, ctx, proc_list):
             notes.append(f"{trial}: trial folder missing")
             continue
         g = grading_name(t)
+        if grading_reward(t, g) == 1.0:
+            # Solves are not audited (owner rule 2026-10-25). awaiting_audit.tsv lists failing runs, but it is written
+            # by audit_results.py and can predate a regrade that turned a run into a solve (2026-10-28: ten
+            # audit_prep jobs for regraded solves, e.g. nifi-s2, anubis-s2).
+            notes.append(f"{trial}: not prepared, a solve on its current grading ({g}): solves are not audited")
+            continue
         state, pm = postmortem_state(t, g)
         if state == "ready":
             ready.append(pm)

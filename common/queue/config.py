@@ -25,6 +25,7 @@ DEFAULTS = {
                  "trials_wait_builds": 20},
     "phase3": {"enabled": True, "batches": [], "max_launches": 3},
     "phase4": {"enabled": True, "audits": True, "fairness": True, "cleanup": True, "step3": True},
+    "build_resume": {"auto_timeouts": False, "max_auto_resumes": 1},
     "reconcile": {"tick_sec": 120, "listing_prefixes": ["stk-"], "rehold_after_regate": True,
                   "unknown_tests_version": "regrade"},
     # Test repairs (repairstep.py, repairjob.py, kinds/repair.py). auto = false: planned repairs are shown, not queued.
