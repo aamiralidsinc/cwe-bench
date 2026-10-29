@@ -420,8 +420,10 @@ def cmd_explain(conn, cfg, a):
         print(f"  stage        {st['stage']}: {st['next']}")
         if any(untrusted.ledger_untrusted(c) for c in (ctx["ledger"].get(a.task) or {}).values()):
             for m, entries in sorted(untrusted.classify(a.task, ctx).items()):
+                why = untrusted.markers.blocked(paths.BUILD / a.task, m)
                 for e in entries:
-                    print(f"  untrusted    {m} {e['job']}: {e['action']} ({e['why']})")
+                    print(f"  untrusted    {m} {e['job']}: " + (f"none (blocked: {why}; never re-run)" if why else
+                                                               f"{e['action']} ({e['why']})"))
     except Exception as e:
         print(f"  stage        unreadable: {type(e).__name__}: {e}")
     for n in t["notes"]:
