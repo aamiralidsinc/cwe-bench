@@ -13,8 +13,10 @@ The job runs `delivery.py prep <slug>`:
      open NEEDS_HUMAN_REVIEW: YES without a KEEP dated on or after the review, and a deciding conflict (CONFLICTS
      line) without a current `CONFLICTS-RULED: <date> KEEP <reason>` line. A refused task is not exported:
      ready.json records the reasons and the job exits 3, like any other unready package.
-  0b. export_delivery.py first runs the file-time leak check (common/gate/env_leak_check.py) on the task's agent image
-     and refuses a task that is not clean (exit 4, nothing exported; owner decision 2026-10-28).
+  0b. export_delivery.py first runs the file-time leak check (common/gate/env_leak_check.py) on the task's agent image.
+     It is a WARNING, never a refusal (owner standing rule 2026-10-28: "the leak check stays a WARNING permanently"):
+     the result goes to ready.json (leak_check, and a line in warnings when not clean) and does not block `ready`.
+     (Until 2026-10-29 a leak made the export exit 4 and the task was refused.)
   1. common/util/export_delivery.py exports the task package and its counted rollouts into
      <out_dir>/<UTC>-<slug>/ ([delivery] out_dir, default ~/.tb-graders/cwe/deliveries). The export redacts every model
      key value and refuses to run without them.
@@ -223,13 +225,17 @@ def prep(slug, cfg, name=None, out_dir=None, export=None):
     hits = pattern_scan(out)
     ready["pattern_hits"] = [h for h, in_tests in hits if not in_tests]
     ready["pattern_hits_in_tests"] = [h for h, in_tests in hits if in_tests]
-    problems = []
-    if r.returncode == 4:
-        # export_delivery.py refuses a task whose agent image leaks file times, or that could not be checked
-        # (owner decision 2026-10-28: a hard refusal at delivery)
-        ready["leak_refusal"] = [l.strip() for l in (r.stdout + r.stderr).splitlines() if "leak check" in l]
-        problems.append("refused: file-time leak check not clean (" + "; ".join(ready["leak_refusal"])[:300] + ")")
-    elif r.returncode != 0:
+    problems, warnings = [], []
+    # The file-time leak check is a WARNING (owner standing rule 2026-10-28): recorded, never a refusal.
+    lc = _jload(out / "leak_check.json")
+    if lc is None:
+        lc = {slug: {"status": "unknown", "summary": "no leak_check.json from the export",
+                     "lines": [l.strip() for l in (r.stdout + r.stderr).splitlines() if "leak check" in l]}}
+    ready["leak_check"] = lc
+    for s, v in sorted(lc.items()):
+        if (v or {}).get("status") != "clean":
+            warnings.append(f"file-time leak check {(v or {}).get('status')}: {s}: {str((v or {}).get('summary'))[:300]}")
+    if r.returncode != 0:
         problems.append(f"export exit {r.returncode}")
     if not ready["secret_scan"] or ready["secret_scan"]["key_values"] == 0:
         problems.append("secret scan did not run")
@@ -238,10 +244,18 @@ def prep(slug, cfg, name=None, out_dir=None, export=None):
     if not toml.exists():
         problems.append("no task package in the export")
     ready["problems"] = problems
+    ready["warnings"] = warnings
     ready["ready"] = not problems
     (out / "ready.json").write_text(json.dumps(ready, indent=2) + "\n")
-    print(json.dumps({k: ready[k] for k in ("slug", "name", "out", "ready", "problems", "rollouts")}))
+    print(json.dumps({k: ready[k] for k in ("slug", "name", "out", "ready", "problems", "warnings", "rollouts")}))
     return (0 if ready["ready"] else 3), ready
+
+
+def _jload(p):
+    try:
+        return json.loads(Path(p).read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def prepared():

@@ -1,5 +1,6 @@
 """File-time leak rollout (2026-10-28): transformer, static rule, leak judge, harness reset script, ledger notes,
 delivery refusal, gate warnings. Run: python3 -m pytest common/gate/tests/test_tsleak.py"""
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -205,23 +206,29 @@ def test_ledger_notes(tmp_path, monkeypatch):
                   "note": "used | times"}]
 
 
-def test_export_refuses_a_leaking_task(tmp_path, monkeypatch):
+def test_export_warns_on_a_leaking_task(tmp_path, monkeypatch):
+    """The leak check is a WARNING at delivery too (owner standing rule 2026-10-28: "the leak check stays a WARNING
+    permanently"; until 2026-10-29 the export exited 4): the package is exported and leak_check.json says why."""
     import paths
     import export_delivery as ed
     monkeypatch.setattr(paths, "TASKS", tmp_path / "tasks")
+    monkeypatch.setattr(paths, "AUDIT_DIR", tmp_path / "audit")
+    (tmp_path / "audit").mkdir()
+    (tmp_path / "audit" / "trials.tsv").write_text("task\tmodel\tjob\ttrial\treward\tgrading\n")
     (tmp_path / "tasks" / "k-s2" / "environment").mkdir(parents=True)
     (tmp_path / "tasks" / "k-s2" / "task.toml").write_text("")
     monkeypatch.setattr(ed.cwe_reuse_tag, "ensure_image_sync", lambda ctx, tag: None)
     monkeypatch.setattr(ed.fairness_verdict, "delivery_blockers", lambda slug: [])   # the leak check alone
+    monkeypatch.setattr(ed, "secret_values", lambda: ["v" * 24])
     monkeypatch.setattr(ed.env_leak_check, "check", lambda task, tag: {"status": "leak", "summary": "LEAK (x)",
                                                                         "leaks": ["T1 mtime"]})
     monkeypatch.setattr(sys, "argv", ["export_delivery.py", str(tmp_path / "out"), "k-s2"])
-    with pytest.raises(SystemExit) as e:
-        ed.main()
-    assert e.value.code == 4 and not (tmp_path / "out").exists()
+    ed.main()
+    assert (tmp_path / "out" / "tasks" / "k-s2" / "task.toml").is_file()
+    assert json.loads((tmp_path / "out" / "leak_check.json").read_text())["k-s2"]["leaks"] == ["T1 mtime"]
     monkeypatch.setattr(ed.env_leak_check, "check", lambda task, tag: {"status": "error", "summary": "no python3",
                                                                         "leaks": []})
-    assert ed.leak_refusals(["k-s2"])                          # could not check: refused too
+    assert ed.leak_results(["k-s2"])["k-s2"]["status"] == "error"      # could not check: recorded, not refused
 
 
 def test_gate_leak_check_is_warning_only(monkeypatch, capsys):

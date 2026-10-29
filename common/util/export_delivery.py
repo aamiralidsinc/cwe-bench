@@ -17,10 +17,11 @@ listed in <out>/EXPORT-REPORT.md. Each trajectory is checked with Harbor's own v
 Every key value in the model env files is redacted from the export ([REDACTED]); the report lists the files.
 Read-only on the sources; writes only under <out_dir>.
 
-File-time leak refusal (owner decision 5 of 2026-10-28, reports/reward-hacking.md): before anything is written, every
-task's agent image (its reuse tag; built if missing) goes through common/gate/env_leak_check.py. A task that LEAKS,
-or that could not be checked, is refused: the export stops with exit 4 and writes nothing. There is no override;
-fix the task first (common/builder/tree_time_reset.py, then a re-gate).
+File-time leak check, a WARNING (owner standing rule 2026-10-28: "the leak check stays a WARNING permanently";
+reports/reward-hacking.md): before anything is written, every task's agent image (its reuse tag; built if missing)
+goes through common/gate/env_leak_check.py. The result of each task is written to <out>/leak_check.json and to the
+report; a task that LEAKS, or that could not be checked, is exported all the same with a WARNING line. The fix is
+common/builder/tree_time_reset.py, then a re-gate. (Until 2026-10-29 a leak refused the export with exit 4.)
 
 No delivery with an open question (client audit PO-3, 2026-10-28): before anything is written, every slug must pass
 common/fairness/fairness_verdict.py delivery_blockers(): HUMAN-DECISION.md must record DECISION: KEEP and no
@@ -175,9 +176,9 @@ def validate(traj):
     return "INVALID: " + ((r.stderr.strip().splitlines() or ["?"])[-1])[:200]
 
 
-def leak_refusals(slugs):
-    """[(slug, reason)] for every task whose agent image is not clean (leak, or could not be checked)."""
-    out = []
+def leak_results(slugs):
+    """{slug: {status, summary, leaks, line}} of the file-time leak check of each task's agent image (a warning)."""
+    out = {}
     for slug in slugs:
         task = paths.TASKS / slug
         try:
@@ -188,8 +189,7 @@ def leak_refusals(slugs):
             r = {"status": "error", "summary": f"could not check: {type(e).__name__}: {e}", "leaks": []}
         line = f"{slug}: leak check {r['status']}: {r['summary']}" + "".join(f"\n    {l}" for l in r.get("leaks", []))
         print(line, flush=True)
-        if r["status"] != "clean":
-            out.append((slug, line))
+        out[slug] = {"status": r["status"], "summary": r["summary"], "leaks": list(r.get("leaks", [])), "line": line}
     return out
 
 
@@ -207,13 +207,13 @@ def main():
     for slug in a.slugs:
         if not (paths.TASKS / slug / "task.toml").is_file():
             sys.exit(f"no task package at {paths.TASKS / slug}")
-    refused = leak_refusals(a.slugs)
-    if refused:
-        print("REFUSED: the agent image shows where the builder changed files (file-time leak), or could not be "
-              "checked; nothing exported. Fix: common/builder/tree_time_reset.py, then re-gate.", file=sys.stderr)
-        for _slug, line in refused:
-            print("  " + line, file=sys.stderr)
-        sys.exit(4)
+    leaks = leak_results(a.slugs)                 # a warning, never a refusal (owner standing rule 2026-10-28)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "leak_check.json").write_text(json.dumps(leaks, indent=1) + "\n")
+    for slug, r in leaks.items():
+        if r["status"] != "clean":
+            print(f"WARNING: {slug}: file-time leak check {r['status']}: {r['summary']} (exported anyway; fix: "
+                  "common/builder/tree_time_reset.py, then re-gate)", file=sys.stderr)
     trials = list(csv.DictReader(open(paths.AUDIT_DIR / "trials.tsv"), delimiter="\t"))
     report = ["# Export report", "", "| task | model | rollout | job/trial | reward | trajectory |", "|---|---|---|---|---|---|"]
     skipped, stripped = [], []
@@ -249,6 +249,8 @@ def main():
     if skipped:
         report += ["", "## Skipped (no trajectory)", ""] + [f"- {s}" for s in skipped]
     report += ["", f"## Internal-path comments: {len(stripped)} changed", ""] + [f"- {s}" for s in stripped]
+    report += ["", "## File-time leak check (a warning, never a refusal)", ""] + [
+        f"- {'WARNING ' if r['status'] != 'clean' else ''}{r['line']}" for r in leaks.values()]
     vals = secret_values()
     if not vals:
         sys.exit("secret scan impossible: no key values found in " + ", ".join(map(str, KEY_FILES)))

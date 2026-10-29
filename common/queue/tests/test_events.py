@@ -214,20 +214,38 @@ def test_worker_command_for_delivery_prep(conn, cfg):
     assert argv[-2:] == ["prep", "k-s2"] and argv[-3].endswith("delivery.py")
 
 
-def test_prep_refuses_a_file_time_leak(root, cfg, tmp_path):
-    """export_delivery.py exits 4 when the leak check is not clean (owner decision 2026-10-28): never ready."""
+def test_prep_records_a_file_time_leak_as_a_warning(root, cfg, tmp_path):
+    """The leak check is a WARNING, never a refusal (owner standing rule 2026-10-28: "the leak check stays a WARNING
+    permanently"): the export goes on, ready.json records the result, and the package is ready."""
     built(root, "k-s2")
     fairness(root, "k-s2")
     keep(root, "k-s2", date="2099-01-01")                       # past the fairness check, so the export runs
-    script = tmp_path / "refusing_export.py"
-    script.write_text('import sys\nprint("k-s2: leak check leak: LEAK (injection files: 4, tracked 10)")\n'
-                      'print("REFUSED: file-time leak", file=sys.stderr)\nsys.exit(4)\n')
+    script = fake_export(tmp_path)
+    with open(script, "a") as f:
+        f.write('import json\n(out / "leak_check.json").write_text(json.dumps({slug: {"status": "leak", '
+                '"summary": "LEAK (injection files: 4, tracked 10)", "leaks": []}}))\n')
     out = tmp_path / "pkg"
     rc, ready = delivery.prep("k-s2", cfg, name="k-task", out_dir=out,
                               export=[sys.executable, str(script), str(out), "k-s2", "--name", "k-s2=k-task"])
-    assert rc == 3 and not ready["ready"]
-    assert any(p.startswith("refused: file-time leak") for p in ready["problems"])
-    assert ready["leak_refusal"] == ["k-s2: leak check leak: LEAK (injection files: 4, tracked 10)"]
+    assert rc == 0 and ready["ready"] and ready["problems"] == []
+    assert ready["leak_check"]["k-s2"]["status"] == "leak"
+    assert ready["warnings"] == ["file-time leak check leak: k-s2: LEAK (injection files: 4, tracked 10)"]
+    saved = json.loads((out / "ready.json").read_text())
+    assert saved["ready"] and saved["leak_check"]["k-s2"]["status"] == "leak"
+
+
+def test_prep_clean_leak_check_has_no_warning(root, cfg, tmp_path):
+    built(root, "k-s2")
+    fairness(root, "k-s2")
+    keep(root, "k-s2", date="2099-01-01")
+    script = fake_export(tmp_path)
+    with open(script, "a") as f:
+        f.write('import json\n(out / "leak_check.json").write_text(json.dumps({slug: {"status": "clean", '
+                '"summary": "clean", "leaks": []}}))\n')
+    out = tmp_path / "pkg"
+    rc, ready = delivery.prep("k-s2", cfg, name="k-task", out_dir=out,
+                              export=[sys.executable, str(script), str(out), "k-s2", "--name", "k-s2=k-task"])
+    assert rc == 0 and ready["ready"] and ready["warnings"] == []
 
 
 # ---------- no delivery with an open question (client audit PO-3, 2026-10-28)

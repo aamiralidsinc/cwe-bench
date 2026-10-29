@@ -282,4 +282,6 @@ Log: `ROLLOUT-20261028.md` in the data folder. What is live:
   - the git index is refreshed.
   The refresh is needed: the probe found a fourth channel, T4, the old times kept in `.git/index` by the A6 baseline.
   Not hidden: inode order in the 11 layer-ordered images.
-- **Delivery refusal:** `export_delivery.py` exits 4 unless the leak check is clean.
+- **Delivery check (a warning):** `export_delivery.py` runs the leak check and records it (`leak_check.json`, the
+  report, `ready.json` `leak_check` / `warnings`); it never refuses (owner standing rule 2026-10-28: "the leak check
+  stays a WARNING permanently"; until 2026-10-29 it exited 4).
