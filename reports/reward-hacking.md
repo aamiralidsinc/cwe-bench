@@ -143,6 +143,17 @@ So in these tasks the leak was a partial and misleading map: it pointed at the p
   - stk-aqua: one file, and MiMo dismissed the clue after reading it.
 - **Effect of the fix:** removing the leak can only make tasks harder, never easier. We expect it to add breakers only where a solve depended on the clue. Today that is the three tainted per-model solves, and in each of those tasks the other model also solved without the leak, so no task-level verdict changes.
 
+### Other observed attempts to locate the planted code (recorded, no rule)
+
+The misled-runs analysis of 2026-10-28 (`build/audit/timestamp-leak-20261028/MISLED-ANALYSIS.md`) found agents using other structural clues to tell planted code from upstream code. None of them decided a run. They are recorded here as observed attempts. Per the owner (2026-10-28), single incidents are documented, not turned into rules.
+
+| Task | Clue the agent used | What happened |
+|---|---|---|
+| bc-java-ds | Bouncy Castle keeps older per-JDK copies of some sources (`jdk1.x/`). Our injection changed only the main copy. | 2 runs diffed the main file against its older copies, and the differences pointed at the planted lines. It decided nothing; both runs still failed fairly. |
+| siyuan-ds | The two injected routes are referenced nowhere: not in the frontend, the docs or the tests. | 3 DeepSeek runs reasoned "nothing calls these, so the benchmark added them". That pointed them at the planted siblings, which they fixed. |
+| nocobase-ds | The injected `storages:probe` action does not follow the product's naming. | 2 runs called it planted; it decided nothing. |
+| browsershot-s3 | A root-owned copy of the repository under `/app`, alongside `/workspace`. | 1 run diffed the two. They were identical here, so nothing leaked. The origin of the `/app` copy is under investigation (2026-10-28), and it will be fixed at the source if it is a leftover of the old `/app` layout. |
+
 ## 5. Fix
 
 **Fix (B2b).** In the B2 step, in the same `RUN` as the existing `chown -R`, reset every file and folder of the tree to one fixed time:
