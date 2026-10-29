@@ -243,6 +243,21 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
   - After one failed run, each remaining run becomes its own one-run job, and they start together.
   - Job arguments carry the task version (the SOUND gate's fingerprint), so a new version starts fresh.
   - After `max_launches` launch groups end without a verdict, the model is reported for a person.
+  - **Untrusted runs (owner-approved fix, 2026-10-29; `common/queue/untrusted.py`).** The ledger leaves out a graded
+    run whose post-run audit is untrusted and still wants 3 valid graded runs per model; the runs log counted it as a
+    graded fail, so neither side planned the missing run and tasks sat in `awaiting_audit` or `trials_stuck` with
+    nothing queued. Each untrusted run of a model whose ledger cell says `audit: untrusted` now gets one action:
+    - `rerun`: the cause is not a test fault the repair step owns (harness or infrastructure, provider stop, rate
+      limit, partial workspace; a test fault no repair covers and the repair step does not take on; a repaired one
+      whose regrade was audited again and is still untrusted). It does not count as graded (`trial_state.state(...,
+      drop=)`), so the stage is `waiting_trials` and the plan above re-runs it. A `stuck` model gets exactly one fresh
+      run per untrusted run (args `rerun_of`, never twice for the same run).
+    - `reaudit`: a test fault a newer repair folder covers, regraded on the current tests, with the audit carried over
+      from the older grading: an `audit_prep` of the regrade (phase 4), never a re-run.
+    - `wait_regrade` (covered, regrade not in yet) and `wait_repair` (`.hold-repair`, a repair job queued or running,
+      or rule T1 plans one): nothing until the repair, regrade or re-audit is done.
+    Holds (`.hold-repair`, `hold_<model>`; a blocked model never gets a run) and `max_launches` apply as to every trial.
+    `cweq explain <slug>` lists each untrusted run with its action.
 - **Stale gate.** A sound task whose files changed since its gate gets a `regate`.
 - **Paused build.** A builder that ended with exit 124 long after its time limit (more than 25 % over) was paused and
   cut by its overdue timer when it resumed; it is not a timeout. Its stage is `build_interrupted` and it gets one
@@ -269,7 +284,7 @@ These rules apply to tasks listed in a batch file (`pipelines/router/out/batches
 
 | Kind | When | Command |
 |---|---|---|
-| `audit_prep` | A failing run waits for its audit. Not for a task held or busy with a repair (its grading is about to change), and not when the run's model already solved the task. A folder prepared before a regrade is replaced | `postmortem.py prepare <trial>` |
+| `audit_prep` | A failing run waits for its audit. Not for a task held or busy with a repair (its grading is about to change), and not when the run's model already solved the task. A folder prepared before a regrade is replaced. Also a repaired untrusted run whose regrade kept the reward (its old audit is carried over): it is audited again on the regrade (`untrusted.py` `reaudit`) | `postmortem.py prepare <trial>` |
 | `audit_record` | An auditor's `verdict.json` is not recorded yet, or a trial result is newer than the ledger | `postmortem.py record-ready`, then `audit_results.py` |
 | `fairness` | The ledger marks a batch task a BREAKER candidate, and no review is current or running. Never while held or busy. A review is current only when it is newer than the newest trial and was made on the current tests (see below) | the stacking or sibling fairness review |
 | `cleanup` | Every UTC hour | `common/util/hourly_cleanup.sh once` |
@@ -318,6 +333,10 @@ The job runs `delivery.py prep <slug>`:
    `python3 common/fairness/fairness_verdict.py --delivery <slug>`.
 1. `common/util/export_delivery.py` writes the task package and its counted rollouts into
    `~/.tb-graders/cwe/deliveries/<UTC>-<slug>/` (`[delivery] out_dir`). The export redacts every model key value.
+   It first runs the file-time leak check on the task's agent image. The check is a **warning, never a refusal**
+   (owner standing rule 2026-10-28: "the leak check stays a WARNING permanently"): the result is written to
+   `leak_check.json` and the report, and `ready.json` records it (`leak_check`, plus a line in `warnings` when not
+   clean) without blocking `ready`.
 2. `task.toml` gets `name = "cwe-bench/<name>"`; nothing else in the package changes.
 3. A pattern scan of the whole export must find no key-like strings outside upstream test fixtures.
 4. `ready.json` records the result:
