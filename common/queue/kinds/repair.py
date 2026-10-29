@@ -10,7 +10,6 @@ leaves the hold and queues the re-gate; the reconciler's rules regrade every gra
 Exit codes: repairjob.py.
 """
 import sys
-from pathlib import Path
 
 from kinds import Kind, register
 

@@ -19,7 +19,6 @@ Handling (`cweq events ...`): `next` gives the oldest open event, urgent kinds f
 --action TEXT` closes it with the action taken. Events are worked strictly in that order.
 """
 import json
-import time
 from pathlib import Path
 
 import qdb

@@ -665,7 +665,7 @@ def write_inputs(slug, inputs, F, manual, key, cfg):
           f"- {b / 'trial_summary.md'} (per-test results of every run; which tests decided a run)",
           f"- {b / 'notes.md'} (the FULL build notes: you need the history)",
           f"- {b / 'FAIRNESS.md'} and FAIRNESS.md.prev-* (earlier reviews), {b / 'HUMAN-DECISION.md'}",
-          f"- earlier repairs: " + (", ".join(n for n, _t in repairstep.repair_folders(b)) or "none") + " (their README.md)",
+          "- earlier repairs: " + (", ".join(n for n, _t in repairstep.repair_folders(b)) or "none") + " (their README.md)",
           f"- {b / 'history'}/: " + (", ".join(hist) or "empty"), ""]
     if prior:
         md += ["## A prior repair analysis exists", "",

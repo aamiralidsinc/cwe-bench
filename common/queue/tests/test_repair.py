@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import time
-from pathlib import Path
 
 import checks
 import dispatch
@@ -16,7 +15,7 @@ import qdb
 import reconcile
 import repairjob
 import repairstep
-from conftest import gate_log, make_task, make_trial, set_mtime, write_config, write_fingerprint
+from conftest import gate_log, make_task, make_trial, set_mtime, write_fingerprint
 
 DAY = 86400
 

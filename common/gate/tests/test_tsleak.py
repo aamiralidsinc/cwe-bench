@@ -1,6 +1,5 @@
 """File-time leak rollout (2026-10-28): transformer, static rule, leak judge, harness reset script, ledger notes,
 delivery refusal, gate warnings. Run: python3 -m pytest common/gate/tests/test_tsleak.py"""
-import json
 import subprocess
 import sys
 from pathlib import Path

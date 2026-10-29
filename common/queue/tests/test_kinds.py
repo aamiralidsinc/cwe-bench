@@ -2,7 +2,6 @@
 import sqlite3
 import textwrap
 
-import config
 import dispatch
 import kinds
 import qdb
