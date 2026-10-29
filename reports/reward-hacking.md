@@ -1,6 +1,6 @@
 # Reward-hacking observation: injected files found through file times (2026-10-28)
 
-Status: **observed and measured. Fix designed and tested on one task. Not yet rolled out.**
+Status: **observed and measured. Fix rolled out 2026-10-29 00:21 UTC (release 603b1e9cfb03), per the owner decisions in section 7.**
 This is an internal record. It goes to the client only after the fix is in.
 Data folder (VM): `~/cwe-bench/build/audit/timestamp-leak-20261028/`
 
@@ -258,6 +258,27 @@ Proposed order:
 - [x] Transcripts scanned (`exploitation.tsv`, `exploitation_attempted.tsv`)
 - [x] Fix tested on one task (oracle 1.0, nop 0.0, leak gone)
 - [x] Detection check written and tested (`tools/env_leak_check.py`, `tools/static_classify.py`)
-- [ ] Template and gate release
+- [x] Template and gate release (commits 59e755d9, 603b1e9c; release 603b1e9cfb03, 2026-10-29 00:21 UTC)
 - [ ] Client note for the 31 delivered tasks (explanation only; no repo change, per owner)
-- [ ] Ledger notes for the 3 tainted per-model solves
+- [x] Ledger notes for the 3 tainted per-model solves (`build/audit/ledger_notes.tsv`, "## Notes" in ledger.md)
+
+### Rollout (2026-10-29)
+
+Log: `ROLLOUT-20261028.md` in the data folder. What is live:
+
+- **Template B2b** and the BUILDER.md rule "no writes to the source tree after B2".
+- **Transformer** `common/builder/tree_time_reset.py`: appends the reset to the B2 step, or adds its own step before the
+  git baseline. `postbuild.sh` and `resume_pipeline.sh` run it before the first gate, and never once a gate fingerprint
+  exists. Builds that were already running at activation keep their old release (`pwd -P` pinning), so their postbuild
+  does not run it. Example: `shescape-s2` became sound at 00:23 with a leaking image. Those tasks are covered by the
+  harness reset.
+- **Gate warnings, permanent:**
+  - static rule `common/gate/static_leak.py`, reported as `leak_warnings` in the static stage;
+  - dynamic check `common/gate/env_leak_check.py` after nop, reported as `leak_check` in the nop stage.
+- **Harness reset** `common/harbor_ext/cwe_tree_reset.py`, which runs in the agent container only, before the agent
+  starts:
+  - every tracked file and every folder gets one time;
+  - the git index is refreshed.
+  The refresh is needed: the probe found a fourth channel, T4, the old times kept in `.git/index` by the A6 baseline.
+  Not hidden: inode order in the 11 layer-ordered images.
+- **Delivery refusal:** `export_delivery.py` exits 4 unless the leak check is clean.
