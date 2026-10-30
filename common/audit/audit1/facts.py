@@ -465,7 +465,8 @@ def infra_signals(res, run, agent, trial, gdir, out_dir, failing):
         add("no-result-event", "the agent log has no result event: the session never finished (killed or crashed)",
             "trial:agent/claude-code.txt")
     if r:
-        if r.get("stop_reason") in ("content_filter", "refusal"):
+        if r.get("stop_reason") in ("content_filter", "refusal", "repetition_truncation"):
+            # owner rule: provider content-filter and repetition-truncation stops are blocked runs, not model fails
             add("provider-stop", f"provider stop_reason={r['stop_reason']}: {r.get('text')}", r["where"])
         elif r.get("stop_reason") not in (None, "end_turn", "tool_use", "stop_sequence"):
             add("unusual-stop", f"stop_reason={r.get('stop_reason')} (e.g. max_tokens / repetition truncation)",

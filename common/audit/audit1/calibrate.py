@@ -42,7 +42,7 @@ AUDIT2_OUTPUT = 2500       # verdict.json per run, tokens
 
 def jload(p):
     try:
-        return json.loads(Path(p).read_text())
+        return json.loads(Path(p).read_text(), strict=False)
     except (OSError, ValueError):
         return None
 

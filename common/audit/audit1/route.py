@@ -25,7 +25,7 @@ SOFT_KINDS = {"verifier-setup-flag"}      # a flag only: real infra only when th
 
 def jload(p):
     try:
-        return json.loads(Path(p).read_text())
+        return json.loads(Path(p).read_text(), strict=False)
     except (OSError, ValueError):
         return None
 

@@ -123,7 +123,7 @@ def check(root, window=3):
     if not d.is_file():
         return None
     try:
-        dossier = json.loads(d.read_text())
+        dossier = json.loads(d.read_text(), strict=False)   # raw tabs/newlines copied from code inside strings
     except ValueError as e:
         return {"pass": False, "quotes": 0, "failed": 0, "error": f"DOSSIER.json is not JSON: {e}", "results": []}
     results = []

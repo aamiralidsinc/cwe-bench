@@ -109,3 +109,15 @@ confidence, and re-measure.
 Each night check runs in the main Opus session. Its health, resource, event and audit-list steps are
 mechanical. A `nightcheck.py` that prints a 15-line summary, with exceptions only, would let the main
 session act on exceptions instead of collecting numbers.
+
+## Built (branch audit-two-stage, 2026-10-30): audit 1
+
+All in `common/audit/audit1/`; nothing is wired into the queue.
+
+| File | What it does |
+|---|---|
+| `facts.py <postmortem>` | No LLM. Writes `FACTS.json` + `facts-input/` (verifier JUnit XML and logs, trial.log error lines) into the folder. Failing tests with category, crash/assertion/setup-error, message, test source file:line, frames mapped to `evidence/tests` (helper frames flagged); reward arithmetic (functional zeroing, sole failure); infra signals (timeout, provider stop / content filter, 429 retries, API cut, missing result event, tool calls inside the grading window, artifact-transfer errors, verifier setup flags, one identical crash everywhere); evidence gaps (empty / missing / truncated patch); contamination candidates (hidden-test paths, WebFetch/WebSearch, code-host fetches, other external URLs, mtime and history probes, netguard lines), each with file:line. Reuses `review_flags.py` and `internet_use.py`. |
+| `AUDIT1-PROMPT.md`, `run_audit1.sh` | The DeepSeek dossier agent, launched like the fairness review: `common/launch/drive.sh deepseek bash .../run_audit1.sh` with the run folder as working directory; tools Read, Grep, Glob, Write; `--restricted` keeps it inside the folder, so it cannot open `verdict.json`, `POSTMORTEM.*`, other runs or reviews. The prompt goes in on stdin, so no task name is on any command line. Writes `DOSSIER.json`, `DOSSIER.md`, `AUDIT1.json` (status, attempts, tokens, quote check). |
+| `quote_check.py` | No LLM. Every `{file, line, quote}` in the dossier must occur verbatim (whitespace-normalised) in the cited file, starting within 3 lines of the cited line. Choices: quotes may span lines; diff markers may be left out in a patch; the digest's ` \| ` newline stand-in matches either way; no ellipses, no case folding. A failing dossier gets one retry that sees only the failure list and its first dossier. |
+| `route.py` | No LLM. The routing table below, from FACTS + DOSSIER + quote check. `decided_by_unfair` is recomputed from the labels (every failing test possibly-unfair or infra), never taken from the agent. |
+| `calibrate.py`, `calibration/` | Calibration: build the set (copies evidence only), run the agents (6 at a time, 30 s apart, progress file), compare with the Opus verdicts. |
