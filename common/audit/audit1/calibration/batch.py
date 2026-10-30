@@ -7,7 +7,8 @@ config.json (a file, so no task names reach any command line):
     {"work": "/home/mara/scratch/audit1-cal",   # runs/<trial>/ prepared by prepare_set.py
      "trials": ["<trial>", ...],                # optional: only these (default: every runs/<trial> without AUDIT1.json)
      "parallel": 6, "stagger_sec": 30, "timeout_sec": 2700,
-     "round": "r1"}                             # label written to the progress file
+     "round": "r1",                             # label written to the progress file
+     "archive_to": "<folder>"}                  # optional: move the previous round's outputs there first
 
 Each agent runs as `bash <repo>/common/launch/drive.sh deepseek bash <repo>/common/audit/audit1/run_audit1.sh` with the
 run folder as its working directory (not on the command line). Progress: <work>/progress.tsv (one line per event:
@@ -16,6 +17,7 @@ stream file present) and logged. Only the pids this script started are ever sign
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -72,6 +74,12 @@ def main():
         if queue and len(running) < par and time.time() - last_start >= stagger:
             trial = queue.pop(0)
             d = runs / trial
+            if cfg.get("archive_to"):        # keep the previous round's outputs OUTSIDE the agent's folder
+                arch = Path(cfg["archive_to"]) / trial
+                arch.mkdir(parents=True, exist_ok=True)
+                for f in list(d.iterdir()):
+                    if f.name.startswith(("AUDIT1", "DOSSIER", "QUOTECHECK", "audit1-", "prompt-")):
+                        shutil.move(str(f), str(arch / f.name))
             for f in d.glob("AUDIT1.json"):
                 f.unlink()
             out = open(d / "audit1-launch.log", "w")

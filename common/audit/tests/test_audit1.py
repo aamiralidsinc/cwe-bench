@@ -85,6 +85,14 @@ class Route(unittest.TestCase):
         sig = {"id": "I1", "kind": "agent-timeout", "infra": False}
         self.assertEqual(self.run_route({"a": "fair"}, infra=[sig]), "provisional-fail")
 
+    def test_unfair_but_fair_version_fails_is_note(self):
+        facts = {"failing_tests": [{"id": "a"}], "infra_signals": []}
+        dossier = {"failing": [{"tests": ["a"], "label": "possibly-unfair:one-implementation",
+                                "fair_version_passes": False}], "run": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            d = make(tmp, {}, dossier, facts, {"pass": True})
+            self.assertEqual(route.route(d)["route"], "note-unfair")
+
     def test_contamination(self):
         self.assertEqual(self.run_route({"a": "fair"}, contamination=[{"hit": "C1", "real": True}]),
                          "hold-contamination")

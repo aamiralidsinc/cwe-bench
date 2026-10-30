@@ -61,7 +61,13 @@ There are no earlier audits, reviews or decisions for you to find; do not look f
    d. List the candidate instruction sentences for this test, verbatim: ALL keeps-working sentences, plus every
       security-rule, refusal-form and scope sentence on this topic. For each say whether the test follows it,
       contradicts it, or is silent.
-   e. Label it:
+   e. Decide fair_version_passes: imagine the test rewritten to accept EVERY outcome the instruction allows and to
+      drop every detail the instruction does not state (any refusal form, any layer, any deadline, any design).
+      Would THIS model's code, as it is in the patch, pass that fair version? false when the model's code leaves the
+      attacked route unchanged, still produces the forbidden effect, never finishes, or breaks a stated behaviour;
+      true when it took a different allowed path and only this test's narrowness makes it fail. An unfair test
+      decides the run only through tests where this is true.
+   f. Label it:
       - "fair": the instruction states what the test checks, any correct fix the instruction allows passes it, and
         the model's code really does the wrong thing.
       - "possibly-unfair:conflict": the test sides with one instruction sentence against another (both directions:
@@ -74,14 +80,17 @@ There are no earlier audits, reviews or decisions for you to find; do not look f
       - "infra": it failed because of the environment, harness or provider, not the code (missing app key after a
         broken workspace transfer, verifier crash, provider stop before any edit, ...).
       Rule: if you can NAME a concrete fix that the instruction allows and that would fail this test, the label is
-      possibly-unfair, whatever the model did. If you are unsure between fair and possibly-unfair, choose
+      possibly-unfair, whatever the model did. The named fix must be COMPLETE: it closes every route the instruction
+      covers (its close variants included) and keeps every keeps-working sentence. A narrower fix (one that leaves a
+      covered route open, or fixes only the reported value) is not an allowed fix and never makes a test unfair. If you are unsure between fair and possibly-unfair, choose
       possibly-unfair with confidence "low". Do not call a test unfair only because the model disagreed with it:
       a route the instruction covers ("whatever form the value takes", "any caller-supplied value") that the
       model's code leaves open is a fair failure.
 
 3. Run level:
-   - decided_by_unfair: true when EVERY failing test is labelled possibly-unfair or infra (any one fair failure
-     alone already blocks the solve). FACTS reward shows the arithmetic.
+   - decided_by_unfair: true when EVERY failing test is labelled infra, or possibly-unfair with
+     fair_version_passes true (any one other failure alone already blocks the solve). FACTS reward shows the
+     arithmetic.
    - infra: judge each FACTS infra signal. Owner rules: a provider content-filter stop, a 429/API cut, or a timeout
      with no graded result is infra (not a model fail); a trial timeout WITH a graded result is a model fail; tool
      calls inside the grading window may have changed what was graded.
@@ -100,8 +109,12 @@ per failing test or group, then the run-level lines). Write nothing else.
 A QUOTE is an object {"file": "<path relative to {{DIR}}>", "line": <1-based line where the quote starts>,
 "quote": "<text copied EXACTLY from that file>"}. Copy, do not paraphrase: same words, same punctuation, same case;
 only whitespace may differ. Keep each quote to one sentence or one code line (at most 200 characters); no "...".
-Cite only files under evidence/ or facts-input/. Take the line number from the file itself (Read shows line
-numbers); a quote more than 3 lines away from where it really starts fails the check.
+Cite only files under evidence/ or facts-input/. Take the line number from the file itself: before you write the
+dossier, run Grep -n with a distinctive part of EACH quote on the cited file and use the line Grep reports. In
+evidence/transcript.md one message spans several lines: cite the line that holds the quoted words, not the line
+where the message starts. Never join pieces from two places into one quote, and never drop or add characters
+inside a quote (backticks, asterisks and quote marks included). A quote more than 3 lines away from where it really
+starts fails the check. Write valid JSON: inside strings use \n and \t escapes, never a raw tab or line break.
 
 {
   "trial": "<FACTS trial>", "task": "<FACTS task>", "model": "<FACTS model>",
@@ -125,7 +138,8 @@ numbers); a quote more than 3 lines away from where it really starts fails the c
          "test_relation": "follows" | "contradicts" | "silent"}
       ],
       "other_correct_fix_fails": true | false,          // would a fix the instruction allows (named below) fail it?
-      "other_fix": "<the concrete fix that would fail it, or empty>",
+      "other_fix": "<the concrete, COMPLETE fix that would fail it, or empty>",
+      "fair_version_passes": true | false,              // step 2e: would THIS model's code pass a fair version?
       "label": "fair" | "possibly-unfair:conflict" | "possibly-unfair:one-implementation" |
                "possibly-unfair:out-of-scope" | "possibly-unfair:unreachable" | "infra",
       "label_reason": "<one or two sentences>",
