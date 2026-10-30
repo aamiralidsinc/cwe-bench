@@ -19,7 +19,8 @@ import sys
 from pathlib import Path
 
 HARD_INFRA = {"provider-stop", "no-result", "no-result-event", "api-cut", "exception", "agent-cut",
-              "tool-calls-in-grading-window", "trial-log", "agent-error", "verifier-setup-flag"}
+              "tool-calls-in-grading-window", "trial-log", "agent-error", "verifier-setup-flag",
+              "permission-denied", "same-env-crash-everywhere"}
 SOFT_KINDS = {"verifier-setup-flag"}      # a flag only: real infra only when the dossier agrees
 
 

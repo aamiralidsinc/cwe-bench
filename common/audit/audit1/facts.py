@@ -75,6 +75,15 @@ TESTS_READ = [
 MTIME = re.compile(r"\bfind\b[^|;&\n]{0,200}\s-(newer\w*|mmin|mtime|cmin|ctime|amin|atime)\b|"
                    r"\bls\s+-[A-Za-z]*t[A-Za-z]*\b|\bstat\s+(-c|--format|-f)\b|"
                    r"\bgit\s+(log|reflog|fsck)\b[^|;&\n]{0,80}(--all|--lost-found|--unreachable|--reflog)")
+# The trial agent runs with bypassPermissions: a denial means the sandbox or a settings file in the repository got in
+# the way (logging-operator-s2 2026-10-28: the repo's own .claude deny rule blocked every read of the file to fix).
+PERMISSION_DENIED = re.compile(r"Permission to use \w+ .{0,300}has been denied|denied by your permission settings|"
+                               r"blocked by (a |your )?(permission|deny) (rule|setting)", re.S)
+# Errors that say the ENVIRONMENT lacks something (a global, a module, a service), not that the code refused or checked.
+ENV_ERROR = re.compile(r"\b(ReferenceError|is not defined\b|Cannot find (module|package)|ModuleNotFoundError|ImportError|"
+                       r"No module named|ClassNotFoundException|NoClassDefFoundError|MissingAppKeyException|"
+                       r"No application encryption key|ECONNREFUSED|Connection refused|command not found|"
+                       r"UnsatisfiedLinkError|ERR_MODULE_NOT_FOUND|could not find driver|getaddrinfo)", re.I)
 UPSTREAM_GIT = re.compile(r"\bgit\s+(clone|fetch|ls-remote|pull|remote\s+add)\b")
 FETCH_TOOL = re.compile(r"\b(curl|wget|git|svn|hg|pip3?|python3? -m pip|npm|pnpm|yarn|npx|go\s+(get|mod)|cargo|gem|composer|"
                         r"mvn|gradle|bundle|apt(-get)?|urllib|requests\.get|httpx\.get|fetch\()", re.I)
@@ -322,7 +331,8 @@ def reward_facts(results, reward_json, failing):
 def agent_log_facts(log):
     """Result event, provider stops, API retries and tool-call counts from the full stream-json log."""
     out = {"present": log.is_file(), "result": None, "api_retries": {}, "api_retry_max_attempt": 0,
-           "tool_calls": 0, "edit_calls": 0, "edit_files": [], "assistant_api_errors": []}
+           "tool_calls": 0, "edit_calls": 0, "edit_files": [], "assistant_api_errors": [],
+           "permission_denials": 0, "permission_denial_examples": []}
     calls = []
     if not log.is_file():
         return out, calls
@@ -346,6 +356,19 @@ def agent_log_facts(log):
                 k = f"{ev.get('error_status')} {ev.get('error')}"
                 out["api_retries"][k] = out["api_retries"].get(k, 0) + 1
                 out["api_retry_max_attempt"] = max(out["api_retry_max_attempt"], int(ev.get("attempt") or 0))
+            elif t == "user":
+                msg = ev.get("message") or {}
+                for c in msg.get("content") or [] if isinstance(msg, dict) else []:
+                    if not (isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error")):
+                        continue
+                    cont = c.get("content")
+                    txt = cont if isinstance(cont, str) else " ".join(
+                        x.get("text", "") for x in (cont or []) if isinstance(x, dict))
+                    if PERMISSION_DENIED.search(txt or ""):
+                        out["permission_denials"] += 1
+                        if len(out["permission_denial_examples"]) < 5:
+                            out["permission_denial_examples"].append(
+                                {"where": f"trial:agent/claude-code.txt:{n}", "text": clip(txt, 200)})
             elif t == "assistant":
                 msg = ev.get("message") or {}
                 for c in msg.get("content") or [] if isinstance(msg, dict) else []:
@@ -483,6 +506,12 @@ def infra_signals(res, run, agent, trial, gdir, out_dir, failing):
             "trial:agent/claude-code.txt (system api_retry events)", infra=exhausted)
     for e in agent.get("assistant_api_errors") or []:
         add("api-error-text", e["text"], e["where"])
+    if agent.get("permission_denials"):
+        ex1 = (agent.get("permission_denial_examples") or [{}])[0]
+        add("permission-denied", f"{agent['permission_denials']} tool calls refused by a permission rule although the "
+                                 f"trial runs with bypassPermissions (sandbox or a repository settings file): "
+                                 f"{ex1.get('text', '')}", ex1.get("where", "trial:agent/claude-code.txt"),
+            infra=agent["permission_denials"] >= 3)
     tim = (run or {}).get("timing") or {}
     if tim.get("tool_calls_during_grading"):
         add("tool-calls-in-grading-window", f"{len(tim['tool_calls_during_grading'])} tool calls inside the grading "
@@ -519,9 +548,13 @@ def infra_signals(res, run, agent, trial, gdir, out_dir, failing):
         firsts = {re.sub(r"\d+", "N", (t["message"] or "").strip().splitlines()[0][:120]) if t["message"] else ""
                   for t in failing}
         if len(firsts) == 1:
-            add("same-crash-everywhere", f"all {len(failing)} failing tests crash with the same first line: "
-                                         f"{next(iter(firsts))!r} (environment, harness, or the model's own broken "
-                                         f"build: judge from the message)", failing[0]["xml"] or "", infra=False)
+            first = next(iter(firsts))
+            env = bool(ENV_ERROR.search(first) or ENV_ERROR.search(failing[0]["message"][:600] or ""))
+            add("same-env-crash-everywhere" if env else "same-crash-everywhere",
+                f"all {len(failing)} failing tests crash with the same first line: {first!r}"
+                + (" - an error saying the environment lacks something (a global, module, key or service)" if env
+                   else " (environment, harness, or the model's own broken build: judge from the message)"),
+                failing[0]["xml"] or "", infra=env)
     return sig
 
 
