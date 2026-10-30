@@ -484,7 +484,7 @@ def infra_signals(res, run, agent, trial, gdir, out_dir, failing):
     if not rw:
         add("no-result", "no reward recorded for this run", "trial:result.json verifier_result")
     r = agent.get("result")
-    if agent.get("present") and r is None:
+    if agent.get("present") and r is None and et != "AgentTimeoutError":   # a timed-out session is killed: expected
         add("no-result-event", "the agent log has no result event: the session never finished (killed or crashed)",
             "trial:agent/claude-code.txt")
     if r:

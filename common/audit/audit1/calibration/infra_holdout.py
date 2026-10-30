@@ -49,7 +49,7 @@ def main():
             if not (pm / "evidence").is_dir():
                 continue
             out = tmp / t
-            out.mkdir()
+            shutil.copytree(pm / "evidence", out / "evidence")
             try:
                 _, f = facts.build(pm, pm.parent, out)
             except Exception as e:
