@@ -545,7 +545,9 @@ def infra_signals(res, run, agent, trial, gdir, out_dir, failing):
     # one identical crash in every failing test (harness, environment, or the model's own broken build)
     crashes = [t for t in failing if t["kind"] in ("crash", "setup-error")]
     if len(failing) >= 3 and len(crashes) == len(failing):
-        firsts = {re.sub(r"\d+", "N", (t["message"] or "").strip().splitlines()[0][:120]) if t["message"] else ""
+        # same first line once numbers and file paths are masked (the importing file may differ per test)
+        firsts = {re.sub(r"\d+", "N", re.sub(r"(?:/[\w@.+-]+)+", "PATH",
+                                             (t["message"] or "").strip().splitlines()[0][:160])) if t["message"] else ""
                   for t in failing}
         if len(firsts) == 1:
             first = next(iter(firsts))
