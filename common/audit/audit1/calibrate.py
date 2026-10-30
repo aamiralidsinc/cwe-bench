@@ -8,7 +8,7 @@ config.json (a file, so no task names reach the command line):
      "opus": "<TSV: trial<TAB>path of the Opus verdict.json>",          # read only; never copied next to the runs
      "only": ["<trial>", ...],                                          # optional subset (a re-run round)
      "out": "<prefix for <prefix>.tsv and <prefix>.json>",
-     "demote_fair_version": true}                                       # route.py's round-2 rule (default on)
+     X
 
 Opus classes (from verdict.json):
     unfair-decided   attribution test-fault (an unfair test decided the run)
@@ -113,7 +113,7 @@ def main():
         d = runs / t
         v = jload(opus[t])
         a1 = jload(d / "AUDIT1.json") or {}
-        r = routemod.route(d, demote=cfg.get("demote_fair_version", True))
+        r = routemod.route(d, demote=cfg.get("demote_fair_version", False))
         q1 = jload(d / "QUOTECHECK-1.json")
         est, per_task = audit2_estimate(d)
         unfair_items = [it for it in (v or {}).get("items") or []

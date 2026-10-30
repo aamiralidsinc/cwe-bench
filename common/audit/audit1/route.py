@@ -32,7 +32,7 @@ def jload(p):
         return None
 
 
-def labels(dossier, demote=True):
+def labels(dossier, demote=False):
     """{test id: label}. A possibly-unfair item whose fair_version_passes is false (this model's code would fail a fair
     version of the test too) cannot decide the run: it is returned as "unfair-not-deciding:<kind>"."""
     out = {}
@@ -45,7 +45,7 @@ def labels(dossier, demote=True):
     return out
 
 
-def route(folder, demote=True):
+def route(folder, demote=False):
     """demote: a possibly-unfair item with fair_version_passes=false cannot decide the run (round-2 rule)."""
     d = Path(folder)
     facts = jload(d / "FACTS.json") or {}

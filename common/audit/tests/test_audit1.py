@@ -101,7 +101,8 @@ class Route(unittest.TestCase):
                                 "fair_version_passes": False}], "run": {}}
         with tempfile.TemporaryDirectory() as tmp:
             d = make(tmp, {}, dossier, facts, {"pass": True})
-            self.assertEqual(route.route(d)["route"], "note-unfair")
+            self.assertEqual(route.route(d, demote=True)["route"], "note-unfair")
+            self.assertEqual(route.route(d)["route"], "hold-unfair-deciding")
 
     def test_contamination(self):
         self.assertEqual(self.run_route({"a": "fair"}, contamination=[{"hit": "C1", "real": True}]),
