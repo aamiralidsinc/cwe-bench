@@ -32,20 +32,21 @@ def jload(p):
         return None
 
 
-def labels(dossier):
+def labels(dossier, demote=True):
     """{test id: label}. A possibly-unfair item whose fair_version_passes is false (this model's code would fail a fair
     version of the test too) cannot decide the run: it is returned as "unfair-not-deciding:<kind>"."""
     out = {}
     for g in (dossier or {}).get("failing") or []:
         lab = str(g.get("label") or "")
-        if lab.startswith("possibly-unfair") and g.get("fair_version_passes") is False:
+        if demote and lab.startswith("possibly-unfair") and g.get("fair_version_passes") is False:
             lab = "unfair-not-deciding:" + lab.split(":", 1)[-1]
         for t in g.get("tests") or []:
             out[t] = lab
     return out
 
 
-def route(folder):
+def route(folder, demote=True):
+    """demote: a possibly-unfair item with fair_version_passes=false cannot decide the run (round-2 rule)."""
     d = Path(folder)
     facts = jload(d / "FACTS.json") or {}
     dossier = jload(d / "DOSSIER.json")
@@ -55,7 +56,7 @@ def route(folder):
         if qc is not None:
             break
     failing = [t["id"] for t in facts.get("failing_tests") or []]
-    lab = labels(dossier)
+    lab = labels(dossier, demote)
     covered = [t for t in failing if t in lab]
     uncovered = [t for t in failing if t not in lab]
     run = (dossier or {}).get("run") or {}
