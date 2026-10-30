@@ -51,6 +51,16 @@ class QuoteCheck(unittest.TestCase):
         self.assertTrue(self.check("if bad(x):", 5, "evidence/final-code/changes.patch")["pass"])
         self.assertTrue(self.check("+    if bad(x):", 5, "evidence/final-code/changes.patch")["pass"])
 
+    def test_transcript_message_block(self):
+        tr = "CALL Bash: {}\nAGENT: I changed the code.\nmore\nmore\nmore\nmore\nThis enforces the token.\nRESULT: ok\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            d = make(tmp, {"evidence/transcript.md": tr},
+                     {"q": [{"file": "evidence/transcript.md", "line": 2, "quote": "This enforces the token."}]})
+            quote_check._cache.clear()
+            quote_check._blocks.clear()
+            self.assertTrue(quote_check.check(d)["pass"])
+            self.assertFalse(quote_check.check(d, strict_lines=True)["pass"])
+
     def test_outside_folder_fails(self):
         self.assertFalse(self.check("root", 1, "../../etc/passwd")["pass"])
 

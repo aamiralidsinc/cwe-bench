@@ -10,6 +10,10 @@ STARTS within --window lines (default 3) of the cited line. Choices made where t
   - In a .patch/.diff file the leading diff marker of each line (+, -, space) may be left out of the quote.
   - In evidence/transcript.md the digest replaces newlines inside a tool result with " | "; a quote that copies
     the original newlines instead (or the reverse) still matches.
+  - In evidence/transcript.md (the digest: one tool call, result or agent message per block, a block starts with
+    "AGENT: ", "CALL " or "RESULT: ") a quote also passes when the cited line is within --window lines of the FIRST
+    line of the block that holds the quote: citing where a long agent message starts still leads the reader to it.
+    --strict-lines turns this off (calibration reports both).
   - Nothing else is forgiven: no case folding, no ellipsis gaps, no paraphrase. An empty quote, a file outside the
     run folder, a missing file or a non-integer line fails.
 A dossier passes when every quote passes and it has at least one quote. Exit 0 = pass, 1 = fail, 2 = no dossier.
@@ -86,7 +90,24 @@ def views(path):
     return _cache[path]
 
 
-def check_one(root, q, window):
+BLOCK_START = ("AGENT: ", "CALL ", "RESULT: ")
+_blocks = {}
+
+
+def block_start(path, line):
+    """First line of the transcript-digest block holding `line` (1-based)."""
+    if path not in _blocks:
+        starts, cur = [], 1
+        for n, text in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if text.startswith(BLOCK_START):
+                cur = n
+            starts.append(cur)
+        _blocks[path] = starts
+    st = _blocks[path]
+    return st[line - 1] if 0 < line <= len(st) else line
+
+
+def check_one(root, q, window, strict_lines=False):
     f, line, text = q.get("file"), q.get("line"), q.get("quote")
     res = {"file": f, "line": line, "quote": (text or "")[:200]}
     if not isinstance(text, str) or not norm(text):
@@ -111,13 +132,17 @@ def check_one(root, q, window):
     if not found:
         return {**res, "ok": False, "why": "text not found in the file"}
     best = min(found, key=lambda n: abs(n - line))
+    if abs(best - line) > window and not strict_lines and p.name == "transcript.md":
+        near = [n for n in found if abs(block_start(p, n) - line) <= window]
+        if near:
+            return {**res, "ok": True, "found_line": near[0], "via": "message block start"}
     if abs(best - line) > window:
         return {**res, "ok": False, "why": f"found at line {best}, not within {window} lines of {line}",
                 "found_line": best}
     return {**res, "ok": True, "found_line": best}
 
 
-def check(root, window=3):
+def check(root, window=3, strict_lines=False):
     root = Path(root).resolve()
     d = root / "DOSSIER.json"
     if not d.is_file():
@@ -128,7 +153,7 @@ def check(root, window=3):
         return {"pass": False, "quotes": 0, "failed": 0, "error": f"DOSSIER.json is not JSON: {e}", "results": []}
     results = []
     for where, q in quotes_in(dossier):
-        r = check_one(root, q, window)
+        r = check_one(root, q, window, strict_lines)
         r["at"] = where
         results.append(r)
     failed = [r for r in results if not r["ok"]]
@@ -141,8 +166,9 @@ def main():
     ap.add_argument("run_folder")
     ap.add_argument("--json")
     ap.add_argument("--window", type=int, default=3)
+    ap.add_argument("--strict-lines", action="store_true")
     a = ap.parse_args()
-    rep = check(a.run_folder, a.window)
+    rep = check(a.run_folder, a.window, a.strict_lines)
     if rep is None:
         print(f"{a.run_folder}: no DOSSIER.json")
         sys.exit(2)
