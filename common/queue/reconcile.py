@@ -127,8 +127,14 @@ def repair_kind(slug):
         if any(f.is_file() and not f.name.endswith(".orig") and f.name != "README.md" and f.name in present
                for f in d.iterdir()):
             return "regrade", []
+        # Repairs since 2026-10-29 keep copies under original/... and new/... (stk-unleash-8843, 2026-10-30: a rewritten
+        # security test was only there, the run was rescored from results of the old file).
+        if _nested_copy_in_suite(d, present):
+            return "regrade", []
     drops = []
     for d in b.glob("removed-tests-*"):
+        if _nested_copy_in_suite(d, present):
+            return "regrade", []                         # a backup of a file that stays: part of it was removed
         for f in d.iterdir():
             if not f.is_file() or f.name == "README.md":
                 continue
@@ -137,6 +143,18 @@ def repair_kind(slug):
                 return "regrade", []                     # one test function removed from a file that stays
             drops.append(name.split(".")[0])             # invalid_schema_value.test.js -> invalid_schema_value
     return ("rescore", sorted(set(drops))) if drops else ("regrade", [])
+
+
+def _nested_copy_in_suite(folder, present):
+    """True when a file inside a subfolder of a repair folder (original/..., new/...) has the name of a file that is
+    still in the task's tests: that file was changed, not removed."""
+    for sub in folder.iterdir():
+        if not sub.is_dir():
+            continue
+        for f in sub.rglob("*"):
+            if f.is_file() and strip_backup(f.name) in present:
+                return True
+    return False
 
 
 def drop_matches_exactly(results, drops):

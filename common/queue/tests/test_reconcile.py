@@ -113,6 +113,32 @@ def test_removed_test_file_gives_rescore_jobs(conn, cfg, root):
     assert qdb.args_of(qdb.jobs(conn, "kind='regate'")[0])["listing"] is False
 
 
+def test_rewritten_file_kept_under_new_and_original_gives_regrade(root):
+    """stk-unleash-8843, 2026-10-30: the repair removed one file and rewrote another; the rewritten file was kept only
+    under repaired-tests-*/original/tests/... and new/tests/..., so the old check (top-level files only) chose a
+    rescore and the runs kept results of the old file."""
+    slug = "stk-u"
+    make_task(root, slug, {"security/redirect.test.ts": "new", "functional/keep.test.ts": "k"})
+    rep = root / "build" / slug / "repaired-tests-20261030T112136Z-repair"
+    for side in ("original", "new"):
+        (rep / side / "tests" / "security").mkdir(parents=True)
+        (rep / side / "tests" / "security" / "redirect.test.ts").write_text(side)
+    (rep / "README.md").write_text("repaired\n")
+    (rep / "tests.diff").write_text("--- original\n+++ new\n")
+    rem = root / "build" / slug / "removed-tests-20261030T112136Z-repair"
+    rem.mkdir()
+    (rem / "legit.test.ts").write_text("removed")
+    assert reconcile.repair_kind(slug) == ("regrade", [])
+    # a pure removal still rescores
+    import shutil
+    shutil.rmtree(rep)
+    assert reconcile.repair_kind(slug) == ("rescore", ["legit"])
+    # a removal folder that keeps an original/ copy of a file still in the suite: part of it was removed
+    (rem / "original").mkdir()
+    (rem / "original" / "keep.test.ts").write_text("k+removed case")
+    assert reconcile.repair_kind(slug) == ("regrade", [])
+
+
 def test_removed_function_from_a_file_that_stays_gives_regrade(conn, cfg, root):
     t0 = time.time() - 2 * DAY
     slug = "stk-b"
