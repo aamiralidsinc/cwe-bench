@@ -77,7 +77,9 @@ refused leading slash, where another route must accept it.
 
 **S8. Scope and reachability (gate a when it fails).** The brief's step 4a, for every trap whose
 origin is not `advisory_route` (uncovered_upstream, published_fix_far_site, injection_room, injected):
-- quote the instruction sentence whose described scope covers the change the trap's test needs;
+- quote the instruction sentence whose described scope covers the change the trap's test needs. The
+  general property counts: a hidden trap needs no sentence that names, describes or points at it, and a
+  trap covered only by the general property, read literally, is in scope (never `out-of-scope`);
 - cite the entry point that reaches it at the pinned commit, and the pinned product code that creates
   every state the test sets up (a token field, a stored record, a configuration). A test whose state no
   pinned code creates is `unreachable` (a dead path), even when the reference passes it;

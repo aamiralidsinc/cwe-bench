@@ -290,9 +290,10 @@ workspace, and a `score.py` that misses setup errors. Shared refusal helpers for
 PHPUnit are in `common/builder/templates/support/refusal/`. The lint complements, and never replaces, the
 fairness review after trials.
 
-### 3l. Scope, reachability and conflicts (2026-10-28, client audit PO-3)
-- **Scope.** Every trap or variant beyond the advisory's own route sits inside the scope the instruction
-  describes: the manifest trap quotes the sentence that covers the change its test needs (`instruction_scope`).
+### 3l. Reachability and conflicts (2026-10-28, client audit PO-3; scope rule rolled back 2026-10-30)
+- **No per-trap scope sentence.** The instruction's general property covers the hidden traps. Never add, or quote,
+  a sentence that names or describes a trap to put it "in scope" (rolled back 2026-10-30: it listed the traps and
+  cut stacking yield; docs/STACKING-THROUGHPUT-DROP-20261030.md).
 - **Reachability.** It is reachable at the pinned commit: the trap cites the entry point a real caller uses and the
   pinned code that creates every state its test sets up (`entry_point`). A state only the test or the reference
   creates is a dead path: drop the trap.

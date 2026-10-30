@@ -101,8 +101,13 @@ def test_scope_warnings_only_for_new_builds():
     assert gate.scope_warnings({"builder_prompt_version": "build-v1", "traps": traps}) == []
     got = gate.scope_warnings({"builder_prompt_version": "build-v1.1", "traps": traps})
     assert len(got) == 1 and "T4" in got[0]
-    traps[0].update(entry_point="pkg/auth/requests/authenticate.go:Authenticate", instruction_scope="\"...\"")
+    traps[0].update(entry_point="pkg/auth/requests/authenticate.go:Authenticate")
     assert gate.scope_warnings({"builder_prompt_version": "build-v1.1", "traps": traps}) == []
+    # build-v1.2 (2026-10-30): no instruction_scope is asked for; an entry point alone clears the warning.
+    assert gate.scope_warnings({"builder_prompt_version": "build-v1.2", "traps": traps}) == []
+    del traps[0]["entry_point"]
+    got = gate.scope_warnings({"builder_prompt_version": "build-v1.2", "traps": traps})
+    assert len(got) == 1 and "entry_point" in got[0] and "instruction" not in got[0]
 
 
 # ---------- the other-reading check (kind other_reading; the repair step, owner 2026-10-28)

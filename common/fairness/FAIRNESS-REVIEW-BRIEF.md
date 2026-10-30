@@ -67,7 +67,9 @@ Write build/SLUG/FAIRNESS.md:
    the instruction sentence whose scope covers it, quoted (the scope the instruction DESCRIBES: the
    protected data, outcome or component it names; "outside the advisory" is not a scope question),
    and the entry point that reaches it at the pinned commit (file:function or route, and the product
-   code that creates the state the test sets up). Label the test `out-of-scope` when no instruction
+   code that creates the state the test sets up). The general property counts: a hidden route needs no
+   sentence that names, describes or points at it, so quoting the general property that, read
+   literally, applies to the route is enough. Label the test `out-of-scope` only when no instruction
    sentence, read literally, covers the change it needs, and `unreachable` when no code at the pinned
    commit creates the state it needs (a dead path) or no real entry point reaches it. Both are unfair:
    list them in the Conflicts table. In gate_report.json, a security test that upstream's own fix

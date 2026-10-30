@@ -5,7 +5,7 @@
 
 | | |
 |---|---|
-| Version | `build-v1.1`, 2026-10-28 (`build-v1`, 2026-10-16) |
+| Version | `build-v1.2`, 2026-10-30 (`build-v1.1`, 2026-10-28; `build-v1`, 2026-10-16) |
 | Spec | `common/builder/PROMPT-TEMPLATES-SPEC.md` §1.3, §1.5, §3.2 |
 | Rules digest made from | `common/builder/BUILDER.md` (§3a–3j as of 2026-10-16), `common/builder/BRIEF-trap-stack.md`, `docs/research/round1-analysis/B-failure-modes.md` §3b/§4, `docs/research/peer-analysis-2026-10-16.md` |
 | Replaces | `common/archive/old-prompts/PROMPT-task-build.md` (first draft, kept for reference) |
@@ -59,6 +59,12 @@
   reviews it, WARN only). Rancher's request-path test needed a state no pinned code creates; passenger's needed a
   change outside the described scope; litellm's and dbhub's functional tests contradicted the security rule.
   notes.md holds build facts only; later steps write `build/<slug>/history/`.
+- build-v1.2 (2026-10-30, stacking throughput fix): the scope half of "Scope of every lever" is rolled back
+  (no quoted covering sentence per lever, no manifest `instruction_scope`, no stop for "outside the scope").
+  Builders met it by writing one instruction sentence per trap; codex classification of solved stacked
+  tasks: grep-adjacent traps 19% (b1/b2, build-v1) vs 47% (b7/b8, build-v1.1), instruction leak 9% vs 17%;
+  kept-breaker yield 27% vs 12%/7%. Reachability (`entry_point`, dead paths) stays.
+  See docs/STACKING-THROUGHPUT-DROP-20261030.md.
 - 2026-10-28 (pipeline fixes, item 3; no version bump): the builder runs only the static and nop stages (oracle
   and patches are the post-build gate's; local proofs instead); rules on waiting (no `pgrep -f`/`pkill -f`,
   logs under the work folder, nothing left running at the report), target daemons only in Docker, no gate
@@ -218,16 +224,14 @@ Never add:
 Every lever must be findable by a blind engineer from the report and the code. A lever that a blind
 fix cannot find is unfair: remove it.
 
-**Scope of every lever.** Every trap or variant beyond the advisory's own route (far sites, uncovered
-routes, injected siblings, shapes, producers) must meet both conditions, or be dropped:
-- **inside the scope the report describes:** quote the report sentence whose protected data, outcome
-  or component covers the change the lever's test needs. "The general property covers it" counts only
-  when you can quote it and it applies literally;
-- **reachable at the pinned commit:** cite the entry point a real caller uses (file:function, route or
-  command) and the pinned product code that creates every state the test sets up (a stored record, a
-  token field, a configuration). A state that only the test or the reference creates is a dead path:
-  the lever is unfair even when the reference passes it.
-Record both in the trap's manifest entry (`instruction_scope`, `entry_point`).
+**Reachability of every lever.** Every trap or variant beyond the advisory's own route (far sites,
+uncovered routes, injected siblings, shapes, producers) must be reachable at the pinned commit, or be
+dropped: cite the entry point a real caller uses (file:function, route or command) and the pinned
+product code that creates every state the test sets up (a stored record, a token field, a
+configuration). A state that only the test or the reference creates is a dead path: the lever is
+unfair even when the reference passes it. Record it in the trap's manifest entry (`entry_point`).
+The report's general property covers the hidden levers: never add a sentence that names or
+describes a lever to make it "in scope".
 
 **Pattern B rules:**
 - Confirm each route with a behavioural test on the pinned copy before relying on it. The
@@ -372,7 +376,7 @@ Put every identifier that must not appear in `manifest.leak_terms`.
 **`build/{{SLUG}}/manifest.json`:**
 - `slug`, `candidate`;
 - `pattern`: `{{PATTERN}}`;
-- `builder_prompt_version`: `build-v1.1`;
+- `builder_prompt_version`: `build-v1.2`;
 - `"strict_gate": true`;
 - `verified`: entry point, sites, routes, services, project tests run;
 - `leak_terms`, `patch_checks`, `wrong_fix_catalogue`;
@@ -380,7 +384,7 @@ Put every identifier that must not appear in `manifest.leak_terms`.
   `coupled_functional_tests`, `security_fail_patch`, and `realistic_because` (for pattern B: "real,
   unmodified upstream code"); `origin` (`advisory_route`, `published_fix_far_site`,
   `uncovered_upstream`, `injected_sibling`); and, for every lever beyond the advisory's own route,
-  `instruction_scope` (the quoted report sentence) and `entry_point` (see "Scope of every lever");
+  `entry_point` (see "Reachability of every lever");
 - `status`.
 
 **Also in `build/{{SLUG}}/`:**
@@ -437,8 +441,7 @@ those local results as "local", and the static and nop results as the gate's.
 - the flaw does not reproduce through a real entry point at the pinned commit;
 - a planned route or site is not reachable, or the check calls the producer directly (substitute
   another lever the code supports if you can, and say so);
-- a lever's test needs a state no pinned code creates, or a change outside the scope the report
-  describes (drop the lever; substitute one if you can);
+- a lever's test needs a state no pinned code creates (drop the lever; substitute one if you can);
 - the task needs network at run time, or a GPU, kernel or GUI;
 - the tests are flaky;
 - no design meets the bar.

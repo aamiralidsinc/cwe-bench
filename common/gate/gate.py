@@ -34,7 +34,8 @@ Checks, in order (it stops at the first failing group):
            the published fix covers (manifest traps with a published origin); tests of uncovered or
            injected traps are expected to fail it. The patches stage records "upstream_fix" and
            "warnings"; a warning never fails the gate. Static warns (never fails) when a trap beyond
-           the advisory names no entry_point or instruction_scope (the builder's scope rule).
+           the advisory names no entry_point (the builder's reachability rule; the instruction_scope
+           field was rolled back 2026-10-30 and is no longer asked for).
            kind=other_reading (2026-10-28, the repair step: common/fairness/OTHER-READING-CHECK.md):
                             a fix that follows the OTHER instruction sentence of a flagged
                             conflict. Never a verdict: per named test the stage reports PASS (no
@@ -1008,8 +1009,10 @@ def other_reading_result(check: dict, result: dict) -> dict:
 
 
 def scope_warnings(manifest: dict) -> list:
-    """Traps beyond the advisory without the builder's scope citation (TASK-BUILD-PROMPT-v1 'Scope of every lever').
-    Only for builds from build-v1.1 on: older manifests never had the fields."""
+    """Traps beyond the advisory without the builder's entry-point citation (TASK-BUILD-PROMPT-v1 'Reachability of
+    every lever'). Only for builds from build-v1.1 on: older manifests never had the field. instruction_scope is not
+    checked: asking for a quoted covering sentence per trap made builders list the traps (rolled back 2026-10-30,
+    docs/STACKING-THROUGHPUT-DROP-20261030.md)."""
     m = re.match(r"build-v(\d+)(?:\.(\d+))?$", str(manifest.get("builder_prompt_version") or ""))
     if not m or (int(m.group(1)), int(m.group(2) or 0)) < (1, 1):
         return []
@@ -1017,10 +1020,9 @@ def scope_warnings(manifest: dict) -> list:
     for t in manifest.get("traps") or []:
         if not isinstance(t, dict) or not t.get("origin") or t.get("origin") in ADVISORY_ORIGINS:
             continue
-        missing = [k for k in ("entry_point", "instruction_scope") if not str(t.get(k) or "").strip()]
-        if missing:
-            out.append(f"trap {t.get('id')} (origin {t.get('origin')}) has no {' / '.join(missing)}: cite the entry "
-                       "point that reaches it at the pinned commit and the instruction sentence that covers it")
+        if not str(t.get("entry_point") or "").strip():
+            out.append(f"trap {t.get('id')} (origin {t.get('origin')}) has no entry_point: cite the entry point that "
+                       "reaches it at the pinned commit and the pinned code that creates its test's state")
     return out
 
 

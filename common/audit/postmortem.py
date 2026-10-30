@@ -120,7 +120,9 @@ Check, at least:
        allowed refusal form), fail this test? The reference fix passing does not answer this;
    (iii) unfair_kind: "conflict" (the test sides with one of two sentences), "one-implementation"
        (it pins a detail the instruction does not state), "out-of-scope" (the change it needs lies
-       outside the scope the instruction describes), "unreachable" (it needs a state no code at the
+       outside the scope the instruction describes; the general property counts: a hidden route that
+       the general property, read literally, covers is in scope even though no sentence names or
+       describes it), "unreachable" (it needs a state no code at the
        pinned commit creates), else "none". Any kind but "none" makes the item a test-fault with
        correct_fix_would_pass=false, whatever the model did, and if every failing test of the run is
        unfair, the run is not model-failed.
